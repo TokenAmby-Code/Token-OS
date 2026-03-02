@@ -3,7 +3,18 @@
 
 import { createServer } from 'http';
 
-export function createHttpServer(discordClient, messageStore, config, logger) {
+export function createHttpServer(botClients, messageStore, config, logger) {
+  // botClients: { mechanicus: client, custodes: client, ... } OR a single client object (legacy)
+  // Normalize to a clients map
+  const clients = (botClients && typeof botClients.sendMessage === 'function')
+    ? { mechanicus: botClients }  // legacy single-client call
+    : botClients;
+  const discordClient = clients['mechanicus'] || Object.values(clients)[0];
+
+  function resolveClient(botName) {
+    if (!botName) return discordClient;
+    return clients[botName] || discordClient;
+  }
   // Resolve channel name to ID
   function resolveChannel(name) {
     if (!name) return null;
@@ -118,10 +129,22 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
         const pendingId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         messageStore.persist(pendingId, { channel: body.channel, channelId, content: body.content });
 
-        const result = await discordClient.sendMessage(channelId, body.content, {
-          embeds: body.embeds,
-          reply_to: body.reply_to,
-        });
+        // If thread_id is provided, send to that thread instead
+        let result;
+        if (body.thread_id) {
+          const thread = await resolveClient(body.bot).client.channels.fetch(body.thread_id);
+          const msg = await thread.send({ content: body.content, embeds: body.embeds });
+          result = {
+            message_id: msg.id,
+            channel_id: msg.channelId,
+            timestamp: msg.createdAt.toISOString(),
+          };
+        } else {
+          result = await resolveClient(body.bot).sendMessage(channelId, body.content, {
+            embeds: body.embeds,
+            reply_to: body.reply_to,
+          });
+        }
 
         messageStore.remove(pendingId);
         logger.info(`Sent to ${channelName(channelId)}: ${(body.content || '').slice(0, 60)}`);
@@ -156,7 +179,7 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
         if (!channelId) return json(res, { error: `Unknown channel: ${body.channel}` }, 400);
         if (!body.message_id || !body.emoji) return json(res, { error: 'message_id and emoji required' }, 400);
 
-        const result = await discordClient.addReaction(channelId, body.message_id, body.emoji);
+        const result = await resolveClient(body.bot).addReaction(channelId, body.message_id, body.emoji);
         return json(res, result);
       }
 
@@ -224,14 +247,18 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
       if (method === 'POST' && path === '/dm') {
         const body = await parseBody(req);
         if (!body.content) return json(res, { error: 'content required' }, 400);
-        const result = await discordClient.sendDM(body.content);
+        const result = await resolveClient(body.bot).sendDM(body.content);
         logger.info(`DM sent: ${body.content.slice(0, 60)}`);
         return json(res, result);
       }
 
       // GET /status — Health check
       if (method === 'GET' && path === '/status') {
-        return json(res, discordClient.getStatus());
+        const botStatuses = {};
+        for (const [name, client] of Object.entries(clients)) {
+          botStatuses[name] = client.getStatus();
+        }
+        return json(res, { ...discordClient.getStatus(), bots: botStatuses });
       }
 
       // GET /channels — List configured channels
@@ -256,6 +283,83 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
         if (replyResult) return json(res, replyResult);
 
         return json(res, { answered: false });
+      }
+
+      // POST /channel/create — Create a new text channel
+      if (method === 'POST' && path === '/channel/create') {
+        const body = await parseBody(req);
+        if (!body.name) return json(res, { error: 'name required' }, 400);
+
+        const guild = await discordClient.client.guilds.fetch(config.guild_id);
+        const opts = {
+          name: body.name,
+          type: 0, // GuildText
+        };
+        if (body.topic) opts.topic = body.topic;
+        if (body.parent_id) opts.parent = body.parent_id;
+
+        const channel = await guild.channels.create(opts);
+        logger.info(`Created channel #${channel.name} (${channel.id})`);
+        return json(res, { id: channel.id, name: channel.name });
+      }
+
+      // POST /channel/rename — Rename an existing channel
+      if (method === 'POST' && path === '/channel/rename') {
+        const body = await parseBody(req);
+        const channelId = resolveChannel(body.channel);
+        if (!channelId) return json(res, { error: `Unknown channel: ${body.channel}` }, 400);
+        if (!body.name) return json(res, { error: 'name required' }, 400);
+
+        const channel = await discordClient.client.channels.fetch(channelId);
+        await channel.setName(body.name);
+        logger.info(`Renamed channel ${channelId} → #${body.name}`);
+        return json(res, { id: channelId, name: body.name });
+      }
+
+      // DELETE /channel — Delete a channel
+      if (method === 'DELETE' && path === '/channel') {
+        const body = await parseBody(req);
+        const channelId = resolveChannel(body.channel);
+        if (!channelId) return json(res, { error: `Unknown channel: ${body.channel}` }, 400);
+
+        const channel = await discordClient.client.channels.fetch(channelId);
+        const name = channel.name;
+        await channel.delete(body.reason || 'Channel redesign');
+        logger.info(`Deleted channel #${name} (${channelId})`);
+        return json(res, { deleted: true, id: channelId, name });
+      }
+
+      // POST /thread/create — Create a thread on a channel
+      if (method === 'POST' && path === '/thread/create') {
+        const body = await parseBody(req);
+        const channelId = resolveChannel(body.channel);
+        if (!channelId) return json(res, { error: `Unknown channel: ${body.channel}` }, 400);
+        if (!body.name) return json(res, { error: 'name required' }, 400);
+
+        const channel = await resolveClient(body.bot).client.channels.fetch(channelId);
+        const thread = await channel.threads.create({
+          name: body.name,
+          autoArchiveDuration: body.auto_archive_duration || 1440, // 24h default
+          type: 11, // ChannelType.PublicThread
+        });
+        logger.info(`Created thread "${thread.name}" (${thread.id}) in #${channelName(channelId)}`);
+        return json(res, { thread_id: thread.id, name: thread.name });
+      }
+
+      // POST /thread/send — Send message to an existing thread
+      if (method === 'POST' && path === '/thread/send') {
+        const body = await parseBody(req);
+        if (!body.thread_id) return json(res, { error: 'thread_id required' }, 400);
+        if (!body.content) return json(res, { error: 'content required' }, 400);
+
+        const thread = await resolveClient(body.bot).client.channels.fetch(body.thread_id);
+        const msg = await thread.send({ content: body.content });
+        logger.info(`Sent to thread ${body.thread_id}: ${body.content.slice(0, 60)}`);
+        return json(res, {
+          message_id: msg.id,
+          channel_id: msg.channelId,
+          timestamp: msg.createdAt.toISOString(),
+        });
       }
 
       // 404

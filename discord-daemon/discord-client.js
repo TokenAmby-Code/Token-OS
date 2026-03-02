@@ -14,10 +14,12 @@ export function loadConfig() {
   return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
 }
 
-function getToken(config) {
-  // Try macOS Keychain first
-  // Support both flat token_keychain_service and nested bots.mechanicus.keychain_service
-  const keychainService = config.token_keychain_service || config.bots?.mechanicus?.keychain_service;
+function getToken(config, botConfig = null) {
+  // If a specific bot config is provided, use its keychain_service
+  const keychainService = botConfig?.keychain_service
+    || config.token_keychain_service
+    || config.bots?.mechanicus?.keychain_service;
+
   if (config.token_source === 'keychain' && keychainService) {
     try {
       const token = execSync(
@@ -44,11 +46,12 @@ function getToken(config) {
     }
   }
 
-  throw new Error('No Discord bot token found in keychain or fallback file');
+  throw new Error(`No Discord bot token found for bot${botConfig ? ` (${botConfig.keychain_service})` : ''}`);
 }
 
-export function createDiscordClient(config, logger) {
-  const token = getToken(config);
+export function createDiscordClient(config, logger, botName = 'mechanicus', botConfig = null) {
+  const resolvedBotConfig = botConfig || config.bots?.[botName] || null;
+  const token = getToken(config, resolvedBotConfig);
 
   // Build reverse channel map: ID -> name
   const channelIdToName = {};
@@ -57,21 +60,27 @@ export function createDiscordClient(config, logger) {
   }
   const allowedChannelIds = new Set(Object.values(config.channels));
 
-  // We need MessageContent intent to read ALL messages (not just mentions)
-  // The bot has admin, so it has permission for this
-  const client = new Client({
+  // The default (listener) bot needs full intents to receive messages + reactions.
+  // Send-only bots (custodes, inquisition) only need Guilds to send to channels.
+  const isListener = resolvedBotConfig?.default === true || botName === 'mechanicus';
+
+  const client = new Client(isListener ? {
+    // Full intents: read ALL message content, DMs, reactions
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,       // Read ALL message content
-      GatewayIntentBits.DirectMessages,        // Operator DMs
-      GatewayIntentBits.GuildMessageReactions, // Track reactions (for ask/wait)
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.GuildMessageReactions,
     ],
     partials: [
-      Partials.Channel,  // Needed for DM support
-      Partials.Message,  // Needed for reaction on uncached messages
-      Partials.Reaction, // Needed for reaction events
+      Partials.Channel,
+      Partials.Message,
+      Partials.Reaction,
     ],
+  } : {
+    // Minimal intents: send-only bots only need Guilds to fetch channels
+    intents: [GatewayIntentBits.Guilds],
   });
 
   // Event: ready
@@ -260,6 +269,7 @@ export function createDiscordClient(config, logger) {
       const channel = await client.channels.fetch(channelId);
       const messages = await channel.messages.fetch({ limit: 50, after: messageId });
       const botId = client.user?.id;
+      // messages is a Collection, iterate in insertion order (oldest to newest)
       for (const [, msg] of messages) {
         if (msg.reference?.messageId === messageId && msg.author.id !== botId && !msg.author.bot) {
           return {
@@ -295,7 +305,31 @@ export function createDiscordClient(config, logger) {
         user: client.user?.tag || null,
         guild_id: config.guild_id,
         channels: Object.keys(config.channels).length,
+        bot_name: botName,
       };
     },
   };
+}
+
+/**
+ * Create clients for all configured bots.
+ * Returns { mechanicus: client, custodes: client, ... }
+ * Bots that fail to load (missing token) are skipped with a warning.
+ */
+export function createBotClients(config, logger) {
+  const clients = {};
+  const bots = config.bots || {};
+  for (const [name, botConfig] of Object.entries(bots)) {
+    try {
+      clients[name] = createDiscordClient(config, logger, name, botConfig);
+      logger.info(`Bot '${name}' client created`);
+    } catch (err) {
+      logger.warn(`Bot '${name}' skipped: ${err.message}`);
+    }
+  }
+  // Ensure at least the default mechanicus client exists
+  if (Object.keys(clients).length === 0) {
+    clients['mechanicus'] = createDiscordClient(config, logger);
+  }
+  return clients;
 }
