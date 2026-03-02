@@ -3,7 +3,7 @@
 # TAGS: instance
 # AUDIENCE: agent
 #
-# Usage: instance-name <name> [--id <instance-id>]
+# Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
 #
 # Examples:
 #   instance-name "auth-refactor"
@@ -18,13 +18,17 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
 Instance Name - Rename current session in Token-API registry
 
-Usage: instance-name <name> [--id <instance-id>]
+Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
 
 Sets the display name for this Claude Code session in the Token-API
 registry dashboard. The name helps identify what you're working on.
 
 Options:
-  --id <id>    Explicit instance ID (for ambiguous cases)
+  --id <id>          Explicit instance ID (for ambiguous cases)
+  --session          Create a session doc named after the instance and assign it
+  --session <title>  Find existing session doc by title (fuzzy) and assign it
+  --session-id <N>   Assign to existing session doc by ID
+  --path <dir>       Override sessions directory (for --session create)
 
 Instance Resolution (in order):
   1. --id flag if provided
@@ -37,6 +41,9 @@ Examples:
   instance-name "auth-refactor"
   instance-name "fix-bug-123"
   instance-name "feature/payments" --id abc123-def456
+  instance-name "my-feature" --session                   # Create + assign session doc
+  instance-name "my-feature" --session "existing-doc"    # Fuzzy match + assign
+  instance-name "my-feature" --session-id 3              # Assign by ID
 EOF
     exit 0
 fi
@@ -44,10 +51,32 @@ fi
 # Parse arguments
 NAME=""
 EXPLICIT_ID=""
+SESSION_FLAG=""
+SESSION_ID=""
+SESSION_PATH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --id)
             EXPLICIT_ID="$2"
+            shift 2
+            ;;
+        --session)
+            if [[ "${2:-}" =~ ^[0-9]+$ ]] || [[ "${2:-}" == --* ]] || [[ -z "${2:-}" ]]; then
+                SESSION_FLAG="create"
+                shift
+            else
+                SESSION_FLAG="assign-fuzzy"
+                SESSION_ID="$2"
+                shift 2
+            fi
+            ;;
+        --session-id)
+            SESSION_FLAG="assign-id"
+            SESSION_ID="$2"
+            shift 2
+            ;;
+        --path)
+            SESSION_PATH="$2"
             shift 2
             ;;
         *)
@@ -59,7 +88,7 @@ done
 
 # Require name
 if [[ -z "$NAME" ]]; then
-    echo "Usage: instance-name <name> [--id <instance-id>]" >&2
+    echo "Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]" >&2
     exit 1
 fi
 
@@ -141,6 +170,49 @@ RESPONSE=$(curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
 
 if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
     echo "Renamed to: $NAME"
+
+    # Handle session document if requested
+    if [[ -n "$SESSION_FLAG" ]]; then
+        case "$SESSION_FLAG" in
+            create)
+                CREATE_BODY="{\"title\": \"$NAME\"}"
+                if [[ -n "$SESSION_PATH" ]]; then
+                    FULL_PATH="${SESSION_PATH%/}/${NAME}.md"
+                    CREATE_BODY="{\"title\": \"$NAME\", \"file_path\": \"$FULL_PATH\"}"
+                fi
+                SESSION_RESP=$(curl -s -X POST "$API_URL/api/instances/$INSTANCE_ID/create-doc" \
+                    -H "Content-Type: application/json" \
+                    -d "$CREATE_BODY" 2>/dev/null || true)
+                if echo "$SESSION_RESP" | jq -e '.id' >/dev/null 2>&1; then
+                    DOC_PATH=$(echo "$SESSION_RESP" | jq -r '.file_path')
+                    echo "Session doc: $DOC_PATH"
+                else
+                    echo "Warning: session doc creation failed" >&2
+                fi
+                ;;
+            assign-id)
+                ASSIGN_RESP=$(curl -s -X POST "$API_URL/api/instances/$INSTANCE_ID/assign-doc?doc_id=$SESSION_ID" 2>/dev/null || true)
+                if echo "$ASSIGN_RESP" | jq -e '.status == "assigned"' >/dev/null 2>&1; then
+                    DOC_PATH=$(echo "$ASSIGN_RESP" | jq -r '.file_path')
+                    echo "Assigned to session: $DOC_PATH"
+                else
+                    echo "Warning: session doc assignment failed" >&2
+                fi
+                ;;
+            assign-fuzzy)
+                DOCS=$(curl -s "$API_URL/api/session-docs?status=active" 2>/dev/null || true)
+                DOC_ID=$(echo "$DOCS" | jq -r --arg t "$SESSION_ID" \
+                    '[.[] | select(.title | ascii_downcase | contains($t | ascii_downcase))] | .[0].id // ""' 2>/dev/null || true)
+                if [[ -n "$DOC_ID" && "$DOC_ID" != "null" ]]; then
+                    ASSIGN_RESP=$(curl -s -X POST "$API_URL/api/instances/$INSTANCE_ID/assign-doc?doc_id=$DOC_ID" 2>/dev/null || true)
+                    DOC_PATH=$(echo "$ASSIGN_RESP" | jq -r '.file_path // "unknown"')
+                    echo "Assigned to session: $DOC_PATH"
+                else
+                    echo "Warning: no session doc matching '$SESSION_ID' found" >&2
+                fi
+                ;;
+        esac
+    fi
 else
     echo "Error: $(echo "$RESPONSE" | jq -r '.detail // "rename failed"' 2>/dev/null || echo "rename failed")" >&2
     exit 1
