@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+# tmux-status - Timer status segment for tmux status bar
+# TAGS: token-api
+# AUDIENCE: human, agent
+"""Compact timer status formatted for tmux status bar.
+
+Outputs a single segment with tmux color syntax (#[fg=...]).
+Designed for use in ~/.tmux.conf status-right/status-left.
+
+Usage:
+    tmux-status              # Timer mode icon + balance, tmux-colored
+    tmux-status --plain      # No color codes (for testing / non-tmux use)
+    tmux-status --work-mode  # Also include work mode indicator
+    tmux-status --icon-only  # Just the mode emoji, no balance
+    tmux-status --help
+
+Output examples (tmux color syntax):
+    💼 #[fg=green]+14m#[default]
+    ☕ #[fg=red]-2m#[default]
+    🌙
+    💼 #[fg=green]+14m#[default] 🏠OFF   (with --work-mode, clocked out)
+    💼 #[fg=green]+14m#[default] 🏋GYM   (with --work-mode, gym)
+
+Integration example (~/.tmux.conf):
+    set -g status-right '#(tmux-status) | %H:%M'
+    set -g status-right-length 60
+
+Notes:
+    - Timeout: 0.5s — won't lag tmux refresh if server is down.
+    - Silent (empty string) on server down — status bar stays clean.
+    - Sleeping and idle modes omit balance (not meaningful to display).
+"""
+
+import sys
+import json
+import urllib.request
+
+API_URL = "http://localhost:7777"
+
+MODE_ICONS = {
+    "working":      "\U0001f4bc",   # 💼
+    "multitasking": "\u26a1",       # ⚡
+    "idle":         "\u23f8",       # ⏸
+    "distracted":   "\u26a0\ufe0f", # ⚠️
+    "break":        "\u2615",       # ☕
+    "sleeping":     "\U0001f319",   # 🌙
+}
+
+WORK_MODE_LABELS = {
+    "clocked_out": "\U0001f3e0OFF",   # 🏠OFF
+    "gym":         "\U0001f3cbGYM",   # 🏋GYM
+}
+
+# Modes where showing balance is meaningful
+BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+
+
+def get_timer():
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/timer", method="GET")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def fmt_balance_compact(seconds):
+    """Format seconds as compact balance: +14m, -2m, +2h3m, +45s."""
+    sign = "+" if seconds >= 0 else "-"
+    abs_s = abs(int(seconds))
+    if abs_s < 60:
+        return f"{sign}{abs_s}s"
+    elif abs_s < 3600:
+        return f"{sign}{abs_s // 60}m"
+    else:
+        h = abs_s // 3600
+        m = (abs_s % 3600) // 60
+        if m == 0:
+            return f"{sign}{h}h"
+        return f"{sign}{h}h{m:02d}m"
+
+
+def tmux_color(text, fg):
+    """Wrap text in tmux #[fg=color]..#[default] syntax."""
+    return f"#[fg={fg}]{text}#[default]"
+
+
+def ansi_color(text, code):
+    """ANSI escape for --plain testing."""
+    return f"\033[{code}m{text}\033[0m"
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return
+
+    plain = "--plain" in args
+    icon_only = "--icon-only" in args
+    show_work_mode = "--work-mode" in args
+
+    data = get_timer()
+    if not data:
+        # Silent on server down
+        return
+
+    mode = (data.get("current_mode") or "").lower()
+    icon = MODE_ICONS.get(mode, "?")
+
+    if icon_only:
+        print(icon)
+        return
+
+    parts = [icon]
+
+    # Balance (only for meaningful modes)
+    if mode in BALANCE_MODES:
+        if data.get("is_in_backlog"):
+            bal_s = -round(data.get("break_backlog_ms", 0) / 1000)
+        else:
+            bal_s = data.get("accumulated_break_seconds", 0)
+
+        bal_str = fmt_balance_compact(bal_s)
+
+        # Color by value
+        if bal_s > 1800:
+            fg = "green"
+            ansi = "32"
+        elif bal_s > 0:
+            fg = "yellow"
+            ansi = "33"
+        else:
+            fg = "red"
+            ansi = "31"
+
+        if plain:
+            parts.append(ansi_color(bal_str, ansi))
+        else:
+            parts.append(tmux_color(bal_str, fg))
+
+    # Optional work mode indicator
+    if show_work_mode:
+        wm = data.get("work_mode", "clocked_in")
+        label = WORK_MODE_LABELS.get(wm)
+        if label:
+            if plain:
+                parts.append(ansi_color(label, "90"))
+            else:
+                parts.append(tmux_color(label, "colour244"))
+
+    print(" ".join(parts))
+
+
+if __name__ == "__main__":
+    main()
