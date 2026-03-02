@@ -2,7 +2,7 @@
 // daemon.js — Discord CLI daemon entry point
 // Maintains WebSocket connection, exposes local HTTP API
 
-import { createDiscordClient, loadConfig } from './discord-client.js';
+import { createDiscordClient, createBotClients, loadConfig } from './discord-client.js';
 import { createHttpServer } from './http-server.js';
 import { createMessageStore } from './message-store.js';
 import { writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'fs';
@@ -55,14 +55,39 @@ async function main() {
 
   // Create components
   const messageStore = createMessageStore(logger);
-  const discordClient = createDiscordClient(config, logger);
-  const httpServer = createHttpServer(discordClient, messageStore, config, logger);
 
-  // Forward incoming messages to Token API if configured
+  // Create a client for each configured bot; fall back to single mechanicus client
+  const botClients = createBotClients(config, logger);
+  const discordClient = botClients['mechanicus'] || Object.values(botClients)[0];
+
+  const httpServer = createHttpServer(botClients, messageStore, config, logger);
+
+  // Forward incoming messages to Token API if configured (main listening bot only)
   if (config.forward_to_token_api) {
+    // Dedup set to prevent double-forwarding replayed events on WebSocket resume.
+    // Discord replays missed events on reconnect — they fire through onMessage again.
+    const seenMessageIds = new Map(); // message_id -> timestamp (ms)
+    const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes — longer than any replay window
+
+    function isDuplicate(messageId) {
+      const now = Date.now();
+      // Evict stale entries to prevent unbounded growth
+      for (const [id, ts] of seenMessageIds) {
+        if (now - ts > DEDUP_TTL_MS) seenMessageIds.delete(id);
+      }
+      if (seenMessageIds.has(messageId)) return true;
+      seenMessageIds.set(messageId, now);
+      return false;
+    }
+
     discordClient.onMessage(async (msg) => {
       // Don't forward bot messages
       if (msg.author.bot) return;
+      // Skip replayed events (WebSocket resume can replay recently-seen messages)
+      if (isDuplicate(msg.message_id)) {
+        logger.debug(`Skipping duplicate message forward: ${msg.message_id}`);
+        return;
+      }
 
       try {
         const resp = await fetch(`http://127.0.0.1:${config.token_api_port}/api/discord/message`, {
@@ -85,8 +110,11 @@ async function main() {
     logger.info(`Recovering ${pending.length} pending messages...`);
   }
 
-  // Start discord client
-  await discordClient.start();
+  // Start all bot clients (mechanicus first as it's the listener)
+  for (const [name, client] of Object.entries(botClients)) {
+    await client.start();
+    logger.info(`Bot '${name}' connected`);
+  }
 
   // Retry pending messages after connection
   const SNOWFLAKE_RE = /^\d{17,19}$/;
@@ -119,7 +147,9 @@ async function main() {
     logger.info(`Received ${signal}, shutting down...`);
     try {
       await httpServer.stop();
-      await discordClient.stop();
+      for (const client of Object.values(botClients)) {
+        await client.stop();
+      }
       unlinkSync(PID_FILE);
     } catch (err) {
       logger.error(`Shutdown error: ${err.message}`);
