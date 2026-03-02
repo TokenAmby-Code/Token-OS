@@ -6,7 +6,7 @@ enabled: true
 variables:
   - name: bt_mac
     type: string
-    value: "XX:XX:XX:XX:XX:XX"
+    value: "AC:80:0A:27:0B:A9"
   - name: result
     type: string
     value: ""

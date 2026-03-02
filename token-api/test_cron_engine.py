@@ -46,6 +46,13 @@ def run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Cancel pending fire-and-forget tasks (e.g. trigger_job spawns) before
+        # closing the loop to suppress "Task was destroyed but it is pending!" warnings.
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
 

@@ -6,8 +6,7 @@ enabled: true
 variables:
   - name: bt_mac
     type: string
-    # TODO: Replace with your WF-1000XM5 MAC address (Settings > Connected Devices > WF-1000XM5 > gear icon)
-    value: "XX:XX:XX:XX:XX:XX"
+    value: "AC:80:0A:27:0B:A9"
   - name: result
     type: string
     value: ""
@@ -20,13 +19,13 @@ triggers:
 actions:
   # Disconnect via shell (Android 13+ cmd bluetooth_manager)
   - type: shell
-    command: "cmd bluetooth_manager disconnect {lv=bt_mac}"
+    command: "cmd bluetooth_manager disconnect {lv=bt_mac} 2>&1 || echo EXIT_CODE=$?"
     root: false
     output_var: "result"
 
   - type: notification
-    title: "BT Disconnected"
-    text: "WF-1000XM5 disconnected from phone"
+    title: "BT Disconnect"
+    text: "Result: {lv=result}"
     channel_type: 2
 
   - type: http_response

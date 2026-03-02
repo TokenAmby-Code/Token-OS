@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# guardsman - Throw free MiniMax validation queries at problems
+# TAGS: claw, testing, validation
+# AUDIENCE: human, agent
+#
+# Usage:
+#   guardsman "<check_cmd> | <assertion>"      Run command, assert on output
+#   guardsman --batch <file>                   Run all checks from file (parallel)
+#   guardsman --batch <file> --serial          Run checks sequentially
+#   guardsman --batch <file> --limit N         Run first N checks only
+#   guardsman --report                         Show results of last batch
+#
+# Backend: MiniMax M2.5 via OpenClaw (free, no rate limits)
+#
+# Check format (one per line in batch files):
+#   <shell_command> | <assertion about the output>
+#
+# The shell command runs locally, its output is sent to MiniMax for judgment.
+# MiniMax returns PASS/FAIL/SKIP — no tool use needed, pure judgment.
+#
+# Output format:
+#   PASS: <what passed>
+#   FAIL: <what failed and why>
+#   SKIP: <why check couldn't run>
+#
+# Examples:
+#   guardsman "curl -sf localhost:7777/health | should return status=healthy"
+#   guardsman "cat ~/.discord-cli/config.json | should have exactly 6 channel entries"
+#   guardsman "grep -c 'fleet' ~/file.md | should be greater than 0"
+#   guardsman --batch checks.guardsman
+
+set -euo pipefail
+
+RESULTS_DIR="$HOME/.claude/guardsman-results"
+mkdir -p "$RESULTS_DIR"
+
+SYSTEM_MSG='You are an Imperial Guardsman — a disposable validation judge.
+
+You receive:
+1. A COMMAND that was executed
+2. Its OUTPUT (stdout/stderr)
+3. An ASSERTION to check against the output
+
+Your job: judge whether the output satisfies the assertion.
+
+Respond with EXACTLY one line:
+  PASS: <brief description of what passed>
+  FAIL: <what was expected vs what was found>
+  SKIP: <why judgment was not possible>
+
+NO other output. No explanations. No suggestions. One line only.'
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+run_single() {
+  local check="$1"
+  local result_file="${2:-$RESULTS_DIR/$(date +%s)-$$-$RANDOM.txt}"
+
+  # Split on " | " to get command and assertion
+  local cmd assertion
+  if [[ "$check" == *" | "* ]]; then
+    cmd="${check%% | *}"
+    assertion="${check#* | }"
+  else
+    # No pipe separator — treat whole thing as a command, assert "should succeed"
+    cmd="$check"
+    assertion="should succeed (exit 0 and produce reasonable output)"
+  fi
+
+  # Run the command locally, capture output
+  local cmd_output exit_code
+  cmd_output=$(eval "$cmd" 2>&1) || true
+  exit_code=$?
+
+  # Truncate output for MiniMax context
+  local truncated
+  truncated=$(echo "$cmd_output" | head -50 | cut -c1-500)
+
+  # Ask MiniMax to judge
+  local prompt="COMMAND: $cmd
+EXIT CODE: $exit_code
+OUTPUT:
+$truncated
+
+ASSERTION: $assertion
+
+Judge: PASS or FAIL?"
+
+  local output
+  output=$(openclaw agent --agent main \
+    --session-id "guardsman-$$-$RANDOM" \
+    -m "$SYSTEM_MSG
+
+$prompt" \
+    --local --json --timeout 30 2>/dev/null) || output=""
+
+  # Extract response
+  local response_text
+  response_text=$(echo "$output" | jq -r '.payloads[0].text // empty' 2>/dev/null)
+
+  if [[ -z "$response_text" ]]; then
+    response_text="SKIP: minimax returned no response"
+  fi
+
+  # Extract the PASS/FAIL/SKIP line
+  local result_line
+  result_line=$(echo "$response_text" | grep -oE '^(PASS|FAIL|SKIP):.*' | tail -1)
+
+  if [[ -z "$result_line" ]]; then
+    # Try to find it anywhere in the response
+    result_line=$(echo "$response_text" | grep -oE '(PASS|FAIL|SKIP):.*' | tail -1)
+  fi
+
+  if [[ -z "$result_line" ]]; then
+    result_line="SKIP: unstructured response — $(echo "$response_text" | head -1 | cut -c1-100)"
+  fi
+
+  echo "$result_line"
+  echo "$result_line" > "$result_file"
+}
+
+run_batch() {
+  local file="$1"
+  local limit="${2:-0}"
+  local serial="${3:-false}"
+
+  [[ -f "$file" ]] || die "Batch file not found: $file"
+
+  local batch_id
+  batch_id="batch-$(date +%Y%m%d-%H%M%S)"
+  local batch_dir="$RESULTS_DIR/$batch_id"
+  mkdir -p "$batch_dir"
+
+  local total=0
+  local pids=()
+
+  while IFS= read -r check || [[ -n "$check" ]]; do
+    # Skip empty lines and comments
+    [[ -z "$check" || "$check" =~ ^# ]] && continue
+
+    ((total++))
+    [[ $limit -gt 0 && $total -gt $limit ]] && break
+
+    local result_file="$batch_dir/$(printf '%03d' $total).txt"
+
+    if [[ "$serial" == "true" ]]; then
+      echo "$check" > "$result_file.prompt"
+      local output
+      output=$(run_single "$check" "$result_file" 2>/dev/null)
+      echo "[$total] $output"
+    else
+      (
+        echo "$check" > "$result_file.prompt"
+        local output
+        output=$(run_single "$check" "$result_file" 2>/dev/null)
+        echo "[$total] $output"
+      ) &
+      pids+=($!)
+
+      # Throttle: max 5 concurrent (MiniMax rate limit friendly)
+      if [[ ${#pids[@]} -ge 5 ]]; then
+        wait "${pids[0]}" 2>/dev/null || true
+        pids=("${pids[@]:1}")
+      fi
+    fi
+  done < "$file"
+
+  # Wait for remaining
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Summary
+  echo "" >&2
+  echo "=== Batch $batch_id ===" >&2
+  local pass fail skip
+  pass=$(grep -rl '^PASS:' "$batch_dir"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  fail=$(grep -rl '^FAIL:' "$batch_dir"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  skip=$(grep -rl '^SKIP:' "$batch_dir"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  echo "PASS: $pass | FAIL: $fail | SKIP: $skip | Total: $total" >&2
+
+  # Show failures
+  if [[ "$fail" -gt 0 ]]; then
+    echo "" >&2
+    echo "Failures:" >&2
+    for f in "$batch_dir"/*.txt; do
+      [[ -f "$f" ]] || continue
+      [[ "$f" == *.prompt ]] && continue
+      local line
+      line=$(cat "$f")
+      if [[ "$line" =~ ^FAIL: ]]; then
+        local prompt_file="${f}.prompt"
+        [[ -f "$prompt_file" ]] && echo "  Q: $(cat "$prompt_file")" >&2
+        echo "  $line" >&2
+        echo "" >&2
+      fi
+    done
+  fi
+
+  echo "$batch_dir"
+}
+
+show_report() {
+  local latest
+  latest=$(ls -dt "$RESULTS_DIR"/batch-* 2>/dev/null | head -1)
+  [[ -z "$latest" ]] && die "No batch results found"
+
+  echo "=== $(basename "$latest") ==="
+  for f in "$latest"/*.txt; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == *.prompt ]] && continue
+    local prompt_file="${f}.prompt"
+    if [[ -f "$prompt_file" ]]; then
+      echo "  $(cat "$prompt_file")"
+    fi
+    echo "  → $(cat "$f")"
+    echo ""
+  done
+
+  local pass fail skip total
+  pass=$(grep -rl '^PASS:' "$latest"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  fail=$(grep -rl '^FAIL:' "$latest"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  skip=$(grep -rl '^SKIP:' "$latest"/*.txt 2>/dev/null | wc -l | tr -d ' ')
+  total=$((pass + fail + skip))
+  echo "=== Summary: PASS=$pass FAIL=$fail SKIP=$skip Total=$total ==="
+}
+
+# --- Main ---
+[[ $# -eq 0 ]] && {
+  awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+  exit 0
+}
+
+case "$1" in
+  --batch)
+    shift
+    file="${1:-}"; shift || die "Usage: guardsman --batch <file> [--serial] [--limit N]"
+    limit=0; serial=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit)  limit="$2"; shift 2 ;;
+        --serial) serial=true; shift ;;
+        *) die "Unknown option: $1" ;;
+      esac
+    done
+    run_batch "$file" "$limit" "$serial"
+    ;;
+  --report)
+    show_report
+    ;;
+  -h|--help|help)
+    awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+    ;;
+  *)
+    run_single "$*"
+    ;;
+esac

@@ -31,6 +31,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
+import tempfile
 import requests
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -2610,6 +2611,13 @@ def _write_productivity_score(date_str: str, score: int):
 
 # ============ Productivity Check-In System ============
 DISCORD_CHECKIN_CHANNEL = "1472043387535495323"
+
+# Discord response routing
+DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
+MECHANICUS_USER_ID = "1472042705788866611"
+CUSTODES_USER_ID   = "1477159418498912357"
+OPERATOR_USER_ID   = "229461055628115968"
+CUSTODES_CHANNELS  = {"briefing", "chat"}  # Channels where replies route to Custodes
 
 CHECKIN_SCHEDULE = {
     "morning_start": {
@@ -8105,7 +8113,115 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     logger.info(f"Discord [{request.channel_name or request.channel_id}] {author_name}: {request.content[:80]}")
 
+    # --- Discord response routing ---
+    # Never respond to bots (loop prevention)
+    if (request.author or {}).get("bot"):
+        return {"received": True, "message_id": request.message_id}
+
+    # Trigger 1: @Mechanicus mention
+    if f"<@{MECHANICUS_USER_ID}>" in (request.content or ""):
+        asyncio.create_task(_discord_respond(request, bot="mechanicus"))
+        return {"received": True, "message_id": request.message_id}
+
+    # Trigger 2: Reply in a Custodes-owned channel
+    if request.is_reply and request.channel_name in CUSTODES_CHANNELS:
+        asyncio.create_task(_discord_respond(request, bot="custodes"))
+
     return {"received": True, "message_id": request.message_id}
+
+
+# Per-channel cooldown: max 1 response per 30 seconds per channel
+_discord_respond_cooldowns: dict[str, float] = {}
+
+async def _discord_respond(message: DiscordMessageRequest, bot: str):
+    """Fetch channel context, build system prompt, spawn responder subprocess."""
+    channel = message.channel_name or message.channel_id
+
+    # Cooldown: 1 response per channel per 30s
+    now = time.time()
+    last = _discord_respond_cooldowns.get(channel, 0)
+    if now - last < 30:
+        logger.info(f"Discord responder: cooldown active for #{channel}, skipping")
+        return
+    _discord_respond_cooldowns[channel] = now
+
+    persona = "Fabricator General (Adeptus Mechanicus)" if bot == "mechanicus" else "Adeptus Custodes"
+
+    # Fetch recent channel context from daemon (sync urllib in executor to stay async)
+    context_str = ""
+    try:
+        def _fetch_context():
+            import urllib.request
+            req = urllib.request.Request(
+                f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=10",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read())
+        data = await asyncio.get_event_loop().run_in_executor(None, _fetch_context)
+        msgs = data.get("messages", [])
+        context_str = "\n".join(
+            f"[{m['author'].get('displayName', m['author'].get('username', '?'))}]: {m['content']}"
+            for m in msgs
+        )
+    except Exception as e:
+        logger.warning(f"Discord responder: could not fetch context: {e}")
+
+    author_display = (message.author or {}).get("displayName",
+                      (message.author or {}).get("username", "user"))
+
+    system_prompt = f"""You are {persona}, responding to a Discord message in #{channel}.
+
+Recent conversation (oldest to newest):
+{context_str or '(no prior context)'}
+
+You are replying directly to:
+[{author_display}]: {message.content}
+
+Rules:
+- Be concise. Discord markdown is supported.
+- Stay in character.
+- Do not start with a greeting or preamble.
+- One reply only."""
+
+    # Write system prompt to temp file (avoids shell escaping issues)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(system_prompt)
+        prompt_file = f.name
+
+    responder = Path(__file__).parent / "discord_responder.py"
+    env = {
+        **os.environ,
+        "CLAUDECODE": "",
+        "TOKEN_API_SUBAGENT": f"discord_responder:{bot}",
+        "PATH": ":".join([
+            str(Path.home() / "Scripts" / "cli-tools" / "bin"),
+            str(Path.home() / ".local" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            os.environ.get("PATH", ""),
+        ]),
+    }
+
+    proc = await asyncio.create_subprocess_exec(
+        "python3", str(responder),
+        channel,
+        message.message_id or "",
+        bot,
+        prompt_file,
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    logger.info(f"Discord responder spawned: bot={bot} channel=#{channel} pid={proc.pid}")
+
+    # Fire-and-forget but log errors
+    async def _wait_and_log():
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(f"Discord responder exited {proc.returncode}: {stderr.decode()[:300]}")
+    asyncio.create_task(_wait_and_log())
 
 
 # ============ Fleet State Endpoints ============
