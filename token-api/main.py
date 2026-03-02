@@ -88,6 +88,7 @@ fastapi_logger.addHandler(buffer_handler)
 
 # Configuration
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+DEFAULT_SESSIONS_DIR = Path.home() / "Token-ENV" / "Sessions"
 SERVER_PORT = 7777  # Authoritative port for Token API
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
@@ -462,6 +463,24 @@ class DiscordMessageRequest(BaseModel):
     reply_to_message_id: Optional[str] = None
     attachments: Optional[list] = None
     embeds: Optional[int] = 0
+
+
+class SessionDocCreateRequest(BaseModel):
+    title: str
+    project: Optional[str] = None
+    file_path: Optional[str] = None
+
+
+class SessionDocUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    project: Optional[str] = None
+    status: Optional[str] = None
+
+
+class SessionDocMergeRequest(BaseModel):
+    content: str
+    source: str = "agent"
+    context: Optional[str] = None
 
 
 # ============ Hook Handler State ============
@@ -8237,6 +8256,436 @@ Rules:
         if proc.returncode != 0:
             logger.warning(f"Discord responder exited {proc.returncode}: {stderr.decode()[:300]}")
     asyncio.create_task(_wait_and_log())
+
+
+# ============ Session Document Support ============
+
+class MiniMaxRateLimiter:
+    """Sliding window rate limiter for MiniMax API calls."""
+    def __init__(self, max_calls: int = 300, window_seconds: int = 18000):
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self.calls: deque = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.time()
+            while self.calls and self.calls[0] < now - self.window_seconds:
+                self.calls.popleft()
+            if len(self.calls) >= int(self.max_calls * 0.8):
+                return False
+            self.calls.append(now)
+            return True
+
+    @property
+    def remaining(self) -> int:
+        now = time.time()
+        while self.calls and self.calls[0] < now - self.window_seconds:
+            self.calls.popleft()
+        return max(0, self.max_calls - len(self.calls))
+
+minimax_limiter = MiniMaxRateLimiter()
+
+
+def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None) -> None:
+    """Create the markdown file for a session document."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    project_line = f"\nproject: {project}" if project else ""
+    content = f"""---
+session_doc_id: {doc_id}
+created: {today}{project_line}
+agents: []
+status: active
+---
+
+# Session: {title}
+
+## Plan
+
+_No plan defined yet._
+
+## Activity Log
+
+"""
+    file_path.write_text(content)
+
+
+async def _update_doc_agents_list(db, doc_id: int) -> None:
+    """Update the agents list in a session doc's YAML frontmatter."""
+    cursor = await db.execute(
+        "SELECT tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
+        (doc_id,)
+    )
+    rows = await cursor.fetchall()
+    agents = [r[0] for r in rows if r[0]]
+
+    cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+    doc_row = await cursor.fetchone()
+    if not doc_row:
+        return
+
+    fp = Path(doc_row[0])
+    if not fp.exists():
+        return
+
+    content = fp.read_text()
+    content = re.sub(
+        r'^agents:.*$',
+        f'agents: [{", ".join(agents)}]',
+        content,
+        count=1,
+        flags=re.MULTILINE
+    )
+    fp.write_text(content)
+
+
+async def _handle_orphan_doc(doc_id: int) -> None:
+    """Handle cleanup when a doc loses all linked instances."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
+            (doc_id,)
+        )
+        count = (await cursor.fetchone())[0]
+        if count > 0:
+            return
+
+        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return
+
+        fp = Path(row[0])
+        if not fp.exists():
+            return
+
+        content = fp.read_text()
+        if "_No plan defined yet._" in content and "## Activity Log\n\n" in content.rstrip():
+            fp.unlink()
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
+            await db.commit()
+            logger.info(f"Orphan cleanup: deleted unedited session doc {doc_id} ({row[1]})")
+        else:
+            await db.execute(
+                "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), doc_id)
+            )
+            await db.commit()
+            logger.info(f"Orphan cleanup: archived edited session doc {doc_id} ({row[1]})")
+
+
+# ============ Session Document Endpoints ============
+
+@app.post("/api/session-docs")
+async def create_session_doc(request: SessionDocCreateRequest):
+    """Create a new session document."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = request.title.lower().replace(" ", "-")[:50]
+
+    if request.file_path:
+        fp = Path(request.file_path)
+    else:
+        fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+
+    if fp.exists():
+        raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?)""",
+            (request.title, str(fp), request.project, datetime.now().isoformat(), datetime.now().isoformat())
+        )
+        doc_id = cursor.lastrowid
+        await db.commit()
+
+    create_session_doc_file(fp, request.title, doc_id, request.project)
+
+    await log_event("session_doc_created", details={"doc_id": doc_id, "title": request.title, "file_path": str(fp)})
+    logger.info(f"Created session doc {doc_id}: {request.title} -> {fp}")
+
+    return {"id": doc_id, "title": request.title, "file_path": str(fp), "status": "active"}
+
+
+@app.get("/api/session-docs")
+async def list_session_docs(status: Optional[str] = None, project: Optional[str] = None):
+    """List session documents with optional filters."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM session_documents WHERE 1=1"
+        params = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+
+        query += " ORDER BY updated_at DESC"
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+
+        docs = []
+        for row in rows:
+            doc = dict(row)
+            # Count linked instances
+            cnt_cursor = await db.execute(
+                "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
+                (row["id"],)
+            )
+            doc["linked_instances"] = (await cnt_cursor.fetchone())[0]
+            docs.append(doc)
+
+    return {"docs": docs}
+
+
+@app.get("/api/session-docs/{doc_id}")
+async def get_session_doc(doc_id: int):
+    """Get session document metadata and linked instances."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+        doc = dict(row)
+
+        # Get linked instances
+        cursor = await db.execute(
+            "SELECT id, tab_name, status, working_dir, is_processing FROM claude_instances WHERE session_doc_id = ?",
+            (doc_id,)
+        )
+        instances = [dict(r) for r in await cursor.fetchall()]
+        doc["instances"] = instances
+
+    return doc
+
+
+@app.get("/api/session-docs/{doc_id}/content")
+async def get_session_doc_content(doc_id: int):
+    """Read the actual markdown file content of a session document."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+    fp = Path(row[0])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {fp}")
+
+    return {"id": doc_id, "title": row[1], "file_path": str(fp), "content": fp.read_text()}
+
+
+@app.patch("/api/session-docs/{doc_id}")
+async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
+    """Update session document metadata."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+        updates = []
+        params = []
+        if request.title is not None:
+            updates.append("title = ?")
+            params.append(request.title)
+        if request.project is not None:
+            updates.append("project = ?")
+            params.append(request.project)
+        if request.status is not None:
+            updates.append("status = ?")
+            params.append(request.status)
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(doc_id)
+
+        await db.execute(
+            f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?",
+            params
+        )
+        await db.commit()
+
+    logger.info(f"Updated session doc {doc_id}: {updates}")
+    return {"id": doc_id, "updated": True}
+
+
+@app.delete("/api/session-docs/{doc_id}")
+async def delete_session_doc(doc_id: int, hard: bool = False):
+    """Delete a session document. Default is soft delete (archive). Use ?hard=true for hard delete."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+        if hard:
+            # NULL out session_doc_id on linked instances
+            await db.execute(
+                "UPDATE claude_instances SET session_doc_id = NULL WHERE session_doc_id = ?",
+                (doc_id,)
+            )
+            # Delete from DB
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
+            await db.commit()
+
+            # Remove file
+            fp = Path(row[0])
+            if fp.exists():
+                fp.unlink()
+
+            await log_event("session_doc_deleted", details={"doc_id": doc_id, "title": row[1], "hard": True})
+            logger.info(f"Hard deleted session doc {doc_id}: {row[1]}")
+            return {"id": doc_id, "deleted": True, "hard": True}
+        else:
+            await db.execute(
+                "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), doc_id)
+            )
+            await db.commit()
+
+            await log_event("session_doc_archived", details={"doc_id": doc_id, "title": row[1]})
+            logger.info(f"Archived session doc {doc_id}: {row[1]}")
+            return {"id": doc_id, "archived": True}
+
+
+# ============ Instance-Doc Linking Endpoints ============
+
+@app.post("/api/instances/{instance_id}/assign-doc")
+async def assign_doc_to_instance(instance_id: str, doc_id: int):
+    """Assign an existing session document to an instance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Verify instance exists
+        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        inst_row = await cursor.fetchone()
+        if not inst_row:
+            raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+
+        old_doc_id = inst_row[1]
+
+        # Verify doc exists
+        cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+        # Assign
+        await db.execute(
+            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            (doc_id, instance_id)
+        )
+        await db.commit()
+
+        # Update agents list in the new doc
+        await _update_doc_agents_list(db, doc_id)
+
+    # Handle orphan cleanup for old doc
+    if old_doc_id and old_doc_id != doc_id:
+        await _handle_orphan_doc(old_doc_id)
+
+    await log_event("session_doc_assigned", instance_id=instance_id, details={"doc_id": doc_id})
+    logger.info(f"Assigned instance {instance_id} to session doc {doc_id}")
+
+    return {"instance_id": instance_id, "doc_id": doc_id, "assigned": True}
+
+
+@app.post("/api/instances/{instance_id}/create-doc")
+async def create_doc_for_instance(instance_id: str, request: SessionDocCreateRequest):
+    """Create a new session document and assign it to the instance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Verify instance exists
+        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        inst_row = await cursor.fetchone()
+        if not inst_row:
+            raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+
+        old_doc_id = inst_row[1]
+
+    # Create the doc by reusing the create endpoint logic
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = request.title.lower().replace(" ", "-")[:50]
+
+    if request.file_path:
+        fp = Path(request.file_path)
+    else:
+        fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+
+    if fp.exists():
+        raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?)""",
+            (request.title, str(fp), request.project, datetime.now().isoformat(), datetime.now().isoformat())
+        )
+        doc_id = cursor.lastrowid
+
+        # Assign to instance
+        await db.execute(
+            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            (doc_id, instance_id)
+        )
+        await db.commit()
+
+    create_session_doc_file(fp, request.title, doc_id, request.project)
+
+    # Handle orphan cleanup for old doc
+    if old_doc_id:
+        await _handle_orphan_doc(old_doc_id)
+
+    await log_event("session_doc_created", instance_id=instance_id, details={
+        "doc_id": doc_id, "title": request.title, "file_path": str(fp), "auto_assigned": True
+    })
+    logger.info(f"Created session doc {doc_id}: {request.title} and assigned to {instance_id}")
+
+    return {"id": doc_id, "title": request.title, "file_path": str(fp), "instance_id": instance_id, "status": "active"}
+
+
+@app.delete("/api/instances/{instance_id}/unassign-doc")
+async def unassign_doc_from_instance(instance_id: str):
+    """Unlink a session document from an instance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        inst_row = await cursor.fetchone()
+        if not inst_row:
+            raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+
+        old_doc_id = inst_row[1]
+        if not old_doc_id:
+            return {"instance_id": instance_id, "unassigned": False, "reason": "No doc was assigned"}
+
+        await db.execute(
+            "UPDATE claude_instances SET session_doc_id = NULL WHERE id = ?",
+            (instance_id,)
+        )
+        await db.commit()
+
+        # Update agents list in the old doc
+        await _update_doc_agents_list(db, old_doc_id)
+
+    # Handle orphan cleanup
+    await _handle_orphan_doc(old_doc_id)
+
+    await log_event("session_doc_unassigned", instance_id=instance_id, details={"doc_id": old_doc_id})
+    logger.info(f"Unassigned instance {instance_id} from session doc {old_doc_id}")
+
+    return {"instance_id": instance_id, "doc_id": old_doc_id, "unassigned": True}
+
+
+# ============ MiniMax Status Endpoint ============
+
+@app.get("/api/minimax/status")
+async def get_minimax_status():
+    """Get MiniMax API rate limiter status."""
+    return {"remaining": minimax_limiter.remaining, "max": minimax_limiter.max_calls}
 
 
 # ============ Fleet State Endpoints ============
