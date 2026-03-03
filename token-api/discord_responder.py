@@ -39,7 +39,10 @@ result = subprocess.run(
     env={**os.environ, "CLAUDECODE": ""},
 )
 
-response = result.stdout.strip()
+# Strip claude CLI noise (e.g. "Error: Reached max turns (1)")
+lines = result.stdout.strip().splitlines()
+lines = [l for l in lines if not l.startswith("Error: Reached max turns")]
+response = "\n".join(lines).strip()
 if not response:
     print(f"discord_responder: no response from claude (rc={result.returncode}, stderr: {result.stderr[:200]})", file=sys.stderr)
     sys.exit(1)
