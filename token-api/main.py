@@ -8014,13 +8014,12 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                     logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
 
         # Return local_exec so generic-hook.sh runs AHK on WSL (which can invoke Windows AHK)
-        ahk_exe = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
-        ahk_script = os.path.expanduser("~/Scripts/ahk/voice-select-other.ahk")
+        # Note: AHK.exe needs a Windows path, so use wslpath -w to convert the WSL path
         logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]}")
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": f'"{ahk_exe}" "{ahk_script}"',
+            "local_exec": '"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")"',
         }
 
     # Only check Bash commands for blocking
