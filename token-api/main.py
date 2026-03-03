@@ -7185,21 +7185,51 @@ async def send_notification(request: NotifyRequest):
 
 @app.post("/api/notify/tts")
 async def notify_tts(request: TTSRequest):
-    """Speak a message using TTS only."""
+    """Speak a message using TTS only.
+
+    When instance_id is provided and no explicit voice is set, uses the
+    instance's assigned voice profile (WSL voice + Mac fallback).
+    """
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {request.message[:80]}")
         return {"success": True, "suppressed": True, "reason": "quiet_hours"}
+
+    # Resolve voice from instance profile when instance_id provided and no explicit voice
+    voice = request.voice
+    wsl_voice = None
+    wsl_rate = None
+    if request.instance_id and not request.voice:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT tts_voice FROM claude_instances WHERE id = ?",
+                (request.instance_id,)
+            )
+            row = await cursor.fetchone()
+        if row and row["tts_voice"]:
+            wsl_voice = row["tts_voice"]
+            # Look up full profile for Mac fallback and WSL rate
+            for p in PROFILES + FALLBACK_VOICES:
+                if p["wsl_voice"] == wsl_voice:
+                    voice = p.get("mac_voice", "Daniel")
+                    wsl_rate = p.get("wsl_rate", 0)
+                    break
 
     # Log TTS starting
     await log_event(
         "tts_starting",
         instance_id=request.instance_id,
-        details={"message": request.message[:100], "voice": request.voice or "default"}
+        details={"message": request.message[:100], "voice": wsl_voice or voice or "default"}
     )
 
     # Run in executor to allow skip API to interrupt
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, speak_tts, request.message, request.voice, request.rate)
+    result = await loop.run_in_executor(
+        None, functools.partial(
+            speak_tts, request.message, voice, request.rate,
+            request.instance_id, wsl_voice, wsl_rate
+        )
+    )
 
     # Log TTS result
     await log_event(
