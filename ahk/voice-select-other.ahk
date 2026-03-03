@@ -1,17 +1,38 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-; One-shot: select "Other" in Claude Code AskUserQuestion prompt
-; Called via local_exec from generic-hook.sh when voice chat is active
-; Strategy: Down x6 to ensure we're at the bottom (list doesn't wrap),
-; then Up x1 to land on "Other" (always second from bottom, above "Chat about this")
+; Voice chat mode: navigates to "Other" on each AskUserQuestion,
+; enables Enter remap for dictation submit, disables after submit.
+; Called via local_exec from generic-hook.sh when voice chat is active.
 
-Sleep(500)          ; Wait for AskUserQuestion UI to render
-Send("{Down 6}")    ; Overshoot to bottom of list
+; --- Define the Enter handler (starts disabled) ---
+VoiceSubmit(ThisHotkey) {
+    ; Stop Wispr dictation
+    Send("{LCtrl down}{LWin down}")
+    Sleep(250)
+    Send("{Space}{LWin up}{LCtrl up}")
+    Sleep(1500)         ; Wait for Wispr to process and paste text
+    Send("{Enter}")     ; Submit the form
+    ; Disable ourselves — no longer in AskUserQuestion
+    Hotkey "$Enter", "Off"
+    Sleep(1000)         ; Wait for Claude to start processing
+    ; Restart dictation
+    Send("{LCtrl down}{LWin down}")
+    Sleep(250)
+    Send("{Space}{LWin up}{LCtrl up}")
+}
+
+; Register hotkey disabled, then enable after navigation
+Hotkey "$Enter", VoiceSubmit, "Off"
+
+; --- Navigate to "Other" box ---
+if WinExist("ahk_exe WindowsTerminal.exe")
+    WinActivate
+
+Sleep(500)
+Send("{Down 6}")    ; Overshoot to bottom ("Chat about this")
 Sleep(50)
-Send("{Up 1}")      ; Back up one to "Other"
-Sleep(50)
-Send("{Enter}")     ; Select "Other"
-Sleep(300)          ; Wait for text input to appear
-Send("^#{Space}")   ; Toggle Wispr Flow dictation on
-ExitApp
+Send("{Up 1}")      ; Back up one to "Other" (type-something input)
+
+; Enable Enter remap now that we're in AskUserQuestion
+Hotkey "$Enter", "On"

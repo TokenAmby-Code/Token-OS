@@ -29,65 +29,102 @@ Claude Code's interaction model is text-in/text-out. The existing TTS system is 
 
 ---
 
-## Approach 1: AskUserQuestion + TTS Loop (Phase 1 — Ship Now)
+## Phase 1: AskUserQuestion + TTS Loop — IMPLEMENTED 2026-03-03
 
-### Architecture
+### Architecture (Actual)
 
 ```
-┌─────────────────────────────────────────────────┐
-│ Claude Code Session                             │
-│                                                 │
-│  1. Claude processes input                      │
-│  2. Claude calls /api/notify/tts (non-blocking  │
-│     narration — "here's what I found...")        │
-│  3. Claude calls AskUserQuestion (blocking)     │
-│     with TTS hook on the question text           │
-│  4. User dictates via Wispr Flow (continuous)   │
-│  5. User presses Enter when ready to submit     │
-│  6. → back to step 1                            │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ Claude Code Session                                                 │
+│                                                                     │
+│  1. Claude processes input (silent — no TTS during tool use)        │
+│  2. Claude calls AskUserQuestion (blocking)                         │
+│     ↓ PreToolUse hook fires                                         │
+│     ↓ generic-hook.sh → POST token-api /api/hooks/PreToolUse       │
+│     ↓ Token-API: extracts question text → queue_tts()               │
+│     ↓ Token-API: returns {local_exec: "AHK command"} in response    │
+│     ↓ generic-hook.sh: parses local_exec, eval's on WSL             │
+│     ↓ AHK.exe runs voice-select-other.ahk (navigate to "Other")    │
+│  3. User hears question via TTS, dictates via Wispr Flow            │
+│  4. User presses Enter → AHK intercept: stop dictation → wait →    │
+│     submit → restart dictation                                      │
+│  5. → back to step 1                                                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Mechanics
 
-**Two TTS modes:**
-- **Non-blocking speak**: `POST /api/notify/tts` — Claude narrates while working (results, thinking out loud)
-- **Blocking ask**: AskUserQuestion with TTS hook — speaks the question, waits for response
+**Hook-driven TTS (no manual curl needed):**
+- PreToolUse handler extracts question text from `tool_input["questions"]`
+- Calls `queue_tts(session_id, question_text)` directly — uses instance's assigned voice
+- Claude can ALSO call `POST /api/notify/tts` for non-blocking narration between questions
 
-**Dictation flow (type-ahead):**
-- User dictates continuously via Wispr Flow (Bluetooth ring to start/stop)
-- Wispr types into whatever is focused (the AskUserQuestion input)
-- User presses Enter whenever ready — if prompt hasn't appeared yet, Enter buffers
-- Between questions, dictation continues accumulating; no need to stop/start
+**local_exec pattern (no satellite needed):**
+- Token-API returns `local_exec` field in PreToolUse response
+- `generic-hook.sh` parses it with `jq` and `eval`s on WSL
+- WSL invokes Windows AHK.exe via `/mnt/c/` mount
+- AHK.exe needs Windows paths — `wslpath -w` converts WSL paths
 
-**Background auto-fill script:**
-- Detects AskUserQuestion prompt appearance
-- Auto-selects "Write your own answer" option
-- Keeps cursor in text input field for Wispr to type into
-- Possibly auto-submits on Enter keypress
+**AHK voice-select-other.ahk:**
+- `WinActivate` focuses Windows Terminal (handles tabbed-out user)
+- `Down 6` overshoots to bottom of option list (no wrap)
+- `Up 1` lands on "Other" (second from bottom, above "Chat about this")
+- Registers a scoped `$Enter` hotkey (active only during AskUserQuestion)
+- On Enter: stop Wispr (`Ctrl+Win+Space` hold pattern) → wait 1.5s → submit → restart Wispr
+- Hotkey disables itself after submit — normal Enter restored
 
-### What Exists vs What's New
+**Wispr Flow integration:**
+- Wispr stays on passively — always listening between questions
+- AHK doesn't toggle Wispr on question arrival (it's already on)
+- Enter remap handles the stop/submit/restart cycle
+- `Ctrl+Win down` → `Sleep(250)` → `Space` → release (matches ring-remap tap pattern)
 
-| Component | Status |
-|-----------|--------|
-| TTS system (SAPI + Mac) | Exists, mature |
-| TTS queue + profiles | Exists |
-| AskUserQuestion tool | Exists in Claude Code |
-| TTS hook on AskUserQuestion | Needs hook config |
-| Auto-fill background script | **New** — AHK or terminal script |
-| Type-ahead Enter buffering | **New** — part of auto-fill script |
-| Voice conversation skill | **New** — skill that drives the loop |
+### What Was Built
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| TTS system (SAPI + Mac) | Pre-existing | Queue-based, 9 voice profiles |
+| Hook-driven TTS on AskUserQuestion | **Built** | PreToolUse extracts question text → queue_tts() |
+| local_exec in PreToolUse response | **Built** | New generic pattern — Token-API returns commands, hook executes |
+| generic-hook.sh local_exec parsing | **Built** | `jq -r '.local_exec'` → `eval` in background |
+| AHK voice-select-other.ahk | **Built** | Navigation + scoped Enter remap with Wispr integration |
+| Voice conversation skill | **Built** | `~/.claude/skills/voice-chat.md` drives the loop |
+| AskUserQuestion PreToolUse matcher | **Built** | In `~/.claude/settings.json` |
+| Voice chat state (VOICE_CHAT_SESSIONS) | **Built** | In-memory dict, keyed by instance_id |
+
+### Key Architectural Decisions
+
+1. **No satellite needed** — original plan routed through token-satellite on WSL. Eliminated by local_exec pattern: Token-API returns the command, generic-hook.sh runs it directly on WSL.
+2. **Hook-driven TTS, not skill-driven** — original plan had Claude making manual TTS curl calls. Moved TTS into the PreToolUse handler so it's automatic and invisible to the agent.
+3. **Scoped Enter remap** — Enter hotkey only active during AskUserQuestion, disables after submit. Prevents interfering with normal terminal use.
+4. **wslpath -w for path conversion** — Token-API runs on Mac, `os.path.expanduser` gives Mac paths. AHK needs Windows paths. `wslpath -w` converts WSL → Windows UNC paths.
+
+### Learnings for Phase 2 (Discord)
+
+1. **Hook-driven TTS is the right pattern** — extracting text from tool payloads and auto-speaking eliminates agent-side boilerplate. Discord voice should reuse this: intercept responses and auto-speak them.
+2. **local_exec is extensible** — any hook can now return side-effect commands. Discord bot could use this for audio playback triggers.
+3. **Turn-taking via blocking prompts works** — AskUserQuestion's blocking nature IS the conversation loop. Discord equivalent: bot waits for voice activity end → transcribes → forwards.
+4. **TTS CLI opportunity** — current pattern is `curl -sf -X POST .../api/notify/tts -d '{...}'`. A `talk "message"` CLI tool or `token-ping` integration would streamline agent-side TTS calls for narration between questions.
+
+### Remaining TODO
+
+- [ ] Auto-start dictation after voice chat activation (currently manual)
+- [ ] `talk` CLI tool or token-ping integration for streamlined TTS
+- [ ] Persist voice chat state across token-api restarts (currently in-memory)
+- [ ] Handle multiple terminal tabs (WinActivate focuses terminal but can't switch tabs)
 
 ### Pros
-- Ships fast — mostly existing infrastructure
+- Ships fast — built in one session
 - Wispr Flow handles all STT complexity
 - Natural turn-taking via blocking AskUserQuestion
-- Works in any Claude Code session
+- Hook-driven = invisible to the agent (no boilerplate)
+- local_exec = reusable pattern for any hook side-effects
 
 ### Cons
-- Requires terminal focus (not headless)
-- Single-persona (whatever voice the instance has)
-- Auto-fill script needs platform-specific work (AHK on Windows/WSL)
+- Requires terminal focus (WinActivate helps but can't target specific tabs)
+- Single-persona (instance voice profile)
+- In-memory voice chat state lost on restart
+- AHK timing is semi-fragile (500ms sleep for UI render)
 
 ---
 
@@ -204,3 +241,13 @@ TTS system (mature, 9 SAPI voices + Mac fallback), and user's STT setup (Wispr F
 Proposed 3 approaches: TTS loop (immediate), Discord voice (autonomous project), hybrid (recommended).
 Key insight: AskUserQuestion blocking behavior IS the turn-taking mechanism for Phase 1.
 Key insight: Discord voice is architecturally correct long-term because personas already live there.
+
+### 2026-03-03 12:40 -- phase-1-implementation
+Built Phase 1 in a single session. Major architectural divergences from plan:
+- **Eliminated satellite proxy** — original plan routed Mac → satellite → AHK. Replaced with `local_exec` pattern: Token-API returns command in PreToolUse response, generic-hook.sh eval's it on WSL.
+- **Hook-driven TTS** — moved TTS from skill-side curl calls into PreToolUse handler. `queue_tts()` called directly from hook handler, invisible to agent.
+- **wslpath -w discovery** — AHK.exe needs Windows paths but Token-API runs on Mac. `os.path.expanduser` gave Mac paths. Fixed with `wslpath -w` conversion in the local_exec command.
+- **Scoped Enter hotkey** — AHK registers `$Enter` only during AskUserQuestion, disables after submit. Prevents global Enter interference.
+- **Wispr hold pattern** — `^#{Space}` shortcut didn't reliably toggle Wispr. Fixed by matching ring-remap pattern: `{LCtrl down}{LWin down}` → Sleep(250) → `{Space}{LWin up}{LCtrl up}`.
+- **"Other" navigation** — Down 6 + Up 1 reliably selects "Other" regardless of option count. "Other" is always second from bottom (above "Chat about this"). List doesn't wrap.
+- User noted future `talk` CLI or token-ping integration to streamline TTS calls from agents.

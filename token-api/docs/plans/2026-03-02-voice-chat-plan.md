@@ -1,12 +1,12 @@
 # Voice Chat Phase 1 — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status: IMPLEMENTED 2026-03-03** — Phase 1 is live. Architecture diverged from original plan (see notes below). Phase 2 (Discord voice) remains planned.
 
 **Goal:** Enable continuous voice conversation with Claude Code — Claude speaks via TTS, user responds via Wispr Flow dictation, turn-taking managed through AskUserQuestion with hook-triggered AHK keystroke injection.
 
-**Architecture:** Hook-driven, no polling. When Claude calls AskUserQuestion, the hook chain fires: `generic-hook.sh` → Mac token-api `/api/hooks/PreToolUse` → proxies to WSL satellite → satellite executes one-shot AHK script that sends keystrokes to auto-select "Other". AHK is a dumb execution engine — token-api is authoritative. TTS calls are inline Bash curls per the skill instructions.
+**Architecture (Actual):** Hook-driven, no polling. When Claude calls AskUserQuestion, the hook chain fires: `generic-hook.sh` → Mac token-api `/api/hooks/PreToolUse` → Token-API extracts question text for TTS + returns `local_exec` command → `generic-hook.sh` eval's command on WSL → AHK.exe runs one-shot script. **No satellite proxy needed** — `local_exec` pattern eliminated the middleman.
 
-**Tech Stack:** Claude Code skills (markdown), AHK v2.0 (one-shot scripts), token-satellite FastAPI, token-api hook handlers, Bash hooks
+**Tech Stack:** Claude Code skills (markdown), AHK v2.0 (persistent + one-shot), token-api hook handlers, Bash hooks, `wslpath` for path conversion
 
 ---
 
@@ -28,29 +28,31 @@
 - `~/Scripts/token-api/token-satellite.py` — WSL satellite server (~800 lines)
 - `~/.claude/skills/` — Skills directory
 
-### Execution Chain (The Key Architecture)
+### Execution Chain (Actual — Implemented 2026-03-03)
 
 ```
 Claude calls AskUserQuestion
-  → PreToolUse hook fires (if AskUserQuestion triggers hooks)
+  → PreToolUse hook fires (AskUserQuestion matcher in settings.json)
   → generic-hook.sh forwards to Mac token-api
   → Mac token-api /api/hooks/PreToolUse handler
-  → Sees tool_name == "AskUserQuestion" + instance is in voice-chat mode
-  → Proxies to WSL satellite: POST /ahk/execute
-  → Satellite runs: AutoHotkey.exe voice-select-other.ahk
-  → AHK sends keystrokes: ↓↓Enter (selects "Other")
-  → AHK process exits
+  → Sees tool_name == "AskUserQuestion" + session_id in VOICE_CHAT_SESSIONS
+  → Extracts question text from tool_input["questions"] → queue_tts()
+  → Returns {local_exec: 'AHK_EXE "$(wslpath -w script)"'} in response
+  → generic-hook.sh parses local_exec with jq, eval's in background
+  → WSL runs: /mnt/c/.../AutoHotkey.exe \\wsl.localhost\...\voice-select-other.ahk
+  → AHK: WinActivate terminal, Down 6 + Up 1 (navigate to "Other")
+  → AHK: enables scoped $Enter hotkey, stays resident
+  → User dictates via Wispr Flow (already on passively)
+  → User presses Enter → AHK: stop Wispr → wait → submit → restart Wispr → disable hotkey
 ```
 
-Fallback if AskUserQuestion doesn't trigger PreToolUse hooks:
-- The skill instructs Claude to call a Bash command that directly hits the satellite endpoint before each AskUserQuestion
-- Same downstream path, just triggered by the skill rather than a hook
+No fallback needed — AskUserQuestion DOES trigger PreToolUse hooks (confirmed).
 
 ---
 
-### Task 1: Add `/ahk/execute` Endpoint to WSL Satellite
+### Task 1: ~~Add `/ahk/execute` Endpoint to WSL Satellite~~ → SKIPPED (local_exec replaced satellite)
 
-The satellite already runs Windows executables (PowerShell for SAPI TTS, cmd.exe for taskkill). Adding AHK execution follows the identical pattern.
+> **Not needed.** The `local_exec` pattern eliminated the satellite proxy entirely. Token-API returns the AHK command in the PreToolUse response, and `generic-hook.sh` runs it directly on WSL.
 
 **Files:**
 - Modify: `~/Scripts/token-api/token-satellite.py`
@@ -135,9 +137,9 @@ git commit -m "feat: add /ahk/execute satellite endpoint + voice-select-other sc
 
 ---
 
-### Task 2: Add Voice Chat Hook Handler to Mac Token-API
+### Task 2: Add Voice Chat Hook Handler to Mac Token-API — DONE ✓
 
-When the Mac server receives a PreToolUse hook for AskUserQuestion from a voice-chat-active instance, it proxies to the satellite's `/ahk/execute` endpoint.
+> **Divergence:** No satellite proxy. Handler does two things: (1) extracts question text → `queue_tts()`, (2) returns `local_exec` with AHK command. See `main.py` around line 7996.
 
 **Files:**
 - Modify: `~/Scripts/token-api/main.py` (hook handler + voice chat state)
@@ -219,9 +221,9 @@ git commit -m "feat: voice chat state + AskUserQuestion hook → satellite AHK d
 
 ---
 
-### Task 3: Create the Voice Chat Skill
+### Task 3: Create the Voice Chat Skill — DONE ✓
 
-The skill instructs Claude to use TTS for all responses and AskUserQuestion for turn-taking. It also registers the instance as voice-chat-active on entry.
+> **Divergence:** Skill no longer instructs Claude to make manual TTS curl calls — TTS is hook-driven and automatic. Skill focuses on conversation loop behavior and voice-chat registration.
 
 **Files:**
 - Create: `~/.claude/skills/voice-chat.md`
@@ -312,9 +314,9 @@ git commit -m "feat: add voice-chat skill for TTS conversation loop"
 
 ---
 
-### Task 4: Add PreToolUse Hook Matcher for AskUserQuestion
+### Task 4: Add PreToolUse Hook Matcher for AskUserQuestion — DONE ✓
 
-Add the hook wiring so AskUserQuestion triggers the generic-hook.sh → Mac token-api chain. This may or may not work (AskUserQuestion might not trigger PreToolUse). If it doesn't, the skill handles the fallback inline.
+> **Confirmed working.** AskUserQuestion DOES trigger PreToolUse hooks. No fallback needed.
 
 **Files:**
 - Modify: `~/.claude/settings.json`
@@ -368,9 +370,9 @@ git commit -m "feat: add AskUserQuestion PreToolUse hook matcher for voice chat"
 
 ---
 
-### Task 5: Wire Voice Chat TTS to Instance Voice Profile
+### Task 5: Wire Voice Chat TTS to Instance Voice Profile — DONE ✓ (via hook)
 
-Ensure voice chat TTS uses the instance's assigned voice (not the default notification voice).
+> **Divergence:** Done automatically. `queue_tts(session_id, text)` already looks up the instance's `tts_voice` column. No endpoint changes needed.
 
 **Files:**
 - Modify: `~/Scripts/token-api/main.py` (TTS endpoint)
@@ -416,9 +418,9 @@ git commit -m "feat: wire voice chat TTS to instance voice profile"
 
 ---
 
-### Task 6: End-to-End Integration Test
+### Task 6: End-to-End Integration Test — DONE ✓
 
-**Prerequisites:** Tasks 1-5 complete, satellite restarted, Mac token-api restarted.
+> **Tested live in session 2026-03-03.** Iterative testing with user. Key findings below.
 
 **Step 1: Restart services**
 
