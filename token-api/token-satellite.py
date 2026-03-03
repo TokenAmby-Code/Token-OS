@@ -11,6 +11,7 @@ Endpoints:
     GET  /processes   — list distraction-relevant processes
     POST /tts/speak   — speak text via Windows SAPI (blocking)
     POST /tts/skip    — skip current TTS playback
+    POST /ahk/execute — execute a one-shot AHK v2 script
     POST /restart     — git pull + restart
     GET  /kvm/status  — DeskFlow watchdog state
     POST /kvm/control — manual DeskFlow start/stop/hold
@@ -38,6 +39,8 @@ app = FastAPI(title="Token Satellite", version="1.0.0")
 # Full paths — bare exes aren't on PATH under systemd
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
+AHK_SCRIPTS_DIR = Path.home() / "Scripts" / "ahk"
 
 # PowerShell script for persistent TTS engine.
 # Uses SpeakAsync so the main loop stays responsive to skip/poll commands.
@@ -631,6 +634,11 @@ class KvmControlRequest(BaseModel):
     hold_minutes: int = 30
 
 
+class AhkRequest(BaseModel):
+    script: str  # Script filename (e.g., "voice-select-other.ahk")
+    args: list[str] = []  # Optional arguments
+
+
 @app.on_event("startup")
 async def startup_event():
     """Warm up TTS engine and start DeskFlow watchdog."""
@@ -758,6 +766,27 @@ async def tts_skip():
     was_speaking = tts_engine.skip()
     logger.info(f"TTS: Skip requested (was_speaking={was_speaking})")
     return {"success": True, "was_speaking": was_speaking}
+
+
+@app.post("/ahk/execute")
+async def execute_ahk(req: AhkRequest):
+    """Execute a one-shot AHK v2 script. AHK is a dumb executor — token-api decides when to call."""
+    script_path = AHK_SCRIPTS_DIR / req.script
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail=f"AHK script not found: {req.script}")
+    # Security: only allow scripts in the ahk directory
+    if not script_path.resolve().is_relative_to(AHK_SCRIPTS_DIR.resolve()):
+        raise HTTPException(status_code=403, detail="Script path escapes ahk directory")
+    try:
+        cmd = [AHK_EXE, str(script_path)] + req.args
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        logger.info(f"AHK: Executed {req.script} (exit={result.returncode})")
+        return {"ok": True, "exit_code": result.returncode, "stderr": result.stderr[:200] if result.stderr else None}
+    except subprocess.TimeoutExpired:
+        logger.warning(f"AHK: Timeout executing {req.script}")
+        return {"ok": False, "error": "timeout"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/kvm/status")
