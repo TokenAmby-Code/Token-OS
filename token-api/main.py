@@ -8013,20 +8013,15 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 except Exception as e:
                     logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
 
-        # AHK trigger to auto-select "Other" input box
-        host = DESKTOP_CONFIG["host"]
-        port = DESKTOP_CONFIG["port"]
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.post(
-                    f"http://{host}:{port}/ahk/execute",
-                    json={"script": "voice-select-other.ahk"},
-                )
-                logger.info(f"PreToolUse: Voice chat AHK trigger for {session_id[:12]} -> {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"PreToolUse: Voice chat AHK trigger failed for {session_id[:12]}: {e}")
-        # Don't block AskUserQuestion — just fire the AHK trigger
-        return {"success": True, "action": "allowed"}
+        # Return local_exec so generic-hook.sh runs AHK on WSL (which can invoke Windows AHK)
+        ahk_exe = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
+        ahk_script = os.path.expanduser("~/Scripts/ahk/voice-select-other.ahk")
+        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]}")
+        return {
+            "success": True,
+            "action": "allowed",
+            "local_exec": f'"{ahk_exe}" "{ahk_script}"',
+        }
 
     # Only check Bash commands for blocking
     if tool_name != "Bash":

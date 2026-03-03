@@ -2,12 +2,14 @@
 #SingleInstance Force
 
 ; One-shot: select "Other" in Claude Code AskUserQuestion prompt
-; Called by token-satellite when voice chat is active
-; AskUserQuestion shows 2 options + "Other" at bottom
-; Down x2 -> Other, Enter -> select it
+; Called via local_exec from generic-hook.sh when voice chat is active
+; Strategy: Down x6 to ensure we're at the bottom (list doesn't wrap),
+; then Up x1 to land on "Other" (always second from bottom, above "Chat about this")
 
-Sleep(300)          ; Wait for AskUserQuestion UI to render
-Send("{Down 2}")    ; Move past 2 options to "Other"
+Sleep(500)          ; Wait for AskUserQuestion UI to render
+Send("{Down 6}")    ; Overshoot to bottom of list
+Sleep(50)
+Send("{Up 1}")      ; Back up one to "Other"
 Sleep(50)
 Send("{Enter}")     ; Select "Other"
 ExitApp
