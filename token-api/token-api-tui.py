@@ -1710,6 +1710,11 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
             parts.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]")
         else:
             parts.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
+        if instance.get("voice_chat"):
+            if instance.get("listening", False):
+                parts.append("[green]🎙 Listening[/green]")
+            else:
+                parts.append("[yellow]🎙 Muted[/yellow]")
         parts.append(f"[dim]{working_dir_short}[/dim]")
 
         if total > 0:
@@ -1731,6 +1736,11 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         lines.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]  [dim]({voice_short} reserved)[/dim]")
     else:  # silent
         lines.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
+    if instance.get("voice_chat"):
+        if instance.get("listening", False):
+            lines.append("[green]🎙 Voice Chat: Listening[/green]")
+        else:
+            lines.append("[yellow]🎙 Voice Chat: Muted[/yellow]")
     lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
 
     # Session document display

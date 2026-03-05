@@ -2448,6 +2448,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True):
     if active:
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
+            "listening": True,
             "started_at": datetime.now().isoformat()
         }
         logger.info(f"Voice chat STARTED for {instance_id[:12]}")
@@ -2462,6 +2463,17 @@ async def get_voice_chat_status(instance_id: str):
     """Check if instance is in voice chat mode."""
     session = VOICE_CHAT_SESSIONS.get(instance_id)
     return {"active": session is not None, "session": session}
+
+
+@app.post("/api/instances/{instance_id}/voice-chat/listening")
+async def toggle_listening(instance_id: str, active: bool = True):
+    """Toggle listening (dictation/mic) state for a voice chat instance."""
+    session = VOICE_CHAT_SESSIONS.get(instance_id)
+    if not session:
+        return {"error": "No active voice chat session", "status_code": 404}
+    session["listening"] = active
+    logger.info(f"Voice chat listening={'ON' if active else 'OFF'} for {instance_id[:12]}")
+    return {"instance_id": instance_id, "listening": active}
 
 
 @app.get("/api/instances", response_model=List[dict])
@@ -2489,7 +2501,15 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
             )
 
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        instances = []
+        for row in rows:
+            inst = dict(row)
+            vc_session = VOICE_CHAT_SESSIONS.get(inst["id"])
+            if vc_session:
+                inst["voice_chat"] = True
+                inst["listening"] = vc_session.get("listening", False)
+            instances.append(inst)
+        return instances
 
 
 @app.get("/api/instances/{instance_id}", response_model=dict)
@@ -8015,11 +8035,12 @@ async def handle_pre_tool_use(payload: dict) -> dict:
 
         # Return local_exec so generic-hook.sh runs AHK on WSL (which can invoke Windows AHK)
         # Note: AHK.exe needs a Windows path, so use wslpath -w to convert the WSL path
-        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]}")
+        listening_arg = "1" if VOICE_CHAT_SESSIONS.get(session_id, {}).get("listening", True) else "0"
+        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]} (listening={listening_arg})")
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": '"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")"',
+            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")" "{session_id}" "{listening_arg}"',
         }
 
     # Only check Bash commands for blocking

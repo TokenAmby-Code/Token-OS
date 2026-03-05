@@ -18,6 +18,9 @@
  *   -m, --method METHOD     HTTP method (default: GET/POST auto)
  *   -b, --body JSON         Request body as JSON
  *   -H, --header KEY:VALUE  Custom header (repeatable)
+ *   --teams                Send as Teams Bot Framework activity instead of Google Chat
+ *   --teams-action NAME    Send Teams Action.Submit (escalate, create-ticket, view-ticket, add-comment)
+ *   --action-data JSON     Extra data for --teams-action (merged into action value)
  *   --localhost             Use localhost instead of ngrok
  *   --dry-run               Show payload/config without sending
  *   --one-shot              Force start → test → stop
@@ -32,6 +35,10 @@
  *   test "hello" --one-shot               # Full cycle
  *   test /api/status                      # GET request
  *   test /webhook -m POST -b '{"text":"hi"}'
+ *   test --teams "Create Ticket Need help with procurement"
+ *   test --teams "My Tickets"             # List tickets
+ *   test --teams-action escalate          # Action.Submit button click
+ *   test --teams-action create-ticket --action-data '{"subject":"RFP help"}'
  */
 
 const path = require('path');
@@ -43,6 +50,7 @@ const DEPLOY_DIR = __dirname;
 const { getState } = require(path.join(DEPLOY_DIR, 'local-server-state'));
 const { sendLocalRequest } = require(path.join(DEPLOY_DIR, 'send-local-request'));
 const { buildRequestConfig } = require(path.join(DEPLOY_DIR, 'google-chat-message'));
+const { buildRequestConfig: buildTeamsRequestConfig } = require(path.join(DEPLOY_DIR, 'teams-message'));
 
 /**
  * Detect input type from the input string
@@ -115,6 +123,9 @@ function parseArgs() {
     method: null,
     body: null,
     headers: {},
+    teams: false,
+    teamsAction: null,
+    actionData: null,
     localhost: false,
     dryRun: false,
     oneShot: false,
@@ -152,6 +163,22 @@ function parseArgs() {
         const value = header.substring(colonIndex + 1).trim();
         parsed.headers[key] = value;
       }
+    } else if (arg === '--teams') {
+      parsed.teams = true;
+    } else if (arg === '--teams-action') {
+      parsed.teams = true;
+      if (i + 1 < args.length) {
+        parsed.teamsAction = args[++i];
+      }
+    } else if (arg === '--action-data') {
+      if (i + 1 < args.length) {
+        try {
+          parsed.actionData = JSON.parse(args[++i]);
+        } catch (error) {
+          console.error('Error: Invalid JSON for --action-data');
+          process.exit(1);
+        }
+      }
     } else if (arg === '--localhost') {
       parsed.localhost = true;
     } else if (arg === '--dry-run') {
@@ -184,6 +211,11 @@ Input Types (auto-detected):
   "message text"  Google Chat message (quotes required)
   /path           HTTP endpoint (starts with /)
 
+Channel Flags:
+  --teams                Send as Teams Bot Framework activity
+  --teams-action NAME    Send Teams Action.Submit button click
+  --action-data JSON     Extra data for --teams-action
+
 Options:
   -m, --method METHOD     HTTP method (default: GET/POST auto)
   -b, --body JSON         Request body as JSON
@@ -196,18 +228,32 @@ Options:
 
 Detection Rules:
   - No input → health check
-  - Starts with " or ' → Google Chat message
   - Starts with / → HTTP endpoint
+  - --teams flag → Teams Bot Framework activity
+  - Default → Google Chat message
   - Auto-selects one-shot if no server running
+
+Teams Commands (text):
+  "Create Ticket <subject>"           → ticket/create
+  "My Tickets [open|resolved|all]"    → ticket/list
+  "Escalate to Advisor [context]"     → ticket/escalate
+
+Teams Actions (--teams-action):
+  escalate, create-ticket, view-ticket, add-comment
+
+Note: Teams endpoint returns {"status":"processing"} immediately.
+      Command runs in background — check logs or use deploy debug for breakpoints.
 
 Examples:
   test                                  # Health check
   test "hello world"                    # Google Chat message
-  test "hello" --localhost              # Via localhost
-  test "hello" --dry-run                # Show payload
-  test "hello" --one-shot               # Force one-shot
+  test --teams "Create Ticket Need help with procurement"
+  test --teams "My Tickets"             # List open tickets
+  test --teams "Escalate to Advisor"    # Text escalation
+  test --teams-action escalate          # Button click escalation
+  test --teams-action create-ticket --action-data '{"subject":"RFP help"}'
+  test --teams "hello" --dry-run        # Show Teams payload
   test /api/status                      # GET request
-  test /webhook -m POST -b '{"text":"hi"}'
 `);
 }
 
@@ -273,6 +319,63 @@ async function runGoogleChatMessage(messageText, options) {
 }
 
 /**
+ * Run Teams message/action test
+ */
+async function runTeamsMessage(messageText, options) {
+  const isAction = !!options.teamsAction;
+
+  if (isAction) {
+    console.log(`Sending Teams Action.Submit: "${options.teamsAction}"`);
+  } else {
+    console.log(`Sending Teams message: "${messageText}"`);
+  }
+
+  const config = buildTeamsRequestConfig(messageText, {
+    action: options.teamsAction || undefined,
+    actionData: options.actionData || undefined,
+  });
+
+  if (options.dryRun) {
+    console.log('\nPayload (dry-run):');
+    console.log(JSON.stringify(config.body, null, 2));
+    console.log('\nEndpoint:', config.endpoint);
+    console.log('Method:', config.method);
+    return true;
+  }
+
+  try {
+    const response = await sendLocalRequest(
+      config.endpoint,
+      {
+        method: config.method,
+        body: config.body,
+        headers: { ...config.headers, ...options.headers }
+      },
+      !options.localhost
+    );
+
+    if (response.status === 200) {
+      const status = response.body && response.body.status;
+      if (status === 'processing') {
+        console.log('✅ Activity accepted (processing in background)');
+        console.log('   Check server logs for command result, or use deploy debug for breakpoints');
+      } else if (status === 'duplicate') {
+        console.log('⚠️  Duplicate activity (already processed)');
+      } else {
+        console.log(`✅ Response: ${JSON.stringify(response.body)}`);
+      }
+      return true;
+    } else {
+      console.log(`⚠️  Server returned status ${response.status}`);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Teams message failed:', error.message);
+    return false;
+  }
+}
+
+/**
  * Run HTTP endpoint test
  */
 async function runEndpointTest(endpoint, options) {
@@ -326,7 +429,16 @@ function runOneShot(input, options) {
 
   // Add input-specific arguments
   const inputType = detectInputType(input);
-  if (inputType === 'message') {
+  if (options.teams || options.teamsAction) {
+    // Teams: use generic request with pre-built payload
+    const config = buildTeamsRequestConfig(input, {
+      action: options.teamsAction || undefined,
+      actionData: options.actionData || undefined,
+    });
+    args.push('--request-endpoint', config.endpoint);
+    args.push('--request-method', 'POST');
+    args.push('--request-body', JSON.stringify(config.body));
+  } else if (inputType === 'message') {
     args.push('--google-chat-message', input);
   } else if (inputType === 'endpoint') {
     args.push('--request-endpoint', input);
@@ -400,7 +512,9 @@ async function main() {
     // Attach mode - use existing server
     let success = false;
 
-    if (inputType === 'health') {
+    if (options.teams || options.teamsAction) {
+      success = await runTeamsMessage(options.input, options);
+    } else if (inputType === 'health') {
       success = await runHealthCheck(options.localhost);
     } else if (inputType === 'message') {
       success = await runGoogleChatMessage(options.input, options);

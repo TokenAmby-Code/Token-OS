@@ -6,11 +6,13 @@
 # Usage: test [input] [options]
 #
 # Input types: (none), "message", /endpoint
-# Options: --dry-run, --localhost, --one-shot, --attach
+# Options: --dry-run, --localhost, --one-shot, --attach, --teams, --teams-action
 #
 # Examples:
 #   test                                  # Health check
 #   test "hello world"                    # Google Chat message
+#   test --teams "Create Ticket Need help"  # Teams ticket command
+#   test --teams-action escalate          # Teams Action.Submit
 #   test "hello" --localhost              # Via localhost
 #   test "hello" --dry-run                # Show payload
 #   test "hello" --one-shot               # Full cycle
@@ -32,6 +34,11 @@ Input Types (auto-detected):
   "message text"  Google Chat message (quotes required)
   /path           HTTP endpoint (starts with /)
 
+Channel Flags:
+  --teams                Send as Teams Bot Framework activity
+  --teams-action NAME    Send Teams Action.Submit (escalate, create-ticket, etc.)
+  --action-data JSON     Extra data for --teams-action
+
 Options:
   -m, --method METHOD     HTTP method (default: GET/POST auto)
   -b, --body JSON         Request body as JSON
@@ -44,18 +51,19 @@ Options:
 
 Detection Rules:
   - No input → health check
-  - Starts with " or ' → Google Chat message
+  - --teams flag → Teams Bot Framework activity
   - Starts with / → HTTP endpoint
+  - Default → Google Chat message
   - Auto-selects one-shot if no server running
 
 Examples:
   test                                  # Health check
   test "hello world"                    # Google Chat message
-  test "hello" --localhost              # Via localhost
-  test "hello" --dry-run                # Show payload
-  test "hello" --one-shot               # Force one-shot
+  test --teams "Create Ticket Need help"  # Teams ticket command
+  test --teams "My Tickets"             # List open tickets
+  test --teams-action escalate          # Action.Submit click
+  test --teams "hello" --dry-run        # Show Teams payload
   test /api/status                      # GET request
-  test /webhook -m POST -b '{"text":"hi"}'
 EOF
     exit 0
 fi

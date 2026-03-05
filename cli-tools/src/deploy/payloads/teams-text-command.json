@@ -1,0 +1,30 @@
+{
+  "type": "message",
+  "id": "{{ACTIVITY_ID}}",
+  "timestamp": "{{TIMESTAMP}}",
+  "localTimestamp": "{{TIMESTAMP}}",
+  "serviceUrl": "https://smba.trafficmanager.net/amer/",
+  "channelId": "msteams",
+  "from": {
+    "id": "29:{{USER_ID}}",
+    "name": "{{USER_NAME}}",
+    "aadObjectId": "{{AAD_OBJECT_ID}}"
+  },
+  "conversation": {
+    "conversationType": "personal",
+    "tenantId": "{{TENANT_ID}}",
+    "id": "a:{{CONVERSATION_ID}}"
+  },
+  "recipient": {
+    "id": "28:8166d817-5f77-4906-b5cf-b11a89138fa2",
+    "name": "askCivic"
+  },
+  "text": "{{MESSAGE_TEXT}}",
+  "textFormat": "plain",
+  "locale": "en-US",
+  "channelData": {
+    "tenant": {
+      "id": "{{TENANT_ID}}"
+    }
+  }
+}

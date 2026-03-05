@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# obsidian-screenshot - Capture the Obsidian window via Win32 PrintWindow (no foreground needed)
+# TAGS: obsidian, screenshot, windows
+# AUDIENCE: human, agent
+#
+# Opens a specific Obsidian view, waits for rendering, then captures the window
+# using the PrintWindow Win32 API via PowerShell (background-safe, no focus steal).
+#
+# Usage:
+#   obsidian-screenshot [options]
+#
+# Options:
+#   --vault <name>    Obsidian vault name (default: Imperium-ENV)
+#   --view <id>       Command ID to open (default: graph:open)
+#   --output <path>   Output PNG path, Linux-style (default: /tmp/obsidian-screenshot.png)
+#   --delay <secs>    Render wait time in seconds (default: 2)
+#   --no-open         Skip the obsidian command step (capture current state as-is)
+#   -h, --help        Show this help
+
+set -euo pipefail
+
+# ── Colors / logging ─────────────────────────────────────────────────────────
+
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log()   { printf "${CYAN}[obsidian-screenshot]${NC} %s\n" "$1" >&2; }
+warn()  { printf "${YELLOW}[obsidian-screenshot]${NC} %s\n" "$1" >&2; }
+error() { printf "${RED}[obsidian-screenshot]${NC} %s\n" "$1" >&2; }
+ok()    { printf "${GREEN}[obsidian-screenshot]${NC} %s\n" "$1" >&2; }
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+obsidian-screenshot - Capture the Obsidian window via Win32 PrintWindow
+
+Runs from WSL2. Opens an Obsidian view via the native CLI, waits for
+rendering, then captures the window using PrintWindow (no foreground switch).
+
+Usage:
+  obsidian-screenshot [options]
+
+Options:
+  --vault <name>    Obsidian vault name (default: Imperium-ENV)
+  --view <id>       Obsidian command ID to open (default: graph:open)
+  --output <path>   Output PNG path, Linux-style (default: /tmp/obsidian-screenshot.png)
+  --delay <secs>    Seconds to wait for render after opening view (default: 2)
+  --no-open         Skip the obsidian command; capture current window state
+  -h, --help        Show this help
+
+Examples:
+  obsidian-screenshot
+  obsidian-screenshot --vault Imperium-ENV
+  obsidian-screenshot --view graph:open
+  obsidian-screenshot --output ~/screenshot.png
+  obsidian-screenshot --delay 3
+  obsidian-screenshot --vault Pax-ENV --view graph:open --output /tmp/pax-graph.png
+  obsidian-screenshot --no-open --output /tmp/current.png
+
+Output:
+  stdout: absolute Linux path to the saved PNG
+  stderr: progress logs
+
+Notes:
+  - Obsidian must be running on Windows
+  - Uses PrintWindow (PW_RENDERFULLCONTENT) — no window focus change required
+  - Output path is automatically converted to a Windows UNC path for PowerShell
+EOF
+    exit 0
+fi
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+VAULT="Imperium-ENV"
+VIEW="graph:open"
+OUTPUT="/tmp/obsidian-screenshot.png"
+DELAY=2
+NO_OPEN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vault)
+            [[ -z "${2:-}" ]] && { error "--vault requires a value"; exit 1; }
+            VAULT="$2"; shift 2 ;;
+        --view)
+            [[ -z "${2:-}" ]] && { error "--view requires a value"; exit 1; }
+            VIEW="$2"; shift 2 ;;
+        --output)
+            [[ -z "${2:-}" ]] && { error "--output requires a value"; exit 1; }
+            OUTPUT="$2"; shift 2 ;;
+        --delay)
+            [[ -z "${2:-}" ]] && { error "--delay requires a value"; exit 1; }
+            DELAY="$2"; shift 2 ;;
+        --no-open)
+            NO_OPEN=true; shift ;;
+        *)
+            error "Unknown option: $1"
+            echo "Run 'obsidian-screenshot --help' for usage." >&2
+            exit 1 ;;
+    esac
+done
+
+# ── Expand ~ in OUTPUT ────────────────────────────────────────────────────────
+
+OUTPUT="${OUTPUT/#\~/$HOME}"
+
+# ── Validate delay is numeric ─────────────────────────────────────────────────
+
+if ! [[ "$DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    error "--delay must be a positive number (got: $DELAY)"
+    exit 1
+fi
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+
+OBSIDIAN_BIN="/home/token/Scripts/cli-tools/bin/obsidian"
+if [[ ! -x "$OBSIDIAN_BIN" ]]; then
+    error "obsidian CLI not found at $OBSIDIAN_BIN"
+    exit 1
+fi
+
+if ! command -v powershell.exe >/dev/null 2>&1; then
+    error "powershell.exe not found — this tool requires WSL2 with Windows interop enabled"
+    exit 1
+fi
+
+if ! command -v wslpath >/dev/null 2>&1; then
+    error "wslpath not found — are you running in WSL2?"
+    exit 1
+fi
+
+# ── Ensure output directory exists ────────────────────────────────────────────
+
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    log "Creating output directory: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+fi
+
+# ── Step 1: Open the Obsidian view ────────────────────────────────────────────
+
+if [[ "$NO_OPEN" == false ]]; then
+    log "Opening view '$VIEW' in vault '$VAULT'..."
+    if ! "$OBSIDIAN_BIN" "vault=$VAULT" "command" "id=$VIEW" 2>/dev/null; then
+        warn "obsidian command returned non-zero (Obsidian may already have the view open, continuing)"
+    fi
+    log "Waiting ${DELAY}s for render..."
+    sleep "$DELAY"
+else
+    log "--no-open: skipping obsidian command, capturing current state"
+fi
+
+# ── Step 2: Convert output path to Windows UNC path ──────────────────────────
+
+WIN_PATH="$(wslpath -w "$OUTPUT")"
+log "Windows output path: $WIN_PATH"
+
+# ── Step 3: Capture via PowerShell / PrintWindow ─────────────────────────────
+
+log "Capturing Obsidian window..."
+
+PS_SCRIPT=$(cat << PSEOF
+Add-Type @"
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public class WindowCapture {
+    [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    public static void Capture(IntPtr hWnd, string path) {
+        RECT rect;
+        GetWindowRect(hWnd, out rect);
+        int w = rect.Right - rect.Left;
+        int h = rect.Bottom - rect.Top;
+        if (w <= 0 || h <= 0) throw new Exception("Window has no size (is it minimized?)");
+        var bmp = new Bitmap(w, h);
+        var g = Graphics.FromImage(bmp);
+        IntPtr hdc = g.GetHdc();
+        PrintWindow(hWnd, hdc, 2);
+        g.ReleaseHdc(hdc);
+        bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+        g.Dispose();
+        bmp.Dispose();
+    }
+}
+"@ -ReferencedAssemblies System.Drawing
+
+\$proc = Get-Process -Name Obsidian -ErrorAction SilentlyContinue |
+         Where-Object { \$_.MainWindowHandle -ne 0 } |
+         Select-Object -First 1
+
+if (-not \$proc) {
+    Write-Error "No Obsidian window found. Is Obsidian running on Windows?"
+    exit 1
+}
+
+try {
+    [WindowCapture]::Capture(\$proc.MainWindowHandle, "$WIN_PATH")
+    Write-Host "Captured: $WIN_PATH"
+} catch {
+    Write-Error "Capture failed: \$_"
+    exit 1
+}
+PSEOF
+)
+
+if ! powershell.exe -NoProfile -NonInteractive -Command "$PS_SCRIPT" 2>&1 | \
+        grep -v "^$" >&2; then
+    error "PowerShell capture failed"
+    exit 1
+fi
+
+# ── Step 4: Verify output exists ──────────────────────────────────────────────
+
+if [[ ! -f "$OUTPUT" ]]; then
+    error "Screenshot file not found at $OUTPUT after capture"
+    error "PowerShell may have written to a different path, or Obsidian was not running"
+    exit 1
+fi
+
+SIZE=$(du -sh "$OUTPUT" 2>/dev/null | cut -f1)
+ok "Saved: $OUTPUT ($SIZE)"
+
+# Print Linux path to stdout for piping/scripting
+printf '%s\n' "$OUTPUT"
