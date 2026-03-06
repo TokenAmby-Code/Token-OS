@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# web-search - Brave Search API CLI for servitors and agents
+# TAGS: search, web, brave, research
+# AUDIENCE: agent, human
+#
+# Usage:
+#   web-search "query terms"                   Search the web
+#   web-search --count 5 "query terms"         Limit results (default: 5)
+#   web-search --json "query terms"            Raw JSON output
+#   web-search --markdown "query terms"        Formatted markdown (default)
+#
+# Examples:
+#   web-search "Obsidian 1.12 CLI documentation"
+#   web-search --count 3 "bash associative arrays macOS"
+#   web-search --json "MiniMax M2.5 API"
+#
+# Backend: Brave Search API (free tier: 2000 queries/month)
+# API Key: stored in Token-API env or passed via BRAVE_API_KEY
+
+set -euo pipefail
+
+BRAVE_API_KEY="${BRAVE_API_KEY:-BSA-915OA3H5GGS01KL5E04_yANwPA8}"
+BRAVE_ENDPOINT="https://api.search.brave.com/res/v1/web/search"
+
+# Defaults
+COUNT=5
+FORMAT="markdown"
+QUERY=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --count|-n) COUNT="$2"; shift 2 ;;
+    --json)     FORMAT="json"; shift ;;
+    --markdown) FORMAT="markdown"; shift ;;
+    -h|--help)
+      awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      QUERY="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "Error: query is required" >&2
+  echo "Usage: web-search \"query terms\"" >&2
+  exit 1
+fi
+
+# URL-encode the query (pass via argv to avoid shell-interpolation breakage on quotes/specials)
+ENCODED_QUERY=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$QUERY")
+
+# Call Brave Search API
+RESPONSE=$(curl -sf \
+  -H "Accept: application/json" \
+  -H "Accept-Encoding: gzip" \
+  -H "X-Subscription-Token: $BRAVE_API_KEY" \
+  "${BRAVE_ENDPOINT}?q=${ENCODED_QUERY}&count=${COUNT}" \
+  --compressed 2>&1) || {
+    echo "Error: Brave Search API call failed" >&2
+    echo "$RESPONSE" >&2
+    exit 1
+  }
+
+if [[ "$FORMAT" == "json" ]]; then
+  echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
+  exit 0
+fi
+
+# Format as markdown
+python3 -c "
+import json, sys, html
+
+data = json.loads(sys.argv[1])
+
+# Web results
+results = data.get('web', {}).get('results', [])
+if not results:
+    print('No results found.')
+    sys.exit(0)
+
+for i, r in enumerate(results, 1):
+    title = html.unescape(r.get('title', 'Untitled'))
+    url = r.get('url', '')
+    desc = html.unescape(r.get('description', 'No description'))
+    print(f'**{i}. {title}**')
+    print(f'   {url}')
+    print(f'   {desc}')
+    print()
+" "$RESPONSE"

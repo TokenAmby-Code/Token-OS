@@ -166,9 +166,11 @@ run_batch() {
   done < "$file"
 
   # Wait for remaining
-  for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null || true
-  done
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
 
   # Summary
   echo "" >&2

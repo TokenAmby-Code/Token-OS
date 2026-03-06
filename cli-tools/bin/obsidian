@@ -1,13 +1,330 @@
 #!/usr/bin/env bash
-# obsidian - WSL wrapper for the Obsidian 1.12 native CLI
-# Proxies commands to the Windows Obsidian.exe via WSL interop
-# Requires: Obsidian 1.12+ (Early Access) with Catalyst license, running on Windows
+# obsidian - Cross-platform Obsidian vault CLI
+# TAGS: vault, obsidian
+# AUDIENCE: human, agent
+#
+# Works on:
+#   - WSL: proxies to Obsidian.exe (1.12 native CLI)
+#   - macOS / Linux / VPS: filesystem-based implementation
+#
+# Usage:
+#   obsidian vault=<name> read path="<note>.md"
+#   obsidian vault=<name> search query="<term>"
+#   obsidian vault=<name> search:context query="<term>"
+#   obsidian vault=<name> backlinks path="<note>.md"
+#   obsidian vault=<name> create path="<path>.md" content="..."
+#   obsidian vault=<name> append path="<path>.md" content="..."
+#   obsidian vault=<name> property:set path="<path>.md" property="key" value="val"
+#   obsidian vault=<name> property:read path="<path>.md" property="key"
+#   obsidian vault=<name> orphans
+#   obsidian vault=<name> move path="<old>.md" to="<new>.md"
+#   obsidian vault=<name> daily:read
 
-OBSIDIAN_EXE="/mnt/c/Users/colby/AppData/Local/Programs/obsidian/Obsidian.exe"
+set -euo pipefail
 
-if [[ ! -x "$OBSIDIAN_EXE" ]]; then
-    echo "Error: Obsidian.exe not found at $OBSIDIAN_EXE" >&2
-    exit 1
+# --- Platform detection ---
+detect_platform() {
+  if [[ -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "wsl"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    echo "macos"
+  else
+    echo "linux"
+  fi
+}
+
+PLATFORM=$(detect_platform)
+
+# --- WSL: proxy to Obsidian.exe if available ---
+if [[ "$PLATFORM" == "wsl" ]]; then
+  OBSIDIAN_EXE="/mnt/c/Users/colby/AppData/Local/Programs/obsidian/Obsidian.exe"
+  if [[ -x "$OBSIDIAN_EXE" ]]; then
+    exec "$OBSIDIAN_EXE" "$@" 2>&1 | grep -v "^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\} Loading"
+  fi
 fi
 
-exec "$OBSIDIAN_EXE" "$@" 2>&1 | grep -v "^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\} Loading"
+# --- Vault resolution ---
+resolve_vault() {
+  local vault_name="$1"
+
+  # Check home directory first
+  if [[ -d "$HOME/$vault_name" ]]; then
+    echo "$HOME/$vault_name"
+    return 0
+  fi
+
+  # WSL: also check Windows documents
+  if [[ "$PLATFORM" == "wsl" && -d "/mnt/c/Users/colby/Documents/Obsidian/$vault_name" ]]; then
+    echo "/mnt/c/Users/colby/Documents/Obsidian/$vault_name"
+    return 0
+  fi
+
+  echo "Error: vault '$vault_name' not found" >&2
+  return 1
+}
+
+# --- Parse args: extract named params ---
+VAULT_NAME=""
+COMMAND=""
+PARAM_path=""
+PARAM_query=""
+PARAM_content=""
+PARAM_property=""
+PARAM_value=""
+PARAM_to=""
+
+for arg in "$@"; do
+  if [[ "$arg" == vault=* ]]; then
+    VAULT_NAME="${arg#vault=}"
+  elif [[ "$arg" == path=* ]]; then
+    val="${arg#path=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_path="$val"
+  elif [[ "$arg" == query=* ]]; then
+    val="${arg#query=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_query="$val"
+  elif [[ "$arg" == content=* ]]; then
+    val="${arg#content=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_content="$val"
+  elif [[ "$arg" == property=* ]]; then
+    val="${arg#property=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_property="$val"
+  elif [[ "$arg" == value=* ]]; then
+    val="${arg#value=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_value="$val"
+  elif [[ "$arg" == to=* ]]; then
+    val="${arg#to=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
+    PARAM_to="$val"
+  elif [[ -z "$COMMAND" && "$arg" != *=* ]]; then
+    COMMAND="$arg"
+  fi
+done
+
+if [[ -z "$VAULT_NAME" ]]; then
+  echo "Error: vault=<name> is required" >&2
+  echo "Usage: obsidian vault=<name> <command> [args...]" >&2
+  exit 1
+fi
+
+VAULT_ROOT=$(resolve_vault "$VAULT_NAME")
+
+resolve_path() {
+  local p="$1"
+  [[ "$p" != *.md ]] && p="${p}.md"
+  echo "$VAULT_ROOT/$p"
+}
+
+# --- Commands ---
+
+cmd_read() {
+  local path
+  path=$(resolve_path "$PARAM_path")
+  if [[ ! -f "$path" ]]; then
+    echo "Error: note not found: $path" >&2
+    return 1
+  fi
+  cat "$path"
+}
+
+cmd_search() {
+  if [[ -z "$PARAM_query" ]]; then
+    echo "Error: query= is required" >&2
+    return 1
+  fi
+  find "$VAULT_ROOT" -name "*.md" -not -path "*/.trash/*" -not -path "*/.obsidian/*" \
+    | while read -r f; do
+        local bn="${f##*/}"
+        bn="${bn%.md}"
+        if echo "$bn" | grep -qi "$PARAM_query" 2>/dev/null; then
+          echo "${f#$VAULT_ROOT/}"
+        fi
+      done | sort
+}
+
+cmd_search_context() {
+  if [[ -z "$PARAM_query" ]]; then
+    echo "Error: query= is required" >&2
+    return 1
+  fi
+  grep -rni --include="*.md" "$PARAM_query" "$VAULT_ROOT" \
+    --exclude-dir=".obsidian" --exclude-dir=".trash" \
+    -C 2 2>/dev/null \
+    | sed "s|$VAULT_ROOT/||g" || true
+}
+
+cmd_backlinks() {
+  if [[ -z "$PARAM_path" ]]; then
+    echo "Error: path= is required" >&2
+    return 1
+  fi
+  local note_name="${PARAM_path##*/}"
+  note_name="${note_name%.md}"
+  grep -rn --include="*.md" "\[\[$note_name\]\]\|\[\[$note_name|" "$VAULT_ROOT" \
+    --exclude-dir=".obsidian" --exclude-dir=".trash" 2>/dev/null \
+    | sed "s|$VAULT_ROOT/||g" || true
+  if [[ "$PARAM_path" == */* ]]; then
+    local path_no_ext="${PARAM_path%.md}"
+    grep -rn --include="*.md" "\[\[$path_no_ext\]\]\|\[\[$path_no_ext|" "$VAULT_ROOT" \
+      --exclude-dir=".obsidian" --exclude-dir=".trash" 2>/dev/null \
+      | sed "s|$VAULT_ROOT/||g" || true
+  fi
+}
+
+cmd_create() {
+  local path
+  path=$(resolve_path "$PARAM_path")
+
+  if [[ -f "$path" ]]; then
+    echo "Error: note already exists: $path" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$PARAM_content" > "$path"
+  echo "Created: ${path#$VAULT_ROOT/}"
+}
+
+cmd_append() {
+  local path
+  path=$(resolve_path "$PARAM_path")
+
+  if [[ ! -f "$path" ]]; then
+    echo "Error: note not found: $path" >&2
+    return 1
+  fi
+
+  printf '\n%s\n' "$PARAM_content" >> "$path"
+  echo "Appended to: ${path#$VAULT_ROOT/}"
+}
+
+cmd_property_set() {
+  local path
+  path=$(resolve_path "$PARAM_path")
+
+  if [[ ! -f "$path" ]]; then
+    echo "Error: note not found: $path" >&2
+    return 1
+  fi
+
+  if [[ -z "$PARAM_property" ]]; then
+    echo "Error: property= is required" >&2
+    return 1
+  fi
+
+  python3 -c "
+import sys
+
+filepath, prop, val = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(filepath, 'r') as f:
+    content = f.read()
+
+if not content.startswith('---'):
+    content = '---\n' + prop + ': ' + val + '\n---\n' + content
+else:
+    end = content.index('---', 3)
+    fm = content[4:end]
+    rest = content[end+3:]
+    lines = fm.strip().split('\n')
+    found = False
+    new_lines = []
+    for line in lines:
+        if line.startswith(prop + ':'):
+            new_lines.append(f'{prop}: {val}')
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f'{prop}: {val}')
+    content = '---\n' + '\n'.join(new_lines) + '\n---' + rest
+
+with open(filepath, 'w') as f:
+    f.write(content)
+print(f'Set {prop}={val} in {filepath.split(\"/\")[-1]}')
+" "$path" "$PARAM_property" "$PARAM_value"
+}
+
+cmd_property_read() {
+  local path
+  path=$(resolve_path "$PARAM_path")
+
+  if [[ ! -f "$path" ]]; then
+    echo "Error: note not found: $path" >&2
+    return 1
+  fi
+
+  python3 -c "
+import sys
+filepath, prop = sys.argv[1], sys.argv[2]
+with open(filepath, 'r') as f:
+    content = f.read()
+if not content.startswith('---'):
+    sys.exit(1)
+end = content.index('---', 3)
+fm = content[4:end]
+for line in fm.strip().split('\n'):
+    if line.startswith(prop + ':'):
+        print(line[len(prop)+1:].strip())
+        sys.exit(0)
+sys.exit(1)
+" "$path" "$PARAM_property"
+}
+
+cmd_orphans() {
+  find "$VAULT_ROOT" -name "*.md" -not -path "*/.trash/*" -not -path "*/.obsidian/*" -not -path "*/Templates/*" \
+    | while read -r note; do
+        local bn="${note##*/}"
+        bn="${bn%.md}"
+        local count
+        count=$(grep -rl --include="*.md" "\[\[$bn\]\]\|\[\[$bn|" "$VAULT_ROOT" \
+          --exclude-dir=".obsidian" --exclude-dir=".trash" 2>/dev/null \
+          | grep -cv "^$note$" 2>/dev/null || echo 0)
+        if [[ "$count" -eq 0 ]]; then
+          echo "${note#$VAULT_ROOT/}"
+        fi
+      done
+}
+
+cmd_move() {
+  local old_path new_path
+  old_path=$(resolve_path "$PARAM_path")
+  new_path=$(resolve_path "$PARAM_to")
+
+  if [[ ! -f "$old_path" ]]; then
+    echo "Error: source not found: $old_path" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$new_path")"
+  mv "$old_path" "$new_path"
+  echo "Moved: ${old_path#$VAULT_ROOT/} -> ${new_path#$VAULT_ROOT/}"
+}
+
+cmd_daily_read() {
+  local today
+  today=$(date +%Y-%m-%d)
+  PARAM_path="Terra/Journal/Daily/$today.md"
+  cmd_read
+}
+
+# --- Dispatch ---
+case "$COMMAND" in
+  read)           cmd_read ;;
+  search)         cmd_search ;;
+  search:context) cmd_search_context ;;
+  backlinks)      cmd_backlinks ;;
+  create)         cmd_create ;;
+  append)         cmd_append ;;
+  property:set)   cmd_property_set ;;
+  property:read)  cmd_property_read ;;
+  orphans)        cmd_orphans ;;
+  move)           cmd_move ;;
+  daily:read)     cmd_daily_read ;;
+  ""|help|-h|--help)
+    awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+    ;;
+  *)
+    echo "Error: unknown command '$COMMAND'" >&2
+    echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read" >&2
+    exit 1
+    ;;
+esac
