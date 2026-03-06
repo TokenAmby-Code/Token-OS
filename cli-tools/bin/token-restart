@@ -5,7 +5,6 @@
 #
 # Usage:
 #   token-restart              # Full restart: scripts-sync, Mac, WSL, phone TUI
-#   token-restart --mac-only   # Mac token-api only (legacy behavior)
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --tui-only   # Signal TUI restarts only (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
@@ -48,7 +47,6 @@ token-restart - Multi-device restart orchestrator
 
 Usage:
     token-restart              Full restart (scripts-sync → Mac → WSL → phone)
-    token-restart --mac-only   Mac token-api only (legacy)
     token-restart --wsl-only   WSL satellite only
     token-restart --tui-only   Signal TUI restarts only (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
@@ -95,7 +93,6 @@ remote_restart() {
     # Pass through relevant flags
     local flags=""
     [[ "${NO_PUSH}" == true ]] && flags="$flags --no-push"
-    [[ "${ACTION}" == "mac-only" ]] && flags="$flags --mac-only"
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
     [[ "${ACTION}" == "tui-only" ]] && flags="$flags --tui-only"
 
@@ -410,10 +407,6 @@ while [[ $# -gt 0 ]]; do
             ACTION="status"
             shift
             ;;
-        --mac-only)
-            ACTION="mac-only"
-            shift
-            ;;
         --wsl-only)
             ACTION="wsl-only"
             shift
@@ -458,10 +451,6 @@ case "$ACTION" in
     watch)
         full_restart "$NO_PUSH"
         watch_logs
-        ;;
-    mac-only)
-        restart_mac
-        write_tui_signals
         ;;
     wsl-only)
         restart_wsl

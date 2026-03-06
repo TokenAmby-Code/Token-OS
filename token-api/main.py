@@ -1128,6 +1128,7 @@ async def restore_desktop_state():
                 restored_mode = details.get("new_mode")
                 if restored_mode and restored_mode in VALID_DETECTION_MODES:
                     DESKTOP_STATE["current_mode"] = restored_mode
+                    DESKTOP_STATE["in_meeting"] = (restored_mode == "meeting")
                     DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
                     print(f"Restored desktop mode: {restored_mode} (from last event)")
                     return
@@ -2649,13 +2650,15 @@ DESKTOP_STATE = {
     # AHK heartbeat tracking
     "ahk_reachable": None,
     "ahk_last_heartbeat": None,
+    # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
+    "in_meeting": False,
 }
 
 # Voice chat state — tracks which instances are in voice conversation mode
 VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
-VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym"]
+VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
@@ -4145,6 +4148,14 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         old_mode = DESKTOP_STATE["current_mode"]
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+
+        # Track meeting state (suppresses TTS)
+        was_meeting = DESKTOP_STATE["in_meeting"]
+        DESKTOP_STATE["in_meeting"] = (detected_mode == "meeting")
+        if DESKTOP_STATE["in_meeting"] and not was_meeting:
+            print(f"    MEETING STARTED: TTS suppressed")
+        elif was_meeting and not DESKTOP_STATE["in_meeting"]:
+            print(f"    MEETING ENDED: TTS resumed")
 
         # Update timer activity layer
         now_ms = int(time.monotonic() * 1000)
@@ -6133,6 +6144,7 @@ async def health_check():
             "satellite_available": TTS_BACKEND["satellite_available"],
         },
         "tts_global_mode": TTS_GLOBAL_MODE["mode"],
+        "in_meeting": DESKTOP_STATE.get("in_meeting", False),
     }
 
 
@@ -6939,6 +6951,11 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
         return {"success": True, "queued": False, "reason": "quiet_hours"}
+
+    # Silence TTS during meetings (Zoom/Google Meet)
+    if DESKTOP_STATE.get("in_meeting"):
+        logger.info(f"TTS suppressed (in meeting): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "in_meeting"}
 
     # Look up instance to get their profile
     async with aiosqlite.connect(DB_PATH) as db:
