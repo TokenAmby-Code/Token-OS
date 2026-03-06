@@ -891,6 +891,49 @@ async def init_db():
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, p)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS habits (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                category            TEXT NOT NULL,
+                window_start_hour   INTEGER NOT NULL,
+                window_end_hour     INTEGER NOT NULL,
+                notes               TEXT,
+                active              INTEGER NOT NULL DEFAULT 1,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS habit_completions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                habit_id    TEXT NOT NULL REFERENCES habits(id),
+                date        TEXT NOT NULL,
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes       TEXT,
+                UNIQUE(habit_id, date)
+            )
+        """)
+
+        # Seed default habit definitions (INSERT OR IGNORE so existing data isn't overwritten)
+        default_habits = [
+            ("morning_teeth",      "Brush teeth",           "morning", 6,  10, None),
+            ("morning_breakfast",  "Breakfast",             "morning", 6,  11, None),
+            ("morning_movement",   "Morning movement",      "morning", 6,  11, "Stretch, walk, or exercise"),
+            ("work_deep_work",     "Deep work session",     "work",    9,  14, "At least one focused block"),
+            ("work_calendar",      "Calendar review",       "work",    9,  13, None),
+            ("health_gym",         "Gym / exercise",        "health",  9,  21, None),
+            ("health_water",       "Hydration",             "health",  6,  22, "Drink water throughout the day"),
+            ("evening_reflection", "Evening reflection",    "evening", 19, 24, None),
+            ("evening_reading",    "Reading",               "evening", 19, 24, None),
+            ("evening_tomorrow",   "Tomorrow prep",         "evening", 19, 24, "Review tomorrow's calendar and tasks"),
+        ]
+        for h in default_habits:
+            await db.execute("""
+                INSERT OR IGNORE INTO habits (id, name, category, window_start_hour, window_end_hour, notes)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, h)
+
         await db.commit()
         print(f"Database initialized at {DB_PATH}")
 
@@ -9689,6 +9732,89 @@ async def reset_fleet_state():
         )
         await db.commit()
     return state
+
+
+# ============ Habit Tracker Endpoints ============
+
+@app.get("/api/habits/definitions")
+async def get_habit_definitions():
+    """Return all active habit definitions with their windows."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, name, category, window_start_hour, window_end_hour, notes FROM habits WHERE active = 1 ORDER BY window_start_hour, category, id"
+        )
+        rows = await cursor.fetchall()
+    return {"habits": [dict(r) for r in rows]}
+
+
+@app.get("/api/habits/today")
+async def get_habits_today():
+    """Return today's habit completion state: definitions + which are checked off."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT h.id, h.name, h.category, h.window_start_hour, h.window_end_hour, h.notes,
+                   hc.completed_at, hc.notes AS completion_notes
+            FROM habits h
+            LEFT JOIN habit_completions hc ON hc.habit_id = h.id AND hc.date = ?
+            WHERE h.active = 1
+            ORDER BY h.window_start_hour, h.category, h.id
+        """, (today,))
+        rows = await cursor.fetchall()
+
+    habits = []
+    for r in rows:
+        d = dict(r)
+        d["completed"] = d["completed_at"] is not None
+        habits.append(d)
+
+    completed_count = sum(1 for h in habits if h["completed"])
+    return {
+        "date": today,
+        "habits": habits,
+        "summary": {"total": len(habits), "completed": completed_count, "pending": len(habits) - completed_count},
+    }
+
+
+@app.post("/api/habits/today/{habit_id}")
+async def mark_habit_today(habit_id: str, body: dict = None):
+    """Mark a habit complete (or incomplete) for today.
+
+    Body: {"completed": true, "notes": "optional notes"}
+    Omitting body or setting completed=true marks it complete.
+    Setting completed=false removes today's completion record.
+    """
+    if body is None:
+        body = {}
+
+    completed = body.get("completed", True)
+    notes = body.get("notes")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Verify habit exists
+        cursor = await db.execute("SELECT id, name FROM habits WHERE id = ? AND active = 1", (habit_id,))
+        habit = await cursor.fetchone()
+        if not habit:
+            raise HTTPException(status_code=404, detail=f"Habit '{habit_id}' not found")
+
+        if completed:
+            await db.execute("""
+                INSERT INTO habit_completions (habit_id, date, notes)
+                VALUES (?, ?, ?)
+                ON CONFLICT(habit_id, date) DO UPDATE SET completed_at = CURRENT_TIMESTAMP, notes = excluded.notes
+            """, (habit_id, today, notes))
+        else:
+            await db.execute(
+                "DELETE FROM habit_completions WHERE habit_id = ? AND date = ?",
+                (habit_id, today)
+            )
+        await db.commit()
+
+    action = "completed" if completed else "uncompleted"
+    return {"habit_id": habit_id, "date": today, "action": action, "notes": notes}
 
 
 if __name__ == "__main__":
