@@ -111,16 +111,18 @@ DetectAudioState() {
     ; 5. Nothing detected → Silence
 
     ; Check for Zoom meeting
+    ; Zoom creates dozens of internal windows (ConfPopupTop, ActiveMovie Window,
+    ; more menu, video_preview_fit_panel, etc.) — blacklisting is whack-a-mole.
+    ; Whitelist: only match titles containing "Zoom Meeting" (default) or
+    ; "'s Zoom Meeting" (personalized). Custom topics without "Meeting" are missed
+    ; but that's better than false positives from internal UI.
     try {
         if (WinExist("ahk_exe Zoom.exe")) {
-            ; Zoom is running — check for an active meeting window
-            ; Active meetings have titles like "Zoom Meeting" or the meeting name
-            ; The main Zoom window when idle is just "Zoom Workplace"
             windows := WinGetList("ahk_exe Zoom.exe")
             for hwnd in windows {
                 try {
                     title := WinGetTitle("ahk_id " . hwnd)
-                    if (title != "" && title != "Zoom Workplace" && title != "Zoom") {
+                    if (InStr(title, "Zoom Meeting")) {
                         LogMessage("Detected: Zoom meeting (" . title . ")")
                         AM_STATE.lastWindowTitle := title
                         return "meeting"

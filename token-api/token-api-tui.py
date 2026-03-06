@@ -2272,6 +2272,7 @@ def _format_context_section() -> list:
         "video": "Watching video",
         "scrolling": "Scrolling (social media)",
         "gaming": "Gaming",
+        "meeting": "In meeting (TTS muted)",
     }
     doing = ACTIVITY_LABELS.get(desktop_mode, desktop_mode)
     if phone_app:
