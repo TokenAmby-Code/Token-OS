@@ -1196,6 +1196,7 @@ async def restore_desktop_state():
                 restored_mode = details.get("new_mode")
                 if restored_mode and restored_mode in VALID_DETECTION_MODES:
                     DESKTOP_STATE["current_mode"] = restored_mode
+                    DESKTOP_STATE["in_meeting"] = (restored_mode == "meeting")
                     DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
                     print(f"Restored desktop mode: {restored_mode} (from last event)")
                     return
@@ -2516,6 +2517,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True):
     if active:
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
+            "listening": True,
             "started_at": datetime.now().isoformat()
         }
         logger.info(f"Voice chat STARTED for {instance_id[:12]}")
@@ -2530,6 +2532,17 @@ async def get_voice_chat_status(instance_id: str):
     """Check if instance is in voice chat mode."""
     session = VOICE_CHAT_SESSIONS.get(instance_id)
     return {"active": session is not None, "session": session}
+
+
+@app.post("/api/instances/{instance_id}/voice-chat/listening")
+async def toggle_listening(instance_id: str, active: bool = True):
+    """Toggle listening (dictation/mic) state for a voice chat instance."""
+    session = VOICE_CHAT_SESSIONS.get(instance_id)
+    if not session:
+        return {"error": "No active voice chat session", "status_code": 404}
+    session["listening"] = active
+    logger.info(f"Voice chat listening={'ON' if active else 'OFF'} for {instance_id[:12]}")
+    return {"instance_id": instance_id, "listening": active}
 
 
 @app.get("/api/instances", response_model=List[dict])
@@ -2557,7 +2570,15 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
             )
 
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        instances = []
+        for row in rows:
+            inst = dict(row)
+            vc_session = VOICE_CHAT_SESSIONS.get(inst["id"])
+            if vc_session:
+                inst["voice_chat"] = True
+                inst["listening"] = vc_session.get("listening", False)
+            instances.append(inst)
+        return instances
 
 
 @app.get("/api/instances/{instance_id}", response_model=dict)
@@ -2697,13 +2718,15 @@ DESKTOP_STATE = {
     # AHK heartbeat tracking
     "ahk_reachable": None,
     "ahk_last_heartbeat": None,
+    # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
+    "in_meeting": False,
 }
 
 # Voice chat state — tracks which instances are in voice conversation mode
 VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
-VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym"]
+VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
@@ -4137,6 +4160,14 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         old_mode = DESKTOP_STATE["current_mode"]
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+
+        # Track meeting state (suppresses TTS)
+        was_meeting = DESKTOP_STATE["in_meeting"]
+        DESKTOP_STATE["in_meeting"] = (detected_mode == "meeting")
+        if DESKTOP_STATE["in_meeting"] and not was_meeting:
+            print(f"    MEETING STARTED: TTS suppressed")
+        elif was_meeting and not DESKTOP_STATE["in_meeting"]:
+            print(f"    MEETING ENDED: TTS resumed")
 
         # Update timer activity layer
         now_ms = int(time.monotonic() * 1000)
@@ -6175,6 +6206,7 @@ async def health_check():
             "satellite_available": TTS_BACKEND["satellite_available"],
         },
         "tts_global_mode": TTS_GLOBAL_MODE["mode"],
+        "in_meeting": DESKTOP_STATE.get("in_meeting", False),
     }
 
 
@@ -6981,6 +7013,11 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
         return {"success": True, "queued": False, "reason": "quiet_hours"}
+
+    # Silence TTS during meetings (Zoom/Google Meet)
+    if DESKTOP_STATE.get("in_meeting"):
+        logger.info(f"TTS suppressed (in meeting): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "in_meeting"}
 
     # Look up instance to get their profile
     async with aiosqlite.connect(DB_PATH) as db:
@@ -8099,11 +8136,12 @@ async def handle_pre_tool_use(payload: dict) -> dict:
 
         # Return local_exec so generic-hook.sh runs AHK on WSL (which can invoke Windows AHK)
         # Note: AHK.exe needs a Windows path, so use wslpath -w to convert the WSL path
-        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]}")
+        listening_arg = "1" if VOICE_CHAT_SESSIONS.get(session_id, {}).get("listening", True) else "0"
+        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]} (listening={listening_arg})")
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": '"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")"',
+            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")" "{session_id}" "{listening_arg}"',
         }
 
     # Only check Bash commands for blocking

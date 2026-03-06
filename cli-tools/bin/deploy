@@ -293,8 +293,7 @@ wait_for_ft() {
 case "$SERVICE" in
     web)
         if [[ "$TARGET" == "local" || "$TARGET" == "debug" ]]; then
-            SRC_ENV="$PROJECT_DIR/widget/.env.pax-local"
-            TARGET_ENV="$PROJECT_DIR/widget/.env"
+            SRC_ENV="$PROJECT_DIR/widget/.env"
             STATE_FILE="$PROJECT_DIR/.claude-local-server-state.json"
 
             if [[ ! -f "$SRC_ENV" ]]; then
@@ -306,7 +305,7 @@ case "$SERVICE" in
 
             # Trap to cleanup on exit (cd to project root for state file)
             # Only stop backend if we started it (BACKEND_ALREADY_RUNNING=false)
-            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; if [[ "$BACKEND_ALREADY_RUNNING" != "true" ]]; then cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; fi; exit 0' INT TERM
+            trap 'echo "Cleaning up..."; if [[ "$BACKEND_ALREADY_RUNNING" != "true" ]]; then cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; fi; exit 0' INT TERM
 
             # Start backend (local or debug mode) — skip if already running
             if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
@@ -364,10 +363,6 @@ PY
             fi
 
             echo "Using API URL: $CURRENT_API_URL"
-
-            # Copy source env to .env for Vite
-            echo "Copying $SRC_ENV → $TARGET_ENV"
-            cp "$SRC_ENV" "$TARGET_ENV"
 
             echo "Starting frontend dev server..."
 

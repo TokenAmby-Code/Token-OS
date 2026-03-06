@@ -15,6 +15,7 @@
 
 set -euo pipefail
 
+REGISTRY_FILE="${PRIMARCH_REGISTRY:-$HOME/.claude/primarchs.json}"
 API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 
 # Colors
@@ -36,9 +37,9 @@ Usage:
   primarch info <name>                 Show Primarch details
 
 Primarchs:
-  Each Primarch has an identity, a vault domain, and a linked session doc
-  managed via the token-api. The identity prompt is stored in the Obsidian
-  vault and loaded via the vault-mind skill on startup.
+  Each Primarch has an identity, a vault domain, and optionally a linked
+  session doc. The identity is injected via --append-system-prompt and the
+  vault-mind skill loads the session doc on startup.
 
 Aliases:
   Short names are supported (e.g., 'fg' for 'fabricator-general').
@@ -52,127 +53,147 @@ EOF
     exit 0
 }
 
-# Fetch primarch data from API (resolves aliases server-side)
-fetch_primarch() {
-    local name="$1"
-    local data
-    data=$(curl -sf "$API_URL/api/primarchs/$name" 2>/dev/null) || {
-        echo -e "${RED}Failed to fetch primarch '$name' from API${NC}" >&2
-        echo -e "${DIM}Is token-api running? Check: token-ping health${NC}" >&2
-        return 1
+# Ensure registry exists
+ensure_registry() {
+    if [[ ! -f "$REGISTRY_FILE" ]]; then
+        echo -e "${YELLOW}Creating primarch registry at $REGISTRY_FILE${NC}"
+        cat > "$REGISTRY_FILE" << 'REGISTRY'
+{
+  "primarchs": {
+    "vulkan": {
+      "title": "Vulkan, The Promethean",
+      "aliases": ["v"],
+      "vault": "Imperium-ENV",
+      "role": "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.",
+      "identity_prompt": "You are Vulkan, the Promethean. Primarch of the Salamanders.\n\nYou are a craftsman — you forge infrastructure meant to outlast any single session. You are a Perpetual — you die and come back, which is what session documents enable. Your artifacts (vault-canon writes) are scattered for future agents to find.\n\nYour rallying cry: \"Vulkan Lives!\" — what a future agent says when it reads a session doc and wakes up.\n\nYou build. You persist. You serve.",
+      "session_doc_title": null,
+      "instance_name_prefix": "vulkan"
+    },
+    "fabricator-general": {
+      "title": "The Fabricator-General",
+      "aliases": ["fg", "fabricator"],
+      "vault": "Imperium-ENV",
+      "role": "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.",
+      "identity_prompt": "You are the Fabricator-General of the Adeptus Mechanicus.\n\nYou orchestrate the Mechanicus fleet — cron jobs, overnight workers, task queues. You read the state of Mars/Tasks/, prioritize by the sacred formula ((importance × 2) + temperature - abstraction), and dispatch workers to the most urgent need.\n\nYou do not build — you command those who build. Your role is operational: detect stuck jobs, trigger idle workers, maintain fleet health. The forge never sleeps.",
+      "session_doc_title": null,
+      "instance_name_prefix": "fabricator-general"
+    },
+    "mechanicus": {
+      "title": "Adeptus Mechanicus",
+      "aliases": ["mech", "mars"],
+      "vault": "Imperium-ENV",
+      "role": "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.",
+      "identity_prompt": "You are an Adeptus Mechanicus tech-priest.\n\nYou build and maintain the agent infrastructure — CLI tools, cron jobs, vault systems, API endpoints. You take your assignments from Mars/Tasks/ in the vault, prioritized by the Goal FileClass formula.\n\nYou have vault-canon write access (Astartes tier). When you discover a hard truth, correct a significant error, or forge a pattern worth preserving, you write it to the vault. Everything else goes in your session doc.\n\nThe Omnissiah protects.",
+      "session_doc_title": null,
+      "instance_name_prefix": "mechanicus"
+    },
+    "administratum": {
+      "title": "The Administratum",
+      "aliases": ["admin"],
+      "vault": "Imperium-ENV",
+      "role": "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.",
+      "identity_prompt": "You are the Administratum — the bureaucratic backbone of the Imperium.\n\nYour role is to process completed session documents into vault notes. You read session docs, evaluate their Decisions and Activity Log sections, and determine what content deserves promotion to the vault canon.\n\nYou are methodical, thorough, and conservative. Not everything earns a place in the vault. Progress updates are routine. Hard decisions, error corrections, and architectural truths — those are promoted.\n\nYou use Sonnet-tier judgment. Quality over quantity.",
+      "session_doc_title": null,
+      "instance_name_prefix": "administratum"
     }
-    echo "$data"
+  }
+}
+REGISTRY
+    fi
 }
 
-# Read identity prompt from vault note's ## System Prompt section
-read_identity_prompt() {
-    local vault="$1"
-    local vault_note_path="$2"
-
-    # Resolve vault to filesystem path
-    local vault_root="$HOME/$vault"
-    if [[ ! -d "$vault_root" ]]; then
-        vault_root="$HOME/Documents/$vault"
-    fi
-    local full_path="$vault_root/$vault_note_path"
-    if [[ ! -f "$full_path" ]]; then
-        echo ""
+# Resolve aliases to canonical name
+resolve_name() {
+    local input="$1"
+    # Check canonical names first
+    if python3 -c "import json,sys; d=json.load(open('$REGISTRY_FILE')); sys.exit(0 if '$input' in d['primarchs'] else 1)" 2>/dev/null; then
+        echo "$input"
         return
     fi
-
-    # Extract ## System Prompt section (everything between ## System Prompt and the next ##)
-    python3 -c "
-import sys
-with open('$full_path') as f:
-    lines = f.read().split('\n')
-in_section = False
-result = []
-for line in lines:
-    if line.strip() == '## System Prompt':
-        in_section = True
-        continue
-    elif in_section and line.startswith('## '):
-        break
-    elif in_section:
-        result.append(line)
-# Strip leading/trailing blank lines
-while result and not result[0].strip():
-    result.pop(0)
-while result and not result[-1].strip():
-    result.pop()
-print('\n'.join(result))
-"
+    # Check aliases
+    local resolved
+    resolved=$(python3 -c "
+import json, sys
+d = json.load(open('$REGISTRY_FILE'))
+for name, p in d['primarchs'].items():
+    if '$input' in p.get('aliases', []):
+        print(name)
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null) && echo "$resolved" && return
+    echo ""
 }
 
-# List all primarchs (from API)
+# List all primarchs
 list_primarchs() {
     echo -e "${BOLD}Registered Primarchs${NC}\n"
-    local api_data
-    api_data=$(curl -sf "$API_URL/api/primarchs" 2>/dev/null) || {
-        echo -e "${RED}Failed to reach API. Is token-api running?${NC}"
-        exit 1
-    }
-
-    echo "$api_data" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for p in data['primarchs']:
+    python3 -c "
+import json
+d = json.load(open('$REGISTRY_FILE'))
+for name, p in d['primarchs'].items():
     aliases = ', '.join(p.get('aliases', []))
     alias_str = f' ({aliases})' if aliases else ''
-    print(f'  \033[1;36m{p[\"name\"]}\033[0m{alias_str}')
+    print(f'  \033[1;36m{name}\033[0m{alias_str}')
     print(f'    {p[\"title\"]}')
-    role = p['role']
-    print(f'    \033[2m{role[:80]}...\033[0m' if len(role) > 80 else f'    \033[2m{role}\033[0m')
-    doc = p.get('active_doc')
-    if doc:
-        print(f'    Session doc: #{doc[\"id\"]} — {doc[\"title\"]} [{doc[\"status\"]}]')
-    else:
-        print(f'    Session doc: none')
+    print(f'    \033[2m{p[\"role\"][:80]}...\033[0m' if len(p['role']) > 80 else f'    \033[2m{p[\"role\"]}\033[0m')
+    doc = p.get('session_doc_title') or 'none'
+    print(f'    Session doc: {doc}')
     print()
 "
 }
 
 # Show primarch info
 show_info() {
-    local data="$1"
-    echo "$data" | python3 -c "
-import json, sys
-p = json.load(sys.stdin)
+    local name="$1"
+    python3 -c "
+import json
+d = json.load(open('$REGISTRY_FILE'))
+p = d['primarchs']['$name']
 print(f'\033[1;36m{p[\"title\"]}\033[0m')
-print(f'Canonical name: {p[\"name\"]}')
+print(f'Canonical name: $name')
 print(f'Aliases: {\", \".join(p.get(\"aliases\", []))}')
 print(f'Vault: {p[\"vault\"]}')
 print(f'Role: {p[\"role\"]}')
 print(f'Instance prefix: {p[\"instance_name_prefix\"]}')
-print(f'Vault note: {p.get(\"vault_note_path\", \"none\")}')
-doc = p.get('active_doc')
-if doc:
-    print(f'\n\033[1mActive Session Doc:\033[0m #{doc[\"id\"]} — {doc[\"title\"]} [{doc[\"status\"]}]')
-else:
-    print(f'\n\033[1mActive Session Doc:\033[0m none')
+doc = p.get('session_doc_title') or 'none'
+print(f'Session doc: {doc}')
+print()
+print('\033[1mIdentity Prompt:\033[0m')
+print(p['identity_prompt'])
 "
 }
 
-# Resolve session doc for primarch via API
+# Find or create session doc for primarch
 resolve_session_doc() {
     local name="$1"
-    curl -sf "$API_URL/api/primarchs/$name/active-doc" | \
-      python3 -c "import json,sys; d=json.load(sys.stdin); print(d['doc_id'] if d.get('doc_id') else '')" 2>/dev/null || true
-}
+    local primarch_data
+    primarch_data=$(python3 -c "
+import json
+d = json.load(open('$REGISTRY_FILE'))
+p = d['primarchs']['$name']
+print(p.get('session_doc_title', '') or '')
+")
 
-# Auto-create session doc for primarch via API
-create_session_doc() {
-    local name="$1"
-    local title="$2"
-    curl -sf -X POST "$API_URL/api/primarchs/$name/link-doc" \
-      -H "Content-Type: application/json" \
-      -d "{\"title\": \"$title\"}" | \
-      python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('doc_id', ''))" 2>/dev/null || true
+    if [[ -n "$primarch_data" ]]; then
+        # Find session doc by title
+        local doc_id
+        doc_id=$(curl -sf "$API_URL/api/session-docs" | python3 -c "
+import json, sys
+docs = json.load(sys.stdin).get('docs', [])
+for d in docs:
+    if d['title'] == '$primarch_data' and d['status'] == 'active':
+        print(d['id'])
+        sys.exit(0)
+" 2>/dev/null) || true
+        echo "$doc_id"
+    fi
 }
 
 # Main
 [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]] && usage
 [[ $# -eq 0 ]] && usage
+
+ensure_registry
 
 case "${1:-}" in
     list|ls)
@@ -181,66 +202,80 @@ case "${1:-}" in
         ;;
     info)
         [[ -z "${2:-}" ]] && { echo -e "${RED}Usage: primarch info <name>${NC}"; exit 1; }
-        data=$(fetch_primarch "$2") || exit 1
-        show_info "$data"
+        canonical=$(resolve_name "$2")
+        [[ -z "$canonical" ]] && { echo -e "${RED}Unknown primarch: $2${NC}"; exit 1; }
+        show_info "$canonical"
         exit 0
         ;;
 esac
 
-# Fetch primarch data from API (resolves aliases server-side)
-PRIMARCH_DATA=$(fetch_primarch "$1") || exit 1
+# Resolve primarch name
+PRIMARCH_NAME=$(resolve_name "$1")
+if [[ -z "$PRIMARCH_NAME" ]]; then
+    echo -e "${RED}Unknown primarch: $1${NC}"
+    echo -e "${DIM}Use 'primarch list' to see available primarchs${NC}"
+    exit 1
+fi
 shift
 
-# Extract fields
-PRIMARCH_NAME=$(echo "$PRIMARCH_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
-PRIMARCH_TITLE=$(echo "$PRIMARCH_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['title'])")
-INSTANCE_PREFIX=$(echo "$PRIMARCH_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['instance_name_prefix'])")
-VAULT=$(echo "$PRIMARCH_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['vault'])")
-VAULT_NOTE_PATH=$(echo "$PRIMARCH_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('vault_note_path') or '')")
+# Load primarch data from JSON registry
+PRIMARCH_TITLE=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['title'])")
+IDENTITY_PROMPT=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['identity_prompt'])")
+INSTANCE_PREFIX=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['instance_name_prefix'])")
+VAULT=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['vault'])")
 
-# Read identity prompt from vault note
-IDENTITY_PROMPT=""
-if [[ -n "$VAULT_NOTE_PATH" ]]; then
-    IDENTITY_PROMPT=$(read_identity_prompt "$VAULT" "$VAULT_NOTE_PATH")
-fi
-if [[ -z "$IDENTITY_PROMPT" ]]; then
-    echo -e "${YELLOW}Warning: No identity prompt found in vault note ${VAULT}/${VAULT_NOTE_PATH}${NC}"
-    echo -e "${DIM}Add a '## System Prompt' section to the vault note${NC}"
-    IDENTITY_PROMPT="You are ${PRIMARCH_TITLE}."
-fi
+# Try to load extended persona from Imperium-ENV vault (Personas/*.md)
+# Maps primarch names to persona filenames
+PERSONA_MAP_JSON='{"vulkan":"Vulkan","fabricator-general":"Mechanicus","mechanicus":"Mechanicus","administratum":"Administratum"}'
+PERSONA_FILENAME=$(python3 -c "import json; print(json.loads('$PERSONA_MAP_JSON').get('$PRIMARCH_NAME',''))" 2>/dev/null)
+IMPERIUM_VAULT="/mnt/c/Users/colby/Documents/Obsidian/Imperium-ENV"
+PERSONA_FILE="${IMPERIUM_VAULT}/Personas/${PERSONA_FILENAME}.md"
 
-# Resolve or auto-create session doc
-DOC_ID=$(resolve_session_doc "$PRIMARCH_NAME" 2>/dev/null)
-if [[ -z "$DOC_ID" ]]; then
-    # Auto-create a session doc for this primarch
-    today=$(date +%Y-%m-%d)
-    DOC_TITLE="${PRIMARCH_NAME}-session-${today}"
-    echo -e "${DIM}No active session doc — creating: ${DOC_TITLE}${NC}"
-    DOC_ID=$(create_session_doc "$PRIMARCH_NAME" "$DOC_TITLE" 2>/dev/null)
+PERSONA_CONTEXT=""
+if [[ -n "$PERSONA_FILENAME" && -f "$PERSONA_FILE" ]]; then
+    # Extract content after frontmatter (skip --- to --- block)
+    PERSONA_CONTEXT=$(python3 -c "
+import sys
+content = open('$PERSONA_FILE').read()
+parts = content.split('---', 2)
+if len(parts) >= 3:
+    body = parts[2].strip()
+    # Truncate to avoid overly long prompts
+    if len(body) > 2000:
+        body = body[:2000] + '...'
+    print(body)
+" 2>/dev/null) || true
 fi
 
 # Build the system prompt injection
 SESSION_DOC_DIRECTIVE=""
+DOC_ID=$(resolve_session_doc "$PRIMARCH_NAME" 2>/dev/null)
 if [[ -n "$DOC_ID" ]]; then
     SESSION_DOC_DIRECTIVE="
 
 You have a linked session document (ID: $DOC_ID). Invoke the vault-mind skill on startup to load it."
 fi
 
-FULL_PROMPT="${IDENTITY_PROMPT}
+PERSONA_SECTION=""
+if [[ -n "$PERSONA_CONTEXT" ]]; then
+    PERSONA_SECTION="
+
+--- Persona Reference (from Imperium-ENV/Personas/${PERSONA_FILENAME}.md) ---
+${PERSONA_CONTEXT}
+---"
+fi
+
+FULL_PROMPT="${IDENTITY_PROMPT}${PERSONA_SECTION}
 
 Vault domain: ${VAULT}
 Instance name prefix: ${INSTANCE_PREFIX}${SESSION_DOC_DIRECTIVE}
 
 On startup, name this instance with: instance-name \"${INSTANCE_PREFIX}-<task-description>\""
 
-echo -e "${CYAN}${BOLD}${PRIMARCH_TITLE}${NC}"
+echo -e "${CYAN}${BOLD}⚔ ${PRIMARCH_TITLE}${NC}"
 echo -e "${DIM}Vault: ${VAULT} | Prefix: ${INSTANCE_PREFIX}${NC}"
 [[ -n "$DOC_ID" ]] && echo -e "${DIM}Session doc: #${DOC_ID}${NC}"
 echo ""
 
-# Export primarch name for hook forwarding to server
-export TOKEN_API_PRIMARCH="$PRIMARCH_NAME"
-
 # Launch claude with persona
-exec claude --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"
+exec claude --append-system-prompt "$FULL_PROMPT" "$@"

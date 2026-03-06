@@ -79,6 +79,12 @@ global AM_MODES := Map(
         icon: "🎮",
         command: "timer-auto-work-gaming",
         description: "Minecraft (Lucky World Invasion) detected"
+    },
+    "meeting", {
+        name: "Meeting",
+        icon: "📞",
+        command: "timer-auto-work-meeting",
+        description: "Zoom or Google Meet active"
     }
 )
 
@@ -98,10 +104,59 @@ DetectAudioState() {
     }
 
     ; Detection Priority:
-    ; 1. Minecraft window title (Lucky World Invasion) → Gaming
-    ; 2. Spotify (if running) → Music
-    ; 3. YouTube in browser → Video
-    ; 4. Nothing detected → Silence
+    ; 1. Meeting (Zoom process or Google Meet in Brave) → Meeting
+    ; 2. Minecraft window title (Lucky World Invasion) → Gaming
+    ; 3. Spotify (if running) → Music
+    ; 4. YouTube in browser → Video
+    ; 5. Nothing detected → Silence
+
+    ; Check for Zoom meeting
+    try {
+        if (WinExist("ahk_exe Zoom.exe")) {
+            ; Zoom is running — check for an active meeting window
+            ; Active meetings have titles like "Zoom Meeting" or the meeting name
+            ; The main Zoom window when idle is just "Zoom Workplace"
+            windows := WinGetList("ahk_exe Zoom.exe")
+            for hwnd in windows {
+                try {
+                    title := WinGetTitle("ahk_id " . hwnd)
+                    if (title != "" && title != "Zoom Workplace" && title != "Zoom") {
+                        LogMessage("Detected: Zoom meeting (" . title . ")")
+                        AM_STATE.lastWindowTitle := title
+                        return "meeting"
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+    } catch {
+        ; ignore
+    }
+
+    ; Check for Google Meet in Brave
+    try {
+        if (WinExist("ahk_exe brave.exe")) {
+            windows := WinGetList("ahk_exe brave.exe")
+            for hwnd in windows {
+                try {
+                    title := WinGetTitle("ahk_id " . hwnd)
+                    ; Active call: "Meet - abc-defg-hij" (meeting code)
+                    ; Named meeting: "Meeting Name | Google Meet" or "Meeting Name - Google Meet"
+                    ; Skip landing page: just "Google Meet" with no separator
+                    if (RegExMatch(title, "^Meet - [a-z]") || RegExMatch(title, ".+[\|\-] Google Meet")) {
+                        LogMessage("Detected: Google Meet in Brave (" . title . ")")
+                        AM_STATE.lastWindowTitle := title
+                        return "meeting"
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+    } catch {
+        ; ignore
+    }
 
     ; Check for Minecraft (Java) - window title contains "Lucky World Invasion"
     try {
@@ -220,8 +275,8 @@ SwitchMode(newMode, windowTitle := "") {
 
     oldMode := AM_STATE.currentMode
 
-    ; Music and silence modes are always allowed without productivity check
-    if (newMode == "music" || newMode == "silence") {
+    ; Music, silence, and meeting modes are always allowed without productivity check
+    if (newMode == "music" || newMode == "silence" || newMode == "meeting") {
         LogMessage("🔄 " . newMode . " mode change (no productivity required): " . oldMode . " → " . newMode)
 
         ; Still notify token-api for tracking, but don't block on response
