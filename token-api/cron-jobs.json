@@ -5,7 +5,7 @@
     "enabled": true,
     "schedule": { "type": "cron", "value": "0 * * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/fabricator-general.md)\" --dangerously-skip-permissions",
-    "timeout_seconds": 180,
+    "timeout_seconds": 600,
     "max_runs_per_window": 8,
     "run_window_hours": 5,
     "session_type": "isolated",
