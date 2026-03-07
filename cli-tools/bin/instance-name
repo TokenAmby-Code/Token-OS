@@ -189,9 +189,9 @@ if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
                 ;;
             assign-id)
                 ASSIGN_RESP=$(curl -s -X POST "$API_URL/api/instances/$INSTANCE_ID/assign-doc?doc_id=$SESSION_ID" 2>/dev/null || true)
-                if echo "$ASSIGN_RESP" | jq -e '.status == "assigned"' >/dev/null 2>&1; then
-                    DOC_PATH=$(echo "$ASSIGN_RESP" | jq -r '.file_path')
-                    echo "Assigned to session: $DOC_PATH"
+                if echo "$ASSIGN_RESP" | jq -e '.assigned == true' >/dev/null 2>&1; then
+                    DOC_ID=$(echo "$ASSIGN_RESP" | jq -r '.doc_id')
+                    echo "Assigned to session doc: $DOC_ID"
                 else
                     echo "Warning: session doc assignment failed" >&2
                 fi
