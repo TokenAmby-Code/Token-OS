@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Custodes Phase 2 — MiniMax heartbeat.
-Polls Token-API state, evaluates via guardsman whether the state is interesting,
-and either pings Discord (#briefing) or logs quietly to the daily note.
+"""Custodes Phase 3 — MiniMax heartbeat with session context.
+Polls Token-API state, evaluates via guardsman whether the state is interesting.
+INTERESTING: reads active session doc, generates contextual observation, posts to #briefing.
+ROUTINE: appends quietly to daily note.
 """
 import datetime
 import json
@@ -64,6 +65,71 @@ def evaluate_with_guardsman(metrics: dict) -> bool:
     output = result.stdout.strip()
     print(f"  guardsman: {output}")
     return output.upper().startswith("PASS")
+
+
+def get_active_session_doc() -> str | None:
+    """Return file_path of session doc for the most recently active non-subagent instance."""
+    result = subprocess.run(
+        [
+            "agents-db", "--json", "query",
+            "SELECT sd.file_path FROM claude_instances ci "
+            "JOIN session_documents sd ON ci.session_doc_id = sd.id "
+            "WHERE ci.status='active' AND ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
+            "ORDER BY ci.last_activity DESC LIMIT 1",
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    try:
+        rows = json.loads(result.stdout)
+        return rows[0].get("file_path") if rows else None
+    except Exception:
+        return None
+
+
+def get_session_context(file_path: str | None) -> str | None:
+    """Read session doc and return last 500 chars of body (after frontmatter)."""
+    if not file_path:
+        return None
+    try:
+        with open(os.path.expanduser(file_path)) as f:
+            content = f.read()
+        parts = content.split("---", 2)
+        body = parts[2].strip() if len(parts) >= 3 else content
+        return body[-500:] if len(body) > 500 else body or None
+    except OSError:
+        return None
+
+
+def generate_observation(summary: str, session_ctx: str | None) -> str:
+    """Generate a contextual observation sentence via openclaw (MiniMax free tier).
+
+    Uses `openclaw agent` for freeform text generation — guardsman is PASS/FAIL only.
+    Response JSON: .payloads[0].text
+    """
+    ctx_snippet = (session_ctx or "unavailable")[:500]
+    prompt = (
+        f"You are Custodes, the watchful AI of the Emperor's forge. "
+        f"Write exactly ONE observation sentence synthesizing this system state and session context. "
+        f"Be specific and useful. No preamble.\n"
+        f"State: {summary}\n"
+        f"Session context: {ctx_snippet}"
+    )
+    import time
+    session_id = f"custodes-obs-{int(time.time())}"
+    result = subprocess.run(
+        ["openclaw", "agent", "--agent", "main", "--session-id", session_id,
+         "-m", prompt, "--local", "--json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 0:
+        try:
+            data = json.loads(result.stdout)
+            text = data.get("payloads", [{}])[0].get("text", "").strip()
+            if text:
+                return text.split("\n")[0]
+        except Exception:
+            pass
+    return f"State: {summary}"
 
 
 def build_comment(metrics: dict) -> str:
@@ -129,9 +195,15 @@ def main():
 
     # 3. Act
     if is_interesting:
-        comment = build_comment(metrics)
-        message = f"Custodes observes: {summary}. {comment}"
-        send_discord(message)
+        session_doc = get_active_session_doc()
+        session_ctx = get_session_context(session_doc)
+        if session_doc:
+            print(f"  Session doc: {session_doc}")
+        else:
+            print("  No linked session doc found")
+        observation = generate_observation(summary, session_ctx)
+        print(f"  Observation: {observation}")
+        send_discord(f"Custodes observes: {observation}")
     else:
         log_to_daily_note(summary)
 
