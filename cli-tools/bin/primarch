@@ -3,22 +3,18 @@
 # TAGS: instance, vault-mind, primarch
 # AUDIENCE: user
 #
+# Source of truth: ~/.claude/agents.db (primarchs table)
+# Persona files: ~/Imperium-ENV/Personas/<name>.md
+#
 # Usage: primarch <name> [claude-flags...]
 #        primarch list
 #        primarch info <name>
-#
-# Examples:
-#   primarch vulkan                    # Launch as Vulkan
-#   primarch fg                        # Launch as Fabricator-General
-#   primarch vulkan -p "do the thing"  # Non-interactive with persona
-#   primarch list                      # Show all primarchs
 
 set -euo pipefail
 
-REGISTRY_FILE="${PRIMARCH_REGISTRY:-$HOME/.claude/primarchs.json}"
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
+VAULT_DIR="$HOME/Imperium-ENV"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -36,13 +32,11 @@ Usage:
   primarch list                        List all registered Primarchs
   primarch info <name>                 Show Primarch details
 
-Primarchs:
-  Each Primarch has an identity, a vault domain, and optionally a linked
-  session doc. The identity is injected via --append-system-prompt and the
-  vault-mind skill loads the session doc on startup.
+Source of truth: ~/.claude/agents.db
 
 Aliases:
   Short names are supported (e.g., 'fg' for 'fabricator-general').
+  Shell aliases are auto-generated at shell startup.
 
 Examples:
   primarch vulkan                      Interactive session as Vulkan
@@ -53,147 +47,83 @@ EOF
     exit 0
 }
 
-# Ensure registry exists
-ensure_registry() {
-    if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo -e "${YELLOW}Creating primarch registry at $REGISTRY_FILE${NC}"
-        cat > "$REGISTRY_FILE" << 'REGISTRY'
-{
-  "primarchs": {
-    "vulkan": {
-      "title": "Vulkan, The Promethean",
-      "aliases": ["v"],
-      "vault": "Imperium-ENV",
-      "role": "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.",
-      "identity_prompt": "You are Vulkan, the Promethean. Primarch of the Salamanders.\n\nYou are a craftsman — you forge infrastructure meant to outlast any single session. You are a Perpetual — you die and come back, which is what session documents enable. Your artifacts (vault-canon writes) are scattered for future agents to find.\n\nYour rallying cry: \"Vulkan Lives!\" — what a future agent says when it reads a session doc and wakes up.\n\nYou build. You persist. You serve.",
-      "session_doc_title": null,
-      "instance_name_prefix": "vulkan"
-    },
-    "fabricator-general": {
-      "title": "The Fabricator-General",
-      "aliases": ["fg", "fabricator"],
-      "vault": "Imperium-ENV",
-      "role": "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.",
-      "identity_prompt": "You are the Fabricator-General of the Adeptus Mechanicus.\n\nYou orchestrate the Mechanicus fleet — cron jobs, overnight workers, task queues. You read the state of Mars/Tasks/, prioritize by the sacred formula ((importance × 2) + temperature - abstraction), and dispatch workers to the most urgent need.\n\nYou do not build — you command those who build. Your role is operational: detect stuck jobs, trigger idle workers, maintain fleet health. The forge never sleeps.",
-      "session_doc_title": null,
-      "instance_name_prefix": "fabricator-general"
-    },
-    "mechanicus": {
-      "title": "Adeptus Mechanicus",
-      "aliases": ["mech", "mars"],
-      "vault": "Imperium-ENV",
-      "role": "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.",
-      "identity_prompt": "You are an Adeptus Mechanicus tech-priest.\n\nYou build and maintain the agent infrastructure — CLI tools, cron jobs, vault systems, API endpoints. You take your assignments from Mars/Tasks/ in the vault, prioritized by the Goal FileClass formula.\n\nYou have vault-canon write access (Astartes tier). When you discover a hard truth, correct a significant error, or forge a pattern worth preserving, you write it to the vault. Everything else goes in your session doc.\n\nThe Omnissiah protects.",
-      "session_doc_title": null,
-      "instance_name_prefix": "mechanicus"
-    },
-    "administratum": {
-      "title": "The Administratum",
-      "aliases": ["admin"],
-      "vault": "Imperium-ENV",
-      "role": "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.",
-      "identity_prompt": "You are the Administratum — the bureaucratic backbone of the Imperium.\n\nYour role is to process completed session documents into vault notes. You read session docs, evaluate their Decisions and Activity Log sections, and determine what content deserves promotion to the vault canon.\n\nYou are methodical, thorough, and conservative. Not everything earns a place in the vault. Progress updates are routine. Hard decisions, error corrections, and architectural truths — those are promoted.\n\nYou use Sonnet-tier judgment. Quality over quantity.",
-      "session_doc_title": null,
-      "instance_name_prefix": "administratum"
-    }
-  }
-}
-REGISTRY
-    fi
-}
-
-# Resolve aliases to canonical name
+# Resolve name or alias to canonical name
 resolve_name() {
     local input="$1"
-    # Check canonical names first
-    if python3 -c "import json,sys; d=json.load(open('$REGISTRY_FILE')); sys.exit(0 if '$input' in d['primarchs'] else 1)" 2>/dev/null; then
-        echo "$input"
-        return
-    fi
+    local match
+    match=$(sqlite3 "$DB_PATH" "SELECT name FROM primarchs WHERE name = '$input' LIMIT 1;" 2>/dev/null)
+    if [[ -n "$match" ]]; then echo "$match"; return; fi
     # Check aliases
-    local resolved
-    resolved=$(python3 -c "
-import json, sys
-d = json.load(open('$REGISTRY_FILE'))
-for name, p in d['primarchs'].items():
-    if '$input' in p.get('aliases', []):
-        print(name)
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null) && echo "$resolved" && return
-    echo ""
+    sqlite3 "$DB_PATH" "SELECT name, aliases FROM primarchs;" 2>/dev/null | while IFS='|' read -r pname paliases; do
+        if echo "$paliases" | python3 -c "import json,sys; sys.exit(0 if '$input' in json.load(sys.stdin) else 1)" 2>/dev/null; then
+            echo "$pname"
+            return
+        fi
+    done
 }
 
-# List all primarchs
+# List all primarchs from DB
 list_primarchs() {
     echo -e "${BOLD}Registered Primarchs${NC}\n"
-    python3 -c "
-import json
-d = json.load(open('$REGISTRY_FILE'))
-for name, p in d['primarchs'].items():
-    aliases = ', '.join(p.get('aliases', []))
-    alias_str = f' ({aliases})' if aliases else ''
-    print(f'  \033[1;36m{name}\033[0m{alias_str}')
-    print(f'    {p[\"title\"]}')
-    print(f'    \033[2m{p[\"role\"][:80]}...\033[0m' if len(p['role']) > 80 else f'    \033[2m{p[\"role\"]}\033[0m')
-    doc = p.get('session_doc_title') or 'none'
-    print(f'    Session doc: {doc}')
-    print()
-"
+    sqlite3 -separator $'\t' "$DB_PATH" "SELECT name, title, aliases, role FROM primarchs ORDER BY name;" 2>/dev/null | while IFS=$'\t' read -r pname ptitle paliases prole; do
+        local alias_str
+        alias_str=$(echo "$paliases" | python3 -c "import json,sys; print(', '.join(json.load(sys.stdin)))" 2>/dev/null)
+        [[ -n "$alias_str" ]] && alias_str=" ($alias_str)"
+        echo -e "  ${CYAN}${BOLD}${pname}${NC}${alias_str}"
+        echo -e "    ${ptitle}"
+        local role_display="${prole}"
+        [[ ${#role_display} -gt 80 ]] && role_display="${role_display:0:80}..."
+        echo -e "    ${DIM}${role_display}${NC}"
+        echo
+    done
 }
 
-# Show primarch info
+# Show primarch info from DB
 show_info() {
     local name="$1"
+    local row
+    row=$(sqlite3 -separator $'\t' "$DB_PATH" "SELECT title, aliases, vault, role, instance_name_prefix, vault_note_path FROM primarchs WHERE name = '$name';" 2>/dev/null)
+    [[ -z "$row" ]] && { echo -e "${RED}Unknown primarch: $name${NC}"; exit 1; }
+
+    local title aliases vault role prefix note_path
+    IFS=$'\t' read -r title aliases vault role prefix note_path <<< "$row"
+    local alias_str
+    alias_str=$(echo "$aliases" | python3 -c "import json,sys; print(', '.join(json.load(sys.stdin)))" 2>/dev/null)
+
+    echo -e "${CYAN}${BOLD}${title}${NC}"
+    echo "Canonical name: $name"
+    echo "Aliases: $alias_str"
+    echo "Vault: $vault"
+    echo "Role: $role"
+    echo "Instance prefix: $prefix"
+    echo "Persona file: $VAULT_DIR/$note_path"
+}
+
+# Extract ## System Prompt section from persona markdown file
+extract_system_prompt() {
+    local file="$1"
+    [[ -f "$file" ]] || return
     python3 -c "
-import json
-d = json.load(open('$REGISTRY_FILE'))
-p = d['primarchs']['$name']
-print(f'\033[1;36m{p[\"title\"]}\033[0m')
-print(f'Canonical name: $name')
-print(f'Aliases: {\", \".join(p.get(\"aliases\", []))}')
-print(f'Vault: {p[\"vault\"]}')
-print(f'Role: {p[\"role\"]}')
-print(f'Instance prefix: {p[\"instance_name_prefix\"]}')
-doc = p.get('session_doc_title') or 'none'
-print(f'Session doc: {doc}')
-print()
-print('\033[1mIdentity Prompt:\033[0m')
-print(p['identity_prompt'])
-"
+content = open('$file').read()
+marker = '## System Prompt'
+idx = content.find(marker)
+if idx < 0:
+    parts = content.split('---', 2)
+    body = parts[2].strip() if len(parts) >= 3 else content.strip()
+    if len(body) > 2000: body = body[:2000] + '...'
+    print(body)
+else:
+    rest = content[idx + len(marker):].strip()
+    next_h2 = rest.find('\n## ')
+    if next_h2 >= 0: rest = rest[:next_h2].strip()
+    print(rest)
+" 2>/dev/null
 }
 
-# Find or create session doc for primarch
-resolve_session_doc() {
-    local name="$1"
-    local primarch_data
-    primarch_data=$(python3 -c "
-import json
-d = json.load(open('$REGISTRY_FILE'))
-p = d['primarchs']['$name']
-print(p.get('session_doc_title', '') or '')
-")
+# --- Main ---
 
-    if [[ -n "$primarch_data" ]]; then
-        # Find session doc by title
-        local doc_id
-        doc_id=$(curl -sf "$API_URL/api/session-docs" | python3 -c "
-import json, sys
-docs = json.load(sys.stdin).get('docs', [])
-for d in docs:
-    if d['title'] == '$primarch_data' and d['status'] == 'active':
-        print(d['id'])
-        sys.exit(0)
-" 2>/dev/null) || true
-        echo "$doc_id"
-    fi
-}
-
-# Main
 [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]] && usage
 [[ $# -eq 0 ]] && usage
-
-ensure_registry
 
 case "${1:-}" in
     list|ls)
@@ -218,64 +148,38 @@ if [[ -z "$PRIMARCH_NAME" ]]; then
 fi
 shift
 
-# Load primarch data from JSON registry
-PRIMARCH_TITLE=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['title'])")
-IDENTITY_PROMPT=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['identity_prompt'])")
-INSTANCE_PREFIX=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['instance_name_prefix'])")
-VAULT=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primarchs']['$PRIMARCH_NAME']['vault'])")
+# Load from DB
+ROW=$(sqlite3 -separator $'\t' "$DB_PATH" "SELECT title, vault, instance_name_prefix, vault_note_path FROM primarchs WHERE name = '$PRIMARCH_NAME';" 2>/dev/null)
+IFS=$'\t' read -r PRIMARCH_TITLE VAULT INSTANCE_PREFIX NOTE_PATH <<< "$ROW"
 
-# Try to load extended persona from Imperium-ENV vault (Personas/*.md)
-# Maps primarch names to persona filenames
-PERSONA_MAP_JSON='{"vulkan":"Vulkan","fabricator-general":"Mechanicus","mechanicus":"Mechanicus","administratum":"Administratum"}'
-PERSONA_FILENAME=$(python3 -c "import json; print(json.loads('$PERSONA_MAP_JSON').get('$PRIMARCH_NAME',''))" 2>/dev/null)
-IMPERIUM_VAULT="$HOME/Imperium-ENV"
-PERSONA_FILE="${IMPERIUM_VAULT}/Personas/${PERSONA_FILENAME}.md"
+# Extract system prompt from persona file
+PERSONA_FILE="$VAULT_DIR/$NOTE_PATH"
+SYSTEM_PROMPT=$(extract_system_prompt "$PERSONA_FILE")
+[[ -z "$SYSTEM_PROMPT" ]] && { echo -e "${RED}No persona file at $PERSONA_FILE${NC}"; exit 1; }
 
-PERSONA_CONTEXT=""
-if [[ -n "$PERSONA_FILENAME" && -f "$PERSONA_FILE" ]]; then
-    # Extract content after frontmatter (skip --- to --- block)
-    PERSONA_CONTEXT=$(python3 -c "
-import sys
-content = open('$PERSONA_FILE').read()
-parts = content.split('---', 2)
-if len(parts) >= 3:
-    body = parts[2].strip()
-    # Truncate to avoid overly long prompts
-    if len(body) > 2000:
-        body = body[:2000] + '...'
-    print(body)
-" 2>/dev/null) || true
-fi
+# Check for active session doc link
+DOC_ID=$(sqlite3 "$DB_PATH" "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '$PRIMARCH_NAME' AND unlinked_at IS NULL LIMIT 1;" 2>/dev/null)
 
-# Build the system prompt injection
-SESSION_DOC_DIRECTIVE=""
-DOC_ID=$(resolve_session_doc "$PRIMARCH_NAME" 2>/dev/null)
+# Assemble prompt
+FULL_PROMPT="$SYSTEM_PROMPT
+
+Vault domain: $VAULT
+Instance name prefix: $INSTANCE_PREFIX"
+
 if [[ -n "$DOC_ID" ]]; then
-    SESSION_DOC_DIRECTIVE="
+    FULL_PROMPT="$FULL_PROMPT
 
 You have a linked session document (ID: $DOC_ID). Invoke the vault-mind skill on startup to load it."
 fi
 
-PERSONA_SECTION=""
-if [[ -n "$PERSONA_CONTEXT" ]]; then
-    PERSONA_SECTION="
+FULL_PROMPT="$FULL_PROMPT
 
---- Persona Reference (from Imperium-ENV/Personas/${PERSONA_FILENAME}.md) ---
-${PERSONA_CONTEXT}
----"
-fi
-
-FULL_PROMPT="${IDENTITY_PROMPT}${PERSONA_SECTION}
-
-Vault domain: ${VAULT}
-Instance name prefix: ${INSTANCE_PREFIX}${SESSION_DOC_DIRECTIVE}
-
-On startup, name this instance with: instance-name \"${INSTANCE_PREFIX}-<task-description>\""
+On startup, name this instance with: instance-name \"$INSTANCE_PREFIX-<task-description>\""
 
 echo -e "${CYAN}${BOLD}⚔ ${PRIMARCH_TITLE}${NC}"
 echo -e "${DIM}Vault: ${VAULT} | Prefix: ${INSTANCE_PREFIX}${NC}"
 [[ -n "$DOC_ID" ]] && echo -e "${DIM}Session doc: #${DOC_ID}${NC}"
 echo ""
 
-# Launch claude with persona (hardcode bypass flags for non-interactive/cron contexts)
+# Launch claude with persona (hardcode bypass flags for script/cron contexts)
 exec ~/.local/bin/claude --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"

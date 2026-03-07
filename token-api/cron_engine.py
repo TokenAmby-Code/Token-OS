@@ -6,7 +6,6 @@ job definitions and run history in agents.db.
 """
 
 import asyncio
-import json
 import os
 import re
 import signal
@@ -28,8 +27,6 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-
-CRON_JOBS_CONFIG = Path(__file__).parent / "cron-jobs.json"
 
 VICTORY_RE = re.compile(r'##IMPERIUM_VICTORIOUS:\s*(.+?)##', re.DOTALL)
 
@@ -179,49 +176,97 @@ class CronEngine:
 
     # ── Load / Sync ────────────────────────────────────────────
 
-    async def load_from_config(self, config_path: Path = None):
-        """Load job definitions from JSON config into DB and register with scheduler."""
-        path = config_path or CRON_JOBS_CONFIG
-        if not path.exists():
-            print(f"CronEngine: No config at {path}, skipping")
-            return
+    # Permanent jobs seeded on first boot (INSERT OR IGNORE — DB is authoritative after that).
+    # Edit these only when the underlying command or schedule truly changes.
+    # Do NOT add ephemeral task workers here; create them via the API.
+    _PERMANENT_JOBS = [
+        {
+            "id": "0b69c65b-c2ac-4d5c-a256-b53dfd43d3f6",
+            "name": "fabricator-general",
+            "commander": "mechanicus",
+            "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker. Runs 24/7.",
+            "enabled": True,
+            "schedule": {"type": "cron", "value": "0 * * * *", "tz": "America/Phoenix"},
+            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/fabricator-general.md)" --dangerously-skip-permissions',
+            "timeout_seconds": 600,
+            "max_runs_per_window": 8,
+            "run_window_hours": 5,
+            "notify_discord": True,
+        },
+        {
+            "id": "d94a1683-d576-4350-ac88-dfe7e0053e02",
+            "name": "adeptus-custodes",
+            "commander": "custodes",
+            "description": "Morning briefing: reads overnight domain logs + cron DB stats, posts full report to #operations and greeting to #interrogative.",
+            "enabled": True,
+            "schedule": {"type": "cron", "value": "0 8 * * *", "tz": "America/Phoenix"},
+            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)" --dangerously-skip-permissions',
+            "timeout_seconds": 180,
+            "quiet_hours": [21, 8],
+            "max_runs_per_window": 3,
+            "run_window_hours": 12,
+        },
+        {
+            "id": "fe8b670b-ce96-424d-b931-e1b1675d7658",
+            "name": "custodes-heartbeat",
+            "commander": "custodes",
+            "description": "Custodes background presence — polls state, posts interesting observations to Discord, nudges on break debt.",
+            "enabled": True,
+            "schedule": {"type": "cron", "value": "*/15 * * * *", "tz": "America/Phoenix"},
+            "command": "cd ~/Scripts/token-api && python3 custodes_heartbeat.py",
+            "timeout_seconds": 120,
+        },
+        {
+            "id": "79358da9-4b1c-498c-8f4c-3e3b2e80c788",
+            "name": "mechanicus-classifier",
+            "commander": "mechanicus",
+            "description": "Autonomy classifier: scans for unclassified prescriptive notes, asks Emperor via Discord react, writes autonomy frontmatter.",
+            "enabled": False,
+            "schedule": {"type": "cron", "value": "30 */4 * * *", "tz": "America/Phoenix"},
+            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-classifier.md)" --dangerously-skip-permissions',
+            "timeout_seconds": 600,
+            "max_runs_per_window": 4,
+            "run_window_hours": 24,
+        },
+        {
+            "id": "e0c0af83-e96e-41b4-8abe-c8f7651a6b23",
+            "name": "security-monitor",
+            "commander": "mechanicus",
+            "description": "Health checks: Token API, Tailscale, caffeinate. Logs to security_log.md.",
+            "enabled": False,
+            "schedule": {"type": "cron", "value": "0 */2 * * *", "tz": "America/Phoenix"},
+            "command": "claude --model claude-haiku-4-5-20251001 -p 'Run health checks and log results. Commands to run: (1) curl -s localhost:7777/health (2) tailscale status 2>&1 | head -3 (3) pgrep caffeinate && echo caffeinate:running || echo caffeinate:not_found. Append a single timestamped line to ~/.openclaw/workspace/memory/logs/security_log.md with format: TIMESTAMP | token_api:STATUS | tailscale:STATUS | caffeinate:STATUS' --dangerously-skip-permissions",
+            "timeout_seconds": 60,
+            "quiet_hours": [23, 7],
+            "max_runs_per_window": 6,
+            "run_window_hours": 5,
+        },
+    ]
 
-        with open(path) as f:
-            jobs = json.load(f)
+    async def ensure_permanent_jobs(self):
+        """Seed permanent jobs into DB on first boot only (INSERT OR IGNORE).
 
+        The DB is authoritative. This only fires for jobs not yet present —
+        it never overwrites live state. Edit _PERMANENT_JOBS when a command
+        or schedule truly changes; the next fresh-DB boot will pick it up.
+        """
+        now = _now_iso()
         async with aiosqlite.connect(self.db_path) as db:
-            for job_def in jobs:
-                job_id = job_def.get("id", str(uuid.uuid4()))
-                name = job_def["name"]
+            for job_def in self._PERMANENT_JOBS:
                 schedule = job_def["schedule"]
                 quiet = job_def.get("quiet_hours")
-
                 await db.execute("""
-                    INSERT INTO cron_jobs (
+                    INSERT OR IGNORE INTO cron_jobs (
                         id, name, description, enabled,
                         schedule_type, schedule_value, timezone,
                         command, timeout_seconds,
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
-                        session_type, notify_discord, commander, created_at, updated_at
+                        session_type, notify_discord, commander,
+                        created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
-                        description = excluded.description,
-                        schedule_type = excluded.schedule_type,
-                        schedule_value = excluded.schedule_value,
-                        timezone = excluded.timezone,
-                        command = excluded.command,
-                        timeout_seconds = excluded.timeout_seconds,
-                        quiet_hours_start = excluded.quiet_hours_start,
-                        quiet_hours_end = excluded.quiet_hours_end,
-                        max_runs_per_window = excluded.max_runs_per_window,
-                        run_window_hours = excluded.run_window_hours,
-                        session_type = excluded.session_type,
-                        notify_discord = excluded.notify_discord,
-                        commander = excluded.commander,
-                        updated_at = excluded.updated_at
                 """, (
-                    job_id, name,
+                    job_def["id"], job_def["name"],
                     job_def.get("description", ""),
                     1 if job_def.get("enabled", True) else 0,
                     schedule["type"], schedule["value"],
@@ -235,7 +280,7 @@ class CronEngine:
                     job_def.get("session_type", "isolated"),
                     1 if job_def.get("notify_discord") else 0,
                     job_def.get("commander", "mechanicus"),
-                    _now_iso(), _now_iso(),
+                    now, now,
                 ))
             await db.commit()
 
