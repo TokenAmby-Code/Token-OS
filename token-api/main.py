@@ -8416,6 +8416,12 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     content = request.content or ""
 
+    # Trigger 0: bare URL in #forge → auto-clip to vault
+    stripped = content.strip()
+    if request.channel_name == "forge" and stripped.startswith("http") and " " not in stripped:
+        asyncio.create_task(_discord_clip(stripped, request))
+        return {"received": True, "message_id": request.message_id}
+
     # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
         asyncio.create_task(_discord_respond(request, bot="mechanicus"))
@@ -8426,6 +8432,78 @@ async def receive_discord_message(request: DiscordMessageRequest):
         asyncio.create_task(_discord_respond(request, bot="custodes"))
 
     return {"received": True, "message_id": request.message_id}
+
+
+async def _discord_clip(url: str, message: DiscordMessageRequest):
+    """Run clip CLI on a bare URL dropped in #forge, reply with the vault path."""
+    channel = message.channel_name or "forge"
+    reply_to = message.message_id or ""
+    logger.info(f"Discord clip: {url}")
+
+    clip_bin = Path.home() / "Scripts" / "cli-tools" / "bin" / "clip"
+    env = {
+        **os.environ,
+        "PATH": ":".join([
+            str(Path.home() / "Scripts" / "cli-tools" / "bin"),
+            str(Path.home() / ".local" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            os.environ.get("PATH", ""),
+        ]),
+    }
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(clip_bin), url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        stderr_text = stderr.decode()
+
+        if proc.returncode != 0:
+            logger.warning(f"Discord clip failed (rc={proc.returncode}): {stderr_text[:300]}")
+            reply_content = f"Clip failed for <{url}>: `{stderr_text.strip()[-200:]}`"
+        else:
+            # Parse "Saved to Imperium-ENV: Terra/Inbox/slug.md" from stderr
+            saved_path = None
+            for line in stderr_text.splitlines():
+                if line.startswith("Saved to "):
+                    parts = line.split(": ", 1)
+                    if len(parts) == 2:
+                        saved_path = parts[1].strip()
+                    break
+            reply_content = f"Clipped: `{saved_path}`" if saved_path else f"Clipped: `{url}`"
+            logger.info(f"Discord clip saved: {saved_path}")
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Discord clip timed out: {url}")
+        reply_content = f"Clip timed out for <{url}>"
+    except Exception as e:
+        logger.warning(f"Discord clip error: {e}")
+        return
+
+    # Send reply via daemon
+    try:
+        import urllib.request as _urllib_req
+        payload = json.dumps({
+            "channel": channel,
+            "bot": "mechanicus",
+            "content": reply_content,
+            "reply_to": reply_to,
+        }).encode()
+        req = _urllib_req.Request(
+            f"{DISCORD_DAEMON_URL}/send",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _urllib_req.urlopen(req, timeout=10)
+        )
+    except Exception as e:
+        logger.warning(f"Discord clip: failed to send reply: {e}")
 
 
 # Per-channel cooldown: max 1 response per 30 seconds per channel
