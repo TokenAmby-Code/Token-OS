@@ -6072,7 +6072,9 @@ async def create_cron_job(request: Request):
     try:
         job = await cron_engine.create_job(data)
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        msg = str(e)
+        status = 409 if "already exists" in msg else 400
+        raise HTTPException(status_code=status, detail=msg)
     return job
 
 
@@ -6080,7 +6082,10 @@ async def create_cron_job(request: Request):
 async def update_cron_job(job_id: str, request: Request):
     """Update a cron job (enable/disable, schedule, command, etc.)."""
     data = await request.json()
-    job = await cron_engine.update_job(job_id, data)
+    try:
+        job = await cron_engine.update_job(job_id, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job

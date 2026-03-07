@@ -561,12 +561,17 @@ class CronEngine:
         job["is_running"] = job_id in self._running_jobs
         return job
 
+    VALID_COMMANDERS = {"mechanicus", "custodes"}
+
     async def create_job(self, data: dict) -> dict:
         """Create a new cron job."""
         job_id = str(uuid.uuid4())
         now = _now_iso()
         schedule = data["schedule"]
         quiet = data.get("quiet_hours")
+        commander = data.get("commander", "mechanicus")
+        if commander not in self.VALID_COMMANDERS:
+            raise ValueError(f"Invalid commander '{commander}'. Must be one of: {sorted(self.VALID_COMMANDERS)}")
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -592,7 +597,7 @@ class CronEngine:
                     data.get("max_runs_per_window"),
                     data.get("run_window_hours", 5),
                     data.get("session_type", "isolated"),
-                    data.get("commander", "mechanicus"),
+                    commander,
                     now, now,
                 ))
                 await db.commit()
@@ -608,6 +613,9 @@ class CronEngine:
 
     async def update_job(self, job_id: str, updates: dict) -> Optional[dict]:
         """Update a cron job. Re-registers with scheduler if schedule changed."""
+        if "commander" in updates and updates["commander"] not in self.VALID_COMMANDERS:
+            raise ValueError(f"Invalid commander '{updates['commander']}'. Must be one of: {sorted(self.VALID_COMMANDERS)}")
+
         job = await self.get_job(job_id)
         if not job:
             return None

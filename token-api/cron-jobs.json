@@ -1,97 +1,143 @@
 [
   {
     "name": "fabricator-general",
-    "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker. Runs 24/7 — night is prime time.",
+    "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker. Runs 24/7 \u2014 night is prime time.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 * * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 * * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/fabricator-general.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 8,
     "run_window_hours": 5,
     "session_type": "isolated",
-    "notify_discord": true
+    "notify_discord": true,
+    "commander": "mechanicus"
   },
   {
     "name": "mechanicus-vault",
     "description": "Claw-ENV vault domain worker. MOCs, notes, wikilinks, Codices expansion. Fallback domain when others run dry.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */8 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-vault.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 4,
     "run_window_hours": 12,
     "session_type": "isolated",
-    "notify_discord": true
+    "notify_discord": true,
+    "commander": "mechanicus"
   },
   {
     "name": "mechanicus-token-api",
     "description": "Token API / Cron Engine domain worker. Endpoints, TUI, monitoring.",
     "enabled": false,
-    "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */8 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-token-api.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 3,
     "run_window_hours": 12,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "commander": "mechanicus"
   },
   {
     "name": "mechanicus-cli-tools",
     "description": "CLI tools + shell/automation domain worker. One tool per run.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */8 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-cli-tools.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 3,
     "run_window_hours": 12,
     "session_type": "isolated",
-    "notify_discord": true
+    "notify_discord": true,
+    "commander": "mechanicus"
   },
   {
     "name": "mechanicus-discord",
     "description": "Discord bot infrastructure domain worker. Bot code only, not administration.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 */12 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */12 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-discord.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 2,
     "run_window_hours": 12,
     "session_type": "isolated",
-    "notify_discord": true
+    "notify_discord": true,
+    "commander": "mechanicus"
   },
   {
     "name": "mechanicus-prospector",
     "description": "Autonomy queue builder. Scouts codebases/vault for gaps, writes prescriptive proposal notes, asks Emperor to classify via #approvals. Fires when queue runs low.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 */12 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */12 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-prospector.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
     "max_runs_per_window": 2,
     "run_window_hours": 24,
     "session_type": "isolated",
-    "notify_discord": true
+    "notify_discord": true,
+    "commander": "mechanicus"
   },
   {
     "name": "adeptus-custodes",
     "description": "Morning briefing: reads overnight domain logs + cron DB stats, posts full report to #operations and greeting to #interrogative.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 8 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 8 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 180,
-    "quiet_hours": [21, 8],
+    "quiet_hours": [
+      21,
+      8
+    ],
     "max_runs_per_window": 3,
     "run_window_hours": 12,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "commander": "custodes"
   },
   {
     "name": "security-monitor",
     "description": "Health checks: Token API, Tailscale, caffeinate. Logs to security_log.md.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "0 */2 * * *", "tz": "America/Phoenix" },
+    "schedule": {
+      "type": "cron",
+      "value": "0 */2 * * *",
+      "tz": "America/Phoenix"
+    },
     "command": "claude --model claude-haiku-4-5-20251001 -p 'Run health checks and log results. Commands to run: (1) curl -s localhost:7777/health (2) tailscale status 2>&1 | head -3 (3) pgrep caffeinate && echo caffeinate:running || echo caffeinate:not_found. Append a single timestamped line to ~/.openclaw/workspace/memory/logs/security_log.md with format: TIMESTAMP | token_api:STATUS | tailscale:STATUS | caffeinate:STATUS' --dangerously-skip-permissions",
     "timeout_seconds": 60,
-    "quiet_hours": [23, 7],
+    "quiet_hours": [
+      23,
+      7
+    ],
     "max_runs_per_window": 6,
     "run_window_hours": 5,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "commander": "mechanicus"
   }
 ]
