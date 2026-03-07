@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# clip — fetch a URL and save a structured Obsidian note using clip templates
+# Usage: clip <url> [--save path] [--vault <name>] [--type article|github]
+#
+# Auto-detects GitHub URLs and applies the GitHub Repo Clip template.
+# All other URLs get the Article Clip template.
+# Metadata (title, author, domain, etc.) extracted via defuddle --json.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: clip <url> [options]" >&2
+    echo "" >&2
+    echo "Fetches a URL, extracts metadata, and saves a structured Obsidian note." >&2
+    echo "" >&2
+    echo "Options:" >&2
+    echo "  --save <path>      Vault path for output (default: Terra/Inbox/<slug>.md)" >&2
+    echo "  --vault <name>     Obsidian vault (default: Imperium-ENV)" >&2
+    echo "  --type <type>      Template type: article | github (auto-detected)" >&2
+    echo "  --dry-run          Print output without saving" >&2
+    echo "  -h, --help         Show this help" >&2
+    exit 1
+}
+
+URL=""
+SAVE_PATH=""
+VAULT="Imperium-ENV"
+CLIP_TYPE=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --vault)    VAULT="${2:-Imperium-ENV}"; shift 2 ;;
+        --save)     SAVE_PATH="${2:-}"; shift 2 ;;
+        --type)     CLIP_TYPE="${2:-}"; shift 2 ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        http://*|https://*) URL="$1"; shift ;;
+        *) URL="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$URL" ]]; then
+    echo "Error: URL required" >&2
+    usage
+fi
+
+# ── Auto-detect clip type ─────────────────────────────────────────────────────
+
+if [[ -z "$CLIP_TYPE" ]]; then
+    if [[ "$URL" =~ ^https?://(www\.)?github\.com/ ]]; then
+        CLIP_TYPE="github"
+    else
+        CLIP_TYPE="article"
+    fi
+fi
+
+echo "Fetching: $URL (type: $CLIP_TYPE)" >&2
+
+# ── Extract metadata via defuddle --json ──────────────────────────────────────
+
+META_JSON=""
+if command -v defuddle &>/dev/null; then
+    META_JSON=$(defuddle parse --json "$URL" 2>/dev/null || true)
+else
+    META_JSON=$(npx --yes defuddle parse --json "$URL" 2>/dev/null || true)
+fi
+
+# Parse metadata fields from JSON (use jq if available, else sed fallback)
+extract_field() {
+    local field="$1"
+    if command -v jq &>/dev/null && [[ -n "$META_JSON" ]]; then
+        echo "$META_JSON" | jq -r ".${field} // empty" 2>/dev/null || true
+    fi
+}
+
+TITLE=$(extract_field "title")
+AUTHOR=$(extract_field "author")
+DESCRIPTION=$(extract_field "description")
+DOMAIN=$(extract_field "domain")
+CONTENT_MD=$(extract_field "content")
+
+# If defuddle failed or returned no content, fall back to research
+if [[ -z "$CONTENT_MD" ]]; then
+    echo "defuddle --json returned no content, falling back to research..." >&2
+    CONTENT_MD=$(research "$URL" 2>/dev/null || true)
+fi
+
+if [[ -z "$CONTENT_MD" ]]; then
+    echo "Error: Failed to fetch content from: $URL" >&2
+    exit 1
+fi
+
+TODAY=$(date +%Y-%m-%d)
+
+# ── Build slug for default save path ─────────────────────────────────────────
+
+make_slug() {
+    local str="$1"
+    echo "$str" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9 -]//g' \
+        | sed 's/[[:space:]]\+/-/g' \
+        | sed 's/-\+/-/g' \
+        | cut -c1-60 \
+        | sed 's/-$//'
+}
+
+if [[ -z "$SAVE_PATH" ]]; then
+    if [[ -n "$TITLE" ]]; then
+        SLUG=$(make_slug "$TITLE")
+    else
+        # Derive from URL
+        SLUG=$(make_slug "$(echo "$URL" | sed 's|https\?://||; s|/.*||')-$(date +%s)")
+    fi
+    SAVE_PATH="Terra/Inbox/${SLUG}.md"
+fi
+
+# ── Compose note ──────────────────────────────────────────────────────────────
+
+NOTE_TITLE="${TITLE:-$(basename "$SAVE_PATH" .md)}"
+
+if [[ "$CLIP_TYPE" == "github" ]]; then
+    # Extract repo slug from URL (owner/repo)
+    REPO_SLUG=$(echo "$URL" | sed 's|https\?://github\.com/||; s|/tree/.*||; s|/$||')
+    LANGUAGE=$(extract_field "language")
+
+    NOTE=$(cat <<EOF
+---
+title: "${NOTE_TITLE}"
+type: clip-github
+repo_url: "${URL}"
+language: "${LANGUAGE}"
+clipped: ${TODAY}
+tags:
+  - type/clip
+  - type/github
+  - inbox/github
+---
+
+# ${NOTE_TITLE}
+
+**Source**: [${REPO_SLUG}](${URL})
+**Date**: ${TODAY}
+
+## Summary
+
+${DESCRIPTION}
+
+## Key Features
+
+-
+
+## Usage Notes
+
+## Links
+
+- [Repo](${URL})
+
+## Raw README
+
+${CONTENT_MD}
+EOF
+)
+else
+    NOTE=$(cat <<EOF
+---
+title: "${NOTE_TITLE}"
+type: clip
+source_url: "${URL}"
+author: "${AUTHOR}"
+clipped: ${TODAY}
+tags:
+  - type/clip
+  - inbox/article
+domain: "${DOMAIN}"
+---
+
+# ${NOTE_TITLE}
+
+**Source**: [${DOMAIN:-$URL}](${URL})
+**Date**: ${TODAY}
+
+## Key Takeaways
+
+-
+
+## Notes
+
+## Raw Content
+
+${CONTENT_MD}
+EOF
+)
+fi
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+if $DRY_RUN; then
+    echo "$NOTE"
+    echo "" >&2
+    echo "[dry-run] Would save to $VAULT: $SAVE_PATH" >&2
+    exit 0
+fi
+
+obsidian vault="$VAULT" create path="$SAVE_PATH" content="$NOTE" 2>/dev/null \
+    || obsidian vault="$VAULT" append path="$SAVE_PATH" content="$NOTE" 2>/dev/null \
+    || { echo "Error: Failed to save to Obsidian vault '$VAULT' at '$SAVE_PATH'" >&2; exit 1; }
+
+echo "Saved to $VAULT: $SAVE_PATH" >&2
+echo "Title: ${NOTE_TITLE}" >&2
