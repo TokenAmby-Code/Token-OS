@@ -7507,12 +7507,15 @@ async def handle_session_start(payload: dict) -> dict:
     if not session_id:
         session_id = f"claude-{int(time.time())}-{os.getpid()}"
 
-    # Detect origin type from SSH_CLIENT env var in payload
+    # Detect origin type from env vars in payload
     origin_type = "local"
     source_ip = None
-    if payload.get("env", {}).get("SSH_CLIENT"):
+    env = payload.get("env", {})
+    if env.get("CRON_JOB_NAME"):
+        origin_type = "cron"
+    elif env.get("SSH_CLIENT"):
         origin_type = "ssh"
-        source_ip = payload["env"]["SSH_CLIENT"].split()[0]
+        source_ip = env["SSH_CLIENT"].split()[0]
 
     # Get working directory and tab name
     working_dir = payload.get("cwd") or os.getcwd()

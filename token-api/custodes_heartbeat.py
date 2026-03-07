@@ -34,15 +34,15 @@ def collect_state() -> tuple[dict, list]:
 def extract_metrics(timer: dict, instances: list) -> dict:
     effective_mode = timer.get("current_mode", "unknown").upper()
     break_minutes = int(timer.get("break_balance_ms", 0) / 60000)
-    active_count = sum(
-        1 for i in instances
-        if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")
-    )
+    alive = [i for i in instances if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")]
+    cron_count = sum(1 for i in alive if i.get("origin_type") == "cron")
+    manual_count = len(alive) - cron_count
     processing_count = sum(1 for i in instances if i.get("is_processing") == 1)
     return {
         "effective_mode": effective_mode,
         "break_minutes": break_minutes,
-        "active_count": active_count,
+        "active_count": manual_count,  # Emperor's manual instances only
+        "cron_count": cron_count,       # Mechanicus cron workers
         "processing_count": processing_count,
         "manual_mode": (timer.get("manual_mode") or "").upper(),
     }
@@ -52,7 +52,8 @@ def evaluate_with_guardsman(metrics: dict) -> bool:
     summary = (
         f"mode={metrics['effective_mode']}, "
         f"break_balance={metrics['break_minutes']}min, "
-        f"active_instances={metrics['active_count']}, "
+        f"emperor_instances={metrics['active_count']}, "
+        f"cron_workers={metrics['cron_count']}, "
         f"processing={metrics['processing_count']}"
     )
     # Guardsman returns PASS/FAIL. PASS = state matches interesting criteria.
@@ -189,15 +190,19 @@ def generate_observation(summary: str, session_ctx: str | None) -> str:
 def build_comment(metrics: dict) -> str:
     mode = metrics["effective_mode"]
     break_min = metrics["break_minutes"]
-    active = metrics["active_count"]
+    active = metrics["active_count"]  # Emperor's manual instances
+    cron = metrics.get("cron_count", 0)
 
     if mode == "DISTRACTED":
         return "Distracted mode detected — intervention may be warranted."
-    if active == 0:
+    if active == 0 and cron == 0:
         return "No active instances — Emperor may have stepped away."
+    if active == 0 and cron > 0:
+        return f"Emperor is offline. {cron} Mechanicus worker(s) running autonomously."
+    cron_suffix = f" ({cron} cron)" if cron > 0 else ""
     if break_min > 60 and active > 0:
-        return f"Break account is {break_min}m with {active} instance(s) still running — consider clearing the queue."
-    return f"{active} instance(s) active in {mode} mode."
+        return f"Break account is {break_min}m with {active} manual instance(s){cron_suffix} still running — consider clearing the queue."
+    return f"{active} manual instance(s) active in {mode} mode{cron_suffix}."
 
 
 def send_discord(message: str, channel: str = BRIEFING_CHANNEL):
@@ -414,9 +419,11 @@ def check_break_observation(metrics: dict) -> str | None:
 
 
 def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
-    """Return (message, channel) if instance count crossed zero boundary, else (None, None)."""
+    """Return (message, channel) if Emperor's manual instance count crossed zero boundary.
+    Cron workers don't count — the Emperor is offline if no manual instances are running."""
     FLAG = Path("/tmp/custodes-zero-sent")
-    active_count = metrics.get("active_count", -1)
+    active_count = metrics.get("active_count", -1)  # manual only
+    cron_count = metrics.get("cron_count", 0)
 
     if active_count < 0:
         return None, None  # metrics unavailable
@@ -424,13 +431,15 @@ def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
     if active_count == 0:
         if not FLAG.exists():
             FLAG.touch()
-            return "Forge is silent — no active Claude instances. Emperor has gone offline.", "fleet"
+            cron_note = f" {cron_count} Mechanicus worker(s) continue autonomously." if cron_count > 0 else ""
+            return f"Emperor has gone offline.{cron_note}", "fleet"
         return None, None  # already sent, suppress
 
-    # Instances are running — clear flag if set
+    # Manual instances are running — clear flag if set
     if FLAG.exists():
         FLAG.unlink()
-        return f"Emperor is back online. {active_count} active instance(s).", "fleet"
+        cron_note = f" ({cron_count} cron)" if cron_count > 0 else ""
+        return f"Emperor is back online. {active_count} manual instance(s){cron_note}.", "fleet"
     return None, None
 
 
@@ -462,6 +471,7 @@ def main():
         f"mode={metrics['effective_mode']}, "
         f"break_balance={metrics['break_minutes']}min, "
         f"active_instances={metrics['active_count']}, "
+        f"cron_workers={metrics.get('cron_count', 0)}, "
         f"processing={metrics['processing_count']}"
     )
     print(f"State: {summary}")
