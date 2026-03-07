@@ -228,7 +228,7 @@ VAULT=$(python3 -c "import json; print(json.load(open('$REGISTRY_FILE'))['primar
 # Maps primarch names to persona filenames
 PERSONA_MAP_JSON='{"vulkan":"Vulkan","fabricator-general":"Mechanicus","mechanicus":"Mechanicus","administratum":"Administratum"}'
 PERSONA_FILENAME=$(python3 -c "import json; print(json.loads('$PERSONA_MAP_JSON').get('$PRIMARCH_NAME',''))" 2>/dev/null)
-IMPERIUM_VAULT="/mnt/c/Users/colby/Documents/Obsidian/Imperium-ENV"
+IMPERIUM_VAULT="$HOME/Imperium-ENV"
 PERSONA_FILE="${IMPERIUM_VAULT}/Personas/${PERSONA_FILENAME}.md"
 
 PERSONA_CONTEXT=""
@@ -277,5 +277,5 @@ echo -e "${DIM}Vault: ${VAULT} | Prefix: ${INSTANCE_PREFIX}${NC}"
 [[ -n "$DOC_ID" ]] && echo -e "${DIM}Session doc: #${DOC_ID}${NC}"
 echo ""
 
-# Launch claude with persona
-exec claude --append-system-prompt "$FULL_PROMPT" "$@"
+# Launch claude with persona (hardcode bypass flags for non-interactive/cron contexts)
+exec ~/.local/bin/claude --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"

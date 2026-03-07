@@ -142,6 +142,8 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN followup_delay_seconds INTEGER DEFAULT NULL")
         if "notify_discord" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN notify_discord INTEGER DEFAULT 0")
+        if "commander" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN commander TEXT DEFAULT 'mechanicus'")
 
         cursor = await db.execute("PRAGMA table_info(cron_runs)")
         cron_runs_cols = {row[1] for row in await cursor.fetchall()}
@@ -201,8 +203,8 @@ class CronEngine:
                         command, timeout_seconds,
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
-                        session_type, notify_discord, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        session_type, notify_discord, commander, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(name) DO UPDATE SET
                         description = excluded.description,
                         schedule_type = excluded.schedule_type,
@@ -216,6 +218,7 @@ class CronEngine:
                         run_window_hours = excluded.run_window_hours,
                         session_type = excluded.session_type,
                         notify_discord = excluded.notify_discord,
+                        commander = excluded.commander,
                         updated_at = excluded.updated_at
                 """, (
                     job_id, name,
@@ -231,6 +234,7 @@ class CronEngine:
                     job_def.get("run_window_hours", 5),
                     job_def.get("session_type", "isolated"),
                     1 if job_def.get("notify_discord") else 0,
+                    job_def.get("commander", "mechanicus"),
                     _now_iso(), _now_iso(),
                 ))
             await db.commit()
@@ -573,8 +577,8 @@ class CronEngine:
                         command, timeout_seconds,
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
-                        session_type, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        session_type, commander, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_id, data["name"],
                     data.get("description", ""),
@@ -588,6 +592,7 @@ class CronEngine:
                     data.get("max_runs_per_window"),
                     data.get("run_window_hours", 5),
                     data.get("session_type", "isolated"),
+                    data.get("commander", "mechanicus"),
                     now, now,
                 ))
                 await db.commit()
@@ -619,6 +624,7 @@ class CronEngine:
             "max_runs_per_window": "max_runs_per_window",
             "run_window_hours": "run_window_hours",
             "session_type": "session_type",
+            "commander": "commander",
         }
 
         for key, col in field_map.items():
