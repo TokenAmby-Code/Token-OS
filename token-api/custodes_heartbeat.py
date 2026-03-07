@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
 
 BASE = "http://localhost:7777"
 BRIEFING_CHANNEL = "briefing"
@@ -174,6 +175,27 @@ def check_break_nudge(metrics: dict) -> str | None:
     return None
 
 
+def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
+    """Return (message, channel) if instance count crossed zero boundary, else (None, None)."""
+    FLAG = Path("/tmp/custodes-zero-sent")
+    active_count = metrics.get("active_count", -1)
+
+    if active_count < 0:
+        return None, None  # metrics unavailable
+
+    if active_count == 0:
+        if not FLAG.exists():
+            FLAG.touch()
+            return "Forge is silent — no active Claude instances. Emperor has gone offline.", "fleet"
+        return None, None  # already sent, suppress
+
+    # Instances are running — clear flag if set
+    if FLAG.exists():
+        FLAG.unlink()
+        return f"Emperor is back online. {active_count} active instance(s).", "fleet"
+    return None, None
+
+
 def log_to_daily_note(summary: str):
     today = datetime.date.today().isoformat()
     note_path = os.path.expanduser(
@@ -212,11 +234,21 @@ def main():
         print(f"  Break nudge: {nudge}")
         send_discord(f"Custodes: {nudge}", channel="fleet")
 
-    # 3. Evaluate
+    # 3. Instance-zero check — deduped via flag file, routes to #fleet
+    zero_msg, zero_ch = check_instance_zero(metrics)
+    if zero_msg:
+        print(f"  Instance zero: {zero_msg}")
+        send_discord(f"Custodes: {zero_msg}", channel=zero_ch)
+        if metrics.get("active_count", 0) == 0:
+            log_to_daily_note(summary)
+            print("Done.")
+            return
+
+    # 4. Evaluate
     is_interesting = evaluate_with_guardsman(metrics)
     print(f"Decision: {'INTERESTING' if is_interesting else 'ROUTINE'}")
 
-    # 4. Act
+    # 5. Act
     if is_interesting:
         session_doc = get_active_session_doc()
         session_ctx = get_session_context(session_doc)
