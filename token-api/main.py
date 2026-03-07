@@ -3073,6 +3073,43 @@ def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
         return False
 
 
+@app.get("/api/daily-note")
+async def get_daily_note():
+    """Return today's daily note content as plain text."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = DAILY_NOTE_DIR / f"{today}.md"
+    if not note_path.exists():
+        return {"date": today, "content": None, "exists": False}
+    content = note_path.read_text(encoding="utf-8")
+    return {"date": today, "content": content, "exists": True, "path": str(note_path)}
+
+
+class DailyNoteAppendRequest(BaseModel):
+    content: str
+    section: str = ""  # optional section header; if provided, used as ## heading
+
+
+@app.post("/api/daily-note/append")
+async def append_daily_note(request: DailyNoteAppendRequest):
+    """Append a timestamped section to today's daily note."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = DAILY_NOTE_DIR / f"{today}.md"
+    now_str = datetime.now().strftime("%H:%M")
+
+    if request.section:
+        block = f"\n## {request.section} ({now_str})\n\n{request.content}\n"
+    else:
+        block = f"\n<!-- {now_str} -->\n{request.content}\n"
+
+    if not note_path.exists():
+        return {"ok": False, "error": f"Daily note not found: {note_path}"}
+
+    with open(note_path, "a", encoding="utf-8") as f:
+        f.write(block)
+
+    return {"ok": True, "date": today, "appended_chars": len(block)}
+
+
 # Phone HTTP server config (MacroDroid on phone via Tailscale)
 PHONE_CONFIG = {
     "host": "100.102.92.24",
