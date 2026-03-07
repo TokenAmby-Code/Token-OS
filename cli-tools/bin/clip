@@ -100,8 +100,8 @@ make_slug() {
     echo "$str" \
         | tr '[:upper:]' '[:lower:]' \
         | sed 's/[^a-z0-9 -]//g' \
-        | sed 's/[[:space:]]\+/-/g' \
-        | sed 's/-\+/-/g' \
+        | sed -E 's/[[:space:]]+/-/g' \
+        | sed -E 's/-+/-/g' \
         | cut -c1-60 \
         | sed 's/-$//'
 }
