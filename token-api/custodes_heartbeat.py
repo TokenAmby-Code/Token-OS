@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Custodes Phase 6 — Per-instance session doc topics in heartbeat.
+"""Custodes Phase 7 — Daily thread in #briefing for interesting observations.
 Polls Token-API state, evaluates via guardsman whether the state is interesting.
 INTERESTING: reads session docs for up to 2 processing instances, enriches observation
-  with "Active work: <topic> (<project>), ..." suffix. Posts to #briefing.
+  with "Active work: <topic> (<project>), ..." suffix. Posts to daily thread in #briefing.
 ROUTINE: appends quietly to daily note.
 BREAK NUDGE: independently fires when break balance is deeply negative or manual BREAK too long.
 """
@@ -185,6 +185,57 @@ def send_discord(message: str, channel: str = BRIEFING_CHANNEL):
         print(f"  Discord send failed: {result.stderr.strip()}")
 
 
+def get_or_create_daily_thread() -> str | None:
+    """Return today's briefing thread ID, creating it if needed. Returns None on failure."""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    cache_path = Path(f"/tmp/custodes_thread_{today.replace('-', '')}.txt")
+
+    if cache_path.exists():
+        thread_id = cache_path.read_text().strip()
+        if thread_id:
+            return thread_id
+
+    thread_name = f"Custodes — {today}"
+    result = subprocess.run(
+        ["discord", "thread", "create", BRIEFING_CHANNEL, thread_name, "--bot", "custodes"],
+        capture_output=True, text=True, timeout=15
+    )
+    if result.returncode != 0:
+        print(f"  Thread create failed: {result.stderr.strip()}")
+        return None
+
+    # Parse thread ID from stdout (e.g. "Thread created: 123456789")
+    output = result.stdout.strip()
+    print(f"  Thread created: {output}")
+    thread_id = None
+    for part in output.split():
+        if part.isdigit() and len(part) > 10:
+            thread_id = part
+            break
+
+    if not thread_id:
+        print(f"  Could not parse thread ID from: {output!r}")
+        return None
+
+    cache_path.write_text(thread_id)
+    return thread_id
+
+
+def send_discord_thread(message: str):
+    """Post to today's daily briefing thread, falling back to main channel."""
+    thread_id = get_or_create_daily_thread()
+    if thread_id:
+        result = subprocess.run(
+            ["discord", "thread", "send", thread_id, "--bot", "custodes", message],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            print(f"  Posted to daily thread {thread_id} via custodes bot")
+            return
+        print(f"  Thread send failed: {result.stderr.strip()}, falling back to #{BRIEFING_CHANNEL}")
+    send_discord(message)
+
+
 def check_break_nudge(metrics: dict) -> str | None:
     """Return a nudge message if break situation warrants it, else None."""
     mode = metrics.get("effective_mode", "WORKING")
@@ -304,7 +355,7 @@ def main():
             active_work_suffix = f" Active work: {', '.join(parts)}."
             print(f"  Active work: {active_work_suffix.strip()}")
 
-        send_discord(f"Custodes observes: {observation}{active_work_suffix}")
+        send_discord_thread(f"Custodes observes: {observation}{active_work_suffix}")
     else:
         log_to_daily_note(summary)
 
