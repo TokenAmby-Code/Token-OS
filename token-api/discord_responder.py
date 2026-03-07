@@ -27,11 +27,10 @@ claude_bin = pathlib.Path.home() / ".local" / "bin" / "claude"
 result = subprocess.run(
     [
         str(claude_bin),
-        "--model", "claude-sonnet-4-6",
+        "--model", "claude-haiku-4-5-20251001",
         "--system-prompt", system_prompt,
         "-p", f"Reply to the Discord message above as the {bot} bot.",
         "--dangerously-skip-permissions",
-        "--max-turns", "1",
     ],
     capture_output=True,
     text=True,
@@ -39,10 +38,7 @@ result = subprocess.run(
     env={**os.environ, "CLAUDECODE": ""},
 )
 
-# Strip claude CLI noise (e.g. "Error: Reached max turns (1)")
-lines = result.stdout.strip().splitlines()
-lines = [l for l in lines if not l.startswith("Error: Reached max turns")]
-response = "\n".join(lines).strip()
+response = result.stdout.strip()
 if not response:
     print(f"discord_responder: no response from claude (rc={result.returncode}, stderr: {result.stderr[:200]})", file=sys.stderr)
     sys.exit(1)
