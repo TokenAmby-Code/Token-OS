@@ -316,6 +316,32 @@ def fetch_session_doc(doc_id):
 # Session doc blurb generation
 # ---------------------------------------------------------------------------
 
+def summarize_with_guardsman(transcript: str, session_id: str) -> str | None:
+    """Call MiniMax via openclaw to summarize the session transcript. Returns summary or None."""
+    snippet = transcript[:3000]
+    prompt = (
+        "You are summarizing a Claude Code session. Write exactly 2-3 sentences describing "
+        "what was accomplished. Be specific: mention file names, features built, bugs fixed. "
+        "Do not mention tools used or process steps. Just the outcome.\n\n"
+        f"Session transcript:\n{snippet}"
+    )
+    try:
+        result = subprocess.run(
+            ["openclaw", "agent", "--agent", "main",
+             "--session-id", f"stop-hook-summary-{session_id[:8]}",
+             "-m", prompt, "--local", "--json"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            text = data.get("payloads", [{}])[0].get("text", "").strip()
+            if text:
+                return text
+    except Exception as e:
+        print(f"[warn] guardsman summary failed: {e}", file=sys.stderr)
+    return None
+
+
 def build_blurb(session_id, events, instance):
     """Build a short markdown blurb for the session doc Activity Log."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -359,11 +385,16 @@ def build_blurb(session_id, events, instance):
     if len(first_user) > 200:
         task_desc += "..."
 
-    # Extract last assistant text as outcome
-    last_assistant = next((e["text"] for e in reversed(events) if e["role"] == "assistant"), "")
-    outcome = last_assistant[:300].replace("\n", " ").strip()
-    if len(last_assistant) > 300:
-        outcome += "..."
+    # Build transcript and try AI summary; fall back to last assistant message
+    transcript = render_transcript(events)
+    ai_summary = summarize_with_guardsman(transcript, session_id)
+    if ai_summary:
+        outcome = ai_summary
+    else:
+        last_assistant = next((e["text"] for e in reversed(events) if e["role"] == "assistant"), "")
+        outcome = last_assistant[:300].replace("\n", " ").strip()
+        if len(last_assistant) > 300:
+            outcome += "..."
 
     blurb = f"""
 ### Session: {tab_name} ({session_id[:8]}) — {now}
