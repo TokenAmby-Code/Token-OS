@@ -719,21 +719,21 @@ def get_timer_header_text() -> Text:
     icon = mode_icons.get(obsidian_mode, "❓")
     mode_name = obsidian_mode.replace("_", " ").title()
 
-    # Break time color: green >1hr, yellow >30min, red >15min, purple ≤15min, magenta backlog
+    # Break time color: bold green >60min, green >30min, yellow >15min, bold red ≥0, bold magenta backlog
     is_backlog = backlog_secs > 0
     if is_backlog:
-        break_color = "magenta"
+        break_style = "bold magenta"
         break_str = format_break_time(backlog_secs)
     else:
         break_str = format_break_time(break_secs)
         if break_secs > 3600:
-            break_color = "green"
+            break_style = "bold green"
         elif break_secs > 1800:
-            break_color = "yellow"
+            break_style = "green"
         elif break_secs > 900:
-            break_color = "red"
+            break_style = "yellow"
         else:
-            break_color = "purple"
+            break_style = "bold red"
 
     # Work mode indicator
     if work_mode == "clocked_out":
@@ -750,8 +750,8 @@ def get_timer_header_text() -> Text:
     text.append("  ", style="dim")
     text.append("⏱ ", style="dim")
     if is_backlog:
-        text.append("BACKLOG ", style=f"bold {break_color}")
-    text.append(break_str, style=f"bold {break_color}")
+        text.append("BACKLOG ", style=break_style)
+    text.append(break_str, style=break_style)
     if work_indicator:
         text.append(f"  {work_indicator}")
 
@@ -2594,15 +2594,15 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
         break_secs = state["break_secs"]
         break_str = format_break_time(break_secs)
         if break_secs > 3600:
-            break_color = "green"
+            break_style = "bold green"
         elif break_secs > 1800:
-            break_color = "yellow"
+            break_style = "green"
         elif break_secs > 900:
-            break_color = "red"
+            break_style = "yellow"
         else:
-            break_color = "purple"
+            break_style = "bold red"
         text.append(f"{icon} ", style="bold")
-        text.append(break_str, style=f"bold {break_color}")
+        text.append(break_str, style=break_style)
     text.append("  ", style="dim")
 
     text.append(f"{active_count}/{total_count} ", style="white")
