@@ -1,67 +1,211 @@
-#!/bin/bash
-# Token Check-in CLI - Interact with Token API check-in system
-# Usage: token-checkin [status|submit] [options]
+#!/usr/bin/env python3
+# token-checkin - Interact with Token-API check-in system
+# TAGS: token-api, wellness
+# AUDIENCE: human, agent
+"""Interact with Token-API productivity check-in system.
 
-API="http://localhost:7777"
+Usage:
+    token-checkin                           # Show check-in status
+    token-checkin status                    # Show check-in status
+    token-checkin today                     # Show today's completed check-ins
+    token-checkin submit <type> [options]   # Submit a check-in
+    token-checkin trigger <type>            # Manually trigger a check-in prompt
+    token-checkin -h, --help                # Show this help
 
-case "${1:-status}" in
-    status)
-        curl -s "$API/api/checkin/status" | jq '.'
-        ;;
-    today)
-        curl -s "$API/api/checkin/today" | jq '.'
-        ;;
-    submit)
-        TYPE="${2:-}"
-        if [[ -z "$TYPE" ]]; then
-            echo "Usage: token-checkin submit <type> [energy] [focus] [mood] [plan]"
-            echo "Types: morning_start, mid_morning, decision_point, afternoon, afternoon_check"
-            exit 1
-        fi
-        ENERGY="${3:-}"
-        FOCUS="${4:-}"
-        MOOD="${5:-}"
-        PLAN="${6:-}"
-        
-        # Build JSON payload
-        PAYLOAD="{\"type\":\"$TYPE\""
-        [[ -n "$ENERGY" ]] && PAYLOAD="$PAYLOAD,\"energy\":$ENERGY"
-        [[ -n "$FOCUS" ]] && PAYLOAD="$PAYLOAD,\"focus\":$FOCUS"
-        [[ -n "$MOOD" ]] && PAYLOAD="$PAYLOAD,\"mood\":\"$MOOD\""
-        [[ -n "$PLAN" ]] && PAYLOAD="$PAYLOAD,\"plan\":\"$PLAN\""
-        PAYLOAD="$PAYLOAD}"
-        
-        curl -s -X POST "$API/api/checkin/submit" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" | jq '.'
-        ;;
-    trigger)
-        TYPE="${2:-}"
-        if [[ -z "$TYPE" ]]; then
-            echo "Usage: token-checkin trigger <type>"
-            exit 1
-        fi
-        curl -s -X POST "$API/api/checkin/trigger/$TYPE" | jq '.'
-        ;;
-    help|--help|-h)
-        echo "Token Check-in CLI"
-        echo ""
-        echo "Usage: token-checkin <command> [options]"
-        echo ""
-        echo "Commands:"
-        echo "  status           Show check-in status (pending, completed, next)"
-        echo "  today            Show today's check-ins"
-        echo "  submit <type>    Submit a check-in"
-        echo "  trigger <type>   Trigger a check-in prompt"
-        echo ""
-        echo "Examples:"
-        echo "  token-checkin status"
-        echo "  token-checkin submit morning_start 8 9 \"focused\" \"Finish API docs\""
-        echo "  token-checkin trigger afternoon"
-        ;;
-    *)
-        echo "Unknown command: $1"
-        echo "Run 'token-checkin help' for usage"
-        exit 1
-        ;;
-esac
+Submit options:
+    --energy N     Energy level 1-10
+    --focus N      Focus level 1-10
+    --mood TEXT    Mood description (e.g. "good", "tired")
+    --notes TEXT   Free-form notes
+    --plan TEXT    Plan for the period
+
+Check-in types:
+    morning_start      9:00 AM
+    mid_morning        10:30 AM
+    decision_point     11:00 AM
+    afternoon          1:00 PM
+    afternoon_check    2:30 PM
+
+Examples:
+    token-checkin status
+    token-checkin submit morning_start --energy 8 --focus 9 --mood good
+    token-checkin submit afternoon --energy 6 --notes "Lost time to Slack"
+    token-checkin trigger afternoon
+"""
+
+import sys
+import json
+import urllib.request
+import urllib.error
+
+API_URL = "http://localhost:7777"
+
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+CYAN   = "\033[36m"
+DIM    = "\033[2m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+VALID_TYPES = (
+    "morning_start", "mid_morning", "decision_point",
+    "afternoon", "afternoon_check",
+)
+
+
+def request(method, path, body=None):
+    url = f"{API_URL}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode()
+            return resp.status, json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode()
+        try:
+            detail = json.loads(body_text)
+        except Exception:
+            detail = {"detail": body_text}
+        return e.code, detail
+    except urllib.error.URLError as e:
+        print(f"{RED}Server unreachable: {e.reason}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_status():
+    status, data = request("GET", "/api/checkin/status")
+    if status >= 400:
+        print(f"{RED}Error {status}: {data.get('detail', data)}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    next_type = data.get("next")
+    next_at   = data.get("next_at")
+    completed = data.get("completed") or []
+    pending   = data.get("pending") or []
+
+    if next_type:
+        time_str = f" at {next_at}" if next_at else ""
+        print(f"  {BOLD}Next:{RESET}      {CYAN}{next_type}{time_str}{RESET}")
+    else:
+        print(f"  {BOLD}Next:{RESET}      {DIM}none scheduled{RESET}")
+
+    if completed:
+        print(f"  {BOLD}Completed:{RESET} {GREEN}{', '.join(completed)}{RESET}")
+    else:
+        print(f"  {BOLD}Completed:{RESET} {DIM}none{RESET}")
+
+    if pending:
+        print(f"  {BOLD}Pending:{RESET}   {YELLOW}{', '.join(pending)}{RESET}")
+
+
+def cmd_today():
+    status, data = request("GET", "/api/checkin/today")
+    if status >= 400:
+        print(f"{RED}Error {status}: {data.get('detail', data)}{RESET}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(data, indent=2))
+
+
+def cmd_submit(args):
+    if not args:
+        print(f"{RED}Error: check-in type required{RESET}", file=sys.stderr)
+        print(f"Types: {', '.join(VALID_TYPES)}", file=sys.stderr)
+        sys.exit(1)
+
+    check_type = args[0]
+    if check_type not in VALID_TYPES:
+        print(f"{RED}Unknown check-in type: {check_type!r}{RESET}", file=sys.stderr)
+        print(f"Valid types: {', '.join(VALID_TYPES)}", file=sys.stderr)
+        sys.exit(1)
+
+    body = {"type": check_type}
+
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--energy" and i + 1 < len(args):
+            try:
+                body["energy"] = int(args[i + 1])
+            except ValueError:
+                print(f"{RED}--energy must be an integer{RESET}", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+        elif arg == "--focus" and i + 1 < len(args):
+            try:
+                body["focus"] = int(args[i + 1])
+            except ValueError:
+                print(f"{RED}--focus must be an integer{RESET}", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+        elif arg == "--mood" and i + 1 < len(args):
+            body["mood"] = args[i + 1]
+            i += 2
+        elif arg == "--notes" and i + 1 < len(args):
+            body["notes"] = args[i + 1]
+            i += 2
+        elif arg == "--plan" and i + 1 < len(args):
+            body["plan"] = args[i + 1]
+            i += 2
+        else:
+            print(f"{RED}Unknown argument: {arg}{RESET}", file=sys.stderr)
+            sys.exit(1)
+
+    status, data = request("POST", "/api/checkin/submit", body)
+    if status >= 400:
+        print(f"{RED}Error {status}: {data.get('detail', data)}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    msg = data.get("message") or data.get("status") or "submitted"
+    print(f"{GREEN}✓{RESET} {check_type}: {msg}")
+
+
+def cmd_trigger(args):
+    if not args:
+        print(f"{RED}Error: check-in type required{RESET}", file=sys.stderr)
+        print(f"Types: {', '.join(VALID_TYPES)}", file=sys.stderr)
+        sys.exit(1)
+
+    check_type = args[0]
+    if check_type not in VALID_TYPES:
+        print(f"{RED}Unknown check-in type: {check_type!r}{RESET}", file=sys.stderr)
+        print(f"Valid types: {', '.join(VALID_TYPES)}", file=sys.stderr)
+        sys.exit(1)
+
+    status, data = request("POST", f"/api/checkin/trigger/{check_type}")
+    if status >= 400:
+        print(f"{RED}Error {status}: {data.get('detail', data)}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    msg = data.get("message") or data.get("status") or "triggered"
+    print(f"{GREEN}✓{RESET} {check_type}: {msg}")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+
+    cmd = args[0] if args else "status"
+    rest = args[1:] if args else []
+
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "today":
+        cmd_today()
+    elif cmd == "submit":
+        cmd_submit(rest)
+    elif cmd == "trigger":
+        cmd_trigger(rest)
+    else:
+        print(f"{RED}Unknown command: {cmd!r}{RESET}", file=sys.stderr)
+        print("Run 'token-checkin --help' for usage.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
