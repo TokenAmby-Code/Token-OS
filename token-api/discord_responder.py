@@ -43,19 +43,39 @@ if not response:
     print(f"discord_responder: no response from claude (rc={result.returncode}, stderr: {result.stderr[:200]})", file=sys.stderr)
     sys.exit(1)
 
-# Post to daemon
-payload = json.dumps({
-    "channel": channel,
-    "bot": bot,
-    "content": response,
-    "reply_to": reply_to,
-}).encode()
+def _send_to_daemon(channel, bot, content, reply_to=None):
+    body = {"channel": channel, "bot": bot, "content": content}
+    if reply_to:
+        body["reply_to"] = reply_to
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:7779/send",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
 
-req = urllib.request.Request(
-    "http://127.0.0.1:7779/send",
-    data=payload,
-    headers={"Content-Type": "application/json"},
-    method="POST",
-)
-urllib.request.urlopen(req, timeout=10)
-print(f"discord_responder: sent {len(response)} chars as {bot} in #{channel}")
+# Post to daemon
+try:
+    _send_to_daemon(channel, bot, response, reply_to)
+    print(f"discord_responder: sent {len(response)} chars as {bot} in #{channel}", file=sys.stderr)
+except urllib.error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="replace")[:200]
+    print(f"[discord_responder] HTTP {e.code} from daemon: {body}", file=sys.stderr, flush=True)
+    if reply_to and e.code in (400, 404, 500):
+        print("[discord_responder] Retrying without reply_to reference...", file=sys.stderr, flush=True)
+        try:
+            _send_to_daemon(channel, bot, response, reply_to=None)
+            print(f"discord_responder: sent {len(response)} chars as {bot} in #{channel} (no reply_to)", file=sys.stderr)
+        except Exception as e2:
+            print(f"[discord_responder] Retry also failed: {e2}", file=sys.stderr, flush=True)
+            sys.exit(1)
+    else:
+        sys.exit(1)
+except urllib.error.URLError as e:
+    print(f"[discord_responder] URLError (daemon down?): {e}", file=sys.stderr, flush=True)
+    sys.exit(1)
+except Exception as e:
+    print(f"[discord_responder] Unexpected send error: {e}", file=sys.stderr, flush=True)
+    sys.exit(1)
