@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet Dispatch POC — Phase 6: retry queue execution + vault fleet report."""
+"""Fleet Dispatch POC — Phase 7: fix guardsman PATH in subprocess dispatch."""
 
 import subprocess, time, json, datetime, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +9,7 @@ LOG_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md")
 FLEET_REPORT_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Fleet/fleet_status.md")
 N = 10
 DAILY_BUDGET_USD = 2.00
+GUARDSMAN_BIN = os.path.expanduser("~/Scripts/cli-tools/bin/guardsman")
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
@@ -87,7 +88,7 @@ def _scan_mars_tasks(limit: int) -> list:
 def dispatch_one(task: str, category: str) -> dict:
     """Dispatch one task to MiniMax guardsman, return result dict."""
     t0 = time.time()
-    r = subprocess.run(["guardsman", task], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([GUARDSMAN_BIN, task], capture_output=True, text=True, timeout=120)
     return {
         "task": task, "category": category,
         "output": r.stdout.strip(), "stderr": r.stderr.strip(),
