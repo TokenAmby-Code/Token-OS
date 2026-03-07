@@ -89,6 +89,31 @@ def get_active_session_doc() -> str | None:
         return None
 
 
+def get_recent_session_doc() -> tuple[str | None, str | None]:
+    """Return (file_path, title) of the most recently active non-subagent instance with a session doc.
+
+    Unlike get_active_session_doc(), includes stopped instances — used for instance_zero context
+    when no active instances exist.
+    """
+    result = subprocess.run(
+        [
+            "agents-db", "--json", "query",
+            "SELECT sd.file_path, sd.title FROM claude_instances ci "
+            "JOIN session_documents sd ON ci.session_doc_id = sd.id "
+            "WHERE ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
+            "ORDER BY ci.last_activity DESC LIMIT 1",
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    try:
+        rows = json.loads(result.stdout)
+        if rows:
+            return rows[0].get("file_path"), rows[0].get("title")
+        return None, None
+    except Exception:
+        return None, None
+
+
 def get_session_context(file_path: str | None) -> str | None:
     """Read session doc and return last 500 chars of body (after frontmatter)."""
     if not file_path:
@@ -375,6 +400,25 @@ def main():
     zero_msg, zero_ch = check_instance_zero(metrics)
     if zero_msg:
         print(f"  Instance zero: {zero_msg}")
+        # Enrich with session context for re-orientation
+        if metrics.get("active_count", 0) == 0:
+            # No instances — surface what the Emperor was last working on
+            file_path, title = get_recent_session_doc()
+            if title:
+                ctx = get_session_context(file_path)
+                excerpt = (ctx[:150].replace("\n", " ").strip() + "…") if ctx else ""
+                zero_msg += f"\nLast active: *{title}*" + (f" — {excerpt}" if excerpt else "")
+                print(f"  Context: {title}")
+        else:
+            # Back online — include what the returning instance is working on
+            active_non_sub = [
+                i for i in instances
+                if i.get("status") == "active" and not i.get("is_subagent")
+            ]
+            if active_non_sub:
+                topic = extract_session_topic(active_non_sub[0])
+                zero_msg += f" Working on: {topic}."
+                print(f"  Context: {topic}")
         send_discord(f"Custodes: {zero_msg}", channel=zero_ch)
         if metrics.get("active_count", 0) == 0:
             log_to_daily_note(summary)
