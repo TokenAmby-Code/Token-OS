@@ -8771,21 +8771,34 @@ async def inbox_create(request: InboxCreateRequest):
 
 OBSIDIAN_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "obsidian")
 WEB_SEARCH_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "web-search")
+DISCORD_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "discord")
+
+CODEX_CONTEXT = """The Imperium of Claude is an agent orchestration system using Warhammer 40K hierarchy:
+- The Emperor: Token (human) — final authority
+- Adeptus Custodes: Claude Opus — strategic architecture, rare invocation
+- Inquisitor: Claude Sonnet — orchestration, medium/large tasks
+- Adeptus Mechanicus: Claude Sonnet (dedicated) — dev/tooling autonomy
+- Imperial Guard: MiniMax M2.5 — bulk work, volume tasks, disposable
+
+MiniMax is for mass, not precision. 300 prompts per 5 hours budget. Notes enter through Terra/Inbox/ and get enriched before promotion to Terra/Ultramar/ (authoritative notes).
+
+The system uses an Obsidian vault (Imperium-ENV) as its knowledge base. Terra/ is personal domain, Mars/ is mechanicus/agent operations."""
 
 
-async def run_implantation(note_path: str, title: str, note_type: str, source: str) -> None:
-    """Stage 2: Implantation — async enrichment of an inbox note with vault matches and web research."""
+async def run_implantation(note_path: str, title: str, note_type: str, source: str, skip_trials: bool = False) -> None:
+    """Stage 2: Implantation — async enrichment of an inbox note with vault matches and research swarm."""
     try:
-        # Budget check — preserve MiniMax quota for higher-priority work
-        if minimax_limiter.remaining < 10:
+        # Budget check — swarm costs ~14-18 queries per note
+        if minimax_limiter.remaining < 25:
             logger.warning(f"Implantation skipped for '{title}': MiniMax budget low ({minimax_limiter.remaining} remaining)")
             return
 
         sections = []
 
-        # --- Similar note search ---
+        # --- Phase 1a: Similar note search (vault) ---
         vault_synthesis = None
         raw_vault_lines = []
+        vault_context_str = ""
         try:
             proc = await asyncio.create_subprocess_exec(
                 OBSIDIAN_CLI, "vault=Imperium-ENV", "search:context", f'query={title}',
@@ -8802,10 +8815,10 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                         raw_vault_lines.append(line)
 
                 if raw_vault_lines:
-                    vault_context = "\n".join(raw_vault_lines[:50])  # cap context size
+                    vault_context_str = "\n".join(raw_vault_lines[:50])  # cap context size
                     vault_synthesis = await minimax_chat(
                         system_prompt=IMPLANTATION_ROLES["vault_relevance"]["system"],
-                        user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context}",
+                        user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context_str}",
                         max_tokens=IMPLANTATION_ROLES["vault_relevance"]["max_tokens"],
                     )
         except asyncio.TimeoutError:
@@ -8818,14 +8831,6 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             sections.append(f"### Similar Notes\n\n{vault_synthesis.strip()}")
         elif raw_vault_lines:
             # Fallback: raw wikilinks from matched files
-            seen_files = []
-            for line in raw_vault_lines:
-                fname = line.split(":")[0] if ":" in line else line
-                if fname not in seen_files:
-                    seen_files.append(fname)
-                note_name = fname.replace("Terra/Ultramar/", "").replace(".md", "")
-                if f"[[{note_name}]]" not in "\n".join(sections):
-                    pass  # will be added below
             fallback_links = []
             seen = set()
             for line in raw_vault_lines:
@@ -8837,35 +8842,105 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             if fallback_links:
                 sections.append(f"### Similar Notes\n\n{chr(10).join(fallback_links[:5])}")
 
-        # --- Web research ---
-        web_synthesis = None
-        raw_web_output = None
+        # --- Phase 1b: Research swarm ---
+        # Step 1: Generate diverse search queries via MiniMax
+        search_queries = []
         try:
-            proc = await asyncio.create_subprocess_exec(
-                WEB_SEARCH_CLI, "--count", "5", title,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            query_response = await minimax_chat(
+                system_prompt=IMPLANTATION_ROLES["query_generator"]["system"],
+                user_content=f"Note title: {title}\nNote type: {note_type}",
+                max_tokens=IMPLANTATION_ROLES["query_generator"]["max_tokens"],
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            raw_web_output = stdout.decode("utf-8", errors="replace").strip()
-
-            if raw_web_output:
-                web_synthesis = await minimax_chat(
-                    system_prompt=IMPLANTATION_ROLES["web_researcher"]["system"],
-                    user_content=f"Topic: {title}\n\nWeb search results:\n{raw_web_output}",
-                    max_tokens=IMPLANTATION_ROLES["web_researcher"]["max_tokens"],
-                )
-        except asyncio.TimeoutError:
-            logger.warning(f"Implantation: web search timed out for '{title}'")
+            if query_response and query_response.strip():
+                search_queries = [q.strip() for q in query_response.strip().splitlines() if q.strip()]
+                search_queries = search_queries[:15]  # cap at 15
         except Exception as e:
-            logger.warning(f"Implantation: web search failed for '{title}': {e}")
+            logger.warning(f"Implantation: query generation failed for '{title}': {e}")
+
+        if not search_queries:
+            # Fallback: use title as sole query
+            search_queries = [title]
+
+        logger.info(f"Implantation: swarm dispatched ({len(search_queries)} researchers) for '{title}'")
+
+        # Step 2: Run all web searches in parallel
+        async def _web_search(query: str) -> tuple[str, str]:
+            """Run a single web search, return (query, results)."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    WEB_SEARCH_CLI, "--count", "5", query,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                return (query, stdout.decode("utf-8", errors="replace").strip())
+            except asyncio.TimeoutError:
+                return (query, "")
+            except Exception:
+                return (query, "")
+
+        web_results = await asyncio.gather(
+            *[_web_search(q) for q in search_queries],
+            return_exceptions=True,
+        )
+
+        # Step 3: Fire MiniMax researcher calls in parallel
+        vault_brief = vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic."
+
+        async def _research(query: str, web_output: str) -> str:
+            """One researcher synthesizes their search results."""
+            if not web_output:
+                return ""
+            return await minimax_chat(
+                system_prompt=IMPLANTATION_ROLES["web_researcher"]["system"],
+                user_content=(
+                    f"Context: {CODEX_CONTEXT}\n\n"
+                    f"Existing vault knowledge:\n{vault_brief}\n\n"
+                    f"Your research angle: {query}\n\n"
+                    f"Web search results:\n{web_output}"
+                ),
+                max_tokens=512,
+            )
+
+        researcher_tasks = []
+        for result in web_results:
+            if isinstance(result, Exception):
+                continue
+            query, output = result
+            if output:
+                researcher_tasks.append(_research(query, output))
+
+        researcher_outputs = []
+        if researcher_tasks:
+            raw_outputs = await asyncio.gather(*researcher_tasks, return_exceptions=True)
+            for out in raw_outputs:
+                if isinstance(out, str) and out.strip():
+                    researcher_outputs.append(out.strip())
+
+        logger.info(f"Implantation: {len(researcher_outputs)}/{len(researcher_tasks)} researchers returned content for '{title}'")
+
+        # --- Phase 1c: Consolidation ---
+        consolidated = None
+        if researcher_outputs:
+            combined = "\n\n---\n\n".join(researcher_outputs)
+            try:
+                consolidated = await minimax_chat(
+                    system_prompt=IMPLANTATION_ROLES["consolidator"]["system"],
+                    user_content=f"Topic: {title}\nNote type: {note_type}\n\nResearch reports:\n\n{combined}",
+                    max_tokens=IMPLANTATION_ROLES["consolidator"]["max_tokens"],
+                )
+            except Exception as e:
+                logger.warning(f"Implantation: consolidation failed for '{title}': {e}")
 
         # Build Research section
-        if web_synthesis and web_synthesis.strip():
-            sections.append(f"### Research\n\n{web_synthesis.strip()}")
-        elif raw_web_output:
-            # Fallback: raw web search output
-            sections.append(f"### Research\n\n{raw_web_output[:2000]}")
+        if consolidated and consolidated.strip():
+            sections.append(f"### Research\n\n{consolidated.strip()}")
+        elif researcher_outputs:
+            # Fallback: use first few researcher outputs directly
+            fallback_research = "\n\n".join(researcher_outputs[:3])
+            sections.append(f"### Research\n\n{fallback_research[:3000]}")
+
+        logger.info(f"Implantation: consolidation complete for '{title}'")
 
         # --- Append to note ---
         if not sections:
@@ -8907,17 +8982,150 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             "type": note_type,
             "source": source,
             "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
-            "has_web_research": bool(web_synthesis or raw_web_output),
+            "has_web_research": bool(consolidated or researcher_outputs),
+            "researcher_count": len(researcher_outputs),
         })
         logger.info(f"Implantation complete for '{title}' ({note_path})")
+
+        # --- Fire Trials phase ---
+        if not skip_trials:
+            asyncio.create_task(run_trials(note_path, title, note_type))
+            logger.info(f"Trials dispatched for '{title}'")
 
     except Exception as e:
         logger.error(f"Implantation failed for '{title}': {e}", exc_info=True)
 
 
+async def run_trials(note_path: str, title: str, note_type: str) -> None:
+    """Stage 3: Trials — Custodes Sonnet challenge of an implanted note."""
+    try:
+        logger.info(f"Trials: starting for '{title}' ({note_path})")
+
+        # Read the full note content (now with implantation)
+        note_content = ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f'path={note_path}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            note_content = stdout.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            logger.error(f"Trials: could not read note '{title}': {e}")
+            return
+
+        if not note_content:
+            logger.warning(f"Trials: empty note content for '{title}', skipping")
+            return
+
+        # Build the trials prompt for Sonnet
+        trials_prompt = (
+            f"{CODEX_CONTEXT}\n\n"
+            f"You are an Adeptus Custodes performing trials on a new aspirant note. "
+            f"Your role is to challenge, question, and stress-test this note before it enters the vault.\n\n"
+            f"The note's declared type is: {note_type}\n\n"
+            f"Here is the full note content:\n\n---\n{note_content}\n---\n\n"
+            f"Produce exactly THREE sections in this format (use Obsidian callout syntax):\n\n"
+            f"## Trials\n\n"
+            f"> [!question] Open Questions\n"
+            f"> - (What's unclear, ambiguous, or needs clarification? What assumptions are being made?)\n\n"
+            f"> [!warning] Challenges\n"
+            f"> - (What could go wrong? What are the counterarguments? What's being overlooked?)\n\n"
+            f"> [!tip] Implementation Speculation\n"
+            f"> - (If prescriptive: how might it be implemented, what steps? If descriptive: what are the implications?)\n\n"
+            f"IMPORTANT: Check the note's `type` field. If the content is prescriptive (a goal, directive, or task) "
+            f"but marked as `descriptive`, or vice versa, flag this as a classification error in your Open Questions section.\n\n"
+            f"Be concise but thorough. 3-5 bullets per section. Output ONLY the formatted sections, nothing else."
+        )
+
+        # Run Claude Sonnet via CLI
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--model", "claude-sonnet-4-6", "--print", "--no-input",
+                "--prompt", trials_prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            trials_output = stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            logger.error(f"Trials: Sonnet timed out for '{title}'")
+            return
+        except Exception as e:
+            logger.error(f"Trials: Sonnet subprocess failed for '{title}': {e}")
+            return
+
+        if not trials_output:
+            logger.warning(f"Trials: empty Sonnet response for '{title}'")
+            return
+
+        # Ensure the output starts with ## Trials header (add if Sonnet omitted it)
+        if not trials_output.startswith("## Trials"):
+            trials_output = f"## Trials\n\n{trials_output}"
+
+        # Append trials to the note
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
+                f'path={note_path}', f'content={trials_output}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                logger.error(f"Trials: append failed for '{title}': {stderr.decode()}")
+                return
+        except Exception as e:
+            logger.error(f"Trials: append command failed for '{title}': {e}")
+            return
+
+        # Update status to trials_complete
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f'path={note_path}', 'property=status', 'value=trials_complete',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Trials: property:set failed for '{title}': {e}")
+
+        logger.info(f"Trials complete for '{title}' ({note_path})")
+
+        # Dual-ship to Discord
+        try:
+            # Build a simplified Discord message
+            discord_message = (
+                f"**Trials Complete: {title}**\n"
+                f"Type: `{note_type}` | Path: `{note_path}`\n\n"
+                f"{trials_output[:1800]}"
+            )
+            discord_proc = await asyncio.create_subprocess_exec(
+                "discord", "send", "fleet", "--bot", "custodes",
+                discord_message,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(discord_proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Trials: Discord notification failed for '{title}': {e}")
+
+        await log_event("trials_complete", device_id="sonnet", details={
+            "path": note_path,
+            "title": title,
+            "type": note_type,
+        })
+
+    except Exception as e:
+        logger.error(f"Trials failed for '{title}': {e}", exc_info=True)
+
+
 class InboxImplantRequest(BaseModel):
     """Manual trigger for implantation on an existing inbox note."""
     path: str
+    skip_trials: bool = False
 
 
 @app.post("/api/inbox/implant")
@@ -8937,9 +9145,10 @@ async def inbox_implant(request: InboxImplantRequest):
         title=title,
         note_type="capture",
         source="manual",
+        skip_trials=request.skip_trials,
     ))
 
-    return {"dispatched": True, "path": request.path, "title": title}
+    return {"dispatched": True, "path": request.path, "title": title, "skip_trials": request.skip_trials}
 
 
 # ============ Session Document Support ============
@@ -8978,8 +9187,16 @@ IMPLANTATION_ROLES = {
         "max_tokens": 512,
     },
     "web_researcher": {
-        "system": "You are a research assistant. Given web search results about a topic, write a concise 2-4 paragraph research brief. Include key facts, recent developments, and actionable insights. Cite sources with markdown links. Be factual and dense — no filler.",
-        "max_tokens": 1024,
+        "system": "You are a research assistant. Given web search results about a topic, write a concise focused paragraph. Include key facts, recent developments, and actionable insights. Cite sources with markdown links. Be factual and dense — no filler. You are one of many researchers working in parallel on different angles of the same topic, so stay focused on YOUR specific research angle.",
+        "max_tokens": 512,
+    },
+    "query_generator": {
+        "system": "You are a research strategist. Given a note title and content, generate 12 diverse web search queries that would help research this topic thoroughly. Include: direct queries, related concepts, opposing viewpoints, practical applications, recent news, and technical deep-dives. Return ONLY the queries, one per line, no numbering or bullets.",
+        "max_tokens": 512,
+    },
+    "consolidator": {
+        "system": "You are a research consolidator. Given multiple research reports on the same topic, merge them into a single cohesive research brief. Remove duplicates, resolve contradictions, keep the most important facts and insights. Cite sources with markdown links. Output clean markdown, 3-6 paragraphs. Be dense and factual.",
+        "max_tokens": 2048,
     },
 }
 
