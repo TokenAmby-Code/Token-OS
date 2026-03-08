@@ -49,13 +49,14 @@ def _check_fg_cadence(fg_id: str, max_hours: int) -> str | None:
     if not runs or not runs.get("runs"):
         return f"fabricator-general has NO run history. Fleet may never have been orchestrated."
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_hours)
+    # Cron engine stores naive local timestamps via datetime.now().isoformat()
+    cutoff = datetime.now() - timedelta(hours=max_hours)
     for run in runs["runs"]:
         if run["status"] == "ok" and run.get("finished_at"):
             try:
                 finished = datetime.fromisoformat(run["finished_at"])
-                if finished.tzinfo is None:
-                    finished = finished.replace(tzinfo=timezone.utc)
+                # Strip any tzinfo to compare naive-to-naive (both local)
+                finished = finished.replace(tzinfo=None)
                 if finished > cutoff:
                     return None  # OK — recent success
             except (ValueError, TypeError):

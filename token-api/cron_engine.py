@@ -373,6 +373,16 @@ class CronEngine:
         import time as _time
         start_time = _time.monotonic()
 
+        # Discord trigger notification (log on start)
+        if job.get("notify_discord"):
+            try:
+                subprocess.run(
+                    ["discord", "send", "fleet", f"🔄 **{job['name']}**: started"],
+                    timeout=8, env=_subprocess_env(),
+                )
+            except Exception as e:
+                print(f"CronEngine: Discord trigger notify failed for '{job['name']}': {e}")
+
         try:
             proc = await asyncio.create_subprocess_shell(
                 job["command"],
@@ -451,10 +461,12 @@ class CronEngine:
 
             print(f"CronEngine: '{job['name']}' finished: {status} ({duration:.1f}s)")
 
-            # Discord completion notification
+            # Discord completion notification (with substance)
             if job.get("notify_discord"):
                 emoji = "✅" if status == "ok" else ("⏱️" if status == "timeout" else "❌")
                 msg = f"{emoji} **{job['name']}**: {status} ({duration:.0f}s)"
+                if victory_reason:
+                    msg += f"\n> {victory_reason}"
                 try:
                     subprocess.run(
                         ["discord", "send", "fleet", msg],
