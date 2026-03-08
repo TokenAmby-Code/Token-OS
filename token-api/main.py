@@ -9039,15 +9039,19 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
             f"Be concise but thorough. 3-5 bullets per section. Output ONLY the formatted sections, nothing else."
         )
 
-        # Run Claude Sonnet via CLI
+        # Run Claude Sonnet via CLI (pipe prompt via stdin for long content)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--model", "claude-sonnet-4-6", "--print", "--no-input",
-                "--prompt", trials_prompt,
+                "claude", "--model", "claude-sonnet-4-6", "-p",
+                "--no-session-persistence", "--dangerously-skip-permissions",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=trials_prompt.encode("utf-8")),
+                timeout=120,
+            )
             trials_output = stdout.decode("utf-8", errors="replace").strip()
         except asyncio.TimeoutError:
             logger.error(f"Trials: Sonnet timed out for '{title}'")
