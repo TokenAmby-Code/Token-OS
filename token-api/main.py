@@ -886,6 +886,7 @@ async def init_db():
             ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
             ("guilliman", "Guilliman, The Codifier", '["g", "guilliman", "ultramar"]', "Imperium-ENV", "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.", "guilliman", "Personas/Guilliman.md"),
             ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
+            ("alpharius", "Alpharius, The Unknowable Twin", '["alpharius", "alpha", "hydra"]', "Imperium-ENV", "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. Reports through Mechanicus channels. I am Alpharius.", "alpharius", "Personas/Alpharius.md"),
         ]
         for p in primarch_seed:
             await db.execute("""

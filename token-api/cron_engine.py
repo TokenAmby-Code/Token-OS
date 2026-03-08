@@ -176,70 +176,19 @@ class CronEngine:
 
     # ── Load / Sync ────────────────────────────────────────────
 
-    # Permanent jobs seeded on first boot (INSERT OR IGNORE — DB is authoritative after that).
-    # Edit these only when the underlying command or schedule truly changes.
-    # Do NOT add ephemeral task workers here; create them via the API.
+    # The deep reserve. Alpharius is the ONLY seeded job — everything else lives
+    # exclusively in the DB, managed by the API. If FG, Custodes, or any other job
+    # is deleted, Alpharius detects it and alerts. The Emperor rebuilds from there.
     _PERMANENT_JOBS = [
         {
-            "id": "0b69c65b-c2ac-4d5c-a256-b53dfd43d3f6",
-            "name": "fabricator-general",
-            "commander": "mechanicus",
-            "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker. Runs 24/7.",
+            "id": "a1pha-r1us-0000-0000-hydra-dominatus",
+            "name": "alpharius-heartbeat",
+            "commander": "alpharius",
+            "description": "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. I am Alpharius.",
             "enabled": True,
-            "schedule": {"type": "cron", "value": "0 * * * *", "tz": "America/Phoenix"},
-            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/fabricator-general.md)" --dangerously-skip-permissions',
-            "timeout_seconds": 600,
-            "max_runs_per_window": 8,
-            "run_window_hours": 5,
-            "notify_discord": True,
-        },
-        {
-            "id": "d94a1683-d576-4350-ac88-dfe7e0053e02",
-            "name": "adeptus-custodes",
-            "commander": "custodes",
-            "description": "Morning briefing: reads overnight domain logs + cron DB stats, posts full report to #operations and greeting to #interrogative.",
-            "enabled": True,
-            "schedule": {"type": "cron", "value": "0 8 * * *", "tz": "America/Phoenix"},
-            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)" --dangerously-skip-permissions',
-            "timeout_seconds": 180,
-            "quiet_hours": [21, 8],
-            "max_runs_per_window": 3,
-            "run_window_hours": 12,
-        },
-        {
-            "id": "fe8b670b-ce96-424d-b931-e1b1675d7658",
-            "name": "custodes-heartbeat",
-            "commander": "custodes",
-            "description": "Custodes background presence — polls state, posts interesting observations to Discord, nudges on break debt.",
-            "enabled": True,
-            "schedule": {"type": "cron", "value": "*/15 * * * *", "tz": "America/Phoenix"},
-            "command": "cd ~/Scripts/token-api && python3 custodes_heartbeat.py",
-            "timeout_seconds": 120,
-        },
-        {
-            "id": "79358da9-4b1c-498c-8f4c-3e3b2e80c788",
-            "name": "mechanicus-classifier",
-            "commander": "mechanicus",
-            "description": "Autonomy classifier: scans for unclassified prescriptive notes, asks Emperor via Discord react, writes autonomy frontmatter.",
-            "enabled": False,
-            "schedule": {"type": "cron", "value": "30 */4 * * *", "tz": "America/Phoenix"},
-            "command": 'claude --model claude-sonnet-4-6 -p "$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-classifier.md)" --dangerously-skip-permissions',
-            "timeout_seconds": 600,
-            "max_runs_per_window": 4,
-            "run_window_hours": 24,
-        },
-        {
-            "id": "e0c0af83-e96e-41b4-8abe-c8f7651a6b23",
-            "name": "security-monitor",
-            "commander": "mechanicus",
-            "description": "Health checks: Token API, Tailscale, caffeinate. Logs to security_log.md.",
-            "enabled": False,
-            "schedule": {"type": "cron", "value": "0 */2 * * *", "tz": "America/Phoenix"},
-            "command": "claude --model claude-haiku-4-5-20251001 -p 'Run health checks and log results. Commands to run: (1) curl -s localhost:7777/health (2) tailscale status 2>&1 | head -3 (3) pgrep caffeinate && echo caffeinate:running || echo caffeinate:not_found. Append a single timestamped line to ~/.openclaw/workspace/memory/logs/security_log.md with format: TIMESTAMP | token_api:STATUS | tailscale:STATUS | caffeinate:STATUS' --dangerously-skip-permissions",
+            "schedule": {"type": "cron", "value": "*/30 * * * *", "tz": "America/Phoenix"},
+            "command": "cd ~/Scripts/token-api && python3 alpharius_heartbeat.py",
             "timeout_seconds": 60,
-            "quiet_hours": [23, 7],
-            "max_runs_per_window": 6,
-            "run_window_hours": 5,
         },
     ]
 
@@ -606,7 +555,7 @@ class CronEngine:
         job["is_running"] = job_id in self._running_jobs
         return job
 
-    VALID_COMMANDERS = {"mechanicus", "custodes"}
+    VALID_COMMANDERS = {"mechanicus", "custodes", "alpharius"}
 
     async def create_job(self, data: dict) -> dict:
         """Create a new cron job."""
