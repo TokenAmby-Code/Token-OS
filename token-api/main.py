@@ -8745,26 +8745,70 @@ async def inbox_create(request: InboxCreateRequest):
         frontmatter_lines += ["progress: 0", "completed: false"]
     frontmatter_lines.append("---")
 
-    body = request.content or ""
-    if request.author:
-        body = f"*Captured from {request.author} via {request.source}*\n\n{body}"
+    raw_body = request.content or ""
+    source_line = f"*Captured from {request.author} via {request.source}*\n\n" if request.author else ""
+
+    # Wrap gene-seed content in a callout so pipeline stages can distinguish
+    # the Emperor's original intent from pipeline-appended content
+    gene_seed_lines = raw_body.strip().splitlines()
+    callout_body = "\n> ".join(gene_seed_lines) if gene_seed_lines else "(empty)"
+    body = f"{source_line}> [!dna] Gene-Seed\n> {callout_body}\n"
 
     content = "\n".join(frontmatter_lines) + "\n\n" + body + "\n"
     filepath.write_text(content, encoding="utf-8")
 
+    note_path = f"Terra/Inbox/{filename}"
+
+    # Create a thread in #aspirants for this note's pipeline lifecycle
+    thread_id = None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post("http://127.0.0.1:7779/thread/create", json={
+                "channel": "aspirants",
+                "name": safe_title[:100],
+                "bot": "custodes",
+            })
+            if resp.status_code == 200:
+                thread_data = resp.json()
+                thread_id = thread_data.get("thread_id")
+                logger.info(f"Inbox: created aspirant thread '{safe_title}' -> {thread_id}")
+
+                # Store thread_id in note frontmatter
+                await asyncio.create_subprocess_exec(
+                    OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                    f"path={note_path}", "property=thread_id", f"value={thread_id}",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+
+                # Post gene-seed to the thread
+                gene_seed_msg = (
+                    f"**🧬 New Aspirant: {safe_title}**\n"
+                    f"Type: `{request.type}` | Source: `{request.source}`\n\n"
+                    f"> {raw_body.strip()[:1500]}"
+                )
+                await client.post("http://127.0.0.1:7779/send", json={
+                    "channel": "aspirants",
+                    "thread_id": thread_id,
+                    "content": gene_seed_msg,
+                    "bot": "custodes",
+                })
+            else:
+                logger.warning(f"Inbox: thread creation failed for '{safe_title}': {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Inbox: thread creation failed for '{safe_title}': {e}")
+
     # Self-notify (same pipeline as Templater-created notes)
     await inbox_notify(InboxNotifyRequest(
-        path=f"Terra/Inbox/{filename}",
+        path=note_path,
         title=safe_title,
         type=request.type,
         source=request.source,
     ))
 
-    note_path = f"Terra/Inbox/{filename}"
     obsidian_uri = f"obsidian://open?vault=Imperium-ENV&file={note_path.replace(' ', '%20')}"
 
     logger.info(f"Inbox: created '{filename}' from {request.source}")
-    return {"created": True, "path": note_path, "title": safe_title, "obsidian_uri": obsidian_uri}
+    return {"created": True, "path": note_path, "title": safe_title, "obsidian_uri": obsidian_uri, "thread_id": thread_id}
 
 
 # ---- Stage 2: Implantation ----
@@ -8772,6 +8816,36 @@ async def inbox_create(request: InboxCreateRequest):
 OBSIDIAN_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "obsidian")
 WEB_SEARCH_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "web-search")
 DISCORD_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "discord")
+DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
+
+
+async def _read_note_property(note_path: str, prop: str) -> str | None:
+    """Read a single frontmatter property from a note via obsidian CLI."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            OBSIDIAN_CLI, "vault=Imperium-ENV", "property:read",
+            f"path={note_path}", f"property={prop}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        val = stdout.decode("utf-8", errors="replace").strip()
+        return val if val and val != "null" and val != "undefined" else None
+    except Exception:
+        return None
+
+
+async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes") -> None:
+    """Post a message to an aspirant's thread in #aspirants."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(f"{DISCORD_DAEMON_URL}/send", json={
+                "channel": "aspirants",
+                "thread_id": thread_id,
+                "content": message[:2000],
+                "bot": bot,
+            })
+    except Exception as e:
+        logger.warning(f"Failed to post to aspirant thread {thread_id}: {e}")
 
 CODEX_CONTEXT = """The Imperium of Claude is an agent orchestration system using Warhammer 40K hierarchy:
 - The Emperor: Token (human) — final authority
@@ -9030,6 +9104,17 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         })
         logger.info(f"Implantation complete for '{title}' ({note_path})")
 
+        # Post implantation summary to aspirant thread
+        thread_id = await _read_note_property(note_path, "thread_id")
+        if thread_id:
+            implant_summary = (
+                f"**📚 Implantation Complete**\n"
+                f"Researchers: {len(researcher_outputs)} | "
+                f"Vault matches: {'Yes' if (vault_synthesis or raw_vault_lines) else 'None'}\n\n"
+                f"{(inquisition_reviewed or consolidated or '')[:1500]}"
+            )
+            await _post_to_aspirant_thread(thread_id, implant_summary)
+
         # --- Fire Trials phase ---
         if not skip_trials:
             asyncio.create_task(run_trials(note_path, title, note_type))
@@ -9067,14 +9152,28 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
             f"{CODEX_CONTEXT}\n\n"
             f"You are an Adeptus Custodes performing trials on a new aspirant note. "
             f"Your role is to challenge, question, and stress-test this note before it enters the vault.\n\n"
+            f"## Pipeline Context — READ THIS FIRST\n\n"
+            f"This note has already passed through earlier pipeline stages. The note contains:\n"
+            f"1. **Gene-Seed** (in a `> [!dna]` callout): The Emperor's original idea/content. This is the CORE of the note — "
+            f"everything else exists to serve it. Your trials should evaluate whether the gene-seed idea is sound, not whether "
+            f"the pipeline processing was perfect.\n"
+            f"2. **## Implantation / ### Research**: Research produced by an Imperial Guard (MiniMax) swarm, then reviewed "
+            f"by the Inquisition (Sonnet). The Inquisition Review section is the oversight layer's assessment of the Guard's "
+            f"research quality. If the Inquisition says 'MISSION FAILURE' or 'FAIL', that means the Guard researched the wrong "
+            f"thing — it does NOT mean the gene-seed idea is wrong. The gene-seed and the research quality are independent.\n"
+            f"3. **Inquisition Verdict**: The Inquisitor's final assessment of research quality. This is pipeline metadata, "
+            f"not part of the note's content. Do not treat it as contradicting the gene-seed.\n\n"
+            f"Your job is to evaluate the GENE-SEED IDEA on its own merits, informed by whatever useful research survived "
+            f"the Inquisition review. If the research failed, note that the idea needs better research — don't conflate "
+            f"research failure with idea failure.\n\n"
             f"The note's declared type is: {note_type}\n\n"
             f"Here is the full note content:\n\n---\n{note_content}\n---\n\n"
             f"Produce exactly THREE sections in this format (use Obsidian callout syntax):\n\n"
             f"## Trials\n\n"
             f"> [!question] Open Questions\n"
-            f"> - (What's unclear, ambiguous, or needs clarification? What assumptions are being made?)\n\n"
+            f"> - (What's unclear about the GENE-SEED idea? What assumptions is the Emperor making? What needs clarification?)\n\n"
             f"> [!warning] Challenges\n"
-            f"> - (What could go wrong? What are the counterarguments? What's being overlooked?)\n\n"
+            f"> - (What could go wrong with this idea? Counterarguments? What's being overlooked?)\n\n"
             f"> [!tip] Implementation Speculation\n"
             f"> - (If prescriptive: how might it be implemented, what steps? If descriptive: what are the implications?)\n\n"
             f"IMPORTANT: Check the note's `type` field. If the content is prescriptive (a goal, directive, or task) "
@@ -9141,17 +9240,25 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
 
         logger.info(f"Trials initiated for '{title}' ({note_path}) — awaiting Emperor response")
 
-        # Dual-ship to Discord for Emperor review
-        try:
-            discord_message = (
-                f"**⚔️ Trials Initiated: {title}**\n"
-                f"Type: `{note_type}` | Path: `{note_path}`\n"
+        # Post trials to aspirant thread (primary) and #fleet (notification)
+        thread_id = await _read_note_property(note_path, "thread_id")
+        if thread_id:
+            trials_msg = (
+                f"**⚔️ Trials Initiated**\n"
                 f"Status: `trials_active` — awaiting Emperor review\n\n"
                 f"{trials_output[:1800]}"
             )
+            await _post_to_aspirant_thread(thread_id, trials_msg)
+
+        # Brief notification to #fleet
+        try:
+            fleet_msg = (
+                f"**⚔️ Trials Initiated: {title}**\n"
+                f"Type: `{note_type}` | Respond in #aspirants thread"
+            )
             discord_proc = await asyncio.create_subprocess_exec(
                 "discord", "send", "fleet", "--bot", "custodes",
-                discord_message,
+                fleet_msg,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

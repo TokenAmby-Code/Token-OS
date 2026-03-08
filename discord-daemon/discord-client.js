@@ -102,9 +102,16 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
     const isAllowedChannel = allowedChannelIds.has(message.channelId);
     const isOperatorDM = isDM && message.author.id === config.operator_user_id;
 
-    if (!isAllowedChannel && !isOperatorDM) return;
+    // Thread support: if message is in a thread whose parent is an allowed channel, forward it
+    const isThread = message.channel.isThread?.() || false;
+    const parentChannelId = isThread ? message.channel.parentId : null;
+    const isAllowedThread = isThread && allowedChannelIds.has(parentChannelId);
 
-    const channelName = isDM ? 'dm' : (channelIdToName[message.channelId] || message.channelId);
+    if (!isAllowedChannel && !isOperatorDM && !isAllowedThread) return;
+
+    const channelName = isDM ? 'dm'
+      : isAllowedThread ? (channelIdToName[parentChannelId] || parentChannelId)
+      : (channelIdToName[message.channelId] || message.channelId);
 
     const msgData = {
       message_id: message.id,
@@ -124,6 +131,12 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
       reply_to_message_id: message.reference?.messageId || null,
       attachments: message.attachments.map(a => ({ url: a.url, name: a.name })),
       embeds: message.embeds.length,
+      // Thread metadata
+      is_thread: isThread,
+      thread_id: isThread ? message.channelId : null,
+      thread_name: isThread ? (message.channel.name || null) : null,
+      parent_channel_id: parentChannelId,
+      parent_channel_name: isAllowedThread ? channelName : null,
     };
 
     logger.debug(`[${channelName}] ${msgData.author.username}: ${message.content.slice(0, 80)}`);
