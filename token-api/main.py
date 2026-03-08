@@ -6167,6 +6167,25 @@ async def get_cron_status():
     return await cron_engine.get_status()
 
 
+@app.post("/api/fleet/pause")
+async def pause_fleet(request: Request):
+    """Pause the fleet by disabling enabled cron jobs.
+    Stores which jobs were enabled so /unpause restores exactly the previous state.
+    Optional body: {"commanders": ["mechanicus"]} to pause specific factions."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    commanders = data.get("commanders")
+    return await cron_engine.pause_fleet(commanders)
+
+
+@app.post("/api/fleet/unpause")
+async def unpause_fleet():
+    """Unpause the fleet by re-enabling jobs that were paused."""
+    return await cron_engine.unpause_fleet()
+
+
 def _parse_heartbeat_entries(max_entries: int = 20) -> list:
     """Parse structured entries from heartbeat_log.md."""
     entries = []

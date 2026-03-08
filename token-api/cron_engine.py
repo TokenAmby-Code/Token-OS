@@ -864,3 +864,112 @@ class CronEngine:
             "runs_last_24h": runs_24h,
             "jobs": jobs,
         }
+
+    # ── Pause / Unpause ──────────────────────────────────────
+
+    async def pause_fleet(self, commanders: list[str] | None = None) -> dict:
+        """Pause cron jobs by disabling them and storing which were enabled.
+
+        Args:
+            commanders: List of commander factions to pause. If None, pauses all.
+
+        Returns:
+            Dict with paused job names and count.
+        """
+        now = _now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            if commanders:
+                placeholders = ",".join("?" for _ in commanders)
+                cursor = await db.execute(
+                    f"SELECT id, name FROM cron_jobs WHERE enabled = 1 AND commander IN ({placeholders})",
+                    commanders,
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT id, name FROM cron_jobs WHERE enabled = 1"
+                )
+            enabled_jobs = await cursor.fetchall()
+
+            if not enabled_jobs:
+                return {"paused": [], "count": 0, "message": "No enabled jobs to pause"}
+
+            job_ids = [row[0] for row in enabled_jobs]
+            job_names = [row[1] for row in enabled_jobs]
+
+            # Store the paused set in a simple table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS fleet_pause_state (
+                    job_id TEXT NOT NULL,
+                    paused_at TEXT NOT NULL
+                )
+            """)
+            # Clear any previous pause state
+            await db.execute("DELETE FROM fleet_pause_state")
+            for jid in job_ids:
+                await db.execute(
+                    "INSERT INTO fleet_pause_state (job_id, paused_at) VALUES (?, ?)",
+                    (jid, now),
+                )
+
+            # Disable all paused jobs
+            placeholders = ",".join("?" for _ in job_ids)
+            await db.execute(
+                f"UPDATE cron_jobs SET enabled = 0, updated_at = ? WHERE id IN ({placeholders})",
+                [now] + job_ids,
+            )
+            await db.commit()
+
+        # Remove from scheduler
+        for jid in job_ids:
+            try:
+                self.scheduler.remove_job(f"cron_{jid}")
+            except Exception:
+                pass
+
+        print(f"CronEngine: Fleet paused — {len(job_ids)} jobs disabled: {', '.join(job_names)}")
+        return {"paused": job_names, "count": len(job_ids)}
+
+    async def unpause_fleet(self) -> dict:
+        """Unpause cron jobs by re-enabling those that were paused.
+
+        Returns:
+            Dict with unpaused job names and count.
+        """
+        now = _now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check if pause state exists
+            try:
+                cursor = await db.execute("SELECT job_id FROM fleet_pause_state")
+                paused_ids = [row[0] for row in await cursor.fetchall()]
+            except Exception:
+                return {"unpaused": [], "count": 0, "message": "No pause state found — fleet was not paused"}
+
+            if not paused_ids:
+                return {"unpaused": [], "count": 0, "message": "No pause state found — fleet was not paused"}
+
+            # Re-enable paused jobs
+            placeholders = ",".join("?" for _ in paused_ids)
+            await db.execute(
+                f"UPDATE cron_jobs SET enabled = 1, updated_at = ? WHERE id IN ({placeholders})",
+                [now] + paused_ids,
+            )
+
+            # Get names for response
+            cursor = await db.execute(
+                f"SELECT name FROM cron_jobs WHERE id IN ({placeholders})",
+                paused_ids,
+            )
+            job_names = [row[0] for row in await cursor.fetchall()]
+
+            # Clear pause state
+            await db.execute("DELETE FROM fleet_pause_state")
+            await db.commit()
+
+        # Re-register with scheduler
+        for jid in paused_ids:
+            job = await self.get_job(jid)
+            if job and job["enabled"]:
+                self._register_job(job)
+
+        print(f"CronEngine: Fleet unpaused — {len(paused_ids)} jobs re-enabled: {', '.join(job_names)}")
+        return {"unpaused": job_names, "count": len(paused_ids)}
