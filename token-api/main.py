@@ -7676,7 +7676,7 @@ async def handle_session_end(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id FROM claude_instances WHERE id = ?",
             (session_id,)
         )
         row = await cursor.fetchone()
@@ -7685,6 +7685,7 @@ async def handle_session_end(payload: dict) -> dict:
             return {"success": False, "action": "not_found", "instance_id": session_id}
 
         is_subagent = row[2]
+        session_doc_id = row[3]
 
         # Count non-subagent active instances BEFORE stopping
         cursor = await db.execute(
@@ -7720,6 +7721,21 @@ async def handle_session_end(payload: dict) -> dict:
     # Instance count Pavlok signals (skip subagents)
     if not is_subagent:
         await check_instance_count_pavlok(remaining_non_sub, was_active)
+
+    # Spawn stop_hook.py to generate session blurb if instance has a linked session doc
+    if session_doc_id and not is_subagent:
+        stop_hook_script = Path(__file__).parent / "stop_hook.py"
+        if stop_hook_script.exists():
+            try:
+                subprocess.Popen(
+                    ["python3", str(stop_hook_script), session_id],
+                    stdout=subprocess.DEVNULL,
+                    stderr=open("/tmp/stop_hook.log", "a"),
+                    start_new_session=True
+                )
+                logger.info(f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id})")
+            except Exception as e:
+                logger.warning(f"Hook: SessionEnd failed to spawn stop_hook: {e}")
 
     # Handle productivity enforcement if needed
     result = {"success": True, "action": "stopped", "instance_id": session_id}
@@ -8470,6 +8486,11 @@ async def receive_discord_message(request: DiscordMessageRequest):
     # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
         asyncio.create_task(_discord_respond(request, bot="mechanicus"))
+        return {"received": True, "message_id": request.message_id}
+
+    # Trigger 1.5: @Custodes mention in any channel
+    if f"<@{CUSTODES_USER_ID}>" in content:
+        asyncio.create_task(_discord_respond(request, bot="custodes"))
         return {"received": True, "message_id": request.message_id}
 
     # Trigger 2: Reply in a Custodes-owned channel
