@@ -697,6 +697,20 @@ def format_break_time(seconds: int) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def break_balance_style(break_secs: int, backlog_secs: int) -> str:
+    """Return Rich style string for break balance color coding."""
+    if backlog_secs > 0:
+        return "bold magenta"
+    if break_secs > 3600:
+        return "bold green"
+    elif break_secs > 1800:
+        return "green"
+    elif break_secs > 900:
+        return "yellow"
+    else:
+        return "bold red"
+
+
 def get_timer_header_text() -> Text:
     """Generate timer/mode display for header. Reads directly from in-memory timer via API."""
     state = _read_timer()
@@ -721,19 +735,8 @@ def get_timer_header_text() -> Text:
 
     # Break time color: bold green >60min, green >30min, yellow >15min, bold red ≥0, bold magenta backlog
     is_backlog = backlog_secs > 0
-    if is_backlog:
-        break_style = "bold magenta"
-        break_str = format_break_time(backlog_secs)
-    else:
-        break_str = format_break_time(break_secs)
-        if break_secs > 3600:
-            break_style = "bold green"
-        elif break_secs > 1800:
-            break_style = "green"
-        elif break_secs > 900:
-            break_style = "yellow"
-        else:
-            break_style = "bold red"
+    break_style = break_balance_style(break_secs, backlog_secs)
+    break_str = format_break_time(backlog_secs if is_backlog else break_secs)
 
     # Work mode indicator
     if work_mode == "clocked_out":
@@ -2617,24 +2620,14 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     }
     icon = mode_icons.get(state["mode"], "❓")
     is_backlog = state["backlog_secs"] > 0
+    _break_secs = state["break_secs"]
+    _backlog_secs = state["backlog_secs"]
+    break_style = break_balance_style(_break_secs, _backlog_secs)
+    break_str = format_break_time(_backlog_secs if is_backlog else _break_secs)
+    text.append(f"{icon} ", style="bold")
     if is_backlog:
-        break_str = format_break_time(state["backlog_secs"])
-        text.append(f"{icon} ", style="bold")
-        text.append("BL ", style="bold magenta")
-        text.append(break_str, style="bold magenta")
-    else:
-        break_secs = state["break_secs"]
-        break_str = format_break_time(break_secs)
-        if break_secs > 3600:
-            break_style = "bold green"
-        elif break_secs > 1800:
-            break_style = "green"
-        elif break_secs > 900:
-            break_style = "yellow"
-        else:
-            break_style = "bold red"
-        text.append(f"{icon} ", style="bold")
-        text.append(break_str, style=break_style)
+        text.append("BL ", style=break_style)
+    text.append(break_str, style=break_style)
     text.append("  ", style="dim")
 
     text.append(f"{active_count}/{total_count} ", style="white")
