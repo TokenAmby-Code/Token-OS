@@ -9477,6 +9477,200 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
         logger.error(f"Trials failed for '{title}': {e}", exc_info=True)
 
 
+async def _read_thread_messages(thread_id: str, limit: int = 20) -> list[dict]:
+    """Read messages from a Discord thread by channel ID via the daemon."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{DISCORD_DAEMON_URL}/read",
+                params={"channel": thread_id, "limit": limit},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("messages", [])
+    except Exception as e:
+        logger.warning(f"Failed to read thread {thread_id}: {e}")
+    return []
+
+
+async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor_response: str) -> None:
+    """Process Emperor's response to trials and render a PASS/FAIL verdict via Sonnet."""
+    try:
+        logger.info(f"Trials verdict: processing for '{title}'")
+
+        # Read the full note content
+        note_content = ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f"path={note_path}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            note_content = stdout.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            logger.error(f"Trials verdict: could not read note '{title}': {e}")
+            return
+
+        # Build verdict prompt for Sonnet
+        verdict_prompt = (
+            f"{CODEX_CONTEXT}\n\n"
+            f"You are the Adeptus Custodes rendering a verdict on the trials of aspirant note '{title}'.\n\n"
+            f"The Emperor has responded in the thread debate. Based on the Emperor's response and the note's "
+            f"content, determine whether this note should PASS (proceed to trials_passed) or FAIL (needs "
+            f"revision, set trials_failed).\n\n"
+            f"## The Note (type: {note_type})\n\n{note_content[:3000]}\n\n"
+            f"## Emperor's Response\n\n{emperor_response}\n\n"
+            f"## Instructions\n\n"
+            f"First line MUST be exactly one of:\n"
+            f"VERDICT: PASS - <one sentence reason>\n"
+            f"VERDICT: FAIL - <one sentence reason explaining what needs revision>\n\n"
+            f"Then 2-3 sentences of commentary on the debate and what happens next.\n"
+            f"If the Emperor's response is ambiguous or asks a question without clearly approving, default to FAIL."
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--model", "claude-sonnet-4-6", "-p",
+                "--no-session-persistence", "--dangerously-skip-permissions",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(input=verdict_prompt.encode("utf-8")),
+                timeout=60,
+            )
+            verdict_output = stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            logger.error(f"Trials verdict: Sonnet timed out for '{title}'")
+            return
+        except Exception as e:
+            logger.error(f"Trials verdict: Sonnet failed for '{title}': {e}")
+            return
+
+        if not verdict_output:
+            logger.warning(f"Trials verdict: empty Sonnet response for '{title}'")
+            return
+
+        # Parse PASS/FAIL from first line
+        first_line = verdict_output.splitlines()[0] if verdict_output.splitlines() else ""
+        is_pass = "VERDICT: PASS" in first_line.upper()
+        new_status = "trials_passed" if is_pass else "trials_failed"
+        verdict_emoji = "✅" if is_pass else "❌"
+        callout_type = "success" if is_pass else "danger"
+
+        # Update note status property
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f"path={note_path}", "property=status", f"value={new_status}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Trials verdict: property:set failed for '{title}': {e}")
+
+        # Append verdict section to note
+        verdict_section = (
+            f"\n\n## Verdict\n\n"
+            f"> [!{callout_type}] {verdict_emoji} {'Trials Passed' if is_pass else 'Trials Failed'}\n"
+            f"> {first_line}\n\n"
+            f"{chr(10).join(verdict_output.splitlines()[1:]).strip()}"
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
+                f"path={note_path}", f"content={verdict_section}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Trials verdict: append failed for '{title}': {e}")
+
+        # Post verdict back to aspirant thread
+        thread_id = await _read_note_property(note_path, "thread_id")
+        if thread_id:
+            thread_msg = (
+                f"**{verdict_emoji} Custodes Verdict: {'TRIALS PASSED' if is_pass else 'TRIALS FAILED'}**\n"
+                f"Status: `{new_status}`\n\n"
+                f"{verdict_output[:1800]}"
+            )
+            await _post_to_aspirant_thread(thread_id, thread_msg)
+
+        await log_event("trials_verdict", device_id="sonnet", details={
+            "path": note_path,
+            "title": title,
+            "type": note_type,
+            "verdict": "pass" if is_pass else "fail",
+            "status": new_status,
+        })
+        logger.info(f"Trials verdict for '{title}': {new_status}")
+
+    except Exception as e:
+        logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
+
+
+@app.post("/api/inbox/trials-check")
+async def inbox_trials_check():
+    """Scan trials_active notes for Emperor replies and dispatch verdicts."""
+    import glob as glob_module
+
+    results: dict = {"scanned": 0, "trials_active": 0, "verdicts_triggered": 0, "notes": []}
+
+    note_files = glob_module.glob(str(OBSIDIAN_INBOX_PATH / "*.md"))
+    results["scanned"] = len(note_files)
+
+    for note_file in note_files:
+        filename = Path(note_file).name
+        note_path = f"Terra/Inbox/{filename}"
+        title = filename.replace(".md", "")
+
+        status = await _read_note_property(note_path, "status")
+        if status != "trials_active":
+            continue
+
+        results["trials_active"] += 1
+
+        thread_id = await _read_note_property(note_path, "thread_id")
+        if not thread_id:
+            results["notes"].append({"title": title, "skipped": "no thread_id"})
+            continue
+
+        messages = await _read_thread_messages(thread_id, limit=20)
+        if not messages:
+            results["notes"].append({"title": title, "skipped": "no messages"})
+            continue
+
+        # Find the timestamp of the Trials Initiated post (the ⚔️ bot message)
+        trials_ts = None
+        for msg in messages:
+            if msg.get("author", {}).get("bot") and "Trials Initiated" in msg.get("content", ""):
+                trials_ts = msg.get("timestamp")
+                break
+
+        # Collect non-bot messages posted after the trials were initiated
+        emperor_replies = []
+        for msg in messages:
+            if msg.get("author", {}).get("bot"):
+                continue
+            if trials_ts and msg.get("timestamp", "") <= trials_ts:
+                continue
+            content = msg.get("content", "").strip()
+            if content:
+                emperor_replies.append(content)
+
+        if not emperor_replies:
+            results["notes"].append({"title": title, "skipped": "no Emperor reply yet"})
+            continue
+
+        note_type = await _read_note_property(note_path, "type") or "unknown"
+        emperor_response = "\n\n".join(emperor_replies)
+
+        asyncio.create_task(run_trials_verdict(note_path, title, note_type, emperor_response))
+        results["verdicts_triggered"] += 1
+        results["notes"].append({"title": title, "verdict": "dispatched", "replies": len(emperor_replies)})
+
+    return results
+
+
 class InboxImplantRequest(BaseModel):
     """Manual trigger for implantation on an existing inbox note."""
     path: str
