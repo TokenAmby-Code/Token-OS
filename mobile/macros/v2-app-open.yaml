@@ -1,0 +1,53 @@
+# App Open Telemetry v2
+# Unified macro — one trigger per monitored app.
+# No Shizuku, no local fallback. Server-only enforcement.
+#
+# MVP: Twitter only. Add triggers here as apps are validated.
+
+name: "App Open v2"
+category: "Telemetry"
+description: "Report app opens to server via /phone/event"
+enabled: true
+
+variables:
+  - name: app_name
+    type: string
+    value: ""
+  - name: response_code
+    type: integer
+    value: 0
+
+triggers:
+  # --- Twitter ---
+  - type: app_launched
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    launched: true
+
+actions:
+  # Identify which app triggered (MacroDroid sets {trigger_app_package})
+  - type: set_variable
+    name: "app_name"
+    value: "{trigger_app_package}"
+    var_type: string
+    local: true
+
+  # Log
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO app-open TRIGGERED app={lv=app_name}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Report to server
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "app_open", "app": "{lv=app_name}"}'
+    content_type: "application/json"
+    code_var: "response_code"
+    block_next: true
+    timeout: 5
+
+  # Log result
+  - type: shell
+    command: 'echo "{system_time} INFO app-open HTTP code={lv=response_code} app={lv=app_name}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false

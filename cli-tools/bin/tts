@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# tts - Send a TTS message to Token-API (Mac mini)
+# tts - Send a TTS message via Token-API queue
 # TAGS: token-api
 # AUDIENCE: agent
 #
 # Usage:
 #   tts "Your spoken message here"
 #   tts --instance-id <id> "Your spoken message"
-#   tts --sync "Your spoken message"   # Wait for response (default: fire-and-forget)
+#   tts --direct "Your spoken message"   # Bypass queue, speak on Mac directly
+#   tts --sync "Your spoken message"     # Wait for response (default: fire-and-forget)
+#
+# Routes through the TTS queue using the calling instance's voice profile
+# and WSL-first audio. Resolves instance ID automatically via PID/CWD.
+# Falls back to direct Mac TTS if no instance can be resolved.
 #
 # The message is passed as all positional arguments after any flags,
 # so quoting is optional: tts Hello world works too.
@@ -16,17 +21,80 @@
 
 set -euo pipefail
 
-TOKEN_API_HOST="http://100.95.109.23:7777"
-ENDPOINT="/api/notify/tts"
+API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 
 # Defaults
-INSTANCE_ID="${TOKEN_API_INSTANCE_ID:-}"
+INSTANCE_ID=""
 SYNC=false
+DIRECT=false
 
 usage() {
-    # Print only the header comment block (stops at first blank line or non-comment)
     awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
     exit 0
+}
+
+# --- Instance resolution (shared pattern with instance-name, voice-chat) ---
+
+_find_claude_pid() {
+    local current="$PPID"
+    local comm
+    for _ in 1 2 3 4 5; do
+        [[ -z "$current" || "$current" == "1" ]] && break
+        comm=$(ps -o comm= -p "$current" 2>/dev/null || true)
+        if [[ "$comm" == "claude" ]]; then
+            echo "$current"
+            return 0
+        fi
+        current=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ' || true)
+    done
+    return 1
+}
+
+_resolve_instance_id() {
+    local INSTANCE_ID=""
+    local INSTANCES=""
+
+    # Method 1: PID-based cache
+    local CLAUDE_PID
+    CLAUDE_PID=$(_find_claude_pid 2>/dev/null || true)
+    if [[ -n "$CLAUDE_PID" ]]; then
+        local SESSION_PID_FILE="${HOME}/.claude/session-pids/${CLAUDE_PID}"
+        if [[ -f "$SESSION_PID_FILE" ]]; then
+            INSTANCE_ID=$(cat "$SESSION_PID_FILE" 2>/dev/null || true)
+        fi
+    fi
+
+    # Method 2: PID field match in API
+    if [[ -z "$INSTANCE_ID" ]] && [[ -n "${CLAUDE_PID:-}" ]]; then
+        INSTANCES=$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)
+        if [[ -n "$INSTANCES" ]]; then
+            INSTANCE_ID=$(echo "$INSTANCES" | \
+                jq -r --argjson pid "$CLAUDE_PID" \
+                    '.[] | select(.pid == $pid and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | \
+                head -1 || true)
+        fi
+    fi
+
+    # Method 3: CWD match
+    if [[ -z "$INSTANCE_ID" ]]; then
+        local CWD
+        CWD="$(pwd)"
+        INSTANCES="${INSTANCES:-$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)}"
+        if [[ -n "$INSTANCES" ]]; then
+            INSTANCE_ID=$(echo "$INSTANCES" | \
+                jq -r --arg cwd "$CWD" \
+                    '[ .[] | select(.status == "processing" and .working_dir == $cwd) ] | .[0].id // ""' \
+                    2>/dev/null || true)
+            if [[ -z "$INSTANCE_ID" ]]; then
+                INSTANCE_ID=$(echo "$INSTANCES" | \
+                    jq -r --arg cwd "$CWD" \
+                        '[ .[] | select(.status == "idle" and .working_dir == $cwd) ] | .[0].id // ""' \
+                        2>/dev/null || true)
+            fi
+        fi
+    fi
+
+    echo "$INSTANCE_ID"
 }
 
 # Parse flags
@@ -41,6 +109,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sync)
             SYNC=true
+            shift
+            ;;
+        --direct)
+            DIRECT=true
             shift
             ;;
         --)
@@ -67,26 +139,40 @@ if [[ -z "$MESSAGE" ]]; then
     exit 1
 fi
 
-# Build JSON with jq — handles all special characters correctly
-# jq --arg passes the value as a literal string, no manual escaping needed
-if [[ -n "$INSTANCE_ID" ]]; then
+# Resolve instance ID if not explicitly provided
+if [[ -z "$INSTANCE_ID" && "$DIRECT" == "false" ]]; then
+    INSTANCE_ID=$(_resolve_instance_id)
+fi
+
+# Route through queue when we have an instance ID (unless --direct)
+if [[ -n "$INSTANCE_ID" && "$DIRECT" == "false" ]]; then
+    ENDPOINT="/api/notify/queue"
     JSON=$(jq -cn \
         --arg msg "$MESSAGE" \
         --arg iid "$INSTANCE_ID" \
-        '{"message": $msg, "instance_id": $iid, "priority": true}')
+        '{"instance_id": $iid, "message": $msg}')
 else
-    JSON=$(jq -cn \
-        --arg msg "$MESSAGE" \
-        '{"message": $msg, "priority": true}')
+    # Fallback: direct TTS on Mac (no queue, no voice profile)
+    ENDPOINT="/api/notify/tts"
+    if [[ -n "$INSTANCE_ID" ]]; then
+        JSON=$(jq -cn \
+            --arg msg "$MESSAGE" \
+            --arg iid "$INSTANCE_ID" \
+            '{"message": $msg, "instance_id": $iid}')
+    else
+        JSON=$(jq -cn \
+            --arg msg "$MESSAGE" \
+            '{"message": $msg}')
+    fi
 fi
 
 if [[ "$SYNC" == "true" ]]; then
-    curl -sf -X POST "${TOKEN_API_HOST}${ENDPOINT}" \
+    curl -sf -X POST "${API_URL}${ENDPOINT}" \
         -H "Content-Type: application/json" \
         -d "$JSON"
 else
     # Fire-and-forget: background the request, discard output
-    curl -sf -X POST "${TOKEN_API_HOST}${ENDPOINT}" \
+    curl -sf -X POST "${API_URL}${ENDPOINT}" \
         -H "Content-Type: application/json" \
         -d "$JSON" \
         >/dev/null 2>&1 &

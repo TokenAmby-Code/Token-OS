@@ -385,11 +385,13 @@ class PhoneActivityResponse(BaseModel):
 
 
 class PhoneSystemEventRequest(BaseModel):
-    """Request from MacroDroid for phone system events (Shizuku, boot, heartbeat)."""
-    event: str  # "shizuku_died", "shizuku_restored", "device_boot", "heartbeat"
+    """Request from MacroDroid for phone system events (Shizuku, boot, heartbeat, telemetry)."""
+    event: str  # "shizuku_died", "shizuku_restored", "device_boot", "heartbeat", "app_open", "app_close", "discord_fallback_received"
     time: Optional[str] = None
     server: Optional[str] = None  # heartbeat: server response code
     shizuku_dead: Optional[str] = None  # heartbeat: current shizuku state
+    app: Optional[str] = None  # app_open/app_close: package name (e.g. "com.twitter.android")
+    notification: Optional[str] = None  # discord_fallback_received: original notification text
 
 
 # ============ Headless Mode Models ============
@@ -3237,6 +3239,30 @@ PHONE_HEARTBEAT = {
 TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
 TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
 
+# ============ Enforcement Cascade v2 (no Shizuku) ============
+# Server-driven escalation. Phone executes levels on command.
+# Discord fallback sends literal endpoint+body when phone unreachable.
+ENFORCEMENT_CASCADE = {
+    "active": False,          # Is a cascade currently running?
+    "app": None,              # Which app triggered it
+    "current_level": 0,       # Current escalation level (0-5)
+    "started_at": None,       # monotonic time
+    "last_escalation": None,  # monotonic time of last level bump
+    "task": None,             # asyncio.Task for the cascade worker
+}
+
+# Level delays (seconds after previous level)
+ENFORCEMENT_LEVEL_DELAYS = {
+    1: 0,    # Notification — immediate after Discord fallback timeout
+    2: 15,   # Full-screen alarm
+    3: 15,   # Notification spam
+    4: 10,   # Spotify redirect
+    5: 30,   # Pavlok zap (repeats every 30s)
+}
+
+ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
+DISCORD_FALLBACK_TIMEOUT = 30      # 30s to wait for app_close via Discord
+
 
 def _persist_twitter_zap_cooldown():
     """Write twitter zap wall-clock time to file so it survives restarts."""
@@ -4132,6 +4158,168 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
         logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
 
+# ============ Enforcement Cascade v2 ============
+
+def _send_enforce_to_phone(app_name: str, level: int) -> dict:
+    """Send enforcement level to phone's MacroDroid HTTP endpoint.
+
+    Returns dict with success status. On failure, caller should use Discord fallback.
+    """
+    host = PHONE_CONFIG["host"]
+    port = PHONE_CONFIG["port"]
+    timeout = PHONE_CONFIG["timeout"]
+    url = f"http://{host}:{port}/enforce"
+    params = {"level": str(level), "app": app_name}
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout)
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print(f"PHONE CASCADE: level={level} app={app_name} -> {response.status_code}")
+        return {"success": response.status_code == 200, "status_code": response.status_code}
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print(f"PHONE CASCADE: level={level} app={app_name} UNREACHABLE: {e}")
+        return {"success": False, "error": type(e).__name__}
+    except Exception as e:
+        PHONE_STATE["reachable"] = False
+        print(f"PHONE CASCADE: level={level} app={app_name} ERROR: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _send_discord_fallback(app_name: str, level: int):
+    """Send enforcement command to Discord #fallback as literal endpoint+body.
+
+    Format: POST /phone/enforce {"level":"N","app":"appname"}
+
+    The phone's MacroDroid macro triggers on "POST /phone/enforce" in the Discord
+    notification, parses the JSON, and relays to its own localhost:7777/enforce.
+    Only /phone/enforce is accepted — no arbitrary code execution.
+    """
+    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}"}}'
+    logger.info(f"DISCORD FALLBACK: {msg}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "discord", "send", "fallback", msg,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception as e:
+        logger.warning(f"DISCORD FALLBACK: Failed to send: {e}")
+
+
+async def _enforcement_cascade_worker(app_name: str):
+    """Background task that escalates enforcement levels until app_close or timeout.
+
+    Flow:
+      1. Send Discord fallback (level 0 — soft close via notification)
+      2. Wait DISCORD_FALLBACK_TIMEOUT for app_close
+      3. If still open, escalate through levels 1-5 with configured delays
+      4. Level 5 (Pavlok) repeats every 30s until close or cascade timeout
+    """
+    cascade = ENFORCEMENT_CASCADE
+    start = time.monotonic()
+    cascade["started_at"] = start
+    cascade["current_level"] = 0
+
+    print(f"CASCADE START: app={app_name}")
+    await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
+
+    # Level 0: Discord fallback (soft close)
+    await _send_discord_fallback(app_name, 1)
+
+    # Wait for Discord fallback to work
+    await asyncio.sleep(DISCORD_FALLBACK_TIMEOUT)
+    if not cascade["active"]:
+        print(f"CASCADE: app_close received during Discord fallback wait")
+        return
+
+    # Escalate through levels 1-5
+    for level in range(1, 6):
+        if not cascade["active"]:
+            print(f"CASCADE: app_close received, standing down at level {level}")
+            return
+
+        elapsed = time.monotonic() - start
+        if elapsed > ENFORCEMENT_CASCADE_TIMEOUT:
+            print(f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}")
+            break
+
+        cascade["current_level"] = level
+        cascade["last_escalation"] = time.monotonic()
+        print(f"CASCADE: Escalating to level {level} for {app_name}")
+        await log_event("enforcement_cascade_escalate", device_id="phone",
+                        details={"app": app_name, "level": level, "elapsed_s": round(elapsed)})
+
+        # Try direct HTTP, fall back to Discord
+        result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
+        if not result["success"]:
+            await _send_discord_fallback(app_name, level)
+
+        # Wait before next level (level 5 repeats in a loop)
+        if level == 5:
+            # Pavlok repeat loop
+            while cascade["active"] and (time.monotonic() - start) < ENFORCEMENT_CASCADE_TIMEOUT:
+                await asyncio.sleep(30)
+                if not cascade["active"]:
+                    break
+                result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
+                if not result["success"]:
+                    await _send_discord_fallback(app_name, 5)
+        else:
+            delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
+            await asyncio.sleep(delay)
+
+    # Cascade exhausted or timed out
+    cascade["active"] = False
+    cascade["task"] = None
+    elapsed = time.monotonic() - start
+    print(f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}")
+    await log_event("enforcement_cascade_end", device_id="phone",
+                    details={"app": app_name, "final_level": cascade["current_level"],
+                             "elapsed_s": round(elapsed), "reason": "timeout_or_exhausted"})
+
+
+def start_enforcement_cascade(app_name: str):
+    """Start the enforcement cascade for a forbidden app. Idempotent — won't double-start."""
+    cascade = ENFORCEMENT_CASCADE
+    if cascade["active"]:
+        print(f"CASCADE: Already active for {cascade['app']}, ignoring {app_name}")
+        return
+
+    cascade["active"] = True
+    cascade["app"] = app_name
+    cascade["current_level"] = 0
+    cascade["task"] = asyncio.ensure_future(_enforcement_cascade_worker(app_name))
+
+
+def stop_enforcement_cascade(reason: str = "app_close"):
+    """Stop the enforcement cascade (app was closed or bailout triggered)."""
+    cascade = ENFORCEMENT_CASCADE
+    if not cascade["active"]:
+        return
+
+    app = cascade["app"]
+    level = cascade["current_level"]
+    elapsed = time.monotonic() - (cascade["started_at"] or time.monotonic())
+    print(f"CASCADE STOP: app={app} level={level} elapsed={elapsed:.0f}s reason={reason}")
+
+    cascade["active"] = False
+    cascade["app"] = None
+    cascade["current_level"] = 0
+    cascade["started_at"] = None
+    cascade["last_escalation"] = None
+
+    if cascade["task"] and not cascade["task"].done():
+        cascade["task"].cancel()
+    cascade["task"] = None
+
+    asyncio.ensure_future(log_event("enforcement_cascade_stop", device_id="phone",
+                                     details={"app": app, "level": level,
+                                              "elapsed_s": round(elapsed), "reason": reason}))
+
+
 def check_phone_reachable() -> dict:
     """
     Check if phone is reachable via heartbeat endpoint.
@@ -4766,8 +4954,8 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     else:
         print(f"    BLOCKED: no break time, no productivity")
-        enforce_result = enforce_phone_app(app_name, action="disable")
-        send_pavlok_stimulus(reason="phone_distraction_blocked")
+        # v2: Start enforcement cascade instead of Shizuku disable
+        start_enforcement_cascade(app_name)
 
         await log_event(
             "phone_distraction_blocked",
@@ -4775,7 +4963,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "app": app_name,
                 "display_name": display_name,
                 "reason": "no_break_no_productivity",
-                "enforcement": enforce_result
+                "enforcement": "cascade_started"
             }
         )
 
@@ -4821,26 +5009,61 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     Handle phone system events from MacroDroid.
 
     Events:
-    - shizuku_died: Shizuku service stopped. Triggers auto-restart from Mac.
-    - shizuku_restored: Shizuku came back. Resets restart state.
-    - device_boot: Phone rebooted.
-    - heartbeat: Periodic health check with server/shizuku status.
+    - app_open: v2 telemetry — app opened (routes through distraction detection)
+    - app_close: v2 telemetry — app closed (stops enforcement cascade)
+    - discord_fallback_received: phone confirmed it received Discord relay
+    - shizuku_died: Shizuku service stopped (legacy, kept for transition)
+    - shizuku_restored: Shizuku came back (legacy)
+    - device_boot: Phone rebooted
+    - heartbeat: Periodic health check
     """
     event = request.event
     now = datetime.now().isoformat()
 
     await log_event(f"phone_{event}", device_id="phone", details={
         "time": request.time,
+        "app": request.app,
         "server": request.server,
         "shizuku_dead": request.shizuku_dead,
     })
 
-    if event == "shizuku_died":
+    # ---- v2 Telemetry: app_open ----
+    if event == "app_open":
+        app_pkg = (request.app or "").lower()
+        if not app_pkg:
+            return {"received": True, "event": event, "error": "missing app field"}
+
+        # Route through existing distraction detection via internal call
+        phone_req = PhoneActivityRequest(app=app_pkg, action="open", package=app_pkg)
+        result = await handle_phone_activity(phone_req)
+        return {"received": True, "event": event, "app": app_pkg, "decision": result.dict()}
+
+    # ---- v2 Telemetry: app_close ----
+    elif event == "app_close":
+        app_pkg = (request.app or "").lower()
+        if not app_pkg:
+            return {"received": True, "event": event, "error": "missing app field"}
+
+        # Stop enforcement cascade if running for this app
+        stop_enforcement_cascade(reason="app_close")
+
+        # Route through existing close handler
+        phone_req = PhoneActivityRequest(app=app_pkg, action="close", package=app_pkg)
+        result = await handle_phone_activity(phone_req)
+        return {"received": True, "event": event, "app": app_pkg, "decision": result.dict()}
+
+    # ---- v2 Discord fallback acknowledgement ----
+    elif event == "discord_fallback_received":
+        logger.info(f"Discord fallback received by phone")
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = now
+        return {"received": True, "event": event}
+
+    # ---- Legacy: Shizuku events (kept for transition) ----
+    elif event == "shizuku_died":
         SHIZUKU_STATE["dead"] = True
         SHIZUKU_STATE["last_death"] = now
         logger.warning(f"Shizuku died at {request.time}")
-
-        # Attempt auto-restart in background
         restart_result = await attempt_shizuku_restart()
         return {"received": True, "event": event, "restart_attempt": restart_result}
 
@@ -4851,15 +5074,13 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         return {"received": True, "event": event}
 
     elif event == "device_boot":
-        SHIZUKU_STATE["dead"] = True  # Shizuku is dead after boot until manually started
+        SHIZUKU_STATE["dead"] = True
         logger.info(f"Phone booted at {request.time}")
         return {"received": True, "event": event}
 
     elif event == "heartbeat":
-        # Update reachability from heartbeat
         PHONE_STATE["reachable"] = True
         PHONE_STATE["last_reachable_check"] = now
-        # Bridge: feed heartbeat worker's silence detection
         PHONE_HEARTBEAT["last_seen"] = datetime.utcnow()
         PHONE_HEARTBEAT["device_id"] = "Token-S24"
         PHONE_HEARTBEAT["alert_state"] = None
@@ -7110,8 +7331,9 @@ async def enforce_break_exhausted_impl() -> dict:
             if mode == "gaming":
                 enforce_app = "game"
 
-        print(f"BREAK-EXHAUSTED: Enforcing disable on {current_app} (mapped to {enforce_app})")
-        phone_result = enforce_phone_app(enforce_app, action="disable")
+        print(f"BREAK-EXHAUSTED: Starting enforcement cascade on {current_app} (mapped to {enforce_app})")
+        start_enforcement_cascade(enforce_app)
+        phone_result = {"cascade_started": True, "app": enforce_app}
         enforced_any = True
 
         PHONE_STATE["current_app"] = None

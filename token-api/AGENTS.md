@@ -112,6 +112,12 @@ Submit body: `{"type": "morning_start", "energy": 7, "focus": 8, "mood": "good",
 
 Responses are stored in `checkins` table and written as time-stamped frontmatter fields (e.g., `energy_0900`, `focus_0900`) to the daily note in `~/Documents/Token-ENV/Journal/Daily/`.
 
+### Dictation
+```
+GET    /api/dictation                   # Current dictation (Wispr) state
+POST   /api/dictation                   # Set dictation state (?active=true|false)
+```
+
 ### System
 ```
 GET    /api/dashboard                   # Dashboard data
@@ -271,6 +277,7 @@ I        - Interrupt frozen instance (SIGINT, cancel current op)
 K        - Kill frozen instance (SIGKILL, auto-copies resume cmd)
 a        - Toggle subagent visibility (hidden by default)
 c        - Clear all stopped
+m        - Cycle TTS mode (verbose/muted/silent/voice-chat)
 o        - Change sort order
 R        - Restart server
 q        - Quit
@@ -343,6 +350,41 @@ Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores th
 - **Mobile path** (`device_id == "Token-S24"`): Webhook to phone, no TTS queue
 - **Skip**: Routes to satellite `/tts/skip` or kills local `say` process based on `TTS_BACKEND["current"]`
 - **Satellite down**: Health probe cached 30s, re-detected within 30s of PC coming online
+
+### TTS Mode Cycle
+
+Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Cycled via `m` key in TUI. Stored as `tts_mode` in DB per instance.
+
+| Mode | Behavior |
+|------|----------|
+| verbose | Full TTS speech for all notifications |
+| muted | Sound effects only, no speech |
+| silent | No audio output |
+| voice-chat | Activates AskUserQuestion voice hooks and dictation tracking |
+
+### Voice Chat
+
+> **STATUS: UNVALIDATED (2026-03-09)** — Not yet tested end-to-end.
+
+Voice chat is a TTS mode (`voice-chat`) rather than a separate system. The `m` key in TUI cycles into it. When active, the instance name shows a microphone emoji in the TUI (TUI-only display, not stored in DB).
+
+The old `/api/instances/{id}/voice-chat` endpoint still works but also sets `tts_mode` in DB. `VOICE_CHAT_SESSIONS` in-memory dict is re-hydrated from DB `tts_mode` on instance list queries.
+
+## Dictation State Tracking
+
+> **STATUS: UNVALIDATED (2026-03-09)** — Not yet tested end-to-end.
+
+Global dictation state tracked via `POST /api/dictation` (set) and `GET /api/dictation` (read). State is in-memory (`DICTATION_STATE` global), not persisted to DB.
+
+### Sources
+
+| Script | Trigger | Method |
+|--------|---------|--------|
+| `script-compiler.ahk` | `~^#Space` keyboard toggle | Blind toggle |
+| `ring-remap.ahk` | Right button | Blind toggle |
+| `voice-select-other.ahk` | Explicit on/off | GET state, only toggle if needed (WisprOff/WisprOn) |
+
+`voice-select-other.ahk` uses explicit WisprOff/WisprOn instead of blind toggles — it GETs the current state first and only toggles if the state doesn't match the desired value.
 
 ## CLI Tools
 

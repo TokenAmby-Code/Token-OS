@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# voice-chat - Manage voice conversation mode for Claude Code sessions
+# TAGS: voice, tts, instance
+# AUDIENCE: agent
+#
+# Usage:
+#   voice-chat activate     Resolve instance ID + register as voice-chat-active
+#   voice-chat deactivate   Unregister voice-chat mode
+#   voice-chat status       Check if voice-chat is active for this instance
+#
+# Instance resolution uses the same logic as instance-name:
+#   1. PID-based cache lookup
+#   2. PID field match in API
+#   3. CWD match (processing preferred over idle)
+
+set -euo pipefail
+
+API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+
+# --- Instance resolution (shared with instance-name) ---
+
+_find_claude_pid() {
+    local current="$PPID"
+    local comm
+    for _ in 1 2 3 4 5; do
+        [[ -z "$current" || "$current" == "1" ]] && break
+        comm=$(ps -o comm= -p "$current" 2>/dev/null || true)
+        if [[ "$comm" == "claude" ]]; then
+            echo "$current"
+            return 0
+        fi
+        current=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ' || true)
+    done
+    return 1
+}
+
+_resolve_instance_id() {
+    local INSTANCE_ID=""
+    local INSTANCES=""
+
+    # Method 1: PID-based cache
+    local CLAUDE_PID
+    CLAUDE_PID=$(_find_claude_pid 2>/dev/null || true)
+    if [[ -n "$CLAUDE_PID" ]]; then
+        local SESSION_PID_FILE="${HOME}/.claude/session-pids/${CLAUDE_PID}"
+        if [[ -f "$SESSION_PID_FILE" ]]; then
+            INSTANCE_ID=$(cat "$SESSION_PID_FILE" 2>/dev/null || true)
+        fi
+    fi
+
+    # Method 2: PID field match in API
+    if [[ -z "$INSTANCE_ID" ]] && [[ -n "${CLAUDE_PID:-}" ]]; then
+        INSTANCES=$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)
+        if [[ -n "$INSTANCES" ]]; then
+            INSTANCE_ID=$(echo "$INSTANCES" | \
+                jq -r --argjson pid "$CLAUDE_PID" \
+                    '.[] | select(.pid == $pid and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | \
+                head -1 || true)
+        fi
+    fi
+
+    # Method 3: CWD match
+    if [[ -z "$INSTANCE_ID" ]]; then
+        local CWD
+        CWD="$(pwd)"
+        INSTANCES="${INSTANCES:-$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)}"
+        if [[ -n "$INSTANCES" ]]; then
+            INSTANCE_ID=$(echo "$INSTANCES" | \
+                jq -r --arg cwd "$CWD" \
+                    '[ .[] | select(.status == "processing" and .working_dir == $cwd) ] | .[0].id // ""' \
+                    2>/dev/null || true)
+            if [[ -z "$INSTANCE_ID" ]]; then
+                INSTANCE_ID=$(echo "$INSTANCES" | \
+                    jq -r --arg cwd "$CWD" \
+                        '[ .[] | select(.status == "idle" and .working_dir == $cwd) ] | .[0].id // ""' \
+                        2>/dev/null || true)
+            fi
+        fi
+    fi
+
+    echo "$INSTANCE_ID"
+}
+
+# --- Commands ---
+
+cmd_activate() {
+    local INSTANCE_ID
+    INSTANCE_ID=$(_resolve_instance_id)
+
+    if [[ -z "$INSTANCE_ID" ]]; then
+        echo "Error: No active instance found." >&2
+        exit 1
+    fi
+
+    RESPONSE=$(curl -sf -X POST "$API_URL/api/instances/$INSTANCE_ID/voice-chat?active=true" 2>/dev/null || true)
+
+    if echo "$RESPONSE" | jq -e '.voice_chat == true' >/dev/null 2>&1; then
+        echo "Voice chat activated for instance $INSTANCE_ID"
+    else
+        echo "Error: Failed to activate voice chat" >&2
+        echo "$RESPONSE" >&2
+        exit 1
+    fi
+}
+
+cmd_deactivate() {
+    local INSTANCE_ID
+    INSTANCE_ID=$(_resolve_instance_id)
+
+    if [[ -z "$INSTANCE_ID" ]]; then
+        echo "Error: No active instance found." >&2
+        exit 1
+    fi
+
+    curl -sf -X POST "$API_URL/api/instances/$INSTANCE_ID/voice-chat?active=false" >/dev/null 2>&1 || true
+    echo "Voice chat deactivated"
+}
+
+cmd_status() {
+    local INSTANCE_ID
+    INSTANCE_ID=$(_resolve_instance_id)
+
+    if [[ -z "$INSTANCE_ID" ]]; then
+        echo "No active instance found"
+        exit 1
+    fi
+
+    INSTANCE=$(curl -s --connect-timeout 3 "$API_URL/api/instances/$INSTANCE_ID" 2>/dev/null || true)
+    VOICE_CHAT=$(echo "$INSTANCE" | jq -r '.voice_chat // false' 2>/dev/null || echo "unknown")
+    echo "Instance: $INSTANCE_ID"
+    echo "Voice chat: $VOICE_CHAT"
+}
+
+# --- Main ---
+
+case "${1:-}" in
+    activate)   cmd_activate ;;
+    deactivate) cmd_deactivate ;;
+    status)     cmd_status ;;
+    -h|--help)
+        awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+        exit 0
+        ;;
+    *)
+        echo "Usage: voice-chat {activate|deactivate|status}" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,245 @@
+# Enforcement Cascade v2
+#
+# Server-triggered escalation. No Shizuku/ADB/root dependency.
+# Single HTTP endpoint: /enforce?level=<0-5>
+#
+# The server controls which level to fire. This keeps the cascade
+# logic server-side (Token-API) so the phone just executes actions.
+# Server calls escalating levels on a timer until app_close received.
+#
+# Levels:
+#   0 = Discord fallback (handled by v2-discord-fallback macro, not here)
+#   1 = Persistent notification (warning)
+#   2 = Full-screen alarm overlay (disruptive)
+#   3 = Notification spam (repeated high-priority)
+#   4 = Spotify auto-play (dopamine redirect)
+#   5 = Pavlok zap (physical consequence)
+#
+# The server decides when to escalate. This macro just executes.
+
+name: "Enforce Cascade v2"
+category: "Enforcement"
+description: "Server-pushed escalation cascade — no Shizuku dependency"
+enabled: true
+
+variables:
+  - name: level
+    type: string
+    value: ""
+  - name: app
+    type: string
+    value: ""
+  - name: response_msg
+    type: string
+    value: '{"status": "ok"}'
+
+triggers:
+  - type: http_server
+    identifier: "enforce"
+    send_response: true
+
+actions:
+  # Parse params
+  - type: set_variable
+    name: "level"
+    value: "{http_param=level}"
+    var_type: string
+    local: true
+
+  - type: set_variable
+    name: "app"
+    value: "{http_param=app}"
+    var_type: string
+    local: true
+
+  # Log
+  - type: shell
+    command: 'echo "{system_time} INFO enforce-cascade TRIGGERED level={lv=level} app={lv=app}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # ========================================
+  # LEVEL 1: Persistent notification
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "level"
+        var_type: string
+        comparison: equals
+        value: "1"
+        local_var: true
+
+  - type: notification
+    title: "Close {lv=app}"
+    text: "Enforcement active. Close the app now."
+    channel_type: 3
+
+  - type: vibrate
+    pattern: [0, 200, 100, 200]
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok", "level": 1, "action": "notification"}'
+    var_type: string
+    local: true
+
+  - type: end_if
+
+  # ========================================
+  # LEVEL 2: Full-screen alarm overlay
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "level"
+        var_type: string
+        comparison: equals
+        value: "2"
+        local_var: true
+
+  - type: notification
+    title: "CLOSE THE APP"
+    text: "Enforcement escalation. This will not stop until you close {lv=app}."
+    channel_type: 3
+
+  - type: vibrate
+    pattern: [0, 500, 200, 500, 200, 500, 200, 500]
+
+  - type: speak
+    text: "Close the app now. Enforcement is active."
+    speed: 1.0
+    pitch: 0.8
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok", "level": 2, "action": "alarm_overlay"}'
+    var_type: string
+    local: true
+
+  - type: end_if
+
+  # ========================================
+  # LEVEL 3: Notification spam
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "level"
+        var_type: string
+        comparison: equals
+        value: "3"
+        local_var: true
+
+  - type: notification
+    title: "CLOSE {lv=app} NOW"
+    text: "Enforcement Level 3. Escalating."
+    channel_type: 3
+
+  - type: wait
+    seconds: 2
+
+  - type: notification
+    title: "Still on {lv=app}"
+    text: "Close it. Pavlok zap is next."
+    channel_type: 3
+
+  - type: wait
+    seconds: 2
+
+  - type: notification
+    title: "Final warning"
+    text: "Pavlok fires in 30 seconds."
+    channel_type: 3
+
+  - type: vibrate
+    pattern: [0, 300, 100, 300, 100, 300, 100, 300, 100, 300]
+
+  - type: speak
+    text: "Final warning. Pavlok fires in thirty seconds."
+    speed: 1.1
+    pitch: 0.7
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok", "level": 3, "action": "notification_spam"}'
+    var_type: string
+    local: true
+
+  - type: end_if
+
+  # ========================================
+  # LEVEL 4: Spotify auto-play (dopamine redirect)
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "level"
+        var_type: string
+        comparison: equals
+        value: "4"
+        local_var: true
+
+  # Launch Spotify and play — redirect the dopamine impulse
+  - type: launch_activity
+    app: "Spotify"
+    package: "com.spotify.music"
+
+  - type: wait
+    seconds: 1
+
+  # Media play (resumes last content or starts default)
+  - type: media_control
+    option: "play"
+    app: "Spotify"
+    package: "com.spotify.music"
+
+  - type: notification
+    title: "Redirecting"
+    text: "Listen to something instead. Close {lv=app}."
+    channel_type: 1
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok", "level": 4, "action": "spotify_redirect"}'
+    var_type: string
+    local: true
+
+  - type: end_if
+
+  # ========================================
+  # LEVEL 5: Pavlok zap
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "level"
+        var_type: string
+        comparison: equals
+        value: "5"
+        local_var: true
+
+  - type: notification
+    title: "Pavlok fired"
+    text: "Zap delivered. Repeats every 30s until {lv=app} is closed."
+    channel_type: 3
+
+  # Fire Pavlok via Termux:Tasker
+  - type: termux_tasker
+    executable: "pavlok.sh"
+    arguments: "zap 30"
+    wait_for_result: false
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok", "level": 5, "action": "pavlok_zap"}'
+    var_type: string
+    local: true
+
+  - type: end_if
+
+  # ========================================
+  # RESPONSE
+  # ========================================
+  - type: http_response
+    code: "OK"
+    text: '{lv=response_msg}'
