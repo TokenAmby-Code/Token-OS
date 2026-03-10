@@ -109,7 +109,7 @@ remote_restart() {
 remote_status() {
     echo -e "${BOLD}=== Multi-Device Status (via Mac) ===${NC}"
     echo ""
-    ssh -o ConnectTimeout=5 -o BatchMode=yes mini "token-restart --status" 2>&1 || {
+    ssh -o ConnectTimeout=5 -o BatchMode=yes mini "~/Scripts/cli-tools/bin/token-restart --status" 2>&1 || {
         echo -e "  ${RED}✗${NC} Cannot reach Mac via SSH"
         # Fall back to direct health checks
         echo ""
@@ -135,7 +135,7 @@ scripts_sync() {
     local flags=("push" "--message" "token-restart: pre-restart sync")
     flags+=("$@")
     echo -e "${BLUE}→${NC} Syncing code via scripts-sync..."
-    if scripts-sync "${flags[@]}" 2>&1 | sed 's/^/  /'; then
+    if "$HOME/Scripts/cli-tools/bin/scripts-sync" "${flags[@]}" 2>&1 | sed 's/^/  /'; then
         return 0
     else
         echo -e "  ${YELLOW}⚠${NC} scripts-sync failed (WSL may get stale code)"
