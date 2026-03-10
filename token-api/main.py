@@ -4004,7 +4004,7 @@ def trigger_obsidian_command(command_id: str, no_focus: bool = False) -> bool:
     return True
 
 
-def enforce_phone_app(app_name: str, action: str = "disable") -> dict:
+def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool = True) -> dict:
     """
     Send enforcement command to phone via MacroDroid HTTP server.
 
@@ -4028,6 +4028,16 @@ def enforce_phone_app(app_name: str, action: str = "disable") -> dict:
         PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
 
         print(f"PHONE: Enforce {action} {app_name} -> {response.status_code}")
+        # Detect Shizuku death from enforce response
+        try:
+            resp_json = response.json()
+            if resp_json.get("status") == "shizuku_dead" and _auto_retry:
+                logger.warning(f"PHONE: Shizuku dead during enforce {action} {app_name}")
+                SHIZUKU_STATE["dead"] = True
+                asyncio.get_event_loop().create_task(_enforce_shizuku_retry(app_name, action))
+                return {"success": False, "error": "shizuku_dead", "restart_initiated": True}
+        except (ValueError, AttributeError):
+            pass
         return {
             "success": response.status_code == 200,
             "status_code": response.status_code,
@@ -4048,6 +4058,25 @@ def enforce_phone_app(app_name: str, action: str = "disable") -> dict:
         PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
         print(f"PHONE: Error enforcing {action} {app_name}: {e}")
         return {"success": False, "error": str(e)}
+
+
+async def _enforce_shizuku_retry(app_name: str, action: str):
+    """Restart Shizuku and retry enforce once. Fire-and-forget via create_task."""
+    try:
+        logger.info(f"PHONE: Auto-restarting Shizuku for {action} {app_name}")
+        restart_result = await attempt_shizuku_restart()
+        await log_event("shizuku_auto_restart", device_id="Token-S24",
+                        details={"trigger": f"enforce_{action}_{app_name}", "result": restart_result})
+        if not restart_result.get("success"):
+            logger.warning(f"PHONE: Shizuku restart failed, skipping retry for {action} {app_name}")
+            return
+        await asyncio.sleep(3)  # Wait for Shizuku init
+        retry_result = await asyncio.to_thread(enforce_phone_app, app_name, action, False)
+        logger.info(f"PHONE: Enforce retry {action} {app_name} -> {retry_result}")
+        await log_event("enforce_shizuku_retry", device_id="Token-S24",
+                        details={"app": app_name, "action": action, "result": retry_result})
+    except Exception as e:
+        logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
 
 def check_phone_reachable() -> dict:
@@ -4777,6 +4806,10 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         # Update reachability from heartbeat
         PHONE_STATE["reachable"] = True
         PHONE_STATE["last_reachable_check"] = now
+        # Bridge: feed heartbeat worker's silence detection
+        PHONE_HEARTBEAT["last_seen"] = datetime.utcnow()
+        PHONE_HEARTBEAT["device_id"] = "Token-S24"
+        PHONE_HEARTBEAT["alert_state"] = None
         if request.shizuku_dead:
             SHIZUKU_STATE["dead"] = request.shizuku_dead.lower() == "true"
         return {"received": True, "event": event, "shizuku_state": SHIZUKU_STATE}
@@ -7163,6 +7196,10 @@ async def phone_heartbeat_worker():
             silence_min = (datetime.utcnow() - last).total_seconds() / 60
             current_alert = PHONE_HEARTBEAT["alert_state"]
 
+            # Don't alert during quiet hours (11 PM - 9 AM)
+            if _is_quiet_hours():
+                continue
+
             if silence_min > 60 and current_alert != "zap":
                 PHONE_HEARTBEAT["alert_state"] = "zap"
                 msg = f"⚡ Phone heartbeat silent {silence_min:.0f}min — Pavlok ZAP fired. Check Tailscale."
@@ -7178,6 +7215,8 @@ async def phone_heartbeat_worker():
                 await asyncio.to_thread(
                     send_pavlok_stimulus, "zap", None, "phone_heartbeat_silence_60min", True
                 )
+                await log_event("phone_heartbeat_silence", device_id="Token-S24",
+                                details={"silence_min": round(silence_min), "alert": "zap"})
 
             elif silence_min > 30 and current_alert is None:
                 PHONE_HEARTBEAT["alert_state"] = "beep"
@@ -7185,7 +7224,7 @@ async def phone_heartbeat_worker():
                 logger.warning(f"PHONE HB: {msg}")
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "discord", "send", "alerts", msg,
+                        "discord", "send", "fallback", msg,
                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                     )
                     await asyncio.wait_for(proc.communicate(), timeout=15)
@@ -7194,6 +7233,8 @@ async def phone_heartbeat_worker():
                 await asyncio.to_thread(
                     send_pavlok_stimulus, "beep", None, "phone_heartbeat_silence_30min", True
                 )
+                await log_event("phone_heartbeat_silence", device_id="Token-S24",
+                                details={"silence_min": round(silence_min), "alert": "beep"})
 
         except Exception as e:
             logger.error(f"phone_heartbeat_worker error: {e}")
