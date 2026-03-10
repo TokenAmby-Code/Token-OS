@@ -23,6 +23,7 @@ Controls:
   Ctrl+R    - Full refresh (restart server + reload TUI code)
   c         - Clear all instances
   o         - Change sort order
+  ?         - Show keybinding help
   q         - Quit
 """
 
@@ -105,6 +106,7 @@ layout_mode_forced = False  # True if user used --mobile, --vertical, --compact,
 sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
 filter_mode = "all"  # "all", "active", "stopped"
 show_subagents = False  # Hide subagents by default, toggle with 'a'
+show_help = False  # Help overlay toggle
 global_tts_mode = "verbose"  # Cached from API
 table_mode = "instances"  # "instances" or "cron"
 cron_selected_index = 0
@@ -316,12 +318,13 @@ def is_custom_tab_name(tab_name: str) -> bool:
 def format_instance_name(instance: dict, max_len: int = 20) -> str:
     """Format instance name, prioritizing custom tab_name over working_dir."""
     tab_name = instance.get("tab_name", "")
+    vc_suffix = " 🎙" if instance.get("voice_chat") or instance.get("tts_mode") == "voice-chat" else ""
 
     # If user has set a custom name, always use it
     if is_custom_tab_name(tab_name):
         if len(tab_name) > max_len:
-            return tab_name[:max_len - 3] + "..."
-        return tab_name
+            return tab_name[:max_len - 3] + "..." + vc_suffix
+        return tab_name + vc_suffix
 
     # Otherwise derive from working_dir
     working_dir = instance.get("working_dir")
@@ -338,9 +341,9 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
             name = working_dir
         if len(name) > max_len:
             name = "..." + name[-(max_len - 3):]
-        return name
+        return name + vc_suffix
     # Fallback to tab_name or id
-    return tab_name or instance.get("id", "?")[:max_len]
+    return (tab_name or instance.get("id", "?")[:max_len]) + vc_suffix
 
 
 def get_instances():
@@ -519,8 +522,8 @@ def change_instance_voice(instance_id: str, voice: str) -> dict:
 
 
 def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
-    """Cycle TTS mode: verbose -> muted -> silent -> verbose."""
-    mode_cycle = {"verbose": "muted", "muted": "silent", "silent": "verbose"}
+    """Cycle TTS mode: verbose -> muted -> silent -> voice-chat -> verbose."""
+    mode_cycle = {"verbose": "muted", "muted": "silent", "silent": "voice-chat", "voice-chat": "verbose"}
     new_mode = mode_cycle.get(current_mode, "muted")
     try:
         data = json.dumps({"mode": new_mode}).encode()
@@ -1706,17 +1709,17 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         parts = [f"{status_icon} [bold]{name}[/bold]"]
         parts.append(f"[dim]({device})[/dim]")
         tts_mode = instance.get("tts_mode", "verbose") or "verbose"
-        if tts_mode == "verbose":
+        if tts_mode == "voice-chat":
+            if instance.get("listening", False):
+                parts.append(f"[cyan]Voice:[/cyan] [green]dictating[/green]")
+            else:
+                parts.append(f"[cyan]Voice:[/cyan] [magenta]voice-chat[/magenta]")
+        elif tts_mode == "verbose":
             parts.append(f"[cyan]Voice:[/cyan] {voice_short}")
         elif tts_mode == "muted":
             parts.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]")
         else:
             parts.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
-        if instance.get("voice_chat"):
-            if instance.get("listening", False):
-                parts.append("[green]🎙 Listening[/green]")
-            else:
-                parts.append("[yellow]🎙 Muted[/yellow]")
         parts.append(f"[dim]{working_dir_short}[/dim]")
 
         if total > 0:
@@ -1732,17 +1735,15 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
 
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]({device})[/dim]")
     tts_mode = instance.get("tts_mode", "verbose") or "verbose"
-    if tts_mode == "verbose":
+    if tts_mode == "voice-chat":
+        dictation_state = "[green]dictating[/green]" if instance.get("listening", False) else "[dim]idle[/dim]"
+        lines.append(f"[cyan]Voice:[/cyan] [magenta]voice-chat[/magenta]  {dictation_state}  [dim]({voice_short})[/dim]")
+    elif tts_mode == "verbose":
         lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
     elif tts_mode == "muted":
         lines.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]  [dim]({voice_short} reserved)[/dim]")
     else:  # silent
         lines.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
-    if instance.get("voice_chat"):
-        if instance.get("listening", False):
-            lines.append("[green]🎙 Voice Chat: Listening[/green]")
-        else:
-            lines.append("[yellow]🎙 Voice Chat: Muted[/yellow]")
     lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
 
     # Session document display
@@ -2593,7 +2594,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         else:
             text.append_text(Text.from_markup(f"[yellow bold]{feedback_msg}[/yellow bold]"))
     else:
-        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop m=mute n=note M=global q=quit[/dim]"))
+        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop m=mute ?=help q=quit[/dim]"))
 
     return text
 
@@ -2903,9 +2904,75 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
     return layout
 
 
+def generate_help_screen() -> Layout:
+    """Generate a full-screen help overlay showing all keybindings."""
+    layout = Layout()
+
+    keybindings = [
+        ("Navigation", [
+            ("↑ / k", "Move selection up"),
+            ("↓ / j", "Move selection down"),
+            ("g", "Jump to first item"),
+            ("G", "Jump to last item"),
+            ("[ / ]", "Switch table (Instances / Cron)"),
+            ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer)"),
+            ("f", "Cycle filter (all / active / stopped)"),
+            ("o", "Change sort order"),
+            ("a", "Toggle subagent visibility"),
+        ]),
+        ("Instance Actions", [
+            ("Enter", "Open selected instance in new terminal tab"),
+            ("r", "Rename selected instance"),
+            ("y", "Copy resume command to clipboard (yank)"),
+            ("v", "Change voice for instance"),
+            ("s", "Stop selected instance"),
+            ("d", "Delete selected instance"),
+            ("c", "Clear all stopped instances"),
+            ("n", "Set session note for instance"),
+        ]),
+        ("Recovery", [
+            ("U", "Unstick frozen instance (SIGWINCH, gentle nudge)"),
+            ("I", "Interrupt frozen instance (SIGINT, cancel op)"),
+            ("K", "Kill deadlocked instance (SIGKILL, preserves /resume)"),
+        ]),
+        ("TTS / Audio", [
+            ("m", "Cycle instance TTS mode (verbose/muted/silent/voice-chat)"),
+            ("M", "Cycle global TTS mode"),
+        ]),
+        ("System", [
+            ("R", "Restart Token-API server"),
+            ("Ctrl+R", "Full refresh (restart server + reload TUI)"),
+            ("?", "Toggle this help screen"),
+            ("q", "Quit"),
+        ]),
+    ]
+
+    lines = []
+    for section, bindings in keybindings:
+        lines.append(f"[bold cyan]{section}[/bold cyan]")
+        for key, desc in bindings:
+            lines.append(f"  [yellow]{key:<12}[/yellow] {desc}")
+        lines.append("")
+
+    content = "\n".join(lines)
+    panel = Panel(
+        content,
+        title="[bold]Keybindings[/bold]  [dim](press ? or any key to close)[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+    layout.update(panel)
+    return layout
+
+
 def get_dashboard(instances: list, selected_idx: int) -> Layout:
     """Get appropriate dashboard based on layout_mode (dynamic if not forced)."""
     global layout_mode
+
+    if show_help:
+        return generate_help_screen()
+
     # Dynamically detect layout mode on each render if not forced by CLI
     if not layout_mode_forced:
         layout_mode = detect_layout_mode()
@@ -2921,7 +2988,7 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page
+    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page, show_help
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
     global table_mode, cron_selected_index, unstick_feedback, global_tts_mode
 
@@ -3004,6 +3071,13 @@ def main():
                         continue
 
                     key = sys.stdin.read(1)
+
+                    # When help is showing, any key dismisses it
+                    if show_help:
+                        with action_lock:
+                            action_queue.append('toggle_help')
+                        update_flag.set()
+                        continue
 
                     if key.lower() == 'q':
                         quit_flag.set()
@@ -3121,6 +3195,10 @@ def main():
                         with action_lock:
                             action_queue.append('table_next')
                         update_flag.set()
+                    elif key == '?':
+                        with action_lock:
+                            action_queue.append('toggle_help')
+                        update_flag.set()
         except Exception:
             pass
         finally:
@@ -3175,6 +3253,11 @@ def main():
                 displayed = _get_displayed()
 
                 for action in actions_to_process:
+                    if action == 'toggle_help':
+                        show_help = not show_help
+                        _refresh(live)
+                        continue
+
                     if action == 'table_prev':
                         table_mode = "instances"
                         _refresh(live)
@@ -3408,7 +3491,7 @@ def main():
                             result = cycle_instance_tts_mode(instance_id, current_mode)
                             if result:
                                 new_mode = result.get("mode", "?")
-                                mode_display = {"verbose": "Verbose (TTS+Sound)", "muted": "Muted (Sound only)", "silent": "Silent"}
+                                mode_display = {"verbose": "Verbose (TTS+Sound)", "muted": "Muted (Sound only)", "silent": "Silent", "voice-chat": "Voice Chat"}
                                 unstick_feedback = (time.time(), f"TTS: {mode_display.get(new_mode, new_mode)}")
                                 instances_cache = get_instances()
                                 refresh_global_tts_mode()

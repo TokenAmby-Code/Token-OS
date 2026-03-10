@@ -2441,16 +2441,17 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
     """Set TTS mode for an instance: verbose, muted, or silent."""
     body = await request.json()
     mode = body.get("mode", "verbose")
-    if mode not in ("verbose", "muted", "silent"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, or silent")
+    if mode not in ("verbose", "muted", "silent", "voice-chat"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat")
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT id, tts_voice, notification_sound FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
+        old_mode = row["tts_mode"] or "verbose"
         old_voice = row["tts_voice"]
         old_sound = row["notification_sound"]
 
@@ -2460,7 +2461,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
                 "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE id = ?",
                 (mode, instance_id)
             )
-        elif mode == "verbose" and not old_voice:
+        elif mode in ("verbose", "voice-chat") and not old_voice:
             # Re-assign voice from pool
             cursor2 = await db.execute(
                 "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
@@ -2473,12 +2474,22 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
                 (mode, profile["wsl_voice"], profile["notification_sound"], instance_id)
             )
         else:
-            # muted or verbose (with existing voice)
             await db.execute(
                 "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
                 (mode, instance_id)
             )
         await db.commit()
+
+    # Manage voice chat session based on mode transition
+    if mode == "voice-chat":
+        VOICE_CHAT_SESSIONS[instance_id] = {
+            "active": True,
+            "started_at": datetime.now().isoformat()
+        }
+        logger.info(f"Voice chat STARTED for {instance_id[:12]} (via tts_mode)")
+    elif old_mode == "voice-chat" and mode != "voice-chat":
+        VOICE_CHAT_SESSIONS.pop(instance_id, None)
+        logger.info(f"Voice chat ENDED for {instance_id[:12]} (via tts_mode)")
 
     await log_event("tts_mode_changed", instance_id=instance_id, details={"mode": mode})
     return {"status": "ok", "instance_id": instance_id, "mode": mode}
@@ -2565,7 +2576,7 @@ async def get_instance_todos(instance_id: str):
 
 @app.post("/api/instances/{instance_id}/voice-chat")
 async def toggle_voice_chat(instance_id: str, active: bool = True):
-    """Toggle voice chat mode for an instance."""
+    """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'."""
     if active:
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
@@ -2575,6 +2586,14 @@ async def toggle_voice_chat(instance_id: str, active: bool = True):
     else:
         VOICE_CHAT_SESSIONS.pop(instance_id, None)
         logger.info(f"Voice chat ENDED for {instance_id[:12]}")
+    # Keep tts_mode column in sync
+    new_mode = "voice-chat" if active else "verbose"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
+            (new_mode, instance_id)
+        )
+        await db.commit()
     return {"instance_id": instance_id, "voice_chat": active}
 
 
@@ -2647,10 +2666,17 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
         instances = []
         for row in rows:
             inst = dict(row)
-            vc_session = VOICE_CHAT_SESSIONS.get(inst["id"])
-            if vc_session:
+            # voice_chat derived from tts_mode column (DB-authoritative)
+            is_vc = (inst.get("tts_mode") == "voice-chat") or (inst["id"] in VOICE_CHAT_SESSIONS)
+            if is_vc:
                 inst["voice_chat"] = True
                 inst["listening"] = DICTATION_STATE["active"]
+                # Ensure in-memory session exists if DB says voice-chat
+                if inst["id"] not in VOICE_CHAT_SESSIONS:
+                    VOICE_CHAT_SESSIONS[inst["id"]] = {
+                        "active": True,
+                        "started_at": datetime.now().isoformat()
+                    }
             instances.append(inst)
         return instances
 
@@ -7303,6 +7329,9 @@ async def queue_tts(instance_id: str, message: str) -> dict:
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
+    # voice-chat behaves like verbose for TTS purposes
+    if instance_mode == "voice-chat":
+        instance_mode = "verbose"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose
     mode_rank = {"verbose": 0, "muted": 1, "silent": 2}

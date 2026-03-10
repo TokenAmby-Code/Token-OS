@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+transcript-extract — Convert Claude Code JSONL conversation logs to clean Markdown.
+
+Deterministically pre-filters JSONL into human-readable session transcripts.
+Drops noise (progress, snapshots, thinking blocks), summarizes tool calls,
+preserves human and assistant text verbatim.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ── Tool summarizers ──────────────────────────────────────────────────────────
+
+def summarize_tool_use(block: dict) -> str:
+    """One-line summary of a tool_use block."""
+    name = block.get("name", "Unknown")
+    inp = block.get("input", {})
+
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        if len(cmd) > 120:
+            cmd = cmd[:117] + "..."
+        return f'[Tool: Bash] command="{cmd}"'
+    elif name == "Read":
+        return f'[Tool: Read] file={inp.get("file_path", "?")}'
+    elif name == "Write":
+        return f'[Tool: Write] file={inp.get("file_path", "?")}'
+    elif name == "Edit":
+        fp = inp.get("file_path", "?")
+        old = inp.get("old_string", "")
+        preview = old[:60].replace("\n", "\\n")
+        if len(old) > 60:
+            preview += "..."
+        return f'[Tool: Edit] file={fp} old="{preview}"'
+    elif name == "Glob":
+        return f'[Tool: Glob] pattern={inp.get("pattern", "?")} path={inp.get("path", ".")}'
+    elif name == "Grep":
+        return f'[Tool: Grep] pattern="{inp.get("pattern", "?")}" path={inp.get("path", ".")}'
+    elif name == "Skill":
+        return f'[Tool: Skill] skill={inp.get("skill", "?")}'
+    elif name == "ToolSearch":
+        return f'[Tool: ToolSearch] query="{inp.get("query", "?")}"'
+    elif name == "WebFetch":
+        return f'[Tool: WebFetch] url={inp.get("url", "?")}'
+    elif name == "WebSearch":
+        return f'[Tool: WebSearch] query="{inp.get("query", "?")}"'
+    elif name == "NotebookEdit":
+        return f'[Tool: NotebookEdit] file={inp.get("file_path", "?")}'
+    else:
+        # Generic: show first key-value pair
+        if inp:
+            first_key = next(iter(inp))
+            val = str(inp[first_key])
+            if len(val) > 80:
+                val = val[:77] + "..."
+            return f'[Tool: {name}] {first_key}={val}'
+        return f'[Tool: {name}]'
+
+
+def summarize_tool_result(block: dict) -> str:
+    """Summarize a tool_result block to max ~100 chars."""
+    content = block.get("content", "")
+    is_error = block.get("is_error", False)
+
+    if is_error:
+        if isinstance(content, str):
+            line = content.split("\n")[0][:90]
+            return f'[Result: ERROR] {line}'
+        return '[Result: ERROR]'
+
+    if isinstance(content, list):
+        # content blocks inside result
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                texts.append(item.get("text", ""))
+        content = "\n".join(texts)
+
+    if isinstance(content, str):
+        if not content.strip():
+            return '[Result: OK (empty)]'
+        first_line = content.strip().split("\n")[0]
+        if len(first_line) > 100:
+            first_line = first_line[:97] + "..."
+        return f'[Result] {first_line}'
+
+    return '[Result: OK]'
+
+
+# ── JSONL Processing ──────────────────────────────────────────────────────────
+
+DROP_TYPES = {"progress", "file-history-snapshot", "queue-operation", "last-prompt", "system"}
+
+
+def process_jsonl(filepath: str, include_subagents: bool = False) -> str:
+    """Process a JSONL file into markdown."""
+    session_id = Path(filepath).stem
+    messages = []
+    cwd = None
+    first_timestamp = None
+    user_count = 0
+    assistant_count = 0
+
+    after_command = False  # tracks if previous user message had a /command tag
+
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = obj.get("type", "")
+
+            # Drop noise types
+            if msg_type in DROP_TYPES:
+                continue
+
+            # Skip sidechain unless requested
+            if not include_subagents and obj.get("isSidechain", False):
+                continue
+
+            # Extract metadata from first available message
+            if cwd is None and obj.get("cwd"):
+                cwd = obj["cwd"]
+            if first_timestamp is None and obj.get("timestamp"):
+                first_timestamp = obj["timestamp"]
+
+            if msg_type == "user":
+                content = obj.get("message", {}).get("content")
+                if content is None:
+                    continue
+
+                rendered = render_content(content, is_user=True, after_command=after_command)
+                if rendered:
+                    # Check if this is purely tool_results (auto-generated)
+                    if is_pure_tool_result(content):
+                        messages.append(("tool_result_block", rendered))
+                    else:
+                        user_count += 1
+                        messages.append(("user", rendered))
+
+                # Track if this message had a command tag for next message detection
+                raw_text = _extract_raw_text(content)
+                after_command = "<command-name>" in raw_text
+
+            elif msg_type == "assistant":
+                content = obj.get("message", {}).get("content")
+                if content is None:
+                    continue
+
+                rendered = render_content(content, is_user=False)
+                if rendered:
+                    assistant_count += 1
+                    messages.append(("assistant", rendered))
+
+    # Build output
+    date_str = ""
+    if first_timestamp:
+        try:
+            dt = datetime.fromisoformat(first_timestamp.replace("Z", "+00:00"))
+            date_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except (ValueError, AttributeError):
+            date_str = first_timestamp
+
+    lines = []
+    lines.append(f"# Session Transcript: {session_id}")
+    if cwd:
+        lines.append(f"**Project:** {cwd}")
+    if date_str:
+        lines.append(f"**Date:** {date_str}")
+    lines.append(f"**Messages:** {user_count} user, {assistant_count} assistant")
+    lines.append("")
+    lines.append("---")
+
+    prev_speaker = None  # tracks last real speaker (user/assistant), ignores tool_result
+    for role, text in messages:
+        if role == "tool_result_block":
+            # Attach to previous block (no header, doesn't change speaker)
+            lines.append(text)
+        elif role == prev_speaker:
+            # Consecutive same-speaker messages: merge without repeating header
+            lines.append(text)
+        else:
+            lines.append("")
+            if role == "user":
+                lines.append("### User")
+            elif role == "assistant":
+                lines.append("### Assistant")
+            lines.append(text)
+            prev_speaker = role
+
+    return "\n".join(lines) + "\n"
+
+
+def is_pure_tool_result(content) -> bool:
+    """Check if content is exclusively tool_result blocks (auto-generated response)."""
+    if isinstance(content, str):
+        return False
+    if isinstance(content, list):
+        return all(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        )
+    return False
+
+
+def _extract_raw_text(content) -> str:
+    """Get the raw text from content (string or block list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
+
+def detect_skill_expansion(text: str, after_command: bool = False) -> str | None:
+    """Detect if text is a /command skill expansion and return a summary."""
+    # Pattern 1: Explicit skill directory marker
+    if text.startswith("Base directory for this skill:"):
+        first_line = text.split("\n")[0]
+        skill_path = first_line.replace("Base directory for this skill:", "").strip()
+        skill_name = skill_path.rstrip("/").split("/")[-1] if skill_path else "unknown"
+        return f"[Skill Expansion: /{skill_name}] ({len(text)} chars, suppressed)"
+    # Pattern 2: Large text block immediately after a <command-name> message
+    if after_command and len(text) > 500 and "<command-name>" not in text:
+        # Extract title from first heading or first line
+        first_line = text.strip().split("\n")[0].lstrip("# ").strip()
+        return f"[Skill Expansion: {first_line}] ({len(text)} chars, suppressed)"
+    return None
+
+
+def detect_command_tags(text: str) -> str | None:
+    """Detect <command-name> tags and extract a clean summary."""
+    import re
+    cmd_match = re.search(r"<command-name>/?([\w-]+)</command-name>", text)
+    if not cmd_match:
+        return None
+    cmd_name = cmd_match.group(1)
+    args_match = re.search(r"<command-args>(.*?)</command-args>", text, re.DOTALL)
+    args = args_match.group(1).strip()[:150] if args_match else ""
+    if args:
+        return f"/{cmd_name} {args}"
+    return f"/{cmd_name}"
+
+
+def render_content(content, is_user: bool, after_command: bool = False) -> str:
+    """Render message content (string or block list) to markdown."""
+    if isinstance(content, str):
+        # Check for skill expansion
+        skill = detect_skill_expansion(content, after_command)
+        if skill:
+            return skill
+        # Check for command tags
+        cmd = detect_command_tags(content)
+        if cmd:
+            return cmd
+        return content.strip()
+
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+
+        btype = block.get("type", "")
+
+        if btype == "text":
+            text = block.get("text", "").strip()
+            if text:
+                # Check for skill expansion
+                skill = detect_skill_expansion(text, after_command)
+                if skill:
+                    parts.append(skill)
+                    continue
+                # Check for command tags
+                cmd = detect_command_tags(text)
+                if cmd:
+                    parts.append(cmd)
+                    continue
+                parts.append(text)
+
+        elif btype == "tool_use":
+            parts.append(summarize_tool_use(block))
+
+        elif btype == "tool_result":
+            parts.append(summarize_tool_result(block))
+
+        elif btype == "thinking":
+            # Drop thinking blocks
+            continue
+
+        # Skip other block types silently
+
+    return "\n".join(parts)
+
+
+# ── --today discovery ─────────────────────────────────────────────────────────
+
+def find_today_sessions() -> list[str]:
+    """Find all JSONL files modified today."""
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    results = []
+
+    for jsonl in claude_dir.rglob("*.jsonl"):
+        mtime = datetime.fromtimestamp(jsonl.stat().st_mtime, tz=timezone.utc)
+        if mtime.date() == today:
+            results.append(str(jsonl))
+
+    results.sort()
+    return results
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract clean markdown transcripts from Claude Code JSONL logs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  transcript-extract session.jsonl
+  transcript-extract session.jsonl -o transcript.md
+  transcript-extract --today
+  transcript-extract session.jsonl --include-subagents
+""",
+    )
+    parser.add_argument("file", nargs="?", help="Path to JSONL file")
+    parser.add_argument("-o", "--output", help="Write output to file instead of stdout")
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="Process all sessions modified today",
+    )
+    parser.add_argument(
+        "--include-subagents",
+        action="store_true",
+        help="Include sidechain/subagent messages",
+    )
+
+    args = parser.parse_args()
+
+    if args.today:
+        sessions = find_today_sessions()
+        if not sessions:
+            print("No sessions found for today.", file=sys.stderr)
+            sys.exit(1)
+
+        outputs = []
+        for path in sessions:
+            try:
+                outputs.append(process_jsonl(path, args.include_subagents))
+            except Exception as e:
+                print(f"Error processing {path}: {e}", file=sys.stderr)
+
+        result = "\n\n---\n\n".join(outputs)
+
+    elif args.file:
+        if not os.path.isfile(args.file):
+            print(f"File not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        result = process_jsonl(args.file, args.include_subagents)
+
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(result)
+        print(f"Written to {args.output}", file=sys.stderr)
+    else:
+        print(result, end="")
+
+
+if __name__ == "__main__":
+    main()

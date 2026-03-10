@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+# session-update - Merge updates into session documents via Token-API
+# TAGS: token-api, session
+# AUDIENCE: agent, human
+"""Merge updates into session documents via Token-API.
+
+Usage:
+    session-update "Activity log entry text"
+    session-update --doc-id 12 "Entry text"
+    session-update --context "why this update" "Entry text"
+    session-update --entry "Did X, Y, Z. Decision: chose A because B."
+    echo "### Heading\\nContent" | session-update --stdin
+    echo "content" | session-update --stdin --entry
+
+Flags:
+    --doc-id N       Explicit session doc ID (default: auto-detect from instance)
+    --stdin          Read content from stdin instead of positional arg
+    --entry          Auto-format with timestamp + instance name header
+    --context TEXT   Brief description for the merge (default: "session-update CLI")
+    --source TEXT    Source label (default: "agent")
+    --json           Output raw API response as JSON
+    -h, --help       Show this help
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+
+def get_api_url():
+    url = os.environ.get("TOKEN_API_URL", "http://100.95.109.23:7777")
+    return url.rstrip("/")
+
+
+def api_get(path):
+    """GET request to Token-API. Returns parsed JSON or raises."""
+    url = f"{get_api_url()}{path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        raise SystemExit(f"Error: API returned {e.code} for GET {path}: {body}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Error: Cannot reach Token-API at {get_api_url()} — {e.reason}")
+    except (TimeoutError, OSError) as e:
+        raise SystemExit(f"Error: Cannot reach Token-API at {get_api_url()} — {e}")
+
+
+def api_post(path, data):
+    """POST JSON to Token-API. Returns parsed JSON or raises."""
+    url = f"{get_api_url()}{path}"
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        resp_body = e.read().decode() if e.fp else ""
+        raise SystemExit(f"Error: API returned {e.code} for POST {path}: {resp_body}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Error: Cannot reach Token-API at {get_api_url()} — {e.reason}")
+    except (TimeoutError, OSError) as e:
+        raise SystemExit(f"Error: Cannot reach Token-API at {get_api_url()} — {e}")
+
+
+def get_instance_id():
+    """Get instance ID from env var."""
+    iid = os.environ.get("TOKEN_API_INSTANCE_ID")
+    if not iid:
+        raise SystemExit(
+            "Error: No TOKEN_API_INSTANCE_ID set and no --doc-id provided.\n"
+            "Either set the env var or pass --doc-id explicitly."
+        )
+    return iid
+
+
+def get_session_doc_id(instance_id):
+    """Resolve session doc ID from instance."""
+    data = api_get(f"/api/instances/{instance_id}/session-doc")
+    doc_id = data.get("session_doc_id")
+    if not doc_id:
+        raise SystemExit(
+            f"Error: Instance {instance_id} has no linked session doc.\n"
+            "Link one first or pass --doc-id explicitly."
+        )
+    return doc_id
+
+
+def get_instance_name(instance_id):
+    """Get tab_name from instance metadata."""
+    data = api_get(f"/api/instances/{instance_id}")
+    return data.get("tab_name") or data.get("name") or f"instance-{instance_id}"
+
+
+def format_entry(content, instance_name):
+    """Format content as a timestamped entry."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"### {now} -- {instance_name}\n{content}"
+
+
+def parse_args(argv):
+    args = {
+        "doc_id": None,
+        "stdin": False,
+        "entry": False,
+        "context": "session-update CLI",
+        "source": "agent",
+        "json_output": False,
+        "content": None,
+    }
+    i = 0
+    positionals = []
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--doc-id":
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("Error: --doc-id requires a value")
+            args["doc_id"] = argv[i]
+        elif a == "--context":
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("Error: --context requires a value")
+            args["context"] = argv[i]
+        elif a == "--source":
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("Error: --source requires a value")
+            args["source"] = argv[i]
+        elif a == "--stdin":
+            args["stdin"] = True
+        elif a == "--entry":
+            args["entry"] = True
+        elif a == "--json":
+            args["json_output"] = True
+        elif a.startswith("-"):
+            raise SystemExit(f"Error: Unknown flag: {a}\nRun session-update --help for usage.")
+        else:
+            positionals.append(a)
+        i += 1
+
+    # Resolve content
+    if args["stdin"]:
+        if not sys.stdin.isatty():
+            args["content"] = sys.stdin.read().rstrip("\n")
+        else:
+            raise SystemExit("Error: --stdin specified but no data piped to stdin")
+        if positionals:
+            raise SystemExit("Error: Cannot use both --stdin and positional content")
+    elif positionals:
+        args["content"] = " ".join(positionals)
+    else:
+        raise SystemExit(
+            "Error: No content provided.\n"
+            "Usage: session-update \"text\" or echo \"text\" | session-update --stdin"
+        )
+
+    if not args["content"].strip():
+        raise SystemExit("Error: Content is empty.")
+
+    return args
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+
+    # Resolve doc ID
+    instance_id = None
+    if args["doc_id"]:
+        doc_id = args["doc_id"]
+    else:
+        instance_id = get_instance_id()
+        doc_id = get_session_doc_id(instance_id)
+
+    content = args["content"]
+
+    # Auto-format entry if requested
+    if args["entry"]:
+        if not instance_id:
+            instance_id = os.environ.get("TOKEN_API_INSTANCE_ID")
+        if instance_id:
+            instance_name = get_instance_name(instance_id)
+        else:
+            instance_name = "manual"
+        content = format_entry(content, instance_name)
+
+    # Merge
+    result = api_post(f"/api/session-docs/{doc_id}/merge", {
+        "content": content,
+        "source": args["source"],
+        "context": args["context"],
+    })
+
+    if args["json_output"]:
+        print(json.dumps(result, indent=2))
+    else:
+        status = result.get("status", "unknown")
+        print(f"Merged into session doc {doc_id} (status: {status})")
+
+
+if __name__ == "__main__":
+    main()
