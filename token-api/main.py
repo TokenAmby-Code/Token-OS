@@ -3185,7 +3185,7 @@ PHONE_CONFIG = {
     "timeout": 5,
     # === TEST SHIM - REMOVE AFTER TESTING ===
     # Set to True to bypass break time check and force blocking
-    "test_force_block": True,
+    "test_force_block": False,
     # =========================================
 }
 
