@@ -3422,36 +3422,57 @@ MACRODROID_TRIGGER_APP_MAP = {
 
 
 import re
-_TRIGGER_NAME_RE = re.compile(r"Application (?:Launched|Closed) \((.+)\)", re.IGNORECASE)
+_APP_TRIGGER_RE = re.compile(r"Application (?:Launched|Closed) \((.+)\)", re.IGNORECASE)
+_GEO_TRIGGER_RE = re.compile(r"Geofence (Entry|Exit) \((.+)\)", re.IGNORECASE)
 
 
-def parse_macrodroid_trigger(raw: str) -> tuple[str, str]:
-    """Extract app key and action from MacroDroid trigger name.
+def parse_macrodroid_trigger(raw: str) -> dict:
+    """Parse any MacroDroid trigger name into a structured dict.
 
-    Input formats:
-      - "Application Launched (X)" → ("twitter", "open")
-      - "Application Closed (YouTube)" → ("youtube", "close")
-      - "com.twitter.android" → ("com.twitter.android", "")  (passthrough, no action)
-      - "twitter" → ("twitter", "")  (passthrough)
+    Returns dict with keys:
+      type: "app" | "geofence" | "unknown"
+      + type-specific fields
 
-    Returns (app_key, action) where app_key is used in PHONE_DISTRACTION_APPS.
+    App triggers:
+      "Application Launched (X)" → {type: "app", app: "twitter", action: "open"}
+      "Application Closed (YouTube)" → {type: "app", app: "youtube", action: "close"}
+
+    Geofence triggers:
+      "Geofence Entry (Home)" → {type: "geofence", location: "home", action: "enter"}
+      "Geofence Exit (Gym)" → {type: "geofence", location: "gym", action: "exit"}
+
+    Passthrough:
+      "twitter" → {type: "unknown", raw: "twitter"}
     """
     if not raw:
-        return ("", "")
-    m = _TRIGGER_NAME_RE.match(raw.strip())
+        return {"type": "unknown", "raw": ""}
+
+    stripped = raw.strip()
+
+    # App trigger
+    m = _APP_TRIGGER_RE.match(stripped)
     if m:
         display_name = m.group(1).strip().lower()
         app_key = MACRODROID_TRIGGER_APP_MAP.get(display_name, display_name)
-        action = "open" if "launched" in raw.lower() else "close"
-        return (app_key, action)
-    # Not a trigger name — passthrough (package name or raw app key)
-    return (raw.lower(), "")
+        action = "open" if "launched" in stripped.lower() else "close"
+        return {"type": "app", "app": app_key, "action": action}
+
+    # Geofence trigger
+    m = _GEO_TRIGGER_RE.match(stripped)
+    if m:
+        direction = m.group(1).lower()  # "entry" or "exit"
+        location = m.group(2).strip().lower()
+        action = "enter" if direction == "entry" else "exit"
+        return {"type": "geofence", "location": location, "action": action}
+
+    # Passthrough
+    return {"type": "unknown", "raw": stripped.lower()}
 
 
 # Backwards compat alias
 def parse_macrodroid_trigger_app(raw: str) -> str:
-    app_key, _ = parse_macrodroid_trigger(raw)
-    return app_key
+    parsed = parse_macrodroid_trigger(raw)
+    return parsed.get("app", parsed.get("raw", ""))
 
 
 # ============ Pavlok Shock Watch ============
@@ -5081,16 +5102,19 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     """
     now = datetime.now().isoformat()
 
-    # Infer event from trigger name if not provided
-    # Minimal format: {"app": "Application Launched (X)"} — no event field needed
+    # Parse trigger name to determine event type and routing
+    # Minimal format: {"app": "Application Launched (X)"} or {"app": "Geofence Entry (Home)"}
+    raw_trigger = request.app or ""
+    parsed = parse_macrodroid_trigger(raw_trigger) if raw_trigger else {"type": "unknown", "raw": ""}
     event = request.event
-    if not event and request.app:
-        raw_lower = request.app.lower()
-        if "launched" in raw_lower:
-            event = "app_open"
-        elif "closed" in raw_lower:
-            event = "app_close"
-        else:
+
+    # Infer event from trigger name if not provided
+    if not event:
+        if parsed["type"] == "app":
+            event = "app_open" if parsed["action"] == "open" else "app_close"
+        elif parsed["type"] == "geofence":
+            event = "geofence"
+        elif raw_trigger:
             event = "app_telemetry"
 
     if not event:
@@ -5103,31 +5127,32 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         "shizuku_dead": request.shizuku_dead,
     })
 
-    # ---- v2 Telemetry ----
-    # Accepts any of:
-    #   {"event": "app_open", "app": "Application Launched (X)"}
-    #   {"app": "Application Launched (X)"}  (event inferred)
-    #   {"app": "Application Closed (X)"}    (event inferred)
-    # The trigger name encodes both the app and open/close distinction.
-    if event in ("app_open", "app_close", "app_telemetry"):
-        raw_app = request.app or ""
-        app_key, trigger_action = parse_macrodroid_trigger(raw_app)
-        if not app_key:
-            return {"received": True, "event": event, "error": "missing app field"}
+    # ---- App telemetry (open/close) ----
+    if event in ("app_open", "app_close", "app_telemetry") and parsed["type"] == "app":
+        app_key = parsed["app"]
+        action = parsed["action"] or ("close" if event == "app_close" else "open")
 
-        # Resolve action: trigger name wins, then event type, then default "open"
-        action = trigger_action or ("close" if event == "app_close" else "open")
+        print(f">>> /phone/event {event}: raw={raw_trigger!r} -> app={app_key!r} action={action!r}")
 
-        print(f">>> /phone/event {event}: raw={raw_app!r} -> app={app_key!r} action={action!r}")
-
-        # Stop enforcement cascade on close
         if action == "close":
             stop_enforcement_cascade(reason="app_close")
 
         phone_req = PhoneActivityRequest(app=app_key, action=action, package=app_key)
         result = await handle_phone_activity(phone_req)
         return {"received": True, "event": event, "app": app_key, "action": action,
-                "raw": raw_app, "decision": result.dict()}
+                "raw": raw_trigger, "decision": result.dict()}
+
+    # ---- Geofence (entry/exit) ----
+    elif event == "geofence" or parsed["type"] == "geofence":
+        location = parsed["location"]
+        action = parsed["action"]
+
+        print(f">>> /phone/event geofence: raw={raw_trigger!r} -> location={location!r} action={action!r}")
+
+        loc_req = LocationEventRequest(location=location, action=action, source="macrodroid_v2")
+        result = await handle_location_event(loc_req)
+        return {"received": True, "event": "geofence", "location": location, "action": action,
+                "raw": raw_trigger, "result": result}
 
     # ---- v2 Discord fallback acknowledgement ----
     elif event == "discord_fallback_received":
