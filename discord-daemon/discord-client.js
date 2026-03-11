@@ -141,6 +141,20 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
 
     logger.debug(`[${channelName}] ${msgData.author.username}: ${message.content.slice(0, 80)}`);
 
+    // Direct forward for fallback channel (webhook messages bypass mechanicus handler)
+    if (channelName === 'fallback') {
+      try {
+        const resp = await fetch(`http://127.0.0.1:${config.token_api_port || 7777}/api/discord/message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(msgData),
+        });
+        logger.info(`Fallback forwarded to Token API: ${resp.status}`);
+      } catch (err) {
+        logger.warn(`Fallback forward failed: ${err.message}`);
+      }
+    }
+
     // Notify all registered handlers
     for (const handler of messageHandlers) {
       try {

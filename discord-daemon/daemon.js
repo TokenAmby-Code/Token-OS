@@ -82,8 +82,8 @@ async function main() {
     }
 
     discordClient.onMessage(async (msg) => {
-      // Don't forward bot messages
-      if (msg.author.bot) return;
+      // Don't forward bot messages (except fallback channel — webhook relay)
+      if (msg.author.bot && msg.channel_name !== "fallback") return;
       // Skip replayed events (WebSocket resume can replay recently-seen messages)
       if (isDuplicate(msg.message_id)) {
         logger.debug(`Skipping duplicate message forward: ${msg.message_id}`);
