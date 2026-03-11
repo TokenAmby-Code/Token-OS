@@ -4230,8 +4230,14 @@ def _send_enforce_to_phone(app_name: str, level: int) -> dict:
         return {"success": False, "error": str(e)}
 
 
+DISCORD_FALLBACK_WEBHOOK = os.getenv(
+    "DISCORD_FALLBACK_WEBHOOK",
+    "https://discord.com/api/webhooks/1481081278190063828/Z7ObPIY-V-bKUkmC9rDhxajo4IssLE2kXirbqBxAGIJDvU8PwzY2tw2C91PadL5N2rlv",
+)
+
+
 async def _send_discord_fallback(app_name: str, level: int):
-    """Send enforcement command to Discord #fallback as literal endpoint+body.
+    """Send enforcement command to Discord #fallback via webhook.
 
     Format: POST /phone/enforce {"level":"N","app":"appname"}
 
@@ -4242,13 +4248,14 @@ async def _send_discord_fallback(app_name: str, level: int):
     msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}"}}'
     logger.info(f"DISCORD FALLBACK: {msg}")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "discord", "send", "fallback", msg,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=15)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(DISCORD_FALLBACK_WEBHOOK, json={"content": msg})
+            if resp.status_code == 204:
+                logger.info("DISCORD FALLBACK: Webhook sent OK")
+            else:
+                logger.warning(f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        logger.warning(f"DISCORD FALLBACK: Failed to send: {e}")
+        logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
 
 
 async def _enforcement_cascade_worker(app_name: str):
