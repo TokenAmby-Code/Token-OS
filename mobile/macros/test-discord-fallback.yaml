@@ -1,0 +1,26 @@
+# Test macro: send enforcement message to #fallback via webhook
+# For validating the Discord fallback loop end-to-end.
+# Delete after testing.
+
+name: "Test Discord Fallback"
+category: "Testing"
+description: "Send a test enforcement message to Discord #fallback webhook"
+enabled: true
+
+triggers:
+  - type: http_server
+    identifier: "test-fallback"
+    send_response: true
+
+actions:
+  - type: http_request
+    url: "https://discord.com/api/webhooks/1481081278190063828/Z7ObPIY-V-bKUkmC9rDhxajo4IssLE2kXirbqBxAGIJDvU8PwzY2tw2C91PadL5N2rlv"
+    method: POST
+    body: '{"content":"POST /phone/enforce {\"level\":\"1\",\"app\":\"twitter\"}"}'
+    content_type: "application/json"
+    block_next: true
+    timeout: 10
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "sent"}'

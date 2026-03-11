@@ -3420,25 +3420,33 @@ import re
 _TRIGGER_NAME_RE = re.compile(r"Application (?:Launched|Closed) \((.+)\)", re.IGNORECASE)
 
 
-def parse_macrodroid_trigger_app(raw: str) -> str:
-    """Extract app key from MacroDroid trigger name.
+def parse_macrodroid_trigger(raw: str) -> tuple[str, str]:
+    """Extract app key and action from MacroDroid trigger name.
 
     Input formats:
-      - "Application Launched (X)" → "twitter"
-      - "Application Closed (YouTube)" → "youtube"
-      - "com.twitter.android" → "com.twitter.android" (passthrough)
-      - "twitter" → "twitter" (passthrough)
+      - "Application Launched (X)" → ("twitter", "open")
+      - "Application Closed (YouTube)" → ("youtube", "close")
+      - "com.twitter.android" → ("com.twitter.android", "")  (passthrough, no action)
+      - "twitter" → ("twitter", "")  (passthrough)
 
-    Returns the internal app key used in PHONE_DISTRACTION_APPS.
+    Returns (app_key, action) where app_key is used in PHONE_DISTRACTION_APPS.
     """
     if not raw:
-        return ""
+        return ("", "")
     m = _TRIGGER_NAME_RE.match(raw.strip())
     if m:
         display_name = m.group(1).strip().lower()
-        return MACRODROID_TRIGGER_APP_MAP.get(display_name, display_name)
+        app_key = MACRODROID_TRIGGER_APP_MAP.get(display_name, display_name)
+        action = "open" if "launched" in raw.lower() else "close"
+        return (app_key, action)
     # Not a trigger name — passthrough (package name or raw app key)
-    return raw.lower()
+    return (raw.lower(), "")
+
+
+# Backwards compat alias
+def parse_macrodroid_trigger_app(raw: str) -> str:
+    app_key, _ = parse_macrodroid_trigger(raw)
+    return app_key
 
 
 # ============ Pavlok Shock Watch ============
@@ -5076,36 +5084,31 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         "shizuku_dead": request.shizuku_dead,
     })
 
-    # ---- v2 Telemetry: app_open ----
-    if event == "app_open":
+    # ---- v2 Telemetry: app_open / app_close / app_telemetry ----
+    # All three formats supported:
+    #   {"event": "app_open",  "app": "Application Launched (X)"}  — action from event type
+    #   {"event": "app_close", "app": "Application Closed (X)"}   — action from event type
+    #   {"event": "app_telemetry", "app": "Application Launched (X)"} — action from trigger name
+    # The trigger name always encodes both the app and open/close distinction.
+    if event in ("app_open", "app_close", "app_telemetry"):
         raw_app = request.app or ""
-        app_key = parse_macrodroid_trigger_app(raw_app)
+        app_key, trigger_action = parse_macrodroid_trigger(raw_app)
         if not app_key:
             return {"received": True, "event": event, "error": "missing app field"}
 
-        print(f">>> /phone/event app_open: raw={raw_app!r} -> key={app_key!r}")
+        # Resolve action: trigger name wins, then event type, then default "open"
+        action = trigger_action or ("close" if event == "app_close" else "open")
 
-        # Route through existing distraction detection via internal call
-        phone_req = PhoneActivityRequest(app=app_key, action="open", package=app_key)
+        print(f">>> /phone/event {event}: raw={raw_app!r} -> app={app_key!r} action={action!r}")
+
+        # Stop enforcement cascade on close
+        if action == "close":
+            stop_enforcement_cascade(reason="app_close")
+
+        phone_req = PhoneActivityRequest(app=app_key, action=action, package=app_key)
         result = await handle_phone_activity(phone_req)
-        return {"received": True, "event": event, "app": app_key, "raw": raw_app, "decision": result.dict()}
-
-    # ---- v2 Telemetry: app_close ----
-    elif event == "app_close":
-        raw_app = request.app or ""
-        app_key = parse_macrodroid_trigger_app(raw_app)
-        if not app_key:
-            return {"received": True, "event": event, "error": "missing app field"}
-
-        print(f">>> /phone/event app_close: raw={raw_app!r} -> key={app_key!r}")
-
-        # Stop enforcement cascade if running for this app
-        stop_enforcement_cascade(reason="app_close")
-
-        # Route through existing close handler
-        phone_req = PhoneActivityRequest(app=app_key, action="close", package=app_key)
-        result = await handle_phone_activity(phone_req)
-        return {"received": True, "event": event, "app": app_key, "raw": raw_app, "decision": result.dict()}
+        return {"received": True, "event": event, "app": app_key, "action": action,
+                "raw": raw_app, "decision": result.dict()}
 
     # ---- v2 Discord fallback acknowledgement ----
     elif event == "discord_fallback_received":
