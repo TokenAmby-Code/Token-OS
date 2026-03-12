@@ -50,6 +50,7 @@ logger.setLevel(logging.INFO)
 
 # ============ Server-side Log Buffer ============
 from collections import deque
+from urllib.parse import quote
 from typing import Deque
 
 # Circular buffer to store recent log entries (max 100)
@@ -7799,13 +7800,21 @@ async def skip_tts(clear_queue: bool = False) -> dict:
 
 
 def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
-    """Send notification via HTTP webhook."""
+    """Send notification via HTTP webhook.
+
+    Sends message as query parameter (for MacroDroid {http_query_string})
+    and as JSON body (for structured consumers).
+    """
     payload = {
         "type": "notification",
         "message": message,
         "timestamp": datetime.now().isoformat(),
         **(data or {})
     }
+
+    # Append message as query param so MacroDroid {http_query_string} picks it up
+    separator = "&" if "?" in webhook_url else "?"
+    url_with_params = f"{webhook_url}{separator}message={quote(message)}"
 
     try:
         result = subprocess.run(
@@ -7815,7 +7824,7 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
                 "-d", json.dumps(payload),
                 "--connect-timeout", "5",
                 "-s",
-                webhook_url
+                url_with_params
             ],
             capture_output=True,
             text=True,
