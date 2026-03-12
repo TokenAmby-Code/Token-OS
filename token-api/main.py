@@ -8622,19 +8622,8 @@ async def handle_stop(payload: dict) -> dict:
         logger.info(f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications")
         return result
 
-    # Mobile path: send webhook notification
-    if device_id == "Token-S24":
-        webhook_result = send_webhook(
-            "http://100.102.92.24:7777/notify",
-            f"[{tab_name}] Claude finished"
-        )
-        result["notification"] = webhook_result
-        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile notification")
-        return result
-
-    # Desktop path: TTS and notification
     # Extract TTS text from transcript (prefer embedded tail for remote access,
-    # fall back to direct file read if local)
+    # fall back to direct file read if local). Used by both mobile and desktop paths.
     transcript_tail = payload.get("transcript_tail")
     transcript_path = payload.get("transcript_path")
     tts_text = None
@@ -8668,18 +8657,6 @@ async def handle_stop(payload: dict) -> dict:
                 except json.JSONDecodeError:
                     continue
 
-    # Check TTS config
-    tts_config_file = Path.home() / ".claude" / ".tts-config.json"
-    tts_enabled = True
-
-    if tts_config_file.exists():
-        try:
-            with open(tts_config_file) as f:
-                config = json.load(f)
-                tts_enabled = config.get("enabled", True)
-        except Exception:
-            pass
-
     # Sanitize TTS text (remove markdown formatting and normalize whitespace)
     if tts_text:
         # Strip markdown headers (must be before newline conversion)
@@ -8701,6 +8678,34 @@ async def handle_stop(payload: dict) -> dict:
         # Normalize multiple spaces
         tts_text = re.sub(r' +', ' ', tts_text)
         tts_text = tts_text.strip()
+
+    # Mobile path: send webhook notification with transcript blurb
+    if device_id == "Token-S24":
+        # Include the transcript blurb (truncated for notification readability)
+        if tts_text:
+            notify_text = f"[{tab_name}] {tts_text[:300]}"
+        else:
+            notify_text = f"[{tab_name}] Claude finished"
+        webhook_result = send_webhook(
+            "http://100.102.92.24:7777/notify",
+            notify_text
+        )
+        result["notification"] = webhook_result
+        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile notification ({len(tts_text or '')} chars)")
+        return result
+
+    # Desktop path: TTS and notification
+    # Check TTS config
+    tts_config_file = Path.home() / ".claude" / ".tts-config.json"
+    tts_enabled = True
+
+    if tts_config_file.exists():
+        try:
+            with open(tts_config_file) as f:
+                config = json.load(f)
+                tts_enabled = config.get("enabled", True)
+        except Exception:
+            pass
 
     # Queue TTS if enabled and we have text
     if tts_enabled and tts_text:
