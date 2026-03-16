@@ -56,8 +56,20 @@ def _get_gcloud_credentials() -> Any:
     return google.oauth2.credentials.Credentials(token=token)
 
 
-# Deploy YAML directory in ProcurementAgentAI
-DEPLOY_DIR = Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / "deploy"
+# Deploy YAML directory — search known locations
+def _find_deploy_dir() -> Path:
+    candidates = [
+        Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / "deploy",
+        Path.home() / "worktrees" / "askCivic" / "wt-main" / "deploy",
+        Path.home() / "worktrees" / "askCivic" / "wt-command-system" / "deploy",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # fallback to original
+
+
+DEPLOY_DIR = _find_deploy_dir()
 
 # Mapping of environment names to YAML files
 ENV_TO_YAML = {
@@ -108,7 +120,7 @@ def _load_environments() -> dict[str, dict[str, Any]]:
     try:
         from dotenv import load_dotenv
 
-        project_env = Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / ".env"
+        project_env = DEPLOY_DIR.parent / ".env"
         if project_env.exists():
             load_dotenv(project_env)
         public_ip = os.environ.get("DB_HOST")

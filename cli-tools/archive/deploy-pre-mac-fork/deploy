@@ -19,8 +19,7 @@
 
 set -euo pipefail
 
-SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
-DEPLOY_DIR="$(dirname "$(dirname "$SCRIPT_SELF")")/src/deploy"
+DEPLOY_DIR="$HOME/Scripts/cli-tools/src/deploy"
 
 # Check if help is requested
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
@@ -127,11 +126,7 @@ GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 
 # Two-layer deployment: use current git root if it has a Makefile, otherwise fall back to main project
-MAIN_PROJECT="$HOME/worktrees/askCivic/wt-main"
-# Fallback to legacy location if new worktree doesn't exist
-if [[ ! -d "$MAIN_PROJECT" ]]; then
-    MAIN_PROJECT="$HOME/ProcAgentDir/ProcurementAgentAI"
-fi
+MAIN_PROJECT="$HOME/ProcAgentDir/ProcurementAgentAI"
 if [[ -f "$GIT_ROOT/Makefile" ]]; then
     PROJECT_DIR="$GIT_ROOT"
 else
@@ -243,18 +238,9 @@ if [[ "$RUN_PRO" == "true" ]]; then
     exit 0
 fi
 
-# Mac autoroute: bypass Makefile/trigger-deploy.js on macOS
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    DEPLOY_MAC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")/deploy-mac"
-    if [[ -x "$DEPLOY_MAC" ]]; then
-        exec "$DEPLOY_MAC" ${SERVICE:+"$SERVICE"} "${ARGS[@]+"${ARGS[@]}"}" \
-            $([ "$RUN_FT" = "true" ] && echo "-ft")
-    fi
-fi
-
 # Determine environment from remaining args
 ENV="development"
-for arg in "${ARGS[@]+"${ARGS[@]}"}"; do
+for arg in "${ARGS[@]}"; do
     case "$arg" in
         prod|production) ENV="production" ;;
         dev|development) ENV="development" ;;
@@ -264,7 +250,7 @@ done
 # Check for local/debug target and --verify flag
 TARGET=""
 VERIFY_MODE=false
-for arg in "${ARGS[@]+"${ARGS[@]}"}"; do
+for arg in "${ARGS[@]}"; do
     case "$arg" in
         local) TARGET="local" ;;
         debug) TARGET="debug" ;;
@@ -499,12 +485,12 @@ PY
         # Default: backend deployment via trigger-deploy.js
         if [[ -n "$FT_PID" ]]; then
             # Can't exec — need to wait for cleanup after deploy finishes
-            node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]+"${ARGS[@]}"}"
+            node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
             DEPLOY_EXIT=$?
             wait_for_ft
             exit $DEPLOY_EXIT
         else
-            exec node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]+"${ARGS[@]}"}"
+            exec node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
         fi
         ;;
 esac

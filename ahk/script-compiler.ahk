@@ -10,14 +10,16 @@ PragmaOnce(scriptPath, hwnd) {
     SetTitleMatchMode 3
     query := scriptPath " ahk_class AutoHotkey"
     ; Check if another instance of this specific script is already running
-    if existingHwnd := WinExist(query) {
-        ToolTip("Balls")
-        ProcessClose(WinGetPID(existingHwnd))  ; Close the existing instance
-        Sleep 100  ; Give it time to close
-        PragmaOnce(scriptPath, hwnd)
-        ToolTip()
-    } else {
-        WinSetTitle scriptPath, "ahk_id " hwnd
+    try {
+        if existingHwnd := WinExist(query) {
+            ToolTip("Balls")
+            ProcessClose(WinGetPID(existingHwnd))  ; Close the existing instance
+            Sleep 100  ; Give it time to close
+            PragmaOnce(scriptPath, hwnd)
+            ToolTip()
+        } else {
+            WinSetTitle scriptPath, "ahk_id " hwnd
+        }
     }
 }
 PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)

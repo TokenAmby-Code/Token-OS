@@ -46,8 +46,9 @@ Output:
 Project detection (in priority order):
   1. cwd contains tests/e2e/screenshot.js
   2. git toplevel of cwd contains tests/e2e/screenshot.js
-  3. Sibling ProcurementAgentAI-* worktrees in /home/token/ProcAgentDir/
-  4. /home/token/ProcAgentDir/ProcurementAgentAI (canonical)
+  3. askCivic worktrees in ~/worktrees/askCivic/wt-*/
+  4. Legacy ProcurementAgentAI-* worktrees in ~/ProcAgentDir/
+  5. ~/ProcAgentDir/ProcurementAgentAI (legacy canonical)
 
 Examples:
   screenshot
@@ -64,7 +65,7 @@ fi
 
 # ── Project directory detection ──────────────────────────────────────────────
 
-CANONICAL_DIR="/home/token/ProcAgentDir/ProcurementAgentAI"
+LEGACY_DIR="/home/token/ProcAgentDir/ProcurementAgentAI"
 PROJECT_DIR=""
 
 # 1. Check if cwd itself contains the harness
@@ -80,7 +81,17 @@ if [[ -z "$PROJECT_DIR" ]] && git rev-parse --show-toplevel >/dev/null 2>&1; the
     fi
 fi
 
-# 3. Check sibling ProcurementAgentAI-* worktree directories
+# 3. Check askCivic worktrees (NAS bare repo model)
+if [[ -z "$PROJECT_DIR" ]]; then
+    for dir in "$HOME"/worktrees/askCivic/wt-*/; do
+        if [[ -f "${dir}tests/e2e/screenshot.js" ]]; then
+            PROJECT_DIR="${dir%/}"
+            break
+        fi
+    done
+fi
+
+# 4. Check legacy ProcurementAgentAI-* worktree directories
 if [[ -z "$PROJECT_DIR" ]]; then
     PROC_AGENT_DIR="/home/token/ProcAgentDir"
     for dir in "$PROC_AGENT_DIR"/ProcurementAgentAI-*/; do
@@ -91,16 +102,16 @@ if [[ -z "$PROJECT_DIR" ]]; then
     done
 fi
 
-# 4. Fall back to canonical location
+# 5. Fall back to legacy canonical location
 if [[ -z "$PROJECT_DIR" ]]; then
-    PROJECT_DIR="$CANONICAL_DIR"
+    PROJECT_DIR="$LEGACY_DIR"
 fi
 
 HARNESS="$PROJECT_DIR/tests/e2e/screenshot.js"
 
 if [[ ! -f "$HARNESS" ]]; then
     echo "Error: screenshot harness not found at $HARNESS" >&2
-    echo "Is ProcurementAgentAI checked out at $CANONICAL_DIR?" >&2
+    echo "Run from an askCivic worktree or check ~/worktrees/askCivic/" >&2
     exit 1
 fi
 

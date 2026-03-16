@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-discord_responder.py <channel> <reply_to_message_id> <bot> <prompt_file>
+discord_responder.py <channel> <reply_to_message_id> <bot> <prompt_file> [model]
 
 Invoked by token-api to respond to Discord messages.
 Reads system prompt from file, calls claude CLI, posts response to daemon.
@@ -13,6 +13,7 @@ import urllib.request
 import pathlib
 
 channel, reply_to, bot, prompt_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+model = sys.argv[5] if len(sys.argv) > 5 else "claude-haiku-4-5-20251001"
 
 try:
     system_prompt = pathlib.Path(prompt_file).read_text()
@@ -27,14 +28,14 @@ claude_bin = pathlib.Path.home() / ".local" / "bin" / "claude"
 result = subprocess.run(
     [
         str(claude_bin),
-        "--model", "claude-haiku-4-5-20251001",
+        "--model", model,
         "--system-prompt", system_prompt,
         "-p", f"Reply to the Discord message above as the {bot} bot.",
         "--dangerously-skip-permissions",
     ],
     capture_output=True,
     text=True,
-    timeout=120,
+    timeout=300 if "sonnet" in model or "opus" in model else 120,
     env={**os.environ, "CLAUDECODE": ""},
 )
 

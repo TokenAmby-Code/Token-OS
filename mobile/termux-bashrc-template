@@ -77,6 +77,9 @@ ssh-connect() {
         if [[ $# -gt 0 ]]; then
             ssh "$HOST" -t "$*"
             break
+        elif [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+            # Forward OAuth token so Claude Code works on the remote host
+            ssh -t "$HOST" "export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}'; exec zsh -l"
         else
             ssh "$HOST"
         fi
@@ -316,10 +319,10 @@ alias python="python3"
 
 # cdc - run claude on Mac (not installed on phone) with optional path/args
 # Uses zsh -il (interactive login) so Mac sources ~/.zprofile (PATH) + ~/.zshrc (aliases)
-# Forwards CLAUDE_CODE_OAUTH_TOKEN so long-lived auth works over SSH (no browser refresh needed)
+# CLAUDE_CODE_OAUTH_TOKEN is forwarded automatically by ssh-connect
 cdc() {
     if [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
-        ssh -t mac "CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN' zsh -il -c 'cdc $*'"
+        ssh -t mac "export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'; zsh -il -c 'cdc $*'"
     else
         ssh -t mac "zsh -il -c 'cdc $*'"
     fi

@@ -1,5 +1,5 @@
 #Requires AutoHotkey v2.0
-#Include C:\Users\colby\Documents\Personal-ENV\Scripts\ahk\helper.ahk
+#Include ..\..\helper.ahk
 
 obs_manage(input) {
     switch (input) {

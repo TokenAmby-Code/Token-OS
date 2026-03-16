@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+# Worktree Sync - transfer worktrees between machines via NAS staging
+# TAGS: git, worktree, nas, sync
+# AUDIENCE: human, agent
+#
+# Usage: worktree-sync <export|import|status> [branch] [options]
+#
+# Transfers worktrees between WSL and Mac by committing dirty state,
+# deregistering the worktree, and writing a manifest to NAS staging.
+# The receiving machine imports by creating a new worktree and resetting
+# the sync commit to restore dirty state.
+#
+# Config: ~/.config/worktrees/<project>.conf
+#
+# NAS staging: derived from BARE_REPO path (e.g. /mnt/civic/askcivic.worktrees/)
+#
+# Examples:
+#   worktree-sync export feature-auth           # Export single branch
+#   worktree-sync export                        # Export all non-main worktrees
+#   worktree-sync import feature-auth           # Import single branch from staging
+#   worktree-sync import                        # Import all staged branches
+#   worktree-sync status                        # Show local + staged worktrees
+#   worktree-sync export --force --skip-sync    # Non-interactive, skip dep sync
+
+set -euo pipefail
+
+# Ensure Homebrew is on PATH (Apple Silicon Macs, non-interactive shells)
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Defaults
+DRY_RUN=false
+FORCE=false
+SKIP_SYNC=false
+PROJECT="askCivic"
+SUBCOMMAND=""
+BRANCH_NAME=""
+
+usage() {
+    cat << 'EOF'
+Worktree Sync - transfer worktrees between machines via NAS staging
+
+Usage: worktree-sync <export|import|status> [branch] [options]
+
+Subcommands:
+  export [branch]     Export worktree(s) to NAS staging (commits dirty state)
+  import [branch]     Import worktree(s) from NAS staging (restores dirty state)
+  status              Show local worktrees and NAS staging area
+
+Arguments:
+  branch              Specific branch to export/import (omit for all)
+
+Options:
+  -p, --project NAME  Project config to use (default: askCivic)
+  -f, --force         Skip confirmation prompts
+  -n, --dry-run       Show what would happen without making changes
+  -s, --skip-sync     Skip dependency sync on import (uv sync, npm install)
+  -h, --help          Show this help message
+
+Design:
+  Export: stages dirty files, creates sync commit, removes worktree, writes manifest
+  Import: creates worktree, copies secrets, resets sync commit, removes manifest
+  main/master branches are always skipped (both machines can have wt-main)
+
+NAS staging location: <bare-repo-parent>/<project>.worktrees/<branch>/manifest.json
+
+Examples:
+  worktree-sync export feature-auth               # Export one branch
+  worktree-sync export                             # Export all non-main
+  worktree-sync import feature-auth                # Import one branch
+  worktree-sync import --force --skip-sync         # Auto-import, no dep sync
+  worktree-sync status                             # List everything
+EOF
+    exit 0
+}
+
+log_info()    { echo -e "${BLUE}→${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
+log_error()   { echo -e "${RED}✗${NC} $1"; }
+
+# ═══════════════════════════════════════════════════════════════
+# Config
+# ═══════════════════════════════════════════════════════════════
+
+load_config() {
+    local project="${1:-askCivic}"
+    local config="$HOME/.config/worktrees/${project}.conf"
+    if [[ ! -f "$config" ]]; then
+        log_error "Project config not found: $config"
+        echo "  Create it with: worktree-setup --init $project"
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$config"
+    for var in BARE_REPO WORKTREE_PARENT SECRETS_DIR; do
+        if [[ -z "${!var:-}" ]]; then
+            log_error "$var not set in $config"
+            exit 1
+        fi
+    done
+    if [[ ! -d "$BARE_REPO" ]]; then
+        log_error "Bare repo not found: $BARE_REPO (is NAS mounted?)"
+        exit 1
+    fi
+    if [[ "$(git --git-dir="$BARE_REPO" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+        log_error "$BARE_REPO is not a bare git repository"
+        exit 1
+    fi
+
+    # Derive staging dir from bare repo path
+    # e.g. /mnt/civic/askcivic.git → /mnt/civic/askcivic.worktrees
+    local bare_parent bare_name
+    bare_parent=$(dirname "$BARE_REPO")
+    bare_name=$(basename "$BARE_REPO" .git)
+    STAGING_DIR="${bare_parent}/${bare_name}.worktrees"
+
+    mkdir -p "$WORKTREE_PARENT"
+}
+
+is_main_branch() {
+    [[ "$1" == "main" || "$1" == "master" ]]
+}
+
+get_hostname() {
+    hostname -s 2>/dev/null || echo "unknown"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Ghost prevention (reused from worktree-delete)
+# ═══════════════════════════════════════════════════════════════
+
+kill_ghost_claude() {
+    local worktree_dir="$1"
+    [[ -d "$worktree_dir" ]] || return 0
+
+    local ghost_pid=""
+    for entry in /proc/[0-9]*; do
+        local pid
+        pid=$(basename "$entry")
+        local comm
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        [[ "$comm" == "claude" ]] || continue
+        local cwd
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+        if [[ "${cwd%/}" == "${worktree_dir%/}" ]]; then
+            ghost_pid="$pid"
+            break
+        fi
+    done
+
+    if [[ -n "$ghost_pid" ]]; then
+        log_warn "Claude session running from worktree (PID $ghost_pid)"
+        log_info "Sending SIGINT to gracefully stop..."
+        kill -INT "$ghost_pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$ghost_pid" 2>/dev/null; then
+            kill -INT "$ghost_pid" 2>/dev/null || true
+            sleep 2
+        fi
+        if kill -0 "$ghost_pid" 2>/dev/null; then
+            log_warn "Force killing PID $ghost_pid"
+            kill -KILL "$ghost_pid" 2>/dev/null || true
+        fi
+        log_success "Claude session terminated"
+        rm -f "${HOME}/.claude/session-pids/${ghost_pid}" 2>/dev/null || true
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Secrets copying (reused from worktree-setup)
+# ═══════════════════════════════════════════════════════════════
+
+copy_secrets() {
+    local worktree_dir="$1"
+
+    # Root .env
+    if [[ -f "$SECRETS_DIR/.env" ]]; then
+        cp "$SECRETS_DIR/.env" "$worktree_dir/.env"
+        log_success "Copied .env"
+    fi
+
+    # widget/.env.* files
+    if [[ -d "$SECRETS_DIR/widget" ]]; then
+        mkdir -p "$worktree_dir/widget"
+        for envfile in "$SECRETS_DIR"/widget/.env.*; do
+            [[ -f "$envfile" ]] || continue
+            cp "$envfile" "$worktree_dir/widget/"
+            log_success "Copied widget/$(basename "$envfile")"
+        done
+    fi
+
+    # deploy/*.json files (service account credentials)
+    if [[ -d "$SECRETS_DIR/deploy" ]]; then
+        mkdir -p "$worktree_dir/deploy"
+        for jsonfile in "$SECRETS_DIR"/deploy/*.json; do
+            [[ -f "$jsonfile" ]] || continue
+            cp "$jsonfile" "$worktree_dir/deploy/"
+            log_success "Copied deploy/$(basename "$jsonfile")"
+        done
+    fi
+
+    # config/ directory (required by Dockerfile but git-ignored)
+    mkdir -p "$worktree_dir/config"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Dependency sync (reused from worktree-setup)
+# ═══════════════════════════════════════════════════════════════
+
+sync_deps() {
+    local worktree_dir="$1"
+    [[ "$SKIP_SYNC" == "true" ]] && return 0
+
+    log_info "Syncing dependencies..."
+
+    # Python
+    if [[ -f "$worktree_dir/uv.lock" ]]; then
+        (cd "$worktree_dir" && uv sync)
+        log_success "Python dependencies synced (uv)"
+    elif [[ -f "$worktree_dir/poetry.lock" ]]; then
+        (cd "$worktree_dir" && poetry install)
+        log_success "Python dependencies synced (poetry)"
+    elif [[ -f "$worktree_dir/requirements.txt" ]]; then
+        (cd "$worktree_dir" && pip install -r requirements.txt)
+        log_success "Python dependencies synced (pip)"
+    fi
+
+    # Node — root
+    if [[ -f "$worktree_dir/package.json" ]]; then
+        (cd "$worktree_dir" && npm install)
+        log_success "Node dependencies synced (root)"
+    fi
+
+    # Node — subdirectories
+    for dir in widget frontend; do
+        if [[ -f "$worktree_dir/$dir/package.json" ]]; then
+            (cd "$worktree_dir/$dir" && npm install)
+            log_success "Node dependencies synced ($dir)"
+        fi
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Alias management (reused from worktree-setup/delete)
+# ═══════════════════════════════════════════════════════════════
+
+register_alias() {
+    local branch="$1" worktree_dir="$2"
+    local aliases_file="$HOME/.cd_quick_aliases"
+    if grep -q "^${branch}=" "$aliases_file" 2>/dev/null; then
+        sed -i '' "s|^${branch}=.*|${branch}=${worktree_dir}|" "$aliases_file" 2>/dev/null || \
+        sed -i "s|^${branch}=.*|${branch}=${worktree_dir}|" "$aliases_file"
+    else
+        echo "${branch}=${worktree_dir}" >> "$aliases_file"
+    fi
+    log_success "CD alias registered: cd $branch → $worktree_dir"
+}
+
+remove_alias() {
+    local branch="$1"
+    local aliases_file="$HOME/.cd_quick_aliases"
+    if grep -q "^${branch}=" "$aliases_file" 2>/dev/null; then
+        sed -i '' "/^${branch}=/d" "$aliases_file" 2>/dev/null || \
+        sed -i "/^${branch}=/d" "$aliases_file"
+        log_success "CD alias removed: $branch"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Export
+# ═══════════════════════════════════════════════════════════════
+
+do_export_branch() {
+    local branch="$1"
+    local worktree_dir="$WORKTREE_PARENT/wt-$branch"
+
+    if is_main_branch "$branch"; then
+        log_warn "Skipping main branch (exempt from sync)"
+        return 0
+    fi
+
+    if [[ ! -d "$worktree_dir" ]]; then
+        log_error "Worktree not found: $worktree_dir"
+        return 1
+    fi
+
+    echo ""
+    log_info "Exporting branch: $branch"
+
+    # Kill any Claude session first
+    kill_ghost_claude "$worktree_dir"
+
+    # Check for dirty state
+    local has_changes=false
+    if [[ -n "$(git -C "$worktree_dir" status --porcelain 2>/dev/null)" ]]; then
+        has_changes=true
+        log_info "Dirty state detected — creating sync commit..."
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            git -C "$worktree_dir" add -A
+            git -C "$worktree_dir" commit -m "[worktree-sync] export from $(get_hostname) at $(date -Iseconds)"
+        fi
+        log_success "Sync commit created"
+    else
+        log_info "Clean state — no sync commit needed"
+    fi
+
+    # Get commit SHA for manifest
+    local commit_sha
+    commit_sha=$(git -C "$worktree_dir" rev-parse HEAD 2>/dev/null)
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Remove worktree
+        log_info "Removing worktree..."
+        git --git-dir="$BARE_REPO" worktree remove "$worktree_dir" --force
+        log_success "Worktree removed"
+
+        # Remove cd alias
+        remove_alias "$branch"
+
+        # Write manifest
+        local manifest_dir="$STAGING_DIR/$branch"
+        mkdir -p "$manifest_dir"
+        cat > "$manifest_dir/manifest.json" << MANIFEST
+{
+  "branch": "$branch",
+  "project": "$PROJECT",
+  "source_machine": "$(get_hostname)",
+  "exported_at": "$(date -Iseconds)",
+  "sync_commit": $has_changes,
+  "sync_commit_sha": "$commit_sha"
+}
+MANIFEST
+        log_success "Manifest written to $manifest_dir/manifest.json"
+    else
+        log_warn "[dry-run] Would remove worktree and write manifest"
+    fi
+}
+
+do_export() {
+    if [[ -n "$BRANCH_NAME" ]]; then
+        # Export specific branch
+        do_export_branch "$BRANCH_NAME"
+    else
+        # Export all non-main worktrees
+        local branches=()
+        while IFS= read -r line; do
+            # Parse worktree list output: /path/to/wt  SHA [branch]
+            local branch
+            branch=$(echo "$line" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+            [[ -z "$branch" ]] && continue
+            is_main_branch "$branch" && continue
+            # Only export worktrees in our worktree parent
+            local wt_path
+            wt_path=$(echo "$line" | awk '{print $1}')
+            [[ "$wt_path" == "$WORKTREE_PARENT"* ]] || continue
+            branches+=("$branch")
+        done < <(git --git-dir="$BARE_REPO" worktree list)
+
+        if [[ ${#branches[@]} -eq 0 ]]; then
+            log_info "No non-main worktrees to export"
+            return 0
+        fi
+
+        echo ""
+        echo "Branches to export:"
+        for b in "${branches[@]}"; do
+            echo "  - $b"
+        done
+        echo ""
+
+        if [[ "$FORCE" == "false" && "$DRY_RUN" == "false" ]]; then
+            read -rp "Export ${#branches[@]} worktree(s)? [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { log_warn "Aborted"; exit 0; }
+        fi
+
+        for b in "${branches[@]}"; do
+            do_export_branch "$b"
+        done
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Import
+# ═══════════════════════════════════════════════════════════════
+
+do_import_branch() {
+    local branch="$1"
+    local manifest_file="$STAGING_DIR/$branch/manifest.json"
+
+    if [[ ! -f "$manifest_file" ]]; then
+        log_error "No manifest found for branch '$branch' at $manifest_file"
+        return 1
+    fi
+
+    local worktree_dir="$WORKTREE_PARENT/wt-$branch"
+
+    if [[ -d "$worktree_dir" ]]; then
+        log_error "Worktree already exists: $worktree_dir"
+        return 1
+    fi
+
+    echo ""
+    log_info "Importing branch: $branch"
+
+    # Read manifest
+    local sync_commit source_machine exported_at sync_sha
+    sync_commit=$(python3 -c "import json; print(json.load(open('$manifest_file'))['sync_commit'])" 2>/dev/null || echo "False")
+    source_machine=$(python3 -c "import json; print(json.load(open('$manifest_file'))['source_machine'])" 2>/dev/null || echo "unknown")
+    exported_at=$(python3 -c "import json; print(json.load(open('$manifest_file'))['exported_at'])" 2>/dev/null || echo "unknown")
+    sync_sha=$(python3 -c "import json; print(json.load(open('$manifest_file')).get('sync_commit_sha', ''))" 2>/dev/null || echo "")
+
+    log_info "From: $source_machine at $exported_at"
+    if [[ "$sync_commit" == "True" ]]; then
+        log_info "Sync commit: ${sync_sha:0:8} (will be reset to restore dirty state)"
+    fi
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Create worktree
+        log_info "Creating worktree..."
+        git --git-dir="$BARE_REPO" worktree add "$worktree_dir" "$branch"
+        log_success "Worktree created at $worktree_dir"
+
+        # Copy secrets
+        log_info "Copying secrets..."
+        copy_secrets "$worktree_dir"
+
+        # Reset sync commit to restore dirty state
+        if [[ "$sync_commit" == "True" ]]; then
+            log_info "Resetting sync commit to restore dirty state..."
+            git -C "$worktree_dir" reset HEAD~1
+            log_success "Dirty state restored"
+        fi
+
+        # Sync dependencies
+        sync_deps "$worktree_dir"
+
+        # Register cd alias
+        register_alias "$branch" "$worktree_dir"
+
+        # Clean up manifest
+        rm -rf "$STAGING_DIR/$branch"
+        log_success "Manifest cleaned up"
+    else
+        log_warn "[dry-run] Would create worktree, copy secrets, reset sync commit"
+    fi
+}
+
+do_import() {
+    if [[ ! -d "$STAGING_DIR" ]]; then
+        log_info "No staging directory found at $STAGING_DIR"
+        return 0
+    fi
+
+    if [[ -n "$BRANCH_NAME" ]]; then
+        # Import specific branch
+        do_import_branch "$BRANCH_NAME"
+    else
+        # Import all staged branches
+        local branches=()
+        for manifest in "$STAGING_DIR"/*/manifest.json; do
+            [[ -f "$manifest" ]] || continue
+            local branch
+            branch=$(basename "$(dirname "$manifest")")
+            branches+=("$branch")
+        done
+
+        if [[ ${#branches[@]} -eq 0 ]]; then
+            log_info "No branches staged for import"
+            return 0
+        fi
+
+        echo ""
+        echo "Branches available for import:"
+        for b in "${branches[@]}"; do
+            local source
+            source=$(python3 -c "import json; print(json.load(open('$STAGING_DIR/$b/manifest.json'))['source_machine'])" 2>/dev/null || echo "?")
+            echo "  - $b (from $source)"
+        done
+        echo ""
+
+        if [[ "$FORCE" == "false" && "$DRY_RUN" == "false" ]]; then
+            read -rp "Import ${#branches[@]} worktree(s)? [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { log_warn "Aborted"; exit 0; }
+        fi
+
+        for b in "${branches[@]}"; do
+            do_import_branch "$b"
+        done
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Status
+# ═══════════════════════════════════════════════════════════════
+
+do_status() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo " Worktree Sync Status — $PROJECT"
+    echo "═══════════════════════════════════════════════════════════════"
+
+    # Local worktrees
+    echo ""
+    echo -e " ${CYAN}Local Worktrees${NC} ($WORKTREE_PARENT)"
+    echo " ─────────────────────────────────────────────────────────────"
+    local has_local=false
+    while IFS= read -r line; do
+        local wt_path branch
+        wt_path=$(echo "$line" | awk '{print $1}')
+        branch=$(echo "$line" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+        [[ -z "$branch" ]] && continue
+        [[ "$wt_path" == "$WORKTREE_PARENT"* ]] || continue
+        has_local=true
+
+        # Check dirty state
+        local dirty=""
+        if [[ -d "$wt_path" && -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+            dirty=" ${YELLOW}(dirty)${NC}"
+        fi
+
+        local main_tag=""
+        if is_main_branch "$branch"; then
+            main_tag=" ${GREEN}[exempt]${NC}"
+        fi
+
+        echo -e "   $branch$main_tag$dirty"
+    done < <(git --git-dir="$BARE_REPO" worktree list)
+
+    if [[ "$has_local" == "false" ]]; then
+        echo "   (none)"
+    fi
+
+    # NAS staging
+    echo ""
+    echo -e " ${CYAN}NAS Staging${NC} ($STAGING_DIR)"
+    echo " ─────────────────────────────────────────────────────────────"
+    local has_staged=false
+    if [[ -d "$STAGING_DIR" ]]; then
+        for manifest in "$STAGING_DIR"/*/manifest.json; do
+            [[ -f "$manifest" ]] || continue
+            has_staged=true
+            local branch source_machine exported_at sync_commit
+            branch=$(basename "$(dirname "$manifest")")
+            source_machine=$(python3 -c "import json; print(json.load(open('$manifest'))['source_machine'])" 2>/dev/null || echo "?")
+            exported_at=$(python3 -c "import json; print(json.load(open('$manifest'))['exported_at'])" 2>/dev/null || echo "?")
+            sync_commit=$(python3 -c "import json; print(json.load(open('$manifest'))['sync_commit'])" 2>/dev/null || echo "?")
+
+            local dirty_tag=""
+            [[ "$sync_commit" == "True" ]] && dirty_tag=" ${YELLOW}(has dirty state)${NC}"
+
+            echo -e "   $branch — from $source_machine at $exported_at$dirty_tag"
+        done
+    fi
+
+    if [[ "$has_staged" == "false" ]]; then
+        echo "   (none)"
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Argument parsing
+# ═══════════════════════════════════════════════════════════════
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help) usage ;;
+        -n|--dry-run) DRY_RUN=true; shift ;;
+        -f|--force) FORCE=true; shift ;;
+        -s|--skip-sync) SKIP_SYNC=true; shift ;;
+        -p|--project)
+            if [[ $# -lt 2 ]]; then
+                log_error "--project requires a name"
+                exit 1
+            fi
+            PROJECT="$2"
+            shift 2
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+        *)
+            if [[ -z "$SUBCOMMAND" ]]; then
+                SUBCOMMAND="$1"
+            elif [[ -z "$BRANCH_NAME" ]]; then
+                BRANCH_NAME="$1"
+            else
+                log_error "Too many arguments"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$SUBCOMMAND" ]]; then
+    log_error "Subcommand required: export, import, or status"
+    echo "Use --help for usage information"
+    exit 1
+fi
+
+# Load project config
+load_config "$PROJECT"
+
+case "$SUBCOMMAND" in
+    export) do_export ;;
+    import) do_import ;;
+    status) do_status ;;
+    *)
+        log_error "Unknown subcommand: $SUBCOMMAND"
+        echo "Use --help for usage information"
+        exit 1
+        ;;
+esac

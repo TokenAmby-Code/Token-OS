@@ -2627,6 +2627,11 @@ async def set_dictation_state(active: bool):
     DICTATION_STATE["active"] = active
     DICTATION_STATE["updated_at"] = datetime.now().isoformat()
     logger.info(f"Dictation {'ON' if active else 'OFF'}")
+
+    # When dictation ends, flush any queued pedal enter after buffer delay
+    if not active and PEDAL_STATE["enter_queued"]:
+        _schedule_pedal_enter(PEDAL_BUFFER_MS)
+
     return {"active": active}
 
 
@@ -2644,6 +2649,87 @@ async def get_dictation_state():
         "updated_at": DICTATION_STATE["updated_at"],
         "voice_chat_instance": voice_chat_instance,
     }
+
+
+def _send_pedal_enter():
+    """Send Enter keystroke via satellite /ahk/execute."""
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    try:
+        resp = requests.post(
+            f"http://{host}:{port}/ahk/execute",
+            json={"script": "pedal-enter.ahk"},
+            timeout=DESKTOP_CONFIG["timeout"],
+        )
+        logger.info(f"Pedal: Enter sent (satellite status={resp.status_code})")
+    except (requests.ConnectionError, requests.Timeout) as e:
+        logger.warning(f"Pedal: Satellite unreachable: {e}")
+
+
+def _schedule_pedal_enter(delay_s: float):
+    """Schedule a delayed Enter send, cancelling any existing scheduled send."""
+    # Cancel existing scheduled send
+    if PEDAL_STATE["queued_task"] and not PEDAL_STATE["queued_task"].done():
+        PEDAL_STATE["queued_task"].cancel()
+
+    async def _delayed_send():
+        await asyncio.sleep(delay_s)
+        PEDAL_STATE["enter_queued"] = False
+        PEDAL_STATE["bypass_active"] = True
+        PEDAL_STATE["bypass_start"] = time.monotonic()
+        _send_pedal_enter()
+        logger.info(f"Pedal: Queued Enter sent after {delay_s}s buffer")
+
+    PEDAL_STATE["queued_task"] = asyncio.create_task(_delayed_send())
+
+
+@app.post("/api/pedal/left")
+async def pedal_left():
+    """Handle left pedal press. Mirrors ring-remap left button logic.
+
+    - During dictation: queue Enter for after buffer
+    - After dictation (bypass window): single tap sends Enter
+    - Normal: double-tap required to send Enter
+    """
+    now = time.monotonic()
+
+    # During active dictation — queue enter
+    if DICTATION_STATE["active"]:
+        PEDAL_STATE["enter_queued"] = True
+        logger.info("Pedal: Enter queued (dictation active)")
+        return {"action": "queued", "reason": "dictation_active"}
+
+    # Check if we're in the buffer window right after dictation ended
+    dictation_updated = DICTATION_STATE.get("updated_at")
+    if dictation_updated and not DICTATION_STATE["active"]:
+        ended_at = datetime.fromisoformat(dictation_updated)
+        elapsed = (datetime.now() - ended_at).total_seconds()
+        if elapsed < PEDAL_BUFFER_MS:
+            remaining = PEDAL_BUFFER_MS - elapsed
+            PEDAL_STATE["enter_queued"] = True
+            _schedule_pedal_enter(remaining)
+            logger.info(f"Pedal: Enter in {remaining:.1f}s (buffer window)")
+            return {"action": "buffered", "delay_s": round(remaining, 1)}
+
+    # Bypass window — single tap sends Enter
+    if PEDAL_STATE["bypass_active"]:
+        if (now - PEDAL_STATE["bypass_start"]) < PEDAL_BYPASS_MS:
+            PEDAL_STATE["bypass_active"] = False
+            PEDAL_STATE["last_tap_time"] = 0
+            _send_pedal_enter()
+            return {"action": "sent", "reason": "bypass"}
+        else:
+            PEDAL_STATE["bypass_active"] = False
+
+    # Double-tap logic
+    if (now - PEDAL_STATE["last_tap_time"]) < (PEDAL_DOUBLE_TAP_MS / 1000.0):
+        PEDAL_STATE["last_tap_time"] = 0
+        _send_pedal_enter()
+        return {"action": "sent", "reason": "double_tap"}
+    else:
+        PEDAL_STATE["last_tap_time"] = now
+        logger.info("Pedal: Tap 1/2")
+        return {"action": "waiting", "reason": "first_tap"}
 
 
 @app.get("/api/instances", response_model=List[dict])
@@ -2837,6 +2923,18 @@ VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
 # Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
 #             voice-select-other (explicit on/off during voice chat)
 DICTATION_STATE = {"active": False, "updated_at": None}
+
+# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
+PEDAL_STATE = {
+    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
+    "enter_queued": False,          # enter waiting for dictation buffer to expire
+    "queued_task": None,            # asyncio.Task for delayed enter send
+    "bypass_active": False,         # single-tap bypass window after buffered enter
+    "bypass_start": 0.0,           # when bypass window started
+}
+PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
+PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
+PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
 VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
@@ -3038,7 +3136,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
     }
 
 
-DAILY_NOTE_DIR = Path.home() / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
+DAILY_NOTE_DIR = Path("/Volumes/Imperium/Imperium-ENV/Terra/Journal/Daily")
 
 
 def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
@@ -9180,30 +9278,107 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
     else:
         persona = "Adeptus Custodes"
 
-    # Fetch recent channel context from daemon (sync urllib in executor to stay async)
-    context_str = ""
-    try:
-        def _fetch_context():
-            import urllib.request
-            req = urllib.request.Request(
-                f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=10",
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return json.loads(resp.read())
-        data = await asyncio.get_event_loop().run_in_executor(None, _fetch_context)
-        msgs = data.get("messages", [])
-        context_str = "\n".join(
-            f"[{m['author'].get('displayName', m['author'].get('username', '?'))}]: {m['content']}"
-            for m in msgs
-        )
-    except Exception as e:
-        logger.warning(f"Discord responder: could not fetch context: {e}")
+    # Model selection: Custodes gets Sonnet, others get Haiku
+    model = "claude-sonnet-4-6" if bot == "custodes" else "claude-haiku-4-5-20251001"
 
     author_display = (message.author or {}).get("displayName",
                       (message.author or {}).get("username", "user"))
 
-    system_prompt = f"""You are {persona}, responding to a Discord message in #{channel}.
+    if bot == "custodes":
+        # Custodes: fetch full day's conversation, daily note, and habits
+        context_str = ""
+        try:
+            today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            def _fetch_custodes_context():
+                import urllib.request as _ur
+                req = _ur.Request(
+                    f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=100&since={today_midnight}",
+                    method="GET",
+                )
+                with _ur.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read())
+            data = await asyncio.get_event_loop().run_in_executor(None, _fetch_custodes_context)
+            msgs = data.get("messages", [])
+            context_str = "\n".join(
+                f"[{m['author'].get('displayName', m['author'].get('username', '?'))}]: {m['content']}"
+                for m in msgs
+            )
+        except Exception as e:
+            logger.warning(f"Discord responder (custodes): could not fetch context: {e}")
+
+        # Read today's daily note
+        daily_note_content = "(Daily note not created yet)"
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        daily_note_path = DAILY_NOTE_DIR / f"{today_str}.md"
+        try:
+            if daily_note_path.exists():
+                daily_note_content = daily_note_path.read_text()
+        except Exception as e:
+            logger.warning(f"Discord responder (custodes): could not read daily note: {e}")
+
+        # Fetch habits from internal API
+        habits_str = "(Could not read habit state)"
+        try:
+            def _fetch_habits():
+                import urllib.request as _ur
+                req = _ur.Request("http://127.0.0.1:7777/api/habits/today", method="GET")
+                with _ur.urlopen(req, timeout=5) as resp:
+                    return resp.read().decode()
+            habits_str = await asyncio.get_event_loop().run_in_executor(None, _fetch_habits)
+        except Exception as e:
+            logger.warning(f"Discord responder (custodes): could not fetch habits: {e}")
+
+        # Load Custodes responder prompt template
+        custodes_prompt_path = Path.home() / ".claude" / "prompts" / "custodes-responder.md"
+        try:
+            custodes_template = custodes_prompt_path.read_text()
+        except Exception as e:
+            logger.warning(f"Discord responder (custodes): could not read prompt template: {e}")
+            custodes_template = "You are the Adeptus Custodes. Respond helpfully."
+
+        system_prompt = f"""{custodes_template}
+
+---
+
+## Injected Context
+
+### Today's Date
+{today_str}
+
+### Daily Note (`Terra/Journal/Daily/{today_str}.md`)
+{daily_note_content}
+
+### Habit State (from /api/habits/today)
+{habits_str}
+
+### Conversation in #{channel} (today, oldest to newest)
+{context_str or '(no prior messages today)'}
+
+### Current Message (replying to)
+[{author_display}]: {message.content}"""
+
+    else:
+        # Non-Custodes bots: existing 10-message fetch
+        context_str = ""
+        try:
+            def _fetch_context():
+                import urllib.request
+                req = urllib.request.Request(
+                    f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=10",
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read())
+            data = await asyncio.get_event_loop().run_in_executor(None, _fetch_context)
+            msgs = data.get("messages", [])
+            context_str = "\n".join(
+                f"[{m['author'].get('displayName', m['author'].get('username', '?'))}]: {m['content']}"
+                for m in msgs
+            )
+        except Exception as e:
+            logger.warning(f"Discord responder: could not fetch context: {e}")
+
+        system_prompt = f"""You are {persona}, responding to a Discord message in #{channel}.
 
 Recent conversation (oldest to newest):
 {context_str or '(no prior context)'}
@@ -9242,12 +9417,13 @@ Rules:
         message.message_id or "",
         bot,
         prompt_file,
+        model,
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    logger.info(f"Discord responder spawned: bot={bot} channel=#{channel} pid={proc.pid}")
+    logger.info(f"Discord responder spawned: bot={bot} model={model} channel=#{channel} pid={proc.pid}")
 
     # Fire-and-forget but log errors
     async def _wait_and_log():

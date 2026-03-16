@@ -5,6 +5,7 @@
 #
 # Usage:
 #   token-restart              # Full restart: scripts-sync, Mac, WSL, phone TUI
+#   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --tui-only   # Signal TUI restarts only (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
@@ -47,6 +48,7 @@ token-restart - Multi-device restart orchestrator
 
 Usage:
     token-restart              Full restart (scripts-sync → Mac → WSL → phone)
+    token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
     token-restart --tui-only   Signal TUI restarts only (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
@@ -341,6 +343,32 @@ watch_logs() {
     tail -f ~/.claude/token-api-stderr.log
 }
 
+# ============ Plist Update ============
+
+update_plist() {
+    local service_dir="$1"
+    local python_path="$service_dir/.venv/bin/python"
+
+    if [[ ! -f "$python_path" ]]; then
+        echo -e "  ${RED}✗${NC} Python not found at $python_path"
+        echo "  Run: uv sync --project '$service_dir' first"
+        return 1
+    fi
+
+    echo -e "${BLUE}→${NC} Updating plist: $service_dir"
+    python3 - "$PLIST" "$python_path" "$service_dir" << 'PYEOF'
+import sys, plistlib
+plist_path, python_path, working_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(plist_path, 'rb') as f:
+    data = plistlib.load(f)
+data['ProgramArguments'][0] = python_path
+data['WorkingDirectory'] = working_dir
+with open(plist_path, 'wb') as f:
+    plistlib.dump(data, f, fmt=plistlib.FMT_XML, sort_keys=False)
+PYEOF
+    echo -e "  ${GREEN}✓${NC} Plist updated"
+}
+
 # ============ Full Restart ============
 
 full_restart() {
@@ -388,6 +416,7 @@ full_restart() {
 
 ACTION="restart"
 NO_PUSH=false
+DEPLOY_FROM=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -418,6 +447,14 @@ while [[ $# -gt 0 ]]; do
         --no-push)
             NO_PUSH=true
             shift
+            ;;
+        --from)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --from requires a path" >&2
+                exit 1
+            fi
+            DEPLOY_FROM="$(cd "$2" && pwd)"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1" >&2
@@ -470,6 +507,9 @@ case "$ACTION" in
         restart_phone_tui
         ;;
     restart)
+        if [[ -n "$DEPLOY_FROM" ]]; then
+            update_plist "$DEPLOY_FROM" || exit 1
+        fi
         full_restart "$NO_PUSH"
         ;;
 esac

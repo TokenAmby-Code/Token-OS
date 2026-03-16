@@ -1,7 +1,7 @@
 #Requires AutoHotkey v2.0
-#Include C:\Users\colby\Documents\Personal-ENV\Scripts\ahk\helper.ahk
-;  #include C:\Users\colby\Documents\Personal-ENV\Scripts\ahk\runjs.ahk
-;  #include C:\Users\colby\Documents\Personal-ENV\Scripts\ahk\numscripts\numroot.ahk
+#Include ..\..\helper.ahk
+;  #include ..\..\runjs.ahk
+;  #include ..\numroot.ahk
 ;  #SingleInstance Force
 ;  global laptopState := true
 obs_create(input) {

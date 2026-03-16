@@ -359,10 +359,18 @@ echo ""
 ALIASES_FILE="$HOME/.bash_aliases"
 
 if [[ -f "$ALIASES_FILE" ]]; then
-    # Expected worktree directory pattern
+    # Expected worktree directory patterns (check both old and new layout)
     REPO_NAME=$(basename "$REPO_ROOT")
     PARENT_DIR=$(dirname "$REPO_ROOT")
-    WORKTREE_DIR_PATTERN="${PARENT_DIR}/${REPO_NAME}-${BRANCH_NAME}"
+    OLD_WORKTREE_DIR_PATTERN="${PARENT_DIR}/${REPO_NAME}-${BRANCH_NAME}"
+    NEW_WORKTREE_DIR_PATTERN="${HOME}/worktrees/askCivic/wt-${BRANCH_NAME}"
+    WORKTREE_DIR_PATTERN="${NEW_WORKTREE_DIR_PATTERN}"
+    # Also check old pattern for backward compat during migration
+    if ! grep -q "$WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then
+        if grep -q "$OLD_WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then
+            WORKTREE_DIR_PATTERN="$OLD_WORKTREE_DIR_PATTERN"
+        fi
+    fi
 
     # Check if alias exists
     if grep -q "$WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then

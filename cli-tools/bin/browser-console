@@ -23,7 +23,9 @@ import sys
 from pathlib import Path
 
 # Add the project venv to path for playwright
-VENV_SITE_PACKAGES = Path.home() / "ProcAgentDir/ProcurementAgentAI/.venv/lib/python3.12/site-packages"
+VENV_SITE_PACKAGES = Path.home() / "worktrees/askCivic/wt-main/.venv/lib/python3.12/site-packages"
+if not VENV_SITE_PACKAGES.exists():
+    VENV_SITE_PACKAGES = Path.home() / "ProcAgentDir/ProcurementAgentAI/.venv/lib/python3.12/site-packages"
 if VENV_SITE_PACKAGES.exists():
     sys.path.insert(0, str(VENV_SITE_PACKAGES))
 

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# deploy-mac - Mac-native frontend deploy (no WSL required)
+# TAGS: deploy, mac
+# AUDIENCE: human, agent
+#
+# Forks the WSL deploy workflow for Mac. Uses Homebrew gcloud/gsutil.
+# Does NOT modify the Makefile or the WSL deploy path.
+#
+# Usage:
+#   deploy-mac web          # Deploy widget to dev (default)
+#   deploy-mac web prod     # Deploy widget to production
+#   deploy-mac web --prod   # Same as above
+#
+# Prerequisites:
+#   brew install --cask google-cloud-sdk
+#   gcloud auth activate-service-account --key-file=deploy/dev-service-account.json
+
+set -euo pipefail
+
+# ── Mac gcloud/gsutil PATH ────────────────────────────────────────────────────
+GCLOUD=/opt/homebrew/bin/gcloud
+_GSUTIL=/opt/homebrew/bin/gsutil
+export CLOUDSDK_PYTHON=/opt/homebrew/opt/python@3.13/bin/python3.13
+# gsutil on macOS hits a Python 3 multiprocessing bug (sys.maxint removed in Py3).
+# Disable parallel process count to avoid it; -m (multithreading) still works.
+gsutil() { "$_GSUTIL" -o "GSUtil:parallel_process_count=1" "$@"; }
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# ── Config (mirrors Makefile variables) ───────────────────────────────────────
+WEB_BUCKET_DEV="askcivic-site-dev"
+WEB_BUCKET_PROD="askcivic-site"
+URL_MAP_DEV="askcivic-map"
+URL_MAP_PROD="askcivic-map"
+SITE_URL_DEV="https://dev.askcivic.com"
+SITE_URL_PROD="https://askcivic.com"
+CDN_PROJECT="pax-dev-469018"
+
+usage() {
+    cat << 'EOF'
+deploy-mac - Mac-native frontend deploy (no WSL required)
+
+Usage:
+  deploy-mac web          Deploy widget to dev
+  deploy-mac web prod     Deploy widget to production
+  deploy-mac web --prod   Same as above
+
+Prerequisites:
+  brew install --cask google-cloud-sdk
+  gcloud auth activate-service-account --key-file=deploy/dev-service-account.json
+EOF
+    exit 0
+}
+
+# ── Parse args ────────────────────────────────────────────────────────────────
+SERVICE=""
+ENV="development"
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage ;;
+        web|frontend) SERVICE="web" ;;
+        prod|production|--prod) ENV="production" ;;
+        dev|development) ENV="development" ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Use --help for usage" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$SERVICE" != "web" ]]; then
+    echo "Usage: deploy-mac web [prod]" >&2
+    echo "Only 'web' is currently supported by deploy-mac" >&2
+    exit 1
+fi
+
+# ── Locate project root ───────────────────────────────────────────────────────
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Error: must be run from within a git repository" >&2
+    exit 1
+}
+
+if [[ ! -f "$GIT_ROOT/widget/package.json" ]]; then
+    echo "Error: widget/package.json not found in $GIT_ROOT" >&2
+    echo "Run deploy-mac from within the askCivic worktree" >&2
+    exit 1
+fi
+
+# ── Resolve env-specific config ───────────────────────────────────────────────
+if [[ "$ENV" == "production" ]]; then
+    MODE="production"
+    BUCKET="$WEB_BUCKET_PROD"
+    URL_MAP="$URL_MAP_PROD"
+    SITE_URL="$SITE_URL_PROD"
+    SA_KEY="$GIT_ROOT/deploy/prod-service-account.json"
+else
+    MODE="development"
+    BUCKET="$WEB_BUCKET_DEV"
+    URL_MAP="$URL_MAP_DEV"
+    SITE_URL="$SITE_URL_DEV"
+    SA_KEY="$GIT_ROOT/deploy/dev-service-account.json"
+fi
+
+CDN_HOST="${SITE_URL#https://}"
+CDN_HOST="${CDN_HOST#http://}"
+CDN_HOST="${CDN_HOST%%/*}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+if [[ ! -x "$GCLOUD" ]]; then
+    echo -e "${RED}❌ gcloud not found at $GCLOUD${NC}"
+    echo "  Run: brew install --cask google-cloud-sdk"
+    exit 1
+fi
+
+if [[ ! -f "$SA_KEY" ]]; then
+    echo -e "${RED}❌ Service account key not found: $SA_KEY${NC}"
+    exit 1
+fi
+
+# Activate service account (idempotent)
+"$GCLOUD" auth activate-service-account --key-file="$SA_KEY" --quiet 2>/dev/null
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+echo -e "${YELLOW}🚀 Building widget bundle for $MODE (bucket: gs://$BUCKET)...${NC}"
+
+cd "$GIT_ROOT/widget"
+
+echo -e "${YELLOW}🛠  Running Vite app build (mode=$MODE)...${NC}"
+npx vite build --mode "$MODE"
+
+echo -e "${YELLOW}🔄 Running post-build...${NC}"
+node post-build.js
+
+echo -e "${YELLOW}🧱 Building embeddable widget (mode=$MODE)...${NC}"
+BUILD_MODE=lib npx vite build --mode "$MODE"
+
+# Verify bundle contains expected API URL
+echo "Verifying build environment..."
+EXPECTED_HOST=$(grep -E '^VITE_API_URL=' ".env.$MODE" | sed 's|.*://||')
+if [[ -z "$EXPECTED_HOST" ]]; then
+    echo -e "${RED}❌ Cannot read VITE_API_URL from widget/.env.$MODE${NC}"
+    exit 1
+fi
+if ! grep -rq "$EXPECTED_HOST" dist/app/assets/; then
+    echo -e "${RED}❌ Bundle does not contain expected API URL: $EXPECTED_HOST${NC}"
+    ACTUAL=$(grep -roh 'pax-widget-proxy-[0-9]*' dist/app/assets/ 2>/dev/null | head -1 || true)
+    echo "  Found in bundle: ${ACTUAL:-none}"
+    exit 1
+fi
+echo -e "${GREEN}  Build verified: $EXPECTED_HOST${NC}"
+
+# ── Upload ────────────────────────────────────────────────────────────────────
+echo -e "${YELLOW}📤 Deploying assets with long cache (1 year)...${NC}"
+gsutil -h "Cache-Control:public, max-age=31536000, immutable" -m rsync -r dist/app/assets/ "gs://$BUCKET/assets/"
+
+echo -e "${YELLOW}📤 Deploying HTML files with short cache (60s)...${NC}"
+while IFS= read -r f; do
+    rel_path="${f#dist/app/}"
+    gsutil -h "Cache-Control:public, max-age=60, must-revalidate" cp "$f" "gs://$BUCKET/$rel_path"
+done < <(find dist/app -name "*.html")
+
+echo -e "${YELLOW}📤 Deploying other files...${NC}"
+while IFS= read -r f; do
+    rel_path="${f#dist/app/}"
+    gsutil cp "$f" "gs://$BUCKET/$rel_path"
+done < <(find dist/app -type f -not -name "*.html" -not -path "*/assets/*")
+
+# ── SPA routing ───────────────────────────────────────────────────────────────
+echo -e "${YELLOW}🔧 Configuring SPA routing on gs://$BUCKET...${NC}"
+gsutil web set -m index.html -e index.html "gs://$BUCKET" 2>&1 || \
+    echo -e "${YELLOW}  ⚠️  SPA routing config skipped (already set or insufficient perms)${NC}"
+
+# ── CDN invalidation ──────────────────────────────────────────────────────────
+if "$GCLOUD" --project "$CDN_PROJECT" compute url-maps describe "$URL_MAP" >/dev/null 2>&1; then
+    echo -e "${YELLOW}🔄 Invalidating CDN cache for $URL_MAP (host=$CDN_HOST)...${NC}"
+    "$GCLOUD" --project "$CDN_PROJECT" compute url-maps invalidate-cdn-cache "$URL_MAP" --path '/*' --host "$CDN_HOST"
+else
+    echo -e "${YELLOW}⚠️  URL map $URL_MAP not found; skipping CDN invalidation${NC}"
+fi
+
+# ── Verify CDN propagation ────────────────────────────────────────────────────
+echo -e "${YELLOW}🔍 Verifying CDN propagation at $SITE_URL ...${NC}"
+GCS_GEN=$(gsutil stat "gs://$BUCKET/index.html" 2>/dev/null | grep 'Generation:' | awk '{print $2}')
+if [[ -z "$GCS_GEN" ]]; then
+    echo -e "${RED}❌ Could not read GCS generation for gs://$BUCKET/index.html${NC}"
+    exit 1
+fi
+echo "  GCS generation: $GCS_GEN"
+
+ATTEMPTS=0
+MAX_ATTEMPTS=12
+while [[ $ATTEMPTS -lt $MAX_ATTEMPTS ]]; do
+    CDN_GEN=$(curl -sI "$SITE_URL/" 2>/dev/null | grep -i 'x-goog-generation:' | awk '{print $2}' | tr -d '\r')
+    if [[ "$CDN_GEN" == "$GCS_GEN" ]]; then
+        echo -e "${GREEN}  CDN generation matches after $((ATTEMPTS * 10))s${NC}"
+        break
+    fi
+    ATTEMPTS=$((ATTEMPTS + 1))
+    if [[ $ATTEMPTS -eq $MAX_ATTEMPTS ]]; then
+        echo -e "${RED}❌ CDN still stale after 120s${NC}"
+        echo "  Expected: $GCS_GEN  CDN: ${CDN_GEN:-none}"
+        echo -e "${YELLOW}  Try: $GCLOUD compute url-maps invalidate-cdn-cache $URL_MAP --path '/*' --host $CDN_HOST --project $CDN_PROJECT${NC}"
+        exit 1
+    fi
+    echo "  Waiting for CDN... (attempt $ATTEMPTS/$MAX_ATTEMPTS, CDN gen: ${CDN_GEN:-none})"
+    sleep 10
+done
+
+echo -e "${GREEN}✅ Website deployed and verified at $SITE_URL${NC}"

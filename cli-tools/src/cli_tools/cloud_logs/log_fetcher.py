@@ -15,8 +15,19 @@ from pathlib import Path
 from typing import Any
 
 
-# Deploy YAML directory in ProcurementAgentAI
-DEPLOY_DIR = Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / "deploy"
+# Deploy YAML directory — search known locations
+def _find_deploy_dir() -> Path:
+    candidates = [
+        Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / "deploy",
+        Path.home() / "worktrees" / "askCivic" / "wt-main" / "deploy",
+        Path.home() / "worktrees" / "askCivic" / "wt-command-system" / "deploy",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # fallback to original
+
+DEPLOY_DIR = _find_deploy_dir()
 
 # Mapping of environment names to YAML files
 ENV_TO_YAML = {

@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Worktree Setup - create git worktrees with environment files and dependencies
-# TAGS: git, worktree
+# Worktree Setup - create git worktrees from NAS bare repos
+# TAGS: git, worktree, nas
 # AUDIENCE: human, agent
 #
 # Usage: worktree-setup <branch-name> [options]
 #
-# Creates a new worktree as a sibling directory, copies necessary .gitignore'd
-# files (.env, etc.), and runs package sync.
+# Creates a worktree on local disk from a NAS-hosted bare repo, copies
+# env files from the NAS secrets dir, and syncs dependencies.
+#
+# Config: ~/.config/worktrees/<project>.conf
 #
 # Examples:
-#   worktree-setup feature-auth          # Create worktree for new branch
-#   worktree-setup fix-bug --existing    # Use existing branch
-#   worktree-setup my-feature --dry-run  # Preview what would happen
+#   worktree-setup feature-auth                    # New branch, default project (askCivic)
+#   worktree-setup fix-bug --existing              # Use existing branch
+#   worktree-setup my-feature --project Scripts    # Different project
+#   worktree-setup my-feature --dry-run            # Preview what would happen
 
 set -euo pipefail
+
+# Ensure Homebrew is on PATH (Apple Silicon Macs, non-interactive shells)
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
 
 # Colors
 RED='\033[0;31m'
@@ -27,36 +33,39 @@ DRY_RUN=false
 USE_EXISTING_BRANCH=false
 SKIP_SYNC=false
 NO_TRANSPLANT=false
+PROJECT="askCivic"
+INIT_MODE=false
 
 usage() {
     cat << 'EOF'
-Worktree Setup - create git worktrees with environment files and dependencies
+Worktree Setup - create git worktrees from NAS bare repos
 
 Usage: worktree-setup <branch-name> [options]
+       worktree-setup --init [project-name]
 
 Arguments:
   branch-name         Name for the new branch and worktree directory
 
 Options:
   -e, --existing        Use an existing branch instead of creating new one
+  -p, --project NAME    Project config to use (default: askCivic)
   -n, --dry-run         Show what would happen without making changes
   -s, --skip-sync       Skip running uv sync / npm install
   --no-transplant       Skip session transplant (for subagents or non-interactive use)
+  --init                Print template config for a new project
   -h, --help            Show this help message
 
-Description:
-  Creates a new git worktree as a sibling directory (../repo-branch-name),
-  copies necessary .gitignore'd files, and syncs dependencies.
-
-Files copied:
-  - .env (root environment file)
-  - widget/.env.* (widget environment configs)
-  - deploy/*.json (service account credentials)
+Config:
+  ~/.config/worktrees/<project>.conf defines:
+    BARE_REPO         Path to bare git repo on NAS
+    WORKTREE_PARENT   Local directory for worktrees
+    SECRETS_DIR       NAS directory with env files and credentials
 
 Examples:
-  worktree-setup feature-auth          # Create worktree with new branch
-  worktree-setup fix-bug --existing    # Worktree for existing branch
-  worktree-setup my-feature --dry-run  # Preview without changes
+  worktree-setup feature-auth              # New branch in askCivic
+  worktree-setup fix-bug --existing        # Existing branch
+  worktree-setup my-feature --project Scripts  # Different project
+  worktree-setup --init myproject          # Print config template
 EOF
     exit 0
 }
@@ -77,12 +86,71 @@ log_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+load_config() {
+    local project="${1:-askCivic}"
+    local config="$HOME/.config/worktrees/${project}.conf"
+    if [[ ! -f "$config" ]]; then
+        log_error "Project config not found: $config"
+        echo "  Create it with: worktree-setup --init $project"
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$config"
+    for var in BARE_REPO WORKTREE_PARENT SECRETS_DIR; do
+        if [[ -z "${!var:-}" ]]; then
+            log_error "$var not set in $config"
+            exit 1
+        fi
+    done
+    # Optional: SYNC_SUBDIR — subdirectory containing pyproject.toml (for monorepos)
+    SYNC_SUBDIR="${SYNC_SUBDIR:-}"
+    # NAS mount check
+    if [[ ! -d "$BARE_REPO" ]]; then
+        log_error "Bare repo not found: $BARE_REPO (is NAS mounted?)"
+        exit 1
+    fi
+    if [[ "$(git --git-dir="$BARE_REPO" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+        log_error "$BARE_REPO is not a bare git repository"
+        exit 1
+    fi
+    if [[ ! -d "$SECRETS_DIR" ]]; then
+        log_error "Secrets dir not found: $SECRETS_DIR (is NAS mounted?)"
+        exit 1
+    fi
+    mkdir -p "$WORKTREE_PARENT"
+}
+
+print_init_template() {
+    local project="${1:-myproject}"
+    cat << EOF
+# ${project} worktree configuration
+# Save as: ~/.config/worktrees/${project}.conf
+
+BARE_REPO=/mnt/civic/${project}.git
+WORKTREE_PARENT=\$HOME/worktrees/${project}
+SECRETS_DIR=/mnt/civic/${project}.secrets
+
+# Optional: subdirectory containing pyproject.toml (for monorepos)
+# SYNC_SUBDIR=subdir
+EOF
+    exit 0
+}
+
 # Parse arguments
 BRANCH_NAME=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
             usage
+            ;;
+        --init)
+            INIT_MODE=true
+            shift
+            # Next arg is optional project name
+            if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                PROJECT="$1"
+                shift
+            fi
             ;;
         -n|--dry-run)
             DRY_RUN=true
@@ -95,6 +163,14 @@ while [[ $# -gt 0 ]]; do
         -s|--skip-sync)
             SKIP_SYNC=true
             shift
+            ;;
+        -p|--project)
+            if [[ $# -lt 2 ]]; then
+                log_error "--project requires a name"
+                exit 1
+            fi
+            PROJECT="$2"
+            shift 2
             ;;
         --no-transplant)
             NO_TRANSPLANT=true
@@ -117,6 +193,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Handle --init mode
+if [[ "$INIT_MODE" == "true" ]]; then
+    print_init_template "$PROJECT"
+fi
+
 # Validate arguments
 if [[ -z "$BRANCH_NAME" ]]; then
     log_error "Branch name required"
@@ -125,17 +206,10 @@ if [[ -z "$BRANCH_NAME" ]]; then
     exit 1
 fi
 
-# Check we're in a git repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    log_error "Not in a git repository"
-    exit 1
-fi
+# Load project config (validates NAS mounts, bare repo, etc.)
+load_config "$PROJECT"
 
-# Get repo info
-REPO_ROOT=$(git rev-parse --show-toplevel)
-REPO_NAME=$(basename "$REPO_ROOT")
-PARENT_DIR=$(dirname "$REPO_ROOT")
-WORKTREE_DIR="$PARENT_DIR/${REPO_NAME}-${BRANCH_NAME}"
+WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_DIR" ]]; then
@@ -144,8 +218,8 @@ if [[ -d "$WORKTREE_DIR" ]]; then
 fi
 
 # Check if branch exists (if --existing not specified)
-BRANCH_EXISTS=$(git branch --list "$BRANCH_NAME" | wc -l)
-REMOTE_EXISTS=$(git branch -r --list "origin/$BRANCH_NAME" | wc -l)
+BRANCH_EXISTS=$(git --git-dir="$BARE_REPO" branch --list "$BRANCH_NAME" | wc -l)
+REMOTE_EXISTS=$(git --git-dir="$BARE_REPO" branch -r --list "origin/$BRANCH_NAME" | wc -l)
 
 if [[ "$USE_EXISTING_BRANCH" == "false" ]]; then
     if [[ $BRANCH_EXISTS -gt 0 ]] || [[ $REMOTE_EXISTS -gt 0 ]]; then
@@ -159,17 +233,17 @@ else
     fi
 fi
 
-# Identify files to copy
+# Identify files to copy from secrets dir
 FILES_TO_COPY=()
 
 # Root .env
-if [[ -f "$REPO_ROOT/.env" ]]; then
+if [[ -f "$SECRETS_DIR/.env" ]]; then
     FILES_TO_COPY+=(".env")
 fi
 
-# widget/.env.* files (widget environment configs)
-if [[ -d "$REPO_ROOT/widget" ]]; then
-    for envfile in "$REPO_ROOT"/widget/.env.*; do
+# widget/.env.* files
+if [[ -d "$SECRETS_DIR/widget" ]]; then
+    for envfile in "$SECRETS_DIR"/widget/.env.*; do
         if [[ -f "$envfile" ]]; then
             FILES_TO_COPY+=("widget/$(basename "$envfile")")
         fi
@@ -177,8 +251,8 @@ if [[ -d "$REPO_ROOT/widget" ]]; then
 fi
 
 # deploy/*.json files (service account credentials)
-if [[ -d "$REPO_ROOT/deploy" ]]; then
-    for jsonfile in "$REPO_ROOT"/deploy/*.json; do
+if [[ -d "$SECRETS_DIR/deploy" ]]; then
+    for jsonfile in "$SECRETS_DIR"/deploy/*.json; do
         if [[ -f "$jsonfile" ]]; then
             FILES_TO_COPY+=("deploy/$(basename "$jsonfile")")
         fi
@@ -191,9 +265,11 @@ echo "════════════════════════�
 echo " Worktree Setup Plan"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "  Repository:    $REPO_NAME"
+echo "  Project:       $PROJECT"
+echo "  Bare repo:     $BARE_REPO"
 echo "  Branch:        $BRANCH_NAME $(if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then echo "(existing)"; else echo "(new)"; fi)"
 echo "  Worktree:      $WORKTREE_DIR"
+echo "  Secrets from:  $SECRETS_DIR"
 echo ""
 
 if [[ ${#FILES_TO_COPY[@]} -gt 0 ]]; then
@@ -206,27 +282,29 @@ else
 fi
 echo ""
 
-# Detect package manager
+# Detect package manager (check bare repo for file existence)
+# SYNC_SUBDIR: for monorepos, check the subdirectory that contains pyproject.toml
 PKG_MANAGER=""
-if [[ -f "$REPO_ROOT/pyproject.toml" ]]; then
-    if grep -q "uv" "$REPO_ROOT/pyproject.toml" 2>/dev/null || [[ -f "$REPO_ROOT/uv.lock" ]]; then
+_PYPROJECT_PATH="${SYNC_SUBDIR:+$SYNC_SUBDIR/}pyproject.toml"
+_UVLOCK_PATH="${SYNC_SUBDIR:+$SYNC_SUBDIR/}uv.lock"
+_POETRYLOCK_PATH="${SYNC_SUBDIR:+$SYNC_SUBDIR/}poetry.lock"
+if git --git-dir="$BARE_REPO" cat-file -e "HEAD:$_PYPROJECT_PATH" 2>/dev/null; then
+    if git --git-dir="$BARE_REPO" cat-file -e "HEAD:$_UVLOCK_PATH" 2>/dev/null; then
         PKG_MANAGER="uv"
-    elif [[ -f "$REPO_ROOT/poetry.lock" ]]; then
+    elif git --git-dir="$BARE_REPO" cat-file -e "HEAD:$_POETRYLOCK_PATH" 2>/dev/null; then
         PKG_MANAGER="poetry"
     else
         PKG_MANAGER="pip"
     fi
-elif [[ -f "$REPO_ROOT/requirements.txt" ]]; then
-    PKG_MANAGER="pip"
 fi
 
-# Check for npm dependencies (root and subdirectories)
+# Check for npm dependencies
 HAS_NPM=false
-if [[ -f "$REPO_ROOT/package.json" ]]; then
+if git --git-dir="$BARE_REPO" cat-file -e HEAD:package.json 2>/dev/null; then
     HAS_NPM=true
 fi
 for dir in widget frontend; do
-    if [[ -d "$REPO_ROOT/$dir" ]] && [[ -f "$REPO_ROOT/$dir/package.json" ]]; then
+    if git --git-dir="$BARE_REPO" cat-file -e "HEAD:$dir/package.json" 2>/dev/null; then
         HAS_NPM=true
         break
     fi
@@ -255,18 +333,23 @@ fi
 
 # Execute
 log_info "Creating worktree..."
+# --force for main/master: allows both WSL and Mac to have wt-main simultaneously
+FORCE_FLAG=""
+if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" ]]; then
+    FORCE_FLAG="--force"
+fi
 if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then
-    git worktree add "$WORKTREE_DIR" "$BRANCH_NAME"
+    git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG "$WORKTREE_DIR" "$BRANCH_NAME"
 else
-    git worktree add -b "$BRANCH_NAME" "$WORKTREE_DIR"
+    git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG -b "$BRANCH_NAME" "$WORKTREE_DIR"
 fi
 log_success "Worktree created at $WORKTREE_DIR"
 
-# Copy files
+# Copy files from secrets dir
 if [[ ${#FILES_TO_COPY[@]} -gt 0 ]]; then
-    log_info "Copying environment files..."
+    log_info "Copying environment files from secrets..."
     for file in "${FILES_TO_COPY[@]}"; do
-        src="$REPO_ROOT/$file"
+        src="$SECRETS_DIR/$file"
         dst="$WORKTREE_DIR/$file"
 
         # Ensure destination directory exists
@@ -292,14 +375,19 @@ if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
     cd "$WORKTREE_DIR"
 
     if [[ "$PKG_MANAGER" == *"uv"* ]]; then
-        uv sync
-        log_success "Python dependencies synced (uv)"
+        if [[ -n "${SYNC_SUBDIR:-}" ]]; then
+            uv sync --project "$SYNC_SUBDIR" && log_success "Python dependencies synced (uv)" || \
+                log_warn "Python sync failed (uv) — continuing with remaining steps"
+        else
+            uv sync && log_success "Python dependencies synced (uv)" || \
+                log_warn "Python sync failed (uv) — continuing with remaining steps"
+        fi
     elif [[ "$PKG_MANAGER" == *"poetry"* ]]; then
-        poetry install
-        log_success "Python dependencies synced (poetry)"
+        poetry install && log_success "Python dependencies synced (poetry)" || \
+            log_warn "Python sync failed (poetry) — continuing with remaining steps"
     elif [[ "$PKG_MANAGER" == *"pip"* ]]; then
-        pip install -r requirements.txt
-        log_success "Python dependencies synced (pip)"
+        pip install -r requirements.txt && log_success "Python dependencies synced (pip)" || \
+            log_warn "Python sync failed (pip) — continuing with remaining steps"
     fi
 
     if [[ "$PKG_MANAGER" == *"npm"* ]]; then
@@ -326,6 +414,7 @@ echo ""
 # Register quick cd alias (branch name → worktree dir)
 CD_QUICK_ALIASES_FILE="$HOME/.cd_quick_aliases"
 if grep -q "^${BRANCH_NAME}=" "$CD_QUICK_ALIASES_FILE" 2>/dev/null; then
+    sed -i '' "s|^${BRANCH_NAME}=.*|${BRANCH_NAME}=${WORKTREE_DIR}|" "$CD_QUICK_ALIASES_FILE" 2>/dev/null || \
     sed -i "s|^${BRANCH_NAME}=.*|${BRANCH_NAME}=${WORKTREE_DIR}|" "$CD_QUICK_ALIASES_FILE"
 else
     echo "${BRANCH_NAME}=${WORKTREE_DIR}" >> "$CD_QUICK_ALIASES_FILE"
@@ -407,8 +496,11 @@ transplant_session() {
     fi
 
     # Fallback: most recent JSONL in source project dir
+    # For bare repo worktrees, the "source" is wherever Claude is currently running
+    local source_cwd
+    source_cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null || pwd)
     local source_encoded
-    source_encoded=$(encode_claude_path "$REPO_ROOT")
+    source_encoded=$(encode_claude_path "$source_cwd")
     local source_project_dir="${HOME}/.claude/projects/${source_encoded}"
     if [[ -z "$session_id" && -d "$source_project_dir" ]]; then
         local latest_jsonl

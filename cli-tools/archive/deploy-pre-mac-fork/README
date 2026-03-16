@@ -1,0 +1,7 @@
+Pre-Mac-fork archive — 2026-03-16
+
+These are the original versions of deploy and deploy-mac before the Mac
+backend/proxy fork was implemented. deploy-mac was web-only; deploy routed
+everything through trigger-deploy.js / Makefile (WSL path).
+
+Archived so the WSL deploy path can be reconstructed if needed.

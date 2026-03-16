@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Worktree Delete - remove git worktrees and clean up associated resources
-# TAGS: git, worktree
+# TAGS: git, worktree, nas
 # AUDIENCE: human, agent
 #
 # Usage: worktree-delete <branch-name> [options]
 #
 # Removes the worktree directory, prunes git worktree references,
 # optionally deletes the branch, and cleans up the cd quick alias.
+# Works with NAS-hosted bare repos via project config.
+#
+# Config: ~/.config/worktrees/<project>.conf
 #
 # Examples:
 #   worktree-delete feature-auth          # Remove worktree, keep branch
 #   worktree-delete feature-auth -b       # Remove worktree AND delete branch
+#   worktree-delete feature-auth --project Scripts
 #   worktree-delete feature-auth --dry-run
 
 set -euo pipefail
@@ -25,6 +29,7 @@ NC='\033[0m'
 # Defaults
 DRY_RUN=false
 DELETE_BRANCH=false
+PROJECT="askCivic"
 
 usage() {
     cat << 'EOF'
@@ -37,18 +42,21 @@ Arguments:
 
 Options:
   -b, --delete-branch  Also delete the local branch
+  -p, --project NAME   Project config to use (default: askCivic)
   -n, --dry-run        Show what would happen without making changes
   -h, --help           Show this help message
 
 Cleanup performed:
+  - Kills any Claude session running from the worktree (ghost prevention)
   - Removes the worktree directory
   - Prunes git worktree references
   - Removes the cd quick alias (~/.cd_quick_aliases)
   - Optionally deletes the local branch (-b)
 
 Examples:
-  worktree-delete feature-auth          # Remove worktree, keep branch
-  worktree-delete feature-auth -b       # Also delete the branch
+  worktree-delete feature-auth              # Remove worktree, keep branch
+  worktree-delete feature-auth -b           # Also delete the branch
+  worktree-delete feature-auth --project Scripts
   worktree-delete feature-auth --dry-run
 EOF
     exit 0
@@ -59,6 +67,34 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warn() { echo -e "${YELLOW}!${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1"; }
 
+load_config() {
+    local project="${1:-askCivic}"
+    local config="$HOME/.config/worktrees/${project}.conf"
+    if [[ ! -f "$config" ]]; then
+        log_error "Project config not found: $config"
+        echo "  Create it with: worktree-setup --init $project"
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$config"
+    for var in BARE_REPO WORKTREE_PARENT SECRETS_DIR; do
+        if [[ -z "${!var:-}" ]]; then
+            log_error "$var not set in $config"
+            exit 1
+        fi
+    done
+    # NAS mount check
+    if [[ ! -d "$BARE_REPO" ]]; then
+        log_error "Bare repo not found: $BARE_REPO (is NAS mounted?)"
+        exit 1
+    fi
+    if [[ "$(git --git-dir="$BARE_REPO" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+        log_error "$BARE_REPO is not a bare git repository"
+        exit 1
+    fi
+    mkdir -p "$WORKTREE_PARENT"
+}
+
 # Parse arguments
 BRANCH_NAME=""
 while [[ $# -gt 0 ]]; do
@@ -66,6 +102,14 @@ while [[ $# -gt 0 ]]; do
         -h|--help) usage ;;
         -n|--dry-run) DRY_RUN=true; shift ;;
         -b|--delete-branch) DELETE_BRANCH=true; shift ;;
+        -p|--project)
+            if [[ $# -lt 2 ]]; then
+                log_error "--project requires a name"
+                exit 1
+            fi
+            PROJECT="$2"
+            shift 2
+            ;;
         -*)
             log_error "Unknown option: $1"
             echo "Use --help for usage information"
@@ -89,16 +133,10 @@ if [[ -z "$BRANCH_NAME" ]]; then
     exit 1
 fi
 
-# Check we're in a git repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    log_error "Not in a git repository"
-    exit 1
-fi
+# Load project config (validates NAS mounts, bare repo, etc.)
+load_config "$PROJECT"
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
-REPO_NAME=$(basename "$REPO_ROOT")
-PARENT_DIR=$(dirname "$REPO_ROOT")
-WORKTREE_DIR="$PARENT_DIR/${REPO_NAME}-${BRANCH_NAME}"
+WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
 # Verify worktree exists
 if [[ ! -d "$WORKTREE_DIR" ]]; then
@@ -119,7 +157,8 @@ echo "════════════════════════�
 echo " Worktree Delete Plan"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "  Repository:    $REPO_NAME"
+echo "  Project:       $PROJECT"
+echo "  Bare repo:     $BARE_REPO"
 echo "  Branch:        $BRANCH_NAME"
 echo "  Worktree:      $WORKTREE_DIR"
 echo "  Delete branch: $(if $DELETE_BRANCH; then echo "yes"; else echo "no"; fi)"
@@ -169,19 +208,19 @@ fi
 # Remove worktree
 if [[ -d "$WORKTREE_DIR" ]]; then
     log_info "Removing worktree..."
-    git worktree remove "$WORKTREE_DIR" --force
+    git --git-dir="$BARE_REPO" worktree remove "$WORKTREE_DIR" --force
     log_success "Worktree removed: $WORKTREE_DIR"
 else
     log_info "Pruning stale worktree references..."
-    git worktree prune
+    git --git-dir="$BARE_REPO" worktree prune
     log_success "Pruned worktree references"
 fi
 
 # Delete branch if requested
 if [[ "$DELETE_BRANCH" == "true" ]]; then
-    if git branch --list "$BRANCH_NAME" | grep -q .; then
+    if git --git-dir="$BARE_REPO" branch --list "$BRANCH_NAME" | grep -q .; then
         log_info "Deleting local branch..."
-        git branch -D "$BRANCH_NAME"
+        git --git-dir="$BARE_REPO" branch -D "$BRANCH_NAME"
         log_success "Branch deleted: $BRANCH_NAME"
     else
         log_warn "Branch '$BRANCH_NAME' not found locally (may already be deleted)"
@@ -191,6 +230,7 @@ fi
 # Remove cd quick alias
 if $HAS_ALIAS; then
     log_info "Removing cd alias..."
+    sed -i '' "/^${BRANCH_NAME}=/d" "$CD_QUICK_ALIASES_FILE" 2>/dev/null || \
     sed -i "/^${BRANCH_NAME}=/d" "$CD_QUICK_ALIASES_FILE"
     log_success "CD alias removed: $BRANCH_NAME"
 fi

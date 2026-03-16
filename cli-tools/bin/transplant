@@ -10,7 +10,7 @@
 # Requires tmux. This is the same mechanism used by worktree-setup.
 #
 # Examples:
-#   transplant /home/token/ProcAgentDir/ProcurementAgentAI
+#   transplant ~/worktrees/askCivic/wt-main
 #   transplant /tmp/transplant-test
 
 set -euo pipefail
@@ -53,7 +53,7 @@ Options:
   --relay        Interactive relay mode (default: headless)
 
 Local examples:
-  transplant /home/token/ProcAgentDir/ProcurementAgentAI
+  transplant ~/worktrees/askCivic/wt-main
   transplant /tmp/transplant-test
 
 Remote examples:

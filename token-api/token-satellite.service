@@ -4,8 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/token/Scripts/token-api
-ExecStart=/home/token/Scripts/token-api/.venv/bin/python -m uvicorn token-satellite:app --host 0.0.0.0 --port 7777
+WorkingDirectory=/mnt/imperium/Scripts/token-api
+Environment=UV_PROJECT_ENVIRONMENT=/home/token/.local/venvs/token-api
+ExecStart=/home/token/.local/bin/uv run python -m uvicorn token-satellite:app --host 0.0.0.0 --port 7777
 Restart=always
 RestartSec=3
 StandardOutput=journal

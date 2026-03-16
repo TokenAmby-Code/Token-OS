@@ -3,4 +3,5 @@
 # TAGS: db
 # AUDIENCE: human, agent
 set -euo pipefail
-exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.db_query.cli "$@"
+CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.db_query.cli "$@"

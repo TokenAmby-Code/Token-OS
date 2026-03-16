@@ -47,13 +47,32 @@ fi
 resolve_vault() {
   local vault_name="$1"
 
-  # Check home directory first
+  # NAS mounts first (canonical locations)
+  # macOS mounts to /Volumes/, Linux mounts to /mnt/
+  if [[ -d "/Volumes/Imperium/$vault_name" ]]; then
+    echo "/Volumes/Imperium/$vault_name"
+    return 0
+  fi
+  if [[ -d "/Volumes/Civic/$vault_name" ]]; then
+    echo "/Volumes/Civic/$vault_name"
+    return 0
+  fi
+  if [[ -d "/mnt/imperium/$vault_name" ]]; then
+    echo "/mnt/imperium/$vault_name"
+    return 0
+  fi
+  if [[ -d "/mnt/civic/$vault_name" ]]; then
+    echo "/mnt/civic/$vault_name"
+    return 0
+  fi
+
+  # Check home directory
   if [[ -d "$HOME/$vault_name" ]]; then
     echo "$HOME/$vault_name"
     return 0
   fi
 
-  # WSL: also check Windows documents
+  # WSL: fallback to Windows documents
   if [[ "$PLATFORM" == "wsl" && -d "/mnt/c/Users/colby/Documents/Obsidian/$vault_name" ]]; then
     echo "/mnt/c/Users/colby/Documents/Obsidian/$vault_name"
     return 0

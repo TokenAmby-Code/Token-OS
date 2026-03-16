@@ -3,4 +3,5 @@
 # TAGS: system
 # AUDIENCE: human
 set -euo pipefail
-exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.timezone.cli "$@"
+CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.timezone.cli "$@"

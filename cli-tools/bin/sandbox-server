@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="/home/token/ProcAgentDir/langgraph-sandbox"
+PROJECT_DIR="/home/token/ProcAgentDir/langgraph-sandbox"  # Legacy path — this repo will be archived
 VENV_DIR="$PROJECT_DIR/.venv"
 DEFAULT_PORT=8080
 
