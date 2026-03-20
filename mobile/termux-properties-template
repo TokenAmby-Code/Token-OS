@@ -10,7 +10,7 @@
 # Notes:
 #   - Top row: ESC + modifiers + HOME/UP/END nav cluster
 #   - Bottom row: | + common chars (~, /, -) + LEFT/DOWN/RIGHT arrows
-#   - ESC key (no popup - vol-toggle is via MacroDroid notification)
+#   - Hold ESC → sends Ctrl-Space (tmux prefix)
 #   - Hold SHIFT → Shift+Tab
 #   - Hold ALT → TAB
 #   - Hold CTRL → Ctrl+C x2 (double interrupt, may coalesce to one)
@@ -18,7 +18,7 @@
 #   - Hold UP → types 'claude' + Enter, hold DOWN → types 'exit' + Enter
 #   - Hold | → types '@'
 extra-keys = [ \
-  [{key: 'ESC'}, {key: 'SHIFT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {key: 'ALT', popup: 'TAB'}, {key: 'CTRL', popup: {macro: "\u0003", display: '^C'}}, {key: 'HOME', popup: 'DRAWER'}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  [{key: 'ESC', popup: {macro: "\u0000", display: '^␣'}}, {key: 'SHIFT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {key: 'ALT', popup: 'TAB'}, {key: 'CTRL', popup: {macro: "\u0003", display: '^C'}}, {key: 'HOME', popup: 'DRAWER'}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
   [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 
