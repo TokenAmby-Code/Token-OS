@@ -267,6 +267,38 @@ def format_duration_colored(start_time_str: str, end_time_str: str = None) -> st
         return f"[dim]{duration}[/dim]"
 
 
+def format_zealotry_cell(instance: dict) -> str:
+    """Format the Z column: countdown if timer pending, ✓ if victory, number if static."""
+    if instance.get("victory_at"):
+        return "[green]✓[/green]"
+    next_fire = instance.get("gt_next_fire")
+    if next_fire:
+        try:
+            fire_dt = datetime.fromisoformat(next_fire.replace("Z", "+00:00").split(".")[0])
+            secs = (fire_dt - datetime.now()).total_seconds()
+            if secs <= 0:
+                return "[red bold]NOW[/red bold]"
+            elif secs < 15:
+                return f"[red bold]{int(secs)}s[/red bold]"
+            elif secs < 60:
+                return f"[yellow]{int(secs)}s[/yellow]"
+            elif secs < 300:
+                return f"[cyan]{int(secs // 60)}m[/cyan]"
+            else:
+                return f"[dim]{int(secs // 60)}m[/dim]"
+        except Exception:
+            return "[magenta]?[/magenta]"
+    zealotry = instance.get("zealotry") or 4
+    if zealotry <= 3:
+        return f"[dim]{zealotry}[/dim]"
+    elif zealotry <= 6:
+        return f"{zealotry}"
+    elif zealotry <= 8:
+        return f"[yellow]{zealotry}[/yellow]"
+    else:
+        return f"[red bold]{zealotry}[/red bold]"
+
+
 def _is_stale_instance(instance: dict) -> bool:
     """Check if a stopped instance should be hidden (pre-today or unnamed 0m run)."""
     if instance.get("status") not in ("stopped",):
@@ -536,6 +568,22 @@ def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
         with urllib.request.urlopen(req, timeout=3) as response:
             result = json.loads(response.read().decode())
             return result
+    except Exception:
+        return None
+
+
+def set_instance_zealotry(instance_id: str, zealotry: int) -> dict | None:
+    """Set zealotry level via API. Range 1-10."""
+    try:
+        data = json.dumps({"zealotry": zealotry}).encode()
+        req = urllib.request.Request(
+            f"{API_URL}/api/instances/{instance_id}/zealotry",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
     except Exception:
         return None
 
@@ -822,6 +870,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("", width=2, justify="center")
     table.add_column("●", style="dim", width=1, justify="center")
     table.add_column("Name", style="white", width=max_name_len)
+    table.add_column("Z", width=4, justify="center")
     table.add_column("Device", style="yellow", width=10)
     table.add_column("Progress", width=14)
     table.add_column("Task", style="dim", min_width=20, max_width=30)
@@ -837,6 +886,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
             name = f"[dim]@ {name}[/dim]"
 
         device = instance.get("device_id", "?")
+        zeal_text = format_zealotry_cell(instance)
         instance_id = instance.get("id", "")
         status = instance.get("status", "idle")
         # Poll for fresh todos when processing, otherwise use cached data
@@ -879,10 +929,10 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
             current_task = "[dim]-[/dim]"
             duration = f"[dim]{duration}[/dim]"
 
-        table.add_row(selector, status_icon, name, device, progress_text, current_task, duration)
+        table.add_row(selector, status_icon, name, zeal_text, device, progress_text, current_task, duration)
 
     if not instances:
-        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-", "-")
+        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-", "-", "-")
 
     return table
 
@@ -1269,6 +1319,26 @@ def create_cron_details_panel(job: dict, max_lines: int = 8) -> Panel:
     else:
         lines.append("[dim]No run history[/dim]")
 
+    # Victory conditions
+    vc_raw = job.get("victory_conditions")
+    if vc_raw:
+        vcs = vc_raw if isinstance(vc_raw, list) else []
+        if isinstance(vc_raw, str):
+            try:
+                import json
+                vcs = json.loads(vc_raw)
+            except Exception:
+                vcs = []
+        if vcs and len(lines) < max_lines:
+            lines.append("")
+            lines.append("[bold magenta]Victory Conditions[/bold magenta]")
+            for vc in vcs:
+                if len(lines) >= max_lines:
+                    break
+                check = "[green]\u2713[/green]" if vc.get("verified") else "[dim]\u2610[/dim]"
+                desc = vc.get("description", "?")
+                lines.append(f"  {check} {desc}")
+
     content = "\n".join(lines[:max_lines])
     return Panel(content, title="Cron Details", border_style="magenta")
 
@@ -1310,6 +1380,20 @@ def create_compact_cron_details_panel(job: dict) -> Panel:
                     parts.append(f"[dim]{line}[/dim]")
                     break
 
+    # Victory conditions indicator
+    vc_raw = job.get("victory_conditions")
+    if vc_raw:
+        vcs = vc_raw if isinstance(vc_raw, list) else []
+        if isinstance(vc_raw, str):
+            try:
+                import json
+                vcs = json.loads(vc_raw)
+            except Exception:
+                vcs = []
+        if vcs:
+            done = sum(1 for v in vcs if v.get("verified"))
+            parts.append(f"[magenta]VC {done}/{len(vcs)}[/magenta]")
+
     content = "  ".join(parts)
     return Panel(content, title="Cron Details", border_style="magenta")
 
@@ -1350,6 +1434,20 @@ def create_mobile_cron_details_panel(job: dict) -> Panel:
     else:
         lines.append(f"Next: {_format_cron_next(job)}")
 
+    # Victory conditions
+    vc_raw = job.get("victory_conditions")
+    if vc_raw:
+        vcs = vc_raw if isinstance(vc_raw, list) else []
+        if isinstance(vc_raw, str):
+            try:
+                import json
+                vcs = json.loads(vc_raw)
+            except Exception:
+                vcs = []
+        if vcs:
+            done = sum(1 for v in vcs if v.get("verified"))
+            lines.append(f"[magenta]VC {done}/{len(vcs)}[/magenta]")
+
     return Panel("\n".join(lines), title="Details", border_style="magenta", padding=(0, 1))
 
 
@@ -1370,6 +1468,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("", width=2, justify="center")
     table.add_column("●", style="dim", width=1, justify="center")
     table.add_column("Name", style="white")  # Dynamic width - fills available space
+    table.add_column("Z", width=4, justify="center")
     table.add_column("Device", style="yellow", width=10)
     table.add_column("Progress", width=14)
     table.add_column("Time", width=6, justify="right")
@@ -1381,6 +1480,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
             name = f"[bold yellow]{name}[/bold yellow]"
 
         device = instance.get("device_id", "?")
+        zeal_text = format_zealotry_cell(instance)
         instance_id = instance.get("id", "")
         status = instance.get("status", "idle")
         # Poll for fresh todos when processing, otherwise use cached data
@@ -1408,10 +1508,10 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
         end_time = instance.get("stopped_at") if status == "stopped" else None
         duration = format_duration_colored(instance.get("registered_at", ""), end_time)
 
-        table.add_row(selector, status_icon, name, device, progress_text, duration)
+        table.add_row(selector, status_icon, name, zeal_text, device, progress_text, duration)
 
     if not instances:
-        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-")
+        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-", "-")
 
     return table
 
@@ -1438,6 +1538,9 @@ def create_events_panel(events: list) -> Panel:
         "phone_app_close": ("blue", "📱", "closed"),
         "phone_geofence": ("cyan", "📍", "geofence"),
         "location_event": ("cyan", "📍", "location"),
+        "golden_throne_scheduled": ("magenta", "⏱", "GT scheduled"),
+        "golden_throne_followup": ("magenta", "⏰", "GT wakeup"),
+        "golden_throne_victory": ("green", "⚔", "GT victory"),
     }
 
     for event in events:
@@ -1805,6 +1908,32 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
                 lines.append(f"[cyan]Session:[/cyan] [bold]{doc_title}[/bold]  [dim]{short_path}[/dim]")
         except Exception:
             lines.append(f"[cyan]Session:[/cyan] [dim]doc #{session_doc_id}[/dim]")
+
+    # Golden Throne status
+    zealotry = instance.get("zealotry") or 4
+    victory_at = instance.get("victory_at")
+    victory_reason = instance.get("victory_reason")
+    gt_next_fire = instance.get("gt_next_fire")
+    if victory_at:
+        reason_short = (victory_reason[:40] + "...") if victory_reason and len(victory_reason) > 40 else (victory_reason or "")
+        lines.append(f"[cyan]Throne:[/cyan] [green]VICTORIOUS[/green] — {reason_short}")
+    elif gt_next_fire:
+        try:
+            fire_dt = datetime.fromisoformat(gt_next_fire.replace("Z", "+00:00").split(".")[0])
+            secs = (fire_dt - datetime.now()).total_seconds()
+            if secs <= 0:
+                countdown = "[red bold]NOW[/red bold]"
+            elif secs < 60:
+                countdown = f"[yellow]{int(secs)}s[/yellow]"
+            else:
+                countdown = f"[cyan]{int(secs // 60)}m{int(secs % 60):02d}s[/cyan]"
+            lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  next in {countdown}")
+        except Exception:
+            lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]timer pending[/dim]")
+    elif zealotry >= 4:
+        lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]idle (schedules on stop)[/dim]")
+    else:
+        lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]no follow-up[/dim]")
 
     lines.append("")
 
@@ -2969,6 +3098,7 @@ def generate_help_screen() -> Layout:
             ("d", "Delete selected instance"),
             ("c", "Clear all stopped instances"),
             ("n", "Set session note for instance"),
+            ("z", "Set zealotry (follow-up frequency 1-10)"),
         ]),
         ("Recovery", [
             ("U", "Unstick frozen instance (SIGWINCH, gentle nudge)"),
@@ -3198,6 +3328,10 @@ def main():
                     elif key == 'm':
                         with action_lock:
                             action_queue.append('mute_toggle')
+                        update_flag.set()
+                    elif key == 'z':
+                        with action_lock:
+                            action_queue.append('set_zealotry')
                         update_flag.set()
                     elif key == 'n':
                         with action_lock:
@@ -3535,6 +3669,41 @@ def main():
                                 unstick_feedback = (time.time(), f"TTS: {mode_display.get(new_mode, new_mode)}")
                                 instances_cache = get_instances()
                                 refresh_global_tts_mode()
+
+                    elif action == 'set_zealotry' and displayed and table_mode == "instances":
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id")
+                            current_zealotry = instance.get("zealotry") or 4
+                            current_name = format_instance_name(instance)
+
+                            input_mode.set()
+                            time.sleep(0.1)
+                            live.stop()
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+
+                            console.print(f"\n[yellow]Set zealotry for:[/yellow] {current_name} (current: {current_zealotry})")
+                            console.print("[dim]1-3: dies quietly  4-6: standard  7-8: frequent  9-10: near-realtime[/dim]")
+                            try:
+                                value = Prompt.ask("Zealotry (1-10)", default=str(current_zealotry))
+                                if value.isdigit() and 1 <= int(value) <= 10:
+                                    result = set_instance_zealotry(instance_id, int(value))
+                                    if result:
+                                        console.print(f"[green]v[/green] Zealotry set to {value}")
+                                    else:
+                                        console.print("[red]x[/red] Failed to set zealotry")
+                                else:
+                                    console.print("[dim]Invalid (must be 1-10)[/dim]")
+                            except (KeyboardInterrupt, EOFError):
+                                console.print("[dim]Cancelled[/dim]")
+
+                            time.sleep(0.3)
+                            tty.setcbreak(sys.stdin.fileno())
+                            input_mode.clear()
+                            instances_cache = get_instances()
+                            _clamp_selection()
+                            live.start()
+                            _refresh(live)
 
                     elif action == 'global_mute_toggle':
                         result = cycle_global_tts_mode()

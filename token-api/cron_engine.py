@@ -6,6 +6,7 @@ job definitions and run history in agents.db.
 """
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -18,6 +19,7 @@ from typing import Optional
 
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from nas_mount import ensure_command_mounts
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -153,6 +155,12 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN model TEXT DEFAULT NULL")
         if "prompt_path" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN prompt_path TEXT DEFAULT NULL")
+        if "active_session_id" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN active_session_id TEXT DEFAULT NULL")
+        if "session_started_date" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN session_started_date TEXT DEFAULT NULL")
+        if "victory_conditions" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN victory_conditions TEXT DEFAULT NULL")
 
         cursor = await db.execute("PRAGMA table_info(cron_runs)")
         cron_runs_cols = {row[1] for row in await cursor.fetchall()}
@@ -222,7 +230,7 @@ class CronEngine:
             "description": "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. I am Alpharius.",
             "enabled": True,
             "schedule": {"type": "cron", "value": "*/30 * * * *", "tz": "America/Phoenix"},
-            "command": "cd ~/Scripts/token-api && python3 alpharius_heartbeat.py",
+            "command": "cd /mnt/imperium/Scripts/token-api && python3 alpharius_heartbeat.py",
             "timeout_seconds": 60,
         },
     ]
@@ -389,6 +397,50 @@ class CronEngine:
 
         return count < max_runs
 
+    async def _build_claude_command(self, job: dict) -> str:
+        """Build claude CLI command, handling session persistence.
+
+        session_type values:
+          'isolated'   — fresh instance every run (default, original behavior)
+          'persistent' — resume same session indefinitely across runs
+          'daily'      — persistent within a day, fresh session each morning
+        """
+        model = job["model"]
+        prompt_path = job["prompt_path"]
+        session_type = job.get("session_type", "isolated")
+        active_session_id = job.get("active_session_id")
+        session_started_date = job.get("session_started_date")
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        base = f'claude --model {model} -p "$(cat {prompt_path})" --dangerously-skip-permissions'
+
+        if session_type == "isolated":
+            return base
+
+        # For persistent/daily: determine if we resume or start fresh
+        needs_new_session = False
+
+        if not active_session_id:
+            needs_new_session = True
+        elif session_type == "daily" and session_started_date != today:
+            needs_new_session = True
+
+        if needs_new_session:
+            new_session_id = str(uuid.uuid4())
+            # Store the session ID and date in the DB before spawning
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE cron_jobs SET active_session_id = ?, session_started_date = ?, updated_at = ? WHERE id = ?",
+                    (new_session_id, today, _now_iso(), job["id"]),
+                )
+                await db.commit()
+            print(f"CronEngine: '{job['name']}' new {session_type} session: {new_session_id[:8]}...")
+            return f'{base} --session-id {new_session_id}'
+        else:
+            # Resume existing session — prompt is injected as the -p message
+            print(f"CronEngine: '{job['name']}' resuming session: {active_session_id[:8]}...")
+            return f'claude -p "$(cat {prompt_path})" --resume {active_session_id} --dangerously-skip-permissions'
+
     async def _execute(self, job: dict):
         """Run the job command as a subprocess with timeout."""
         job_id = job["id"]
@@ -423,9 +475,29 @@ class CronEngine:
 
         # Build command from structured fields if available
         if job.get("prompt_path") and job.get("model"):
-            command = f'claude --model {job["model"]} -p "$(cat {job["prompt_path"]})" --dangerously-skip-permissions'
+            command = await self._build_claude_command(job)
         else:
             command = job["command"]
+
+        # NAS availability check — attempt remount before giving up
+        nas_ok, nas_err = await asyncio.get_event_loop().run_in_executor(
+            None, ensure_command_mounts, command
+        )
+        if not nas_ok:
+            status = "nas_unavailable"
+            error_summary = nas_err
+            print(f"CronEngine: '{job['name']}' skipped — {nas_err}")
+            # Alert fleet channel once so the issue is visible
+            try:
+                subprocess.run(
+                    ["discord", "send", "fleet",
+                     f"⚠️ **{job['name']}** skipped: {nas_err}"],
+                    timeout=8, env=_subprocess_env(),
+                )
+            except Exception:
+                pass
+            # Jump straight to DB update in finally block
+            raise RuntimeError(nas_err)
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -474,8 +546,9 @@ class CronEngine:
                 error_summary = f"Killed after {job.get('timeout_seconds', 120)}s timeout\n" + error_summary
 
         except Exception as e:
-            status = "error"
-            error_summary = str(e)[:4000]
+            if status != "nas_unavailable":  # don't overwrite NAS-specific status
+                status = "error"
+                error_summary = str(e)[:4000]
 
         finally:
             duration = _time.monotonic() - start_time
@@ -591,6 +664,13 @@ class CronEngine:
             else:
                 job["next_run_at"] = None
             job["is_running"] = job["id"] in self._running_jobs
+            # Deserialize victory_conditions JSON
+            vc = job.get("victory_conditions")
+            if vc and isinstance(vc, str):
+                try:
+                    job["victory_conditions"] = json.loads(vc)
+                except json.JSONDecodeError:
+                    pass
 
         return jobs
 
@@ -609,6 +689,13 @@ class CronEngine:
         else:
             job["next_run_at"] = None
         job["is_running"] = job_id in self._running_jobs
+        # Deserialize victory_conditions JSON
+        vc = job.get("victory_conditions")
+        if vc and isinstance(vc, str):
+            try:
+                job["victory_conditions"] = json.loads(vc)
+            except json.JSONDecodeError:
+                pass
         return job
 
     VALID_COMMANDERS = {"mechanicus", "custodes", "alpharius", "dorn", "emperor"}
@@ -642,8 +729,9 @@ class CronEngine:
                         max_runs_per_window, run_window_hours,
                         session_type, commander,
                         model, prompt_path,
+                        victory_conditions,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_id, data["name"],
                     data.get("description", ""),
@@ -659,6 +747,7 @@ class CronEngine:
                     data.get("session_type", "isolated"),
                     commander,
                     model, prompt_path,
+                    json.dumps(data["victory_conditions"]) if data.get("victory_conditions") else None,
                     now, now,
                 ))
                 await db.commit()
@@ -696,12 +785,19 @@ class CronEngine:
             "commander": "commander",
             "model": "model",
             "prompt_path": "prompt_path",
+            "active_session_id": "active_session_id",
+            "session_started_date": "session_started_date",
+            "victory_conditions": "victory_conditions",
         }
 
         for key, col in field_map.items():
             if key in updates:
                 set_clauses.append(f"{col} = ?")
-                params.append(updates[key])
+                val = updates[key]
+                # JSON-serialize victory_conditions
+                if key == "victory_conditions" and val is not None and not isinstance(val, str):
+                    val = json.dumps(val)
+                params.append(val)
 
         # Handle schedule sub-object
         if "schedule" in updates:
