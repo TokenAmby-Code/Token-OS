@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Custodes Phase 7 — Daily thread in #briefing for interesting observations.
+"""Custodes Phase 8 — Token-API state commentary over habit spam.
 Polls Token-API state, evaluates via guardsman whether the state is interesting.
 INTERESTING: reads session docs for up to 2 processing instances, enriches observation
   with "Active work: <topic> (<project>), ..." suffix. Posts to daily thread in #briefing.
@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import time as _time
 import urllib.request
 from pathlib import Path
 
@@ -24,44 +25,179 @@ def _get(path: str) -> dict | list:
         return json.loads(resp.read())
 
 
-def collect_state() -> tuple[dict, list]:
+def collect_state() -> tuple[dict, list, list]:
     timer = _get("/api/timer")
     instances = _get("/api/instances")
     if isinstance(instances, dict):
         instances = instances.get("instances", [])
-    return timer, instances
+    try:
+        cron_data = _get("/api/cron/jobs")
+        cron_jobs = cron_data if isinstance(cron_data, list) else cron_data.get("jobs", [])
+    except Exception:
+        cron_jobs = []
+    return timer, instances, cron_jobs
 
 
-def extract_metrics(timer: dict, instances: list) -> dict:
+def extract_metrics(timer: dict, instances: list, cron_jobs: list) -> dict:
     effective_mode = timer.get("current_mode", "unknown").upper()
     break_minutes = int(timer.get("break_balance_ms", 0) / 60000)
+    work_minutes = int(timer.get("work_time_ms", timer.get("work_ms", 0)) / 60000)
     alive = [i for i in instances if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")]
     cron_count = sum(1 for i in alive if i.get("origin_type") == "cron")
     manual_count = len(alive) - cron_count
     processing_count = sum(1 for i in instances if i.get("is_processing") == 1)
+
+    # Cron job fleet stats
+    active_cron_jobs = [j for j in cron_jobs if j.get("status") == "running"]
+    recent_victories = _get_recent_cron_victories(cron_jobs)
+
     return {
         "effective_mode": effective_mode,
         "break_minutes": break_minutes,
-        "active_count": manual_count,  # Emperor's manual instances only
-        "cron_count": cron_count,       # Mechanicus cron workers
+        "work_minutes": work_minutes,
+        "active_count": manual_count,       # Emperor's manual instances only
+        "cron_count": cron_count,            # Mechanicus cron workers (instances)
         "processing_count": processing_count,
         "manual_mode": (timer.get("manual_mode") or "").upper(),
+        "active_cron_jobs": len(active_cron_jobs),
+        "recent_victories": recent_victories,
     }
 
 
-def evaluate_with_guardsman(metrics: dict) -> bool:
+def _get_recent_cron_victories(cron_jobs: list) -> list[str]:
+    """Return names of cron jobs that completed with a victory signal in the last 15 minutes."""
+    now = _time.time()
+    fifteen_min_ago = now - 900
+    victories = []
+    for job in cron_jobs:
+        last_run = job.get("last_run_at") or job.get("last_run")
+        victory_conditions = job.get("victory_conditions")
+        if not last_run or not victory_conditions:
+            continue
+        try:
+            if isinstance(last_run, str):
+                lr_dt = datetime.datetime.fromisoformat(last_run.replace("Z", "+00:00"))
+                lr_ts = lr_dt.timestamp()
+            else:
+                lr_ts = float(last_run)
+            if lr_ts >= fifteen_min_ago:
+                victories.append(job.get("name") or job.get("id", "unknown"))
+        except Exception:
+            continue
+    return victories
+
+
+# ── Idle tracking ──────────────────────────────────────────────────────────────
+
+IDLE_START_FLAG = "/tmp/custodes_idle_start_{date}.txt"
+
+
+def check_extended_idle(metrics: dict) -> str | None:
+    """Return a message if IDLE mode has persisted continuously for >45 minutes."""
+    mode = metrics.get("effective_mode", "")
+    today = datetime.date.today().isoformat().replace("-", "")
+    start_flag = Path(IDLE_START_FLAG.format(date=today))
+
+    if mode != "IDLE":
+        start_flag.unlink(missing_ok=True)
+        return None
+
+    now = _time.time()
+    if not start_flag.exists():
+        try:
+            start_flag.write_text(str(now))
+        except Exception:
+            pass
+        return None
+
+    try:
+        idle_started_at = float(start_flag.read_text().strip())
+    except Exception:
+        try:
+            start_flag.write_text(str(now))
+        except Exception:
+            pass
+        return None
+
+    elapsed_min = (now - idle_started_at) / 60
+    if elapsed_min >= 45:
+        return f"Extended idle: IDLE for {int(elapsed_min)} minutes continuously."
+    return None
+
+
+# ── Mode oscillation tracking ──────────────────────────────────────────────────
+
+MODE_HISTORY_FILE = "/tmp/custodes_mode_history_{date}.json"
+
+
+def track_and_check_oscillation(mode: str) -> str | None:
+    """Track mode snapshots. Return message if >4 WORKING↔IDLE switches in last hour."""
+    today = datetime.date.today().isoformat().replace("-", "")
+    history_file = Path(MODE_HISTORY_FILE.format(date=today))
+
+    now = _time.time()
+    history = []
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text())
+        except Exception:
+            history = []
+
+    history.append({"mode": mode, "ts": now})
+    one_hour_ago = now - 3600
+    history = [h for h in history if h["ts"] >= one_hour_ago]
+
+    try:
+        history_file.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+    # Count WORKING↔IDLE transitions
+    transitions = 0
+    prev_mode = None
+    for entry in history:
+        m = entry["mode"]
+        if m in ("WORKING", "IDLE"):
+            if prev_mode and prev_mode != m:
+                transitions += 1
+            prev_mode = m
+
+    if transitions > 4:
+        return f"Mode oscillation: {transitions} WORKING↔IDLE switches in last hour."
+    return None
+
+
+# ── Guardsman evaluation ───────────────────────────────────────────────────────
+
+def evaluate_with_guardsman(metrics: dict, extra_flags: dict) -> bool:
+    """Guardsman PASS/FAIL based on state-commentary conditions (not habits).
+
+    PASS if any of:
+    - break_balance > 60min (deep break debt)
+    - mode is IDLE and continuous idle >45min
+    - processing_instances > 0 (active work with session docs)
+    - fleet_victory detected (cron job just completed with victory)
+    - mode oscillation >4 switches in last hour
+    - mode is DISTRACTED
+    """
     summary = (
         f"mode={metrics['effective_mode']}, "
         f"break_balance={metrics['break_minutes']}min, "
+        f"work_time={metrics['work_minutes']}min, "
         f"emperor_instances={metrics['active_count']}, "
         f"cron_workers={metrics['cron_count']}, "
-        f"processing={metrics['processing_count']}"
+        f"processing={metrics['processing_count']}, "
+        f"extended_idle={extra_flags.get('extended_idle', False)}, "
+        f"fleet_victory={bool(metrics['recent_victories'])}, "
+        f"mode_oscillation={extra_flags.get('oscillation', False)}"
     )
-    # Guardsman returns PASS/FAIL. PASS = state matches interesting criteria.
     assertion = (
-        "PASS if: break_balance > 60min AND active_instances > 0, "
-        "OR active_instances == 0, "
-        "OR mode is DISTRACTED. "
+        "PASS if: break_balance > 60min, "
+        "OR mode is DISTRACTED, "
+        "OR extended_idle is True, "
+        "OR processing > 0, "
+        "OR fleet_victory is True, "
+        "OR mode_oscillation is True. "
         "Otherwise FAIL."
     )
     result = subprocess.run(
@@ -170,8 +306,7 @@ def generate_observation(summary: str, session_ctx: str | None) -> str:
         f"State: {summary}\n"
         f"Session context: {ctx_snippet}"
     )
-    import time
-    session_id = f"custodes-obs-{int(time.time())}"
+    session_id = f"custodes-obs-{int(_time.time())}"
     result = subprocess.run(
         ["openclaw", "agent", "--agent", "main", "--session-id", session_id,
          "-m", prompt, "--local", "--json"],
@@ -191,8 +326,12 @@ def generate_observation(summary: str, session_ctx: str | None) -> str:
 def build_comment(metrics: dict) -> str:
     mode = metrics["effective_mode"]
     break_min = metrics["break_minutes"]
-    active = metrics["active_count"]  # Emperor's manual instances
+    work_min = metrics.get("work_minutes", 0)
+    active = metrics["active_count"]      # Emperor's manual instances
     cron = metrics.get("cron_count", 0)
+    processing = metrics.get("processing_count", 0)
+    victories = metrics.get("recent_victories", [])
+    active_cron_jobs = metrics.get("active_cron_jobs", 0)
 
     if mode == "DISTRACTED":
         return "Distracted mode detected — intervention may be warranted."
@@ -200,10 +339,17 @@ def build_comment(metrics: dict) -> str:
         return "No active instances — Emperor may have stepped away."
     if active == 0 and cron > 0:
         return f"Emperor is offline. {cron} Mechanicus worker(s) running autonomously."
+
     cron_suffix = f" ({cron} cron)" if cron > 0 else ""
+    timer_suffix = f" | work={work_min}m, break={break_min:+d}m"
+
+    if victories:
+        return f"Fleet victory: {', '.join(victories[:2])}.{timer_suffix}"
     if break_min > 60 and active > 0:
-        return f"Break account is {break_min}m with {active} manual instance(s){cron_suffix} still running — consider clearing the queue."
-    return f"{active} manual instance(s) active in {mode} mode{cron_suffix}."
+        return f"Break account is {break_min}m with {active} manual instance(s){cron_suffix} running — consider clearing the queue.{timer_suffix}"
+    if processing > 0:
+        return f"{processing} instance(s) actively processing in {mode} mode{cron_suffix}.{timer_suffix}"
+    return f"{active} manual instance(s) in {mode} mode{cron_suffix}.{timer_suffix}"
 
 
 def send_discord(message: str, channel: str = BRIEFING_CHANNEL):
@@ -236,7 +382,6 @@ def get_or_create_daily_thread() -> str | None:
         print(f"  Thread create failed: {result.stderr.strip()}")
         return None
 
-    # Parse thread ID from stdout (e.g. "Thread created: 123456789")
     output = result.stdout.strip()
     print(f"  Thread created: {output}")
     thread_id = None
@@ -268,74 +413,6 @@ def send_discord_thread(message: str):
     send_discord(message)
 
 
-def check_morning_habits() -> str | None:
-    """Check habits API for overdue habits and remind the Emperor.
-    Uses the Token-API /api/habits/today endpoint instead of daily note frontmatter.
-    Fires every 2 hours (debounced via flag file with 2h TTL).
-    Phoenix is MST = UTC-7 (no DST).
-    """
-    import time as _time
-
-    phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
-    current_hour = phoenix_now.hour
-
-    # Only check during waking hours (9am–10pm, Emperor alarm 8:30)
-    if not (9 <= current_hour < 22):
-        return None
-
-    # Debounce: only fire once every 2 hours
-    today = datetime.date.today().isoformat()
-    flag_file = Path(f"/tmp/custodes_habit_check_{today.replace('-', '')}.txt")
-    if flag_file.exists():
-        try:
-            mtime = os.path.getmtime(flag_file)
-            if _time.time() - mtime < 7200:  # 2 hours
-                return None
-        except Exception:
-            pass
-
-    # Query habits API
-    try:
-        habits_data = _get("/api/habits/today")
-    except Exception as e:
-        print(f"  Warning: habits API unreachable: {e}", file=sys.stderr)
-        return None
-
-    habits = habits_data.get("habits", [])
-    if not habits:
-        return None
-
-    # Find overdue habits: window has started, not completed
-    overdue = []
-    for h in habits:
-        if h.get("completed"):
-            continue
-        window_start = h.get("window_start_hour", 24)
-        window_end = h.get("window_end_hour", 0)
-        if current_hour >= window_start and current_hour < window_end:
-            overdue.append(h.get("name", h.get("id", "unknown")))
-
-    if not overdue:
-        return None
-
-    # Write flag file
-    try:
-        flag_file.write_text(datetime.datetime.now().isoformat())
-    except Exception:
-        pass
-
-    summary = habits_data.get("summary", {})
-    done = summary.get("completed", 0)
-    total = summary.get("total", len(habits))
-    habit_names = ", ".join(overdue[:4])
-    urgency = "still pending" if current_hour < 12 else "getting late"
-
-    return (
-        f"<@{EMPEROR_DISCORD_ID}> Habits ({done}/{total}): **{habit_names}** {urgency} "
-        f"({phoenix_now.strftime('%H:%M')} MST). Did you get to those?"
-    )
-
-
 def check_break_nudge(metrics: dict) -> str | None:
     """Return a nudge message if break situation warrants it, else None."""
     mode = metrics.get("effective_mode", "WORKING")
@@ -365,8 +442,6 @@ def check_break_observation(metrics: dict) -> str | None:
 
     Clears break_start flag when break ends (auto-reset on next entry).
     """
-    import time as _time
-
     today = datetime.date.today().isoformat().replace("-", "")
     mode = metrics.get("effective_mode", "")
     manual_mode = metrics.get("manual_mode", "")
@@ -433,7 +508,7 @@ def check_break_observation(metrics: dict) -> str | None:
     return msg
 
 
-def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
+def check_instance_zero(metrics: dict, instances: list) -> tuple[str | None, str | None]:
     """Return (message, channel) if Emperor's manual instance count crossed zero boundary.
     Cron workers don't count — the Emperor is offline if no manual instances are running."""
     FLAG = Path("/tmp/custodes-zero-sent")
@@ -459,7 +534,7 @@ def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
 
 
 def check_morning_greeting(metrics: dict) -> str | None:
-    """Post a morning greeting on the first heartbeat of the day (7am+ Phoenix time).
+    """Post a morning greeting on the first heartbeat of the day (9am+ Phoenix time).
     Creates the daily thread as a side effect. Only fires once per day via flag file.
     """
     phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
@@ -474,7 +549,7 @@ def check_morning_greeting(metrics: dict) -> str | None:
         return None
 
     # This is the first heartbeat of the day — create the daily thread
-    thread_id = get_or_create_daily_thread()
+    get_or_create_daily_thread()
 
     # Build a brief morning status
     active = metrics.get("active_count", 0)
@@ -491,14 +566,6 @@ def check_morning_greeting(metrics: dict) -> str | None:
         last_fg = "unknown"
         fleet_note = "Fleet state unavailable."
 
-    # Check habits summary
-    try:
-        habits_data = _get("/api/habits/today")
-        summary = habits_data.get("summary", {})
-        total_habits = summary.get("total", 0)
-    except Exception:
-        total_habits = 0
-
     flag_file.touch()
 
     greeting = (
@@ -506,8 +573,6 @@ def check_morning_greeting(metrics: dict) -> str | None:
         f"Fleet: {active} manual + {cron} cron instances. Mode: {mode}.\n"
         f"Last FG run: {last_fg[:16] if last_fg != 'unknown' else 'unknown'}\n"
     )
-    if total_habits > 0:
-        greeting += f"Habits: 0/{total_habits} — tracking begins.\n"
     if fleet_note:
         greeting += f"\nFleet note: {fleet_note}"
 
@@ -516,9 +581,7 @@ def check_morning_greeting(metrics: dict) -> str | None:
 
 def log_to_daily_note(summary: str):
     today = datetime.date.today().isoformat()
-    note_path = os.path.expanduser(
-        f"~/Imperium-ENV/Terra/Journal/{today}.md"
-    )
+    note_path = f"/Volumes/Imperium/Imperium-ENV/Terra/Journal/Daily/{today}.md"
     timestamp = datetime.datetime.now().strftime("%H:%M")
     line = f"\n- [{timestamp}] Custodes heartbeat: {summary} — ROUTINE\n"
     try:
@@ -537,18 +600,20 @@ def emperor_is_live(metrics: dict) -> bool:
 def main():
     # 1. Collect state
     try:
-        timer, instances = collect_state()
+        timer, instances, cron_jobs = collect_state()
     except Exception as e:
         print(f"ERROR: Could not reach token-api: {e}", file=sys.stderr)
         sys.exit(1)
 
-    metrics = extract_metrics(timer, instances)
+    metrics = extract_metrics(timer, instances, cron_jobs)
     summary = (
         f"mode={metrics['effective_mode']}, "
         f"break_balance={metrics['break_minutes']}min, "
+        f"work_time={metrics['work_minutes']}min, "
         f"active_instances={metrics['active_count']}, "
         f"cron_workers={metrics.get('cron_count', 0)}, "
-        f"processing={metrics['processing_count']}"
+        f"processing={metrics['processing_count']}, "
+        f"active_cron_jobs={metrics.get('active_cron_jobs', 0)}"
     )
     print(f"State: {summary}")
 
@@ -564,7 +629,6 @@ def main():
     if morning:
         print(f"  Morning greeting: posting to daily thread")
         send_discord_thread(f"Custodes: {morning}")
-        # Also post a brief pointer to #briefing
         send_discord(
             f"Good morning, Emperor. Daily thread is live. Overnight report in #fleet.",
             channel=BRIEFING_CHANNEL,
@@ -576,25 +640,17 @@ def main():
         print(f"  Break nudge: {nudge}")
         send_discord(f"Custodes: {nudge}", channel="fleet")
 
-    # 3. Morning habit check — fires to main #briefing (NOT thread) so notifications aren't suppressed
-    habit_reminder = check_morning_habits()
-    if habit_reminder:
-        print(f"  Habit reminder: {habit_reminder}")
-        send_discord(f"Custodes: {habit_reminder}", channel=BRIEFING_CHANNEL)
-
-    # 3b. Break mode observation — fires to daily thread when in manual BREAK >15 min
+    # 3. Break mode observation — fires to daily thread when in manual BREAK >15 min
     break_obs = check_break_observation(metrics)
     if break_obs:
         print(f"  Break observation: {break_obs}")
         send_discord_thread(f"Custodes: {break_obs}")
 
     # 4. Instance-zero check — deduped via flag file, routes to #fleet
-    zero_msg, zero_ch = check_instance_zero(metrics)
+    zero_msg, zero_ch = check_instance_zero(metrics, instances)
     if zero_msg:
         print(f"  Instance zero: {zero_msg}")
-        # Enrich with session context for re-orientation
         if metrics.get("active_count", 0) == 0:
-            # No instances — surface what the Emperor was last working on
             file_path, title = get_recent_session_doc()
             if title:
                 ctx = get_session_context(file_path)
@@ -602,7 +658,6 @@ def main():
                 zero_msg += f"\nLast active: *{title}*" + (f" — {excerpt}" if excerpt else "")
                 print(f"  Context: {title}")
         else:
-            # Back online — include what the returning instance is working on
             active_non_sub = [
                 i for i in instances
                 if i.get("status") == "active" and not i.get("is_subagent")
@@ -617,11 +672,38 @@ def main():
             print("Done.")
             return
 
-    # 5. Evaluate
-    is_interesting = evaluate_with_guardsman(metrics)
+    # 5. State-commentary checks — compute extra flags for guardsman
+    mode = metrics["effective_mode"]
+
+    # Extended idle: >45 minutes in IDLE
+    idle_msg = check_extended_idle(metrics)
+    if idle_msg:
+        print(f"  Extended idle: {idle_msg}")
+        send_discord_thread(f"Custodes: {idle_msg}")
+
+    # Mode oscillation: WORKING↔IDLE >4 switches/hr
+    oscillation_msg = track_and_check_oscillation(mode)
+    if oscillation_msg:
+        print(f"  Mode oscillation: {oscillation_msg}")
+        send_discord_thread(f"Custodes: {oscillation_msg}")
+
+    # Fleet victories: cron job completed with victory signal in last 15 min
+    if metrics["recent_victories"]:
+        victory_names = ", ".join(metrics["recent_victories"][:3])
+        victory_msg = f"Fleet victory: {victory_names} completed."
+        print(f"  {victory_msg}")
+        send_discord_thread(f"Custodes: {victory_msg}")
+
+    extra_flags = {
+        "extended_idle": idle_msg is not None,
+        "oscillation": oscillation_msg is not None,
+    }
+
+    # 6. Evaluate via guardsman
+    is_interesting = evaluate_with_guardsman(metrics, extra_flags)
     print(f"Decision: {'INTERESTING' if is_interesting else 'ROUTINE'}")
 
-    # 6. Act
+    # 7. Act
     if is_interesting:
         session_doc = get_active_session_doc()
         session_ctx = get_session_context(session_doc)
