@@ -15,6 +15,8 @@ Endpoints:
     POST /restart     — git pull + restart
     GET  /kvm/status  — DeskFlow watchdog state
     POST /kvm/control — manual DeskFlow start/stop/hold
+    GET  /files/read    — read a file under ~/.claude/ (for cross-machine transcript fetch)
+    POST /tmux/send-keys — send a command to a tmux pane (cross-machine dispatch)
 """
 
 import json
@@ -245,15 +247,16 @@ DESKFLOW_PROCESS_CHECK_INTERVAL = 300 # verify DeskFlow process every 5 min
 class DeskFlowWatchdog:
     """Background watchdog for DeskFlow KVM server lifecycle.
 
-    Manages the Windows DeskFlow server and coordinates with the Mac Mini
-    DeskFlow client via token-api endpoints. Runs as a daemon thread.
+    The local DeskFlow server runs permanently. The watchdog only manages
+    connection state and restarts the Mac client when needed.
 
     States:
         starting  — boot: waiting for Tailscale + DeskFlow startup
-        running   — both sides up, periodic health checks
-        idle      — stable for 15min, polling stopped
-        mac_down  — Mac unreachable (confirmed), DeskFlow stopped
+        running   — connected, periodic health checks
+        waiting   — server up, Mac not connected, polling for connection
+        idle      — stable for 15min, reduced polling (still checks server alive)
         held      — manual override, watchdog paused for N minutes
+        stopped   — manual force_stop, fully paused
     """
 
     def __init__(self):
@@ -313,19 +316,27 @@ class DeskFlowWatchdog:
         if self._stop_event.is_set():
             return
 
-        # Start DeskFlow server immediately
+        # Start DeskFlow server immediately — it stays up permanently
         self._start_deskflow_server()
         time.sleep(5)
 
-        # Best-effort: try to start Mac client on boot
-        if self._check_mac_reachable():
-            self._ensure_mac_client_connected()
+        # Check if Mac already auto-connected
+        if self._check_deskflow_connected():
             self.state = "running"
             self.last_state_change = time.time()
             self.last_process_check = time.time()
-            logger.info("KVM watchdog: Mac reachable on boot → RUNNING")
+            logger.info("KVM watchdog: Mac already connected on boot → RUNNING")
         else:
-            logger.info("KVM watchdog: Mac not reachable on boot, will keep polling")
+            # Try to kick the Mac client
+            self._ensure_mac_client_connected()
+            if self._check_deskflow_connected():
+                self.state = "running"
+                self.last_state_change = time.time()
+                self.last_process_check = time.time()
+                logger.info("KVM watchdog: Mac connected after kick → RUNNING")
+            else:
+                self.state = "waiting"
+                logger.info("KVM watchdog: Mac not connected on boot, server running, will poll")
 
         while not self._stop_event.is_set():
             self._stop_event.wait(DESKFLOW_POLL_INTERVAL)
@@ -337,49 +348,76 @@ class DeskFlowWatchdog:
                 logger.error(f"KVM watchdog: tick error: {e}")
 
     def _tick(self):
+        # Stopped: manual force_stop, do nothing until force_start
+        if self.state == "stopped":
+            return
+
         # Held: wait for expiry
         if self.state == "held":
             if self.hold_until and time.time() > self.hold_until:
                 logger.info("KVM watchdog: Hold expired, resuming")
-                self.state = "mac_down"
+                self.state = "waiting"
                 self.consecutive_up = 0
                 self.consecutive_down = 0
+            # Even when held, keep the local server alive
+            self._ensure_server_alive()
             return
 
-        # Idle: polling stopped, nothing to do
-        if self.state == "idle":
-            return
+        # Always ensure the local server is running
+        self._ensure_server_alive()
 
-        mac_up = self._check_mac_reachable()
-        self.last_mac_status = mac_up
+        # Check actual deskflow connection (ESTABLISHED on port 24800)
+        connected = self._check_deskflow_connected()
+        self.last_mac_status = connected
 
-        if mac_up:
+        if connected:
             self.consecutive_up += 1
             self.consecutive_down = 0
         else:
             self.consecutive_down += 1
             self.consecutive_up = 0
 
-        # State transitions
-        if self.state in ("starting", "mac_down") and mac_up:
+        # State transitions based on actual connection
+        if self.state in ("waiting", "starting") and connected:
             if self.consecutive_up >= DESKFLOW_CONFIRM_CHECKS:
-                self._transition_to_running()
+                logger.info("KVM watchdog: Mac connected → RUNNING")
+                self.state = "running"
+                self.last_state_change = time.time()
+                self.last_process_check = time.time()
 
-        elif self.state in ("starting", "running") and not mac_up:
+        elif self.state == "running" and not connected:
             if self.consecutive_down >= DESKFLOW_CONFIRM_CHECKS:
-                self._transition_to_mac_down()
+                logger.info("KVM watchdog: Mac disconnected → WAITING (server stays up)")
+                self.state = "waiting"
+                self.last_state_change = time.time()
 
-        elif self.state == "running" and mac_up:
-            # Check if stable long enough to go idle
+        elif self.state == "running" and connected:
+            # Stable — check if we can reduce polling
             elapsed = time.time() - self.last_state_change
             if elapsed >= DESKFLOW_STABLE_TIMEOUT:
                 logger.info(
-                    f"KVM watchdog: Stable for {int(elapsed)}s → IDLE (polling stopped)"
+                    f"KVM watchdog: Stable for {int(elapsed)}s → IDLE"
                 )
                 self.state = "idle"
                 self.last_state_change = time.time()
-                return
-            self._periodic_health_check()
+
+        elif self.state == "idle":
+            if not connected:
+                logger.info("KVM watchdog: Connection lost while idle → WAITING")
+                self.state = "waiting"
+                self.last_state_change = time.time()
+                self.consecutive_down = 1
+                self.consecutive_up = 0
+
+    def _ensure_server_alive(self):
+        """Restart the local DeskFlow server if it died. Lightweight check."""
+        now = time.time()
+        if now - self.last_process_check < DESKFLOW_PROCESS_CHECK_INTERVAL:
+            return
+        self.last_process_check = now
+        if not self._check_deskflow_running():
+            logger.warning("KVM watchdog: DeskFlow server died, restarting")
+            self._start_deskflow_server()
 
     # ── Reachability ──
 
@@ -498,7 +536,16 @@ class DeskFlowWatchdog:
                 pass
 
     def _ensure_mac_client_connected(self):
-        """Start Mac client if needed, restart if connection is dead."""
+        """Start Mac client if needed, restart if connection is dead.
+
+        Checks for an ESTABLISHED connection first — if the Mac auto-connected
+        to our server, there's nothing to do.
+        """
+        if self._check_deskflow_connected():
+            logger.info("KVM watchdog: Mac already connected, nothing to do")
+            return
+
+        # Not connected — try to wake and start the Mac client
         self._wake_mac_display()
         time.sleep(2)
         try:
@@ -508,68 +555,27 @@ class DeskFlowWatchdog:
             data = resp.json()
             logger.info(f"KVM watchdog: Mac client → {data.get('message', 'unknown')}")
         except Exception as e:
-            logger.error(f"KVM watchdog: Failed to start Mac client: {e}")
-            return
+            logger.warning(f"KVM watchdog: Mac API not available (no token-api?): {e}")
 
         # Wait for connection to establish, then verify
-        time.sleep(5)
-        if not self._check_deskflow_connected():
-            logger.warning(
-                "KVM watchdog: Mac client running but no ESTABLISHED connection, "
-                "restarting client"
-            )
-            self._restart_mac_client()
-
-    # ── State transitions ──
-
-    def _transition_to_running(self):
-        logger.info("KVM watchdog: Mac confirmed reachable → RUNNING")
-        if not self._check_deskflow_running():
-            self._start_deskflow_server()
-            time.sleep(5)
-        self._ensure_mac_client_connected()
-        self.state = "running"
-        self.last_state_change = time.time()
-        self.last_process_check = time.time()
-
-    def _transition_to_mac_down(self):
-        logger.info("KVM watchdog: Mac confirmed unreachable → MAC_DOWN")
-        self._stop_deskflow_server()
-        self.state = "mac_down"
-        self.last_state_change = time.time()
-
-    def _periodic_health_check(self):
-        now = time.time()
-        if now - self.last_process_check < DESKFLOW_PROCESS_CHECK_INTERVAL:
-            return
-        self.last_process_check = now
-
-        if not self._check_deskflow_running():
-            logger.warning("KVM watchdog: DeskFlow server died, restarting")
-            self._start_deskflow_server()
-            time.sleep(5)
-            self._ensure_mac_client_connected()
-            return
-
+        time.sleep(8)
         if not self._check_deskflow_connected():
             logger.warning(
                 "KVM watchdog: No ESTABLISHED connection on port 24800, "
-                "restarting Mac client"
+                "restarting Mac client via SSH"
             )
             self._restart_mac_client()
+
+    # ── State transitions are handled inline in _tick() ──
 
     # ── API helpers ──
 
     def get_status(self) -> dict:
-        connected = False
-        running = False
-        if self.state not in ("mac_down",):
-            running = self._check_deskflow_running()
-            if running:
-                connected = self._check_deskflow_connected()
+        running = self._check_deskflow_running()
+        connected = self._check_deskflow_connected() if running else False
         return {
             "state": self.state,
-            "mac_reachable": self.last_mac_status,
+            "mac_connected": connected,
             "deskflow_running": running,
             "deskflow_connected": connected,
             "consecutive_up": self.consecutive_up,
@@ -591,15 +597,14 @@ class DeskFlowWatchdog:
     def force_start(self):
         self._start_deskflow_server()
         time.sleep(5)
-        if self._check_mac_reachable():
-            self._ensure_mac_client_connected()
+        self._ensure_mac_client_connected()
         self.state = "running"
         self.last_state_change = time.time()
         self.last_process_check = time.time()
 
     def force_stop(self):
         self._stop_deskflow_server()
-        self.state = "mac_down"
+        self.state = "stopped"
         self.last_state_change = time.time()
 
 
@@ -637,6 +642,18 @@ class KvmControlRequest(BaseModel):
 class AhkRequest(BaseModel):
     script: str  # Script filename (e.g., "voice-select-other.ahk")
     args: list[str] = []  # Optional arguments
+
+class TmuxSendKeysRequest(BaseModel):
+    pane: str       # tmux pane ID (e.g., "%5")
+    command: str    # slash command or text to send (e.g., "/color cyan")
+    no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
+
+
+class GoldenThroneFollowupRequest(BaseModel):
+    session_id: str
+    tmux_pane: Optional[str] = None
+    working_dir: str = "~"
+    prompt: str
 
 
 @app.on_event("startup")
@@ -816,6 +833,159 @@ async def kvm_control(request: KvmControlRequest):
             status_code=400,
             detail=f"Unknown action: {action}. Valid: start, stop, hold",
         )
+
+
+@app.get("/files/read")
+async def read_file(path: str):
+    """Read a file from the local filesystem. Scoped to ~/.claude/ for security."""
+    claude_dir = Path.home() / ".claude"
+    resolved = Path(path).resolve()
+    if not resolved.is_relative_to(claude_dir.resolve()):
+        raise HTTPException(status_code=403, detail="Path must be under ~/.claude/")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    try:
+        content = resolved.read_text(encoding="utf-8")
+        logger.info(f"FILES: Read {resolved} ({len(content)} bytes)")
+        return {"path": str(resolved), "content": content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Read failed: {e}")
+
+
+@app.post("/tmux/send-keys")
+async def tmux_send_keys(req: TmuxSendKeysRequest):
+    """Send a command to a Claude Code instance's tmux pane.
+
+    Used by Mac Token-API / claude-cmd for cross-machine dispatch.
+    Input locking is handled by the caller (Mac-side DB lock), not here.
+    """
+    pane = req.pane
+    command = req.command
+
+    # Validate pane format
+    if not pane.startswith("%"):
+        raise HTTPException(status_code=400, detail=f"Invalid pane format: {pane}")
+
+    # Verify pane exists
+    try:
+        verify = subprocess.run(
+            ["tmux", "display-message", "-t", pane, "-p", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if verify.returncode != 0 or not verify.stdout.strip():
+            raise HTTPException(status_code=404, detail=f"Pane {pane} not found")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="tmux command timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"tmux check failed: {e}")
+
+    # Send command (mirrors claude-cmd pattern)
+    try:
+        if not req.no_escape:
+            subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], timeout=5)
+            time.sleep(0.3)
+        subprocess.run(["tmux", "send-keys", "-t", pane, command, "Enter"], timeout=5)
+        logger.info(f"TMUX: Sent to {pane}: {command[:80]}")
+        return {"success": True, "pane": pane, "command": command}
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="tmux send-keys timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"tmux send-keys failed: {e}")
+
+
+def _get_or_create_backrooms_pane() -> str:
+    """Get or create the backrooms tmux window for autonomous sessions."""
+    # Check if backrooms window exists
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().split("\n")[0]
+
+    # Create backrooms window (detached so it doesn't steal focus)
+    subprocess.run(
+        ["tmux", "new-window", "-t", "main", "-n", "backrooms", "-d"],
+        timeout=5,
+    )
+
+    # Get pane ID and tag it
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    pane_id = result.stdout.strip().split("\n")[0]
+    subprocess.run(
+        ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms"],
+        timeout=5,
+    )
+    logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
+    return pane_id
+
+
+@app.post("/golden-throne/followup")
+async def golden_throne_followup(req: GoldenThroneFollowupRequest):
+    """Resume an idle Claude instance via tmux send-keys or claude --resume.
+
+    Called by Mac token-api when the Golden Throne timer fires for a WSL instance.
+    Transport detection: if the tmux pane has claude running, send-keys the SOP prompt.
+    Otherwise, spawn `claude --resume` in the backrooms window.
+    """
+    transport = "unknown"
+    pane = req.tmux_pane
+
+    if pane:
+        # Check if pane exists and what's running in it
+        try:
+            verify = subprocess.run(
+                ["tmux", "display-message", "-t", pane, "-p", "#{pane_current_command}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            current_cmd = verify.stdout.strip() if verify.returncode == 0 else ""
+        except Exception:
+            current_cmd = ""
+
+        if current_cmd and "claude" in current_cmd.lower():
+            # Claude is alive in the pane — send SOP prompt via send-keys
+            try:
+                subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], timeout=5)
+                time.sleep(0.3)
+                subprocess.run(["tmux", "send-keys", "-t", pane, req.prompt, "Enter"], timeout=5)
+                transport = "send-keys"
+                logger.info(f"Golden Throne: sent SOP to {pane} via send-keys (session {req.session_id[:12]})")
+            except Exception as e:
+                logger.error(f"Golden Throne: send-keys failed for {pane}: {e}")
+                raise HTTPException(status_code=500, detail=f"send-keys failed: {e}")
+        else:
+            # Claude not running — resume in backrooms with SOP prompt
+            try:
+                backrooms_pane = _get_or_create_backrooms_pane()
+                working_dir = os.path.expanduser(req.working_dir)
+                # Write SOP to temp file (avoids shell escaping)
+                sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
+                Path(sop_file).write_text(req.prompt)
+                resume_cmd = (
+                    f'cd {working_dir} && claude -p "$(cat {sop_file})" '
+                    f'--resume {req.session_id} --dangerously-skip-permissions'
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", backrooms_pane, resume_cmd, "Enter"],
+                    timeout=5,
+                )
+                transport = "resume"
+                logger.info(
+                    f"Golden Throne: resumed {req.session_id[:12]} in backrooms "
+                    f"pane={backrooms_pane} via claude --resume"
+                )
+            except Exception as e:
+                logger.error(f"Golden Throne: resume failed for {req.session_id[:12]}: {e}")
+                raise HTTPException(status_code=500, detail=f"resume failed: {e}")
+    else:
+        raise HTTPException(status_code=400, detail="No tmux_pane provided")
+
+    return {"success": True, "transport": transport, "session_id": req.session_id}
 
 
 @app.post("/restart")

@@ -12,19 +12,39 @@
 #   tmux-workspace --mac        # Create Mac 'bridge' layout and attach
 #   tmux-workspace --window     # Add WSL grid window to current session
 #   tmux-workspace --mobile     # Create the mobile window (2-pane vertical split)
+#   tmux-workspace --focus      # Drop all side columns, keep only the 2×2 grid
+#   tmux-workspace --unfocus    # Restore side columns to their original layout
 
 set -euo pipefail
+
+# Source machine identity for NAS paths
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+# shellcheck source=../lib/nas-path.sh
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 SESSION_NAME="main"
 WINDOW_NAME="grid"
 BRIDGE_WINDOW="bridge"
-MOBILE_WINDOW="mobile"
+TUI_WINDOW="tui"
+MOBILE_WINDOW_PREFIX="mobile"
+MOBILE_WINDOW_COUNT=3
+MOBILE_MONITOR_HEIGHT=6
+MOBILE_SHELL_INIT="${CLI_TOOLS:-/Volumes/Imperium/Scripts/cli-tools}/tmux/mobile-shell-init.zsh"
+TOKEN_API_DIR="${IMPERIUM:-/Volumes/Imperium}/Scripts/token-api"
 
 # --- Proportions ---
 # Side columns: ~15% each, center grid: ~70%
 # Default detached size (overridden by client on attach)
 DETACHED_W=240
 DETACHED_H=60
+
+# Enable TUI pane lifecycle: remain-on-exit + auto-restart unless dirty
+init_tui_lifecycle() {
+    local pane="$1"
+    tmux set-option -p -t "$pane" remain-on-exit on
+    tmux set-hook -p -t "$pane" pane-died \
+        "if -F '#{==:#{@TUI_DIRTY},true}' '' 'respawn-pane -k -t #{pane_id} tui-pane-guard'"
+}
 
 create_grid_window() {
     local session="$1"
@@ -82,6 +102,11 @@ create_grid_window() {
         tmux set-option -p -t "${session}:${window}.${pane}" @GRID_RESERVED "false"
     done
 
+    # Tag layout origin for focus/unfocus
+    tmux set-option -w -t "${session}:${window}" @LAYOUT_ORIGIN "wsl"
+    tmux set-option -w -t "${session}:${window}" @FOCUSED "false"
+    tmux set-option -w -t "${session}:${window}" @GRID_EXPANDED "none"
+
     # Focus the top-left grid pane
     tmux select-pane -t "${session}:${window}.2"
 }
@@ -95,9 +120,9 @@ create_bridge_window() {
     local total_h
     total_h=$(tmux display-message -t "${session}:${window}" -p '#{window_height}')
 
-    # Right column: ~22% width; 2×2 grid gets the rest
+    # Right column: 1/3 width (enough for TUI vertical mode); 2×2 grid gets 2/3
     local usable=$((total_w - 2))  # 2 pane borders
-    local right_w=$((usable * 44 / 100))
+    local right_w=$((usable * 33 / 100))
     local grid_w=$((usable - right_w))
     local grid_half=$((grid_w / 2))
     local half_h=$((total_h / 2))
@@ -126,60 +151,274 @@ create_bridge_window() {
     tmux set-option -p -t "${session}:${window}.3" @GRID_STATE "small"
     tmux set-option -p -t "${session}:${window}.4" @GRID_STATE "small"
     tmux set-option -p -t "${session}:${window}.5" @GRID_STATE "side"
+    tmux set-option -p -t "${session}:${window}.5" @PANE_TYPE "tui"
 
     for pane in 1 2 3 4 5; do
         tmux set-option -p -t "${session}:${window}.${pane}" @GRID_RESERVED "false"
     done
 
-    # Auto-launch monitor in right column
-    tmux send-keys -t "${session}:${window}.5" "monitor" Enter
+    # Tag layout origin for focus/unfocus
+    tmux set-option -w -t "${session}:${window}" @LAYOUT_ORIGIN "mac"
+    tmux set-option -w -t "${session}:${window}" @FOCUSED "false"
+    tmux set-option -w -t "${session}:${window}" @GRID_EXPANDED "none"
+
+    # TUI lifecycle: auto-restart unless intentionally closed
+    init_tui_lifecycle "${session}:${window}.5"
+    tmux send-keys -t "${session}:${window}.5" "exec tui-pane-guard" Enter
 
     # Focus top-left grid pane
     tmux select-pane -t "${session}:${window}.1"
 }
 
-create_mobile_window() {
+create_tui_window() {
     local session="$1"
+    tmux new-window -t "${session}" -n "${TUI_WINDOW}" -c "${TOKEN_API_DIR}"
+    tmux set-option -p -t "${session}:${TUI_WINDOW}.1" @PANE_TYPE "tui"
+    init_tui_lifecycle "${session}:${TUI_WINDOW}.1"
+    tmux send-keys -t "${session}:${TUI_WINDOW}" "exec tui-pane-guard" Enter
+}
 
-    tmux new-window -t "${session}" -n "${MOBILE_WINDOW}"
-    local total_h
-    total_h=$(tmux display-message -t "${session}:${MOBILE_WINDOW}" -p '#{window_height}')
-    tmux split-window -v -t "${session}:${MOBILE_WINDOW}.1" -l $((total_h / 2))
+create_backrooms_window() {
+    local session="$1"
+    tmux new-window -t "${session}" -n "backrooms" -d
+    tmux set-option -p -t "${session}:backrooms.1" @PANE_TYPE "backrooms"
+}
 
-    # Set zone state
-    tmux set-option -p -t "${session}:${MOBILE_WINDOW}.1" @GRID_STATE "small"
-    tmux set-option -p -t "${session}:${MOBILE_WINDOW}.2" @GRID_STATE "small"
-    tmux set-option -p -t "${session}:${MOBILE_WINDOW}.1" @GRID_RESERVED "false"
-    tmux set-option -p -t "${session}:${MOBILE_WINDOW}.2" @GRID_RESERVED "false"
+create_mobile_windows() {
+    local session="$1"
+    local count="${2:-$MOBILE_WINDOW_COUNT}"
+
+    for i in $(seq 1 "$count"); do
+        local win_name="${MOBILE_WINDOW_PREFIX}-${i}"
+        tmux new-window -t "${session}" -n "${win_name}"
+
+        local total_h
+        total_h=$(tmux display-message -t "${session}:${win_name}" -p '#{window_height}')
+        local terminal_area=$((total_h - MOBILE_MONITOR_HEIGHT - 2))
+        local half_terminal=$((terminal_area / 2))
+
+        # Split off monitor at top (pane 1 stays small, pane 2 gets the rest)
+        tmux split-window -v -t "${session}:${win_name}.1" -l "${terminal_area}"
+
+        # Split the terminal area in half (pane 2 → top terminal, pane 3 → bottom terminal)
+        tmux split-window -v -t "${session}:${win_name}.2" -l "${half_terminal}"
+
+        # Final layout: pane 1 = monitor (top, crushed), pane 2 = terminal A, pane 3 = terminal B
+        tmux set-option -p -t "${session}:${win_name}.1" @GRID_STATE "mini"
+        tmux set-option -p -t "${session}:${win_name}.2" @GRID_STATE "small"
+        tmux set-option -p -t "${session}:${win_name}.3" @GRID_STATE "small"
+        tmux set-option -p -t "${session}:${win_name}.1" @PANE_TYPE "tui"
+        tmux set-option -p -t "${session}:${win_name}.1" @GRID_RESERVED "true"
+        tmux set-option -p -t "${session}:${win_name}.2" @GRID_RESERVED "false"
+        tmux set-option -p -t "${session}:${win_name}.3" @GRID_RESERVED "false"
+        tmux set-option -p -t "${session}:${win_name}.1" @PANE_CLEAN "true"
+        tmux set-option -p -t "${session}:${win_name}.2" @PANE_CLEAN "true"
+        tmux set-option -p -t "${session}:${win_name}.3" @PANE_CLEAN "true"
+
+        # Init dirty bit hooks in terminal panes (not monitor — it'll run a TUI)
+        tmux send-keys -t "${session}:${win_name}.2" "source ${MOBILE_SHELL_INIT} && clear" Enter
+        tmux send-keys -t "${session}:${win_name}.3" "source ${MOBILE_SHELL_INIT} && clear" Enter
+
+        # TUI lifecycle: auto-restart unless intentionally closed
+        init_tui_lifecycle "${session}:${win_name}.1"
+        tmux send-keys -t "${session}:${win_name}.1" "exec tui-pane-guard" Enter
+
+        # Focus top terminal pane
+        tmux select-pane -t "${session}:${win_name}.2"
+    done
+}
+
+focus_mode() {
+    # Drop all side-class panes from the current window.
+    # Resilient: works with 0, 1, or N side panes regardless of layout.
+    local session window target
+    session=$(tmux display-message -p '#{session_name}')
+    window=$(tmux display-message -p '#{window_index}')
+    target="${session}:${window}"
+
+    # Collect pane IDs where @GRID_STATE == "side"
+    local side_panes=()
+    while IFS= read -r line; do
+        local pane_id state
+        pane_id=$(echo "$line" | cut -d' ' -f1)
+        state=$(echo "$line" | cut -d' ' -f2)
+        if [[ "$state" == "side" ]]; then
+            side_panes+=("$pane_id")
+        fi
+    done < <(tmux list-panes -t "$target" -F '#{pane_id} #{@GRID_STATE}')
+
+    if [[ ${#side_panes[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    # Record layout origin so unfocus knows what to restore.
+    # "wsl" if 2 sides, "mac" if 1 side, generic count otherwise.
+    local side_count=${#side_panes[@]}
+    local layout_origin
+    if [[ $side_count -ge 2 ]]; then
+        layout_origin="wsl"
+    else
+        layout_origin="mac"
+    fi
+    tmux set-option -w -t "$target" @LAYOUT_ORIGIN "$layout_origin"
+    tmux set-option -w -t "$target" @FOCUSED "true"
+
+    # Kill side panes first (stable, immune to index renumbering)
+    for pid in "${side_panes[@]}"; do
+        tmux kill-pane -t "$pid"
+    done
+
+    # On WSL: snap terminal to right 50% (changes terminal dimensions)
+    if [[ "$layout_origin" == "wsl" ]] && command -v wt-focus &>/dev/null; then
+        wt-focus on
+    fi
+
+    # No explicit refresh needed — tmux auto-adjusts pane sizes when the
+    # terminal resizes from wt-focus. The canonical reset (tmux-refresh-layout)
+    # is available via prefix+e or tx refresh if manual correction is needed.
+}
+
+unfocus_mode() {
+    # Restore side columns based on stored layout origin.
+    local session window target
+    session=$(tmux display-message -p '#{session_name}')
+    window=$(tmux display-message -p '#{window_index}')
+    target="${session}:${window}"
+
+    local focused
+    focused=$(tmux show-options -wv -t "$target" @FOCUSED 2>/dev/null || echo "false")
+    if [[ "$focused" != "true" ]]; then
+        return 0
+    fi
+
+    local layout_origin
+    layout_origin=$(tmux show-options -wv -t "$target" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+
+    local total_w total_h
+    total_w=$(tmux display-message -t "$target" -p '#{window_width}')
+    total_h=$(tmux display-message -t "$target" -p '#{window_height}')
+
+    # On WSL: maximize terminal first so layout calculations use full dimensions
+    if [[ "$layout_origin" == "wsl" ]] && command -v wt-focus &>/dev/null; then
+        wt-focus off
+    fi
+
+    # Re-read dimensions after potential maximize
+    total_w=$(tmux display-message -t "$target" -p '#{window_width}')
+    total_h=$(tmux display-message -t "$target" -p '#{window_height}')
+
+    if [[ "$layout_origin" == "wsl" ]]; then
+        # Restore two full-height side columns flanking the existing grid
+        local usable=$((total_w - 5))
+        local side_w=$((usable * 20 / 100))
+
+        # Get the leftmost pane to split a full-height left side off of
+        local first_pane
+        first_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | head -1)
+
+        # -f = full-width/height split (spans entire window, not just target pane)
+        # -hb = horizontal split, new pane goes before (left)
+        tmux split-window -fhb -t "$first_pane" -l "${side_w}"
+        local left_side
+        left_side=$(tmux display-message -t "$target" -p '#{pane_id}')
+        tmux set-option -p -t "$left_side" @GRID_STATE "side"
+        tmux set-option -p -t "$left_side" @GRID_RESERVED "false"
+
+        # Get the rightmost pane to split a full-height right side off of
+        local last_pane
+        last_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | tail -1)
+
+        # -fh = full-height horizontal split, new pane goes after (right)
+        tmux split-window -fh -t "$last_pane" -l "${side_w}"
+        local right_side
+        right_side=$(tmux display-message -t "$target" -p '#{pane_id}')
+        tmux set-option -p -t "$right_side" @GRID_STATE "side"
+        tmux set-option -p -t "$right_side" @GRID_RESERVED "false"
+
+    elif [[ "$layout_origin" == "mac" ]]; then
+        # Restore full-height right column (1/3 width for TUI vertical mode)
+        local usable=$((total_w - 2))
+        local right_w=$((usable * 33 / 100))
+
+        local last_pane
+        last_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | tail -1)
+
+        # -fh = full-height split spanning entire window
+        tmux split-window -fh -t "$last_pane" -l "${right_w}"
+        local right_col
+        right_col=$(tmux display-message -t "$target" -p '#{pane_id}')
+        tmux set-option -p -t "$right_col" @GRID_STATE "side"
+        tmux set-option -p -t "$right_col" @PANE_TYPE "tui"
+        tmux set-option -p -t "$right_col" @GRID_RESERVED "false"
+
+        # TUI lifecycle: auto-restart unless intentionally closed
+        init_tui_lifecycle "$right_col"
+        tmux send-keys -t "$right_col" "exec tui-pane-guard" Enter
+
+    else
+        return 1
+    fi
+
+    # Rebalance grid to even sizing (grid width changed with side columns added)
+    tmux-refresh-layout
+
+    tmux set-option -w -t "$target" @FOCUSED "false"
 }
 
 # --- Parse args ---
 ATTACH=false
 WINDOW_ONLY=false
 MOBILE_ONLY=false
+# Auto-detect layout from machine config. --mac flag overrides.
 MAC_MODE=false
+if [[ "$(imperium_cfg tmux_layout 2>/dev/null)" == "bridge" ]]; then
+    MAC_MODE=true
+fi
+FOCUS_MODE=false
+UNFOCUS_MODE=false
+PORTABLE_MODE=false
+WINDOW_RESET=""
+BRIDGE_RESET=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --attach)     ATTACH=true ;;
-        --window)     WINDOW_ONLY=true ;;
-        --mobile)     MOBILE_ONLY=true ;;
-        --mac)        MAC_MODE=true; ATTACH=true ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --attach)        ATTACH=true ;;
+        --window)        WINDOW_ONLY=true ;;
+        --mobile)        MOBILE_ONLY=true ;;
+        --mac)           MAC_MODE=true; ATTACH=true ;;
+        --mac-no-attach) MAC_MODE=true ;;
+        --portable)      PORTABLE_MODE=true ;;
+        --focus)         FOCUS_MODE=true ;;
+        --unfocus)       UNFOCUS_MODE=true ;;
+        --toggle-focus)
+            state=$(tmux show-options -wv @FOCUSED 2>/dev/null || echo "false")
+            if [[ "$state" == "true" ]]; then
+                UNFOCUS_MODE=true
+            else
+                FOCUS_MODE=true
+            fi
+            ;;
+        --window-reset)  WINDOW_RESET="$2"; shift ;;
+        --bridge-reset)  BRIDGE_RESET="$2"; shift ;;
         -h|--help)
-            echo "Usage: tmux-workspace [--attach] [--mac] [--window] [--mobile]"
+            echo "Usage: tmux-workspace [--attach] [--mac] [--window] [--mobile] [--focus] [--unfocus]"
             echo ""
             echo "  (no args)   Create 'main' session with WSL grid + mobile windows"
             echo "  --attach    Create and attach to session"
             echo "  --mac       Create Mac bridge layout [2×2][right-col] and attach"
+            echo "  --portable  Attach to existing session with portable monitor status bar"
             echo "  --window    Add WSL grid window to current session (must be inside tmux)"
             echo "  --mobile    Add mobile window to current session"
+            echo "  --focus     Drop all side columns, keep only the 2×2 grid"
+            echo "  --unfocus   Restore side columns to their original layout"
             exit 0
             ;;
         *)
-            echo "Unknown arg: $arg" >&2
+            echo "Unknown arg: $1" >&2
             exit 1
             ;;
     esac
+    shift
 done
 
 # --- Window-only mode: add to current session ---
@@ -201,9 +440,65 @@ if $MOBILE_ONLY; then
         exit 1
     fi
     session=$(tmux display-message -p '#{session_name}')
-    create_mobile_window "${session}"
-    echo "Mobile window added to session '${session}'"
+    create_mobile_windows "${session}"
+    echo "Mobile windows (${MOBILE_WINDOW_COUNT}) added to session '${session}'"
     exit 0
+fi
+
+if $FOCUS_MODE; then
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: --focus requires being inside tmux" >&2
+        exit 1
+    fi
+    focus_mode
+    exit 0
+fi
+
+if $UNFOCUS_MODE; then
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: --unfocus requires being inside tmux" >&2
+        exit 1
+    fi
+    unfocus_mode
+    exit 0
+fi
+
+# --- Reset modes (internal, called by tmux-reset) ---
+if [[ -n "$WINDOW_RESET" ]]; then
+    session=$(tmux display-message -p '#{session_name}')
+    create_grid_window "${session}" "${WINDOW_RESET}"
+    exit 0
+fi
+
+if [[ -n "$BRIDGE_RESET" ]]; then
+    session=$(tmux display-message -p '#{session_name}')
+    create_bridge_window "${session}" "${BRIDGE_RESET}"
+    exit 0
+fi
+
+# --- Portable monitor: grouped session with status overrides ---
+if $PORTABLE_MODE; then
+    if ! tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
+        echo "Error: no '${SESSION_NAME}' session to attach to. Create it first." >&2
+        exit 1
+    fi
+
+    PORTABLE_SESSION="portable"
+    PORTABLE_STATUS="/Volumes/Imperium/Scripts/cli-tools/tmux/tmux-portable-status.conf"
+
+    # Kill stale portable session if it exists
+    tmux kill-session -t "${PORTABLE_SESSION}" 2>/dev/null || true
+
+    # Grouped session: shares windows with main, independent status bar
+    tmux new-session -d -t "${SESSION_NAME}" -s "${PORTABLE_SESSION}"
+    tmux source-file -t "${PORTABLE_SESSION}" "${PORTABLE_STATUS}"
+
+    # Select bridge window if it exists, otherwise stay on current
+    if tmux list-windows -t "${PORTABLE_SESSION}" -F '#{window_name}' | grep -q "^${BRIDGE_WINDOW}$"; then
+        tmux select-window -t "${PORTABLE_SESSION}:${BRIDGE_WINDOW}"
+    fi
+
+    exec tmux attach-session -t "${PORTABLE_SESSION}"
 fi
 
 # --- Mac bridge layout ---
@@ -215,9 +510,16 @@ if $MAC_MODE; then
     fi
     tmux new-session -d -s "${SESSION_NAME}" -n "${BRIDGE_WINDOW}" -x 220 -y 50
     create_bridge_window "${SESSION_NAME}" "${BRIDGE_WINDOW}"
+    create_backrooms_window "${SESSION_NAME}"
+    create_mobile_windows "${SESSION_NAME}"
+    tmux select-window -t "${SESSION_NAME}:${BRIDGE_WINDOW}"
     echo "Mac workspace '${SESSION_NAME}' created."
     echo "  Window '${BRIDGE_WINDOW}': [2×2] [right-col → monitor]"
-    exec tmux attach-session -t "${SESSION_NAME}"
+    echo "  Windows '${MOBILE_WINDOW_PREFIX}-1..${MOBILE_WINDOW_COUNT}': monitor + terminal (dirty bit tracked)"
+    if $ATTACH; then
+        exec tmux attach-session -t "${SESSION_NAME}"
+    fi
+    exit 0
 fi
 
 # --- Full session creation ---
@@ -235,20 +537,28 @@ fi
 tmux new-session -d -s "${SESSION_NAME}" -n "${WINDOW_NAME}" -x 240 -y 60
 create_grid_window "${SESSION_NAME}" "${WINDOW_NAME}"
 
-# Add the mobile window
-create_mobile_window "${SESSION_NAME}"
+# Add the TUI window (dedicated for vertical monitor)
+create_tui_window "${SESSION_NAME}"
+
+# Add the backrooms window (autonomous sessions, Golden Throne resume)
+create_backrooms_window "${SESSION_NAME}"
+
+# Add the mobile windows
+create_mobile_windows "${SESSION_NAME}"
 
 # Go back to the grid window
 tmux select-window -t "${SESSION_NAME}:${WINDOW_NAME}"
 
 echo "Workspace session '${SESSION_NAME}' created."
 echo "  Window '${WINDOW_NAME}': [side] [2×2] [side]"
-echo "  Window '${MOBILE_WINDOW}': 2-pane vertical split"
+echo "  Window '${TUI_WINDOW}': token-api TUI (vertical monitor)"
+echo "  Windows '${MOBILE_WINDOW_PREFIX}-1..${MOBILE_WINDOW_COUNT}': monitor + terminal (dirty bit tracked)"
 
 if $ATTACH; then
     exec tmux attach-session -t "${SESSION_NAME}"
 else
     echo ""
     echo "Attach with: tmux attach -t ${SESSION_NAME}"
-    echo "Phone:       tmux new-session -t ${SESSION_NAME} \\; select-window -t ${MOBILE_WINDOW}"
+    echo "TUI:         tmux attach -t ${SESSION_NAME}:${TUI_WINDOW}"
+    echo "Phone:       tmux new-session -t ${SESSION_NAME} \\; select-window -t ${MOBILE_WINDOW_PREFIX}-1"
 fi

@@ -26,6 +26,9 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
+# Canonical Scripts root — derived from this file's location (token-api/ is one level down)
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, Response
@@ -36,8 +39,10 @@ import requests
 import httpx
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from cron_engine import CronEngine
 from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
@@ -91,6 +96,7 @@ fastapi_logger.addHandler(buffer_handler)
 # Configuration
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 DEFAULT_SESSIONS_DIR = Path.home() / "Imperium-ENV" / "Terra" / "Sessions"
+MARS_SESSIONS_DIR = Path.home() / "Imperium-ENV" / "Mars" / "Sessions"
 SERVER_PORT = 7777  # Authoritative port for Token API
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
@@ -100,6 +106,11 @@ STASH_MAX_AGE_HOURS = 24
 # ============ Crash Logging ============
 import sys
 import traceback
+
+# Machine identity from centralized config
+sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
+from imperium_config import cfg, MACHINE
+LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
 
 
 def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
@@ -166,29 +177,30 @@ DEVICE_IPS = {
 # US English voices (David, Zira, Mark) are fallback-only when pool is exhausted.
 # Ultimate fallback if everything is taken: David.
 PROFILES = [
-    {"name": "profile_1", "wsl_voice": "Microsoft George",   "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},   # UK M
-    {"name": "profile_2", "wsl_voice": "Microsoft Susan",    "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "notify.wav", "color": "#00cc66"},   # UK F
-    {"name": "profile_3", "wsl_voice": "Microsoft Catherine", "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "ding.wav",   "color": "#ff9900"},   # AU F
-    {"name": "profile_4", "wsl_voice": "Microsoft James",    "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#cc66ff"},   # AU M
-    {"name": "profile_5", "wsl_voice": "Microsoft Sean",     "wsl_rate": 0, "mac_voice": "Moira",  "notification_sound": "chord.wav",  "color": "#ff6666"},   # IE M
-    {"name": "profile_6", "wsl_voice": "Microsoft Hazel",    "wsl_rate": 1, "mac_voice": "Moira",  "notification_sound": "recycle.wav","color": "#66cccc"},   # IE F
-    {"name": "profile_7", "wsl_voice": "Microsoft Heera",    "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "chimes.wav", "color": "#ffcc00"},   # IN F
-    {"name": "profile_8", "wsl_voice": "Microsoft Ravi",     "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "notify.wav", "color": "#cc99ff"},   # IN M
-    {"name": "profile_9", "wsl_voice": "Microsoft Linda",    "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "ding.wav",   "color": "#0099ff"},   # CA F
+    {"name": "profile_1", "wsl_voice": "Microsoft George",    "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#66cccc", "cc_color": "cyan"},     # UK M
+    {"name": "profile_2", "wsl_voice": "Microsoft Susan",     "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "notify.wav", "color": "#ff66cc", "cc_color": "pink"},     # UK F
+    {"name": "profile_3", "wsl_voice": "Microsoft Catherine",  "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "ding.wav",   "color": "#ffcc00", "cc_color": "yellow"},   # AU F
+    {"name": "profile_5", "wsl_voice": "Microsoft Sean",      "wsl_rate": 0, "mac_voice": "Moira",  "notification_sound": "chord.wav",  "color": "#ff9900", "cc_color": "orange"},   # IE M
+    {"name": "profile_7", "wsl_voice": "Microsoft Heera",     "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "chimes.wav", "color": "#cc66ff", "cc_color": "purple"},   # IN F
+    {"name": "profile_8", "wsl_voice": "Microsoft Ravi",      "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "notify.wav", "color": "#ff6666", "cc_color": "red"},      # IN M
 ]
 
 # Fallback voices when all foreign accents are exhausted (US English, less distinct)
 FALLBACK_VOICES = [
-    {"name": "fallback_1", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#888888"},
-    {"name": "fallback_2", "wsl_voice": "Microsoft Zira",  "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "chord.wav",  "color": "#999999"},
-    {"name": "fallback_3", "wsl_voice": "Microsoft Mark",  "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "recycle.wav","color": "#aaaaaa"},
+    {"name": "fallback_1", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#888888", "cc_color": "default"},
+    {"name": "fallback_2", "wsl_voice": "Microsoft Zira",  "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "chord.wav",  "color": "#999999", "cc_color": "default"},
+    {"name": "fallback_3", "wsl_voice": "Microsoft Mark",  "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "recycle.wav","color": "#aaaaaa", "cc_color": "default"},
 ]
 
 # Ultimate fallback when even fallback voices are exhausted
-ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#666666"}
+ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#666666", "cc_color": "default"}
 
-# Scheduler instance
-scheduler = AsyncIOScheduler()
+# Scheduler instance — dual job stores:
+#   'default' = in-memory (cron engine jobs with unpicklable bound methods)
+#   'golden_throne' = SQLite-persisted (restart-safe date-trigger follow-ups)
+scheduler = AsyncIOScheduler(
+    jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH}')}
+)
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
@@ -518,6 +530,11 @@ _post_tool_debounce: dict = {}  # session_id -> last_call_time
 # Incremented in handle_pre_tool_use, decremented in handle_prompt_submit.
 _pending_background_tasks: dict = {}  # session_id -> count
 
+# Tracks recent evaluator nudges to prevent re-evaluation loops on stop.
+# Maps instance_id -> timestamp of last evaluator-triggered nudge.
+_recently_nudged: dict[str, float] = {}
+NUDGE_COOLDOWN_SECONDS = 300  # 5 minutes
+
 
 # Database helper: connect with busy_timeout to prevent indefinite blocking
 async def get_db():
@@ -568,12 +585,36 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
         if 'session_doc_id' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER")
+        if 'zealotry' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4")
+        if 'tmux_pane' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT")
+        if 'victory_at' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP")
+        if 'victory_reason' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT")
+        if 'input_lock' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN input_lock TEXT")
+        if 'primarch' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN primarch TEXT")
+        if 'transplant_target_session' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT")
+        if 'legion' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'")
+        if 'synced' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0")
+        if 'discord_hosted' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0")
+        if 'discord_channel' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT")
 
-        # Migration: add primarch_name to session_documents
+        # Migration: add primarch_name and cron_job_id to session_documents
         cursor = await db.execute("PRAGMA table_info(session_documents)")
         sd_columns = [col[1] for col in await cursor.fetchall()]
         if 'primarch_name' not in sd_columns:
             await db.execute("ALTER TABLE session_documents ADD COLUMN primarch_name TEXT")
+        if 'cron_job_id' not in sd_columns:
+            await db.execute("ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT")
 
         # Migration: Convert two-field status (status + is_processing) to single enum
         # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
@@ -590,6 +631,8 @@ async def init_db():
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)")
 
         # Create devices table
         await db.execute("""
@@ -850,6 +893,7 @@ async def init_db():
                 title       TEXT,
                 project     TEXT,
                 primarch_name TEXT,
+                cron_job_id TEXT,
                 status      TEXT DEFAULT 'active',
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1108,7 +1152,7 @@ async def cleanup_stale_instances() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             UPDATE claude_instances
-            SET status = 'stopped', stopped_at = CURRENT_TIMESTAMP
+            SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = CURRENT_TIMESTAMP
             WHERE status IN ('processing', 'idle')
               AND last_activity < ?
         """, (cutoff,))
@@ -1526,7 +1570,8 @@ async def register_instance(request: InstanceRegisterRequest):
             "name": profile["name"],
             "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
-            "color": profile.get("color", "#0099ff")
+            "color": profile.get("color", "#0099ff"),
+            "cc_color": profile.get("cc_color", "default")
         }
     )
 
@@ -1603,7 +1648,7 @@ async def stop_instance(instance_id: str):
 
         await db.execute(
             """UPDATE claude_instances
-               SET status = 'stopped', stopped_at = ?
+               SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ?
                WHERE id = ?""",
             (now, instance_id)
         )
@@ -1757,7 +1802,7 @@ async def kill_instance(instance_id: str):
                 # Mark stopped in DB anyway (cleanup)
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
-                        "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                        "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
                         (now, instance_id)
                     )
                     await db.commit()
@@ -1771,7 +1816,7 @@ async def kill_instance(instance_id: str):
             # Can't scan /proc on remote device
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1789,7 +1834,7 @@ async def kill_instance(instance_id: str):
             # Process already exited or PID reused by another process
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1806,7 +1851,7 @@ async def kill_instance(instance_id: str):
             # Already dead
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1888,7 +1933,7 @@ async def kill_instance(instance_id: str):
     # Mark stopped in DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
             (now, instance_id)
         )
         await db.commit()
@@ -2284,10 +2329,10 @@ class LogsResponse(BaseModel):
 
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
-    """Rename an instance's tab_name."""
+    """Rename an instance's tab_name. Also updates linked session doc title."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, tab_name FROM claude_instances WHERE id = ?",
+            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
@@ -2296,20 +2341,87 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         old_name = row[1]
+        session_doc_id = row[2]
         await db.execute(
             "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
             (request.tab_name, instance_id)
         )
+
+        # Also update session doc title if linked
+        if session_doc_id:
+            now = datetime.now().isoformat()
+            await db.execute(
+                "UPDATE session_documents SET title = ?, updated_at = ? WHERE id = ?",
+                (request.tab_name, now, session_doc_id)
+            )
+
         await db.commit()
 
     # Log event
     await log_event(
         "instance_renamed",
         instance_id=instance_id,
-        details={"old_name": old_name, "new_name": request.tab_name}
+        details={"old_name": old_name, "new_name": request.tab_name,
+                 "session_doc_updated": bool(session_doc_id)}
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
+
+
+@app.patch("/api/instances/{instance_id}/transplant-pending")
+async def mark_transplant_pending(instance_id: str, target_session: str):
+    """Mark an instance as about to be transplanted to a new session ID.
+
+    Called by the transplant CLI before killing Claude. The new session's
+    SessionStart handler checks for this marker to find the supplant source,
+    enabling cross-device transplants where file-based handoff doesn't work.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE claude_instances SET transplant_target_session = ? WHERE id = ?",
+            (target_session, instance_id)
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+    logger.info(f"Transplant pending: {instance_id[:12]}... → target session {target_session[:12]}...")
+    return {"status": "pending", "instance_id": instance_id, "target_session": target_session}
+
+
+@app.post("/api/instances/{instance_id}/input-lock")
+async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
+    """Acquire input lock for an instance's tmux pane.
+
+    Prevents concurrent tmux send-keys from interleaving in the PTY buffer.
+    Uses atomic UPDATE with WHERE to ensure only one caller wins.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE claude_instances SET input_lock = ? WHERE id = ? AND input_lock IS NULL",
+            (locker, instance_id)
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            # Check if instance exists vs lock held
+            cursor = await db.execute("SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,))
+            row = await cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Instance not found")
+            return {"acquired": False, "held_by": row[0]}
+        return {"acquired": True, "locker": locker}
+
+
+@app.delete("/api/instances/{instance_id}/input-lock")
+async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
+    """Release input lock for an instance's tmux pane."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE claude_instances SET input_lock = NULL WHERE id = ? AND input_lock = ?",
+            (instance_id, locker)
+        )
+        await db.commit()
+    return {"released": True}
 
 
 class VoiceChangeRequest(BaseModel):
@@ -2583,14 +2695,20 @@ async def get_instance_todos(instance_id: str):
 
 
 @app.post("/api/instances/{instance_id}/voice-chat")
-async def toggle_voice_chat(instance_id: str, active: bool = True):
-    """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'."""
+async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: str = ""):
+    """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'.
+
+    Args:
+        tmux_pane: Target tmux pane for send-keys (e.g., 'main:grid.2').
+                   If empty, AHK script will use default.
+    """
     if active:
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
-            "started_at": datetime.now().isoformat()
+            "started_at": datetime.now().isoformat(),
+            "tmux_pane": tmux_pane or "",
         }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]}")
+        logger.info(f"Voice chat STARTED for {instance_id[:12]} (pane: {tmux_pane or 'default'})")
     else:
         VOICE_CHAT_SESSIONS.pop(instance_id, None)
         logger.info(f"Voice chat ENDED for {instance_id[:12]}")
@@ -2602,7 +2720,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True):
             (new_mode, instance_id)
         )
         await db.commit()
-    return {"instance_id": instance_id, "voice_chat": active}
+    return {"instance_id": instance_id, "voice_chat": active, "tmux_pane": tmux_pane}
 
 
 @app.get("/api/instances/{instance_id}/voice-chat")
@@ -2649,6 +2767,537 @@ async def get_dictation_state():
         "updated_at": DICTATION_STATE["updated_at"],
         "voice_chat_instance": voice_chat_instance,
     }
+
+
+# ============ Golden Throne API ============
+# Thread persistence engine — zealotry controls follow-up frequency
+
+# Zealotry-to-delay mapping (seconds)
+ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 120}
+
+
+def _load_golden_throne_sop() -> str:
+    """Load SOP prompt from file, with inline fallback."""
+    sop_path = Path.home() / ".claude" / "prompts" / "golden-throne-sop.md"
+    if sop_path.exists():
+        return sop_path.read_text()
+    return (
+        "Read your session doc. Assess what remains. "
+        "Act if clear, escalate if blocked. Update session doc. "
+        "Declare victory when exhausted."
+    )
+
+
+async def _get_or_create_backrooms_pane() -> str:
+    """Get or create the backrooms tmux window for autonomous sessions.
+
+    Returns the pane ID of the backrooms window. Creates it on-demand
+    if it doesn't exist — avoids cluttering the workspace until needed.
+    """
+    # Check if backrooms window exists
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode == 0 and stdout.decode().strip():
+        return stdout.decode().strip().split("\n")[0]
+
+    # Create backrooms window
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "new-window", "-t", "main", "-n", "backrooms", "-d",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=5)
+
+    # Tag it and get the pane ID
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    pane_id = stdout.decode().strip().split("\n")[0]
+
+    # Tag pane type
+    await asyncio.create_subprocess_exec(
+        "tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms",
+    )
+    logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
+    return pane_id
+
+
+async def golden_throne_followup(session_id: str):
+    """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?", (session_id,)
+        )
+        instance = await cursor.fetchone()
+
+    if not instance:
+        logger.warning(f"Golden Throne: instance {session_id[:12]} not found, skipping")
+        return
+
+    instance = dict(instance)
+
+    # Skip if already processing (user beat us to it)
+    if instance["status"] == "processing":
+        logger.info(f"Golden Throne: {session_id[:12]} already processing, skipping")
+        return
+
+    # Skip if victory was declared
+    if instance.get("victory_at"):
+        logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
+        return
+
+    sop_prompt = _load_golden_throne_sop()
+    tmux_pane = instance.get("tmux_pane")
+    working_dir = instance.get("working_dir") or "~"
+    tab_name = instance.get("tab_name", "session")
+
+    # Phone notification before satellite dispatch
+    zealotry = instance.get("zealotry") or 4
+    vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
+    try:
+        await asyncio.to_thread(_send_to_phone, "/notify", {
+            "vibe": vibe_intensity,
+            "tts_text": "Golden Throne resuming work",
+            "banner_text": f"Resuming: {tab_name}",
+        })
+    except Exception as e:
+        logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
+
+    # Dispatch: local for instances on this machine, satellite for remote
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    if device_id == LOCAL_DEVICE_NAME and tmux_pane:
+        # Local delivery — transport detection per Golden Throne spec:
+        # Check pane_current_command to decide send-keys vs claude --resume
+        transport = "unknown"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_current_command}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            current_cmd = stdout.decode().strip() if proc.returncode == 0 else ""
+        except Exception:
+            current_cmd = ""
+
+        if current_cmd and "claude" in current_cmd.lower():
+            # Claude alive in pane — inject SOP via claude-cmd send-keys
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "claude-cmd", "--pane", tmux_pane, sop_prompt,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                if proc.returncode == 0:
+                    transport = "send-keys"
+                    logger.info(f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys pane={tmux_pane}")
+                else:
+                    logger.error(f"Golden Throne: claude-cmd failed for {session_id[:12]}: {stderr.decode()[:200]}")
+            except Exception as e:
+                logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
+        else:
+            # Claude not running — resume in backrooms with SOP prompt
+            try:
+                backrooms_pane = await _get_or_create_backrooms_pane()
+                # Write SOP to temp file (avoids shell escaping issues)
+                sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
+                Path(sop_file).write_text(sop_prompt)
+                resume_cmd = (
+                    f'cd {working_dir} && claude -p "$(cat {sop_file})" '
+                    f'--resume {session_id} --dangerously-skip-permissions'
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", backrooms_pane, resume_cmd, "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+                transport = "resume"
+                logger.info(
+                    f"Golden Throne: resumed {session_id[:12]} in backrooms "
+                    f"pane={backrooms_pane} via claude --resume"
+                )
+            except Exception as e:
+                logger.error(f"Golden Throne: resume failed for {session_id[:12]}: {e}")
+    else:
+        # Remote delivery via satellite
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/golden-throne/followup",
+                    json={
+                        "session_id": session_id,
+                        "tmux_pane": tmux_pane,
+                        "working_dir": working_dir,
+                        "prompt": sop_prompt,
+                    },
+                )
+                result = resp.json()
+                logger.info(
+                    f"Golden Throne: follow-up dispatched for {session_id[:12]} "
+                    f"via {result.get('transport', '?')}"
+                )
+        except Exception as e:
+            logger.error(f"Golden Throne: satellite dispatch failed for {session_id[:12]}: {e}")
+
+    await log_event("golden_throne_followup", instance_id=session_id,
+                    details={"zealotry": instance.get("zealotry", 4)})
+
+
+async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
+    """Internal: immediate followup via satellite dispatch (MiniMax escalation path).
+
+    Reuses golden throne satellite infra but fires immediately instead of on a timer.
+    Cancels any pending golden throne timer for this instance.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        instance = await cursor.fetchone()
+
+    if not instance:
+        logger.warning(f"Nudge: instance {instance_id[:12]} not found")
+        return {"nudged": False, "reason": "instance_not_found"}
+
+    instance = dict(instance)
+
+    if instance["status"] == "processing":
+        logger.info(f"Nudge: {instance_id[:12]} already processing, skipping")
+        return {"nudged": False, "reason": "already_processing"}
+
+    if instance.get("victory_at"):
+        logger.info(f"Nudge: {instance_id[:12]} declared victory, skipping")
+        return {"nudged": False, "reason": "victory_declared"}
+
+    # Cancel pending Golden Throne timer (nudge supersedes it)
+    try:
+        scheduler.remove_job(f"golden-throne-{instance_id}")
+        logger.info(f"Nudge: cancelled golden throne timer for {instance_id[:12]}")
+    except Exception:
+        pass
+
+    tmux_pane = instance.get("tmux_pane")
+    working_dir = instance.get("working_dir") or "~"
+    tab_name = instance.get("tab_name", instance_id[:8])
+
+    prompt = (
+        f"[Evaluator nudge for {tab_name}]\n"
+        f"{reason}\n\n"
+        f"Address the above finding(s) before continuing. "
+        f"If the finding is about instructing the user to do manual actions, "
+        f"perform those actions autonomously instead."
+    )
+
+    # Deliver prompt: local for instances on this machine, satellite for remote
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    if device_id == LOCAL_DEVICE_NAME and tmux_pane:
+        # Local delivery via claude-cmd
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude-cmd", "--pane", tmux_pane, prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            if proc.returncode == 0:
+                logger.info(f"Nudge: delivered to {instance_id[:12]} via claude-cmd pane={tmux_pane}")
+            else:
+                logger.error(f"Nudge: claude-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}")
+                return {"nudged": False, "reason": f"claude-cmd failed: rc={proc.returncode}"}
+        except Exception as e:
+            logger.error(f"Nudge: local delivery failed for {instance_id[:12]}: {e}")
+            return {"nudged": False, "reason": f"local_failed: {e}"}
+    else:
+        # Remote delivery via WSL satellite
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/golden-throne/followup",
+                    json={
+                        "session_id": instance_id,
+                        "tmux_pane": tmux_pane,
+                        "working_dir": working_dir,
+                        "prompt": prompt,
+                    },
+                )
+                result = resp.json()
+                logger.info(f"Nudge: dispatched for {instance_id[:12]} via satellite {result.get('transport', '?')}")
+        except Exception as e:
+            logger.error(f"Nudge: satellite dispatch failed for {instance_id[:12]}: {e}")
+            return {"nudged": False, "reason": f"dispatch_failed: {e}"}
+
+    # Record nudge timestamp for evaluator cooldown
+    _recently_nudged[instance_id] = time.time()
+
+    await log_event("nudge_dispatched", instance_id=instance_id,
+                    details={"reason": reason[:200]})
+    return {"nudged": True, "reason": reason[:200]}
+
+
+@app.post("/api/instances/{instance_id}/nudge")
+async def nudge_instance_endpoint(instance_id: str, request: Request):
+    """Immediate followup — MiniMax escalation path.
+
+    Fires a satellite dispatch to resume the Claude instance with a contextual
+    prompt. Cancels any pending Golden Throne timer. Used by the plan auditor
+    swarm when it detects stale session doc state.
+    """
+    body = await request.json()
+    reason = body.get("reason", "Manual nudge")
+    return await _nudge_instance(instance_id, reason=reason)
+
+
+@app.patch("/api/instances/{instance_id}/zealotry")
+async def set_zealotry(instance_id: str, request: Request):
+    """Set zealotry (follow-up frequency) for an instance. Range 1-10."""
+    body = await request.json()
+    zealotry = body.get("zealotry")
+    if not isinstance(zealotry, int) or zealotry < 1 or zealotry > 10:
+        raise HTTPException(status_code=400, detail="zealotry must be integer 1-10")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await db.execute(
+            "UPDATE claude_instances SET zealotry = ? WHERE id = ?",
+            (zealotry, instance_id)
+        )
+        await db.commit()
+
+    # Cancel pending follow-up if zealotry drops below threshold
+    timer_cancelled = False
+    if zealotry < 4:
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+            timer_cancelled = True
+        except Exception:
+            pass
+
+    logger.info(f"Golden Throne: zealotry={zealotry} for {instance_id[:12]}")
+    return {"instance_id": instance_id, "zealotry": zealotry, "timer_cancelled": timer_cancelled}
+
+
+# ── Legion / Synced Session Endpoints ─────────────────────────
+
+ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic"}
+
+
+@app.patch("/api/instances/{instance_id}/legion")
+async def set_instance_legion(instance_id: str, request: Request):
+    """Set the legion for an instance."""
+    body = await request.json()
+    legion = body.get("legion")
+    if legion not in ALLOWED_LEGIONS:
+        raise HTTPException(status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await db.execute(
+            "UPDATE claude_instances SET legion = ? WHERE id = ?",
+            (legion, instance_id)
+        )
+        await db.commit()
+
+    logger.info(f"Legion: {instance_id[:12]} → {legion}")
+    return {"instance_id": instance_id, "legion": legion}
+
+
+@app.patch("/api/instances/{instance_id}/synced")
+async def set_instance_synced(instance_id: str, request: Request):
+    """Set synced flag for an instance. Enforces one synced session per legion."""
+    body = await request.json()
+    synced = body.get("synced")
+    if synced not in (True, False, 0, 1):
+        raise HTTPException(status_code=400, detail="synced must be true or false")
+    synced_int = 1 if synced else 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, legion FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        legion = row[1] or "astartes"
+
+        if synced_int:
+            # Check for existing synced session in this legion
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing') AND id != ?",
+                (legion, instance_id)
+            )
+            conflict = await cursor.fetchone()
+            if conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}"
+                )
+
+        await db.execute(
+            "UPDATE claude_instances SET synced = ? WHERE id = ?",
+            (synced_int, instance_id)
+        )
+        await db.commit()
+
+    logger.info(f"Synced: {instance_id[:12]} → synced={synced_int} (legion={legion})")
+    return {"instance_id": instance_id, "synced": bool(synced_int), "legion": legion}
+
+
+@app.patch("/api/instances/{instance_id}/discord")
+async def set_instance_discord(instance_id: str, request: Request):
+    """Set discord_hosted flag and discord_channel for an instance."""
+    body = await request.json()
+    discord_hosted = body.get("discord_hosted")
+    discord_channel = body.get("discord_channel")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+        updates = []
+        params = []
+        if discord_hosted is not None:
+            if discord_hosted not in (True, False, 0, 1):
+                raise HTTPException(status_code=400, detail="discord_hosted must be true or false")
+            updates.append("discord_hosted = ?")
+            params.append(1 if discord_hosted else 0)
+        if discord_channel is not None:
+            updates.append("discord_channel = ?")
+            params.append(discord_channel if discord_channel else None)
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="Provide discord_hosted and/or discord_channel")
+
+        params.append(instance_id)
+        await db.execute(
+            f"UPDATE claude_instances SET {', '.join(updates)} WHERE id = ?",
+            tuple(params)
+        )
+        await db.commit()
+
+    logger.info(f"Discord: {instance_id[:12]} → hosted={discord_hosted}, channel={discord_channel}")
+    return {"instance_id": instance_id, "discord_hosted": discord_hosted, "discord_channel": discord_channel}
+
+
+@app.get("/api/legion/{legion}/synced-session")
+async def get_synced_session(legion: str):
+    """Lookup the active synced session for a legion."""
+    if legion not in ALLOWED_LEGIONS:
+        raise HTTPException(status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tab_name, tmux_pane, device_id, legion, status
+               FROM claude_instances
+               WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+               LIMIT 1""",
+            (legion,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"legion": legion, "synced_session": None}
+        return {
+            "legion": legion,
+            "synced_session": dict(row),
+        }
+
+
+@app.get("/api/instances/{instance_id}/zealotry")
+async def get_zealotry(instance_id: str):
+    """Get zealotry level and timer status for an instance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT zealotry, victory_at, victory_reason FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+    zealotry = row["zealotry"] or 4
+    job = scheduler.get_job(f"golden-throne-{instance_id}")
+    return {
+        "instance_id": instance_id,
+        "zealotry": zealotry,
+        "timer_pending": job is not None,
+        "next_fire": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "victory_at": row["victory_at"],
+        "victory_reason": row["victory_reason"],
+    }
+
+
+@app.post("/api/instances/{instance_id}/victory")
+async def declare_victory(instance_id: str, request: Request):
+    """Declare victory for an instance — cancel follow-up timer, record reason."""
+    body = await request.json()
+    reason = body.get("reason")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, tab_name FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        tab_name = row["tab_name"] or instance_id[:12]
+
+        await db.execute(
+            "UPDATE claude_instances SET victory_at = ?, victory_reason = ? WHERE id = ?",
+            (now, reason, instance_id)
+        )
+        await db.commit()
+
+    # Cancel pending follow-up timer
+    timer_cancelled = False
+    try:
+        scheduler.remove_job(f"golden-throne-{instance_id}")
+        timer_cancelled = True
+    except Exception:
+        pass
+
+    # Discord notification
+    try:
+        subprocess.run(
+            ["discord", "send", "fleet", f"⚔️ **IMPERIUM VICTORIOUS** — {tab_name}\n> {reason}"],
+            timeout=10, capture_output=True,
+        )
+    except Exception as e:
+        logger.warning(f"Golden Throne: Victory Discord notify failed: {e}")
+
+    logger.info(f"Golden Throne: VICTORY for {instance_id[:12]} — {reason}")
+    await log_event("golden_throne_victory", instance_id=instance_id,
+                    details={"reason": reason, "timer_cancelled": timer_cancelled})
+    return {"instance_id": instance_id, "victory": True, "timer_cancelled": timer_cancelled}
+
+
+@app.post("/api/instances/{instance_id}/golden-throne/trigger")
+async def trigger_golden_throne_followup(instance_id: str):
+    """Manually trigger the Golden Throne follow-up callback for an instance."""
+    await golden_throne_followup(instance_id)
+    return {"triggered": True, "instance_id": instance_id}
 
 
 def _send_pedal_enter():
@@ -2771,8 +3420,72 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
                         "active": True,
                         "started_at": datetime.now().isoformat()
                     }
+            # Resolve cc_color from profile name
+            pn = inst.get("profile_name")
+            if pn:
+                for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                    if p["name"] == pn:
+                        inst["color"] = p.get("color", "#0099ff")
+                        inst["cc_color"] = p.get("cc_color", "default")
+                        break
+            # Golden Throne: enrich with pending timer state
+            gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
+            inst["gt_next_fire"] = gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
+
             instances.append(inst)
         return instances
+
+
+@app.get("/api/instances/resolve")
+async def resolve_instance(pid: Optional[int] = None, cwd: Optional[str] = None):
+    """Resolve the calling agent's instance using PID and/or CWD fallback.
+
+    Returns instance + session doc info in a single call.
+    Resolution order: PID match → CWD match (prefer processing over idle).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        instance = None
+
+        # Method 1: PID match
+        if pid:
+            cursor = await db.execute(
+                "SELECT * FROM claude_instances WHERE pid = ? AND status IN ('processing', 'idle') LIMIT 1",
+                (pid,)
+            )
+            instance = await cursor.fetchone()
+
+        # Method 2: CWD match (prefer processing)
+        if not instance and cwd:
+            cursor = await db.execute(
+                "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'processing' ORDER BY last_activity DESC LIMIT 1",
+                (cwd,)
+            )
+            instance = await cursor.fetchone()
+            if not instance:
+                cursor = await db.execute(
+                    "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'idle' ORDER BY last_activity DESC LIMIT 1",
+                    (cwd,)
+                )
+                instance = await cursor.fetchone()
+
+        if not instance:
+            raise HTTPException(404, "No matching instance found")
+
+        result = dict(instance)
+
+        # Attach session doc if linked
+        if result.get("session_doc_id"):
+            cursor = await db.execute(
+                "SELECT * FROM session_documents WHERE id = ?",
+                (result["session_doc_id"],)
+            )
+            doc = await cursor.fetchone()
+            result["session_doc"] = dict(doc) if doc else None
+        else:
+            result["session_doc"] = None
+
+        return result
 
 
 @app.get("/api/instances/{instance_id}", response_model=dict)
@@ -2789,7 +3502,16 @@ async def get_instance(instance_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        return dict(row)
+        instance = dict(row)
+        # Resolve color from profile name
+        profile_name = instance.get("profile_name")
+        if profile_name:
+            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                if p["name"] == profile_name:
+                    instance["color"] = p.get("color", "#0099ff")
+                    instance["cc_color"] = p.get("cc_color", "default")
+                    break
+        return instance
 
 
 # Dashboard Endpoint
@@ -2948,10 +3670,13 @@ def reset_idle_timer():
     now_ms = int(time.monotonic() * 1000)
     timer_engine.set_productivity(True, now_ms)
 
-# Paths for Obsidian vault
-OBSIDIAN_VAULT_PATH = Path.home() / "Imperium-ENV"
+# Paths for Obsidian vault — NAS mount preferred, home fallback
+_imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
+if not _imperium_root.exists():
+    _imperium_root = Path.home()
+OBSIDIAN_VAULT_PATH = _imperium_root / "Imperium-ENV"
 OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Journal" / "Daily"
-OBSIDIAN_INBOX_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Inbox"
+OBSIDIAN_INBOX_PATH = OBSIDIAN_VAULT_PATH / "Aspirants"
 
 
 def _write_productivity_score(date_str: str, score: int):
@@ -3343,9 +4068,9 @@ PHONE_HEARTBEAT = {
 TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
 TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
 
-# ============ Enforcement Cascade v2 (no Shizuku) ============
-# Server-driven escalation. Phone executes levels on command.
-# Discord fallback sends literal endpoint+body when phone unreachable.
+# ============ Enforcement Cascade v3 ============
+# Server-driven escalation. Phone executes v3 param-based endpoints.
+# Fallback chain: phone /enforce|/notify → server-side Pavlok API → Discord webhook.
 ENFORCEMENT_CASCADE = {
     "active": False,          # Is a cascade currently running?
     "app": None,              # Which app triggered it
@@ -3357,11 +4082,21 @@ ENFORCEMENT_CASCADE = {
 
 # Level delays (seconds after previous level)
 ENFORCEMENT_LEVEL_DELAYS = {
-    1: 0,    # Notification — immediate after Discord fallback timeout
-    2: 15,   # Full-screen alarm
-    3: 15,   # Notification spam
+    1: 0,    # Vibe — immediate after Discord fallback timeout
+    2: 15,   # Vibe + beep + TTS
+    3: 15,   # Stronger vibe + beep + TTS warning
     4: 10,   # Spotify redirect
     5: 30,   # Pavlok zap (repeats every 30s)
+}
+
+# v3 param mapping per cascade level
+# Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
+ENFORCE_LEVEL_PARAMS = {
+    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "Close {app}"}},
+    2: {"endpoint": "/notify", "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
+    3: {"endpoint": "/notify", "params": {"vibe": 80, "beep": 50, "tts_text": "Final warning. Close {app}", "banner_text": "Final warning"}},
+    4: {"endpoint": "/enforce", "params": {"banner_text": "Enforcement active"}},
+    5: {"endpoint": "/enforce", "params": {"zap": 50, "tts_text": "Pavlok fired", "banner_text": "Enforcement — Pavlok"}},
 }
 
 ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
@@ -3643,16 +4378,28 @@ async def check_instance_count_pavlok(remaining_active: int, was_active: int):
     - Drops to 1 (from 2+): double vibe as warning
     - Drops to 0: zap as penalty
     Skips if was_active was already at or below threshold (no regression).
+    Phone-first, server-side Pavlok API fallback.
     """
     if remaining_active == 1 and was_active >= 2:
-        print(f"PAVLOK: Instance count dropped to 1 (from {was_active}), double vibe")
-        send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
+        print(f"INSTANCE COUNT: Dropped to 1 (from {was_active}), double vibe")
+        result = await asyncio.to_thread(_send_to_phone, "/notify", {
+            "vibe": 50, "banner_text": f"1 Claude remaining (was {was_active})",
+        })
+        if not result["success"]:
+            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
         await asyncio.sleep(3)
-        send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
+        result = await asyncio.to_thread(_send_to_phone, "/notify", {"vibe": 50})
+        if not result["success"]:
+            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
         await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
     elif remaining_active == 0 and was_active >= 1:
-        print(f"PAVLOK: All Claude instances stopped, zap")
-        send_pavlok_stimulus(stimulus_type="zap", value=50, reason="all_claudes_stopped", respect_cooldown=False)
+        print(f"INSTANCE COUNT: All Claude instances stopped, zap")
+        result = await asyncio.to_thread(_send_to_phone, "/notify", {
+            "vibe": 80, "beep": 50, "tts_text": "All Claude instances stopped",
+            "banner_text": "All Claudes stopped",
+        })
+        if not result["success"]:
+            send_pavlok_stimulus(stimulus_type="zap", value=50, reason="all_claudes_stopped", respect_cooldown=False)
         await log_event("instance_count_zero", details={"was": was_active})
 
 
@@ -4333,34 +5080,51 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
         logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
 
-# ============ Enforcement Cascade v2 ============
+# ============ Phone v3 Endpoints ============
 
-def _send_enforce_to_phone(app_name: str, level: int) -> dict:
-    """Send enforcement level to phone's MacroDroid HTTP endpoint.
+def _send_to_phone(endpoint: str, params: dict) -> dict:
+    """Send v3 params to phone's MacroDroid HTTP endpoint.
 
-    Returns dict with success status. On failure, caller should use Discord fallback.
+    Args:
+        endpoint: "/notify", "/enforce", or "/zap"
+        params: v3 query params (vibe, beep, zap, tts_text, banner_text, etc.)
+
+    Returns dict with success status. On failure, caller should fall back to
+    server-side Pavlok API or Discord webhook.
     """
     host = PHONE_CONFIG["host"]
     port = PHONE_CONFIG["port"]
     timeout = PHONE_CONFIG["timeout"]
-    url = f"http://{host}:{port}/enforce"
-    params = {"level": str(level), "app": app_name}
+    url = f"http://{host}:{port}{endpoint}"
 
     try:
         response = requests.get(url, params=params, timeout=timeout)
         PHONE_STATE["reachable"] = True
         PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE CASCADE: level={level} app={app_name} -> {response.status_code}")
+        print(f"PHONE v3: {endpoint} params={params} -> {response.status_code}")
         return {"success": response.status_code == 200, "status_code": response.status_code}
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
         PHONE_STATE["reachable"] = False
         PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE CASCADE: level={level} app={app_name} UNREACHABLE: {e}")
+        print(f"PHONE v3: {endpoint} UNREACHABLE: {e}")
         return {"success": False, "error": type(e).__name__}
     except Exception as e:
         PHONE_STATE["reachable"] = False
-        print(f"PHONE CASCADE: level={level} app={app_name} ERROR: {e}")
+        print(f"PHONE v3: {endpoint} ERROR: {e}")
         return {"success": False, "error": str(e)}
+
+
+def _send_enforce_to_phone(app_name: str, level: int) -> dict:
+    """Send enforcement level to phone using v3 params.
+
+    Maps cascade level to v3 endpoint + params, sends to phone.
+    Returns dict with success status.
+    """
+    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
+    endpoint = level_config["endpoint"]
+    params = {k: v.format(app=app_name) if isinstance(v, str) else v
+              for k, v in level_config["params"].items()}
+    return _send_to_phone(endpoint, params)
 
 
 DISCORD_FALLBACK_WEBHOOK = os.getenv(
@@ -4372,13 +5136,16 @@ DISCORD_FALLBACK_WEBHOOK = os.getenv(
 async def _send_discord_fallback(app_name: str, level: int):
     """Send enforcement command to Discord #fallback via webhook.
 
-    Format: POST /phone/enforce {"level":"N","app":"appname"}
+    Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
 
     The phone's MacroDroid macro triggers on "POST /phone/enforce" in the Discord
     notification, parses the JSON, and relays to its own localhost:7777/enforce.
     Only /phone/enforce is accepted — no arbitrary code execution.
     """
-    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}"}}'
+    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
+    params = {k: v.format(app=app_name) if isinstance(v, str) else v
+              for k, v in level_config["params"].items()}
+    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
     logger.info(f"DISCORD FALLBACK: {msg}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -4434,9 +5201,16 @@ async def _enforcement_cascade_worker(app_name: str):
         await log_event("enforcement_cascade_escalate", device_id="phone",
                         details={"app": app_name, "level": level, "elapsed_s": round(elapsed)})
 
-        # Try direct HTTP, fall back to Discord
+        # Try phone first, fall back to server-side Pavlok API, then Discord
         result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
         if not result["success"]:
+            # Phone unreachable — try server-side Pavlok API for levels with haptics
+            level_params = ENFORCE_LEVEL_PARAMS.get(level, {}).get("params", {})
+            if "zap" in level_params:
+                send_pavlok_stimulus("zap", level_params["zap"], reason=f"cascade_level_{level}", respect_cooldown=False)
+            elif "vibe" in level_params:
+                send_pavlok_stimulus("vibe", level_params["vibe"], reason=f"cascade_level_{level}", respect_cooldown=False)
+            # Discord as last resort
             await _send_discord_fallback(app_name, level)
 
         # Wait before next level (level 5 repeats in a loop)
@@ -4448,6 +5222,7 @@ async def _enforcement_cascade_worker(app_name: str):
                     break
                 result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
                 if not result["success"]:
+                    send_pavlok_stimulus("zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False)
                     await _send_discord_fallback(app_name, 5)
         else:
             delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
@@ -4776,6 +5551,10 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
         enforce_result = close_distraction_windows()
         send_pavlok_stimulus(reason="desktop_distraction_blocked")
+        asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
+            "vibe": 30,
+            "banner_text": f"Desktop blocked: {detected_mode}",
+        }))
 
         await log_event(
             "desktop_mode_blocked",
@@ -6702,6 +7481,43 @@ async def trigger_cron_job(job_id: str, dry_run: bool = False, delay_seconds: in
     return result
 
 
+@app.post("/api/cron/jobs/{job_id}/victory")
+async def declare_cron_victory(job_id: str, request: Request):
+    """Declare victory for a cron job run — record reason and fire Discord notification.
+    Body: {"reason": "...", "run_id": optional int}
+    Agents can call this explicitly instead of emitting the ##IMPERIUM_VICTORIOUS:...## pattern."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = body.get("reason", "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    run_id = body.get("run_id")
+
+    job = await cron_engine.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Persist victory_reason to the specified run (or most recent run)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if run_id:
+            await db.execute(
+                "UPDATE cron_runs SET victory_reason = ? WHERE id = ?",
+                (reason, run_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE cron_runs SET victory_reason = ? WHERE id = (SELECT id FROM cron_runs WHERE job_id = ? ORDER BY id DESC LIMIT 1)",
+                (reason, job_id)
+            )
+        await db.commit()
+
+    await cron_engine.handle_victory(job, run_id or 0, reason)
+    await log_event("cron_victory", details={"job_id": job_id, "job_name": job["name"], "reason": reason})
+    return {"job_id": job_id, "job_name": job["name"], "victory": True, "reason": reason}
+
+
 @app.get("/api/cron/jobs/{job_id}/runs")
 async def get_cron_job_runs(job_id: str, limit: int = 20):
     """Get recent run history for a cron job."""
@@ -6978,7 +7794,7 @@ def clean_markdown_for_tts(text: str) -> str:
 
     # Path compression - replace long paths with friendly names
     path_replacements = [
-        ('~/.openclaw/workspace/', ''),
+        ('~/.claude/', ''),
         ('~/', ''),
     ]
     for path, replacement in path_replacements:
@@ -7317,9 +8133,13 @@ async def timer_worker():
                     _current_session_id = await timer_start_session("distracted", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
-                    # Enforce: close distraction windows + Pavlok
+                    # Enforce: close distraction windows + Pavlok + phone notify
                     close_distraction_windows()
                     send_pavlok_stimulus(reason="distraction_timeout")
+                    asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
+                        "vibe": 30,
+                        "banner_text": "Distraction timeout — close distractions",
+                    }))
                     loop = asyncio.get_event_loop()
                     loop.run_in_executor(None, speak_tts, "Distraction timeout. Close distractions now.")
                     continue
@@ -7481,15 +8301,20 @@ async def _async_enforce_twitter_timeout():
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
 
-    # Send notification sound + TTS
+    # Desktop: notification sound + TTS
     play_sound()
     try:
         subprocess.Popen(["say", "-v", "Daniel", "Twitter open for 7 minutes. Forcing break."])
     except Exception:
         pass
 
-    # Send low-intensity Pavlok zap
-    send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
+    # Phone: v3 enforce with zap, fallback to server-side Pavlok API
+    result = await asyncio.to_thread(_send_to_phone, "/enforce", {
+        "zap": 30, "tts_text": "Twitter 7 minutes. Forcing break.",
+        "banner_text": "Twitter timeout",
+    })
+    if not result["success"]:
+        send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
 
     # Force timer into BREAK mode (clear any existing manual mode first)
     old_mode = timer_engine.current_mode.value
@@ -7550,7 +8375,13 @@ async def enforce_break_exhausted_impl() -> dict:
         timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
 
     if enforced_any:
-        send_pavlok_stimulus(reason="break_exhausted")
+        # Phone: v3 enforce with notification, fallback to server-side Pavlok API
+        phone_notify = await asyncio.to_thread(_send_to_phone, "/enforce", {
+            "zap": 30, "tts_text": "Break time exhausted",
+            "banner_text": "Break exhausted",
+        })
+        if not phone_notify["success"]:
+            send_pavlok_stimulus(reason="break_exhausted")
 
     return {
         "enforced": enforced_any,
@@ -7936,6 +8767,444 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
         return {"success": False, "error": str(e)}
 
 
+# ── Morning Enforce ─────────────────────────────────────────
+# In-memory state for the current day's morning session enforce loop.
+# Resets each time a new morning session fires.
+MORNING_ENFORCE_STATE: dict = {
+    "status": "idle",           # idle | pending | acknowledged | overridden | blocked
+    "session_type": None,
+    "fired_at": None,
+    "acknowledged_at": None,
+    "override_reason": None,
+    "escalation_level": 0,      # 0 = none, 1 = TTS repeat, 2 = Discord DM, 3 = blocked
+}
+
+
+def _register_morning_expected_response(session_type: str = "morning_session") -> None:
+    """Register an expected response and schedule escalation checks at +5/+10/+15 min."""
+    MORNING_ENFORCE_STATE.update({
+        "status": "pending",
+        "session_type": session_type,
+        "fired_at": datetime.utcnow().isoformat(),
+        "acknowledged_at": None,
+        "override_reason": None,
+        "escalation_level": 0,
+    })
+
+    base = datetime.now()
+    for level, offset_min in [(1, 5), (2, 10), (3, 15)]:
+        fire_at = base + timedelta(minutes=offset_min)
+        job_id = f"morning-enforce-l{level}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        scheduler.add_job(
+            _morning_escalate,
+            DateTrigger(run_date=fire_at),
+            args=[level],
+            id=job_id,
+            replace_existing=True,
+            name=f"Morning Enforce L{level}",
+            misfire_grace_time=120,
+        )
+    logger.info(f"Morning enforce registered: {session_type}, escalations scheduled at +5/+10/+15 min")
+
+
+@app.post("/api/morning/enforce-register")
+async def register_morning_enforce():
+    """Register the morning escalation chain independently of /api/morning/start.
+
+    Used by morning_launcher.py which handles session spawning itself but still
+    needs the enforce escalation pathway (Discord DMs at +5/+10/+15 min).
+    """
+    _register_morning_expected_response("morning_session")
+    await log_event("morning_enforce_registered", device_id="cron")
+    return {"status": "registered", "escalations": ["+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
+
+
+
+def _cancel_morning_escalations() -> None:
+    """Cancel all pending escalation jobs (called on acknowledge/override)."""
+    for level in [1, 2, 3]:
+        try:
+            scheduler.remove_job(f"morning-enforce-l{level}")
+        except Exception:
+            pass
+
+
+def _morning_escalate(level: int) -> None:
+    """APScheduler callback: fire morning enforce escalation at the given level.
+
+    Runs in APScheduler thread — bridges to async unified_enforce via event loop.
+    """
+    state = MORNING_ENFORCE_STATE
+    if state["status"] != "pending":
+        logger.info(f"Morning escalation L{level} skipped: status={state['status']}")
+        return
+
+    state["escalation_level"] = level
+    logger.warning(f"Morning enforce escalation L{level} fired")
+
+    if level == 1:
+        _unified_enforce_sync(
+            level="notify",
+            message="Morning session waiting. Please acknowledge.",
+            source="morning",
+            channel="briefing",
+        )
+    elif level == 2:
+        _unified_enforce_sync(
+            level="warn",
+            message=(
+                "**Morning Session — Unacknowledged** (10 min elapsed)\n"
+                "The morning regiment is waiting for your response.\n"
+                "Acknowledge: `POST /api/morning/acknowledge`\n"
+                "Override: `POST /api/morning/override` with a reason."
+            ),
+            source="morning",
+        )
+    elif level == 3:
+        state["status"] = "blocked"
+        logger.warning("Morning enforce L3: morning_blocked — Custodes will not proceed")
+        _unified_enforce_sync(
+            level="block",
+            message=(
+                "**Morning Session BLOCKED** (15 min elapsed)\n"
+                "Custodes will not proceed until you respond.\n"
+                "Acknowledge: `POST /api/morning/acknowledge`\n"
+                "Override: `POST /api/morning/override` (requires reason)"
+            ),
+            source="morning",
+        )
+
+
+# ── Unified Enforce ───────────────────────────────────────
+# Single entry point for all escalation: Discord (@mention for notify, DM for warn/enforce/block)
+# + phone notifications + TTS. Agents call this, not raw urllib.
+
+_ENFORCE_LEVELS = {
+    "notify": {"phone_endpoint": "/notify", "phone_vibe": 30, "discord_mode": "channel", "emoji": ""},
+    "warn":   {"phone_endpoint": "/notify", "phone_vibe": 50, "phone_beep": 30, "discord_mode": "dm", "emoji": "⚠️"},
+    "enforce": {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "⛔"},
+    "block":  {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "🚫"},
+}
+
+
+async def unified_enforce(
+    level: str,
+    message: str,
+    source: str = "agent",
+    channel: str | None = None,
+    bot: str = "custodes",
+    phone_params: dict | None = None,
+    legion_context: str | None = None,
+) -> dict:
+    """Unified enforce: Discord + phone + TTS in one call.
+
+    Args:
+        level: "notify" | "warn" | "enforce" | "block"
+        message: Human-readable message content
+        source: Origin of the enforce ("morning", "timer", "agent", "custom")
+        channel: Discord channel for @mention-level messages (None = DM only)
+        bot: Discord bot identity ("custodes", "mechanicus", "inquisition")
+        phone_params: Override default phone notification params
+        legion_context: For third-person framing of non-custodes escalations
+    """
+    cfg = _ENFORCE_LEVELS.get(level)
+    if not cfg:
+        return {"success": False, "error": f"Unknown enforce level: {level}"}
+
+    result = {"level": level, "source": source, "discord": None, "phone": None, "tts": None}
+
+    # ── Discord ──
+    discord_mode = cfg["discord_mode"]
+    emoji = cfg["emoji"]
+
+    # Third-person framing for non-custodes escalations
+    if legion_context and bot != "custodes":
+        discord_text = f"{emoji} There's a report of a stranded **{legion_context}** that needs attention.\n{message}"
+    else:
+        discord_text = f"{emoji} {message}" if emoji else message
+
+    try:
+        import urllib.request as _urllib_req
+        if discord_mode == "channel" and channel:
+            payload = json.dumps({
+                "channel": channel,
+                "bot": bot,
+                "content": discord_text[:2000],
+            }).encode()
+            req = _urllib_req.Request(
+                f"{DISCORD_DAEMON_URL}/send",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _urllib_req.urlopen(req, timeout=10)
+            )
+            result["discord"] = f"channel:{channel}"
+        elif discord_mode == "dm" or (discord_mode == "channel" and not channel):
+            payload = json.dumps({"content": discord_text[:2000]}).encode()
+            req = _urllib_req.Request(
+                f"{DISCORD_DAEMON_URL}/dm",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _urllib_req.urlopen(req, timeout=10)
+            )
+            result["discord"] = "dm"
+        logger.info(f"Enforce [{level}]: Discord {result['discord']} sent")
+    except Exception as e:
+        logger.warning(f"Enforce [{level}]: Discord failed: {e}")
+        result["discord"] = f"error:{e}"
+
+    # ── Phone ──
+    p = phone_params or {}
+    phone_endpoint = p.get("endpoint", cfg["phone_endpoint"])
+    phone_payload = {}
+    if "phone_vibe" in cfg:
+        phone_payload["vibe"] = p.get("vibe", cfg["phone_vibe"])
+    if "phone_beep" in cfg:
+        phone_payload["beep"] = p.get("beep", cfg["phone_beep"])
+    if "phone_zap" in cfg:
+        phone_payload["zap"] = p.get("zap", cfg["phone_zap"])
+    # Strip emoji for TTS
+    tts_clean = message.split("\n")[0][:200]
+    phone_payload["tts_text"] = p.get("tts_text", tts_clean)
+    phone_payload["banner_text"] = p.get("banner_text", f"Enforce: {level}")
+
+    phone_result = _send_to_phone(phone_endpoint, phone_payload)
+    result["phone"] = phone_result
+    if not phone_result.get("success") and level in ("enforce", "block"):
+        stim = "zap" if level in ("enforce", "block") else "vibe"
+        send_pavlok_stimulus(stim, value=phone_payload.get("zap", phone_payload.get("vibe", 30)),
+                             reason=f"enforce_{level}_{source}")
+        logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok {stim} fallback fired")
+
+    # ── Desktop TTS ──
+    speak_checkin_tts(tts_clean)
+    result["tts"] = "sent"
+
+    await log_event("enforce", details={"level": level, "source": source, "message": message[:200]})
+    logger.info(f"Enforce [{level}] from {source}: complete")
+    return result
+
+
+def _unified_enforce_sync(level: str, message: str, source: str = "agent",
+                          channel: str | None = None, bot: str = "custodes",
+                          phone_params: dict | None = None, legion_context: str | None = None) -> dict:
+    """Sync wrapper for unified_enforce — for APScheduler callbacks."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                unified_enforce(level, message, source, channel, bot, phone_params, legion_context),
+                loop
+            )
+            return future.result(timeout=20)
+        else:
+            return asyncio.run(unified_enforce(level, message, source, channel, bot, phone_params, legion_context))
+    except Exception as e:
+        logger.warning(f"Enforce sync wrapper failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+class EnforceRequest(BaseModel):
+    level: str  # "notify" | "warn" | "enforce" | "block"
+    message: str
+    source: str = "api"
+    channel: str | None = None
+    bot: str = "custodes"
+    phone_params: dict | None = None
+    legion_context: str | None = None
+
+
+@app.post("/api/enforce")
+async def enforce_endpoint(request: EnforceRequest):
+    """Unified enforce endpoint — callable by agents, CLI tools, and cron jobs."""
+    if request.level not in _ENFORCE_LEVELS:
+        raise HTTPException(status_code=400, detail=f"level must be one of: {', '.join(_ENFORCE_LEVELS)}")
+    return await unified_enforce(
+        level=request.level,
+        message=request.message,
+        source=request.source,
+        channel=request.channel,
+        bot=request.bot,
+        phone_params=request.phone_params,
+        legion_context=request.legion_context,
+    )
+
+
+# ── Morning Session ────────────────────────────────────────
+
+@app.post("/api/morning/start")
+async def start_morning_session():
+    """Trigger the Custodes morning session.
+
+    Called by the phone Morning Setup macro after alarm dismiss.
+    Gathers context, spawns a Custodes Claude session with daily persistence,
+    sends briefing via TTS, and enters a follow-up loop.
+    """
+    from morning_session import run_morning_session
+    today = datetime.now().strftime("%Y-%m-%d")
+    state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
+
+    # Check if already running
+    if state_file.exists():
+        import json as _json
+        data = _json.loads(state_file.read_text())
+        if data.get("status") == "active":
+            return {"status": "already_active", "session_id": data.get("session_id")}
+
+    # Fire and forget — the session runs in background
+    asyncio.create_task(run_morning_session())
+
+    # Register enforce expected response — escalation chain fires if unanswered
+    _register_morning_expected_response("morning_session")
+
+    await log_event("morning_session_start", device_id="phone", details={"date": today})
+    return {"status": "started", "date": today}
+
+
+@app.get("/api/morning/status")
+async def get_morning_session_status():
+    """Check current morning session state, including enforce escalation status."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
+    session_state: dict = {}
+    if state_file.exists():
+        import json as _json
+        session_state = _json.loads(state_file.read_text())
+    else:
+        session_state = {"status": "not_started", "date": today}
+
+    # Merge enforce state
+    session_state["enforce"] = {
+        "status": MORNING_ENFORCE_STATE["status"],
+        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+        "fired_at": MORNING_ENFORCE_STATE["fired_at"],
+        "acknowledged_at": MORNING_ENFORCE_STATE["acknowledged_at"],
+        "override_reason": MORNING_ENFORCE_STATE["override_reason"],
+        "morning_blocked": MORNING_ENFORCE_STATE["status"] == "blocked",
+    }
+    return session_state
+
+
+@app.post("/api/morning/acknowledge")
+async def acknowledge_morning_session():
+    """Acknowledge the morning session — clears pending enforce state and cancels escalations."""
+    state = MORNING_ENFORCE_STATE
+    if state["status"] not in ("pending", "blocked"):
+        return {
+            "status": "noop",
+            "reason": f"enforce state is '{state['status']}', nothing to acknowledge",
+        }
+
+    _cancel_morning_escalations()
+    state["acknowledged_at"] = datetime.utcnow().isoformat()
+    state["status"] = "acknowledged"
+    logger.info("Morning session acknowledged — enforce escalations cancelled")
+
+    await log_event("morning_acknowledged", details={
+        "escalation_level": state["escalation_level"],
+        "fired_at": state["fired_at"],
+    })
+    return {
+        "status": "acknowledged",
+        "escalation_level": state["escalation_level"],
+        "fired_at": state["fired_at"],
+        "acknowledged_at": state["acknowledged_at"],
+    }
+
+
+class MorningOverrideRequest(BaseModel):
+    reason: str
+
+
+@app.post("/api/morning/override")
+async def override_morning_session(request: MorningOverrideRequest):
+    """Override the morning session enforce — requires a reason. Unblocks Custodes."""
+    if not request.reason or not request.reason.strip():
+        raise HTTPException(status_code=400, detail="reason is required for override")
+
+    _cancel_morning_escalations()
+    MORNING_ENFORCE_STATE["status"] = "overridden"
+    MORNING_ENFORCE_STATE["override_reason"] = request.reason.strip()
+    MORNING_ENFORCE_STATE["acknowledged_at"] = datetime.utcnow().isoformat()
+    logger.info(f"Morning session overridden: {request.reason.strip()}")
+
+    await log_event("morning_overridden", details={
+        "reason": request.reason.strip(),
+        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+        "fired_at": MORNING_ENFORCE_STATE["fired_at"],
+    })
+    return {
+        "status": "overridden",
+        "reason": request.reason.strip(),
+        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+    }
+
+
+_ALARM_DISMISS_JOB_ID = "morning_alarm_dismiss"
+
+
+@app.post("/api/morning/alarm-dismiss")
+async def alarm_dismiss(delay_minutes: int = 0):
+    """Schedule morning session after alarm dismiss.
+
+    Called by phone when the alarm is dismissed. Schedules /api/morning/start
+    after an optional delay, replacing any previously pending alarm-dismiss job.
+    Eliminates the MacroDroid timer dependency.
+
+    Args:
+        delay_minutes: Seconds to wait before firing (default 0, max 120).
+    """
+    delay_minutes = max(0, min(delay_minutes, 120))
+    now = datetime.now()
+    fires_at = now + timedelta(minutes=delay_minutes)
+
+    async def _fire_morning_start():
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post("http://localhost:7777/api/morning/start", timeout=10)
+        except Exception as exc:
+            logger.error(f"alarm-dismiss fire failed: {exc}")
+
+    # Cancel any existing pending job (idempotent)
+    try:
+        scheduler.remove_job(_ALARM_DISMISS_JOB_ID)
+        logger.info("alarm-dismiss: cancelled previous pending job")
+    except Exception:
+        pass  # No existing job — fine
+
+    scheduler.add_job(
+        _fire_morning_start,
+        DateTrigger(run_date=fires_at),
+        id=_ALARM_DISMISS_JOB_ID,
+        replace_existing=True,
+        name="Morning Alarm Dismiss",
+        misfire_grace_time=300,
+    )
+
+    logger.info(f"alarm-dismiss: morning session scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)")
+    await log_event("morning_alarm_dismiss", device_id="phone", details={
+        "delay_minutes": delay_minutes,
+        "fires_at": fires_at.isoformat(),
+    })
+
+    return {
+        "scheduled_at": now.isoformat(),
+        "fires_at": fires_at.isoformat(),
+    }
+
+
+# ── Notifications ──────────────────────────────────────────
+
 @app.post("/api/notify")
 async def send_notification(request: NotifyRequest):
     """Send notification to a device (sound + TTS or webhook)."""
@@ -7991,12 +9260,13 @@ async def send_notification(request: NotifyRequest):
             results["sound"] = play_sound(request.sound)
             results["tts"] = speak_tts(request.message, request.voice)
     elif method == "webhook":
-        # Mobile: send webhook
-        webhook_url = device.get("webhook_url")
-        if webhook_url:
-            results["webhook"] = send_webhook(webhook_url, request.message)
-        else:
-            results["webhook"] = {"success": False, "error": "No webhook_url configured"}
+        # Mobile: v3 /notify with TTS + banner
+        notify_params = {
+            "tts_text": request.message[:300],
+            "banner_text": request.message[:100],
+            "vibe": 30,
+        }
+        results["webhook"] = _send_to_phone("/notify", notify_params)
 
     # Log the notification event
     await log_event(
@@ -8210,21 +9480,208 @@ async def handle_session_start(payload: dict) -> dict:
     is_subagent = 1 if subagent_env else 0
     spawner = subagent_env or None
 
+    # Capture tmux pane for Golden Throne transport and cross-machine dispatch
+    # Claude Code strips $TMUX_PANE from hook env, so also check top-level payload
+    # (hook resolves pane via PID walk and injects it directly)
+    tmux_pane = env.get("TMUX_PANE") or payload.get("tmux_pane")
+
     # Auto-name subagents
     if is_subagent and not payload.get("env", {}).get("CLAUDE_TAB_NAME"):
         tab_name = f"sub: {spawner}"
 
-    # Resolve device_id from source_ip
-    device_id = resolve_device_from_ip(source_ip) if source_ip else "Mac-Mini"
+    # Resolve device_id from HTTP client IP (where the instance actually runs)
+    # SSH_CLIENT gives the SSH origin (Mac), not the instance's machine (WSL)
+    client_ip = payload.get("_client_ip")
+    if not source_ip:
+        source_ip = client_ip
+    device_id = resolve_device_from_ip(client_ip) if client_ip else "Mac-Mini"
+
+    # Detect primarch (env var) and transplant-from (file-based handoff injected by hook)
+    primarch_name = env.get("TOKEN_API_PRIMARCH", "")
+    transplant_from = payload.get("transplant_from", "")
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
         # Check if already registered
         cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE id = ?",
+            "SELECT * FROM claude_instances WHERE id = ?",
             (session_id,)
         )
-        if await cursor.fetchone():
-            return {"success": True, "action": "already_registered", "instance_id": session_id}
+        existing_row = await cursor.fetchone()
+
+        # --- Supplant logic: reuse existing instance row instead of creating new ---
+        # Priority: DB transplant marker > hook file handoff > primarch singleton
+        supplant_id = None
+
+        # 1. Check DB for pending transplant targeting this session (cross-device safe)
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE transplant_target_session = ?",
+            (session_id,)
+        )
+        db_transplant_row = await cursor.fetchone()
+        if db_transplant_row:
+            supplant_id = db_transplant_row["id"]
+            # Clear the marker
+            await db.execute(
+                "UPDATE claude_instances SET transplant_target_session = NULL WHERE id = ?",
+                (supplant_id,)
+            )
+
+        # 2. File-based handoff (local transplant — injected by generic-hook.sh)
+        if not supplant_id and transplant_from:
+            supplant_id = transplant_from
+
+        # 3. Primarch singleton (reuse most recent instance with same primarch)
+        if not supplant_id and primarch_name:
+            # Primarch singleton: find most recent instance with this primarch name
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE primarch = ? ORDER BY registered_at DESC LIMIT 1",
+                (primarch_name,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                supplant_id = row["id"]
+
+        # --- Handle --continue (same session ID) with transplant ---
+        # With --continue, the session ID doesn't change. If the row already exists
+        # and there's a transplant signal, update the row in-place (new device, dir, pid).
+        # If no transplant signal, it's a normal re-registration (no-op).
+        if existing_row:
+            if supplant_id and supplant_id == session_id:
+                # Same-ID transplant (--continue): update the existing row in-place
+                now = datetime.now().isoformat()
+                await db.execute(
+                    """UPDATE claude_instances
+                       SET working_dir = ?, pid = ?, device_id = ?,
+                           status = 'idle', tmux_pane = ?,
+                           last_activity = ?,
+                           stopped_at = NULL, victory_at = NULL, victory_reason = NULL,
+                           input_lock = NULL, transplant_target_session = NULL,
+                           primarch = ?
+                       WHERE id = ?""",
+                    (
+                        working_dir,
+                        payload.get("pid"),
+                        device_id,
+                        tmux_pane,
+                        now,
+                        primarch_name or existing_row["primarch"] if hasattr(existing_row, '__getitem__') else primarch_name,
+                        session_id
+                    )
+                )
+                await db.commit()
+
+                # Resolve preserved profile for color
+                cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
+                updated_inst = await cursor.fetchone()
+                cc_color = "default"
+                hex_color = "#666666"
+                if updated_inst and updated_inst["profile_name"]:
+                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                        if p["name"] == updated_inst["profile_name"]:
+                            cc_color = p.get("cc_color", "default")
+                            hex_color = p.get("color", "#666666")
+                            break
+
+                logger.info(f"Hook: SessionStart transplant-refresh {session_id[:12]}... ({working_dir}) [device:{device_id}]")
+                return {
+                    "success": True,
+                    "action": "transplant_refreshed",
+                    "instance_id": session_id,
+                    "profile": updated_inst["profile_name"] if updated_inst else None,
+                    "color": hex_color,
+                    "cc_color": cc_color,
+                    "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None
+                }
+            else:
+                # No transplant signal — normal re-registration, no-op
+                return {"success": True, "action": "already_registered", "instance_id": session_id}
+
+        if supplant_id:
+            # Fetch the old instance to preserve its config
+            cursor = await db.execute(
+                "SELECT * FROM claude_instances WHERE id = ?",
+                (supplant_id,)
+            )
+            old_inst = await cursor.fetchone()
+
+            if old_inst:
+                now = datetime.now().isoformat()
+                internal_session_id = str(uuid.uuid4())
+
+                # Update the old row with new session identity, preserve config
+                await db.execute(
+                    """UPDATE claude_instances
+                       SET id = ?, session_id = ?, working_dir = ?, pid = ?,
+                           status = 'idle', tmux_pane = ?, device_id = ?,
+                           registered_at = ?, last_activity = ?,
+                           stopped_at = NULL, victory_at = NULL, victory_reason = NULL,
+                           input_lock = NULL, primarch = ?
+                       WHERE id = ?""",
+                    (
+                        session_id,
+                        internal_session_id,
+                        working_dir,
+                        payload.get("pid"),
+                        tmux_pane,
+                        device_id,
+                        now,
+                        now,
+                        primarch_name or old_inst["primarch"],
+                        supplant_id
+                    )
+                )
+
+                # Auto-link primarch session doc if applicable
+                session_doc_id = old_inst["session_doc_id"]
+                if primarch_name and not session_doc_id:
+                    cursor = await db.execute(
+                        "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+                        (primarch_name,)
+                    )
+                    link_row = await cursor.fetchone()
+                    if link_row and link_row[0]:
+                        session_doc_id = link_row[0]
+                        await db.execute(
+                            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+                            (session_doc_id, session_id)
+                        )
+
+                await db.commit()
+
+                if session_doc_id:
+                    await _update_doc_agents_list(db, session_doc_id)
+
+                # Resolve cc_color from preserved profile
+                preserved_profile = old_inst["profile_name"]
+                cc_color = "default"
+                hex_color = "#666666"
+                if preserved_profile:
+                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                        if p["name"] == preserved_profile:
+                            cc_color = p.get("cc_color", "default")
+                            hex_color = p.get("color", "#666666")
+                            break
+
+                supplant_source = f"transplant:{transplant_from}" if transplant_from else f"primarch:{primarch_name}"
+                logger.info(f"Hook: SessionStart supplanted {supplant_id[:12]}... → {session_id[:12]}... ({working_dir}) [{supplant_source}]")
+                await log_event("instance_supplanted", instance_id=session_id, device_id=device_id,
+                                details={"old_id": supplant_id, "tab_name": old_inst["tab_name"],
+                                         "source": supplant_source, "primarch": primarch_name or None})
+
+                return {
+                    "success": True,
+                    "action": "supplanted",
+                    "instance_id": session_id,
+                    "supplanted_from": supplant_id,
+                    "profile": preserved_profile,
+                    "color": hex_color,
+                    "cc_color": cc_color,
+                    "session_doc_id": session_doc_id
+                }
+
+        # --- Normal registration (no supplant) ---
 
         # Skip TTS profile assignment for subagents (headless, no voice needed)
         if is_subagent:
@@ -8248,9 +9705,9 @@ async def handle_session_start(payload: dict) -> dict:
             """INSERT INTO claude_instances
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
-                is_subagent, spawner,
+                is_subagent, spawner, tmux_pane, primarch,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 internal_session_id,
@@ -8265,12 +9722,13 @@ async def handle_session_start(payload: dict) -> dict:
                 payload.get("pid"),
                 is_subagent,
                 spawner,
+                tmux_pane,
+                primarch_name or None,
                 now,
                 now
             )
         )
         # Auto-link primarch instance to its active session doc
-        primarch_name = payload.get("env", {}).get("TOKEN_API_PRIMARCH", "")
         session_doc_id = None
         if primarch_name:
             cursor = await db.execute(
@@ -8285,13 +9743,96 @@ async def handle_session_start(payload: dict) -> dict:
                     (session_doc_id, session_id)
                 )
 
+        # Auto-create session doc for top-level sessions that don't have one yet
+        auto_created_doc = False
+        if not session_doc_id and not is_subagent:
+            today = datetime.now().strftime("%Y-%m-%d")
+            now_ts = datetime.now().isoformat()
+
+            if origin_type == "cron":
+                # Cron agents: reuse existing doc for same job, or create one
+                cron_job_id = env.get("CRON_JOB_ID")
+                cron_job_name = env.get("CRON_JOB_NAME", "cron")
+                if cron_job_id:
+                    cursor = await db.execute(
+                        "SELECT id FROM session_documents WHERE cron_job_id = ? AND status = 'active'",
+                        (cron_job_id,)
+                    )
+                    existing_cron_doc = await cursor.fetchone()
+                    if existing_cron_doc:
+                        session_doc_id = existing_cron_doc[0]
+                    else:
+                        # Create new cron session doc in Mars/Sessions/
+                        doc_title = cron_job_name
+                        slug = doc_title.lower().replace(" ", "-")[:50]
+                        fp = MARS_SESSIONS_DIR / f"{today}-{slug}.md"
+                        # Avoid collision
+                        counter = 1
+                        while fp.exists():
+                            fp = MARS_SESSIONS_DIR / f"{today}-{slug}-{counter}.md"
+                            counter += 1
+                        cursor = await db.execute(
+                            """INSERT INTO session_documents (title, file_path, project, cron_job_id, status, created_at, updated_at)
+                               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+                            (doc_title, str(fp), None, cron_job_id, now_ts, now_ts)
+                        )
+                        session_doc_id = cursor.lastrowid
+                        create_session_doc_file(fp, doc_title, session_doc_id)
+                        auto_created_doc = True
+            else:
+                # Interactive sessions: create doc with "{cwd_basename} {date}"
+                cwd_basename = Path(working_dir).name if working_dir else "session"
+                doc_title = f"{cwd_basename} {today}"
+                slug = doc_title.lower().replace(" ", "-")[:50]
+                fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+                counter = 1
+                while fp.exists():
+                    fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}-{counter}.md"
+                    counter += 1
+                cursor = await db.execute(
+                    """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+                       VALUES (?, ?, ?, 'active', ?, ?)""",
+                    (doc_title, str(fp), None, now_ts, now_ts)
+                )
+                session_doc_id = cursor.lastrowid
+                create_session_doc_file(fp, doc_title, session_doc_id)
+                auto_created_doc = True
+
+            if session_doc_id:
+                await db.execute(
+                    "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+                    (session_doc_id, session_id)
+                )
+
+        # Auto-detect legion from context
+        auto_legion = None
+        if origin_type == "cron":
+            # Cron jobs: look up legion from cron_jobs table, default to mechanicus
+            cron_job_id = env.get("CRON_JOB_ID")
+            if cron_job_id:
+                cursor = await db.execute(
+                    "SELECT legion FROM cron_jobs WHERE id = ?", (cron_job_id,)
+                )
+                cron_row = await cursor.fetchone()
+                auto_legion = (cron_row[0] if cron_row and cron_row[0] else "mechanicus")
+            else:
+                auto_legion = "mechanicus"
+        elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
+            auto_legion = "civic"
+
+        if auto_legion:
+            await db.execute(
+                "UPDATE claude_instances SET legion = ? WHERE id = ?",
+                (auto_legion, session_id)
+            )
+
         await db.commit()
 
         # Update frontmatter if we linked a session doc
         if session_doc_id:
             await _update_doc_agents_list(db, session_doc_id)
 
-    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}")
+    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}{f' [legion:{auto_legion}]' if auto_legion else ''}")
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
                     details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
                              "is_subagent": is_subagent, "spawner": spawner,
@@ -8302,6 +9843,8 @@ async def handle_session_start(payload: dict) -> dict:
         "action": "registered",
         "instance_id": session_id,
         "profile": profile["name"] if not is_subagent else None,
+        "color": profile.get("color") if not is_subagent else None,
+        "cc_color": profile.get("cc_color") if not is_subagent else None,
         "session_doc_id": session_doc_id
     }
 
@@ -8337,7 +9880,7 @@ async def handle_session_end(payload: dict) -> dict:
         was_active = count_row[0] if count_row else 0
 
         await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
             (now, session_id)
         )
         await db.commit()
@@ -8356,6 +9899,13 @@ async def handle_session_end(payload: dict) -> dict:
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
 
+    # Golden Throne: cancel any pending follow-up (session terminated)
+    try:
+        scheduler.remove_job(f"golden-throne-{session_id}")
+        logger.info(f"Golden Throne: cancelled follow-up for {session_id[:12]} (session end)")
+    except Exception:
+        pass
+
     logger.info(f"Hook: SessionEnd stopped {session_id[:12]}...")
     await log_event("instance_stopped", instance_id=session_id, device_id=row[1],
                     details={"source": "hook"})
@@ -8364,8 +9914,8 @@ async def handle_session_end(payload: dict) -> dict:
     if not is_subagent:
         await check_instance_count_pavlok(remaining_non_sub, was_active)
 
-    # Spawn stop_hook.py to generate session blurb if instance has a linked session doc
-    if session_doc_id and not is_subagent:
+    # Spawn stop_hook.py to generate transcript + wikilink (session doc or daily note fallback)
+    if not is_subagent:
         stop_hook_script = Path(__file__).parent / "stop_hook.py"
         if stop_hook_script.exists():
             try:
@@ -8375,7 +9925,7 @@ async def handle_session_end(payload: dict) -> dict:
                     stderr=open("/tmp/stop_hook.log", "a"),
                     start_new_session=True
                 )
-                logger.info(f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id})")
+                logger.info(f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id or 'none, daily note fallback'})")
             except Exception as e:
                 logger.warning(f"Hook: SessionEnd failed to spawn stop_hook: {e}")
 
@@ -8433,6 +9983,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
         await timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
         logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
 
+    # Golden Throne: cancel any pending follow-up (user is active)
+    try:
+        scheduler.remove_job(f"golden-throne-{session_id}")
+        logger.info(f"Golden Throne: cancelled follow-up for {session_id[:12]} (user prompt)")
+    except Exception:
+        pass
+
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
     return {"success": True, "action": "processing", "instance_id": session_id, "exited_idle": exited_idle}
 
@@ -8473,192 +10030,40 @@ async def handle_post_tool_use(payload: dict) -> dict:
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
 
-def _parse_assistant_turn_from_lines(lines: list) -> Optional[dict]:
-    """Parse the last assistant turn from a list of JSONL lines."""
-    blocks: list = []
-    found = False
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        line_type = d.get("type", "")
-        if line_type == "assistant":
-            found = True
-            content = d.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                blocks = content + blocks
-            elif isinstance(content, str):
-                blocks.insert(0, {"type": "text", "text": content})
-        elif line_type == "user" and found:
-            break
-
-    if blocks and any(b.get("type") == "text" for b in blocks):
-        return {
-            "text": "\n".join(b["text"] for b in blocks if b.get("type") == "text"),
-            "tool_names": [b.get("name", "") for b in blocks if b.get("type") == "tool_use"],
-            "last_block_type": blocks[-1].get("type", "unknown"),
-        }
-    return None
+# Legion → Discord bot name mapping
+_LEGION_BOT_MAP = {
+    "custodes": "custodes",
+    "mechanicus": "mechanicus",
+    "astartes": "mechanicus",
+    "inquisition": "inquisition",
+}
 
 
-def _extract_last_assistant_turn(transcript_path: str, max_retries: int = 8, retry_delay: float = 0.25) -> Optional[dict]:
-    """Extract last assistant turn from a transcript file, polling briefly for flush."""
-    for attempt in range(max_retries):
-        try:
-            with open(transcript_path, "r") as f:
-                lines = f.readlines()
-        except OSError:
-            return None
-
-        result = _parse_assistant_turn_from_lines(lines)
-        if result:
-            return result
-
-        if attempt < max_retries - 1:
-            time.sleep(retry_delay)
-
-    return None
-
-
-def _check_stop_patterns(text: str) -> Optional[str]:
-    """Return a block reason if text contains unverified action suggestions, else None."""
-    # Pattern 1: User-directed instructions with action verbs
-    if re.search(
-        r'(please |you (can|should|need to|will need to|might want to|may want to) )'
-        r'(run|execute|try running|start|launch|restart|open|install|add|create|update|configure|set up)',
-        text, re.IGNORECASE
-    ):
-        return "Detected instruction for user to perform an action"
-
-    # Pattern 2: Imperative sentences starting with action verbs
-    if re.search(
-        r'(^|\n)\s*(Run|Execute|Start|Launch|Install|Open|Add|Create|Configure|Set up|Copy|Paste'
-        r'|Navigate to|Go to|Visit|Type|Enter) (the |this |these |following |it |a |your )',
-        text, re.MULTILINE
-    ):
-        return "Detected imperative instruction to user"
-
-    # Pattern 3: Shell command with $ prompt
-    if re.search(r'(^|\n)\s*\$\s+\w', text, re.MULTILINE):
-        return "Detected shell command with $ prompt"
-
-    # Pattern 4: Copy/paste instructions
-    if re.search(r'(copy and paste|paste (this|the|it) )', text, re.IGNORECASE):
-        return "Detected copy/paste instruction"
-
-    # Pattern 5: Open browser/terminal instructions
-    if re.search(r'open (your |a |the )(browser|terminal|editor|file manager|console)', text, re.IGNORECASE):
-        return "Detected instruction to open a tool manually"
-
-    # Pattern 6 & 7: Shell code blocks with manual/offered instruction
-    if re.search(r'```(bash|shell|sh|zsh|console|terminal)', text):
-        if re.search(r'(you (can|should|need to)|please )(run|execute|add|copy|paste|use)', text, re.IGNORECASE):
-            return "Detected shell code block with manual instruction"
-        if re.search(
-            r'(want me to|would you like me to|shall I|should I|I can )\s*'
-            r'(run|execute|restart|start|launch|do|try|fix|update|install|create|set up)',
-            text, re.IGNORECASE
-        ):
-            return "Detected offered action with code block — should just do it or use AskUserQuestion"
-
-    # Pattern 9: "manually" in instructional context
-    if re.search(
-        r'(you.{0,20}manual(ly)?|manual(ly)? (run|execute|add|edit|update|configure|restart|start|set))',
-        text, re.IGNORECASE
-    ):
-        return "Detected instruction for manual action"
-
-    # Pattern 10: "add this/the following to your"
-    if re.search(r'add (this|the following|these) to (your|the) ', text, re.IGNORECASE):
-        return "Detected instruction to manually add content"
-
-    return None
-
-
-async def handle_stop_validate(payload: dict) -> dict:
-    """
-    Synchronous stop validator — blocks the agent's stop if it's instructing the user
-    to perform unverified manual actions instead of doing them autonomously.
-
-    Returns {"decision": "block", "reason": "..."} to block, or {} to allow.
-    Called by stop-validator.sh (thin shim).
-    """
-    session_id = payload.get("session_id", "")
-    pid = payload.get("pid")
-    log_prefix = f"StopValidate {session_id[:12]}..."
-
-    # ── Subagent detection: this instance IS a subagent ──
-    # Process tree (direct claude→claude spawn) or TOKEN_API_SUBAGENT env var.
-    if pid and is_subagent_pid(pid):
-        logger.info(f"{log_prefix} ALLOW: is subagent (parent PID {get_parent_pid(pid)} is claude)")
-        return {}
-
-    token_api_subagent = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
-    if token_api_subagent:
-        logger.info(f"{log_prefix} ALLOW: TOKEN_API_SUBAGENT={token_api_subagent}")
-        return {}
-
-    # Intermediate stop: background subagents still pending for this session.
-    if _pending_background_tasks.get(session_id, 0) > 0:
-        logger.info(f"{log_prefix} ALLOW: intermediate stop ({_pending_background_tasks[session_id]} background tasks pending)")
-        return {}
-
-    # ── Escape hatch: second attempt is always allowed ──
-    if payload.get("stop_hook_active"):
-        logger.info(f"{log_prefix} ALLOW: stop_hook_active")
-        return {}
-
-    # ── Extract last assistant turn ──
-    # Prefer embedded tail (sent by shim when transcript is on a remote machine),
-    # fall back to direct file read if local.
-    transcript_tail = payload.get("transcript_tail")
-    transcript_path = payload.get("transcript_path")
-    if transcript_tail:
-        turn = _parse_assistant_turn_from_lines(transcript_tail.splitlines())
-    elif transcript_path and os.path.exists(transcript_path):
-        turn = _extract_last_assistant_turn(transcript_path)
-    else:
-        logger.info(f"{log_prefix} ALLOW: no transcript")
-        return {}
-
-    if not turn:
-        logger.info(f"{log_prefix} ALLOW: no assistant turn found")
-        return {}
-
-    # ── Short-circuit allows ──
-    if "AskUserQuestion" in turn["tool_names"] or "EnterPlanMode" in turn["tool_names"]:
-        logger.info(f"{log_prefix} ALLOW: last turn uses {turn['tool_names']}")
-        return {}
-
-    if not turn["text"]:
-        logger.info(f"{log_prefix} ALLOW: no text content")
-        return {}
-
-    if turn["last_block_type"] == "tool_use":
-        logger.info(f"{log_prefix} ALLOW: last block is tool_use")
-        return {}
-
-    # ── Pattern detection ──
-    reason = _check_stop_patterns(turn["text"])
-    if reason:
-        logger.info(f"{log_prefix} BLOCK: {reason}")
-        full_reason = (
-            f"{reason}. Rules: (1) Do not end by telling the user to execute commands or perform "
-            "manual actions — verify autonomously using your tools instead. (2) If verification "
-            "requires a tool you don't have, use the Task tool with subagent_type=tool-creator to "
-            "create one. (3) If you genuinely cannot verify or act autonomously, use AskUserQuestion "
-            "to present options rather than ending with unverified instructions. "
-            "(4) If you believe this block is incorrect and have completed your work, you may stop "
-            "on the next attempt (stop_hook_active will be true)."
+async def _post_discord_mirror(channel: str, bot: str, content: str):
+    """Mirror instance output to its Discord channel/thread."""
+    is_thread = channel.isdigit()
+    payload = {
+        "channel": "aspirants" if is_thread else channel,
+        "bot": bot,
+        "content": content[:2000],
+    }
+    if is_thread:
+        payload["thread_id"] = channel
+    try:
+        import urllib.request as _urllib_req
+        data = json.dumps(payload).encode()
+        req = _urllib_req.Request(
+            f"{DISCORD_DAEMON_URL}/send",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return {"decision": "block", "reason": full_reason}
-
-    logger.info(f"{log_prefix} ALLOW: no patterns detected")
-    return {}
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _urllib_req.urlopen(req, timeout=10)
+        )
+        logger.info(f"Discord mirror: {channel} ({bot}) — {len(content)} chars")
+    except Exception as e:
+        logger.warning(f"Discord mirror failed for {channel}: {e}")
 
 
 async def handle_stop(payload: dict) -> dict:
@@ -8698,14 +10103,20 @@ async def handle_stop(payload: dict) -> dict:
         )
         await db.commit()
 
-    # Fire session doc swarm if instance has a linked doc
-    session_doc_id = instance.get("session_doc_id")
+    # Fire async stop evaluators (action_validator, plan_auditor, etc.)
+    # Skips subagents and intermediate stops (background tasks pending).
     is_subagent_instance_quick = bool(instance.get("is_subagent"))
-    if session_doc_id and not is_subagent_instance_quick:
-        stop_context = payload.get("transcript_tail", "")[:2000] if payload.get("transcript_tail") else ""
-        asyncio.create_task(fire_session_doc_swarm(
-            session_doc_id, tab_name, context=stop_context
+    has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
+    if not is_subagent_instance_quick and not has_pending_background:
+        session_doc_id = instance.get("session_doc_id")
+        stop_context = payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
+        asyncio.create_task(_run_stop_evaluators(
+            session_id, session_doc_id, stop_context, tab_name
         ))
+        # Auto-name: if instance still has default "Claude HH:MM" name, generate one
+        # Pass transcript_path as fallback — stop_context may be empty for short sessions
+        transcript_path = payload.get("transcript_path", "")
+        asyncio.create_task(_auto_name_instance(dict(instance), stop_context, transcript_path))
 
     result = {
         "success": True,
@@ -8764,6 +10175,13 @@ async def handle_stop(payload: dict) -> dict:
                 except json.JSONDecodeError:
                     continue
 
+    # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
+    if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):
+        discord_bot = _LEGION_BOT_MAP.get(instance.get("legion", ""), "mechanicus")
+        asyncio.create_task(_post_discord_mirror(
+            instance["discord_channel"], discord_bot, tts_text
+        ))
+
     # Sanitize TTS text (remove markdown formatting and normalize whitespace)
     if tts_text:
         # Strip markdown headers (must be before newline conversion)
@@ -8786,19 +10204,17 @@ async def handle_stop(payload: dict) -> dict:
         tts_text = re.sub(r' +', ' ', tts_text)
         tts_text = tts_text.strip()
 
-    # Mobile path: send webhook notification with transcript blurb
+    # Mobile path: v3 /notify with TTS + banner + vibe
     if device_id == "Token-S24":
-        # Include the transcript blurb (truncated for notification readability)
+        notify_params = {
+            "banner_text": f"[{tab_name}] finished",
+            "vibe": 30,
+        }
         if tts_text:
-            notify_text = f"[{tab_name}] {tts_text[:300]}"
-        else:
-            notify_text = f"[{tab_name}] Claude finished"
-        webhook_result = send_webhook(
-            "http://100.102.92.24:7777/notify",
-            notify_text
-        )
-        result["notification"] = webhook_result
-        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile notification ({len(tts_text or '')} chars)")
+            notify_params["tts_text"] = tts_text[:300]
+        phone_result = await asyncio.to_thread(_send_to_phone, "/notify", notify_params)
+        result["notification"] = phone_result
+        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile v3 notify ({len(tts_text or '')} chars)")
         return result
 
     # Desktop path: TTS and notification
@@ -8838,6 +10254,43 @@ async def handle_stop(payload: dict) -> dict:
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})
+
+    # Golden Throne: schedule follow-up if zealotry >= 4
+    zealotry = instance.get("zealotry") or 4
+    if zealotry >= 4 and not is_subagent_instance:
+        delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, 1800)
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        job_id = f"golden-throne-{session_id}"
+
+        # Cancel any existing timer (double-stop scenario)
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=job_id,
+            replace_existing=True,
+            name=f"Golden Throne: {tab_name}",
+            misfire_grace_time=300,
+            jobstore='golden_throne',
+        )
+        result["golden_throne"] = {
+            "scheduled": True,
+            "delay_seconds": delay_seconds,
+            "fire_at": fire_at.isoformat(),
+            "zealotry": zealotry,
+        }
+        logger.info(
+            f"Golden Throne: scheduled follow-up for {session_id[:12]} "
+            f"in {delay_seconds}s (zealotry={zealotry})"
+        )
+        await log_event("golden_throne_scheduled", instance_id=session_id,
+                        details={"zealotry": zealotry, "delay_seconds": delay_seconds,
+                                 "fire_at": fire_at.isoformat()})
 
     return result
 
@@ -8887,14 +10340,61 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 except Exception as e:
                     logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
 
-        # Return local_exec so generic-hook.sh runs AHK on WSL (which can invoke Windows AHK)
-        # Note: AHK.exe needs a Windows path, so use wslpath -w to convert the WSL path
-        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]}")
+        # Return local_exec so generic-hook.sh runs AHK on WSL
+        # voice-send-keys.ahk uses tmux send-keys — no WinActivate needed
+        vc_session = VOICE_CHAT_SESSIONS.get(session_id, {})
+        tmux_pane = vc_session.get("tmux_pane", "")
+        pane_arg = f' "{tmux_pane}"' if tmux_pane else ""
+        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]} (pane: {tmux_pane or 'default'})")
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "$(wslpath -w "$HOME/Scripts/ahk/voice-select-other.ahk")" "{session_id}"',
+            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "//Token-NAS/Imperium/Scripts/ahk/voice-send-keys.ahk"{pane_arg} --navigate',
         }
+
+    # Discord-hosted: post AskUserQuestion to Discord channel and notify phone
+    _ask_handled_by_discord = False
+    if tool_name == "AskUserQuestion" and session_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT discord_hosted, discord_channel, legion FROM claude_instances WHERE id = ?",
+                (session_id,)
+            )
+            dh_row = await cursor.fetchone()
+        if dh_row and dh_row[0] and dh_row[1]:
+            _ask_handled_by_discord = True
+            discord_channel = dh_row[1]
+            discord_bot = _LEGION_BOT_MAP.get(dh_row[2] or "", "mechanicus")
+            questions = tool_input.get("questions", [])
+            if questions:
+                q_parts = [q.get("question", "") for q in questions if q.get("question")]
+                if q_parts:
+                    q_text = "\n".join(q_parts)
+                    asyncio.create_task(_post_discord_mirror(
+                        discord_channel, discord_bot,
+                        f"**Question:** {q_text}"
+                    ))
+                    # Also phone notify so Emperor knows to check Discord
+                    asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
+                        "vibe": 40,
+                        "tts_text": f"Claude is asking a question in Discord.",
+                        "banner_text": q_parts[0][:80],
+                    }))
+                    logger.info(f"PreToolUse: AskUserQuestion posted to Discord #{discord_channel} for {session_id[:12]}")
+
+    # Phone notification for AskUserQuestion (non-voice-chat, non-discord-hosted instances)
+    if tool_name == "AskUserQuestion" and session_id and session_id not in VOICE_CHAT_SESSIONS and not _ask_handled_by_discord:
+        questions = tool_input.get("questions", [])
+        if questions:
+            q_text = questions[0].get("question", "")[:200]
+            if q_text:
+                asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
+                    "vibe": 40,
+                    "beep": 30,
+                    "tts_text": f"Claude is asking: {q_text}",
+                    "banner_text": q_text[:80],
+                }))
+                logger.info(f"PreToolUse: AskUserQuestion phone notify for {session_id[:12]}: {q_text[:60]}")
 
     # Only check Bash commands for blocking
     if tool_name != "Bash":
@@ -8951,7 +10451,7 @@ async def handle_notification(payload: dict) -> dict:
 
 # Hook dispatcher endpoint
 @app.post("/api/hooks/{action_type}")
-async def dispatch_hook(action_type: str, payload: dict) -> dict:
+async def dispatch_hook(action_type: str, payload: dict, request: Request) -> dict:
     """
     Unified hook dispatcher for Claude Code hooks.
 
@@ -8964,7 +10464,6 @@ async def dispatch_hook(action_type: str, payload: dict) -> dict:
         "UserPromptSubmit": handle_prompt_submit,
         "PostToolUse": handle_post_tool_use,
         "Stop": handle_stop,
-        "StopValidate": handle_stop_validate,
         "PreToolUse": handle_pre_tool_use,
         "Notification": handle_notification,
     }
@@ -8973,6 +10472,10 @@ async def dispatch_hook(action_type: str, payload: dict) -> dict:
     if not handler:
         logger.warning(f"Hook: Unknown action type: {action_type}")
         return {"success": False, "action": "unknown_hook_type", "type": action_type}
+
+    # Inject HTTP client IP into payload for device detection fallback
+    if request.client:
+        payload["_client_ip"] = request.client.host
 
     try:
         result = await handler(payload)
@@ -9096,9 +10599,144 @@ async def stash_clear_all():
 # ============ Discord Endpoints ============
 
 
+def _format_discord_injection(channel_name: str, content: str) -> str:
+    """Format a Discord message for injection into a synced session."""
+    # Strip Discord mention tags for cleaner injection
+    clean = re.sub(r'<@&?\d+>\s*', '', content).strip()
+    return f"[Emperor via Discord #{channel_name}]: {clean}"
+
+
+async def _try_synced_injection(legion: str, message) -> bool:
+    """Try to inject a Discord message into the synced session for a legion.
+
+    Returns True if injection succeeded, False if no synced session or injection failed.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+               LIMIT 1""",
+            (legion,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False
+
+    instance_id, tmux_pane, device_id = row
+    if not tmux_pane:
+        logger.warning(f"Synced injection: instance {instance_id[:12]} has no tmux_pane, falling back")
+        return False
+
+    formatted = _format_discord_injection(
+        message.channel_name or "dm",
+        message.content or ""
+    )
+
+    try:
+        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        proc = await asyncio.create_subprocess_exec(
+            str(claude_cmd), "--instance", instance_id, formatted,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": ":".join([
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ])},
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            logger.info(f"Synced injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
+            return True
+        else:
+            logger.warning(f"Synced injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+            return False
+    except asyncio.TimeoutError:
+        logger.warning(f"Synced injection timed out for {instance_id[:12]}")
+        return False
+    except Exception as e:
+        logger.warning(f"Synced injection error: {e}")
+        return False
+
+
+async def _try_legion_injection(legion: str, message) -> bool:
+    """Try to inject a Discord message into ANY live instance for a legion.
+
+    Unlike _try_synced_injection, this does NOT require synced=1.
+    Used for Custodes singleton routing — all messages go to the one live instance.
+    Returns True if injection succeeded, False if no live instance or injection failed.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = ? AND status IN ('idle', 'processing')
+               LIMIT 1""",
+            (legion,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False
+
+    instance_id, tmux_pane, device_id = row
+    if not tmux_pane:
+        logger.warning(f"Legion injection: instance {instance_id[:12]} has no tmux_pane, cannot inject")
+        return False
+
+    formatted = _format_discord_injection(
+        message.channel_name or "dm",
+        message.content or ""
+    )
+
+    try:
+        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        proc = await asyncio.create_subprocess_exec(
+            str(claude_cmd), "--instance", instance_id, formatted,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": ":".join([
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ])},
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            logger.info(f"Legion injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
+            return True
+        else:
+            logger.warning(f"Legion injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+            return False
+    except asyncio.TimeoutError:
+        logger.warning(f"Legion injection timed out for {instance_id[:12]}")
+        return False
+    except Exception as e:
+        logger.warning(f"Legion injection error: {e}")
+        return False
+
+
+# Dedup cache for Discord messages (daemon sometimes delivers twice)
+_discord_seen_ids: set = set()
+_DISCORD_DEDUP_MAX = 200
+
+
 @app.post("/api/discord/message")
 async def receive_discord_message(request: DiscordMessageRequest):
     """Receive a forwarded Discord message from the discord-cli daemon."""
+    # Dedup: skip if we've already processed this message_id
+    if request.message_id:
+        if request.message_id in _discord_seen_ids:
+            return {"received": True, "message_id": request.message_id, "dedup": True}
+        _discord_seen_ids.add(request.message_id)
+        # Evict oldest entries when cache is full
+        if len(_discord_seen_ids) > _DISCORD_DEDUP_MAX:
+            _discord_seen_ids.clear()
+
     author_name = request.author.get("username", "unknown") if request.author else "unknown"
     author_id = request.author.get("id") if request.author else None
 
@@ -9155,24 +10793,38 @@ async def receive_discord_message(request: DiscordMessageRequest):
         asyncio.create_task(_discord_clip(stripped, request))
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
+    # Morning ack shortcut — fastest possible escalation cancel via Discord
+    if MORNING_ENFORCE_STATE.get("status") == "pending":
+        lower = content.lower().strip()
+        if any(kw in lower for kw in ("ack", "acknowledged", "acknowledge", "here", "awake")):
+            await acknowledge_morning_session()
+            logger.info(f"Morning ack via Discord from {author_name}")
+            # Still fall through to inject into synced session if applicable
+
+    # Trigger 1: @Mechanicus mention → try synced injection, fallback to one-off responder
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
-        asyncio.create_task(_discord_respond(request, bot="mechanicus"))
+        injected = await _try_synced_injection("mechanicus", request)
+        if not injected:
+            asyncio.create_task(_discord_respond(request, bot="mechanicus"))
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 1.5: @Custodes mention in any channel
+    # Trigger 1.5: @Custodes mention → route to singleton (no one-off responder)
     if f"<@{CUSTODES_USER_ID}>" in content:
-        asyncio.create_task(_discord_respond(request, bot="custodes"))
+        injected = await _try_legion_injection("custodes", request)
+        if not injected:
+            logger.warning("Custodes @mention but no live Custodes instance to route to")
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 1.6: @Inquisition mention in any channel
+    # Trigger 1.6: @Inquisition mention — no synced support, always one-off responder
     if f"<@{INQUISITION_USER_ID}>" in content:
         asyncio.create_task(_discord_respond(request, bot="inquisition"))
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 2: Reply in a Custodes-owned channel
+    # Trigger 2: Reply in a Custodes-owned channel → route to singleton (no one-off responder)
     if request.is_reply and request.channel_name in CUSTODES_CHANNELS:
-        asyncio.create_task(_discord_respond(request, bot="custodes"))
+        injected = await _try_legion_injection("custodes", request)
+        if not injected:
+            logger.warning(f"Reply in #{request.channel_name} but no live Custodes instance")
 
     return {"received": True, "message_id": request.message_id}
 
@@ -9183,11 +10835,11 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
     reply_to = message.message_id or ""
     logger.info(f"Discord clip: {url}")
 
-    clip_bin = Path.home() / "Scripts" / "cli-tools" / "bin" / "clip"
+    clip_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "clip"
     env = {
         **os.environ,
         "PATH": ":".join([
-            str(Path.home() / "Scripts" / "cli-tools" / "bin"),
+            str(SCRIPTS_DIR / "cli-tools" / "bin"),
             str(Path.home() / ".local" / "bin"),
             "/opt/homebrew/bin",
             "/usr/local/bin",
@@ -9209,7 +10861,7 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
             logger.warning(f"Discord clip failed (rc={proc.returncode}): {stderr_text[:300]}")
             reply_content = f"Clip failed for <{url}>: `{stderr_text.strip()[-200:]}`"
         else:
-            # Parse "Saved to Imperium-ENV: Terra/Inbox/slug.md" and "Title: ..." from stderr
+            # Parse "Saved to Imperium-ENV: Aspirants/slug.md" and "Title: ..." from stderr
             saved_path = None
             note_title = None
             for line in stderr_text.splitlines():
@@ -9328,6 +10980,18 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         except Exception as e:
             logger.warning(f"Discord responder (custodes): could not fetch habits: {e}")
 
+        # Fetch timer state
+        timer_str = "(Could not read timer state)"
+        try:
+            def _fetch_timer():
+                import urllib.request as _ur
+                req = _ur.Request("http://127.0.0.1:7777/api/timer", method="GET")
+                with _ur.urlopen(req, timeout=5) as resp:
+                    return resp.read().decode()
+            timer_str = await asyncio.get_event_loop().run_in_executor(None, _fetch_timer)
+        except Exception as e:
+            logger.warning(f"Discord responder (custodes): could not fetch timer: {e}")
+
         # Load Custodes responder prompt template
         custodes_prompt_path = Path.home() / ".claude" / "prompts" / "custodes-responder.md"
         try:
@@ -9350,6 +11014,9 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
 
 ### Habit State (from /api/habits/today)
 {habits_str}
+
+### Timer State (from /api/timer)
+{timer_str}
 
 ### Conversation in #{channel} (today, oldest to newest)
 {context_str or '(no prior messages today)'}
@@ -9403,7 +11070,7 @@ Rules:
         "CLAUDECODE": "",
         "TOKEN_API_SUBAGENT": f"discord_responder:{bot}",
         "PATH": ":".join([
-            str(Path.home() / "Scripts" / "cli-tools" / "bin"),
+            str(SCRIPTS_DIR / "cli-tools" / "bin"),
             str(Path.home() / ".local" / "bin"),
             "/opt/homebrew/bin",
             "/usr/local/bin",
@@ -9457,7 +11124,7 @@ async def inbox_notify(request: InboxNotifyRequest):
 
 @app.post("/api/inbox/create")
 async def inbox_create(request: InboxCreateRequest):
-    """Create a new aspirant note in Terra/Inbox/ from an external source."""
+    """Create a new aspirant note in Aspirants/ from an external source."""
     # Sanitize title for filename
     safe_title = re.sub(r'[^\w\s-]', '', request.title).strip()
     safe_title = re.sub(r'\s+', ' ', safe_title)
@@ -9501,7 +11168,7 @@ async def inbox_create(request: InboxCreateRequest):
     content = "\n".join(frontmatter_lines) + "\n\n" + body + "\n"
     filepath.write_text(content, encoding="utf-8")
 
-    note_path = f"Terra/Inbox/{filename}"
+    note_path = f"Aspirants/{filename}"
 
     # Create a thread in #aspirants for this note's pipeline lifecycle
     thread_id = None
@@ -9557,9 +11224,9 @@ async def inbox_create(request: InboxCreateRequest):
 
 # ---- Stage 2: Implantation ----
 
-OBSIDIAN_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "obsidian")
-WEB_SEARCH_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "web-search")
-DISCORD_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "discord")
+OBSIDIAN_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian")
+WEB_SEARCH_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "web-search")
+DISCORD_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "discord")
 DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 
 
@@ -9598,7 +11265,7 @@ CODEX_CONTEXT = """The Imperium of Claude is an agent orchestration system using
 - Adeptus Mechanicus: Claude Sonnet (dedicated) — dev/tooling autonomy
 - Imperial Guard: MiniMax M2.5 — bulk work, volume tasks, disposable
 
-MiniMax is for mass, not precision. 300 prompts per 5 hours budget. Notes enter through Terra/Inbox/ and get enriched before promotion to Terra/Ultramar/ (authoritative notes).
+MiniMax is for mass, not precision. 300 prompts per 5 hours budget. Notes enter through Aspirants/ and get enriched before promotion to Terra/Ultramar/ (authoritative notes).
 
 The system uses an Obsidian vault (Imperium-ENV) as its knowledge base. Terra/ is personal domain, Mars/ is mechanicus/agent operations."""
 
@@ -10147,6 +11814,18 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
         })
         logger.info(f"Trials verdict for '{title}': {new_status}")
 
+        # On FAIL, re-dispatch to implantation for additional research per CLAUDE.md spec
+        if not is_pass:
+            source = await _read_note_property(note_path, "source") or "re-implant"
+            logger.info(f"Trials failed for '{title}': re-dispatching to implantation")
+            asyncio.create_task(run_implantation(
+                note_path=note_path,
+                title=title,
+                note_type=note_type,
+                source=source,
+                skip_trials=False,
+            ))
+
     except Exception as e:
         logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
 
@@ -10163,7 +11842,7 @@ async def inbox_trials_check():
 
     for note_file in note_files:
         filename = Path(note_file).name
-        note_path = f"Terra/Inbox/{filename}"
+        note_path = f"Aspirants/{filename}"
         title = filename.replace(".md", "")
 
         status = await _read_note_property(note_path, "status")
@@ -10212,6 +11891,172 @@ async def inbox_trials_check():
         results["notes"].append({"title": title, "verdict": "dispatched", "replies": len(emperor_replies)})
 
     return results
+
+
+async def run_deployment(note_path: str, title: str, note_type: str) -> None:
+    """Stage 4: Deployment — Guilliman codifies and promotes a trials_passed note to its final vault location."""
+    try:
+        logger.info(f"Deployment: starting for '{title}' (type={note_type})")
+
+        # Read the full note content
+        note_content = ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f"path={note_path}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            note_content = stdout.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            logger.error(f"Deployment: could not read note '{title}': {e}")
+            return
+
+        # Determine destination based on note type
+        is_prescriptive = note_type in ("prescriptive", "task")
+        destination_dir = "Mars/Tasks" if is_prescriptive else "Terra/Ultramar"
+        destination_path = f"{destination_dir}/{title}.md"
+
+        # Build Guilliman deployment prompt
+        deployment_prompt = (
+            f"{CODEX_CONTEXT}\n\n"
+            f"You are Guilliman, the Codifier. You are deploying aspirant note '{title}' to the Imperium vault.\n\n"
+            f"## Source Note\n\nPath: {note_path}\nType: {note_type}\nDestination: {destination_path}\n\n"
+            f"## Note Content\n\n{note_content[:4000]}\n\n"
+            f"## Instructions\n\n"
+            f"Restructure this note for its final vault location. Your output will REPLACE the note content entirely.\n\n"
+            f"Requirements:\n"
+            f"1. Write valid Obsidian frontmatter. Keep existing fields, update:\n"
+            f"   - status: deployed\n"
+            f"   - deployed_from: {note_path}\n"
+            f"   - deployed_date: {datetime.now().strftime('%Y-%m-%d')}\n"
+            f"{'   - For prescriptive: ensure progress, completed, temperature, importance, timescale fields exist' + chr(10) if is_prescriptive else ''}"
+            f"2. Remove pipeline artifacts (## Implantation, ## Trials, ## Verdict sections) — these were staging, not canon\n"
+            f"3. Keep the Gene-Seed callout as the core content seed\n"
+            f"4. Add a clean ## Summary section synthesizing the research insights into authoritative prose\n"
+            f"5. Add relevant [[wikilinks]] to existing vault notes where connections exist\n"
+            f"6. Add appropriate tags (use {'mars/task' if is_prescriptive else 'terra/ultramar'} domain prefix)\n"
+            f"7. Output ONLY the final note content (frontmatter + body), nothing else\n"
+        )
+
+        deployed_content = ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--model", "claude-sonnet-4-6", "-p",
+                "--no-session-persistence", "--dangerously-skip-permissions",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(input=deployment_prompt.encode("utf-8")),
+                timeout=120,
+            )
+            deployed_content = stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            logger.error(f"Deployment: Sonnet timed out for '{title}'")
+            return
+        except Exception as e:
+            logger.error(f"Deployment: Sonnet failed for '{title}': {e}")
+            return
+
+        if not deployed_content:
+            logger.warning(f"Deployment: empty output for '{title}'")
+            return
+
+        # Strip markdown code fences that Sonnet sometimes wraps output in
+        if deployed_content.startswith("```"):
+            lines = deployed_content.splitlines()
+            if lines[-1].strip() == "```":
+                deployed_content = "\n".join(lines[1:-1]).strip()
+
+        # Create the note at its final destination via obsidian CLI
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "create",
+                f"path={destination_path}", f"content={deployed_content}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                if "already exists" in stderr_text.lower():
+                    logger.warning(f"Deployment: {destination_path} already exists, overwriting")
+                    dest_full = OBSIDIAN_VAULT_PATH / destination_path
+                    dest_full.write_text(deployed_content, encoding="utf-8")
+                else:
+                    logger.error(f"Deployment: create failed for '{title}': {stderr_text}")
+                    return
+        except Exception as e:
+            logger.error(f"Deployment: create failed for '{title}': {e}")
+            return
+
+        # Update original note status to deployed
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f"path={note_path}", "property=status", f"value=deployed",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f"path={note_path}", "property=deployed_to", f"value={destination_path}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Deployment: status update failed for '{title}': {e}")
+
+        # Post deployment summary to aspirant thread
+        thread_id = await _read_note_property(note_path, "thread_id")
+        if thread_id:
+            deploy_msg = (
+                f"**Guilliman Deployment Complete**\n"
+                f"Promoted to: `{destination_path}`\n"
+                f"Status: `deployed`\n\n"
+                f"The aspirant has been codified and admitted to the vault canon."
+            )
+            await _post_to_aspirant_thread(thread_id, deploy_msg)
+
+        await log_event("deployment", device_id="guilliman", details={
+            "source_path": note_path,
+            "destination_path": destination_path,
+            "title": title,
+            "type": note_type,
+        })
+        logger.info(f"Deployment complete: '{title}' -> {destination_path}")
+
+    except Exception as e:
+        logger.error(f"Deployment failed for '{title}': {e}", exc_info=True)
+
+
+class InboxDeployRequest(BaseModel):
+    """Manual trigger for deployment on a trials_passed note."""
+    path: str
+
+
+@app.post("/api/inbox/deploy")
+async def inbox_deploy(request: InboxDeployRequest):
+    """Manually trigger Guilliman deployment on a trials_passed note."""
+    filename = request.path.rsplit("/", 1)[-1] if "/" in request.path else request.path
+    title = filename.replace(".md", "")
+
+    full_path = OBSIDIAN_VAULT_PATH / request.path
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail=f"Note not found: {request.path}")
+
+    note_type = await _read_note_property(request.path, "type") or "descriptive"
+    status = await _read_note_property(request.path, "status")
+    if status not in ("trials_passed", "trials_complete"):
+        raise HTTPException(status_code=400, detail=f"Note status is '{status}', expected 'trials_passed'")
+
+    asyncio.create_task(run_deployment(
+        note_path=request.path,
+        title=title,
+        note_type=note_type,
+    ))
+
+    destination_dir = "Mars/Tasks" if note_type in ("prescriptive", "task") else "Terra/Ultramar"
+    return {"dispatched": True, "path": request.path, "title": title, "destination": f"{destination_dir}/{title}.md"}
 
 
 class InboxImplantRequest(BaseModel):
@@ -10295,16 +12140,12 @@ IMPLANTATION_ROLES = {
 # ---- Minimax API Client ----
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _MINIMAX_MODEL = "MiniMax-M2.5"
-_MINIMAX_AUTH_PROFILES = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
-
-
 def _get_minimax_key() -> str:
-    """Read MiniMax API key from auth-profiles."""
-    try:
-        profiles = json.loads(_MINIMAX_AUTH_PROFILES.read_text())
-        return profiles["profiles"]["minimax:default"]["key"]
-    except Exception as e:
-        raise RuntimeError(f"Could not load MiniMax API key: {e}")
+    """Read MiniMax API key from MINIMAX_API_KEY env var."""
+    key = os.environ.get("MINIMAX_API_KEY")
+    if not key:
+        raise RuntimeError("MINIMAX_API_KEY environment variable not set")
+    return key
 
 
 async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 1024) -> str:
@@ -10330,82 +12171,383 @@ async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 
         )
         resp.raise_for_status()
         data = resp.json()
-        return "".join(
-            block["text"] for block in data.get("content", [])
+        content = data.get("content") or []
+        stop_reason = data.get("stop_reason", "?")
+        text = "".join(
+            block["text"] for block in content
             if block.get("type") == "text"
         )
+        if not text:
+            logger.warning(f"MiniMax empty response: stop_reason={stop_reason}, content={data.get('content')!r}")
+        return text
 
 
-# ---- Session Document Swarm ----
-SESSION_SWARM_ROLES = {
-    "activity_scribe": {
-        "system": "You are an Activity Scribe. Given an agent's recent output, write a concise activity log entry. Format: ### YYYY-MM-DD HH:MM — <agent_name>\n<2-3 sentences of what was done>. Include specific file names, decisions made, and outcomes. Be factual, not flowery.",
-        "max_tokens": 512,
+# ---- Stop Evaluators ----
+# Async MiniMax-powered evaluators that run after every stop.
+# Each evaluator gets shared context (compacted history, recent tail, session doc)
+# and can trigger a nudge if it detects a problem.
+STOP_EVALUATORS = {
+    "action_validator": {
+        "system": (
+            "You are an Action Validator for an autonomous AI coding agent. "
+            "Your job is to determine whether the agent's final message instructs the human user "
+            "to perform manual actions (running commands, editing files, opening tools, copy-pasting) "
+            "instead of doing those actions autonomously.\n\n"
+            "Context: The agent has access to Bash, file editing, web search, and subagent tools. "
+            "It should almost never tell the user to do something manually. Exceptions where user "
+            "action IS acceptable:\n"
+            "- The agent asked the user a question (AskUserQuestion)\n"
+            "- The agent is reporting results of completed work\n"
+            "- The agent is explaining what it DID (past tense), not what the user SHOULD DO\n"
+            "- The agent needs physical-world action (restart an app, plug in a device)\n"
+            "- The agent is in plan mode discussing approach\n\n"
+            "Analyze the agent's final message. If the agent is telling the user to perform "
+            "actions the agent could do itself, respond with:\n"
+            "VIOLATION: <1-2 sentence description of what the agent should do instead>\n\n"
+            "If the agent's message is acceptable, respond with exactly: PASS"
+        ),
+        "max_tokens": 256,
+        "requires_session_doc": False,
     },
     "plan_auditor": {
-        "system": "You are a Plan Auditor. Given a session document and recent activity, identify if any part of the Plan section needs updating based on what just happened. If no updates needed, respond with exactly: NO_UPDATE. Otherwise, describe the specific plan changes needed in 2-3 sentences.",
+        "system": (
+            "You are a Plan Auditor. Given a session document and recent activity, "
+            "identify if any part of the Plan section needs updating based on what just happened. "
+            "If no updates needed, respond with exactly: PASS\n"
+            "Otherwise, respond with:\n"
+            "UPDATE: <2-3 sentence description of the specific plan changes needed>"
+        ),
         "max_tokens": 512,
+        "requires_session_doc": True,
     },
 }
 
 
-async def fire_session_doc_swarm(session_doc_id: int, instance_tab_name: str, context: str = "") -> None:
-    """Fire Minimax agents to update session doc after a stop event."""
+def _parse_evaluator_result(evaluator_name: str, text: str) -> tuple[bool, str]:
+    """Parse MiniMax evaluator response into (should_nudge, finding)."""
+    text = text.strip()
+    if evaluator_name == "action_validator":
+        if text.upper().startswith("VIOLATION:"):
+            return True, text[len("VIOLATION:"):].strip()
+        return False, ""
+    elif evaluator_name == "plan_auditor":
+        if text.upper().startswith("UPDATE:"):
+            return True, text[len("UPDATE:"):].strip()
+        if "NO_UPDATE" in text or text.upper() == "PASS":
+            return False, ""
+        # Ambiguous response — treat non-trivial output as a finding
+        if len(text) > 20:
+            return True, text
+        return False, ""
+    # Generic fallback: VIOLATION/UPDATE prefix = nudge, PASS = no nudge
+    if text.upper().startswith("VIOLATION:"):
+        return True, text[len("VIOLATION:"):].strip()
+    if text.upper().startswith("UPDATE:"):
+        return True, text[len("UPDATE:"):].strip()
+    if text.upper() == "PASS":
+        return False, ""
+    return False, ""
+
+
+def _build_evaluator_prompt(evaluator_name: str, ctx: dict) -> str:
+    """Build the user-content prompt for a specific evaluator from shared context."""
+    if evaluator_name == "action_validator":
+        parts = []
+        if ctx["compacted_history"]:
+            parts.append(f"## Session History (compacted)\n{ctx['compacted_history'][:3000]}")
+        parts.append(f"## Recent Agent Activity (raw transcript tail)\n{ctx['recent_tail'][:3000]}")
+        parts.append(f"Agent name: {ctx['tab_name']}")
+        parts.append("Analyze the agent's FINAL message. Is it telling the user to do something manually?")
+        return "\n\n".join(parts)
+
+    elif evaluator_name == "plan_auditor":
+        parts = []
+        if ctx["session_doc"]:
+            parts.append(f"## Session Document\n{ctx['session_doc'][:3000]}")
+        if ctx["compacted_history"]:
+            parts.append(f"## Session History (compacted)\n{ctx['compacted_history'][:2000]}")
+        parts.append(f"## Recent Activity\n{ctx['recent_tail'][:2000]}")
+        parts.append(f"Agent name: {ctx['tab_name']}")
+        parts.append("Does the Plan section need any updates based on this activity?")
+        return "\n\n".join(parts)
+
+    return ctx["recent_tail"][:4000]
+
+
+async def _gather_evaluator_context(
+    instance_id: str,
+    session_doc_id: Optional[int],
+    transcript_tail: str,
+    tab_name: str,
+) -> dict:
+    """Build shared context dict for all stop evaluators.
+
+    Returns dict with: compacted_history, recent_tail, session_doc, tab_name.
+    """
+    ctx = {
+        "compacted_history": "",
+        "recent_tail": transcript_tail[:4000] if transcript_tail else "",
+        "session_doc": None,
+        "tab_name": tab_name,
+    }
+
+    # Fetch compacted transcripts (prior stops for this instance)
+    prefix = instance_id[:8]
+    transcript_rel = await _find_latest_transcript(prefix)
+    if transcript_rel:
+        try:
+            result = subprocess.run(
+                ["obsidian", "vault=Imperium-ENV", "read", f"path={transcript_rel}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                ctx["compacted_history"] = result.stdout[:6000]
+        except Exception:
+            pass
+
+    # Fetch session doc if linked
+    if session_doc_id:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT file_path FROM session_documents WHERE id = ?",
+                    (session_doc_id,)
+                )
+                row = await cursor.fetchone()
+                if row:
+                    fp = Path(row[0])
+                    if fp.exists():
+                        ctx["session_doc"] = fp.read_text()[:3000]
+        except Exception:
+            pass
+
+    return ctx
+
+
+async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_path: str = "") -> None:
+    """Generate a session name via MiniMax if instance still has default name.
+
+    Called on first stop. If tab_name matches "Claude HH:MM" (the default),
+    MiniMax reads the transcript tail and generates a short descriptive name.
+    The name is applied via claude-cmd /rename; the status line auto-syncs
+    it to Token-API on the next message.
+    """
+    import re as _re
+
+    instance_id = instance.get("id", "?")[:12]
+    tab_name = instance.get("tab_name", "")
+    logger.info(f"AutoName: checking {instance_id} tab_name={tab_name!r}")
+
+    # Only auto-name if still using default "Claude HH:MM" pattern
+    if not _re.match(r"^Claude \d{2}:\d{2}$", tab_name):
+        logger.info(f"AutoName: skipping {instance_id} — already named")
+        return
+
+    tmux_pane = instance.get("tmux_pane")
+    if not tmux_pane:
+        logger.info(f"AutoName: skipping {instance_id} — no tmux_pane")
+        return
+
+    # Try embedded transcript tail first, fall back to reading transcript file
+    if not transcript_tail or len(transcript_tail) < 50:
+        if transcript_path and os.path.exists(transcript_path):
+            try:
+                with open(transcript_path) as f:
+                    lines = f.readlines()
+                transcript_tail = "".join(lines[-60:])
+                logger.info(f"AutoName: read {len(transcript_tail)} chars from transcript file")
+            except Exception as e:
+                logger.warning(f"AutoName: failed to read transcript file: {e}")
+
+    if not transcript_tail or len(transcript_tail) < 50:
+        logger.info(f"AutoName: skipping {instance_id} — transcript too short ({len(transcript_tail or '')} chars)")
+        return
+
+    if minimax_limiter.remaining < 3:
+        logger.warning(f"AutoName: skipping {instance_id} — MiniMax budget low ({minimax_limiter.remaining})")
+        return
+
+    system_prompt = (
+        "Output a single kebab-case name for a coding session. "
+        "2-4 words, lowercase, hyphens only. "
+        "Examples: auth-refactor, tmux-grid-expand, fix-deploy-pipeline. "
+        "RESPOND WITH ONLY THE NAME. No explanation. No reasoning. No quotes. Just the name."
+    )
+    user_content = f"Transcript tail (last ~60 lines):\n\n{transcript_tail[:3000]}"
+
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,))
-            row = await cursor.fetchone()
-            if not row:
+        name = await minimax_chat(system_prompt, user_content, max_tokens=32)
+        name = name.strip().strip('"').strip("'").lower()
+        # Validate: must be kebab-case, 2-4 words, no spaces
+        if not _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+){1,3}$", name):
+            # MiniMax sometimes returns prose — try to extract a kebab-case name from it
+            match = _re.search(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+){1,3})\b", name)
+            if match:
+                name = match.group(1)
+                logger.info(f"AutoName: extracted {name!r} from verbose response")
+            else:
+                logger.warning(f"AutoName: MiniMax returned invalid name: {name[:100]!r}")
                 return
-        fp = Path(row[0])
-        if not fp.exists():
-            return
-        doc_content = fp.read_text()
+        logger.info(f"AutoName: naming {instance['id'][:12]} -> {name}")
 
-        # Activity Scribe — summarize what happened
-        scribe_config = SESSION_SWARM_ROLES["activity_scribe"]
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        scribe_prompt = f"""Session document:
-{doc_content[:2000]}
-
-Recent agent activity context:
-{context[:2000]}
-
-Agent name: {instance_tab_name}
-Current time: {now}
-
-Write the activity log entry."""
-
-        scribe_result = await minimax_chat(scribe_config["system"], scribe_prompt, scribe_config["max_tokens"])
-
-        if scribe_result.strip():
-            await merge_into_session_doc(
-                session_doc_id,
-                SessionDocMergeRequest(content=scribe_result, source="minimax", context="Activity scribe update")
+        # Rename via Token-API directly (faster than claude-cmd for the API side)
+        instance_id = instance["id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
+                (name, instance_id)
             )
+            await db.commit()
 
-        # Plan Auditor — check if plan needs updating
-        auditor_config = SESSION_SWARM_ROLES["plan_auditor"]
-        auditor_prompt = f"""Session document:
-{doc_content[:2000]}
-
-Recent activity just logged:
-{scribe_result[:500]}
-
-Does the Plan section need any updates based on this activity?"""
-
-        auditor_result = await minimax_chat(auditor_config["system"], auditor_prompt, auditor_config["max_tokens"])
-
-        if auditor_result.strip() and "NO_UPDATE" not in auditor_result:
-            await merge_into_session_doc(
-                session_doc_id,
-                SessionDocMergeRequest(content=f"Plan audit note: {auditor_result}", source="minimax", context="Plan auditor finding")
+        # Also rename in Claude Code UI via tmux
+        device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+        rename_cmd = f"/rename {name}"
+        if device_id == LOCAL_DEVICE_NAME:
+            proc = await asyncio.create_subprocess_exec(
+                "claude-cmd", "--pane", tmux_pane, rename_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-
-        logger.info(f"Session swarm completed for doc {session_doc_id}")
-
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+        else:
+            # WSL: deliver via satellite /tmux/send-keys
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    await client.post(
+                        f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/send-keys",
+                        json={"pane": tmux_pane, "command": rename_cmd},
+                    )
+            except Exception as e:
+                logger.warning(f"AutoName: satellite delivery failed: {e}")
     except Exception as e:
-        logger.error(f"Session swarm failed for doc {session_doc_id}: {e}")
+        logger.error(f"AutoName: failed for {instance.get('id', '?')[:12]}: {e}")
+
+
+async def _run_stop_evaluators(
+    instance_id: str,
+    session_doc_id: Optional[int],
+    transcript_tail: str,
+    tab_name: str,
+) -> None:
+    """Dispatch stop evaluators concurrently — first failure wins, cancel the rest.
+
+    All evaluators produce a binary outcome: nudge or pass. If any evaluator
+    triggers a nudge the others are irrelevant (the instance is being nudged
+    regardless), so we race them and cancel survivors on first failure.
+    """
+    # Loop prevention: skip if recently nudged
+    last_nudge = _recently_nudged.get(instance_id, 0)
+    if time.time() - last_nudge < NUDGE_COOLDOWN_SECONDS:
+        logger.info(f"StopEval: skipping {instance_id[:12]} — nudged {int(time.time() - last_nudge)}s ago")
+        return
+
+    # Rate limit check
+    if minimax_limiter.remaining < 5:
+        logger.warning(f"StopEval: skipping — MiniMax budget low ({minimax_limiter.remaining})")
+        return
+
+    # Gather shared context once
+    ctx = await _gather_evaluator_context(instance_id, session_doc_id, transcript_tail, tab_name)
+
+    # Fire all applicable evaluators concurrently
+    tasks: dict[str, asyncio.Task] = {}
+    for name, config in STOP_EVALUATORS.items():
+        if config.get("requires_session_doc") and not ctx["session_doc"]:
+            continue
+        prompt = _build_evaluator_prompt(name, ctx)
+        tasks[name] = asyncio.create_task(
+            minimax_chat(config["system"], prompt, config["max_tokens"])
+        )
+
+    if not tasks:
+        return
+
+    # Race: first nudge wins, cancel the rest
+    task_to_name = {t: n for n, t in tasks.items()}
+    pending = set(tasks.values())
+    nudge_evaluator = None
+    nudge_finding = None
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            name = task_to_name[task]
+            try:
+                text = task.result()
+            except Exception as e:
+                logger.error(f"StopEval: {name} failed for {instance_id[:12]}: {e}")
+                continue
+
+            should_nudge, finding = _parse_evaluator_result(name, text)
+            if should_nudge and finding:
+                nudge_evaluator = name
+                nudge_finding = finding
+                logger.info(f"StopEval: {name} triggered for {instance_id[:12]}: {finding[:100]}")
+                # Cancel all remaining evaluators — nudge decision is made
+                for t in pending:
+                    t.cancel()
+                pending = set()
+                break
+            else:
+                logger.info(f"StopEval: {name} passed for {instance_id[:12]}")
+
+    if not nudge_finding:
+        # All evaluators passed — clear cooldown
+        _recently_nudged.pop(instance_id, None)
+        return
+
+    # Append finding to transcript file
+    label = nudge_evaluator.replace("_", " ").title()
+    nudge_message = f"[{label}] {nudge_finding}"
+
+    transcript_rel = await _find_latest_transcript(instance_id[:8])
+    if transcript_rel:
+        audit_section = f"\n\n## Evaluator Finding\n\n**{nudge_evaluator}**: {nudge_finding}\n"
+        try:
+            subprocess.run(
+                ["obsidian", "vault=Imperium-ENV", "append",
+                 f"path={transcript_rel}", f"content={audit_section}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            pass
+
+    # Record nudge timestamp BEFORE nudging
+    _recently_nudged[instance_id] = time.time()
+
+    # Nudge the instance
+    try:
+        await _nudge_instance(instance_id, reason=nudge_message)
+    except Exception as e:
+        logger.warning(f"StopEval: nudge failed for {instance_id[:12]}: {e}")
+
+
+async def _find_latest_transcript(instance_id_short: str) -> str | None:
+    """Find the most recent transcript file for an instance (by glob on prefix)."""
+    import glob as _glob
+    pattern = f"Mars/Logs/Transcripts/{instance_id_short}-*.md"
+    try:
+        result = subprocess.run(
+            ["obsidian", "vault=Imperium-ENV", "search", f"query=path:{pattern}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Fallback: glob on disk
+        disk_pattern = str(Path.home() / "Imperium-ENV" / pattern)
+        matches = sorted(_glob.glob(disk_pattern), reverse=True)
+        if not matches:
+            # Also check NAS path
+            nas_pattern = f"/Volumes/Imperium/Imperium-ENV/{pattern}"
+            matches = sorted(_glob.glob(nas_pattern), reverse=True)
+        if matches:
+            # Return vault-relative path
+            for m in matches:
+                parts = Path(m).parts
+                for i, p in enumerate(parts):
+                    if p.lower().endswith("-env"):
+                        return str(Path(*parts[i + 1:]))
+        return None
+    except Exception:
+        return None
 
 
 # Valid session doc status transitions (from → set of valid targets)
