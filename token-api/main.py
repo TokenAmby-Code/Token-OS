@@ -2888,7 +2888,12 @@ async def golden_throne_followup(session_id: str):
         except Exception:
             current_cmd = ""
 
-        if current_cmd and "claude" in current_cmd.lower():
+        # On Mac, pane_current_command shows version string (e.g. "2.1.88") not "claude"
+        cmd_is_claude = current_cmd and (
+            "claude" in current_cmd.lower()
+            or (current_cmd[0:1].isdigit() and "." in current_cmd)  # version string like "2.1.88"
+        )
+        if cmd_is_claude:
             # Claude alive in pane — inject SOP via claude-cmd send-keys
             try:
                 proc = await asyncio.create_subprocess_exec(
