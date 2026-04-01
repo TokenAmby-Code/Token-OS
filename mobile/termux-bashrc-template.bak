@@ -60,10 +60,10 @@ ssh-mini() {
 alias sshmini="ssh-mini"
 
 # Fetch and update .bashrc from desktop
-alias fetch-bashrc='ssh token@${WSL_IP} "cat /home/token/Scripts/mobile/termux-bashrc-template" > ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"'
+alias fetch-bashrc='ssh token@${WSL_IP} "cat /mnt/imperium/Scripts/mobile/termux-bashrc-template" > ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"'
 
 # Fetch and update termux.properties from desktop
-alias fetch-properties='ssh token@${WSL_IP} "cat /home/token/Scripts/mobile/termux-properties-template" > ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"'
+alias fetch-properties='ssh token@${WSL_IP} "cat /mnt/imperium/Scripts/mobile/termux-properties-template" > ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"'
 
 # ====================================================
 # HISTORY

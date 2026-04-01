@@ -1,0 +1,89 @@
+name: "Constraint Probes"
+category: "Debug"
+description: |
+  Constrained shell log probes for debugging Notify macro.
+  Import, then copy the if-blocks into Notify's dictionary loop.
+  Each if-block mirrors the constraint on the real action.
+enabled: false
+
+triggers:
+  - type: http_server
+    identifier: "constraint-probe"
+    send_response: true
+    query_params_dict: "request-params"
+
+variables:
+  - name: request-params
+    type: dictionary
+    value: {}
+
+actions:
+  # ── Entry log ──
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [PROBE] entry qs={http_query_string}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── Pavlok constraint probe ──
+  # Mirrors: SendIntent constrained on key matches (vibe|beep) AND val > 0
+  - type: if
+    conditions:
+      - type: variable
+        var_type: string
+        variable: "iterator_dictionary_key"
+        comparison: equals
+        value: "(vibe|beep)"
+        regex: true
+        case_sensitive: false
+      - type: variable
+        var_type: integer
+        variable: "iterator_value"
+        comparison: greater_than
+        value: "0"
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [CONSTRAINT] pavlok PASS key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+  - type: end_if
+
+  # ── Banner constraint probe ──
+  # Mirrors: Notification constrained on key == banner_text
+  - type: if
+    conditions:
+      - type: variable
+        var_type: string
+        variable: "iterator_dictionary_key"
+        comparison: equals
+        value: "banner_text"
+        case_sensitive: false
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [CONSTRAINT] banner PASS key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+  - type: end_if
+
+  # ── TTS constraint probe ──
+  # Mirrors: Speak constrained on key == tts_text
+  - type: if
+    conditions:
+      - type: variable
+        var_type: string
+        variable: "iterator_dictionary_key"
+        comparison: equals
+        value: "tts_text"
+        case_sensitive: false
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [CONSTRAINT] tts PASS key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+  - type: end_if
+
+  # ── Done ──
+  - type: notification
+    title: "Constraint Probes"
+    text: "Import complete. Copy if-blocks into Notify loop."
+    channel_type: 3
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "constraint probes imported"}'

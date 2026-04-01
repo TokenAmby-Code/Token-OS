@@ -77,9 +77,6 @@ ssh-connect() {
         if [[ $# -gt 0 ]]; then
             ssh "$HOST" -t "$*"
             break
-        elif [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
-            # Forward OAuth token so Claude Code works on the remote host
-            ssh -t "$HOST" "export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}'; exec zsh -l"
         else
             ssh "$HOST"
         fi
@@ -107,23 +104,218 @@ alias sshpc="ssh-wsl"
 alias sshmac="ssh-mac"
 alias sshmini="ssh-mac"
 
-# Clear old aliases to prevent syntax errors when transitioning alias→function
-unalias fetch-bashrc fetch-properties 2>/dev/null
+# Pull configs from NAS (reverse path via Mac — inefficient but reliable backup)
+fetch-mobile() { ssh -t mac "push-mobile -b"; }
+alias fetch-bashrc="fetch-mobile"
 
-# Fetch and update .bashrc from Mac (syncs WSL→Mac first, then copies)
-fetch-bashrc() {
-    echo "Syncing Scripts repo (WSL → Mac)..."
-    ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
-    echo "Fetching bashrc from Mac..."
-    scp mac:~/Scripts/mobile/termux-bashrc-template ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"
+
+# ====================================================
+# TMUX — local session + remote attach
+# ====================================================
+# is_portable_monitor: true when terminal is wide enough to be an external display.
+# Threshold 150 cols: phone portrait ~80, landscape ~130, portable monitor 200+.
+# tput cols queries the terminal directly — avoids stale COLUMNS at launch time.
+# Manual override: ~/.portable_monitor forces on; ~/.no_portable_monitor forces off.
+is_portable_monitor() {
+    [[ -f "$HOME/.portable_monitor" ]] && return 0
+    [[ -f "$HOME/.no_portable_monitor" ]] && return 1
+    local cols
+    cols=$(tput cols 2>/dev/null) || cols=${COLUMNS:-0}
+    [[ "$cols" -gt 150 ]]
 }
 
-# Fetch and update termux.properties from Mac (syncs WSL→Mac first, then copies)
-fetch-properties() {
-    echo "Syncing Scripts repo (WSL → Mac)..."
-    ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
-    echo "Fetching termux.properties from Mac..."
-    scp mac:~/Scripts/mobile/termux-properties-template ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"
+# _write_termux_props MODE — write a complete termux.properties and reload settings.
+# Modes: mobile-nav (true mobile, small keys), portable-nav (monitor, large keys),
+#        portable-pager (monitor, window-number keys + nav, large keys).
+# The swap button in portable toolbars uses ^U + command so it fires cleanly at a prompt.
+_write_termux_props() {
+    local mode="$1"
+    local f="$HOME/.termux/termux.properties"
+    case "$mode" in
+        mobile-nav)
+            cat > "$f" << 'PROPS'
+# ~/.termux/termux.properties — mobile-nav toolbar (true mobile, 3 rows, key-height:40)
+extra-keys = [ \
+  ['DRAWER', {macro: "\u001b[Z", display: '⇧Tab'}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "tmux capture-pane -p | termux-clipboard-set\n", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
+]
+extra-keys-style = key-height:40,key-gap:0,key-border:0
+terminal-transcript-rows = 10000
+enforce-char-based-input = true
+volume-keys = volume
+PROPS
+            ;;
+        portable-nav)
+            cat > "$f" << 'PROPS'
+# ~/.termux/termux.properties — portable-nav toolbar (portable monitor, 2 rows, large keys)
+# ⇄ swaps to portable-pager toolbar (window numbers + nav keys)
+# 2 rows (vs 3 on mobile) with tall keys + visible borders = unmistakable difference
+extra-keys = [ \
+  [{macro: "\u0015toggle-toolbar\n", display: '⇄'}, 'ESC', {key: 'CTRL', popup: 'SHIFT'}, {key: 'ALT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
+]
+extra-keys-style = key-height:90,key-gap:4,key-border:1
+terminal-transcript-rows = 10000
+enforce-char-based-input = true
+volume-keys = volume
+PROPS
+            ;;
+        portable-pager)
+            cat > "$f" << 'PROPS'
+# ~/.termux/termux.properties — portable-pager toolbar (window numbers + nav, large keys)
+# Row 1: tmux windows 1-5, ⇄ swaps back to portable-nav
+# Row 2: prev/next window, detach, zoom, rename, kill-pane, ESC
+# All tmux keys use prefix (\u0000 = ^Space)
+extra-keys = [ \
+  [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u00005", display: '5'}, {macro: "\u0015toggle-toolbar\n", display: '⇄'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{macro: "\u0000p", display: '←prev'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000z", display: 'zoom'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, 'ESC'] \
+]
+extra-keys-style = key-height:90,key-gap:4,key-border:1
+terminal-transcript-rows = 10000
+enforce-char-based-input = true
+volume-keys = volume
+PROPS
+            ;;
+        *)
+            echo "_write_termux_props: unknown mode '$mode'" >&2
+            return 1
+            ;;
+    esac
+    echo "$mode" > "$HOME/.toolbar-mode"
+    termux-reload-settings
+    echo "Toolbar: $mode"
+}
+
+# toggle-toolbar: swap between portable-nav and portable-pager toolbars.
+# Called by the ⇄ button in both portable toolbars.
+toggle-toolbar() {
+    local current
+    current=$(cat "$HOME/.toolbar-mode" 2>/dev/null || echo "portable-nav")
+    if [[ "$current" == "portable-nav" ]]; then
+        _write_termux_props portable-pager
+    else
+        _write_termux_props portable-nav
+    fi
+}
+
+# portable-monitor: manual override for is_portable_monitor detection.
+# on: portable-nav toolbar (large keys) + reconnect to main session.
+# off: mobile-nav toolbar (original keys) + reconnect to phone session.
+# auto: clear overrides, restore auto-detection.
+# Usage: portable-monitor on|off|auto
+portable-monitor() {
+    case "$1" in
+        on)
+            touch "$HOME/.portable_monitor"
+            rm -f "$HOME/.no_portable_monitor"
+            echo "Portable monitor: ON"
+            _write_termux_props portable-nav
+            # Sync state to Mac for TUI sliver (skip if called from Mac via SSH)
+            [[ -z "$SSH_CONNECTION" ]] && ssh mini "echo on > ~/.portable_monitor_state" 2>/dev/null &
+            ;;
+        off)
+            touch "$HOME/.no_portable_monitor"
+            rm -f "$HOME/.portable_monitor"
+            echo "Portable monitor: OFF"
+            _write_termux_props mobile-nav
+            # Sync state to Mac for TUI sliver (skip if called from Mac via SSH)
+            [[ -z "$SSH_CONNECTION" ]] && ssh mini "echo off > ~/.portable_monitor_state" 2>/dev/null &
+            ;;
+        auto|"")
+            rm -f "$HOME/.portable_monitor" "$HOME/.no_portable_monitor"
+            echo "Portable monitor: AUTO ($(is_portable_monitor && echo detected || echo not detected))"
+            return 0
+            ;;
+        *)
+            echo "Usage: portable-monitor on|off|auto" >&2
+            return 1
+            ;;
+    esac
+
+    # If called remotely (e.g. Mac SSHing in to flip the flag), skip reconnect —
+    # the caller is already in the right session and just wants the flag + toolbar updated.
+    [[ -n "$SSH_CONNECTION" ]] && return 0
+
+    # Reconnect to mac with updated mode.
+    # In tx pane: respawn this pane with mac — kills current process, restarts clean.
+    # Bare Termux: call mac() directly (full session selection path).
+    if [[ -n "$TMUX" ]]; then
+        tmux respawn-pane -k -t "$TMUX_PANE" "bash -ic mac"
+    else
+        echo "Reconnecting..."
+        mac
+    fi
+}
+
+# tx / t: local tmux with 2 vertically-split raw terminals. No SSH, no remote attach.
+tx() {
+    if tmux has-session -t local 2>/dev/null; then
+        tmux attach -t local
+        return
+    fi
+
+    tmux new-session -d -s local
+    tmux split-window -v -t local:0
+    tmux select-pane -t local:0.0
+    tmux attach -t local
+}
+alias t=tx
+
+# mac: SSH to Mac. From tx panes → plain SSH. Standalone → SSH then attach tmux.
+# Portable monitor → main session (full workspace).
+# Phone → grouped session 'phone' on main:mobile-1 with keyboard auto-zoom hook.
+# SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
+mac() {
+    if [[ -n "$TMUX" ]]; then
+        # Session selection even from tx pane — respects portable monitor flag.
+        if is_portable_monitor; then
+            ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
+        else
+            ssh mac
+        fi
+        return
+    fi
+
+    local _mac_attach
+    if is_portable_monitor; then
+        _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
+    else
+        _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 \\; set-hook client-resized 'run-shell tmux-mobile-keyboard' 2>/dev/null || exec zsh -il"
+    fi
+
+    local retries=0
+    while true; do
+        ssh -t mac "$_mac_attach"
+        local exit_code=$?
+
+        # Exit code 0 = clean disconnect (user detached). Don't retry.
+        [[ $exit_code -eq 0 ]] && break
+
+        # SSH failed — likely a dropped connection. Retry up to 3 times
+        # with a brief delay to allow transient network issues to resolve.
+        ((retries++))
+        if [[ $retries -ge 3 ]]; then
+            echo "Connection lost after $retries attempts."
+            break
+        fi
+        echo "Connection dropped, reconnecting (attempt $retries/3)..."
+        sleep 2
+    done
+}
+
+# wsl: SSH to WSL. From tx panes → plain SSH. Standalone → SSH then attach tmux.
+# Portable monitor → main session (full workspace).
+# Phone → grouped session 'phone' on main:mobile-1 with keyboard auto-zoom hook.
+# SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
+wsl() {
+    if [[ -n "$TMUX" ]]; then
+        ssh wsl
+    elif is_portable_monitor; then
+        ssh -t wsl "bash -ic 'tmux attach -t main 2>/dev/null || tx start'"
+    else
+        ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 \\; set-hook client-resized 'run-shell tmux-mobile-keyboard' 2>/dev/null || exec bash -il"
+    fi
 }
 
 # ====================================================
@@ -319,13 +511,10 @@ alias python="python3"
 
 # cdc - run claude on Mac (not installed on phone) with optional path/args
 # Uses zsh -il (interactive login) so Mac sources ~/.zprofile (PATH) + ~/.zshrc (aliases)
-# CLAUDE_CODE_OAUTH_TOKEN is forwarded automatically by ssh-connect
+# Note: Mac has its own OAuth credentials — don't forward CLAUDE_CODE_OAUTH_TOKEN
+# (env var overrides stored credentials, and phone token may be stale)
 cdc() {
-    if [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
-        ssh -t mac "export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'; zsh -il -c 'cdc $*'"
-    else
-        ssh -t mac "zsh -il -c 'cdc $*'"
-    fi
+    ssh -t mac "zsh -il -c 'cdc $*'"
 }
 
 # ====================================================
@@ -459,12 +648,6 @@ shutdown-mini() {
 }
 
 # ====================================================
-# AUTO-SSH TO MAC ON STARTUP
+# STARTUP
 # ====================================================
-# Start in SSH session to Mac by default. Use 'exit' to access local phone.
-# Guard: only auto-SSH when opening Termux locally on the phone.
-# Skip if incoming SSH session (SSH_CONNECTION set) or non-interactive shell.
-if [[ -z "$SSH_CONNECTION" ]] && [[ $- == *i* ]] && [[ -z "$__AUTO_SSH_DONE" ]]; then
-    export __AUTO_SSH_DONE=1
-    ssh-connect mac
-fi
+# No auto-launch. Use `tx` for local terminals, `mac`/`wsl` to connect remote.
