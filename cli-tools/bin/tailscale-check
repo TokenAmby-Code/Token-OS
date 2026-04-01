@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# tailscale-check - Verify Tailscale is running, attempt restart if not
+# TAGS: network, tailscale, infra
+# AUDIENCE: human, agent
+"""Check Tailscale status and attempt restart if toggled off or down.
+
+Usage:
+    tailscale-check              # Check status, restart if down
+    tailscale-check --status     # Status check only, no restart
+    tailscale-check --json       # JSON output
+    tailscale-check --quiet      # Exit 0 if up, 1 if down (no output)
+
+Exit codes:
+    0 - Tailscale is up and connected
+    1 - Tailscale is down or could not be restarted
+    2 - Tailscale is up but some peers are offline (informational)
+"""
+
+import json
+import subprocess
+import sys
+
+TAILSCALE = "/opt/homebrew/bin/tailscale"
+BREW = "/opt/homebrew/bin/brew"
+
+
+def run(cmd, timeout=10):
+    """Run a command, return (returncode, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def get_tailscale_status():
+    """Return parsed Tailscale status dict, or None if CLI not available."""
+    rc, out, err = run([TAILSCALE, "status", "--json"])
+    if rc != 0:
+        return None, err
+    try:
+        return json.loads(out), None
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error: {e}"
+
+
+def is_tailscale_running():
+    """Check if tailscaled daemon is running via launchctl."""
+    rc, out, _ = run(["launchctl", "list", "homebrew.mxcl.tailscale"])
+    return rc == 0
+
+
+def restart_tailscale():
+    """Attempt to restart Tailscale via brew services."""
+    rc, out, err = run([BREW, "services", "restart", "tailscale"], timeout=30)
+    return rc == 0, out or err
+
+
+def check_and_restart(status_only=False, quiet=False, json_output=False):
+    status, err = get_tailscale_status()
+
+    result = {
+        "up": False,
+        "backend_state": None,
+        "self_ip": None,
+        "peers_total": 0,
+        "peers_online": 0,
+        "restarted": False,
+        "restart_success": None,
+        "error": err,
+    }
+
+    if status:
+        backend = status.get("BackendState", "Unknown")
+        result["backend_state"] = backend
+        result["up"] = backend in ("Running", "NeedsLogin")
+
+        # Self node info
+        self_node = status.get("Self", {})
+        addrs = self_node.get("TailscaleIPs", [])
+        result["self_ip"] = addrs[0] if addrs else None
+
+        # Peer stats
+        peers = status.get("Peer", {})
+        result["peers_total"] = len(peers)
+        result["peers_online"] = sum(
+            1 for p in peers.values()
+            if p.get("Online") or p.get("LastSeen") == "2006-01-02T15:04:05Z"
+            # fall back: active is not null
+        )
+        # More reliable: count Active peers
+        result["peers_online"] = sum(
+            1 for p in peers.values()
+            if p.get("Active", False)
+        )
+    else:
+        # CLI failed — check if daemon is running
+        if not is_tailscale_running():
+            result["error"] = "tailscaled not running"
+        else:
+            result["error"] = err or "tailscale status failed"
+
+    # Attempt restart if down and not status-only
+    if not result["up"] and not status_only:
+        if not quiet:
+            print("Tailscale is down, attempting restart...", file=sys.stderr)
+        ok, msg = restart_tailscale()
+        result["restarted"] = True
+        result["restart_success"] = ok
+        if ok:
+            # Re-check after restart
+            import time
+            time.sleep(3)
+            status2, _ = get_tailscale_status()
+            if status2:
+                backend2 = status2.get("BackendState", "Unknown")
+                result["up"] = backend2 in ("Running", "NeedsLogin")
+                result["backend_state"] = backend2
+        else:
+            result["error"] = f"restart failed: {msg}"
+
+    if json_output:
+        print(json.dumps(result, indent=2))
+        return 0 if result["up"] else 1
+
+    if quiet:
+        return 0 if result["up"] else 1
+
+    # Human output
+    up = result["up"]
+    state = result["backend_state"] or "Unknown"
+    color_up = "\033[32m"
+    color_down = "\033[31m"
+    color_warn = "\033[33m"
+    reset = "\033[0m"
+
+    icon = f"{color_up}●{reset}" if up else f"{color_down}●{reset}"
+    print(f"{icon} Tailscale  {state}")
+
+    if result["self_ip"]:
+        print(f"   IP: {result['self_ip']}")
+
+    if result["peers_total"] > 0:
+        online = result["peers_online"]
+        total = result["peers_total"]
+        peer_color = color_up if online == total else color_warn
+        print(f"   Peers: {peer_color}{online}/{total} active{reset}")
+
+    if result["restarted"]:
+        if result["restart_success"] and result["up"]:
+            print(f"   {color_up}Restarted successfully{reset}")
+        elif result["restart_success"]:
+            print(f"   {color_warn}Restart attempted, still not up{reset}")
+        else:
+            print(f"   {color_down}Restart failed: {result.get('error', '')}{reset}")
+
+    if result["error"] and not result["up"]:
+        print(f"   Error: {result['error']}", file=sys.stderr)
+
+    if not up:
+        return 1
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        sys.exit(0)
+
+    status_only = "--status" in args
+    quiet = "--quiet" in args
+    json_output = "--json" in args
+
+    sys.exit(check_and_restart(
+        status_only=status_only,
+        quiet=quiet,
+        json_output=json_output,
+    ))
+
+
+if __name__ == "__main__":
+    main()

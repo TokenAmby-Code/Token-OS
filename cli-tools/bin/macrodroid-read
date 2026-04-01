@@ -33,7 +33,7 @@ except ImportError:
 
 # Phone HTTP server for triggering exports
 PHONE_HTTP_PORT = 7777
-PHONE_TAILSCALE_IP = "100.102.92.24"
+PHONE_TAILSCALE_IP = os.environ.get("PHONE_TAILSCALE_IP", "100.102.92.24")
 PHONE_LOCAL_IP = os.environ.get("PHONE_LOCAL_IP", "192.168.0.89")
 EXPORT_ENDPOINT = "list-exports"
 DEFAULT_EXPORT_PATH = "~/macros/EXPORT.mdr"
@@ -58,19 +58,74 @@ def trigger_phone_export(timeout=5):
 
 
 def pull_export_from_phone(dest_path=None):
-    """Pull the latest .mdr export from phone via SSH."""
+    """Pull the latest .mdr export from phone via SSH.
+
+    Tries the 'phone' SSH alias first, then falls back to direct
+    Tailscale IP with explicit port. Before failing, pings Tailscale
+    to distinguish 'phone offline' from 'sshd down'.
+    """
     if dest_path is None:
         dest_path = Path.cwd() / "EXPORT.mdr"
 
+    # Attempt 1: SSH alias (respects ~/.ssh/config)
     try:
         result = subprocess.run(
-            ["scp", "-q", f"phone:{DEFAULT_EXPORT_PATH}", str(dest_path)],
+            ["scp", "-q", "-o", "ConnectTimeout=5",
+             f"phone:{DEFAULT_EXPORT_PATH}", str(dest_path)],
             capture_output=True,
-            timeout=30
+            timeout=15
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+        pass
+
+    # Attempt 2: Direct Tailscale IP with explicit port
+    print("  SCP via alias failed, trying direct Tailscale IP...", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["scp", "-q", "-P", "8022", "-o", "ConnectTimeout=5",
+             f"{PHONE_TAILSCALE_IP}:{DEFAULT_EXPORT_PATH}", str(dest_path)],
+            capture_output=True,
+            timeout=15
+        )
+        if result.returncode == 0:
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Attempt 3: Hit /sshd endpoint to wake it, then retry
+    print("  Direct SCP failed, hitting /sshd to wake SSH daemon...", file=sys.stderr)
+    try:
+        url = f"http://{PHONE_TAILSCALE_IP}:{PHONE_HTTP_PORT}/sshd"
+        with urlopen(url, timeout=5) as resp:
+            resp.read()
+        time.sleep(2)
+        result = subprocess.run(
+            ["scp", "-q", "-P", "8022", "-o", "ConnectTimeout=5",
+             f"{PHONE_TAILSCALE_IP}:{DEFAULT_EXPORT_PATH}", str(dest_path)],
+            capture_output=True,
+            timeout=15
+        )
+        if result.returncode == 0:
+            return True
+    except (URLError, TimeoutError, OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Diagnostics: ping Tailscale to explain the failure
+    try:
+        ping = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", PHONE_TAILSCALE_IP],
+            capture_output=True, timeout=5
+        )
+        if ping.returncode == 0:
+            print(f"  Phone reachable via Tailscale but SSH/SCP failed (sshd may be down)", file=sys.stderr)
+        else:
+            print(f"  Phone unreachable via Tailscale (offline or VPN down)", file=sys.stderr)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print(f"  Could not ping phone at {PHONE_TAILSCALE_IP}", file=sys.stderr)
+
+    return False
 
 
 def refresh_export(dest_path=None):

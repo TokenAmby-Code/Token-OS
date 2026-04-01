@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# mewgenics-capture - Timed screenshot loop for Mewgenics cat data capture
+# TAGS: mewgenics, screenshot, capture, gaming
+# AUDIENCE: human
+#
+# Takes screenshots on a timed interval while you manually click through
+# cat stat screens and gene pages. Screenshots are timestamped and stored
+# in a session directory for later parsing.
+#
+# Usage:
+#   mewgenics-capture [options]
+#
+# Options:
+#   --interval <secs>   Seconds between captures (default: 3)
+#   --output <dir>      Output directory (default: /tmp/mewgenics-capture/<timestamp>)
+#   --window <name>     Capture specific window by process name (default: full screen)
+#   --session <name>    Session name for the output folder (default: timestamp)
+#   -h, --help          Show this help
+
+set -euo pipefail
+
+# ── Colors / logging ─────────────────────────────────────────────────────────
+
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+DIM='\033[2m'
+NC='\033[0m'
+
+log()   { printf "${CYAN}[mewgenics]${NC} %s\n" "$1" >&2; }
+warn()  { printf "${YELLOW}[mewgenics]${NC} %s\n" "$1" >&2; }
+ok()    { printf "${GREEN}[mewgenics]${NC} %s\n" "$1" >&2; }
+error() { printf "${RED}[mewgenics]${NC} %s\n" "$1" >&2; }
+dim()   { printf "${DIM}[mewgenics]${NC} %s\n" "$1" >&2; }
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+mewgenics-capture - Timed screenshot loop for Mewgenics
+
+Takes screenshots at a regular interval while you click through cat stats,
+gene pages, and other screens. All captures go into a timestamped session
+directory for later OCR/parsing.
+
+Usage:
+  mewgenics-capture [options]
+
+Options:
+  --interval <secs>   Seconds between captures (default: 3)
+  --output <dir>      Base output directory (default: /tmp/mewgenics-capture)
+  --window <name>     Capture specific window by process name (default: full screen)
+  --session <name>    Session name for subfolder (default: YYYYMMDD-HHMMSS)
+  -h, --help          Show this help
+
+Controls:
+  Ctrl+C              Stop capturing
+
+Examples:
+  mewgenics-capture                          # 3s interval, full screen
+  mewgenics-capture --interval 2             # faster capture
+  mewgenics-capture --session fight-club     # named session
+  mewgenics-capture --window Mewgenics       # capture game window only
+
+Output structure:
+  /tmp/mewgenics-capture/<session>/
+    001_20260326-141523.png
+    002_20260326-141526.png
+    ...
+EOF
+    exit 0
+fi
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+INTERVAL=3
+OUTPUT_BASE="/tmp/mewgenics-capture"
+WINDOW=""
+SESSION=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --interval)
+            [[ -z "${2:-}" ]] && { error "--interval requires a value"; exit 1; }
+            INTERVAL="$2"; shift 2 ;;
+        --output)
+            [[ -z "${2:-}" ]] && { error "--output requires a value"; exit 1; }
+            OUTPUT_BASE="$2"; shift 2 ;;
+        --window)
+            [[ -z "${2:-}" ]] && { error "--window requires a value"; exit 1; }
+            WINDOW="$2"; shift 2 ;;
+        --session)
+            [[ -z "${2:-}" ]] && { error "--session requires a value"; exit 1; }
+            SESSION="$2"; shift 2 ;;
+        *)
+            error "Unknown option: $1"
+            echo "Run 'mewgenics-capture --help' for usage." >&2
+            exit 1 ;;
+    esac
+done
+
+# ── Validate ──────────────────────────────────────────────────────────────────
+
+if ! [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || (( $(echo "$INTERVAL <= 0" | bc -l) )); then
+    error "--interval must be a positive number (got: $INTERVAL)"
+    exit 1
+fi
+
+if ! command -v powershell.exe >/dev/null 2>&1; then
+    error "powershell.exe not found — requires WSL2 with Windows interop"
+    exit 1
+fi
+
+# ── Setup session directory ──────────────────────────────────────────────────
+
+if [[ -z "$SESSION" ]]; then
+    SESSION="$(date +%Y%m%d-%H%M%S)"
+fi
+SESSION_DIR="${OUTPUT_BASE}/${SESSION}"
+mkdir -p "$SESSION_DIR"
+
+log "Session: $SESSION"
+log "Output:  $SESSION_DIR"
+log "Interval: ${INTERVAL}s"
+if [[ -n "$WINDOW" ]]; then
+    log "Window: $WINDOW"
+else
+    log "Mode: full screen (primary monitor)"
+fi
+echo "" >&2
+
+# ── Build PowerShell capture script ──────────────────────────────────────────
+
+if [[ -n "$WINDOW" ]]; then
+    # Window-specific capture using PrintWindow (same as obsidian-screenshot)
+    PS_CAPTURE_FN=$(cat << 'PSEOF'
+Add-Type @"
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public class WindowCapture {
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    public static void Capture(IntPtr hWnd, string path) {
+        RECT rect;
+        GetWindowRect(hWnd, out rect);
+        int w = rect.Right - rect.Left;
+        int h = rect.Bottom - rect.Top;
+        if (w <= 0 || h <= 0) throw new Exception("Window has zero size");
+        var bmp = new Bitmap(w, h);
+        var g = Graphics.FromImage(bmp);
+        IntPtr hdc = g.GetHdc();
+        PrintWindow(hWnd, hdc, 2);
+        g.ReleaseHdc(hdc);
+        bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+        g.Dispose(); bmp.Dispose();
+    }
+}
+"@ -ReferencedAssemblies System.Drawing
+PSEOF
+    )
+else
+    # Full primary monitor capture using CopyFromScreen
+    PS_CAPTURE_FN=$(cat << 'PSEOF'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+PSEOF
+    )
+fi
+
+# ── Capture function ─────────────────────────────────────────────────────────
+
+capture_frame() {
+    local seq="$1"
+    local timestamp
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    local filename
+    filename="$(printf '%03d_%s.png' "$seq" "$timestamp")"
+    local linux_path="${SESSION_DIR}/${filename}"
+    local win_path
+    win_path="$(wslpath -w "$linux_path")"
+
+    if [[ -n "$WINDOW" ]]; then
+        powershell.exe -NoProfile -NonInteractive -Command "
+${PS_CAPTURE_FN}
+\$proc = Get-Process -Name '${WINDOW}' -ErrorAction SilentlyContinue |
+         Where-Object { \$_.MainWindowHandle -ne 0 } |
+         Select-Object -First 1
+if (-not \$proc) { Write-Error 'Window not found: ${WINDOW}'; exit 1 }
+[WindowCapture]::Capture(\$proc.MainWindowHandle, '${win_path}')
+" 2>&1 | grep -v "^$" >&2
+    else
+        powershell.exe -NoProfile -NonInteractive -Command "
+${PS_CAPTURE_FN}
+\$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+\$bmp = New-Object System.Drawing.Bitmap(\$bounds.Width, \$bounds.Height)
+\$g = [System.Drawing.Graphics]::FromImage(\$bmp)
+\$g.CopyFromScreen(\$bounds.Location, [System.Drawing.Point]::Empty, \$bounds.Size)
+\$bmp.Save('${win_path}', [System.Drawing.Imaging.ImageFormat]::Png)
+\$g.Dispose(); \$bmp.Dispose()
+" 2>&1 | grep -v "^$" >&2
+    fi
+
+    if [[ -f "$linux_path" ]]; then
+        local size
+        size=$(du -sh "$linux_path" 2>/dev/null | cut -f1)
+        ok "#${seq} ${filename} (${size})"
+        # short high beep = success
+        powershell.exe -NoProfile -NonInteractive -Command "[console]::beep(1200,80)" 2>/dev/null &
+        return 0
+    else
+        warn "#${seq} capture failed"
+        # low double beep = failure
+        powershell.exe -NoProfile -NonInteractive -Command "[console]::beep(400,150); Start-Sleep -Milliseconds 100; [console]::beep(400,150)" 2>/dev/null &
+        return 1
+    fi
+}
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+
+COUNT=0
+FAIL=0
+
+cleanup() {
+    echo "" >&2
+    log "Stopped after ${COUNT} captures (${FAIL} failed)"
+    log "Screenshots: $SESSION_DIR"
+    printf '%s\n' "$SESSION_DIR"
+    exit 0
+}
+trap cleanup INT TERM
+
+ok "Capturing... (Ctrl+C to stop)"
+echo "" >&2
+
+while true; do
+    COUNT=$((COUNT + 1))
+    if ! capture_frame "$COUNT"; then
+        FAIL=$((FAIL + 1))
+    fi
+    sleep "$INTERVAL"
+done

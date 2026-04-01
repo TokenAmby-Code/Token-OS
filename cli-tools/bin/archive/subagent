@@ -4,4 +4,4 @@
 
 set -euo pipefail
 
-exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" subagent "$@"
+exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" subagent "$@"

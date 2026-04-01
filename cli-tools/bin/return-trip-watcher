@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# return-trip-watcher - Daemon that watches for SSH exit in a relay pane and restarts Claude
+# TAGS: instance, tmux, recovery
+# AUDIENCE: agent
+#
+# Spawned on WSL by the Mac return-trip code. Watches the relay pane for SSH to die,
+# then sends the restart command to resume Claude locally.
+#
+# Reads from:
+#   ~/.claude/transplant-pending/relay-origin       (pane ID, session info, fallback)
+#   ~/.claude/transplant-pending/return-trip-restart (restart command from Mac)
+#
+# Writes:
+#   ~/.claude/transplant-pending/recovery.log       (all activity)
+#   ~/.claude/transplant-pending/return-trip-watcher.pid
+
+set -euo pipefail
+
+PENDING_DIR="${HOME}/.claude/transplant-pending"
+ORIGIN_FILE="${PENDING_DIR}/relay-origin"
+RESTART_FILE="${PENDING_DIR}/return-trip-restart"
+PID_FILE="${PENDING_DIR}/return-trip-watcher.pid"
+RECOVERY_LOG="${PENDING_DIR}/recovery.log"
+
+POLL_INTERVAL=1       # seconds between checks
+POLL_TIMEOUT=7200     # 120 minutes max wait
+VERIFY_DELAY_1=8      # first verification delay
+VERIFY_DELAY_2=5      # second verification delay
+
+# --- Logging ---
+log() {
+    local level="$1" msg="$2"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$PENDING_DIR"
+    echo "[$ts] [RTW:$level] $msg" >> "$RECOVERY_LOG"
+}
+
+# --- TTS notification ---
+notify() {
+    local msg="$1"
+    log "NOTIFY" "$msg"
+    if command -v tts &>/dev/null; then
+        tts "Return trip: $msg" &>/dev/null &
+    fi
+}
+
+# --- PID file management ---
+check_existing() {
+    if [[ -f "$PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            log "SKIP" "Another return-trip-watcher already running (PID $old_pid)"
+            exit 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+}
+
+write_pid() {
+    echo "$$" > "$PID_FILE"
+}
+
+cleanup_pid() {
+    rm -f "$PID_FILE" 2>/dev/null
+}
+trap cleanup_pid EXIT
+
+# --- Process tree walk (same logic as transplant's verify_pane_has_process) ---
+walk_children() {
+    local parent="$1" pattern="$2" max_depth="$3" depth="$4"
+    [[ $depth -ge $max_depth ]] && return 1
+    local children
+    children=$(pgrep -P "$parent" 2>/dev/null) || return 1
+    for child in $children; do
+        local cmdline
+        cmdline=$(ps -p "$child" -o args= 2>/dev/null) || continue
+        if echo "$cmdline" | grep -q "$pattern"; then
+            return 0
+        fi
+        walk_children "$child" "$pattern" "$max_depth" $((depth + 1)) && return 0
+    done
+    return 1
+}
+
+verify_pane_has_process() {
+    local pane_id="$1" pattern="$2"
+    local pane_pid
+    pane_pid=$(tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+    [[ -z "$pane_pid" ]] && return 1
+    walk_children "$pane_pid" "$pattern" 5 0
+}
+
+# --- Main ---
+
+check_existing
+write_pid
+
+log "START" "return-trip-watcher started (PID $$)"
+
+# Wait for both files to exist (restart file may arrive slightly after watcher spawns)
+wait_count=0
+while [[ ! -f "$ORIGIN_FILE" ]] || [[ ! -f "$RESTART_FILE" ]]; do
+    sleep 1
+    wait_count=$((wait_count + 1))
+    if [[ $wait_count -ge 30 ]]; then
+        log "FAIL" "Timed out waiting for input files (origin=$([[ -f "$ORIGIN_FILE" ]] && echo Y || echo N) restart=$([[ -f "$RESTART_FILE" ]] && echo Y || echo N))"
+        notify "Watcher timed out waiting for input files"
+        exit 1
+    fi
+done
+
+# Parse relay-origin file (KEY=VALUE format)
+PANE=""
+SESSION_ID=""
+FALLBACK_CMD=""
+while IFS='=' read -r key value; do
+    case "$key" in
+        PANE) PANE="$value" ;;
+        SESSION_ID) SESSION_ID="$value" ;;
+        FALLBACK_CMD) FALLBACK_CMD="$value" ;;
+    esac
+done < "$ORIGIN_FILE"
+
+# Read restart command
+RESTART_CMD=$(cat "$RESTART_FILE" 2>/dev/null)
+
+if [[ -z "$PANE" || -z "$RESTART_CMD" ]]; then
+    log "FAIL" "Missing required data: PANE='$PANE' RESTART_CMD present=$([[ -n "$RESTART_CMD" ]] && echo Y || echo N)"
+    exit 1
+fi
+
+log "INFO" "Watching pane=$PANE session=${SESSION_ID:0:12} for SSH exit"
+
+# Poll for SSH to exit from the pane
+poll_count=0
+max_polls=$((POLL_TIMEOUT / POLL_INTERVAL))
+
+while true; do
+    if ! verify_pane_has_process "$PANE" "ssh"; then
+        log "INFO" "SSH no longer running in pane $PANE (after ${poll_count}s)"
+        break
+    fi
+
+    poll_count=$((poll_count + 1))
+    if [[ $poll_count -ge $max_polls ]]; then
+        log "FAIL" "Timed out after ${POLL_TIMEOUT}s waiting for SSH to exit"
+        notify "Watcher timed out waiting for SSH exit"
+        exit 1
+    fi
+
+    sleep "$POLL_INTERVAL"
+done
+
+# Small grace period for pane to settle
+sleep 1
+
+# Clear pane and send restart
+log "INFO" "Clearing pane and sending restart command"
+
+# Exit copy-mode if active
+if [[ "$(tmux display-message -t "$PANE" -p '#{pane_in_mode}' 2>/dev/null)" == "1" ]]; then
+    tmux send-keys -t "$PANE" q
+    sleep 0.2
+    log "INFO" "Exited copy-mode"
+fi
+
+tmux send-keys -t "$PANE" "clear" Enter
+sleep 0.3
+tmux send-keys -t "$PANE" "$RESTART_CMD" Enter
+log "INFO" "Restart command sent to pane $PANE"
+
+# Verify Claude started
+sleep "$VERIFY_DELAY_1"
+if verify_pane_has_process "$PANE" "claude"; then
+    log "OK" "Claude verified in pane $PANE after return-trip restart"
+    # Clean up input files
+    rm -f "$ORIGIN_FILE" "$RESTART_FILE" 2>/dev/null
+    log "OK" "Cleaned up relay-origin and return-trip-restart files"
+    notify "Return trip successful. Claude running."
+    exit 0
+fi
+
+log "WARN" "Claude not found after ${VERIFY_DELAY_1}s — waiting ${VERIFY_DELAY_2}s more"
+sleep "$VERIFY_DELAY_2"
+
+if verify_pane_has_process "$PANE" "claude"; then
+    log "OK" "Claude verified in pane $PANE (second check)"
+    rm -f "$ORIGIN_FILE" "$RESTART_FILE" 2>/dev/null
+    log "OK" "Cleaned up relay-origin and return-trip-restart files"
+    notify "Return trip successful. Claude running."
+    exit 0
+fi
+
+# Restart failed — try fallback
+log "FAIL" "Claude not found after restart — firing fallback"
+tmux send-keys -t "$PANE" C-c
+sleep 0.3
+
+if [[ -n "$FALLBACK_CMD" ]]; then
+    tmux send-keys -t "$PANE" "$FALLBACK_CMD" Enter
+    log "RECOVER" "Fallback command sent to pane $PANE"
+    notify "Return trip restart failed. Original session restored."
+else
+    log "FAIL" "No fallback command available — manual recovery needed"
+    notify "Return trip failed. No fallback. Manual intervention needed."
+fi
+
+# Clean up input files even on failure
+rm -f "$ORIGIN_FILE" "$RESTART_FILE" 2>/dev/null
+
+exit 1

@@ -15,6 +15,7 @@ Examples:
     instances-clear --confirm    # Delete all stopped instances
 """
 
+import os
 import sys
 import json
 import sqlite3
@@ -22,7 +23,7 @@ from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path.home() / ".claude" / "agents.db"
-API_URL = "http://localhost:7777"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 def get_instances(include_active: bool = False):
     """Get instances from the database."""

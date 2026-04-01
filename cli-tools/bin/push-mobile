@@ -9,20 +9,21 @@
 #   push-mobile -m              # Push macros folder
 #   push-mobile -bp             # Push bashrc + properties
 #   push-mobile -a              # Push everything
-#   push-mobile --sync -b       # Sync repo (WSL↔Mac) first, then push
 #
 # Works from either WSL or Mac - just needs SSH access to phone.
 
 set -euo pipefail
 
-SCRIPTS_DIR="$HOME/Scripts"
-MOBILE_DIR="${SCRIPTS_DIR}/mobile"
+# Source machine identity for NAS paths
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+# shellcheck source=../lib/nas-path.sh
+source "${_LIB_DIR}/nas-path.sh"
+MOBILE_DIR="${SCRIPTS}/mobile"
 SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
 
 PUSH_BASHRC=false
 PUSH_PROPERTIES=false
 PUSH_MACROS=false
-DO_SYNC=false
 DRY_RUN=false
 
 GREEN='\033[0;32m'
@@ -46,11 +47,9 @@ Usage:
     push-mobile -p, --properties    Push termux.properties
     push-mobile -m, --macros        Push macros folder
     push-mobile -a, --all           Push everything
-    push-mobile --sync              Sync repo (WSL↔Mac) before pushing
     push-mobile --dry-run           Preview without doing anything
 
 Combine flags:  push-mobile -bp       (bashrc + properties)
-                push-mobile --sync -a (sync + everything)
 
 Files:
     -b  mobile/termux-bashrc-template      → phone:~/.bashrc
@@ -66,7 +65,6 @@ while [[ $# -gt 0 ]]; do
         --properties) PUSH_PROPERTIES=true; shift ;;
         --macros) PUSH_MACROS=true; shift ;;
         --all) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_MACROS=true; shift ;;
-        --sync) DO_SYNC=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -[bpma]*)
             # Parse combined short flags: -bp, -bpm, -a, etc.
@@ -96,17 +94,6 @@ fi
 if ! ssh $SSH_OPTS phone "true" 2>/dev/null; then
     log_err "Phone unreachable via SSH"
     exit 1
-fi
-
-# Optional: sync repo between WSL and Mac first
-if [[ "$DO_SYNC" == true ]]; then
-    log_info "Syncing Scripts repo..."
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would run: scripts-sync push"
-    else
-        "${SCRIPTS_DIR}/cli-tools/bin/scripts-sync" push
-    fi
-    echo ""
 fi
 
 pushed=0

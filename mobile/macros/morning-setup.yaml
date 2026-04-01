@@ -1,0 +1,79 @@
+# Morning Setup
+#
+# Manual macro — run after alarm dismiss to bootstrap the phone for the day.
+# Ensures all Imperium infrastructure is online before the morning session fires.
+#
+# Prerequisites:
+#   - Tailscale set to Always-on VPN (Settings → Network → VPN → Tailscale)
+#   - Termux installed with sshd script at ~/.termux/tasker/start-sshd.sh
+#   - Pavlok app installed (com.pavlok.pavlokv3)
+#
+# Flow:
+#   1. Start SSHD (Termux) — enables SSH access from Mac Mini
+#   2. Launch Pavlok — refreshes BLE connection for enforcement
+#   3. Verify Token-API reachable — confirms Tailscale + server are up
+#   4. Toast result — "Imperium online" or "Token-API unreachable"
+
+name: "Morning Setup"
+category: "System"
+description: "Morning bootstrap: sshd + Pavlok BLE + Token-API health check"
+enabled: true
+
+triggers:
+  - type: manual_trigger
+    # Widget button or Quick Tile — run on alarm dismiss
+
+actions:
+  # 1. Start sshd via Termux (same as boot-startup.yaml)
+  - type: shell
+    command: "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/home/.termux/tasker/start-sshd.sh' --ez com.termux.RUN_COMMAND_BACKGROUND 'true'"
+    root: false
+    block: true
+
+  - type: wait
+    seconds: 2
+
+  # 2. Launch Pavlok to refresh BLE connection
+  - type: launch_app
+    app: "Pavlok"
+    package: "com.pavlok.pavlokv3"
+
+  - type: wait
+    seconds: 3
+
+  # 3. Verify Token-API is reachable (confirms Tailscale + server)
+  - type: http_request
+    url: "http://100.95.109.23:7777/api/health"
+    method: GET
+    block: true
+    save_response: true
+
+  # 4a. Success — infrastructure is online, trigger morning session
+  - type: condition
+    if: "{http_response_code} = 200"
+    actions:
+      - type: toast
+        text: "Imperium online"
+      # 5. Trigger Custodes morning session
+      - type: http_request
+        url: "http://100.95.109.23:7777/api/morning/start"
+        method: POST
+        content_type: "application/json"
+        block: false
+      - type: shell
+        command: 'echo "{system_time} MORNING_SETUP success morning_session_triggered" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+        block: false
+
+  # 4b. Failure — Tailscale likely dropped overnight
+  - type: condition
+    if: "{http_response_code} != 200"
+    actions:
+      - type: notification
+        title: "Morning Setup Failed"
+        text: "Token-API unreachable — check Tailscale connection"
+        channel_type: 1
+      - type: toast
+        text: "Token-API unreachable — check Tailscale"
+      - type: shell
+        command: 'echo "{system_time} MORNING_SETUP failed http={http_response_code}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+        block: false

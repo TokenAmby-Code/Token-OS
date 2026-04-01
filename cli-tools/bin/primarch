@@ -4,7 +4,7 @@
 # AUDIENCE: user
 #
 # Source of truth: ~/.claude/agents.db (primarchs table)
-# Persona files: ~/Imperium-ENV/Personas/<name>.md
+# Persona files: <vault>/Personas/<name>.md
 #
 # Usage: primarch <name> [claude-flags...]
 #        primarch list
@@ -13,7 +13,18 @@
 set -euo pipefail
 
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
-VAULT_DIR="$HOME/Imperium-ENV"
+
+# Detect vault path by platform
+if [[ -d "/mnt/imperium/Imperium-ENV" ]]; then
+    VAULT_DIR="/mnt/imperium/Imperium-ENV"         # WSL
+elif [[ -d "/Volumes/Imperium/Imperium-ENV" ]]; then
+    VAULT_DIR="/Volumes/Imperium/Imperium-ENV"      # macOS (NAS mount)
+elif [[ -d "$HOME/Imperium-ENV" ]]; then
+    VAULT_DIR="$HOME/Imperium-ENV"                  # macOS (local sync)
+else
+    echo "ERROR: Cannot find Imperium-ENV vault" >&2
+    exit 1
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,19 +58,21 @@ EOF
     exit 0
 }
 
-# Resolve name or alias to canonical name
+# Resolve name or alias to canonical name (case-insensitive)
 resolve_name() {
-    local input="$1"
+    local input
+    input=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    # Direct name match
     local match
-    match=$(sqlite3 "$DB_PATH" "SELECT name FROM primarchs WHERE name = '$input' LIMIT 1;" 2>/dev/null)
+    match=$(sqlite3 "$DB_PATH" "SELECT name FROM primarchs WHERE LOWER(name) = '$input' LIMIT 1;" 2>/dev/null)
     if [[ -n "$match" ]]; then echo "$match"; return; fi
-    # Check aliases
-    sqlite3 "$DB_PATH" "SELECT name, aliases FROM primarchs;" 2>/dev/null | while IFS='|' read -r pname paliases; do
-        if echo "$paliases" | python3 -c "import json,sys; sys.exit(0 if '$input' in json.load(sys.stdin) else 1)" 2>/dev/null; then
-            echo "$pname"
-            return
-        fi
-    done
+    # Alias match via SQL JSON — avoids subshell pipe bug
+    match=$(sqlite3 "$DB_PATH" "
+        SELECT name FROM primarchs
+        WHERE LOWER(aliases) LIKE '%\"$input\"%'
+        LIMIT 1;
+    " 2>/dev/null)
+    if [[ -n "$match" ]]; then echo "$match"; return; fi
 }
 
 # List all primarchs from DB
@@ -181,5 +194,15 @@ echo -e "${DIM}Vault: ${VAULT} | Prefix: ${INSTANCE_PREFIX}${NC}"
 [[ -n "$DOC_ID" ]] && echo -e "${DIM}Session doc: #${DOC_ID}${NC}"
 echo ""
 
-# Launch claude with persona (hardcode bypass flags for script/cron contexts)
-exec ~/.local/bin/claude --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"
+# Export primarch identity so SessionStart hook can auto-link session docs
+export TOKEN_API_PRIMARCH="$PRIMARCH_NAME"
+
+# Resolve claude binary (may not be in PATH for SSH sessions)
+CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+    echo -e "${RED}Claude not found in PATH or ~/.local/bin/claude${NC}" >&2
+    exit 1
+fi
+
+# Launch claude with persona
+exec "$CLAUDE_BIN" --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"

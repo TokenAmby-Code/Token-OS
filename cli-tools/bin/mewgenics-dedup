@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""mewgenics-dedup - Deduplicate capture sessions using perceptual hashing.
+
+Compares consecutive frames and keeps only those where the screen changed
+meaningfully. Outputs unique frames to a subdirectory for downstream processing.
+
+Usage:
+    mewgenics-dedup <session-dir> [options]
+    mewgenics-dedup --all [options]
+
+Options:
+    --threshold <int>   Hash distance threshold for "same frame" (default: 8)
+                        Lower = stricter (0 = pixel-identical hashes only)
+                        Higher = more aggressive dedup (12+ merges similar screens)
+    --output <dir>      Output directory (default: <session-dir>/unique/)
+    --dry-run           Show what would be kept/dropped without copying
+    --all               Process all sessions in /tmp/mewgenics-capture/
+    -h, --help          Show this help
+"""
+
+import sys
+import os
+import shutil
+import argparse
+from pathlib import Path
+
+import imagehash
+from PIL import Image
+
+
+def log(msg):
+    print(f"\033[0;36m[mewgenics-dedup]\033[0m {msg}", file=sys.stderr)
+
+
+def ok(msg):
+    print(f"\033[0;32m[mewgenics-dedup]\033[0m {msg}", file=sys.stderr)
+
+
+def warn(msg):
+    print(f"\033[1;33m[mewgenics-dedup]\033[0m {msg}", file=sys.stderr)
+
+
+def compute_hash(path):
+    """Compute perceptual hash of an image."""
+    img = Image.open(path)
+    return imagehash.phash(img)
+
+
+def dedup_session(session_dir, output_dir, threshold, dry_run):
+    """Deduplicate a single session directory."""
+    session_dir = Path(session_dir)
+    frames = sorted(session_dir.glob("*.png"))
+
+    if not frames:
+        warn(f"No PNG files in {session_dir}")
+        return []
+
+    log(f"Session: {session_dir.name} ({len(frames)} frames)")
+
+    # Compute hashes
+    hashes = []
+    for f in frames:
+        h = compute_hash(f)
+        hashes.append((f, h))
+
+    # Walk through and keep frames where hash distance from last-kept exceeds threshold
+    kept = [hashes[0]]  # always keep first frame
+    dropped = []
+
+    for frame_path, frame_hash in hashes[1:]:
+        last_kept_hash = kept[-1][1]
+        distance = frame_hash - last_kept_hash
+        if distance > threshold:
+            kept.append((frame_path, frame_hash))
+        else:
+            dropped.append((frame_path, distance))
+
+    # Report
+    for path, dist in dropped:
+        print(f"  DROP {path.name} (distance={dist})", file=sys.stderr)
+    for path, _ in kept:
+        print(f"  KEEP {path.name}", file=sys.stderr)
+
+    ok(f"{len(kept)}/{len(frames)} unique frames (threshold={threshold})")
+
+    if dry_run:
+        log("Dry run — no files copied")
+        return [p for p, _ in kept]
+
+    # Copy unique frames to output
+    out = Path(output_dir) if output_dir else session_dir / "unique"
+    out.mkdir(parents=True, exist_ok=True)
+
+    for i, (path, _) in enumerate(kept, 1):
+        dest = out / f"{i:03d}_{path.name}"
+        shutil.copy2(path, dest)
+
+    ok(f"Unique frames → {out}")
+    return [p for p, _ in kept]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Deduplicate Mewgenics capture sessions"
+    )
+    parser.add_argument("session_dir", nargs="?", help="Session directory to process")
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=8,
+        help="Hash distance threshold (default: 8)",
+    )
+    parser.add_argument("--output", help="Output directory for unique frames")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show results without copying"
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Process all sessions in /tmp/mewgenics-capture/",
+    )
+    args = parser.parse_args()
+
+    if args.all:
+        base = Path("/tmp/mewgenics-capture")
+        sessions = sorted(
+            [d for d in base.iterdir() if d.is_dir() and d.name != "unique"]
+        )
+        if not sessions:
+            warn("No sessions found")
+            sys.exit(1)
+
+        total_kept = 0
+        total_frames = 0
+        all_unique = []
+
+        for session in sessions:
+            # Skip 'unique' subdirs inside sessions
+            if (session / "unique").exists() and not args.output:
+                pass  # still process, output goes to unique/
+            unique = dedup_session(session, args.output, args.threshold, args.dry_run)
+            total_kept += len(unique)
+            total_frames += len(list(session.glob("*.png")))
+            all_unique.extend(unique)
+            print("", file=sys.stderr)
+
+        ok(f"Total: {total_kept}/{total_frames} unique frames across {len(sessions)} sessions")
+
+        # Print unique paths to stdout for piping
+        for p in all_unique:
+            print(p)
+
+    elif args.session_dir:
+        unique = dedup_session(
+            args.session_dir, args.output, args.threshold, args.dry_run
+        )
+        for p in unique:
+            print(p)
+
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

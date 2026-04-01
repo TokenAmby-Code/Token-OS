@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# tui-screenshot — Capture the token-api TUI from its tmux pane
+# TAGS: token-api, screenshot, tmux
+# AUDIENCE: human, agent
+#
+# Finds the tmux pane running token-api-tui.py, captures its content
+# (with ANSI color), and saves as an SVG (default) or plain text file.
+#
+# Usage:
+#   tui-screenshot [options]
+#
+# Options:
+#   --pane <target>   Explicit tmux pane target (e.g. main:2.1, %7)
+#   --output <path>   Output file path (default: /tmp/tui-screenshot.svg)
+#   --format svg|txt  Output format: svg (colored) or txt (plain text)
+#   --title <text>    SVG window title (default: "Token-API TUI")
+#   --list            List all detected TUI panes and exit
+#   -h, --help        Show this help
+
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+# ── Colors / logging ──────────────────────────────────────────────────────────
+
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log()   { printf "${CYAN}[tui-screenshot]${NC} %s\n" "$1" >&2; }
+warn()  { printf "${YELLOW}[tui-screenshot]${NC} %s\n" "$1" >&2; }
+error() { printf "${RED}[tui-screenshot]${NC} %s\n" "$1" >&2; }
+ok()    { printf "${GREEN}[tui-screenshot]${NC} %s\n" "$1" >&2; }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+usage() {
+    awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+    exit 0
+}
+
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    usage
+fi
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+TOKEN_API_DIR="${IMPERIUM:-/mnt/imperium}/Scripts/token-api"
+TOKEN_API_SCRIPT="token-api-tui.py"
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+PANE_TARGET=""
+OUTPUT="/tmp/tui-screenshot.svg"
+FORMAT="svg"
+TITLE="Token-API TUI"
+LIST_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane)
+            [[ -z "${2:-}" ]] && { error "--pane requires a value"; exit 1; }
+            PANE_TARGET="$2"; shift 2 ;;
+        --output)
+            [[ -z "${2:-}" ]] && { error "--output requires a value"; exit 1; }
+            OUTPUT="$2"; shift 2 ;;
+        --format)
+            [[ -z "${2:-}" ]] && { error "--format requires a value"; exit 1; }
+            case "$2" in
+                svg|txt) FORMAT="$2" ;;
+                *) error "--format must be 'svg' or 'txt' (got: $2)"; exit 1 ;;
+            esac
+            shift 2 ;;
+        --title)
+            [[ -z "${2:-}" ]] && { error "--title requires a value"; exit 1; }
+            TITLE="$2"; shift 2 ;;
+        --list)
+            LIST_ONLY=true; shift ;;
+        *)
+            error "Unknown option: $1"
+            echo "Run 'tui-screenshot --help' for usage." >&2
+            exit 1 ;;
+    esac
+done
+
+# Expand ~ in OUTPUT
+OUTPUT="${OUTPUT/#\~/$HOME}"
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+
+if ! command -v tmux >/dev/null 2>&1; then
+    error "tmux not found"
+    exit 1
+fi
+
+if ! tmux list-sessions >/dev/null 2>&1; then
+    error "No tmux server running (or no sessions)"
+    exit 1
+fi
+
+if [[ "$FORMAT" == "svg" ]]; then
+    if ! python3 -c "import rich" 2>/dev/null; then
+        error "Python 'rich' library not found. Install with: pip install rich"
+        error "Or use --format txt for plain text output"
+        exit 1
+    fi
+fi
+
+# ── Pane discovery ────────────────────────────────────────────────────────────
+
+_find_tui_panes() {
+    # Find panes where: current_command is "uv" and current_path is token-api dir
+    # Then verify child process includes the TUI script name
+    local results=()
+
+    while IFS= read -r line; do
+        local pane cmd path
+        pane=$(echo "$line" | awk '{print $1}')
+        cmd=$(echo "$line" | awk '{print $2}')
+        path=$(echo "$line" | awk '{print $3}')
+
+        if [[ "$path" != "$TOKEN_API_DIR" ]]; then
+            continue
+        fi
+
+        # Accept uv (TUI launched via uv run) or python3/python (direct)
+        if [[ "$cmd" != "uv" && "$cmd" != "python3" && "$cmd" != "python" ]]; then
+            continue
+        fi
+
+        # Verify by checking child processes contain the TUI script
+        local pane_pid
+        pane_pid=$(tmux display-message -t "$pane" -p "#{pane_pid}" 2>/dev/null || true)
+        if [[ -z "$pane_pid" ]]; then
+            continue
+        fi
+
+        # Walk descendants looking for token-api-tui.py
+        if pstree -p "$pane_pid" 2>/dev/null | grep -q "$TOKEN_API_SCRIPT" || \
+           ps --ppid "$pane_pid" -o cmd= 2>/dev/null | grep -q "$TOKEN_API_SCRIPT" || \
+           ps -o cmd= $(ps --ppid "$pane_pid" -o pid= 2>/dev/null) 2>/dev/null | grep -q "$TOKEN_API_SCRIPT"; then
+            results+=("$pane")
+        fi
+    done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_current_path}" 2>/dev/null)
+
+    printf '%s\n' "${results[@]+"${results[@]}"}"
+}
+
+if [[ "$LIST_ONLY" == true ]]; then
+    log "Scanning for TUI panes (cmd=uv/python in $TOKEN_API_DIR)..."
+    mapfile -t PANES < <(_find_tui_panes)
+    if [[ ${#PANES[@]} -eq 0 ]]; then
+        warn "No TUI panes found"
+        exit 0
+    fi
+    echo "Found ${#PANES[@]} TUI pane(s):"
+    for p in "${PANES[@]}"; do
+        pane_pid=$(tmux display-message -t "$p" -p "#{pane_pid}" 2>/dev/null || echo "?")
+        pane_size=$(tmux display-message -t "$p" -p "#{pane_width}x#{pane_height}" 2>/dev/null || echo "?")
+        echo "  $p  [${pane_size}]  pid=${pane_pid}"
+    done
+    exit 0
+fi
+
+DEFAULT_TUI_PANE="main:tui.1"
+
+if [[ -z "$PANE_TARGET" ]]; then
+    # Try the canonical TUI window first
+    if tmux display-message -t "$DEFAULT_TUI_PANE" -p "#{pane_id}" >/dev/null 2>&1; then
+        PANE_TARGET="$DEFAULT_TUI_PANE"
+        log "Using TUI window: $PANE_TARGET"
+    else
+        log "main:tui not found, scanning for TUI pane..."
+        mapfile -t PANES < <(_find_tui_panes)
+        if [[ ${#PANES[@]} -eq 0 ]]; then
+            error "No token-api TUI pane found"
+            error "Is token-api-tui.py running in tmux?"
+            error "Use --pane <target> to specify a pane manually"
+            exit 1
+        fi
+        PANE_TARGET="${PANES[0]}"
+        if [[ ${#PANES[@]} -gt 1 ]]; then
+            warn "Multiple TUI panes found, using first: $PANE_TARGET"
+            warn "Use --list to see all, --pane to specify"
+        else
+            log "Found TUI pane: $PANE_TARGET"
+        fi
+    fi
+fi
+
+# ── Validate pane target ──────────────────────────────────────────────────────
+
+if ! tmux display-message -t "$PANE_TARGET" -p "#{pane_id}" >/dev/null 2>&1; then
+    error "Pane not found: $PANE_TARGET"
+    exit 1
+fi
+
+PANE_SIZE=$(tmux display-message -t "$PANE_TARGET" -p "#{pane_width}x#{pane_height}" 2>/dev/null || echo "unknown")
+log "Capturing pane $PANE_TARGET [$PANE_SIZE]..."
+
+# ── Capture pane content ──────────────────────────────────────────────────────
+
+PANE_WIDTH=$(tmux display-message -t "$PANE_TARGET" -p "#{pane_width}" 2>/dev/null || echo "80")
+PANE_HEIGHT=$(tmux display-message -t "$PANE_TARGET" -p "#{pane_height}" 2>/dev/null || echo "24")
+
+if [[ "$FORMAT" == "txt" ]]; then
+    # Plain text capture (no escape codes)
+    CONTENT=$(tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null)
+
+    OUTPUT_DIR="$(dirname "$OUTPUT")"
+    if [[ ! -d "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+    fi
+
+    printf '%s\n' "$CONTENT" > "$OUTPUT"
+    SIZE=$(wc -l < "$OUTPUT")
+    ok "Saved plain text: $OUTPUT ($SIZE lines)"
+    printf '%s\n' "$OUTPUT"
+
+else
+    # SVG capture (with ANSI color via rich)
+    # Capture with escape codes (-e flag)
+    ANSI_CONTENT=$(tmux capture-pane -t "$PANE_TARGET" -p -e 2>/dev/null)
+
+    OUTPUT_DIR="$(dirname "$OUTPUT")"
+    if [[ ! -d "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+    fi
+
+    # Write ANSI content to a temp file to avoid heredoc escaping issues
+    ANSI_TMPFILE=$(mktemp /tmp/tui-screenshot-ansi.XXXXXX)
+    printf '%s' "$ANSI_CONTENT" > "$ANSI_TMPFILE"
+    trap 'rm -f "$ANSI_TMPFILE"' EXIT
+
+    # Use Python/rich to render ANSI → SVG
+    # Pass all values via environment variables (safe against special chars)
+    TUI_ANSI_FILE="$ANSI_TMPFILE" \
+    TUI_WIDTH="$PANE_WIDTH" \
+    TUI_TITLE="$TITLE" \
+    TUI_OUTPUT="$OUTPUT" \
+    python3 - <<'PYEOF'
+import os, sys
+from rich.console import Console
+from rich.text import Text
+
+ansi_file = os.environ["TUI_ANSI_FILE"]
+width     = int(os.environ["TUI_WIDTH"])
+title     = os.environ["TUI_TITLE"]
+output    = os.environ["TUI_OUTPUT"]
+
+with open(ansi_file, "r", errors="replace") as f:
+    ansi_content = f.read()
+
+console = Console(record=True, width=width, highlight=False)
+text = Text.from_ansi(ansi_content)
+console.print(text, end="")
+
+svg = console.export_svg(title=title)
+with open(output, "w") as f:
+    f.write(svg)
+PYEOF
+
+    if [[ ! -f "$OUTPUT" ]]; then
+        error "SVG file not created at $OUTPUT"
+        exit 1
+    fi
+
+    SIZE=$(du -sh "$OUTPUT" 2>/dev/null | cut -f1)
+    ok "Saved SVG: $OUTPUT ($SIZE)"
+    printf '%s\n' "$OUTPUT"
+fi

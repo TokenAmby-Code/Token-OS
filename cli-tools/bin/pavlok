@@ -30,15 +30,12 @@ Examples:
 
 import sys
 import json
-import platform
+import os
 import urllib.request
 import urllib.error
 import urllib.parse
 
-if platform.system() == "Darwin":
-    API_URL = "http://localhost:7777"
-else:
-    API_URL = "http://100.95.109.23:7777"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 RESET  = "\033[0m"
 RED    = "\033[31m"

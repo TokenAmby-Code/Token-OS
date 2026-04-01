@@ -57,7 +57,7 @@ womp            1       ← wake on LAN
 | 6 | **fast_task** | Highest | — | Starts Fast! app (`C:\Program Files (x86)\Fast!\fast!.exe`) |
 | 7 | **Dual Monitor Tools** | Limited | — | Starts DMT.exe for multi-monitor management |
 | 8 | **Autorun for colby** | Limited | 3s | Starts PowerToys |
-| 9 | **MonitorLauncher** | Limited | 15s | Runs `monitor-launcher.ahk` — launches Windows Terminal with `monitor` TUI on leftmost monitor |
+| 9 | **MonitorLauncher** | Limited | 15s | Runs `monitor-launcher.ahk` — launches Windows Terminal with `monitor` TUI on leftmost monitor. Creates grouped session `monitor` for independent window viewing. TUI runs via `tui-pane-guard` with auto-restart lifecycle. |
 
 ### On-Demand Only (No Logon Trigger)
 
@@ -91,7 +91,7 @@ These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or 
 
 ## AHK Script Architecture
 
-All AHK scripts live at `/Volumes/Imperium/Scripts/ahk/` (accessed from Windows via `\\wsl.localhost\Ubuntu\home\token\Scripts\ahk\`).
+All AHK scripts live at `/Volumes/Imperium/Scripts/ahk/` (accessed from Windows via `\\Token-NAS\Imperium\Scripts\ahk\`).
 
 ```
 script-compiler.ahk          <- ahk_init task (main entry point)
@@ -120,7 +120,7 @@ Not managed by us. Includes: Steam, Discord, Docker Desktop, Spotify, Figma Agen
 2. Task Scheduler fires all logon-triggered tasks (with respective delays)
 3. **Deskflow** (3s delay) starts KVM, then notifies Mac token-api after 10s
 4. AHK scripts, PowerToys, DMT, Fast! all start in parallel
-5. **MonitorLauncher** (15s delay) opens Windows Terminal with `monitor` TUI on leftmost screen — this starts WSL Ubuntu and triggers systemd
+5. **MonitorLauncher** (15s delay) opens Windows Terminal with `monitor` TUI on leftmost screen — creates grouped session `monitor` on `main` for independent window viewing. TUI auto-restarts on crash via `tui-pane-guard`. This starts WSL Ubuntu and triggers systemd
 6. systemd starts **token-satellite** on `:7777`
 
 ---

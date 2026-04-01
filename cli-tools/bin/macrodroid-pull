@@ -10,6 +10,9 @@
 
 set -e
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 SSH_HOST="phone"
 DEFAULT_REMOTE="~/macros"
 DEFAULT_LOCAL="."
@@ -36,7 +39,7 @@ EOF
 }
 
 # Wake phone sshd via MacroDroid HTTP endpoint if SSH fails
-PHONE_TAILSCALE_IP="${PHONE_TAILSCALE_IP:-100.102.92.24}"
+PHONE_TAILSCALE_IP="${PHONE_TAILSCALE_IP:-$(imperium_cfg tailscale_ip phone)}"
 PHONE_HTTP_PORT="${PHONE_HTTP_PORT:-7777}"
 
 wake_phone_sshd() {

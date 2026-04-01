@@ -254,7 +254,7 @@ run_remote() {
 
     # Build remote subagent command (pass through all flags except --host/--dir)
     # Use full path so the correct version is found regardless of remote SSH PATH
-    local remote_cmd="~/Scripts/cli-tools/bin/subagent"
+    local remote_cmd="/mnt/imperium/Scripts/cli-tools/bin/subagent"
     case "$BACKEND" in
         codex)  remote_cmd+=" --codex" ;;
         claude) remote_cmd+=" --claude" ;;

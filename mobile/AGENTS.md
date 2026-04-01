@@ -8,17 +8,9 @@ Tools and configuration for phone automation via Termux and MacroDroid.
 Use event-driven patterns: MacroDroid notification triggers, HTTP webhooks, LaunchAgent intervals.
 If polling is truly unavoidable, staple it to the existing single poll macro in MacroDroid.
 
-## Shizuku (ADB over Tailscale)
+## Shizuku (ARCHIVED 2026-03-10)
 
-Shizuku runs in "Connected to a computer" mode via ADB over Tailscale — NOT wireless debugging.
-
-| Component | Detail |
-|-----------|--------|
-| ADB target | `100.102.92.24:5555` (phone Tailscale IP) |
-| CLI | `shizuku-connect [status\|connect\|start\|bootstrap\|keepalive\|disconnect]` |
-| LaunchAgent | `ai.tokenclaw.shizuku-keepalive` (every 5 min) |
-| Recovery | MacroDroid "Shizuku Died" → POST to Mac → `shizuku-connect start` |
-| Bootstrap | `shizuku-connect bootstrap` (needs wireless debugging briefly, one-time per reboot) |
+Shizuku is no longer used. v2+ enforcement uses stock Android + MacroDroid (no root/ADB). Archive at `macros/archive/pre-v2-shizuku-era-2026-03-10.mdr`. CLI tools (`shizuku-connect`) still exist but are inactive.
 
 ## Overview
 
@@ -29,62 +21,58 @@ This directory contains:
 
 The phone (Samsung S24) connects via Tailscale and runs Termux for SSH access.
 
-## Focus Management System
+## Focus Management System (v3)
 
-A phone-server system for managing app usage. The phone reports events to the server, which decides enforcement actions.
+Phone-server system for app usage management. Phone reports telemetry via Token-Ping (local relay with Discord fallback). Server decides enforcement actions and pushes to phone.
 
-### Architecture
+### Architecture (v3, 2026-03-29)
 
 ```
 Phone (MacroDroid)                    Desktop Server (Token-API)
 ──────────────────                    ────────────────────────────
 
-[Telemetry Macros]
-  Twitter/YouTube/Games    ─POST──>   /phone (logs app events)
-  Open/Close events                   │
-                                      ▼
-  Geofence Home/Gym       ─POST──>   Server analyzes context
-  Enter/Exit events                   (time, location, usage)
-         │                                    │
-         ├─ 200 OK ─────────────────>        │
-         │                                    ▼
-         └─ Error ──> Enable Local    /enforce (pushes commands)
-                      Fallback               │
-                           │                 │
-                           ▼                 │
-[Enforcement Macros]  <──────────────────────┘
-  /enforce endpoint       Disable/enable specific apps
-  Local Management        (disabled by default)
+[Telemetry — 1 unified macro, 36 triggers]
+  All apps open/close  ──>  Token-Ping  ──>  POST /phone/event
+  YouTube special (YT/YT_BG/YT_BTN)         (parses trigger name)
+  Spotify (clears yt_bg)                          │
+  Geofence (Home/Gym/Campus)                      ▼
+                                           Server analyzes context
+  Token-Ping on failure ──>  Discord       (time, location, usage)
+                             webhook              │
+                             fallback             ▼
+                                           Enforcement cascade
+[Notification/Enforcement — v3 unified params]    │
+  /notify?params  <───────────────────────────────┘
+  /enforce?params (+ Pavlok zap + Spotify redirect)
+  /zap?params     (direct Pavlok, lightweight)
 ```
 
 ### Phone Endpoints (MacroDroid HTTP Server, port 7777)
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/enforce?action=disable&app=twitter` | Disable an app |
-| `/enforce?action=enable&app=twitter` | Re-enable an app |
-| `/enable-local` | Enable local fallback enforcement |
-| `/disable-local` | Disable local fallback (server back) |
-| `/notify?title=X&text=Y` | Show notification |
-| `/list-exports` | List available macro exports |
+| `/notify?vibe=N&beep=N&tts_text=X&banner_text=X&type=T` | Notification + TTS + Pavlok vibe/beep |
+| `/enforce?zap=N&tts_text=X&banner_text=X&type=T` | Same + Pavlok zap + Spotify redirect |
+| `/zap?zap=N` | Direct Pavlok zap (lightweight) |
+| `/token-ping` | Local relay → Token-API with Discord fallback |
+| `/heartbeat` | Health check |
+| `/sshd` | Start Termux SSH daemon |
+| `/list-exports` | Trigger macro export |
 
-### Server Endpoints (Token-API)
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /phone` | Receive app/geofence telemetry |
-
-### Macro Categories
+### Macro Categories (25 total, 18 enabled)
 
 | Category | Count | Purpose |
 |----------|-------|---------|
-| Telemetry | 6 | Report app opens/closes to server |
-| Geofence | 4 | Report location enter/exit |
-| Enforcement | 6 | Enable/disable apps on command |
-| Endpoints | 2 | HTTP API endpoints |
-| Other | 4 | Misc (Spotify, YouTube toggle, etc.) |
+| Telemetry | 1 | Unified app open/close (36 triggers, 18 apps) |
+| YouTube | 3 | YT + YT_BG + YT_BTN (background audio tracking) |
+| Spotify | 1 | Cross-app state (clears yt_bg) |
+| Token-Ping | 1 | Local HTTP relay with Discord fallback |
+| Notify/Enforce | 3 | Notify, Enforce, Zappa (v3 unified params) |
+| Geofence | 1+6 | Unified + 6 legacy disabled |
+| System | 3 | sshd, Phone Health, Heartbeat |
+| Other | 6 | BT, gestures, list-exports, legacy |
 
-See `macros/MACRODROID.md` for full macro inventory.
+See `macros/MACRODROID.md` for full macro inventory and v3 param schema.
 
 ## Connection
 
@@ -437,6 +425,58 @@ actions:
 **Condition types:**
 - `variable` - Check variable value (`comparison`: equals, not_equals, greater_than, less_than)
 - `http_response` - Check HTTP response code
+
+## Debug Logging Pattern
+
+MacroDroid actions silently succeed/fail — the HTTP trigger always returns OK. Use shell script logging blocks for visibility.
+
+### Log File
+
+```
+/storage/emulated/0/MacroDroid/logs/debug.log
+```
+
+Watch live: `ssh-phone "tail -f /storage/emulated/0/MacroDroid/logs/debug.log"`
+
+### Standard Logging Block
+
+One shell action, parameterized by changing the echo content. Always append to `debug.log`:
+
+```bash
+echo "$(date +%H:%M:%S) [TAG] message key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+```
+
+Replace `TAG` with macro name, `message` with checkpoint name. Use MacroDroid magic variables as needed:
+
+| Variable | Context | Value |
+|----------|---------|-------|
+| `{http_query_string}` | HTTP trigger | Raw query string |
+| `{http_request_body}` | HTTP trigger | POST body |
+| `{http_param=key}` | HTTP trigger | Specific query param |
+| `{lv=varname}` | Any | Local variable value |
+| `{v=varname}` | Any | Global variable value |
+| `{iterator_dictionary_key}` | Dict iteration | Current key |
+| `{iterator_value}` | Dict iteration | Current value |
+| `{trigger}` | Any | Trigger name string |
+| `{system_time}` | Any | System time |
+
+### Where to Place
+
+| Checkpoint | Shell log line |
+|------------|---------------|
+| Entry point | `[NOTIFY] entry qs={http_query_string}` |
+| After dict parse | `[NOTIFY] dict={lv=request-params}` |
+| Inside iteration | `[NOTIFY] iter key={iterator_dictionary_key} val={iterator_value}` |
+| Before constrained action | `[NOTIFY] pre-pavlok key={iterator_dictionary_key}` |
+| After Pavlok intent | `[NOTIFY] pavlok-fired action={iterator_dictionary_key} intensity={iterator_value}` |
+
+### Pre-built Blocks
+
+`macros/debug-logging-blocks.yaml` contains copy-paste-ready shell actions for all common checkpoints. Generate + push + import, then copy individual actions into the target macro. Delete the debug macro when done.
+
+```bash
+macrodroid-gen macros/debug-logging-blocks.yaml | macrodroid-push - debug-logging-blocks.macro
+```
 
 ## Termux Configuration
 

@@ -6,21 +6,25 @@
 # terminal-margin-horizontal = 0
 # terminal-margin-vertical = 0
 
-# Extra keys toolbar (always visible) - 7x2 with popups
-# Notes:
-#   - Top row: ESC + modifiers + HOME/UP/END nav cluster
-#   - Bottom row: | + common chars (~, /, -) + LEFT/DOWN/RIGHT arrows
-#   - Hold ESC → sends Ctrl-Space (tmux prefix)
-#   - Hold SHIFT → Shift+Tab
-#   - Hold ALT → TAB
-#   - Hold CTRL → Ctrl+C x2 (double interrupt, may coalesce to one)
-#   - Hold HOME → DRAWER, hold END → PASTE
-#   - Hold UP → types 'claude' + Enter, hold DOWN → types 'exit' + Enter
-#   - Hold | → types '@'
+# Extra keys toolbar (always visible) - 8+7+7 (3 rows)
+# Row 1 (top):    DRAWER, ⇧Tab, ^R, ^C, Tab, ^Space(prefix), ⌨(keyboard)
+# Row 2 (middle): ESC, SHIFT, ALT, CTRL, HOME, UP, END
+# Row 3 (bottom): | ~ / - LEFT DOWN RIGHT (symbols + arrows)
+#
+# Hold behaviors:
+#   - Hold HOME → captures tmux pane to clipboard
+#   - Hold UP → types 'claude' + Enter
+#   - Hold END → PASTE
+#   - Hold | → @
+#   - Hold DOWN → types 'exit' + Enter
 extra-keys = [ \
-  [{key: 'ESC', popup: {macro: "\u0000", display: '^␣'}}, {key: 'SHIFT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {key: 'ALT', popup: 'TAB'}, {key: 'CTRL', popup: {macro: "\u0003", display: '^C'}}, {key: 'HOME', popup: 'DRAWER'}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  ['DRAWER', {macro: "\u001b[Z", display: '⇧Tab'}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "tmux capture-pane -p | termux-clipboard-set\n", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
   [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
+
+# Reduce extra-keys row height to reclaim vertical space with 3 rows
+extra-keys-style = key-height:40,key-gap:0,key-border:0
 
 # Better text handling
 terminal-transcript-rows = 10000

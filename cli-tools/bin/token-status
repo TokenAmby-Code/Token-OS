@@ -10,13 +10,14 @@ Usage:
     token-status --json       # JSON output
 """
 
+import os
 import re
 import sys
 import json
 import urllib.request
 from datetime import datetime
 
-API_URL = "http://localhost:7777"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 
 def check_health():

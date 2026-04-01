@@ -3,7 +3,7 @@
 # TAGS: deploy, mac
 # AUDIENCE: human, agent
 #
-# Forks the WSL deploy workflow for Mac. Uses Homebrew gcloud/gsutil.
+# Forks the WSL deploy workflow for Mac. Uses Homebrew gcloud CLI.
 # Does NOT modify the Makefile or the WSL deploy path.
 #
 # Usage:
@@ -21,16 +21,14 @@
 # Prerequisites:
 #   brew install --cask google-cloud-sdk
 #   gcloud auth activate-service-account --key-file=deploy/dev-service-account.json
+#
+# Note: Uses `gcloud storage` commands (not gsutil) to avoid Python 3 sys.maxint errors.
 
 set -euo pipefail
 
-# ── Mac gcloud/gsutil PATH ────────────────────────────────────────────────────
+# ── Mac gcloud PATH ──────────────────────────────────────────────────────────
 GCLOUD=/opt/homebrew/bin/gcloud
-_GSUTIL=/opt/homebrew/bin/gsutil
 export CLOUDSDK_PYTHON=/opt/homebrew/opt/python@3.13/bin/python3.13
-# gsutil on macOS hits a Python 3 multiprocessing bug (sys.maxint removed in Py3).
-# Disable parallel process count to avoid it; -m (multithreading) still works.
-gsutil() { "$_GSUTIL" -o "GSUtil:parallel_process_count=1" "$@"; }
 
 # Colors
 RED='\033[0;31m'
@@ -327,12 +325,12 @@ deploy_web() {
 
     local mode bucket url_map site_url
     if [[ "$ENV" == "production" ]]; then
-        mode="production"
+        mode="prod"
         bucket="$WEB_BUCKET_PROD"
         url_map="$URL_MAP_PROD"
         site_url="$SITE_URL_PROD"
     else
-        mode="development"
+        mode="dev"
         bucket="$WEB_BUCKET_DEV"
         url_map="$URL_MAP_DEV"
         site_url="$SITE_URL_DEV"
@@ -347,14 +345,8 @@ deploy_web() {
 
     cd "$GIT_ROOT/widget"
 
-    echo -e "${YELLOW}🛠  Running Vite app build (mode=$mode)...${NC}"
-    npx vite build --mode "$mode"
-
-    echo -e "${YELLOW}🔄 Running post-build...${NC}"
-    node post-build.js
-
-    echo -e "${YELLOW}🧱 Building embeddable widget (mode=$mode)...${NC}"
-    BUILD_MODE=lib npx vite build --mode "$mode"
+    echo -e "${YELLOW}🛠  Running npm run build:$mode...${NC}"
+    npm run "build:$mode"
 
     # Verify bundle contains expected API URL
     echo "Verifying build environment..."
@@ -375,23 +367,25 @@ deploy_web() {
 
     # ── Upload ────────────────────────────────────────────────────────────────
     echo -e "${YELLOW}📤 Deploying assets with long cache (1 year)...${NC}"
-    gsutil -h "Cache-Control:public, max-age=31536000, immutable" -m rsync -r dist/app/assets/ "gs://$bucket/assets/"
+    "$GCLOUD" storage rsync dist/app/assets/ "gs://$bucket/assets/" --recursive \
+        --cache-control="public, max-age=31536000, immutable"
 
     echo -e "${YELLOW}📤 Deploying HTML files with short cache (60s)...${NC}"
     while IFS= read -r f; do
         local rel_path="${f#dist/app/}"
-        gsutil -h "Cache-Control:public, max-age=60, must-revalidate" cp "$f" "gs://$bucket/$rel_path"
+        "$GCLOUD" storage cp "$f" "gs://$bucket/$rel_path" \
+            --cache-control="public, max-age=60, must-revalidate"
     done < <(find dist/app -name "*.html")
 
     echo -e "${YELLOW}📤 Deploying other files...${NC}"
     while IFS= read -r f; do
         local rel_path="${f#dist/app/}"
-        gsutil cp "$f" "gs://$bucket/$rel_path"
+        "$GCLOUD" storage cp "$f" "gs://$bucket/$rel_path"
     done < <(find dist/app -type f -not -name "*.html" -not -path "*/assets/*")
 
     # ── SPA routing ───────────────────────────────────────────────────────────
     echo -e "${YELLOW}🔧 Configuring SPA routing on gs://$bucket...${NC}"
-    gsutil web set -m index.html -e index.html "gs://$bucket" 2>&1 || \
+    "$GCLOUD" storage buckets update "gs://$bucket" --web-main-page-suffix=index.html --web-error-page=index.html 2>&1 || \
         echo -e "${YELLOW}  ⚠️  SPA routing config skipped (already set or insufficient perms)${NC}"
 
     # ── CDN invalidation ──────────────────────────────────────────────────────
@@ -405,7 +399,7 @@ deploy_web() {
     # ── Verify CDN propagation ────────────────────────────────────────────────
     echo -e "${YELLOW}🔍 Verifying CDN propagation at $site_url ...${NC}"
     local gcs_gen
-    gcs_gen=$(gsutil stat "gs://$bucket/index.html" 2>/dev/null | grep 'Generation:' | awk '{print $2}')
+    gcs_gen=$("$GCLOUD" storage objects describe "gs://$bucket/index.html" --format='value(generation)' 2>/dev/null)
     if [[ -z "$gcs_gen" ]]; then
         echo -e "${RED}❌ Could not read GCS generation for gs://$bucket/index.html${NC}"
         exit 1

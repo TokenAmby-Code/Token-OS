@@ -2,4 +2,4 @@
 # Convenience shim for followup command
 # TAGS: workflow
 # AUDIENCE: human
-exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" followup "$@"
+exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" followup "$@"

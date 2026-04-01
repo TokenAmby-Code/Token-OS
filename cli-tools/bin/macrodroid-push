@@ -10,6 +10,9 @@
 
 set -e
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 # Use the 'phone' SSH alias configured in ~/.ssh/config
 SSH_HOST="phone"
 # Termux home is always writable; user can import from here
@@ -71,7 +74,7 @@ if [[ ! -f "$SOURCE" ]]; then
 fi
 
 # Wake phone sshd via MacroDroid HTTP endpoint if SSH fails
-PHONE_TAILSCALE_IP="${PHONE_TAILSCALE_IP:-100.102.92.24}"
+PHONE_TAILSCALE_IP="${PHONE_TAILSCALE_IP:-$(imperium_cfg tailscale_ip phone)}"
 PHONE_HTTP_PORT="${PHONE_HTTP_PORT:-7777}"
 
 wake_phone_sshd() {

@@ -2,17 +2,23 @@
 # Matches are prefix-based (subdirs inherit). ~ expands to $HOME.
 # "all" includes every tool.
 
-~/ProcAgentDir:
+$IMPERIUM/Imperium-ENV:
+  tags: [vault, workflow, system]
+
+~/worktrees:
   tags: [deploy, db, git, pr, worktree, instance, workflow, system]
 
-~/Scripts/token-api:
+$CIVIC:
+  tags: [deploy, db, git, pr, worktree, instance, workflow, system]
+
+$IMPERIUM/Scripts/token-api:
   tags: [token-api, deploy, instance]
 
-~/Scripts/mobile:
+$IMPERIUM/Scripts/mobile:
   tags: [mobile, macrodroid]
 
-~/Scripts/cli-tools:
+$IMPERIUM/Scripts/cli-tools:
   tags: [all]
 
-~/Scripts:
+$IMPERIUM/Scripts:
   tags: [git, workflow, system, instance]

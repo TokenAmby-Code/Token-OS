@@ -18,6 +18,10 @@
 
 set -euo pipefail
 
+# Source shared libs
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/git-remote.sh"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -322,7 +326,7 @@ if [[ "$IN_WORKTREE" == "true" ]]; then
 
     # Delete remote branch (since we didn't use --delete-branch in worktree context)
     info "Deleting remote branch: ${BRANCH_NAME}"
-    git push origin --delete "$BRANCH_NAME" 2>/dev/null || {
+    git push "$GIT_GITHUB_REMOTE" --delete "$BRANCH_NAME" 2>/dev/null || {
         warn "Could not delete remote branch ${BRANCH_NAME} (may already be deleted)"
     }
 
@@ -350,8 +354,8 @@ echo ""
 
 # Pull main
 log "${PULL} Pulling main..."
-MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
-git pull origin "$MAIN_BRANCH" 2>&1 | sed 's/^/   /'
+MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null | sed "s@^refs/remotes/${GIT_GITHUB_REMOTE}/@@" || echo "main")
+git pull "$GIT_GITHUB_REMOTE" "$MAIN_BRANCH" 2>&1 | sed 's/^/   /'
 
 echo ""
 

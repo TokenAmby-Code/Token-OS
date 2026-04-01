@@ -35,7 +35,7 @@ Scripts/
 - Vault queries (stats, graph, search)
 
 **Commands**:
-- `token-restart`: Multi-device restart (git push → Mac → WSL → phone TUI)
+- `token-restart`: Multi-device restart (Mac → WSL → phone TUI)
 - `token-restart --status`: All-device health check
 - `curl http://localhost:7777/health`: Health check
 

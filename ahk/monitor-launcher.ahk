@@ -8,7 +8,9 @@
 SetTitleMatchMode 2  ; Partial title match
 
 ; Launch Windows Terminal minimized to avoid flash on main monitor
-Run('wt.exe --title "token-monitor" -p "Ubuntu" -- wsl.exe -d Ubuntu -e bash -lic "monitor"', , "Min")
+; IMPERIUM_NO_TMUX=1 exported before sourcing .bashrc prevents auto-attach
+; monitor() handles its own tmux session creation + attachment to main:tui
+Run('wt.exe --title "token-monitor" -p "Ubuntu" -- wsl.exe -d Ubuntu -e env IMPERIUM_NO_TMUX=1 bash -lic monitor', , "Min")
 
 ; Wait for window — Windows Terminal may recycle the hwnd during startup
 ; so we retry a few times if the handle goes stale

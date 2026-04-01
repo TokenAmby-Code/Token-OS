@@ -38,7 +38,7 @@ RunTP(cmdName, args := []) {
         }  
     }
     try {
-        Run('obsidian://advanced-uri?vault=Token-ENV&eval=' tpFunc '(' argBuf ');',, "Hide")
+        Run('obsidian://advanced-uri?vault=Imperium-ENV&eval=' tpFunc '(' argBuf ');',, "Hide")
     } catch as err {
         MsgBox "Error running JavaScript: " err.Message
     }

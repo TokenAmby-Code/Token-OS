@@ -154,7 +154,8 @@ export function createHttpServer(botClients, messageStore, config, logger) {
       // GET /read — Read recent messages
       if (method === 'GET' && path === '/read') {
         const query = parseQuery(req.url);
-        const channelId = resolveChannel(query.channel);
+        // Accept named channels or raw numeric IDs (for thread reads)
+        const channelId = resolveChannel(query.channel) || (/^\d+$/.test(query.channel) ? query.channel : null);
         if (!channelId) return json(res, { error: `Unknown channel: ${query.channel}` }, 400);
 
         const limit = parseInt(query.limit) || 25;

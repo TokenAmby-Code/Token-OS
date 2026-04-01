@@ -15,7 +15,10 @@
 
 set -euo pipefail
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # --- Instance resolution (shared with instance-name) ---
 
@@ -84,7 +87,7 @@ _resolve_instance_id() {
 # --- Commands ---
 
 cmd_activate() {
-    local INSTANCE_ID
+    local INSTANCE_ID TMUX_PANE=""
     INSTANCE_ID=$(_resolve_instance_id)
 
     if [[ -z "$INSTANCE_ID" ]]; then
@@ -92,10 +95,15 @@ cmd_activate() {
         exit 1
     fi
 
-    RESPONSE=$(curl -sf -X POST "$API_URL/api/instances/$INSTANCE_ID/voice-chat?active=true" 2>/dev/null || true)
+    # Auto-detect tmux pane — use pane_id (e.g. %5) which is globally stable
+    TMUX_PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+
+    RESPONSE=$(curl -sf -X POST "$API_URL/api/instances/$INSTANCE_ID/voice-chat?active=true&tmux_pane=$TMUX_PANE" 2>/dev/null || true)
 
     if echo "$RESPONSE" | jq -e '.voice_chat == true' >/dev/null 2>&1; then
-        echo "Voice chat activated for instance $INSTANCE_ID"
+        local pane_info=""
+        [[ -n "$TMUX_PANE" ]] && pane_info=" (pane: $TMUX_PANE)"
+        echo "Voice chat activated for instance $INSTANCE_ID$pane_info"
     else
         echo "Error: Failed to activate voice chat" >&2
         echo "$RESPONSE" >&2

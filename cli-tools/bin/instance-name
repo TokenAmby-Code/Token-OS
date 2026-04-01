@@ -11,7 +11,10 @@
 
 set -euo pipefail
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # Help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
@@ -25,6 +28,7 @@ registry dashboard. The name helps identify what you're working on.
 
 Options:
   --id <id>          Explicit instance ID (for ambiguous cases)
+  --no-ui            Skip Claude Code /rename and /color (for headless/cron)
   --session          Create a session doc named after the instance and assign it
   --session <title>  Find existing session doc by title (fuzzy) and assign it
   --session-id <N>   Assign to existing session doc by ID
@@ -53,11 +57,16 @@ EXPLICIT_ID=""
 SESSION_FLAG=""
 SESSION_ID=""
 SESSION_PATH=""
+NO_UI="${NO_UI:-0}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --id)
             EXPLICIT_ID="$2"
             shift 2
+            ;;
+        --no-ui)
+            NO_UI=1
+            shift
             ;;
         --session)
             if [[ "${2:-}" =~ ^[0-9]+$ ]] || [[ "${2:-}" == --* ]] || [[ -z "${2:-}" ]]; then
@@ -91,13 +100,20 @@ if [[ -z "$NAME" ]]; then
     exit 1
 fi
 
+# Enforce kebab-case: strip artifacts, lowercase, collapse to 2-4 words
+NAME="${NAME#✳ }"
+NAME="${NAME#✳}"
+NAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 -]//g' | tr -s ' ' '-' | sed 's/^-//;s/-$//')
+# Truncate to max 4 hyphen-separated words
+NAME=$(echo "$NAME" | cut -d- -f1-4)
+
 # Find parent claude process PID by walking up the process tree
 _find_claude_pid() {
     local current="$PPID"
     local comm
     for _ in 1 2 3 4 5; do
         [[ -z "$current" || "$current" == "1" ]] && break
-        comm=$(ps -o comm= -p "$current" 2>/dev/null || true)
+        comm=$(basename "$(ps -o comm= -p "$current" 2>/dev/null)" 2>/dev/null || true)
         if [[ "$comm" == "claude" ]]; then
             echo "$current"
             return 0
@@ -107,52 +123,15 @@ _find_claude_pid() {
     return 1
 }
 
-# Resolve instance ID (priority: --id > pid-cache > pid-api > cwd)
+# Resolve instance via Token-API (server handles PID → CWD fallback)
 if [[ -n "$EXPLICIT_ID" ]]; then
     INSTANCE_ID="$EXPLICIT_ID"
 else
-    INSTANCE_ID=""
-
-    # Method 1: PID-based cache lookup (fastest, most reliable)
-    # generic-hook.sh writes ~/.claude/session-pids/<claude-pid> on SessionStart
     CLAUDE_PID=$(_find_claude_pid 2>/dev/null || true)
-    if [[ -n "$CLAUDE_PID" ]]; then
-        SESSION_PID_FILE="${HOME}/.claude/session-pids/${CLAUDE_PID}"
-        if [[ -f "$SESSION_PID_FILE" ]]; then
-            INSTANCE_ID=$(cat "$SESSION_PID_FILE" 2>/dev/null || true)
-        fi
-    fi
-
-    # Method 2: PID field match in API (still reliable, requires API call)
-    if [[ -z "$INSTANCE_ID" ]] && [[ -n "${CLAUDE_PID:-}" ]]; then
-        INSTANCES=$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)
-        if [[ -n "$INSTANCES" ]]; then
-            INSTANCE_ID=$(echo "$INSTANCES" | \
-                jq -r --argjson pid "$CLAUDE_PID" \
-                    '.[] | select(.pid == $pid and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | \
-                head -1 || true)
-        fi
-    fi
-
-    # Method 3: CWD match (least reliable - multiple sessions may share a working dir)
-    # Prefer "processing" status over "idle" to pick the active instance
-    if [[ -z "$INSTANCE_ID" ]]; then
-        CWD="$(pwd)"
-        INSTANCES="${INSTANCES:-$(curl -s --connect-timeout 3 "$API_URL/api/instances" 2>/dev/null || true)}"
-        if [[ -n "$INSTANCES" ]]; then
-            # Try processing first, then idle
-            INSTANCE_ID=$(echo "$INSTANCES" | \
-                jq -r --arg cwd "$CWD" \
-                    '[ .[] | select(.status == "processing" and .working_dir == $cwd) ] | .[0].id // ""' \
-                    2>/dev/null || true)
-            if [[ -z "$INSTANCE_ID" ]]; then
-                INSTANCE_ID=$(echo "$INSTANCES" | \
-                    jq -r --arg cwd "$CWD" \
-                        '[ .[] | select(.status == "idle" and .working_dir == $cwd) ] | .[0].id // ""' \
-                        2>/dev/null || true)
-            fi
-        fi
-    fi
+    QUERY="cwd=$(pwd)"
+    [[ -n "$CLAUDE_PID" ]] && QUERY="pid=${CLAUDE_PID}&${QUERY}"
+    RESOLVED=$(curl -s --connect-timeout 3 "$API_URL/api/instances/resolve?${QUERY}" 2>/dev/null || true)
+    INSTANCE_ID=$(echo "$RESOLVED" | jq -r '.id // empty' 2>/dev/null || true)
 fi
 
 if [[ -z "$INSTANCE_ID" ]]; then
@@ -167,6 +146,23 @@ RESPONSE=$(curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
 
 if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
     echo "Renamed to: $NAME"
+
+    # Queue /rename and /color for next UserPromptSubmit (avoids collision with user typing)
+    if [[ "$NO_UI" != "1" ]]; then
+        PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
+
+        if [[ -n "$PANE" ]]; then
+            INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$INSTANCE_ID" 2>/dev/null || true)
+            COLOR=$(echo "$INSTANCE_DATA" | jq -r '.cc_color // empty' 2>/dev/null || true)
+
+            PENDING_DIR="${HOME}/.claude/pending-ui-cmds"
+            mkdir -p "$PENDING_DIR"
+            PANE_SAFE=$(echo "$PANE" | tr -d '%')
+            echo "$PANE /rename $NAME" >> "$PENDING_DIR/${PANE_SAFE}"
+            [[ -n "$COLOR" ]] && echo "$PANE /color $COLOR" >> "$PENDING_DIR/${PANE_SAFE}"
+            echo "Queued: /rename $NAME + /color $COLOR (fires on next prompt submit)"
+        fi
+    fi
 
     # Handle session document if requested
     if [[ -n "$SESSION_FLAG" ]]; then

@@ -256,8 +256,10 @@ show_dir_tools() {
             # Trim whitespace
             current_path="${current_path## }"
             current_path="${current_path%% }"
-            # Expand ~
+            # Expand ~ and env vars ($IMPERIUM, $CIVIC, etc.)
             current_path="${current_path/#\~/$HOME}"
+            current_path="${current_path//\$IMPERIUM/${IMPERIUM:-}}"
+            current_path="${current_path//\$CIVIC/${CIVIC:-}}"
             continue
         fi
 
@@ -279,8 +281,7 @@ show_dir_tools() {
     done < "$TAGS_YAML"
 
     if [[ -z "$best_tags" ]]; then
-        echo "No directory mapping found for: $dir_path" >&2
-        exit 1
+        best_tags="all"
     fi
 
     scan_tools
@@ -484,7 +485,7 @@ ai_fallback() {
             echo ""
             read -rp "Do you want to create this tool? Describe it (or 'no' to cancel): " response
             if [[ "$response" != "no" && "$response" != "n" && -n "$response" ]]; then
-                (cd "$HOME/Scripts/cli-tools" && unset CLAUDECODE && claude "$response")
+                (cd "/mnt/imperium/Scripts/cli-tools" && unset CLAUDECODE && claude "$response")
             fi
         fi
     fi

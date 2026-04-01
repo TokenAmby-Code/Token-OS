@@ -7,8 +7,12 @@
 #   tts-skip         Skip current TTS, queue continues
 #   tts-skip --all   Skip current TTS and clear queue
 
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
 if [[ "$1" == "--all" || "$1" == "-a" ]]; then
-    curl -s -X POST "http://localhost:7777/api/tts/skip?clear_queue=true" | jq .
+    curl -s -X POST "${API_URL}/api/tts/skip?clear_queue=true" | jq .
 else
-    curl -s -X POST "http://localhost:7777/api/tts/skip" | jq .
+    curl -s -X POST "${API_URL}/api/tts/skip" | jq .
 fi
