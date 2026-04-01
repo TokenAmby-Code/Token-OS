@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# wt-focus - Toggle Windows Terminal focus mode (snap + tab bar)
+# TAGS: tmux, windows, focus
+# AUDIENCE: human
+#
+# Called by tmux-workspace --focus/--unfocus on WSL.
+#   wt-focus on   — store HWND to file, hide tab bar, snap to right 50%, re-apply layout
+#   wt-focus off  — maximize terminal, re-apply layout, show tab bar, remove HWND file
+#
+# After each window move, #{window_layout} is re-applied via tmux select-layout so
+# pane proportions survive the terminal resize.
+
+set -euo pipefail
+
+WT_SETTINGS="/mnt/c/Users/colby/AppData/Local/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json"
+HWND_FILE="/tmp/.wt-focus-hwnd"
+POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+MODE="${1:-on}"
+
+toggle_tab_bar() {
+    local show="$1"  # "True" or "False"
+
+    [[ -f "$WT_SETTINGS" ]] || return
+
+    python3 -c "
+import json
+with open('$WT_SETTINGS', 'r') as f:
+    s = json.load(f)
+s['showTabsInTitleBar'] = $show
+with open('$WT_SETTINGS', 'w') as f:
+    json.dump(s, f, indent=4)
+"
+}
+
+snap_right() {
+    local hwnd
+    hwnd=$(cat "$HWND_FILE" 2>/dev/null | tr -d '\r' || echo "")
+    if [[ -z "$hwnd" ]]; then return; fi
+
+    # Position WT at right 50% of screen using stored HWND
+    $POWERSHELL -NoProfile -Command '
+        Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            public class WinPos {
+                [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+                [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+                [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+                [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);
+                [StructLayout(LayoutKind.Sequential)]
+                public struct RECT { public int Left, Top, Right, Bottom; }
+            }
+"@
+        $h = [IntPtr]::new('"$hwnd"')
+        $r = New-Object WinPos+RECT
+        [WinPos]::SystemParametersInfo(0x0030, 0, [ref]$r, 0) | Out-Null
+        $w = $r.Right - $r.Left
+        $ht = $r.Bottom - $r.Top
+        [WinPos]::ShowWindow($h, 9) | Out-Null
+        [WinPos]::MoveWindow($h, $r.Left + ($w / 2), $r.Top, $w / 2, $ht, $true) | Out-Null
+        [WinPos]::SetForegroundWindow($h) | Out-Null
+    ' 2>/dev/null
+}
+
+store_hwnd() {
+    # Capture the foreground window handle (should be Windows Terminal)
+    $POWERSHELL -NoProfile -Command '
+        Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            public class WinHelper {
+                [DllImport("user32.dll")]
+                public static extern IntPtr GetForegroundWindow();
+            }
+"@
+        [WinHelper]::GetForegroundWindow().ToInt64()
+    ' 2>/dev/null | tr -d '\r' > "$HWND_FILE"
+}
+
+maximize_by_hwnd() {
+    local hwnd
+    hwnd=$(cat "$HWND_FILE" 2>/dev/null | tr -d '\r' || echo "")
+
+    if [[ -z "$hwnd" ]]; then
+        # Fallback: just maximize the foreground window
+        $POWERSHELL -NoProfile -Command '
+            Add-Type -TypeDefinition @"
+                using System;
+                using System.Runtime.InteropServices;
+                public class WinHelper {
+                    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+                    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+                }
+"@
+            [WinHelper]::ShowWindow([WinHelper]::GetForegroundWindow(), 3) | Out-Null
+        ' 2>/dev/null
+    else
+        # Use stored HWND to maximize directly — works even if WT isn't foreground
+        $POWERSHELL -NoProfile -Command '
+            Add-Type -TypeDefinition @"
+                using System;
+                using System.Runtime.InteropServices;
+                public class WinHelper {
+                    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+                    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+                }
+"@
+            $h = [IntPtr]::new('"$hwnd"')
+            [WinHelper]::SetForegroundWindow($h) | Out-Null
+            [WinHelper]::ShowWindow($h, 3) | Out-Null
+        ' 2>/dev/null
+    fi
+}
+
+case "$MODE" in
+    on)
+        store_hwnd
+        toggle_tab_bar "False"
+        snap_right
+        sleep 0.5
+        # No layout re-apply here — the caller (tmux-workspace focus_mode)
+        # runs tmux-refresh-layout afterward for canonical reset at new dimensions.
+        ;;
+    off)
+        maximize_by_hwnd
+        sleep 0.5
+        layout=$(tmux display-message -p '#{window_layout}' 2>/dev/null) || true
+        tmux select-layout "$layout" 2>/dev/null || true
+        toggle_tab_bar "True"
+        rm -f "$HWND_FILE"
+        ;;
+    *)
+        exit 1
+        ;;
+esac

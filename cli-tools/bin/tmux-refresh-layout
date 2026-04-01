@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# tmux-refresh-layout - Reset all panes to canonical proportions
+# TAGS: tmux, layout, reset
+# AUDIENCE: script
+#
+# Resets the current window to its canonical layout proportions based on
+# the current mode (@FOCUSED) and platform (@LAYOUT_ORIGIN). This gives
+# every layout operation a clean starting point for absolute moves.
+#
+# Canonical states:
+#   Focused (any):     even 2x2 grid filling the terminal
+#   Unfocused WSL:     20% side columns + even 2x2 grid
+#   Unfocused Mac:     even 2x2 grid + 33% right column
+#
+# Usage: tmux-refresh-layout [target-window]
+
+set -euo pipefail
+
+TARGET="${1:-}"
+
+if [[ -z "$TARGET" ]]; then
+    SESSION=$(tmux display-message -p '#{session_name}')
+    WINDOW=$(tmux display-message -p '#{window_index}')
+    TARGET="${SESSION}:${WINDOW}"
+fi
+
+# Read mode state
+FOCUSED=$(tmux show-options -wv -t "$TARGET" @FOCUSED 2>/dev/null || echo "false")
+LAYOUT_ORIGIN=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+
+# Get window dimensions
+WIN_W=$(tmux display-message -t "$TARGET" -p '#{window_width}')
+WIN_H=$(tmux display-message -t "$TARGET" -p '#{window_height}')
+
+# Collect all panes with their state and geometry
+all_panes=$(
+    tmux list-panes -t "$TARGET" \
+        -F '#{pane_id}	#{@GRID_STATE}	#{pane_left}	#{pane_top}	#{pane_width}	#{pane_height}'
+)
+
+# Separate side and grid panes
+side_panes=()
+grid_panes=()
+while IFS=$'\t' read -r pid state pleft ptop pwidth pheight; do
+    if [[ "$state" == "side" ]]; then
+        side_panes+=("$pid")
+    elif [[ "$state" == "small" ]]; then
+        grid_panes+=("$pid:$pleft:$ptop")
+    fi
+done <<< "$all_panes"
+
+# --- Reset side columns to canonical widths (unfocused only) ---
+if [[ "$FOCUSED" != "true" && ${#side_panes[@]} -gt 0 ]]; then
+    if [[ "$LAYOUT_ORIGIN" == "wsl" ]]; then
+        local_side_w=$(( (WIN_W - 5) * 20 / 100 ))
+        for spid in "${side_panes[@]}"; do
+            tmux resize-pane -t "$spid" -x "$local_side_w"
+        done
+    elif [[ "$LAYOUT_ORIGIN" == "mac" ]]; then
+        local_right_w=$(( (WIN_W - 2) * 33 / 100 ))
+        # Mac has one side pane (right column)
+        for spid in "${side_panes[@]}"; do
+            tmux resize-pane -t "$spid" -x "$local_right_w"
+        done
+    fi
+fi
+
+# --- Reset grid panes to even sizing ---
+if [[ ${#grid_panes[@]} -lt 2 ]]; then
+    exit 0
+fi
+
+# Recompute grid bounds after side resize (pane geometry may have shifted)
+grid_data=$(
+    tmux list-panes -t "$TARGET" \
+        -F '#{pane_id}	#{@GRID_STATE}	#{pane_left}	#{pane_top}	#{pane_width}	#{pane_height}' \
+    | awk -F'\t' '$2 == "small" { print $1"\t"$3"\t"$4"\t"$5"\t"$6 }'
+)
+
+grid_left=99999 grid_right=0 grid_top=99999 grid_bottom=0
+while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+    pright=$((pleft + pwidth))
+    pbottom=$((ptop + pheight))
+    (( pleft < grid_left )) && grid_left=$pleft
+    (( pright > grid_right )) && grid_right=$pright
+    (( ptop < grid_top )) && grid_top=$ptop
+    (( pbottom > grid_bottom )) && grid_bottom=$pbottom
+done <<< "$grid_data"
+
+grid_w=$((grid_right - grid_left))
+grid_h=$((grid_bottom - grid_top))
+even_w=$(( (grid_w - 1) / 2 ))
+even_h=$(( (grid_h - 1) / 2 ))
+
+# Origin-pane resize pattern:
+#
+# The pane tree is column-first: [origin-col | far-col | side?]
+# Resizing a pane sets its container's size. The space exchange happens
+# with the container's next tree sibling:
+#   origin-col resize → adjusts origin/far grid boundary (correct)
+#   far-col resize    → adjusts far/side boundary (WRONG — leaks to monitor)
+#
+# So width resets MUST go through an origin-column pane (smallest pane_left).
+# Height resets are per-column (each column has its own vertical split),
+# so we need one top pane per column.
+
+# Find origin-column top pane and far-column top pane
+origin_top="" far_top=""
+min_left=99999 min_top=99999
+while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+    (( pleft < min_left )) && min_left=$pleft
+    (( ptop < min_top )) && min_top=$ptop
+done <<< "$grid_data"
+
+while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+    if (( ptop == min_top )); then
+        if (( pleft == min_left )); then
+            origin_top="$pid"  # origin column, top row
+        else
+            far_top="$pid"     # far column, top row
+        fi
+    fi
+done <<< "$grid_data"
+
+# Reset column widths through origin-column pane only
+[[ -n "$origin_top" ]] && tmux resize-pane -t "$origin_top" -x "$even_w"
+
+# Reset row heights per-column (each column has its own vertical split)
+[[ -n "$origin_top" ]] && tmux resize-pane -t "$origin_top" -y "$even_h"
+[[ -n "$far_top" ]] && tmux resize-pane -t "$far_top" -y "$even_h"
+
+tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none" 2>/dev/null || true
+tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true

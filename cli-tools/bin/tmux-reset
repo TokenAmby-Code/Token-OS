@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# tmux-reset - Reset the current tmux workspace layout
+# TAGS: tmux, workspace
+# AUDIENCE: human
+#
+# Offers two modes via tmux menu:
+#   Reset formatting  — kill all panes, rebuild the grid, re-inject running commands
+#   Full wipe         — kill all panes, rebuild the grid from scratch
+#
+# Must be run from inside tmux.
+
+set -euo pipefail
+
+if [ -z "${TMUX:-}" ]; then
+    echo "Error: must be run from inside tmux" >&2
+    exit 1
+fi
+
+SESSION=$(tmux display-message -p '#{session_name}')
+WINDOW=$(tmux display-message -p '#{window_index}')
+WINDOW_NAME=$(tmux display-message -p '#{window_name}')
+TARGET="${SESSION}:${WINDOW}"
+
+# Detect layout origin
+LAYOUT_ORIGIN=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+if [[ -z "$LAYOUT_ORIGIN" ]]; then
+    echo "Error: no @LAYOUT_ORIGIN set on this window — not a workspace window?" >&2
+    exit 1
+fi
+
+capture_running_commands() {
+    # Capture the command running in each non-side pane (skip idle shells)
+    local cmds=()
+    while IFS=$'\t' read -r pane_id state cmd; do
+        if [[ "$state" == "side" ]]; then
+            continue
+        fi
+        # Skip bare shells — only capture real commands
+        case "$cmd" in
+            bash|zsh|sh|-bash|-zsh|-sh|"") ;;
+            *) cmds+=("$cmd") ;;
+        esac
+    done < <(tmux list-panes -t "$TARGET" -F '#{pane_id}	#{@GRID_STATE}	#{pane_current_command}')
+    printf '%s\n' "${cmds[@]}"
+}
+
+do_reset() {
+    local mode="$1"  # "soft" or "hard"
+    local saved_cmds=()
+
+    if [[ "$mode" == "soft" ]]; then
+        # Capture running commands before destroying panes
+        while IFS= read -r cmd; do
+            [[ -n "$cmd" ]] && saved_cmds+=("$cmd")
+        done < <(capture_running_commands)
+    fi
+
+    # Kill all panes except the first (tmux won't kill the last pane in a window)
+    local panes
+    panes=$(tmux list-panes -t "$TARGET" -F '#{pane_id}')
+    local first=true
+    while IFS= read -r pid; do
+        if $first; then
+            first=false
+            continue
+        fi
+        tmux kill-pane -t "$pid"
+    done <<< "$panes"
+
+    # The surviving pane is now pane 1 — rebuild the layout
+    if [[ "$LAYOUT_ORIGIN" == "wsl" ]]; then
+        tmux-workspace --window-reset "$WINDOW_NAME"
+    elif [[ "$LAYOUT_ORIGIN" == "mac" ]]; then
+        tmux-workspace --bridge-reset "$WINDOW_NAME"
+    fi
+
+    # Clear expanded state after rebuild
+    tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none"
+
+    if [[ "$mode" == "soft" && ${#saved_cmds[@]} -gt 0 ]]; then
+        # Re-inject saved commands into grid panes (skip side panes)
+        local grid_panes=()
+        while IFS=$'\t' read -r pane_id state; do
+            if [[ "$state" != "side" ]]; then
+                grid_panes+=("$pane_id")
+            fi
+        done < <(tmux list-panes -t "$TARGET" -F '#{pane_id}	#{@GRID_STATE}')
+
+        local i=0
+        for cmd in "${saved_cmds[@]}"; do
+            if [[ $i -ge ${#grid_panes[@]} ]]; then
+                break  # more commands than available grid slots
+            fi
+            tmux send-keys -t "${grid_panes[$i]}" "$cmd" Enter
+            ((i++))
+        done
+
+        tmux display-message "Reset formatting: ${#saved_cmds[@]} command(s) re-injected"
+    else
+        tmux display-message "Full wipe: workspace rebuilt fresh"
+    fi
+}
+
+# --- Dispatch ---
+# When called with --do-soft/--do-hard (by menu callback), execute immediately.
+# When called with no args, show the interactive menu.
+case "${1:-}" in
+    --do-soft)
+        do_reset soft
+        ;;
+    --do-hard)
+        do_reset hard
+        ;;
+    *)
+        tmux display-menu -T "Reset Workspace" \
+            "Reset formatting (preserve processes)" r "run-shell 'tmux-reset --do-soft'" \
+            "Full wipe (start fresh)" w "run-shell 'tmux-reset --do-hard'" \
+            "" \
+            "Cancel" q ""
+        ;;
+esac

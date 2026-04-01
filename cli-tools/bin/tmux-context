@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+# tmux-context — Claude Code status line script for tmux context observability
+# TAGS: tmux, context, statusline, observability
+# AUDIENCE: agent (called by Claude Code status line)
+"""Claude Code status line script that:
+1. Displays context % in Claude Code's status line
+2. Sets @CONTEXT_INFO pane option for tmux pane border display
+3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
+4. Triggers pre-compact /session-update at configurable threshold
+5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
+
+Enriches display with Token-API instance data (voice, session doc).
+
+Receives JSON on stdin from Claude Code's status line system.
+Outputs formatted text for Claude Code to display.
+
+Configuration (settings.json):
+    "statusLine": {
+        "type": "command",
+        "command": "tmux-context"
+    }
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+# --- Config ---
+STATE_DIR = "/tmp/claude-panes"
+FLUSH_THRESHOLD = 70  # percent — inject /session-update
+FLUSH_COOLDOWN = 300  # seconds — don't re-flush within 5 minutes
+MODE_ENFORCE_COOLDOWN = 8  # seconds — don't re-check mode within 8s of last correction
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+
+# ANSI colors for status line output
+RED = "\033[31m"
+YELLOW = "\033[33m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def read_input():
+    """Read JSON from stdin (Claude Code status line data)."""
+    try:
+        return json.load(sys.stdin)
+    except Exception:
+        return {}
+
+
+def api_get(path, timeout=2.5):
+    """GET a Token-API endpoint, return parsed JSON or None."""
+    try:
+        req = urllib.request.Request(f"{API_URL}{path}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def api_patch(path, data, timeout=1.5):
+    """PATCH a Token-API endpoint."""
+    try:
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(f"{API_URL}{path}", data=body, method="PATCH")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def get_pane_title(pane_id):
+    """Read tmux pane title (set by Claude Code on /rename).
+
+    Strips Claude Code's spinner characters (braille dots U+2800-U+28FF)
+    and leading/trailing whitespace to get the clean session name.
+    """
+    if not pane_id:
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_title}"],
+            capture_output=True, text=True, timeout=1
+        )
+        title = result.stdout.strip()
+        # Strip braille spinner chars (U+2800-U+28FF)
+        title = "".join(c for c in title if not ("\u2800" <= c <= "\u28FF"))
+        return title.strip()
+    except Exception:
+        return ""
+
+
+def get_instance_by_pane(pane_id):
+    """Fetch instance data from Token-API by tmux pane ID.
+
+    Also resolves session doc title if a doc is linked.
+    """
+    if not pane_id:
+        return None
+    instances = api_get("/api/instances")
+    if not instances:
+        return None
+    for inst in instances:
+        if inst.get("tmux_pane") == pane_id and not inst.get("stopped_at"):
+            # Resolve session doc title if linked
+            doc_id = inst.get("session_doc_id")
+            if doc_id:
+                doc = api_get(f"/api/session-docs/{doc_id}", timeout=1)
+                if doc:
+                    inst["_session_doc_title"] = doc.get("title", "")
+            return inst
+    return None
+
+
+def format_tokens(tokens):
+    """Format token count: 73000 -> 73k, 150000 -> 150k, 1050000 -> 1.05M."""
+    if tokens is None:
+        return "?"
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1_000:
+        return f"{tokens // 1_000}k"
+    return str(tokens)
+
+
+def context_color(pct):
+    """Pick ANSI color based on context usage."""
+    if pct is None:
+        return DIM
+    if pct >= 70:
+        return RED
+    if pct >= 50:
+        return YELLOW
+    return GREEN
+
+
+def short_voice(voice_str):
+    """Extract short voice name: 'Microsoft Mark' -> 'Mark'."""
+    if not voice_str:
+        return ""
+    parts = voice_str.split()
+    # Drop 'Microsoft' prefix if present
+    return parts[-1] if len(parts) > 1 and parts[0] == "Microsoft" else voice_str
+
+
+def short_cwd(cwd):
+    """Abbreviate CWD: /mnt/imperium/Imperium-ENV -> Imperium-ENV."""
+    if not cwd:
+        return ""
+    return os.path.basename(cwd.rstrip("/"))
+
+
+def short_session_doc(doc_id):
+    """Abbreviate session doc path for display."""
+    if not doc_id:
+        return ""
+    # doc_id might be a path like "Mars/Sessions/2026-03-25-foo"
+    # or just the filename
+    base = os.path.basename(str(doc_id))
+    # Strip date prefix if present (YYYY-MM-DD-)
+    if len(base) > 11 and base[4] == "-" and base[7] == "-" and base[10] == "-":
+        base = base[11:]
+    # Strip .md
+    if base.endswith(".md"):
+        base = base[:-3]
+    return base
+
+
+def update_pane_option(pane_id, parts):
+    """Set tmux pane option @CONTEXT_INFO for pane border display."""
+    if not pane_id or not os.environ.get("TMUX"):
+        return
+    info = " | ".join(p for p in parts if p)
+    # Escape quotes for tmux
+    info = info.replace('"', '\\"')
+    try:
+        os.system(f'tmux set-option -p -t "{pane_id}" @CONTEXT_INFO "{info}" 2>/dev/null')
+    except Exception:
+        pass
+
+
+def write_state(pane_id, data, pct, model_name, session_id, instance):
+    """Write per-pane state file for external consumption."""
+    if not pane_id:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    safe_id = pane_id.lstrip("%")
+    state_file = os.path.join(STATE_DIR, f"pane-{safe_id}.json")
+
+    ctx = data.get("context_window", {})
+    cost = data.get("cost", {})
+
+    state = {
+        "pane_id": pane_id,
+        "model": model_name,
+        "session_id": session_id,
+        "used_percentage": pct,
+        "remaining_percentage": ctx.get("remaining_percentage"),
+        "total_input_tokens": ctx.get("total_input_tokens"),
+        "total_output_tokens": ctx.get("total_output_tokens"),
+        "context_window_size": ctx.get("context_window_size"),
+        "cost_usd": cost.get("total_cost_usd"),
+        "cwd": data.get("cwd"),
+        "updated_at": time.time(),
+    }
+    if instance:
+        state["voice"] = instance.get("tts_voice")
+        state["session_doc_id"] = instance.get("session_doc_id")
+        state["tab_name"] = instance.get("tab_name")
+        state["instance_id"] = instance.get("id")
+        state["cc_color"] = instance.get("cc_color")
+        state["tts_state"] = instance.get("_tts_state", "")
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def check_pre_compact(pane_id, pct):
+    """If context crosses threshold, inject /session-update. Idempotent via cooldown."""
+    if not pane_id or not os.environ.get("TMUX"):
+        return
+    if pct is None or pct < FLUSH_THRESHOLD:
+        return
+
+    safe_id = pane_id.lstrip("%")
+    marker = os.path.join(STATE_DIR, f"flush-{safe_id}.ts")
+
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                last_flush = float(f.read().strip())
+            if time.time() - last_flush < FLUSH_COOLDOWN:
+                return
+    except Exception:
+        pass
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+    os.system(f'tmux send-keys -t "{pane_id}" "/session-update" Enter')
+
+
+def enforce_bypass_mode(pane_id):
+    """Detect invalid mode (accept-edits or none) and correct to bypass.
+
+    Only plan and bypass are valid modes. If accept-edits or no-mode is
+    detected, fires tmux-mode-toggle in background to correct.
+    """
+    if not pane_id or not os.environ.get("TMUX"):
+        return
+
+    safe_id = pane_id.lstrip("%")
+    marker = os.path.join(STATE_DIR, f"mode-enforce-{safe_id}.ts")
+
+    # Cooldown: skip if we corrected recently
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                last = float(f.read().strip())
+            if time.time() - last < MODE_ENFORCE_COOLDOWN:
+                return
+    except Exception:
+        pass
+
+    # Capture last 5 lines to detect mode (same technique as tmux-mode-toggle)
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-5"],
+            capture_output=True, text=True, timeout=1
+        )
+        tail = result.stdout
+    except Exception:
+        return
+
+    # Valid modes — no correction needed
+    if "bypass permissions on" in tail or "plan mode on" in tail:
+        return
+
+    # Invalid: "accept edits on" is unambiguous
+    is_accept = "accept edits on" in tail
+    # Invalid: no mode indicator at all = "none" mode
+    is_none = (not is_accept
+               and "bypass permissions" not in tail
+               and "plan mode" not in tail
+               and "accept edits" not in tail)
+
+    if not is_accept and not is_none:
+        return
+
+    # Write cooldown BEFORE correction to prevent re-entrancy
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+    # Fire correction in background (non-blocking)
+    subprocess.Popen(
+        ["tmux-mode-toggle", "--pane", pane_id],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def main():
+    data = read_input()
+    if not data:
+        return
+
+    pane_id = os.environ.get("TMUX_PANE", "")
+    ctx = data.get("context_window", {})
+    model = data.get("model", {})
+    model_name = model.get("display_name", "Claude").split(" (")[0]
+    session_id = data.get("session_id", "")
+    cwd = data.get("cwd", "")
+
+    pct = ctx.get("used_percentage")
+    total_tokens = ctx.get("context_window_size")
+    input_tokens = ctx.get("total_input_tokens") or 0
+    output_tokens = ctx.get("total_output_tokens") or 0
+    used_tokens = input_tokens + output_tokens
+
+    cost = data.get("cost", {})
+    cost_usd = cost.get("total_cost_usd")
+
+    # Fetch instance data and TTS state from Token-API
+    instance = get_instance_by_pane(pane_id)
+    voice = short_voice(instance.get("tts_voice")) if instance else ""
+    # Use resolved title if available, fall back to short_session_doc on raw ID
+    session_doc = ""
+    if instance:
+        session_doc = instance.get("_session_doc_title") or short_session_doc(instance.get("session_doc_id")) if instance.get("session_doc_id") else ""
+
+    # --- TTS state: speaking / queued ---
+    tts_label = ""
+    if instance:
+        inst_id = instance.get("id", "")
+        tts_status = api_get("/api/notify/queue/status", timeout=0.5)
+        if tts_status:
+            current = tts_status.get("current")
+            if current and current.get("instance_id") == inst_id:
+                tts_label = "\U0001f50a"  # 🔊 speaking
+            elif any(q.get("instance_id") == inst_id for q in tts_status.get("queue", [])):
+                tts_label = "\U0001f508"  # 🔈 queued
+        if instance and tts_label:
+            instance["_tts_state"] = "speaking" if tts_label == "\U0001f50a" else "queued"
+
+    # --- Name sync: tmux pane title → Token-API tab_name ---
+    # Only sync kebab-case names (our naming convention). Claude Code auto-generates
+    # verbose sentence-case titles (e.g., "Fix tmux quit keybind regression") which
+    # must NOT overwrite the DB — otherwise _auto_name_instance sees a non-default
+    # name at Stop and skips MiniMax kebab-case naming entirely.
+    if instance and pane_id:
+        pane_title = get_pane_title(pane_id)
+        api_name = instance.get("tab_name", "")
+        # Only sync if: non-empty, differs from DB, and looks like an intentional
+        # rename (no spaces = kebab-case). Skip Claude Code auto-titles, spinner
+        # artifacts, paths, and fallback names.
+        is_our_name = bool(pane_title and " " not in pane_title
+                           and "/" not in pane_title and "..." not in pane_title
+                           and pane_title not in ("Claude Code", "claude"))
+        if pane_title and pane_title != api_name and is_our_name:
+            api_patch(f"/api/instances/{instance['id']}/rename", {"tab_name": pane_title})
+
+    # --- 1. Build pane border info ---
+    used_str = format_tokens(used_tokens)
+    total_str = format_tokens(total_tokens)
+    pct_str = f"{pct}%" if pct is not None else "?"
+
+    border_parts = [
+        f"{model_name} {pct_str} {used_str}/{total_str}",
+    ]
+    if tts_label:
+        border_parts.append(tts_label)
+    if voice:
+        border_parts.append(voice)
+    if session_doc:
+        border_parts.append(session_doc)
+    if cwd:
+        border_parts.append(short_cwd(cwd))
+
+    update_pane_option(pane_id, border_parts)
+
+    # --- 2. Write state file ---
+    write_state(pane_id, data, pct, model_name, session_id, instance)
+
+    # --- 3. Check pre-compact threshold ---
+    check_pre_compact(pane_id, pct)
+
+    # --- 4. Output status line for Claude Code ---
+    color = context_color(pct)
+    pct_display = f"{pct}%" if pct is not None else "..."
+    cost_str = f" ${cost_usd:.2f}" if cost_usd is not None else ""
+    voice_str = f" {DIM}{voice}{RESET}" if voice else ""
+    doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
+
+    tts_str = f" {tts_label}" if tts_label else ""
+    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{voice_str}{doc_str}{tts_str}")
+
+    # --- 5. Enforce bypass mode (auto-correct accept-edits/no-mode) ---
+    enforce_bypass_mode(pane_id)
+
+
+if __name__ == "__main__":
+    main()

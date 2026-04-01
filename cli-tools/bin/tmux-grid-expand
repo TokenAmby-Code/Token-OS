@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# tmux-grid-expand - Expand/retract panes in the workspace
+# TAGS: tmux, grid, expand
+# AUDIENCE: human + script
+#
+# Two independent expansion axes, toggled with the same key (prefix + e):
+#
+#   Grid expansion (@GRID_EXPANDED):
+#     Active grid pane expands to ~70% of grid area. Neighbors shrink but
+#     stay alive. Width resizes go through the origin-column pane (smallest
+#     pane_left) so side panes are never in the resize path.
+#
+#   Side expansion (@SIDE_EXPANDED):
+#     WSL: close the other side panel, shift the grid, expand this terminal
+#          into the freed space. Grid panes stay the same size.
+#     Mac: compress the grid proportionally to give the monitor more room.
+#
+# Both can be active simultaneously. Layering order on every apply:
+#   1. Reset to canonical (tmux-refresh-layout)
+#   2. Apply side expansion (changes grid's total available space)
+#   3. Apply grid expansion (works within the current grid area)
+#
+# Usage:
+#   tmux-grid-expand              # Toggle expand/retract for active pane
+#   tmux-grid-expand --retract    # Force full reset to canonical
+
+set -euo pipefail
+
+GRID_EXPAND_RATIO=70
+MAC_SIDE_EXPAND_RATIO=50
+
+SESSION=$(tmux display-message -p '#{session_name}')
+WINDOW=$(tmux display-message -p '#{window_index}')
+TARGET="${SESSION}:${WINDOW}"
+ACTIVE_PANE=$(tmux display-message -p '#{pane_id}')
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+get_all_panes() {
+    tmux list-panes -t "$TARGET" \
+        -F '#{pane_id}	#{@GRID_STATE}	#{pane_left}	#{pane_top}	#{pane_width}	#{pane_height}'
+}
+
+get_grid_panes() {
+    get_all_panes | awk -F'\t' '$2 == "small" { print $1"\t"$3"\t"$4"\t"$5"\t"$6 }'
+}
+
+get_side_panes() {
+    get_all_panes | awk -F'\t' '$2 == "side" { print $1"\t"$3"\t"$4"\t"$5"\t"$6 }'
+}
+
+# Compute grid bounding box from current geometry.
+# Sets: GRID_W, GRID_H, GRID_LEFT, GRID_RIGHT, GRID_TOP, GRID_BOTTOM
+compute_grid_bounds() {
+    GRID_LEFT=99999 GRID_RIGHT=0 GRID_TOP=99999 GRID_BOTTOM=0
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        local pr=$((pleft + pwidth)) pb=$((ptop + pheight))
+        (( pleft < GRID_LEFT )) && GRID_LEFT=$pleft
+        (( pr > GRID_RIGHT )) && GRID_RIGHT=$pr
+        (( ptop < GRID_TOP )) && GRID_TOP=$ptop
+        (( pb > GRID_BOTTOM )) && GRID_BOTTOM=$pb
+    done < <(get_grid_panes)
+    GRID_W=$((GRID_RIGHT - GRID_LEFT))
+    GRID_H=$((GRID_BOTTOM - GRID_TOP))
+}
+
+# Find origin-column and far-column top panes.
+# Origin column (smallest pane_left) is safe for width resizes — its next
+# tree sibling is the far column, never a side pane.
+# Sets: ORIGIN_COL, ORIGIN_COL_W, FAR_COL, FAR_COL_W
+find_grid_cols() {
+    local min_left=99999 min_top=99999
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        (( pleft < min_left )) && min_left=$pleft
+        (( ptop < min_top )) && min_top=$ptop
+    done < <(get_grid_panes)
+
+    ORIGIN_COL="" ORIGIN_COL_W=0
+    FAR_COL="" FAR_COL_W=0
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        if (( ptop == min_top )); then
+            if (( pleft == min_left )); then
+                ORIGIN_COL="$pid"; ORIGIN_COL_W=$pwidth
+            else
+                FAR_COL="$pid"; FAR_COL_W=$pwidth
+            fi
+        fi
+    done < <(get_grid_panes)
+}
+
+# Find the target's grid partners by relative position.
+#   H_PARTNER: same column, other row
+#   V_PARTNER: same row, other column
+#   DIAGONAL:  other row, other column
+find_partners() {
+    local target="$1"
+    local pids=() lefts=() tops=()
+    local t_idx=-1 i=0
+
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        pids+=("$pid"); lefts+=("$pleft"); tops+=("$ptop")
+        [[ "$pid" == "$target" ]] && t_idx=$i
+        i=$((i + 1))
+    done < <(get_grid_panes)
+
+    local t_left=${lefts[$t_idx]} t_top=${tops[$t_idx]}
+    TARGET_LEFT=$t_left TARGET_TOP=$t_top
+
+    H_PARTNER="" V_PARTNER="" DIAGONAL=""
+    H_TOP=0 V_LEFT=0 D_TOP=0
+
+    for ((j=0; j<${#pids[@]}; j++)); do
+        [[ $j -eq $t_idx ]] && continue
+        local same_col=false same_row=false
+        local dl=$(( ${lefts[$j]} - t_left )) dt=$(( ${tops[$j]} - t_top ))
+        (( dl > -5 && dl < 5 )) && same_col=true
+        (( dt > -5 && dt < 5 )) && same_row=true
+
+        if [[ "$same_col" == true && "$same_row" == false ]]; then
+            H_PARTNER="${pids[$j]}"; H_TOP=${tops[$j]}
+        elif [[ "$same_col" == false && "$same_row" == true ]]; then
+            V_PARTNER="${pids[$j]}"; V_LEFT=${lefts[$j]}
+        elif [[ "$same_col" == false && "$same_row" == false ]]; then
+            DIAGONAL="${pids[$j]}"; D_TOP=${tops[$j]}
+        fi
+    done
+}
+
+# ─── Side Expansion ─────────────────────────────────────────────────
+
+do_side_expand() {
+    local target_side="$1"
+    local origin
+    origin=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+
+    if [[ "$origin" == "wsl" ]]; then
+        do_side_expand_wsl "$target_side"
+    elif [[ "$origin" == "mac" ]]; then
+        do_side_expand_mac "$target_side"
+    fi
+}
+
+do_side_expand_wsl() {
+    local target_side="$1"
+
+    # Find both side panes with their widths and positions
+    local other_side="" target_w=0 other_w=0 target_left=0 other_left=0
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        if [[ "$pid" == "$target_side" ]]; then
+            target_w=$pwidth; target_left=$pleft
+        else
+            other_side="$pid"; other_w=$pwidth; other_left=$pleft
+        fi
+    done < <(get_side_panes)
+
+    [[ -z "$other_side" ]] && return
+
+    # Save grid column widths BEFORE any resizing
+    find_grid_cols
+    local saved_origin_w=$ORIGIN_COL_W
+    local saved_far_w=$FAR_COL_W
+
+    # Target gets all redistributable side space (other shrinks to 1)
+    local desired=$((target_w + other_w - 1))
+
+    # Chain space through the tree left-to-right.
+    # tmux exchanges space with the NEXT sibling (rightward), so we must
+    # adjust boundaries from left to right to chain correctly:
+    #   LS/LC boundary → LC/RC boundary → RC/RS boundary
+    #
+    # Step 1: adjust the leftmost side boundary
+    if (( target_left < other_left )); then
+        # Target is left side → grow it (takes from origin-col)
+        tmux resize-pane -t "$target_side" -x "$desired"
+    else
+        # Other is left side → shrink it to 1 (gives to origin-col)
+        tmux resize-pane -t "$other_side" -x 1
+    fi
+
+    # Steps 2-3: restore grid columns left-to-right, chaining excess
+    # through to the rightmost side pane
+    tmux resize-pane -t "$ORIGIN_COL" -x "$saved_origin_w"
+    tmux resize-pane -t "$FAR_COL" -x "$saved_far_w"
+}
+
+do_side_expand_mac() {
+    local target_side="$1"
+    local win_w
+    win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
+
+    # Monitor expands to MAC_SIDE_EXPAND_RATIO% of window
+    local new_monitor_w=$((win_w * MAC_SIDE_EXPAND_RATIO / 100))
+
+    # Grid shrinks proportionally — preserve the column ratio
+    find_grid_cols
+    compute_grid_bounds
+    local new_grid_w=$((win_w - new_monitor_w - 1))  # 1 border between grid and monitor
+    local new_origin_w=$((ORIGIN_COL_W * new_grid_w / GRID_W))
+
+    # Apply: monitor first (adjusts far-col/monitor boundary),
+    # then origin-col (adjusts internal grid boundary)
+    tmux resize-pane -t "$target_side" -x "$new_monitor_w"
+    tmux resize-pane -t "$ORIGIN_COL" -x "$new_origin_w"
+}
+
+# ─── Grid Expansion ─────────────────────────────────────────────────
+
+shrink_monitor_for_grid() {
+    # Mild monitor shrink (33% → 20%) when only grid is expanded (no side expansion).
+    # If side expansion is active, it already controls the monitor size.
+    local side_exp
+    side_exp=$(tmux show-options -wv -t "$TARGET" @SIDE_EXPANDED 2>/dev/null || echo "none")
+    [[ "$side_exp" != "none" ]] && return
+
+    local focused
+    focused=$(tmux show-options -wv -t "$TARGET" @FOCUSED 2>/dev/null || echo "false")
+    local origin
+    origin=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+
+    [[ "$focused" == "true" || "$origin" != "mac" ]] && return
+
+    local monitor_pid=""
+    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
+        [[ "$pid" != "" ]] && { monitor_pid="$pid"; break; }
+    done < <(get_side_panes)
+
+    [[ -z "$monitor_pid" ]] && return
+
+    local win_w
+    win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
+    local shrunk_w=$(( (win_w - 2) * 20 / 100 ))
+    tmux resize-pane -t "$monitor_pid" -x "$shrunk_w"
+}
+
+do_grid_expand() {
+    local target_pane="$1"
+
+    local pane_count
+    pane_count=$(get_grid_panes | wc -l)
+    if [[ "$pane_count" -ne 4 ]]; then
+        tmux display-message "Cannot expand grid: not a 2x2 grid ($pane_count panes)"
+        return 1
+    fi
+
+    # Mild monitor courtesy shrink (Mac only, no-op if side already expanded)
+    shrink_monitor_for_grid
+
+    # Find partners relative to target
+    find_partners "$target_pane"
+
+    # Compute grid bounds (after any monitor shrink)
+    compute_grid_bounds
+
+    local big_w=$((GRID_W * GRID_EXPAND_RATIO / 100))
+    local big_h=$((GRID_H * GRID_EXPAND_RATIO / 100))
+    local small_w=$((GRID_W - big_w - 1))
+    local small_h=$((GRID_H - big_h - 1))
+
+    # Width: resize through the origin-column pane (smaller pane_left)
+    if (( TARGET_LEFT < V_LEFT )); then
+        tmux resize-pane -t "$target_pane" -x "$big_w"
+    else
+        tmux resize-pane -t "$V_PARTNER" -x "$small_w"
+    fi
+
+    # Height: resize through the origin-row pane (smaller pane_top) per column
+    if (( TARGET_TOP < H_TOP )); then
+        tmux resize-pane -t "$target_pane" -y "$big_h"
+        tmux resize-pane -t "$V_PARTNER" -y "$big_h"
+    else
+        tmux resize-pane -t "$H_PARTNER" -y "$small_h"
+        tmux resize-pane -t "$DIAGONAL" -y "$small_h"
+    fi
+}
+
+# ─── Layered Apply ──────────────────────────────────────────────────
+
+# Reset only grid panes to even within current space, without touching
+# side panes. This avoids the visual flash of side panes snapping to
+# canonical then back when only grid state is changing.
+reset_grid_even() {
+    find_grid_cols
+    compute_grid_bounds
+    local even_w=$(( (GRID_W - 1) / 2 ))
+    local even_h=$(( (GRID_H - 1) / 2 ))
+
+    tmux resize-pane -t "$ORIGIN_COL" -x "$even_w"
+    tmux resize-pane -t "$ORIGIN_COL" -y "$even_h"
+    tmux resize-pane -t "$FAR_COL" -y "$even_h"
+}
+
+# Apply all active expansions.
+# $1 = "grid" or "side" — which axis just changed.
+# When only grid changed and side is already active, skip the full
+# canonical reset to avoid a visible flash of side panes jumping.
+apply_expansions() {
+    local what_changed="${1:-full}"
+
+    local side_exp grid_exp
+    side_exp=$(tmux show-options -wv -t "$TARGET" @SIDE_EXPANDED 2>/dev/null || echo "none")
+    grid_exp=$(tmux show-options -wv -t "$TARGET" @GRID_EXPANDED 2>/dev/null || echo "none")
+
+    # Validate expansion targets still exist (panes can be killed by focus toggle)
+    if [[ "$side_exp" != "none" ]] && ! tmux display-message -t "$side_exp" -p '' 2>/dev/null; then
+        side_exp="none"
+        tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
+    fi
+    if [[ "$grid_exp" != "none" ]] && ! tmux display-message -t "$grid_exp" -p '' 2>/dev/null; then
+        grid_exp="none"
+        tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none" 2>/dev/null || true
+    fi
+
+    if [[ "$what_changed" == "grid" && "$side_exp" != "none" ]]; then
+        # Side is active and didn't change — skip full reset, just even the grid
+        reset_grid_even
+    else
+        # Side changed (or no side) — full canonical reset needed
+        tmux-refresh-layout "$TARGET"
+        # Restore state (refresh-layout clears it)
+        tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "$side_exp" 2>/dev/null || true
+        tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$grid_exp" 2>/dev/null || true
+        # Apply side expansion (changes grid's total available space)
+        if [[ "$side_exp" != "none" ]]; then
+            do_side_expand "$side_exp"
+        fi
+    fi
+
+    # Apply grid expansion (works within current grid area)
+    if [[ "$grid_exp" != "none" ]]; then
+        do_grid_expand "$grid_exp"
+    fi
+
+    # Clean up SIGWINCH prompt stacking in idle panes
+    clear_stale_prompts
+}
+
+# Clear panes where SIGWINCH redraws have stacked identical prompt lines.
+# Heuristic: if the last 4+ non-empty lines are all identical, the pane is
+# idle at a prompt and the duplicates are from resize signals. Safe to clear.
+# Panes with real output (commands, mixed content) are never touched.
+clear_stale_prompts() {
+    local all_panes
+    all_panes=$(get_all_panes)
+
+    while IFS=$'\t' read -r pid state pleft ptop pwidth pheight; do
+        [[ "$state" == "small" || "$state" == "side" ]] || continue
+
+        # Capture visible content, drop empty lines
+        local lines
+        lines=$(tmux capture-pane -t "$pid" -p 2>/dev/null | sed '/^$/d')
+        [[ -z "$lines" ]] && continue
+
+        local line_count unique_count
+        line_count=$(echo "$lines" | tail -5 | wc -l)
+        unique_count=$(echo "$lines" | tail -5 | sort -u | wc -l)
+
+        # 4+ identical trailing lines = stacked prompts from SIGWINCH
+        if (( line_count >= 4 && unique_count == 1 )); then
+            tmux send-keys -t "$pid" C-l
+        fi
+    done <<< "$all_panes"
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --retract)
+        tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none" 2>/dev/null || true
+        tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
+        tmux-refresh-layout "$TARGET"
+        ;;
+    *)
+        active_state=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_STATE 2>/dev/null || echo "")
+
+        if [[ "$active_state" == "small" ]]; then
+            # Grid pane: toggle grid expansion
+            current=$(tmux show-options -wv -t "$TARGET" @GRID_EXPANDED 2>/dev/null || echo "none")
+            if [[ "$current" == "$ACTIVE_PANE" ]]; then
+                tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none"
+            else
+                tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$ACTIVE_PANE"
+            fi
+            apply_expansions "grid"
+
+        elif [[ "$active_state" == "side" ]]; then
+            # Side pane: toggle side expansion
+            current=$(tmux show-options -wv -t "$TARGET" @SIDE_EXPANDED 2>/dev/null || echo "none")
+            if [[ "$current" == "$ACTIVE_PANE" ]]; then
+                tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none"
+            else
+                tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "$ACTIVE_PANE"
+            fi
+            apply_expansions "side"
+
+        else
+            tmux display-message "Cannot expand: pane has no grid state"
+        fi
+        ;;
+esac

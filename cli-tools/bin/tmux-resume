@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# tmux-resume — Inject a prompt into a running Claude Code session via tmux
+# TAGS: tmux, resume, golden-throne, send-keys
+# AUDIENCE: human + cron + golden-throne
+#
+# The ////resume pattern: instead of spawning a new Claude instance,
+# inject a follow-up prompt into an existing session's tmux pane.
+# Better process coherence, single session history, no orphaned processes.
+#
+# Usage:
+#   tmux-resume -t main:grid.2 "check if the tests pass"
+#   tmux-resume -t main:grid.2 --file ~/.claude/prompts/follow-up.md
+#   tmux-resume --find-claude "check status"               # Auto-find Claude pane
+#   echo "prompt" | tmux-resume -t main:grid.2 --stdin
+
+set -euo pipefail
+
+TARGET=""
+TEXT=""
+FROM_STDIN=false
+FROM_FILE=""
+FIND_CLAUDE=false
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--target)
+            TARGET="$2"
+            shift 2
+            ;;
+        --file|-f)
+            FROM_FILE="$2"
+            shift 2
+            ;;
+        --stdin)
+            FROM_STDIN=true
+            shift
+            ;;
+        --find-claude)
+            FIND_CLAUDE=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            cat <<'EOF'
+tmux-resume — Inject a prompt into a running Claude Code session
+
+Usage:
+  tmux-resume [OPTIONS] "prompt text"
+
+Options:
+  -t, --target PANE    Target pane (e.g., main:grid.2)
+  -f, --file PATH      Read prompt from file
+  --stdin              Read prompt from stdin
+  --find-claude        Auto-detect pane running Claude Code
+  --dry-run            Show what would be sent without sending
+  -h, --help           Show this help
+
+The ////resume Pattern:
+  Instead of spawning new Claude instances per task, inject follow-up
+  prompts into existing sessions. Benefits:
+  - Single session history (no orphaned processes)
+  - Better process coherence
+  - Pane stays associated with its workspace zone
+
+Examples:
+  tmux-resume -t main:grid.2 "check test results"
+  tmux-resume --find-claude "update the session doc"
+  tmux-resume -t main:grid.2 -f ~/.claude/prompts/golden-throne-checkin.md
+EOF
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            TEXT="$1"
+            shift
+            ;;
+    esac
+done
+
+# --- Resolve text ---
+if [[ -n "$FROM_FILE" ]]; then
+    if [[ ! -f "$FROM_FILE" ]]; then
+        echo "Error: file not found: $FROM_FILE" >&2
+        exit 1
+    fi
+    TEXT=$(cat "$FROM_FILE")
+elif $FROM_STDIN; then
+    TEXT=$(cat)
+fi
+
+if [[ -z "$TEXT" ]]; then
+    echo "Error: no prompt provided." >&2
+    exit 1
+fi
+
+# --- Find Claude pane ---
+if $FIND_CLAUDE; then
+    # Walk all panes, find one running claude
+    CLAUDE_PANE=""
+    while IFS= read -r line; do
+        pane_id=$(echo "$line" | cut -d' ' -f1)
+        pane_cmd=$(echo "$line" | cut -d' ' -f2-)
+        if [[ "$pane_cmd" == *"claude"* ]]; then
+            CLAUDE_PANE="$pane_id"
+            break
+        fi
+    done < <(tmux list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null)
+
+    if [[ -z "$CLAUDE_PANE" ]]; then
+        echo "Error: no pane running Claude found." >&2
+        exit 1
+    fi
+    TARGET="$CLAUDE_PANE"
+    echo "Found Claude in pane: $TARGET" >&2
+fi
+
+if [[ -z "$TARGET" ]]; then
+    echo "Error: no target pane specified. Use -t or --find-claude." >&2
+    exit 1
+fi
+
+# --- Dry run ---
+if $DRY_RUN; then
+    echo "Would send to pane $TARGET:"
+    echo "---"
+    echo "$TEXT"
+    echo "---"
+    exit 0
+fi
+
+# --- Send the prompt ---
+# Use send-keys -l for literal text, then Enter to submit
+tmux send-keys -t "$TARGET" -l "$TEXT"
+tmux send-keys -t "$TARGET" Enter
+
+echo "Prompt injected into $TARGET" >&2

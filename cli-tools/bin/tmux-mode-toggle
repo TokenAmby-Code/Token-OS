@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# tmux-mode-toggle — Toggle Claude Code between plan and bypass modes
+# TAGS: tmux, claude, mode, keybind
+# AUDIENCE: human
+#
+# Detects the current Claude Code mode by parsing the pane content,
+# then sends the exact number of Shift+Tab presses to reach the target.
+#
+# Usage:
+#     tmux-mode-toggle              # Toggle plan <-> bypass in current pane
+#     tmux-mode-toggle --pane %4    # Target a specific pane
+#     tmux-mode-toggle --status     # Just print current mode, don't toggle
+#
+# Mode cycle (Shift+Tab): no-mode → accept-edits → plan → bypass → no-mode
+#
+# Behavior:
+#   plan    → bypass  (1 press)
+#   bypass  → plan    (3 presses)
+#   no-mode → bypass  (3 presses, with warning — missing --dangerously-skip-permissions flag)
+#   accept  → bypass  (2 presses, with warning)
+
+set -euo pipefail
+
+PANE=""
+STATUS_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="$2"; shift 2 ;;
+        --status) STATUS_ONLY=true; shift ;;
+        -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Default to current pane
+PANE_ARG=()
+if [[ -n "$PANE" ]]; then
+    PANE_ARG=(-t "$PANE")
+fi
+
+# Capture the last 5 lines of the pane — mode indicator is at the very bottom
+TAIL=$(tmux capture-pane "${PANE_ARG[@]}" -p -S -5 2>/dev/null || true)
+
+# Detect current mode from the status line
+detect_mode() {
+    if echo "$TAIL" | grep -q "bypass permissions on"; then
+        echo "bypass"
+    elif echo "$TAIL" | grep -q "plan mode on"; then
+        echo "plan"
+    elif echo "$TAIL" | grep -q "accept edits on"; then
+        echo "accept"
+    else
+        echo "none"
+    fi
+}
+
+MODE=$(detect_mode)
+
+if $STATUS_ONLY; then
+    echo "$MODE"
+    exit 0
+fi
+
+# Calculate presses needed and send them
+send_shift_tabs() {
+    local count=$1
+    for ((i = 0; i < count; i++)); do
+        tmux send-keys "${PANE_ARG[@]}" BTab
+        # Small delay so Claude Code registers each keypress
+        sleep 0.15
+    done
+}
+
+case "$MODE" in
+    plan)
+        send_shift_tabs 1
+        echo "plan → bypass"
+        ;;
+    bypass)
+        send_shift_tabs 3
+        echo "bypass → plan"
+        ;;
+    accept)
+        echo "WARNING: in accept-edits mode (unexpected) — correcting to bypass" >&2
+        send_shift_tabs 2
+        echo "accept → bypass"
+        ;;
+    none)
+        echo "WARNING: no mode detected — may be missing --dangerously-skip-permissions flag" >&2
+        echo "Attempting to reach bypass (3 presses)..." >&2
+        send_shift_tabs 3
+        # Verify we landed on bypass
+        sleep 0.3
+        TAIL=$(tmux capture-pane "${PANE_ARG[@]}" -p -S -5 2>/dev/null || true)
+        VERIFY=$(detect_mode)
+        if [[ "$VERIFY" != "bypass" ]]; then
+            echo "ERROR: Could not reach bypass mode (landed on: $VERIFY)" >&2
+            echo "Instance likely launched without --dangerously-skip-permissions" >&2
+            exit 1
+        fi
+        echo "none → bypass"
+        ;;
+esac
