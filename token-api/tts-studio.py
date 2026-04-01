@@ -386,9 +386,9 @@ def main():
                     try:
                         import platform
                         if platform.system() == "Darwin":
-                            main_py_path = os.path.expanduser("~/Scripts/token-api/main.py")
+                            main_py_path = "/Volumes/Imperium/Scripts/token-api/main.py"
                         else:
-                            main_py_path = "/home/token/Scripts/token-api/main.py"
+                            main_py_path = "/mnt/imperium/Scripts/token-api/main.py"
 
                         with open(main_py_path, "r") as f:
                             content = f.read()

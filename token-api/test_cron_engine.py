@@ -6,13 +6,13 @@ Integration tests hit the live Token API at localhost:7777.
 
 Run:
     # Unit tests only (fast, no server needed):
-    cd ~/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "not integration"
+    cd /mnt/imperium/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "not integration"
 
     # Integration tests (requires running Token API):
-    cd ~/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "integration"
+    cd /mnt/imperium/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "integration"
 
     # All tests:
-    cd ~/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v
+    cd /mnt/imperium/Scripts/token-api && .venv/bin/python -m pytest test_cron_engine.py -v
 """
 
 import asyncio
@@ -722,7 +722,7 @@ class TestIntegrationTrigger:
 
 @skip_no_server
 class TestIntegrationPATH:
-    """Verify that claude and openclaw are in the subprocess PATH."""
+    """Verify that claude is in the subprocess PATH."""
 
     def test_claude_in_path(self):
         job = api_post("/api/cron/jobs", {
@@ -740,21 +740,6 @@ class TestIntegrationPATH:
         finally:
             api_delete(f"/api/cron/jobs/{job['id']}")
 
-    def test_openclaw_in_path(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-path-openclaw",
-            "command": "which openclaw",
-            "schedule": {"type": "interval", "value": "1h"},
-            "enabled": False,
-        })
-        try:
-            api_post(f"/api/cron/jobs/{job['id']}/trigger")
-            time.sleep(3)
-            runs = api_get(f"/api/cron/jobs/{job['id']}/runs?limit=1")
-            assert runs["runs"][0]["status"] == "ok"
-            assert "openclaw" in runs["runs"][0]["output_summary"]
-        finally:
-            api_delete(f"/api/cron/jobs/{job['id']}")
 
 
 @skip_no_server
@@ -814,13 +799,13 @@ class TestIntegrationAgentLaunch:
         reason="File creation is LLM-dependent; exit_code=0 is the reliable agent-launch signal",
     )
     def test_agent_writes_file(self):
-        proof_file = Path.home() / ".openclaw/workspace/memory/logs/test_suite_agent_proof.md"
+        proof_file = Path("/tmp/test_suite_agent_proof.md")
         if proof_file.exists():
             proof_file.unlink()
 
         job = api_post("/api/cron/jobs", {
             "name": "int-test-agent",
-            "command": "claude -p \"Write exactly this to ~/.openclaw/workspace/memory/logs/test_suite_agent_proof.md using the Write tool: TEST_SUITE_AGENT_VERIFIED\" --dangerously-skip-permissions",
+            "command": "claude -p \"Write exactly this to /tmp/test_suite_agent_proof.md using the Write tool: TEST_SUITE_AGENT_VERIFIED\" --dangerously-skip-permissions",
             "schedule": {"type": "interval", "value": "1h"},
             "timeout_seconds": 120,
             "enabled": False,
@@ -963,3 +948,83 @@ class TestVictoryRegex:
         from cron_engine import VICTORY_RE
         m = VICTORY_RE.search("##IMPERIUM_VICTORIOUS:   spaces around   ##")
         assert m.group(1).strip() == "spaces around"
+
+
+# ── Unit Tests: Instance Mutex ─────────────────────────────────
+
+
+class TestInstanceMutex:
+    """Tests for _check_instance_mutex: skips run if live cron instance exists."""
+
+    def _seed_instance(self, db_path, job_name: str, status: str, instance_id: str = None):
+        """Insert a claude_instance row directly into the test DB."""
+        import sqlite3
+        instance_id = instance_id or f"inst-{time.monotonic_ns()}"
+        con = sqlite3.connect(str(db_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS claude_instances (
+                id TEXT PRIMARY KEY,
+                tab_name TEXT,
+                status TEXT DEFAULT 'active',
+                spawner TEXT,
+                is_subagent INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+        """)
+        con.execute(
+            "INSERT INTO claude_instances (id, tab_name, status, spawner, is_subagent, created_at) VALUES (?,?,?,?,1,?)",
+            (instance_id, f"sub: cron:{job_name}", status, f"cron:{job_name}", "2026-01-01T00:00:00"),
+        )
+        con.commit()
+        con.close()
+        return instance_id
+
+    def test_mutex_clear_when_no_instances(self, engine, db_path):
+        """Returns True (proceed) when no instances exist for the job."""
+        job = {"id": "j1", "name": "my-task", "enabled": 1}
+        # Ensure claude_instances table exists (empty)
+        import sqlite3
+        con = sqlite3.connect(str(db_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS claude_instances (
+                id TEXT PRIMARY KEY, tab_name TEXT, status TEXT DEFAULT 'active',
+                spawner TEXT, is_subagent INTEGER DEFAULT 0, created_at TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+        result = run(engine._check_instance_mutex(job))
+        assert result is True
+
+    def test_mutex_blocked_by_active_instance(self, engine, db_path):
+        """Returns False (skip) when a live instance with matching spawner exists."""
+        job = {"id": "j2", "name": "my-task", "enabled": 1}
+        self._seed_instance(db_path, "my-task", status="active")
+        result = run(engine._check_instance_mutex(job))
+        assert result is False
+
+    def test_mutex_clear_after_instance_stopped(self, engine, db_path):
+        """Returns True (proceed) when the previous instance is stopped."""
+        job = {"id": "j3", "name": "my-task", "enabled": 1}
+        self._seed_instance(db_path, "my-task", status="stopped")
+        result = run(engine._check_instance_mutex(job))
+        assert result is True
+
+    def test_mutex_only_matches_job_name(self, engine, db_path):
+        """Live instance for a different job does not block this job."""
+        job = {"id": "j4", "name": "job-alpha", "enabled": 1}
+        self._seed_instance(db_path, "job-beta", status="active")
+        result = run(engine._check_instance_mutex(job))
+        assert result is True
+
+    def test_mutex_skip_logged(self, engine, db_path):
+        """When mutex blocks, _log_skip records a 'skipped' cron_run row."""
+        job_payload = create_job_dict(name="mutex-skip-test")
+        created = run(engine.create_job(job_payload))
+        job_id = created["id"]
+        self._seed_instance(db_path, "mutex-skip-test", status="active")
+
+        run(engine._log_skip(job_id, "instance_mutex"))
+
+        runs = run(engine.get_runs(job_id))
+        assert any(r["status"] == "skipped" and r.get("skip_reason") == "instance_mutex" for r in runs)

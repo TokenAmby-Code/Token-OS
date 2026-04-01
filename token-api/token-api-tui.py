@@ -4,11 +4,16 @@ Token-API TUI: Terminal dashboard for Claude instance management.
 
 Connects to existing Token-API server running on port 7777.
 
+Layout adapts to terminal size:
+  Normal     - Vertical stacked dashboard (header, table, info, details, footer)
+  Narrow     - Same layout with reduced columns (<60 chars wide)
+  Widget     - 6-line timer + active instances (<=10 lines tall)
+
 Controls:
   arrow/jk  - Select instance/cron job (up/down)
   g/G       - Jump to first/last
   [/]       - Switch table (Instances/Cron)
-  h/l       - Switch info panel (Events/Logs/Deploy/Monitor)
+  h/l       - Switch info panel (Events/Logs/Deploy/Monitor/Timer)
   Enter     - Open selected instance in new terminal tab
   r         - Rename selected instance
   y         - Copy resume command to clipboard (yank)
@@ -87,13 +92,8 @@ _timer_cache = {
 }
 
 # Layout detection thresholds
-MOBILE_TAILSCALE_IP = "100.102.92.24"
-MOBILE_WIDTH_THRESHOLD = 60  # Below this = mobile mode
-COMPACT_WIDTH_THRESHOLD = 100  # Below this (but above mobile) = compact mode
-# Vertical threshold: character cells are ~2x taller than wide, so a "square" terminal
-# in pixels has aspect ratio ~2.0 in characters. We favor vertical mode - only clearly
-# wide terminals (aspect > 2.5) get full mode. Square-ish terminals stay vertical.
-VERTICAL_ASPECT_RATIO_THRESHOLD = 2.5
+NARROW_WIDTH_THRESHOLD = 60  # Below this, tables reduce columns and panels tighten
+WIDGET_HEIGHT_THRESHOLD = 30  # At or below this, fall back to 6-line widget (DEBUG: raised from 10)
 
 # Global state
 selected_index = 0
@@ -101,15 +101,17 @@ instances_cache = []
 todos_cache = {}  # instance_id -> last known todos data (persists when not polling)
 api_healthy = True
 api_error_message = None
-layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
-layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
 sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
 filter_mode = "all"  # "all", "active", "stopped"
 show_subagents = False  # Hide subagents by default, toggle with 'a'
 show_help = False  # Help overlay toggle
 global_tts_mode = "verbose"  # Cached from API
-table_mode = "instances"  # "instances" or "cron"
+TABLE_MODES = ["instances", "cron", "archived"]
+table_mode = "instances"  # "instances", "cron", or "archived"
 cron_selected_index = 0
+archived_selected_index = 0
+_evaluating_instances: set[str] = set()  # instance IDs currently in evaluator phase
+_throbber_tick = 0  # cycles 0-3 on each refresh for evaluator throbber
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
 PANEL_PAGE_MAX = 4  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor, 4=Timer Stats
 deploy_active = False
@@ -119,49 +121,10 @@ deploy_previous_page = 0
 deploy_auto_switched = False
 DEPLOY_SCAN_DIR = Path.home() / "ProcAgentDir"
 TUI_SIGNAL_DIR = Path.home() / ".claude"
-TUI_SLOTS = ("desktop", "mobile")  # Two monitor slots
+TUI_SLOTS = ("desktop",)  # Signal file slots
 console = Console()
 
 
-def detect_layout_mode() -> str:
-    """Detect layout mode: 'mobile', 'vertical', 'compact', or 'full'.
-
-    Priority:
-    1. Phone SSH always gets mobile
-    2. Very narrow (<60) always gets mobile
-    3. Vertical/square orientation (aspect < 2.5) gets vertical (stacked panels)
-    4. Medium width (60-100) gets compact (no sidebar)
-    5. Wide + normal aspect gets full
-
-    Note: Character cells are ~2x taller than wide, so a "square" terminal in pixels
-    has aspect ratio ~2.0 in character terms. We favor vertical mode (threshold 2.5)
-    so only clearly wide terminals get full mode.
-    """
-    ssh_client = os.environ.get("SSH_CLIENT", "")
-
-    # Phone always mobile
-    if ssh_client.startswith(MOBILE_TAILSCALE_IP + " "):
-        return "mobile"
-
-    width = console.size.width
-    height = console.size.height
-
-    # Very narrow always mobile
-    if width < MOBILE_WIDTH_THRESHOLD:
-        return "mobile"
-
-    # Check vertical orientation (tall terminal in character terms)
-    is_vertical = height > 0 and (width / height) < VERTICAL_ASPECT_RATIO_THRESHOLD
-
-    # Vertical monitor gets dedicated vertical mode (stacked panels)
-    if is_vertical:
-        return "vertical"
-
-    # Medium width gets compact (no sidebar but horizontal header)
-    if width < COMPACT_WIDTH_THRESHOLD:
-        return "compact"
-
-    return "full"
 
 
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
@@ -299,6 +262,30 @@ def format_zealotry_cell(instance: dict) -> str:
         return f"[red bold]{zealotry}[/red bold]"
 
 
+def format_device_short(device_id: str) -> str:
+    """Normalize device_id to colored 3-char display code."""
+    if not device_id:
+        return "?"
+    d = device_id.lower()
+    if "mac" in d:
+        return "[white]mac[/white]"
+    if d in ("desktop", "tokenpc"):
+        return "[cyan]wsl[/cyan]"
+    if "s24" in d or "samsung" in d or "galaxy" in d:
+        return "[green]s24[/green]"
+    return device_id[:3]
+
+
+def format_tags(instance: dict) -> str:
+    """Build tag string from instance metadata."""
+    tags = ""
+    if instance.get("voice_chat") or instance.get("tts_mode") == "voice-chat":
+        tags += "\U0001f399"  # 🎙
+    if instance.get("is_subagent"):
+        tags += "\u2193"  # ↓ (sub indicator)
+    return tags
+
+
 def _is_stale_instance(instance: dict) -> bool:
     """Check if a stopped instance should be hidden (pre-today or unnamed 0m run)."""
     if instance.get("status") not in ("stopped",):
@@ -319,13 +306,17 @@ def _is_stale_instance(instance: dict) -> bool:
 
 
 def filter_instances(instances: list) -> list:
-    """Filter instances based on current filter_mode and subagent visibility."""
+    """Filter instances based on current filter_mode and subagent visibility.
+    Always excludes archived instances (they live in their own tab)."""
     # First filter by subagent visibility
     if not show_subagents:
         instances = [i for i in instances if not i.get("is_subagent")]
 
     # Hide stale instances (pre-today stopped, unnamed 0m runs)
     instances = [i for i in instances if not _is_stale_instance(i)]
+
+    # Exclude archived instances from main tab
+    instances = [i for i in instances if i.get("instance_type", "one_off") != "archived"]
 
     if filter_mode == "all":
         return instances
@@ -350,13 +341,12 @@ def is_custom_tab_name(tab_name: str) -> bool:
 def format_instance_name(instance: dict, max_len: int = 20) -> str:
     """Format instance name, prioritizing custom tab_name over working_dir."""
     tab_name = instance.get("tab_name", "")
-    vc_suffix = " 🎙" if instance.get("voice_chat") or instance.get("tts_mode") == "voice-chat" else ""
 
     # If user has set a custom name, always use it
     if is_custom_tab_name(tab_name):
         if len(tab_name) > max_len:
-            return tab_name[:max_len - 3] + "..." + vc_suffix
-        return tab_name + vc_suffix
+            return tab_name[:max_len - 3] + "..."
+        return tab_name
 
     # Otherwise derive from working_dir
     working_dir = instance.get("working_dir")
@@ -373,9 +363,9 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
             name = working_dir
         if len(name) > max_len:
             name = "..." + name[-(max_len - 3):]
-        return name + vc_suffix
+        return name
     # Fallback to tab_name or id
-    return (tab_name or instance.get("id", "?")[:max_len]) + vc_suffix
+    return tab_name or instance.get("id", "?")[:max_len]
 
 
 def get_instances():
@@ -685,14 +675,13 @@ def format_event_instance_name(event: dict, max_len: int = 15) -> str:
     return "system"
 
 
-def get_tts_queue_status():
-    """Fetch TTS queue status from the API."""
+def _read_portable_monitor_state() -> str:
+    """Read portable monitor state from ~/.portable_monitor_state.
+    Returns 'on', 'off', or '' (unknown/auto). Written by portable-monitor script."""
     try:
-        req = urllib.request.Request(f"{API_URL}/api/notify/queue/status")
-        with urllib.request.urlopen(req, timeout=2) as response:
-            return json.loads(response.read().decode())
-    except Exception:
-        return {"current": None, "queue": [], "queue_length": 0}
+        return (Path.home() / ".portable_monitor_state").read_text().strip()
+    except OSError:
+        return ""
 
 
 def _read_timer() -> dict:
@@ -853,142 +842,154 @@ def make_progress_bar(progress: int, width: int = 10) -> str:
         return f"[cyan]{'█' * filled}[/cyan][dim]{'─' * empty}[/dim]"
 
 
+STATUS_ORDER = {"processing": 0, "idle": 1, "stopped": 2}
+STATUS_LABELS = {"processing": "PROCESSING", "idle": "IDLE", "stopped": "STOPPED"}
+LIFECYCLE_ORDER = {"sync": 0, "golden_throne": 1, "one_off": 2}
+THROBBER_CHARS = "◐◓◑◒"
+
+
+def format_status_icon(instance: dict) -> str:
+    """Return a 1-char status icon for the instance."""
+    sid = instance.get("id", "")
+    status = instance.get("status", "stopped")
+
+    if sid in _evaluating_instances:
+        return f"[yellow]{THROBBER_CHARS[_throbber_tick % 4]}[/yellow]"
+    elif status == "processing":
+        return "[green]●[/green]"
+    elif status == "idle":
+        return "[dim]○[/dim]"
+    else:
+        return " "
+
+
 def create_instances_table(instances: list, selected_idx: int) -> Table:
-    """Create the instances table with selection and todo progress."""
-    max_name_len = 15
-    for inst in instances:
-        name = format_instance_name(inst, max_len=30)
-        max_name_len = max(max_name_len, len(name) + 2)
+    """Create the instances table, grouped by lifecycle type (sync/golden_throne/one_off).
 
-    table = Table(
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=False
-    )
+    Narrow (<60): 4 cols — S, Name, Tags, ssh
+    Normal (>=60): 5 cols — S, Name, Tags, Z, ssh
+    """
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
 
-    table.add_column("", width=2, justify="center")
-    table.add_column("●", style="dim", width=1, justify="center")
-    table.add_column("Name", style="white", width=max_name_len)
-    table.add_column("Z", width=4, justify="center")
-    table.add_column("Device", style="yellow", width=10)
-    table.add_column("Progress", width=14)
-    table.add_column("Task", style="dim", min_width=20, max_width=30)
-    table.add_column("Time", width=6, justify="right")
-
-    for i, instance in enumerate(instances):
-        is_sub = instance.get("is_subagent")
-        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
-        name = format_instance_name(instance, max_len=30)
-        if i == selected_idx:
-            name = f"[bold yellow]{name}[/bold yellow]"
-        elif is_sub:
-            name = f"[dim]@ {name}[/dim]"
-
-        device = instance.get("device_id", "?")
-        zeal_text = format_zealotry_cell(instance)
-        instance_id = instance.get("id", "")
-        status = instance.get("status", "idle")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if status == "processing":
-            todos = get_instance_todos(instance_id, use_cache=False)
-        else:
-            todos = get_instance_todos(instance_id, use_cache=True)
-
-        has_active_subtask = todos.get("current_task") is not None
-
-        if status == "stopped":
-            status_icon = "[dim]o[/dim]"
-        elif status == "processing" or has_active_subtask:
-            status_icon = "[green]>[/green]"
-        else:
-            status_icon = "[cyan]*[/cyan]"
-
-        if todos.get("total", 0) > 0:
-            progress = todos.get("progress", 0)
-            progress_bar = make_progress_bar(progress, 8)
-            progress_text = f"{progress_bar} {progress}%"
-        else:
-            progress_text = "[dim]-[/dim]"
-
-        current_task = todos.get("current_task", "")
-        if current_task:
-            if len(current_task) > 28:
-                current_task = current_task[:25] + "..."
-            current_task = f"[italic]{current_task}[/italic]"
-        else:
-            current_task = "[dim]-[/dim]"
-
-        end_time = instance.get("stopped_at") if instance["status"] == "stopped" else None
-        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
-
-        # Dim all columns for subagent rows
-        if is_sub and i != selected_idx:
-            device = f"[dim]{device}[/dim]"
-            progress_text = "[dim]-[/dim]"
-            current_task = "[dim]-[/dim]"
-            duration = f"[dim]{duration}[/dim]"
-
-        table.add_row(selector, status_icon, name, zeal_text, device, progress_text, current_task, duration)
+    if narrow:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+            expand=True,
+            padding=(0, 0)
+        )
+        table.add_column("S", width=1, justify="center")
+        table.add_column("Name", style="white", no_wrap=True, max_width=20)
+        table.add_column("Tags", width=3, justify="center")
+        table.add_column("ssh", width=3, justify="center")
+        num_cols = 4
+    else:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+            expand=True
+        )
+        table.add_column("S", width=1, justify="center")
+        table.add_column("Name", style="white")
+        table.add_column("Tags", width=5, justify="center")
+        table.add_column("Z", width=4, justify="center")
+        table.add_column("ssh", width=3, justify="center")
+        num_cols = 5
 
     if not instances:
-        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-", "-", "-")
+        empty_cols = [""] * (num_cols - 1)
+        table.add_row("", "[dim]No instances[/dim]", *[""] * (num_cols - 2))
+        return table
+
+    # Group by lifecycle type, preserving original indices
+    grouped = {}
+    for i, inst in enumerate(instances):
+        itype = inst.get("instance_type", "one_off")
+        grouped.setdefault(itype, []).append((i, inst))
+
+    ordered_groups = sorted(grouped.items(), key=lambda x: LIFECYCLE_ORDER.get(x[0], 99))
+
+    first_group = True
+    for group_type, members in ordered_groups:
+        if not first_group:
+            table.add_section()
+        first_group = False
+
+        # Within each lifecycle group, sort: processing first, then by last_activity desc
+        members.sort(key=lambda m: (
+            0 if m[1].get("status") == "processing" else 1,
+            -(datetime.fromisoformat(m[1].get("last_activity", "2000-01-01T00:00:00")).timestamp()
+              if m[1].get("last_activity") else 0)
+        ))
+
+        for orig_idx, instance in members:
+            icon = format_status_icon(instance)
+            name = format_instance_name(instance, max_len=18 if narrow else 35)
+            if orig_idx == selected_idx:
+                name = f"[bold yellow]{name}[/bold yellow]"
+
+            tags = format_tags(instance)
+            device = format_device_short(instance.get("device_id", "?"))
+
+            if narrow:
+                table.add_row(icon, name, tags, device)
+            else:
+                zeal = format_zealotry_cell(instance)
+                table.add_row(icon, name, tags, zeal, device)
 
     return table
 
 
-def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
-    """Create a compact instances table for mobile."""
-    table = Table(
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=True,
-        padding=(0, 0)
-    )
+def create_archived_table(instances: list, selected_idx: int) -> Table:
+    """Create the archived instances table."""
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
 
-    table.add_column("", width=1, justify="center")
-    table.add_column("*", width=1, justify="center")
-    table.add_column("Name", style="white", no_wrap=True, max_width=20)
-    table.add_column("Prog", width=6)
-    table.add_column("T", width=4, justify="right")
+    if narrow:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="dim",
+            expand=True,
+            padding=(0, 0)
+        )
+        table.add_column("Name", style="white", no_wrap=True, max_width=20)
+        table.add_column("Tags", width=3, justify="center")
+        table.add_column("ssh", width=3, justify="center")
+        num_cols = 3
+    else:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="dim",
+            expand=True
+        )
+        table.add_column("Name", style="white")
+        table.add_column("Tags", width=5, justify="center")
+        table.add_column("Type", width=8, justify="center")
+        table.add_column("ssh", width=3, justify="center")
+        num_cols = 4
 
-    for i, instance in enumerate(instances):
-        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
-        name = format_instance_name(instance, max_len=18)
+    archived = [i for i in instances if i.get("instance_type") == "archived"]
+
+    if not archived:
+        empty_cols = [""] * (num_cols - 1)
+        table.add_row("[dim]No archived instances[/dim]", *empty_cols)
+        return table
+
+    for i, instance in enumerate(archived):
+        name = format_instance_name(instance, max_len=18 if narrow else 35)
         if i == selected_idx:
             name = f"[bold yellow]{name}[/bold yellow]"
 
-        instance_id = instance.get("id", "")
-        status = instance.get("status", "idle")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if status == "processing":
-            todos = get_instance_todos(instance_id, use_cache=False)
+        tags = format_tags(instance)
+        device = format_device_short(instance.get("device_id", "?"))
+
+        if narrow:
+            table.add_row(name, tags, device)
         else:
-            todos = get_instance_todos(instance_id, use_cache=True)
-
-        has_active_subtask = todos.get("current_task") is not None
-
-        if status == "stopped":
-            status_icon = "[dim]o[/dim]"
-        elif status == "processing" or has_active_subtask:
-            status_icon = "[green]>[/green]"
-        else:
-            status_icon = "[cyan]*[/cyan]"
-
-        if todos.get("total", 0) > 0:
-            progress = todos.get("progress", 0)
-            progress_bar = make_progress_bar(progress, 5)
-        else:
-            progress_bar = "[dim]-----[/dim]"
-
-        end_time = instance.get("stopped_at") if status == "stopped" else None
-        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
-
-        table.add_row(selector, status_icon, name, progress_bar, duration)
-
-    if not instances:
-        table.add_row(" ", "o", "[dim]None[/dim]", "-----", "-")
+            table.add_row(name, tags, "[dim]archived[/dim]", device)
 
     return table
 
@@ -1095,102 +1096,54 @@ def _format_cron_status(job: dict) -> str:
 
 
 def create_cron_table(jobs: list, selected_idx: int) -> Table:
-    """Create the cron jobs table (full layout)."""
-    table = Table(
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=False
-    )
+    """Create the cron jobs table, adapting to terminal width.
 
-    table.add_column("", width=2, justify="center")
-    table.add_column("Name", style="white", min_width=15)
-    table.add_column("Schedule", style="dim", width=8, justify="center")
-    table.add_column("Next", width=10, justify="right")
-    table.add_column("Last", style="dim", width=10, justify="right")
-    table.add_column("Status", width=10)
+    Narrow (<60): 3 cols — selector, name, next
+    Normal (>=60): 4 cols — adds last run
+    """
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
 
-    for i, job in enumerate(jobs):
-        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
-        name = job.get("name", job.get("id", "?")[:12])
-        if i == selected_idx:
-            name = f"[bold yellow]{name}[/bold yellow]"
-
-        table.add_row(
-            selector,
-            name,
-            _format_cron_schedule(job),
-            _format_cron_next(job),
-            _format_cron_last(job),
-            _format_cron_status(job),
+    if narrow:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+            expand=True,
+            padding=(0, 0)
         )
-
-    if not jobs:
-        table.add_row(" ", "[dim]No cron jobs[/dim]", "-", "-", "-", "-")
-
-    return table
-
-
-def create_compact_cron_table(jobs: list, selected_idx: int) -> Table:
-    """Create a compact cron jobs table (compact/vertical layout)."""
-    table = Table(
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=True
-    )
-
-    table.add_column("", width=2, justify="center")
-    table.add_column("Name", style="white")
-    table.add_column("Next", width=10, justify="right")
-    table.add_column("Last", style="dim", width=10, justify="right")
-
-    for i, job in enumerate(jobs):
-        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
-        name = job.get("name", job.get("id", "?")[:12])
-        if i == selected_idx:
-            name = f"[bold yellow]{name}[/bold yellow]"
-
-        table.add_row(
-            selector,
-            name,
-            _format_cron_next(job),
-            _format_cron_last(job),
+        table.add_column("", width=1, justify="center")
+        table.add_column("Name", style="white", no_wrap=True, max_width=20)
+        table.add_column("Next", width=8, justify="right")
+    else:
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+            expand=True
         )
-
-    if not jobs:
-        table.add_row(" ", "[dim]No cron jobs[/dim]", "-", "-")
-
-    return table
-
-
-def create_mobile_cron_table(jobs: list, selected_idx: int) -> Table:
-    """Create a mobile cron jobs table."""
-    table = Table(
-        title="Cron [dim](jk \\[\\] q)[/dim]",
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=True,
-        padding=(0, 0)
-    )
-
-    table.add_column("", width=1, justify="center")
-    table.add_column("Name", style="white", no_wrap=True, max_width=20)
-    table.add_column("Next", width=8, justify="right")
+        table.add_column("", width=2, justify="center")
+        table.add_column("Name", style="white")
+        table.add_column("Next", width=10, justify="right")
+        table.add_column("Last", style="dim", width=10, justify="right")
 
     for i, job in enumerate(jobs):
         selector = "[yellow]>[/yellow]" if i == selected_idx else " "
         name = job.get("name", job.get("id", "?")[:12])
-        if len(name) > 18:
+        if narrow and len(name) > 18:
             name = name[:15] + "..."
         if i == selected_idx:
             name = f"[bold yellow]{name}[/bold yellow]"
 
-        table.add_row(selector, name, _format_cron_next(job))
+        if narrow:
+            table.add_row(selector, name, _format_cron_next(job))
+        else:
+            table.add_row(selector, name, _format_cron_next(job), _format_cron_last(job))
 
     if not jobs:
-        table.add_row(" ", "[dim]No jobs[/dim]", "-")
+        if narrow:
+            table.add_row(" ", "[dim]No jobs[/dim]", "-")
+        else:
+            table.add_row(" ", "[dim]No cron jobs[/dim]", "-", "-")
 
     return table
 
@@ -1245,106 +1198,8 @@ def _wrap_summary_lines(text: str, width: int = 70) -> list[str]:
     return out
 
 
-def create_cron_details_panel(job: dict, max_lines: int = 8) -> Panel:
-    """Create a panel showing details for the selected cron job."""
-    if not job:
-        return Panel("[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta")
-
-    lines = []
-    name = job.get("name", job.get("id", "?"))
-    job_id = job.get("id", "")
-    enabled = job.get("enabled")
-    schedule_str = _format_cron_schedule(job)
-    is_running = job.get("is_running", False)
-
-    # Header: name + status + quota info
-    status_tag = "[green]enabled[/green]" if enabled else "[red]disabled[/red]"
-    if is_running:
-        status_tag = "[green bold]RUNNING[/green bold]"
-    quota_tag = ""
-    max_runs = job.get("max_runs_per_window")
-    if max_runs:
-        window = job.get("run_window_hours", 5)
-        quota_tag = f"  [dim]quota: {max_runs}/{window}h[/dim]"
-    quiet_start = job.get("quiet_hours_start")
-    quiet_end = job.get("quiet_hours_end")
-    quiet_tag = ""
-    if quiet_start is not None and quiet_end is not None:
-        quiet_tag = f"  [dim]quiet: {quiet_start}-{quiet_end}[/dim]"
-    lines.append(f"[bold]{name}[/bold]  ({schedule_str})  {status_tag}{quota_tag}{quiet_tag}")
-
-    # Last/next timing from run history
-    runs = get_cached_cron_run_history(job_id, max_runs=3)
-    if runs:
-        latest = runs[0]
-        started = latest.get("started_at", "")
-        try:
-            last_dt = datetime.fromisoformat(started)
-            last_str = last_dt.strftime("%H:%M:%S")
-        except (ValueError, TypeError):
-            last_str = "?"
-        dur = latest.get("duration_seconds")
-        dur_str = f" ({dur:.0f}s)" if dur else ""
-        last_status = latest.get("status", "")
-        result_style = "green" if last_status in ("ok", "success", "") else ("yellow" if last_status == "skipped" else "red")
-        result_tag = f"[{result_style}]{last_status}[/{result_style}]" if last_status else ""
-        skip_reason = latest.get("skip_reason", "")
-        skip_tag = f" [dim]({skip_reason})[/dim]" if skip_reason else ""
-        lines.append(f"Last: [cyan]{last_str}[/cyan]{dur_str} {result_tag}{skip_tag}  Next: {_format_cron_next(job)}")
-    else:
-        lines.append(f"[dim]No previous runs[/dim]  Next: {_format_cron_next(job)}")
-
-    # Run transcript content
-    if runs:
-        latest = runs[0]
-        summary = latest.get("output_summary", "") or latest.get("summary", "")
-        error = latest.get("error_summary", "") or latest.get("error", "")
-
-        if error:
-            lines.append(f"[red]{error}[/red]")
-        if summary:
-            lines.append("")
-            summary_lines = _wrap_summary_lines(summary, width=70)
-            for sl in summary_lines:
-                if len(lines) >= max_lines:
-                    break
-                # Color bullet lines
-                stripped = sl.lstrip()
-                if stripped.startswith("- "):
-                    lines.append(f"[green]>[/green] {stripped[2:]}")
-                else:
-                    lines.append(sl)
-        elif not error:
-            lines.append("[dim]No summary from last run[/dim]")
-    else:
-        lines.append("[dim]No run history[/dim]")
-
-    # Victory conditions
-    vc_raw = job.get("victory_conditions")
-    if vc_raw:
-        vcs = vc_raw if isinstance(vc_raw, list) else []
-        if isinstance(vc_raw, str):
-            try:
-                import json
-                vcs = json.loads(vc_raw)
-            except Exception:
-                vcs = []
-        if vcs and len(lines) < max_lines:
-            lines.append("")
-            lines.append("[bold magenta]Victory Conditions[/bold magenta]")
-            for vc in vcs:
-                if len(lines) >= max_lines:
-                    break
-                check = "[green]\u2713[/green]" if vc.get("verified") else "[dim]\u2610[/dim]"
-                desc = vc.get("description", "?")
-                lines.append(f"  {check} {desc}")
-
-    content = "\n".join(lines[:max_lines])
-    return Panel(content, title="Cron Details", border_style="magenta")
-
-
-def create_compact_cron_details_panel(job: dict) -> Panel:
-    """Create a compact single-line cron details panel for vertical layout."""
+def create_cron_details_panel(job: dict) -> Panel:
+    """Create a compact single-line cron details panel."""
     if not job:
         return Panel("[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta")
 
@@ -1396,124 +1251,6 @@ def create_compact_cron_details_panel(job: dict) -> Panel:
 
     content = "  ".join(parts)
     return Panel(content, title="Cron Details", border_style="magenta")
-
-
-def create_mobile_cron_details_panel(job: dict) -> Panel:
-    """Create a compact cron details panel for mobile."""
-    if not job:
-        return Panel("[dim]No selection[/dim]", title="Details", border_style="magenta", padding=(0, 1))
-
-    lines = []
-    name = job.get("name", job.get("id", "?"))
-    job_id = job.get("id", "")
-
-    status_icon = "[green]>[/green]" if job.get("is_running") else "[cyan]*[/cyan]"
-    if not job.get("enabled"):
-        status_icon = "[dim]-[/dim]"
-    lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]{_format_cron_schedule(job)}[/dim]")
-
-    # Last run summary from transcript
-    runs = get_cached_cron_run_history(job_id, max_runs=1)
-    if runs:
-        latest = runs[0]
-        error = latest.get("error_summary", "") or latest.get("error", "")
-        summary = latest.get("output_summary", "") or latest.get("summary", "")
-        if error:
-            if len(error) > 35:
-                error = error[:32] + "..."
-            lines.append(f"[red]{error}[/red]")
-        elif summary:
-            # First meaningful line
-            for line in summary.split("\n"):
-                line = line.strip().replace("**", "")
-                if line and not line.startswith("#"):
-                    if len(line) > 35:
-                        line = line[:32] + "..."
-                    lines.append(f"[dim]{line}[/dim]")
-                    break
-    else:
-        lines.append(f"Next: {_format_cron_next(job)}")
-
-    # Victory conditions
-    vc_raw = job.get("victory_conditions")
-    if vc_raw:
-        vcs = vc_raw if isinstance(vc_raw, list) else []
-        if isinstance(vc_raw, str):
-            try:
-                import json
-                vcs = json.loads(vc_raw)
-            except Exception:
-                vcs = []
-        if vcs:
-            done = sum(1 for v in vcs if v.get("verified"))
-            lines.append(f"[magenta]VC {done}/{len(vcs)}[/magenta]")
-
-    return Panel("\n".join(lines), title="Details", border_style="magenta", padding=(0, 1))
-
-
-def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
-    """Create a compact instances table without Task column (for compact mode)."""
-    max_name_len = 25
-    for inst in instances:
-        name = format_instance_name(inst, max_len=40)
-        max_name_len = max(max_name_len, len(name) + 2)
-
-    table = Table(
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        expand=True
-    )
-
-    table.add_column("", width=2, justify="center")
-    table.add_column("●", style="dim", width=1, justify="center")
-    table.add_column("Name", style="white")  # Dynamic width - fills available space
-    table.add_column("Z", width=4, justify="center")
-    table.add_column("Device", style="yellow", width=10)
-    table.add_column("Progress", width=14)
-    table.add_column("Time", width=6, justify="right")
-
-    for i, instance in enumerate(instances):
-        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
-        name = format_instance_name(instance, max_len=35)
-        if i == selected_idx:
-            name = f"[bold yellow]{name}[/bold yellow]"
-
-        device = instance.get("device_id", "?")
-        zeal_text = format_zealotry_cell(instance)
-        instance_id = instance.get("id", "")
-        status = instance.get("status", "idle")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if status == "processing":
-            todos = get_instance_todos(instance_id, use_cache=False)
-        else:
-            todos = get_instance_todos(instance_id, use_cache=True)
-
-        has_active_subtask = todos.get("current_task") is not None
-
-        if status == "stopped":
-            status_icon = "[dim]o[/dim]"
-        elif status == "processing" or has_active_subtask:
-            status_icon = "[green]>[/green]"
-        else:
-            status_icon = "[cyan]*[/cyan]"
-
-        if todos.get("total", 0) > 0:
-            progress = todos.get("progress", 0)
-            progress_bar = make_progress_bar(progress, 8)
-            progress_text = f"{progress_bar} {progress}%"
-        else:
-            progress_text = "[dim]-[/dim]"
-
-        end_time = instance.get("stopped_at") if status == "stopped" else None
-        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
-
-        table.add_row(selector, status_icon, name, zeal_text, device, progress_text, duration)
-
-    if not instances:
-        table.add_row(" ", "[dim]-[/dim]", "[dim]No instances[/dim]", "-", "-", "-", "-")
-
-    return table
 
 
 def create_events_panel(events: list) -> Panel:
@@ -1603,99 +1340,6 @@ def create_events_panel(events: list) -> Panel:
 
     content = "\n".join(lines[:6])
     return Panel(content, title="Recent Events", border_style="blue")
-
-
-def create_mobile_events_panel(events: list) -> Panel:
-    """Create a compact events panel for mobile."""
-    lines = []
-
-    EVENT_ICONS = {
-        "instance_registered": "[green]+[/green]",
-        "instance_stopped": "[red]-[/red]",
-        "instance_killed": "[red]x[/red]",
-        "instance_unstick": "[cyan]![/cyan]",
-        "instance_renamed": "[yellow]~[/yellow]",
-        "tts_playing": "[cyan]>[/cyan]",
-        "notification_sent": "[magenta]*[/magenta]",
-        "phone_app_closed": "[blue]📱[/blue]",
-        "phone_distraction_allowed": "[yellow]📱[/yellow]",
-        "phone_distraction_blocked": "[red]📱[/red]",
-        "phone_app_open": "[yellow]📱[/yellow]",
-        "phone_app_close": "[blue]📱[/blue]",
-        "phone_geofence": "[cyan]📍[/cyan]",
-        "location_event": "[cyan]📍[/cyan]",
-    }
-
-    for event in events[:4]:
-        try:
-            created = event.get("created_at", "")
-            time_str = utc_to_local_timestr(created) if created else "??:??"
-
-            event_type = event.get("event_type", "unknown")
-            details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
-            icon = EVENT_ICONS.get(event_type, "[dim].[/dim]")
-
-            # Phone events: show app/location display name instead of instance name
-            if event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked",
-                              "phone_app_open", "phone_app_close"):
-                display_name = details.get("display_name") or details.get("app", "?")
-                for prefix in ("Application Launched (", "Application Closed ("):
-                    if display_name.startswith(prefix) and display_name.endswith(")"):
-                        display_name = display_name[len(prefix):-1]
-                        break
-            elif event_type in ("phone_geofence", "location_event"):
-                raw = details.get("app", "") or ""
-                location = details.get("location", "")
-                geo_action = details.get("action", "")
-                if not location:
-                    for prefix in ("Geofence Entry (", "Geofence Exit ("):
-                        if raw.startswith(prefix) and raw.endswith(")"):
-                            location = raw[len(prefix):-1]
-                            geo_action = "enter" if "Entry" in prefix else "exit"
-                display_name = f"{location} {geo_action}" if location else raw[:12]
-            else:
-                # Get human-readable name using the helper function
-                display_name = format_event_instance_name(event, max_len=12)
-
-            lines.append(f"[dim]{time_str}[/dim] {icon} {display_name}")
-        except Exception:
-            continue
-
-    if not lines:
-        lines.append("[dim]No events[/dim]")
-
-    return Panel("\n".join(lines), title="Events", border_style="blue", padding=(0, 1))
-
-
-def create_tts_queue_panel(queue_status: dict) -> Panel:
-    """Create a compact one-row TTS queue panel showing instance names in order."""
-    current = queue_status.get("current")
-    queue = queue_status.get("queue", [])
-
-    # Build compact queue string
-    queue_items = []
-
-    if current:
-        current_name = current.get('tab_name', '?')
-        if len(current_name) > 12:
-            current_name = current_name[:10] + ".."
-        queue_items.append(f"[yellow]{current_name}[/yellow]")
-
-    for item in queue[:5]:  # Show max 5 queued items
-        name = item.get('tab_name', '?')
-        if len(name) > 12:
-            name = name[:10] + ".."
-        queue_items.append(name)
-
-    if len(queue) > 5:
-        queue_items.append(f"[dim]+{len(queue) - 5} more[/dim]")
-
-    if queue_items:
-        content = "Queue: " + " → ".join(queue_items)
-    else:
-        content = "[dim]Queue: (empty)[/dim]"
-
-    return Panel(content, title="TTS Queue", border_style="yellow")
 
 
 def create_server_logs_panel(max_lines: int = 8) -> Panel:
@@ -1966,59 +1610,6 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
 
     content = "\n".join(lines)
     return Panel(content, title="Instance Details", border_style="magenta")
-
-
-def create_mobile_instance_details_panel(instance: dict, todos_data: dict) -> Panel:
-    """Create a compact panel showing the active subtask for mobile."""
-    if not instance:
-        return Panel("[dim]No selection[/dim]", title="Details", border_style="magenta", padding=(0, 1))
-
-    lines = []
-
-    name = format_instance_name(instance, max_len=15)
-    status = instance.get("status", "unknown")
-    if status == "stopped":
-        status_icon = "[dim]o[/dim]"
-    elif status == "processing":
-        status_icon = "[green]>[/green]"
-    else:
-        status_icon = "[cyan]*[/cyan]"
-
-    # Get TTS voice profile info
-    tts_voice = instance.get("tts_voice", "")
-    voice_short = tts_voice.replace("Microsoft ", "").replace(" Desktop", "") if tts_voice else "?"
-
-    lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]{voice_short}[/dim]")
-
-    current_task = todos_data.get("current_task")
-    progress = todos_data.get("progress", 0)
-    total = todos_data.get("total", 0)
-
-    if current_task:
-        if len(current_task) > 35:
-            current_task = current_task[:32] + "..."
-        lines.append(f"[yellow]>[/yellow] {current_task}")
-        if total > 0:
-            lines.append(f"[dim]{progress}% ({todos_data.get('completed', 0)}/{total})[/dim]")
-    elif total > 0:
-        lines.append(f"[dim]{progress}% complete[/dim]")
-    else:
-        lines.append("[dim]No active task[/dim]")
-
-    content = "\n".join(lines)
-    return Panel(content, title="Details", border_style="magenta", padding=(0, 1))
-
-
-def create_server_status_panel() -> Panel:
-    """Create a panel showing server status."""
-    if api_healthy:
-        content = "[green]* Server running[/green] on port 7777"
-        border = "green"
-    else:
-        content = f"[red]! Server error[/red]\n[dim]{api_error_message or 'Unknown error'}[/dim]"
-        border = "red"
-
-    return Panel(content, title="API Server", border_style=border)
 
 
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
@@ -2524,38 +2115,32 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
             content.append_text(Text.from_markup("[dim]No timer shifts recorded today[/dim]"))
         return Panel(content, title="Timer Stats", border_style="magenta")
 
-    # Trim context for compact viewports (Activity + Prod only)
-    if layout_mode in ("mobile", "compact"):
+    # Trim context for narrow viewports (Activity + Prod only)
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
+    if narrow:
         lines = lines[:2]
 
     lines.append("")  # spacer
 
     # Determine available content width for graph
-    # Label prefix takes LABEL_PAD chars + 1 trailing space = 11 total
     LABEL_PAD = 10
-    LABEL_TOTAL = LABEL_PAD + 1  # includes trailing space after label
+    LABEL_TOTAL = LABEL_PAD + 1
     PANEL_CHROME = 4  # 2 border + 2 padding
     try:
         con_width = console.width if console else 80
     except Exception:
         con_width = 80
 
-    if layout_mode == "full":
-        # Sidebar: ratio=2 of split_row(3, 2); Layout rounds down with 1-char gap
-        sidebar_width = (con_width * 2) // 5 - 1
-        graph_width = max(10, sidebar_width - PANEL_CHROME - LABEL_TOTAL)
-    elif layout_mode == "mobile":
-        # Full-width but narrow terminal — extra -2 safety for rounding
+    if narrow:
         graph_width = max(6, con_width - PANEL_CHROME - LABEL_TOTAL - 2)
     else:
-        # vertical, compact: full-width panel
         graph_width = max(10, con_width - PANEL_CHROME - LABEL_TOTAL)
 
-    # Graph height per mode
-    if layout_mode in ("mobile", "compact"):
-        graph_height = 2  # minimal useful graph
+    # Graph height
+    if narrow:
+        graph_height = 2
     else:
-        graph_height = max(3, max_lines - 9)  # leave room for context(4) + spacer + labels + stats
+        graph_height = max(3, max_lines - 9)
 
     # Break balance line graph (braille with colored backgrounds)
     series = data.get("balance_series", [])
@@ -2666,32 +2251,50 @@ def create_info_panel(max_lines: int = 8) -> Panel:
         return create_timer_stats_panel(max_lines=max_lines)
 
 
-def create_mobile_info_panel(max_lines: int = 6) -> Panel:
-    """Create a compact info panel for mobile - events, server logs, deploy logs, monitor, or timer stats based on panel_page."""
-    if panel_page == 0:
-        events = get_recent_events(max_lines)
-        return create_mobile_events_panel(events)
-    elif panel_page == 1:
-        return create_server_logs_panel(max_lines=max_lines)
-    elif panel_page == 2:
-        return create_deploy_logs_panel(max_lines=max_lines)
-    elif panel_page == 3:
-        return create_monitor_panel(max_lines=max_lines)
-    else:
-        return create_timer_stats_panel(max_lines=max_lines)
-
-
 def create_status_bar(instances: list, selected_idx: int) -> Text:
-    """Create the status bar."""
+    """Create the status bar, adapting to terminal width."""
     global unstick_feedback, resume_feedback, restart_feedback
 
     active_count = sum(1 for i in instances if i.get("status") in ("processing", "idle"))
     total_count = len(instances)
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
 
-    # Mode indicator with color
-    mode_colors = {"mobile": "yellow", "vertical": "magenta", "compact": "blue", "full": "cyan"}
-    mode_color = mode_colors.get(layout_mode, "white")
+    if narrow:
+        # Compact status bar with timer state inline
+        page_indicators = {0: "E", 1: "L", 2: "D", 3: "M", 4: "T"}
+        page_indicator = page_indicators.get(panel_page, "?")
 
+        text = Text()
+
+        # Timer state (condensed)
+        state = _read_timer()
+        mode_icons = {
+            "working": "\U0001f4bb", "multitasking": "\U0001f4fa", "idle": "\U0001f4a4",
+            "break": "\u2615", "distracted": "\u26a0\ufe0f", "sleeping": "\U0001f319",
+        }
+        icon = mode_icons.get(state["mode"], "\u2753")
+        is_backlog = state["backlog_secs"] > 0
+        _break_secs = state["break_secs"]
+        _backlog_secs = state["backlog_secs"]
+        break_style = break_balance_style(_break_secs, _backlog_secs)
+        break_str = format_break_time(_backlog_secs if is_backlog else _break_secs)
+        text.append(f"{icon} ", style="bold")
+        if is_backlog:
+            text.append("BL ", style=break_style)
+        text.append(break_str, style=break_style)
+        text.append("  ", style="dim")
+
+        text.append(f"{active_count}/{total_count} ", style="white")
+        if active_count > 0:
+            text.append("*", style="green")
+        else:
+            text.append("o", style="dim")
+        text.append(f"  sel:{selected_idx + 1}", style="dim")
+        text.append(f"  [{page_indicator}]", style="cyan")
+
+        return text
+
+    # Normal status bar
     # Page indicator
     page_names = ["Events", "Logs", "Deploy", "Monitor", "Timer"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
@@ -2718,14 +2321,15 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     # Table mode indicator
     if table_mode == "cron":
         table_indicator = "[yellow bold]\\[Cron][/yellow bold]"
+    elif table_mode == "archived":
+        table_indicator = "[dim]\\[Archived][/dim]"
     else:
         table_indicator = "[cyan]\\[Instances][/cyan]"
 
     text = Text()
     text.append_text(Text.from_markup(f"{table_indicator} [dim](\\[/])[/dim]"))
     text.append(f"  {active_count}/{total_count}  |  ", style="white")
-    text.append_text(Text.from_markup(f"[{mode_color}]{layout_mode}[/{mode_color}]"))
-    text.append(f"  |  {selected_idx + 1}/{total_count}  |  ", style="white")
+    text.append(f"sel:{selected_idx + 1}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]"))
     if filter_indicator:
         text.append_text(Text.from_markup(filter_indicator))
@@ -2757,9 +2361,8 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
             resume_feedback = None
 
     if feedback_msg:
-        # Use green for success messages, yellow for warnings
         if "Copied" in feedback_msg or "Skipped" in feedback_msg or "Restarted" in feedback_msg:
-            text.append_text(Text.from_markup(f"[green bold]✓ {feedback_msg}[/green bold]"))
+            text.append_text(Text.from_markup(f"[green bold]\u2713 {feedback_msg}[/green bold]"))
         else:
             text.append_text(Text.from_markup(f"[yellow bold]{feedback_msg}[/yellow bold]"))
     else:
@@ -2768,154 +2371,158 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     return text
 
 
-def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
-    """Create a compact status bar for mobile."""
-    active_count = sum(1 for i in instances if i.get("status") in ("processing", "idle"))
-    total_count = len(instances)
+def generate_mobile_widget(instances: list) -> Layout:
+    """Generate a compact widget for small terminal panes.
 
-    # Page indicator
-    page_indicators = {0: "E", 1: "L", 2: "D", 3: "M", 4: "T"}
-    page_indicator = page_indicators.get(panel_page, "?")
-
-    table_tag = "C" if table_mode == "cron" else "I"
-
-    text = Text()
-
-    # Timer state (condensed)
+    Shows timer stats header, then a table of active instances with full detail:
+    status, name, device, zealotry, duration, progress, current task, working dir.
+    Adapts row count to available height.
+    """
     state = _read_timer()
     mode_icons = {
-        "working": "💻", "multitasking": "📺", "idle": "💤",
-        "break": "☕", "distracted": "⚠️", "sleeping": "🌙",
+        "working": "\U0001f4bb", "multitasking": "\U0001f4fa", "idle": "\U0001f4a4",
+        "break": "\u2615", "distracted": "\u26a0\ufe0f", "sleeping": "\U0001f319",
     }
-    icon = mode_icons.get(state["mode"], "❓")
+    icon = mode_icons.get(state["mode"], "\u2753")
+    mode_name = state["mode"].replace("_", " ").title()
     is_backlog = state["backlog_secs"] > 0
-    _break_secs = state["break_secs"]
-    _backlog_secs = state["backlog_secs"]
-    break_style = break_balance_style(_break_secs, _backlog_secs)
-    break_str = format_break_time(_backlog_secs if is_backlog else _break_secs)
-    text.append(f"{icon} ", style="bold")
+    break_style = break_balance_style(state["break_secs"], state["backlog_secs"])
+    break_str = format_break_time(state["backlog_secs"] if is_backlog else state["break_secs"])
+
+    # Filter to active instances only
+    active = [i for i in instances if i.get("status") in ("processing", "idle") and not i.get("is_subagent")]
+
+    # Build timer header line
+    header = Text()
+    header.append(f"{icon} ", style="bold")
+    header.append(mode_name, style="bold white")
+    header.append("  ", style="dim")
     if is_backlog:
-        text.append("BL ", style=break_style)
-    text.append(break_str, style=break_style)
-    text.append("  ", style="dim")
+        header.append("BL ", style=break_style)
+    header.append(break_str, style=break_style)
 
-    text.append(f"{active_count}/{total_count} ", style="white")
-    if active_count > 0:
-        text.append("*", style="green")
-    else:
-        text.append("o", style="dim")
-    text.append(f"  sel:{selected_idx + 1}", style="dim")
-    text.append(f"  [{page_indicator}]", style="cyan")
+    # Work mode
+    work_mode = state.get("work_mode", "clocked_in")
+    if work_mode == "clocked_out":
+        header.append("  OFF", style="dim")
+    elif work_mode == "gym":
+        header.append("  GYM", style="magenta")
 
-    return text
+    # Instance count
+    header.append(f"  [{len(active)}]", style="green" if active else "dim")
 
+    # Portable monitor indicator — only shown when explicitly on
+    if _read_portable_monitor_state() == "on":
+        header.append("  MON", style="bold cyan")
 
-def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
-    """Generate a compact dashboard layout for mobile."""
-    global api_healthy, api_error_message
-
-    selected_instance = None
-    selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
-    if instances and 0 <= selected_idx < len(instances):
-        selected_instance = instances[selected_idx]
-        instance_id = selected_instance.get("id", "")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("status") == "processing":
-            selected_todos = get_instance_todos(instance_id, use_cache=False)
-        else:
-            selected_todos = get_instance_todos(instance_id, use_cache=True)
-
-    layout = Layout()
-
+    # Health indicator
     if not api_healthy:
-        layout.split_column(
-            Layout(name="error", size=2),
-            Layout(name="instances"),
-            Layout(name="details", size=5),
-            Layout(name="info_panel", size=8),
-            Layout(name="footer", size=1)
-        )
-        error_text = Text()
-        error_text.append("! API down", style="bold red")
-        layout["error"].update(Panel(error_text, border_style="red"))
-    else:
-        layout.split_column(
-            Layout(name="instances"),
-            Layout(name="details", size=5),
-            Layout(name="info_panel", size=8),
-            Layout(name="footer", size=1)
-        )
+        header.append("  !", style="bold red")
 
-    if table_mode == "cron":
-        cron_jobs = get_cached_cron_jobs()
-        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
-        layout["instances"].update(create_mobile_cron_table(cron_jobs, cron_selected_index))
-        layout["details"].update(create_mobile_cron_details_panel(selected_job))
-    else:
-        layout["instances"].update(create_mobile_instances_table(instances, selected_idx))
-        layout["details"].update(create_mobile_instance_details_panel(selected_instance, selected_todos))
-    layout["info_panel"].update(create_mobile_info_panel(max_lines=6))
-    layout["footer"].update(create_mobile_status_bar(instances, selected_idx))
+    height = console.size.height
+    width = console.size.width
 
-    return layout
+    # 2 lines for header + separator, rest for instance rows
+    max_rows = max(1, height - 2)
 
+    lines = [header, Text("\u2500" * min(width, 80), style="dim")]
 
-def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
-    """Generate compact dashboard without sidebar (for medium-width terminals)."""
-    global api_healthy, api_error_message
+    for inst in active[:max_rows]:
+        name = format_instance_name(inst, max_len=20)
+        status = inst.get("status", "idle")
+        instance_id = inst.get("id", "")
+        device = inst.get("device_id", "?")
+        zealotry = inst.get("zealotry") or 4
 
-    selected_instance = None
-    selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
-    if instances and 0 <= selected_idx < len(instances):
-        selected_instance = instances[selected_idx]
-        instance_id = selected_instance.get("id", "")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("status") == "processing":
-            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        if status == "processing":
+            todos = get_instance_todos(instance_id, use_cache=False)
         else:
-            selected_todos = get_instance_todos(instance_id, use_cache=True)
+            todos = get_instance_todos(instance_id, use_cache=True)
+
+        end_time = inst.get("stopped_at") if status == "stopped" else None
+        duration = format_duration_colored(inst.get("registered_at", ""), end_time)
+
+        row = Text()
+        # Status icon
+        row.append("> " if status == "processing" else "* ", style="green" if status == "processing" else "cyan")
+        # Name
+        row.append(name, style="bold white")
+        # Device
+        row.append(f"  {device}", style="yellow")
+        # Zealotry
+        zeal_text = format_zealotry_cell(inst)
+        row.append("  ")
+        row.append_text(Text.from_markup(zeal_text))
+        # Duration
+        row.append("  ")
+        row.append_text(Text.from_markup(duration))
+
+        # Progress
+        if todos.get("total", 0) > 0:
+            progress = todos.get("progress", 0)
+            row.append(f"  {progress}%", style="yellow")
+
+        # Current task — fill remaining width
+        current_task = todos.get("current_task", "")
+        if current_task:
+            remaining = max(0, width - len(row.plain) - 3)
+            if remaining > 5:
+                if len(current_task) > remaining:
+                    current_task = current_task[:remaining - 3] + "..."
+                row.append(f"  {current_task}", style="dim italic")
+
+        # Second line: dir name + session doc title if we have room
+        working_dir = inst.get("working_dir", "")
+        if working_dir and len(lines) + 2 <= height:
+            dir_name = working_dir.rstrip("/").split("/")[-1] or working_dir
+            detail_line = Text()
+            detail_line.append("  ")
+            detail_line.append(dir_name, style="dim")
+
+            # Session doc title if available
+            session_doc_id = inst.get("session_doc_id")
+            if session_doc_id:
+                try:
+                    with sqlite3.connect(DB_PATH) as doc_conn:
+                        doc_row = doc_conn.execute(
+                            "SELECT title FROM session_documents WHERE id = ?",
+                            (session_doc_id,)
+                        ).fetchone()
+                    if doc_row and doc_row[0]:
+                        detail_line.append(f"  {doc_row[0]}", style="cyan")
+                except Exception:
+                    pass
+
+            lines.append(row)
+            lines.append(detail_line)
+            continue
+
+        lines.append(row)
+
+    if not active:
+        lines.append(Text("  No active instances", style="dim"))
+
+    # Pad to fill height
+    while len(lines) < height:
+        lines.append(Text(""))
 
     layout = Layout()
-
-    # Compact header + main content + footer
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="instances"),
-        Layout(name="info_panel", size=4),
-        Layout(name="footer", size=1)
-    )
-
-    # Single header panel with health dot inline
-    health_dot = "[green]●[/green]" if api_healthy else "[red]●[/red]"
-    timer_text = get_timer_header_text()
-    dot = Text("● ", style="green" if api_healthy else "red")
-    dot.append_text(timer_text)
-    timer_text = dot
-    timer_text.justify = "center"
-    layout["header"].update(Panel(
-        timer_text,
-        border_style="cyan" if api_healthy else "red"
-    ))
-
-    if table_mode == "cron":
-        cron_jobs = get_cached_cron_jobs()
-        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
-        layout["instances"].update(create_compact_cron_table(cron_jobs, cron_selected_index))
-    else:
-        layout["instances"].update(create_compact_instances_table(instances, selected_idx))
-    layout["info_panel"].update(create_info_panel(max_lines=3))
-    layout["footer"].update(create_status_bar(instances, selected_idx))
-
+    content = Text()
+    for i, line in enumerate(lines[:height]):
+        if i > 0:
+            content.append("\n")
+        content.append_text(line)
+    layout.update(content)
     return layout
 
 
-def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
-    """Generate vertical dashboard with stacked panels (for vertical monitors).
+def generate_dashboard(instances: list, selected_idx: int) -> Layout:
+    """Generate the dashboard layout. Single vertical-stacked layout that adapts to width.
 
     Layout (top to bottom):
-    - Header (timer + server status)
+    - Header (timer + health dot) — hidden on narrow terminals
     - Instance table (sized to fit content, primary element)
-    - Recent events (fills remaining space)
+    - Info panel (events/logs/deploy/monitor/timer — fills remaining space)
     - Instance details (compact, bottom-aligned)
     - Footer (status bar)
     """
@@ -2926,148 +2533,97 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     if instances and 0 <= selected_idx < len(instances):
         selected_instance = instances[selected_idx]
         instance_id = selected_instance.get("id", "")
-        # Poll for fresh todos when processing, otherwise use cached data
         if selected_instance.get("status") == "processing":
             selected_todos = get_instance_todos(instance_id, use_cache=False)
         else:
             selected_todos = get_instance_todos(instance_id, use_cache=True)
 
-    # Calculate adaptive sizes based on terminal height and content
     height = console.size.height
+    narrow = console.size.width < NARROW_WIDTH_THRESHOLD
 
     # Fixed elements
-    header_size = 3
     footer_size = 1
-    details_size = 3  # Compact instance details at bottom (single line + borders)
+    details_size = 3
 
-    # Instance table: sized to fit content (primary element)
-    num_instances = max(len(instances), 1)
-    # Table needs: title + header + separator + N data rows + borders = N + 6
-    table_ideal = num_instances + 6
-    # Reasonable bounds - table is primary, but don't let it dominate
-    table_min = 6   # Minimum to show a couple rows
-    table_max = 20  # Allow more room for table as primary element
+    if narrow:
+        # Narrow: no header, fixed panel sizes
+        header_size = 0
+        info_size = 8
+        layout = Layout()
 
-    # Calculate instance table size
-    instance_size = max(table_min, min(table_ideal, table_max))
-
-    # Events panel gets all remaining space
-    # Available = total - header - footer - details - table
-    events_size = height - header_size - footer_size - details_size - instance_size
-    events_min = 6  # Minimum readable events panel
-    events_size = max(events_min, events_size)
-
-    layout = Layout()
-
-    # Vertical layout: Table → Events → Details (bottom)
-    layout.split_column(
-        Layout(name="header", size=header_size),
-        Layout(name="instances", size=instance_size),
-        Layout(name="info_panel"),  # Events - takes remaining space (no size = flex)
-        Layout(name="details", size=details_size),
-        Layout(name="footer", size=footer_size)
-    )
-
-    # Single header panel with health dot inline
-    timer_text = get_timer_header_text()
-    dot = Text("● ", style="green" if api_healthy else "red")
-    dot.append_text(timer_text)
-    timer_text = dot
-    timer_text.justify = "center"
-    layout["header"].update(Panel(
-        timer_text,
-        border_style="cyan" if api_healthy else "red"
-    ))
-
-    # Calculate how many lines fit in the info panel (panel has 2 border lines)
-    info_lines = max(1, events_size - 2)
-
-    if table_mode == "cron":
-        cron_jobs = get_cached_cron_jobs()
-        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
-        layout["instances"].update(create_compact_cron_table(cron_jobs, cron_selected_index))
-        layout["details"].update(create_compact_cron_details_panel(selected_job))
-    else:
-        layout["instances"].update(create_compact_instances_table(instances, selected_idx))
-        layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
-    layout["info_panel"].update(create_info_panel(max_lines=info_lines))
-    layout["footer"].update(create_status_bar(instances, selected_idx))
-
-    return layout
-
-
-def generate_dashboard(instances: list, selected_idx: int) -> Layout:
-    """Generate the full dashboard layout."""
-    global api_healthy, api_error_message
-
-    tts_queue = get_tts_queue_status()
-
-    selected_instance = None
-    selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
-    if instances and 0 <= selected_idx < len(instances):
-        selected_instance = instances[selected_idx]
-        instance_id = selected_instance.get("id", "")
-        # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("status") == "processing":
-            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        if not api_healthy:
+            layout.split_column(
+                Layout(name="error", size=2),
+                Layout(name="instances"),
+                Layout(name="details", size=5),
+                Layout(name="info_panel", size=info_size),
+                Layout(name="footer", size=footer_size)
+            )
+            error_text = Text()
+            error_text.append("! API down", style="bold red")
+            layout["error"].update(Panel(error_text, border_style="red"))
         else:
-            selected_todos = get_instance_todos(instance_id, use_cache=True)
+            layout.split_column(
+                Layout(name="instances"),
+                Layout(name="details", size=5),
+                Layout(name="info_panel", size=info_size),
+                Layout(name="footer", size=footer_size)
+            )
+        info_lines = max(1, info_size - 2)
+    else:
+        # Normal: header + adaptive sizing
+        header_size = 3
 
-    layout = Layout()
+        # Instance table: sized to fit content (primary element)
+        # Account for group headers and section dividers
+        num_instances = max(len(instances), 1)
+        num_groups = len(set(inst.get("status", "idle") for inst in instances)) if instances else 1
+        extra_rows = max(0, num_groups - 1)  # section dividers only
+        table_ideal = num_instances + extra_rows + 4
+        table_min = 6
+        table_max = 20
+        instance_size = max(table_min, min(table_ideal, table_max))
 
-    # Include server status in header area
-    layout.split_column(
-        Layout(name="header", size=5),
-        Layout(name="main"),
-        Layout(name="footer", size=1)
-    )
+        # Events panel gets remaining space
+        events_size = height - header_size - footer_size - details_size - instance_size
+        events_size = max(6, events_size)
 
-    # Header with server status
-    header_layout = Layout()
-    header_layout.split_row(
-        Layout(name="title", ratio=2),
-        Layout(name="server_status", ratio=1)
-    )
-    timer_text = get_timer_header_text()
-    timer_text.justify = "center"
-    header_layout["title"].update(Panel(
-        timer_text,
-        border_style="cyan"
-    ))
-    header_layout["server_status"].update(create_server_status_panel())
-    layout["header"].update(header_layout)
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=header_size),
+            Layout(name="instances", size=instance_size),
+            Layout(name="info_panel"),
+            Layout(name="details", size=details_size),
+            Layout(name="footer", size=footer_size)
+        )
 
-    # Main content
-    layout["main"].split_row(
-        Layout(name="left_column", ratio=3),
-        Layout(name="sidebar", ratio=2)
-    )
+        # Header with health dot
+        timer_text = get_timer_header_text()
+        dot = Text("\u25cf ", style="green" if api_healthy else "red")
+        dot.append_text(timer_text)
+        timer_text = dot
+        timer_text.justify = "center"
+        layout["header"].update(Panel(
+            timer_text,
+            border_style="cyan" if api_healthy else "red"
+        ))
+        info_lines = max(1, events_size - 2)
 
-    # Left column: instances table + details section (instance_details + tts_queue)
-    layout["left_column"].split_column(
-        Layout(name="instances", ratio=3),
-        Layout(name="details_section", ratio=1)
-    )
-
-    # Details section: instance details (3/4) + TTS queue (1/4)
-    layout["details_section"].split_column(
-        Layout(name="instance_details", ratio=3),
-        Layout(name="tts_queue", ratio=1)
-    )
-
-    # Sidebar shows events or server logs based on panel_page
-    layout["sidebar"].update(create_info_panel(max_lines=20))
-
+    # Populate shared panels
     if table_mode == "cron":
         cron_jobs = get_cached_cron_jobs()
         selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
         layout["instances"].update(create_cron_table(cron_jobs, cron_selected_index))
-        layout["instance_details"].update(create_cron_details_panel(selected_job))
+        layout["details"].update(create_cron_details_panel(selected_job))
+    elif table_mode == "archived":
+        archived = [i for i in instances_cache if i.get("instance_type") == "archived"]
+        layout["instances"].update(create_archived_table(instances_cache, archived_selected_index))
+        selected_archived = archived[archived_selected_index] if archived and 0 <= archived_selected_index < len(archived) else None
+        layout["details"].update(create_instance_details_panel(selected_archived, {}, compact=True))
     else:
         layout["instances"].update(create_instances_table(instances, selected_idx))
-        layout["instance_details"].update(create_instance_details_panel(selected_instance, selected_todos))
-    layout["tts_queue"].update(create_tts_queue_panel(tts_queue))
-
+        layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
+    layout["info_panel"].update(create_info_panel(max_lines=info_lines))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
     return layout
@@ -3083,7 +2639,7 @@ def generate_help_screen() -> Layout:
             ("↓ / j", "Move selection down"),
             ("g", "Jump to first item"),
             ("G", "Jump to last item"),
-            ("[ / ]", "Switch table (Instances / Cron)"),
+            ("[ / ]", "Switch table (Instances / Cron / Archived)"),
             ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer)"),
             ("f", "Cycle filter (all / active / stopped)"),
             ("o", "Change sort order"),
@@ -3099,6 +2655,8 @@ def generate_help_screen() -> Layout:
             ("c", "Clear all stopped instances"),
             ("n", "Set session note for instance"),
             ("z", "Set zealotry (follow-up frequency 1-10)"),
+            ("A", "Archive / Unarchive instance"),
+            ("t", "Set instance type (sync/golden_throne/one_off)"),
         ]),
         ("Recovery", [
             ("U", "Unstick frozen instance (SIGWINCH, gentle nudge)"),
@@ -3137,62 +2695,32 @@ def generate_help_screen() -> Layout:
 
 
 def get_dashboard(instances: list, selected_idx: int) -> Layout:
-    """Get appropriate dashboard based on layout_mode (dynamic if not forced)."""
-    global layout_mode
-
+    """Get appropriate dashboard — widget if terminal too short, full dashboard otherwise."""
     if show_help:
         return generate_help_screen()
 
-    # Dynamically detect layout mode on each render if not forced by CLI
-    if not layout_mode_forced:
-        layout_mode = detect_layout_mode()
-
-    if layout_mode == "mobile":
-        return generate_mobile_dashboard(instances, selected_idx)
-    if layout_mode == "vertical":
-        return generate_vertical_dashboard(instances, selected_idx)
-    if layout_mode == "compact":
-        return generate_compact_dashboard(instances, selected_idx)
+    if console.size.height <= WIDGET_HEIGHT_THRESHOLD:
+        return generate_mobile_widget(instances)
     return generate_dashboard(instances, selected_idx)
 
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page, show_help
+    global selected_index, instances_cache, api_healthy, api_error_message, sort_mode, filter_mode, show_subagents, panel_page, show_help
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
-    global table_mode, cron_selected_index, unstick_feedback, global_tts_mode
+    global table_mode, cron_selected_index, archived_selected_index, unstick_feedback, global_tts_mode
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
-    parser.add_argument("--mobile", "-m", action="store_true",
-                        help="Force mobile-friendly layout")
-    parser.add_argument("--vertical", "-v", action="store_true",
-                        help="Force vertical layout (stacked panels)")
-    parser.add_argument("--compact", action="store_true",
-                        help="Force compact layout (no sidebar)")
-    parser.add_argument("--no-mobile", action="store_true",
-                        help="Force full desktop layout even on narrow terminals")
-    args = parser.parse_args()
+    parser.parse_args()
 
-    if args.mobile:
-        layout_mode = "mobile"
-        layout_mode_forced = True
-    elif args.vertical:
-        layout_mode = "vertical"
-        layout_mode_forced = True
-    elif args.compact:
-        layout_mode = "compact"
-        layout_mode_forced = True
-    elif args.no_mobile:
-        layout_mode = "full"
-        layout_mode_forced = True
-    else:
-        layout_mode = detect_layout_mode()
-        layout_mode_forced = False
+    # TUI must run inside tmux for lifecycle management (auto-restart, dirty bit)
+    if not os.environ.get("TMUX"):
+        console.print("[red]Error:[/red] TUI must run inside tmux. Use [bold]monitor[/bold] to launch.")
+        raise SystemExit(1)
 
-    mode_colors = {"mobile": "yellow", "vertical": "magenta", "compact": "blue", "full": "cyan"}
-    mode_indicator = f"[{mode_colors.get(layout_mode, 'white')}]{layout_mode}[/{mode_colors.get(layout_mode, 'white')}]"
-
-    console.print(f"[cyan]Starting Token-API TUI[/cyan] ({mode_indicator} mode)")
+    h, w = console.size.height, console.size.width
+    mode_label = "widget" if h <= WIDGET_HEIGHT_THRESHOLD else f"dashboard ({w}x{h})"
+    console.print(f"[cyan]Starting Token-API TUI[/cyan] ([magenta]{mode_label}[/magenta])")
 
     # Health check
     api_healthy, api_error_message = check_api_health()
@@ -3203,7 +2731,7 @@ def main():
     console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, n=note, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 
     # Record startup time for smart restart detection; clean stale signals
-    tui_slot = "mobile" if layout_mode == "mobile" else "desktop"
+    tui_slot = "desktop"
     try:
         (TUI_SIGNAL_DIR / f"tui-started-{tui_slot}.timestamp").write_text(str(int(time.time())))
         signal_file = TUI_SIGNAL_DIR / f"tui-restart-{tui_slot}.signal"
@@ -3223,24 +2751,30 @@ def main():
     # Store terminal settings at main scope for cleanup on Ctrl+C
     import tty
     import termios
-    original_terminal_settings = termios.tcgetattr(sys.stdin)
+    # Open /dev/tty directly — sys.stdin may be a socket/pipe in tmux or
+    # when launched from non-interactive shells (e.g. Claude Code).
+    try:
+        tty_fd = open("/dev/tty", "r")
+    except OSError:
+        tty_fd = sys.stdin
+    original_terminal_settings = termios.tcgetattr(tty_fd)
 
     def key_listener():
         """Listen for keypresses."""
         import select as sel
 
         try:
-            tty.setcbreak(sys.stdin.fileno())
+            tty.setcbreak(tty_fd.fileno())
             while not quit_flag.is_set():
                 if input_mode.is_set():
                     time.sleep(0.05)
                     continue
 
-                if sel.select([sys.stdin], [], [], 0.02)[0]:
+                if sel.select([tty_fd], [], [], 0.02)[0]:
                     if input_mode.is_set():
                         continue
 
-                    key = sys.stdin.read(1)
+                    key = tty_fd.read(1)
 
                     # When help is showing, any key dismisses it
                     if show_help:
@@ -3253,8 +2787,8 @@ def main():
                         quit_flag.set()
                         break
                     elif key == '\x1b':
-                        if sel.select([sys.stdin], [], [], 0.05)[0]:
-                            seq = sys.stdin.read(2)
+                        if sel.select([tty_fd], [], [], 0.05)[0]:
+                            seq = tty_fd.read(2)
                             with action_lock:
                                 if seq == '[A':
                                     action_queue.append('up')
@@ -3321,6 +2855,14 @@ def main():
                         with action_lock:
                             action_queue.append('kill')
                         update_flag.set()
+                    elif key == 'A':
+                        with action_lock:
+                            action_queue.append('archive_toggle')
+                        update_flag.set()
+                    elif key == 't':
+                        with action_lock:
+                            action_queue.append('set_type')
+                        update_flag.set()
                     elif key == 'a':
                         with action_lock:
                             action_queue.append('toggle_subagents')
@@ -3377,7 +2919,7 @@ def main():
             pass
         finally:
             try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
             except:
                 pass
 
@@ -3392,15 +2934,30 @@ def main():
         """Get filtered instances for display."""
         return filter_instances(instances_cache)
 
+    def _get_archived():
+        """Get archived instances for the archived tab."""
+        return [i for i in instances_cache if i.get("instance_type") == "archived"]
+
     def _refresh(live_ref):
         """Refresh dashboard with filtered instances."""
+        global _throbber_tick, _evaluating_instances
+        _throbber_tick += 1
+        # Scan for evaluator signal files
+        signal_dir = Path.home() / ".claude" / "tui-signals"
+        _evaluating_instances = {
+            f.name.removeprefix("evaluating-")
+            for f in signal_dir.glob("evaluating-*")
+        } if signal_dir.exists() else set()
         displayed = _get_displayed()
         live_ref.update(get_dashboard(displayed, selected_index))
         live_ref.refresh()
+        # Re-hide cursor after every render (Rich may re-show it during redraws)
+        console.file.write("\033[?25l")
+        console.file.flush()
 
     def _clamp_selection():
-        """Clamp selected_index and cron_selected_index to their list bounds."""
-        global selected_index, cron_selected_index
+        """Clamp all selection indices to their list bounds."""
+        global selected_index, cron_selected_index, archived_selected_index
         displayed = _get_displayed()
         if displayed:
             selected_index = min(selected_index, len(displayed) - 1)
@@ -3411,8 +2968,17 @@ def main():
             cron_selected_index = min(cron_selected_index, len(cron_jobs) - 1)
         else:
             cron_selected_index = 0
+        archived = _get_archived()
+        if archived:
+            archived_selected_index = min(archived_selected_index, len(archived) - 1)
+        else:
+            archived_selected_index = 0
 
     try:
+        # Hide cursor to prevent flashing during redraws.
+        # We suppress cursor throughout the TUI lifecycle and only restore it
+        # temporarily during input prompts (live.stop() restores normal terminal).
+        console.show_cursor(False)
         with Live(get_dashboard(_get_displayed(), selected_index), console=console, refresh_per_second=10, screen=True) as live:
             last_refresh = time.time()
             last_timer_refresh = last_refresh
@@ -3433,12 +2999,15 @@ def main():
                         continue
 
                     if action == 'table_prev':
-                        table_mode = "instances"
+                        idx = TABLE_MODES.index(table_mode)
+                        table_mode = TABLE_MODES[(idx - 1) % len(TABLE_MODES)]
+                        _clamp_selection()
                         _refresh(live)
                         continue
 
                     elif action == 'table_next':
-                        table_mode = "cron"
+                        idx = TABLE_MODES.index(table_mode)
+                        table_mode = TABLE_MODES[(idx + 1) % len(TABLE_MODES)]
                         _clamp_selection()
                         _refresh(live)
                         continue
@@ -3446,6 +3015,8 @@ def main():
                     if action == 'up':
                         if table_mode == "cron":
                             cron_selected_index = max(0, cron_selected_index - 1)
+                        elif table_mode == "archived":
+                            archived_selected_index = max(0, archived_selected_index - 1)
                         elif displayed:
                             selected_index = max(0, selected_index - 1)
                         _refresh(live)
@@ -3454,6 +3025,9 @@ def main():
                         if table_mode == "cron":
                             cron_jobs = get_cached_cron_jobs()
                             cron_selected_index = min(len(cron_jobs) - 1, cron_selected_index + 1) if cron_jobs else 0
+                        elif table_mode == "archived":
+                            archived = _get_archived()
+                            archived_selected_index = min(len(archived) - 1, archived_selected_index + 1) if archived else 0
                         elif displayed:
                             selected_index = min(len(displayed) - 1, selected_index + 1)
                         _refresh(live)
@@ -3461,6 +3035,8 @@ def main():
                     elif action == 'go_top':
                         if table_mode == "cron":
                             cron_selected_index = 0
+                        elif table_mode == "archived":
+                            archived_selected_index = 0
                         elif displayed:
                             selected_index = 0
                         _refresh(live)
@@ -3469,6 +3045,9 @@ def main():
                         if table_mode == "cron":
                             cron_jobs = get_cached_cron_jobs()
                             cron_selected_index = len(cron_jobs) - 1 if cron_jobs else 0
+                        elif table_mode == "archived":
+                            archived = _get_archived()
+                            archived_selected_index = len(archived) - 1 if archived else 0
                         elif displayed:
                             selected_index = len(displayed) - 1
                         _refresh(live)
@@ -3483,7 +3062,7 @@ def main():
                             time.sleep(0.1)
                             live.stop()
 
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                             console.print(f"\n[yellow]Rename instance:[/yellow] {current_name}")
                             try:
@@ -3499,7 +3078,7 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             _clamp_selection()
@@ -3527,7 +3106,7 @@ def main():
                             time.sleep(0.1)
                             live.stop()
 
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                             console.print(f"\n[yellow]Session note for:[/yellow] {format_instance_name(instance)}")
                             try:
@@ -3555,7 +3134,7 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             _clamp_selection()
@@ -3572,7 +3151,7 @@ def main():
                             time.sleep(0.1)
                             live.stop()
 
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                             console.print(f"\n[red]Delete instance:[/red] {instance_name}")
                             try:
@@ -3588,7 +3167,7 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             _clamp_selection()
@@ -3606,7 +3185,7 @@ def main():
                             time.sleep(0.1)
                             live.stop()
 
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                             voices = get_available_voices()
                             if not voices:
@@ -3651,7 +3230,7 @@ def main():
                                     console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             live.start()
@@ -3680,7 +3259,7 @@ def main():
                             input_mode.set()
                             time.sleep(0.1)
                             live.stop()
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                             console.print(f"\n[yellow]Set zealotry for:[/yellow] {current_name} (current: {current_zealotry})")
                             console.print("[dim]1-3: dies quietly  4-6: standard  7-8: frequent  9-10: near-realtime[/dim]")
@@ -3698,7 +3277,7 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             _clamp_selection()
@@ -3721,7 +3300,7 @@ def main():
                             live.stop()
                             console.print("\n[dim]No instances to clear.[/dim]")
                             time.sleep(1)
-                            tty.setcbreak(sys.stdin.fileno())
+                            tty.setcbreak(tty_fd.fileno())
                             input_mode.clear()
                             live.start()
                             _refresh(live)
@@ -3731,7 +3310,7 @@ def main():
                         time.sleep(0.1)
                         live.stop()
 
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                         console.print(f"\n[red bold]Clear all {total_count} instance(s)?[/red bold]")
                         console.print("[dim]This will remove all instances from the database.[/dim]")
@@ -3750,7 +3329,7 @@ def main():
                             console.print("[dim]Cancelled[/dim]")
 
                         time.sleep(0.3)
-                        tty.setcbreak(sys.stdin.fileno())
+                        tty.setcbreak(tty_fd.fileno())
                         input_mode.clear()
                         instances_cache = get_instances()
                         _clamp_selection()
@@ -3877,7 +3456,7 @@ def main():
                     elif action == 'full_refresh':
                         # Ctrl+R: restart server + re-exec TUI to pick up code changes
                         live.stop()
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
                         console.print("\n[cyan bold]Full refresh: restarting server and TUI...[/cyan bold]")
                         try:
                             subprocess.run(["token-restart"], capture_output=True, text=True, timeout=15)
@@ -3928,7 +3507,7 @@ def main():
                         time.sleep(0.1)
                         live.stop()
 
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
                         console.print("\n[cyan bold]Sort instances by:[/cyan bold]")
                         console.print("  [yellow]1[/yellow] Status then recent activity (default)")
@@ -3949,7 +3528,7 @@ def main():
                             console.print("[dim]Cancelled[/dim]")
 
                         time.sleep(0.3)
-                        tty.setcbreak(sys.stdin.fileno())
+                        tty.setcbreak(tty_fd.fileno())
                         input_mode.clear()
                         instances_cache = get_instances()
                         live.start()
@@ -3967,6 +3546,71 @@ def main():
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
+                        _refresh(live)
+
+                    elif action == 'archive_toggle':
+                        if table_mode == "instances" and displayed and 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id", "")
+                            try:
+                                req = urllib.request.Request(
+                                    f"{API_URL}/api/instances/{instance_id}/archive",
+                                    method="PATCH",
+                                    headers={"Content-Type": "application/json"},
+                                    data=b"{}"
+                                )
+                                urllib.request.urlopen(req, timeout=5)
+                                resume_feedback = (time.time(), f"Archived {format_instance_name(instance)}")
+                            except Exception as e:
+                                resume_feedback = (time.time(), f"Archive failed: {e}")
+                        elif table_mode == "archived":
+                            archived = _get_archived()
+                            if archived and 0 <= archived_selected_index < len(archived):
+                                instance = archived[archived_selected_index]
+                                instance_id = instance.get("id", "")
+                                try:
+                                    req = urllib.request.Request(
+                                        f"{API_URL}/api/instances/{instance_id}/unarchive",
+                                        method="PATCH",
+                                        headers={"Content-Type": "application/json"},
+                                        data=b"{}"
+                                    )
+                                    urllib.request.urlopen(req, timeout=5)
+                                    resume_feedback = (time.time(), f"Unarchived {format_instance_name(instance)}")
+                                except Exception as e:
+                                    resume_feedback = (time.time(), f"Unarchive failed: {e}")
+                        _refresh(live)
+
+                    elif action == 'set_type' and table_mode == "instances" and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id", "")
+                            current_type = instance.get("instance_type", "one_off")
+                            valid_types = [t for t in ("sync", "golden_throne", "one_off") if t != current_type]
+
+                            input_mode.set()
+                            time.sleep(0.1)
+                            live.stop()
+                            try:
+                                console.print(f"\n[cyan]Current type:[/cyan] {current_type}")
+                                console.print(f"[cyan]Options:[/cyan] {', '.join(valid_types)}")
+                                new_type = Prompt.ask("Set type", choices=valid_types, default=valid_types[0])
+                                body = json.dumps({"instance_type": new_type}).encode()
+                                req = urllib.request.Request(
+                                    f"{API_URL}/api/instances/{instance_id}/type",
+                                    method="PATCH",
+                                    headers={"Content-Type": "application/json"},
+                                    data=body
+                                )
+                                urllib.request.urlopen(req, timeout=5)
+                                resume_feedback = (time.time(), f"Type → {new_type}")
+                            except KeyboardInterrupt:
+                                pass
+                            except Exception as e:
+                                resume_feedback = (time.time(), f"Set type failed: {e}")
+                            finally:
+                                input_mode.clear()
+                                live.start()
                         _refresh(live)
 
                     elif action == 'resume' and table_mode == "instances":
@@ -4002,7 +3646,7 @@ def main():
                     tui_signal = check_tui_restart_signal(tui_slot)
                     if tui_signal:
                         live.stop()
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
                         reason = tui_signal.get("reason", "unknown")
                         console.print(f"\n[cyan bold]Remote restart signal received ({reason}). Re-launching TUI...[/cyan bold]")
                         time.sleep(0.5)
@@ -4063,9 +3707,13 @@ def main():
         quit_flag.set()
         # Wait for listener thread to exit cleanly
         listener_thread.join(timeout=0.5)
-        # Restore terminal settings (critical for Ctrl+C cleanup)
+        # Restore cursor and terminal settings (critical for Ctrl+C cleanup)
         try:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+            console.show_cursor(True)
+        except:
+            pass
+        try:
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
         except:
             pass
         console.print("\n[dim]Goodbye![/dim]")

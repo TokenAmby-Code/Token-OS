@@ -19,7 +19,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
 - **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
-- `token-restart` orchestrates all three: git push → Mac restart → WSL restart → phone signal
+- `token-restart` orchestrates all three: Mac restart → WSL restart → phone signal
 - TUI runs on any device, connects to Mac API at `100.95.109.23:7777`
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
 
@@ -110,7 +110,7 @@ Check-in types: `morning_start` (9am), `mid_morning` (10:30), `decision_point` (
 
 Submit body: `{"type": "morning_start", "energy": 7, "focus": 8, "mood": "good", "notes": "..."}`
 
-Responses are stored in `checkins` table and written as time-stamped frontmatter fields (e.g., `energy_0900`, `focus_0900`) to the daily note in `~/Documents/Token-ENV/Journal/Daily/`.
+Responses are stored in `checkins` table and written as time-stamped frontmatter fields (e.g., `energy_0900`, `focus_0900`) to the daily note in `~/Documents/Imperium-ENV/Journal/Daily/`.
 
 ### Dictation
 ```
@@ -394,7 +394,7 @@ Global dictation state tracked via `POST /api/dictation` (set) and `GET /api/dic
 |---------|---------|
 | `agents-db` | Query local agents.db database |
 | `token-status` | Quick server status check |
-| `token-restart` | Multi-device restart orchestrator (Mac + WSL + phone) |
+| `token-restart` | Multi-device restart orchestrator (Mac → WSL → phone, no sync needed) |
 | `notify-test` | Send test notifications |
 | `tts-skip` | Skip current TTS (--all to clear queue) |
 | `instance-name` | Rename current session |
@@ -418,12 +418,11 @@ Global dictation state tracked via `POST /api/dictation` (set) and `GET /api/dic
 # Quick status check
 token-status
 
-# Multi-device restart (git push → Mac → WSL → phone)
-token-restart                    # Full restart: push, Mac, WSL satellite, phone TUI
-token-restart --mac-only         # Mac token-api only (launchctl + TUI signals)
+# Multi-device restart (Mac → WSL → phone, no sync needed in NAS era)
+token-restart                    # Full restart: Mac, WSL satellite, phone TUI
+token-restart --from <dir>       # Update plist to serve from <dir>, then restart
 token-restart --wsl-only         # WSL satellite only (HTTP or SSH fallback)
 token-restart --tui-only         # TUI restart signals only (no server restart)
-token-restart --no-push          # Skip git push step
 token-restart --kill             # Kill Mac server (launchd auto-restarts)
 token-restart --watch            # Full restart + tail logs
 token-restart --status           # Multi-device status (Mac + WSL + phone)
