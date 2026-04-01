@@ -1,0 +1,182 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ide__getDiagnostics",
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(gcloud run services get-iam-policy:*)",
+      "Bash(gcloud projects get-iam-policy:*)",
+      "Bash(make lint:*)",
+      "Bash(git checkout:*)"
+    ],
+    "deny": [],
+    "defaultMode": "bypassPermissions"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=SessionStart bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tools --agent --dir \"$PWD\"",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=SessionEnd bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=Notification bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/stop-validator.sh",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=Stop bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/plan-gatekeeper.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/permission-auto-allow.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=UserPromptSubmit bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/btw-capture.sh",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PostToolUse bash ~/.claude/hooks/generic-hook.sh",
+            "async": true
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "tmux-context"
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": false
+  },
+  "showClearContextOnPlanAccept": true,
+  "skipDangerousModePermissionPrompt": true
+}
