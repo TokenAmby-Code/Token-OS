@@ -76,7 +76,7 @@ if __name__ == "__main__":
 Create `bin/{tool-name}`:
 ```bash
 #!/usr/bin/env bash
-exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" {tool-name} "$@"
+exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" {tool-name} "$@"
 ```
 
 Make it executable: `chmod +x bin/{tool-name}`

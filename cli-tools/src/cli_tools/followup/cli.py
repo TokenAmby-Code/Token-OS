@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Follow-up creation CLI.
 
-Create one-shot and recurring follow-up jobs via openclaw cron.
+Create one-shot and recurring follow-up jobs via Token-API cron.
 
 Usage:
     followup create "check migration status" --at +4h
@@ -63,7 +63,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
         prog="followup",
-        description="Create and manage follow-up jobs via openclaw cron",
+        description="Create and manage follow-up jobs via Token-API cron",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:

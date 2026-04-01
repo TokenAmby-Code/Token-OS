@@ -19,7 +19,7 @@ set -e  # Exit on error
 ENVIRONMENT=${1:-development}
 FLAG=${2:-}
 PROJECT_DIR=${3:-$(pwd)}
-DEPLOY_DIR="$HOME/Scripts/cli-tools/src/deploy"
+DEPLOY_DIR="/mnt/imperium/Scripts/cli-tools/src/deploy"
 LOG_FILE="$PROJECT_DIR/.claude-deploy.log"
 SIGNAL_FILE="$PROJECT_DIR/.claude-deploy-signal"
 STATE_FILE="$PROJECT_DIR/.claude-local-server-state.json"
@@ -97,7 +97,7 @@ cleanup_mutex() {
 trap cleanup_mutex EXIT INT TERM
 
 # For non-local cloud deployments, try to use Listr2 runner for rich output
-CLI_TOOLS_DIR="$HOME/Scripts/cli-tools"
+CLI_TOOLS_DIR="/mnt/imperium/Scripts/cli-tools"
 if [ "$IS_LOCAL_DEPLOYMENT" = false ] && [ -t 1 ] && command -v node >/dev/null 2>&1; then
     # Check if listr2 is available (check in cli-tools directory)
     if (cd "$CLI_TOOLS_DIR" && node -e "require('listr2')" 2>/dev/null); then
