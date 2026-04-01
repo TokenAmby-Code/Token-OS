@@ -23,16 +23,13 @@ from langgraph.graph import END, StateGraph
 
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _MINIMAX_MODEL = "MiniMax-M2.5"
-_AUTH_PROFILES_PATH = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
-
-
 def _get_minimax_key() -> str:
-    """Read MiniMax API key from openclaw auth-profiles."""
-    try:
-        profiles = json.loads(_AUTH_PROFILES_PATH.read_text())
-        return profiles["profiles"]["minimax:default"]["key"]
-    except Exception as e:
-        raise RuntimeError(f"Could not load MiniMax API key from {_AUTH_PROFILES_PATH}: {e}")
+    """Read MiniMax API key from MINIMAX_API_KEY env var."""
+    import os
+    key = os.environ.get("MINIMAX_API_KEY")
+    if not key:
+        raise RuntimeError("MINIMAX_API_KEY environment variable not set")
+    return key
 
 
 # Guard lenses cycle through these validation perspectives

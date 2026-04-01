@@ -24,13 +24,14 @@ API = "http://localhost:7777"
 FLEET_CHANNEL = "1473184628155088918"
 VAULT_ROOT = Path.home() / "Imperium-ENV"
 STATE_FILE = Path.home() / ".claude" / "corax-state.json"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 
 # Critical paths to monitor for unexpected changes
 WATCHED_PATHS = {
-    "cron_engine": Path.home() / "Scripts" / "token-api" / "cron_engine.py",
-    "main_py": Path.home() / "Scripts" / "token-api" / "main.py",
-    "stop_hook": Path.home() / "Scripts" / "token-api" / "stop_hook.py",
-    "alpharius": Path.home() / "Scripts" / "token-api" / "alpharius_heartbeat.py",
+    "cron_engine": SCRIPTS_DIR / "token-api" / "cron_engine.py",
+    "main_py": SCRIPTS_DIR / "token-api" / "main.py",
+    "stop_hook": SCRIPTS_DIR / "token-api" / "stop_hook.py",
+    "alpharius": SCRIPTS_DIR / "token-api" / "alpharius_heartbeat.py",
     "discord_daemon": Path.home() / ".discord-cli" / "node" / "daemon.js",
 }
 
@@ -182,7 +183,7 @@ def check_env_files() -> list[str]:
     secret_patterns = [
         VAULT_ROOT / ".env",
         VAULT_ROOT / "credentials.json",
-        Path.home() / "Scripts" / "token-api" / ".env",
+        SCRIPTS_DIR / "token-api" / ".env",
     ]
 
     for p in secret_patterns:

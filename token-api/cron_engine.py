@@ -161,6 +161,8 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN session_started_date TEXT DEFAULT NULL")
         if "victory_conditions" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN victory_conditions TEXT DEFAULT NULL")
+        if "legion" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN legion TEXT DEFAULT 'mechanicus'")
 
         cursor = await db.execute("PRAGMA table_info(cron_runs)")
         cron_runs_cols = {row[1] for row in await cursor.fetchall()}
@@ -351,6 +353,11 @@ class CronEngine:
             await self._log_skip(job_id, "already_running")
             return
 
+        # Guard: instance mutex — previous claude instance for this job still live
+        if not await self._check_instance_mutex(job):
+            await self._log_skip(job_id, "instance_mutex")
+            return
+
         # Guard: quiet hours
         if not self._check_quiet_hours(job):
             await self._log_skip(job_id, "quiet_hours")
@@ -504,7 +511,11 @@ class CronEngine:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=_subprocess_env(CRON_JOB_NAME=job["name"], CRON_JOB_ID=job_id),
+                env=_subprocess_env(
+                    CRON_JOB_NAME=job["name"],
+                    CRON_JOB_ID=job_id,
+                    TOKEN_API_SUBAGENT=f"cron:{job['name']}",
+                ),
                 start_new_session=True,
             )
             self._running_jobs[job_id] = proc
@@ -623,8 +634,9 @@ class CronEngine:
                 except ImportError:
                     pass  # post_run_graph not yet installed
 
-    async def _handle_victory(self, job: dict, run_id: int, reason: str):
-        """Fire Discord victory notification when an agent raises the victory banner."""
+    async def handle_victory(self, job: dict, run_id: int, reason: str):
+        """Fire Discord victory notification when an agent raises the victory banner.
+        Called internally on VICTORY_RE detection or externally via POST /api/cron/jobs/{id}/victory."""
         msg = f"⚔️ **IMPERIUM VICTORIOUS** — {job['name']}\n> {reason}"
         try:
             subprocess.run(
@@ -635,6 +647,30 @@ class CronEngine:
         except Exception as e:
             print(f"CronEngine: Victory Discord notify failed: {e}")
         print(f"CronEngine: '{job['name']}' declared victory: {reason}")
+
+    # Keep private alias for backwards compatibility
+    _handle_victory = handle_victory
+
+    async def _check_instance_mutex(self, job: dict) -> bool:
+        """Return True if no live claude instance exists for this job.
+
+        Cron workers tag their instance with spawner='cron:<job_name>' via
+        TOKEN_API_SUBAGENT. If a previous run's instance is still alive
+        (status != 'stopped'), skip this run to avoid pileup.
+        """
+        spawner_prefix = f"cron:{job['name']}"
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM claude_instances WHERE spawner LIKE ? AND status != 'stopped'",
+                (f"{spawner_prefix}%",),
+            )
+            count = (await cursor.fetchone())[0]
+        if count > 0:
+            print(
+                f"CronEngine: '{job['name']}' SKIPPED: mutex — "
+                f"previous instance still running ({count} live)"
+            )
+        return count == 0
 
     async def _log_skip(self, job_id: str, reason: str):
         """Record a skipped run."""
@@ -697,6 +733,41 @@ class CronEngine:
             except json.JSONDecodeError:
                 pass
         return job
+
+    async def load_from_config(self, config_path: Path) -> list[dict]:
+        """Load (or reload) cron jobs from a JSON config file.
+
+        Each entry in the JSON array is upserted by name: created if new,
+        updated if a job with that name already exists.  Missing file is a
+        no-op (returns empty list).
+        """
+        if not Path(config_path).exists():
+            return []
+
+        try:
+            entries = json.loads(Path(config_path).read_text())
+        except Exception as e:
+            print(f"CronEngine: load_from_config failed to parse {config_path}: {e}")
+            return []
+
+        results = []
+        for entry in entries:
+            name = entry.get("name")
+            if not name:
+                continue
+            # Find existing job by name
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT id FROM cron_jobs WHERE name = ?", (name,))
+                row = await cursor.fetchone()
+
+            if row:
+                job = await self.update_job(row["id"], entry)
+            else:
+                job = await self.create_job(entry)
+            results.append(job)
+
+        return results
 
     VALID_COMMANDERS = {"mechanicus", "custodes", "alpharius", "dorn", "emperor"}
 

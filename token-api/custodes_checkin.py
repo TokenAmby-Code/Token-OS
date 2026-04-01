@@ -42,7 +42,7 @@ def get_session_doc(instance):
         return None
     try:
         result = subprocess.run(
-            ["obsidian", "vault=Token-ENV", "read", f'path="Terra/Sessions/{doc_id}.md"'],
+            ["obsidian", "vault=Imperium-ENV", "read", f'path="Terra/Sessions/{doc_id}.md"'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -58,7 +58,7 @@ def get_daily_thread_id(today: str) -> str | None:
     """Extract thread ID from today's daily note if Phase 0 stored one."""
     try:
         result = subprocess.run(
-            ["obsidian", "vault=Token-ENV", "read", f'path="Journal/Daily/{today}.md"'],
+            ["obsidian", "vault=Imperium-ENV", "read", f'path="Terra/Journal/Daily/{today}.md"'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
@@ -122,10 +122,10 @@ def post_to_discord(observation: str, thread_id: str | None, today: str):
 
 
 def append_to_daily_note(observation: str, today: str, timestamp: str):
-    note_path = f"Journal/Daily/{today}.md"
+    note_path = f"Terra/Journal/Daily/{today}.md"
     entry = f"\n## Custodes — {timestamp}\n\n{observation}\n"
     result = subprocess.run(
-        ["obsidian", "vault=Token-ENV", "append", f'path="{note_path}"', f'content="{entry}"'],
+        ["obsidian", "vault=Imperium-ENV", "append", f'path="{note_path}"', f'content="{entry}"'],
         capture_output=True, text=True, timeout=10
     )
     if result.returncode == 0:

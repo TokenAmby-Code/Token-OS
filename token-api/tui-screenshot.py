@@ -3,7 +3,7 @@
 Render specific TUI panels to SVG/text for debugging.
 
 Usage:
-    python tui-screenshot.py timer-stats [--width 100] [--height 20] [--layout full]
+    python tui-screenshot.py timer-stats [--width 100] [--height 20]
     python tui-screenshot.py monitor
     python tui-screenshot.py dashboard
     python tui-screenshot.py info
@@ -37,12 +37,6 @@ def main():
     )
     parser.add_argument("--width", type=int, default=None, help="Terminal width to simulate (default: current terminal width)")
     parser.add_argument("--height", type=int, default=20, help="max_lines for panel (default: 20)")
-    parser.add_argument(
-        "--layout",
-        choices=["full", "vertical", "compact", "mobile"],
-        default="full",
-        help="Layout mode to simulate (default: full)",
-    )
     parser.add_argument("--svg", default="/tmp/tui-screenshot.svg", help="SVG output path")
     parser.add_argument("--txt", default="/tmp/tui-screenshot.txt", help="Text output path")
     args = parser.parse_args()
@@ -52,9 +46,7 @@ def main():
     # Load TUI module
     tui = load_tui()
 
-    # Set globals before rendering
-    tui.layout_mode = args.layout
-    # Override the TUI module's console width so panel width calculations are correct
+    # Override the TUI module's console so panel width calculations are correct
     tui.console = __import__("rich.console", fromlist=["Console"]).Console(width=width)
 
     # Map panel names to page numbers and render functions

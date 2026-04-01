@@ -58,8 +58,8 @@ from collections import deque
 from urllib.parse import quote
 from typing import Deque
 
-# Circular buffer to store recent log entries (max 100)
-log_buffer: Deque[dict] = deque(maxlen=100)
+# Circular buffer to store recent log entries (max 500)
+log_buffer: Deque[dict] = deque(maxlen=500)
 
 
 class LogBufferHandler(logging.Handler):
@@ -607,6 +607,16 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0")
         if 'discord_channel' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT")
+        if 'follow_up_sop' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT")
+        if 'instance_type' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'")
+            await db.execute("""UPDATE claude_instances SET instance_type = CASE
+                WHEN synced = 1 AND status IN ('processing', 'idle') THEN 'sync'
+                WHEN victory_at IS NOT NULL THEN 'one_off'
+                WHEN zealotry >= 4 AND COALESCE(is_subagent, 0) = 0 THEN 'golden_throne'
+                ELSE 'one_off'
+            END""")
 
         # Migration: add primarch_name and cron_job_id to session_documents
         cursor = await db.execute("PRAGMA table_info(session_documents)")
@@ -1152,7 +1162,7 @@ async def cleanup_stale_instances() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             UPDATE claude_instances
-            SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = CURRENT_TIMESTAMP
+            SET status = 'stopped', synced = 0, stopped_at = CURRENT_TIMESTAMP
             WHERE status IN ('processing', 'idle')
               AND last_activity < ?
         """, (cutoff,))
@@ -1648,7 +1658,7 @@ async def stop_instance(instance_id: str):
 
         await db.execute(
             """UPDATE claude_instances
-               SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ?
+               SET status = 'stopped', synced = 0, stopped_at = ?
                WHERE id = ?""",
             (now, instance_id)
         )
@@ -1802,7 +1812,7 @@ async def kill_instance(instance_id: str):
                 # Mark stopped in DB anyway (cleanup)
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
-                        "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+                        "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
                         (now, instance_id)
                     )
                     await db.commit()
@@ -1816,7 +1826,7 @@ async def kill_instance(instance_id: str):
             # Can't scan /proc on remote device
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1834,7 +1844,7 @@ async def kill_instance(instance_id: str):
             # Process already exited or PID reused by another process
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1851,7 +1861,7 @@ async def kill_instance(instance_id: str):
             # Already dead
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
                     (now, instance_id)
                 )
                 await db.commit()
@@ -1933,7 +1943,7 @@ async def kill_instance(instance_id: str):
     # Mark stopped in DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+            "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
             (now, instance_id)
         )
         await db.commit()
@@ -2329,7 +2339,21 @@ class LogsResponse(BaseModel):
 
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
-    """Rename an instance's tab_name. Also updates linked session doc title."""
+    """Rename an instance's tab_name. Also updates linked session doc title.
+
+    Enforces kebab-case: strips ✳ artifacts, lowercases, converts spaces to
+    hyphens, removes non-alphanumeric chars, truncates to 4 words.
+    """
+    import re as _re
+    # Normalize to kebab-case
+    clean = (request.tab_name or "").lstrip("✳ ").strip()
+    clean = _re.sub(r"[^a-z0-9 -]", "", clean.lower())
+    clean = _re.sub(r"[ -]+", "-", clean).strip("-")
+    clean = "-".join(clean.split("-")[:4])
+    if not clean:
+        raise HTTPException(status_code=400, detail="Name cannot be empty after normalization")
+    request.tab_name = clean
+
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
@@ -2845,7 +2869,8 @@ async def golden_throne_followup(session_id: str):
     instance = dict(instance)
 
     # Skip if already processing (user beat us to it)
-    if instance["status"] == "processing":
+    # Sync instances are permanently processing — never skip them
+    if instance["status"] == "processing" and instance.get("instance_type") != "sync":
         logger.info(f"Golden Throne: {session_id[:12]} already processing, skipping")
         return
 
@@ -2854,7 +2879,18 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
-    sop_prompt = _load_golden_throne_sop()
+    # Custom SOP: instance-level override, then default
+    custom_sop_path = instance.get("follow_up_sop")
+    if custom_sop_path:
+        expanded = Path(custom_sop_path).expanduser()
+        if expanded.exists():
+            sop_prompt = expanded.read_text()
+            logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
+        else:
+            logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
+            sop_prompt = _load_golden_throne_sop()
+    else:
+        sop_prompt = _load_golden_throne_sop()
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
@@ -3270,7 +3306,7 @@ async def declare_victory(instance_id: str, request: Request):
         tab_name = row["tab_name"] or instance_id[:12]
 
         await db.execute(
-            "UPDATE claude_instances SET victory_at = ?, victory_reason = ? WHERE id = ?",
+            "UPDATE claude_instances SET victory_at = ?, victory_reason = ?, instance_type = 'one_off' WHERE id = ?",
             (now, reason, instance_id)
         )
         await db.commit()
@@ -3303,6 +3339,110 @@ async def trigger_golden_throne_followup(instance_id: str):
     """Manually trigger the Golden Throne follow-up callback for an instance."""
     await golden_throne_followup(instance_id)
     return {"triggered": True, "instance_id": instance_id}
+
+
+# ============ Instance Lifecycle Type ============
+
+VALID_INSTANCE_TYPES = {"sync", "golden_throne", "one_off", "archived"}
+
+
+@app.patch("/api/instances/{instance_id}/type")
+async def set_instance_type(instance_id: str, request: Request):
+    """Set instance lifecycle type with transition validation."""
+    body = await request.json()
+    new_type = body.get("instance_type")
+    if new_type not in VALID_INSTANCE_TYPES:
+        raise HTTPException(status_code=400, detail=f"instance_type must be one of {VALID_INSTANCE_TYPES}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        instance = await cursor.fetchone()
+        if not instance:
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+        old_type = instance["instance_type"] or "one_off"
+
+        # Archived instances can only unarchive to one_off
+        if old_type == "archived" and new_type != "one_off":
+            raise HTTPException(status_code=400, detail="Archived instances can only be unarchived to one_off")
+
+        updates = ["instance_type = ?"]
+        params = [new_type]
+
+        # Optional follow_up_sop — persist custom SOP path for GT follow-ups
+        follow_up_sop = body.get("follow_up_sop")
+        if follow_up_sop is not None:
+            updates.append("follow_up_sop = ?")
+            params.append(follow_up_sop if follow_up_sop else None)
+
+        # Optional zealotry override in same call
+        zealotry_override = body.get("zealotry")
+        if isinstance(zealotry_override, int) and 1 <= zealotry_override <= 10:
+            updates.append("zealotry = ?")
+            params.append(zealotry_override)
+
+        # Auto-set zealotry minimum when promoting to golden_throne
+        if new_type == "golden_throne" and (instance["zealotry"] or 4) < 4 and zealotry_override is None:
+            updates.append("zealotry = 4")
+
+        params.append(instance_id)
+        await db.execute(f"UPDATE claude_instances SET {', '.join(updates)} WHERE id = ?", params)
+        await db.commit()
+
+    # Cancel timers when leaving golden_throne or sync
+    if old_type in ("golden_throne", "sync") and new_type not in ("golden_throne", "sync"):
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        try:
+            scheduler.remove_job(f"sync-retrigger-{instance_id}")
+        except Exception:
+            pass
+
+    await log_event("instance_type_changed", instance_id=instance_id,
+                    details={"old_type": old_type, "new_type": new_type})
+    return {"instance_id": instance_id, "instance_type": new_type, "old_type": old_type}
+
+
+@app.patch("/api/instances/{instance_id}/archive")
+async def archive_instance(instance_id: str):
+    """Archive an instance — manual user action only."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await db.execute(
+            "UPDATE claude_instances SET instance_type = 'archived', status = 'stopped' WHERE id = ?",
+            (instance_id,)
+        )
+        await db.commit()
+
+    # Cancel any pending timers
+    for prefix in ("golden-throne-", "sync-retrigger-"):
+        try:
+            scheduler.remove_job(f"{prefix}{instance_id}")
+        except Exception:
+            pass
+
+    return {"instance_id": instance_id, "instance_type": "archived"}
+
+
+@app.patch("/api/instances/{instance_id}/unarchive")
+async def unarchive_instance(instance_id: str):
+    """Unarchive an instance — returns to one_off."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await db.execute(
+            "UPDATE claude_instances SET instance_type = 'one_off' WHERE id = ?",
+            (instance_id,)
+        )
+        await db.commit()
+
+    return {"instance_id": instance_id, "instance_type": "one_off"}
 
 
 def _send_pedal_enter():
@@ -9478,7 +9618,10 @@ async def handle_session_start(payload: dict) -> dict:
 
     # Get working directory and tab name
     working_dir = payload.get("cwd") or os.getcwd()
-    tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or f"Claude {datetime.now().strftime('%H:%M')}"
+    raw_tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or ""
+    # Strip Claude Code's ✳ prefix and whitespace artifacts from pane titles
+    tab_name = raw_tab_name.lstrip("✳ ").strip() if raw_tab_name else ""
+    tab_name = tab_name or f"Claude {datetime.now().strftime('%H:%M')}"
 
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
@@ -9703,6 +9846,22 @@ async def handle_session_start(payload: dict) -> dict:
             # Assign profile via linear probe
             profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
 
+        # Preserve discord settings from prior registration (--resume re-registers with same id)
+        _prior_discord_hosted = 0
+        _prior_discord_channel = None
+        _prior_legion = None
+        cursor = await db.execute(
+            "SELECT discord_hosted, discord_channel, legion FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        _prior_row = await cursor.fetchone()
+        if _prior_row:
+            _prior_discord_hosted = _prior_row[0] or 0
+            _prior_discord_channel = _prior_row[1]
+            _prior_legion = _prior_row[2]
+            # Delete old row so INSERT succeeds (id is PRIMARY KEY)
+            await db.execute("DELETE FROM claude_instances WHERE id = ?", (session_id,))
+
         # Insert instance
         now = datetime.now().isoformat()
         internal_session_id = str(uuid.uuid4())
@@ -9711,8 +9870,9 @@ async def handle_session_start(payload: dict) -> dict:
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
                 is_subagent, spawner, tmux_pane, primarch,
+                discord_hosted, discord_channel,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 internal_session_id,
@@ -9729,6 +9889,8 @@ async def handle_session_start(payload: dict) -> dict:
                 spawner,
                 tmux_pane,
                 primarch_name or None,
+                _prior_discord_hosted,
+                _prior_discord_channel,
                 now,
                 now
             )
@@ -9825,10 +9987,16 @@ async def handle_session_start(payload: dict) -> dict:
         elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
             auto_legion = "civic"
 
+        # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:
             await db.execute(
                 "UPDATE claude_instances SET legion = ? WHERE id = ?",
                 (auto_legion, session_id)
+            )
+        elif _prior_legion and _prior_legion != "astartes":
+            await db.execute(
+                "UPDATE claude_instances SET legion = ? WHERE id = ?",
+                (_prior_legion, session_id)
             )
 
         await db.commit()
@@ -9885,7 +10053,7 @@ async def handle_session_end(payload: dict) -> dict:
         was_active = count_row[0] if count_row else 0
 
         await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', synced = 0, discord_hosted = 0, stopped_at = ? WHERE id = ?",
+            "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
             (now, session_id)
         )
         await db.commit()
@@ -10099,27 +10267,47 @@ async def handle_stop(payload: dict) -> dict:
     tts_voice = instance.get("tts_voice", "Microsoft David")
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
-    # Mark as no longer processing
+    # Update last_activity but DON'T set idle yet — that's the evaluators' job.
+    # Sync instances never go idle (permanent processing until SessionEnd).
+    # Golden throne / one-off: evaluators write idle on pass, or stay processing on nudge.
     now = datetime.now().isoformat()
+    instance_type = instance.get("instance_type", "one_off")
+    is_sync_instance = instance_type == "sync"
+    is_subagent_instance_quick = bool(instance.get("is_subagent"))
+    has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
+
+    # Determine if evaluators will run (they own the idle transition)
+    will_evaluate = (not is_subagent_instance_quick and not has_pending_background and not is_sync_instance)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET status = 'idle', last_activity = ? WHERE id = ?",
-            (now, session_id)
-        )
+        if will_evaluate or is_sync_instance:
+            # Evaluators (or sync retrigger) will handle status — just update timestamp
+            await db.execute(
+                "UPDATE claude_instances SET last_activity = ? WHERE id = ?",
+                (now, session_id)
+            )
+        else:
+            # Subagents, intermediate stops, no evaluators — go idle immediately
+            await db.execute(
+                "UPDATE claude_instances SET status = 'idle', last_activity = ? WHERE id = ?",
+                (now, session_id)
+            )
         await db.commit()
 
     # Fire async stop evaluators (action_validator, plan_auditor, etc.)
-    # Skips subagents and intermediate stops (background tasks pending).
-    is_subagent_instance_quick = bool(instance.get("is_subagent"))
-    has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
-    if not is_subagent_instance_quick and not has_pending_background:
+    # Skips subagents, sync instances, and intermediate stops.
+    if will_evaluate:
         session_doc_id = instance.get("session_doc_id")
         stop_context = payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
+        # Signal TUI that evaluators are running for this instance
+        _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
+        _tui_signal_dir.mkdir(exist_ok=True)
+        (_tui_signal_dir / f"evaluating-{session_id}").touch()
         asyncio.create_task(_run_stop_evaluators(
             session_id, session_doc_id, stop_context, tab_name
         ))
-        # Auto-name: if instance still has default "Claude HH:MM" name, generate one
-        # Pass transcript_path as fallback — stop_context may be empty for short sessions
+        # Auto-name: generate kebab-case name if not explicitly named by our pipeline
+        # Also sends /rename + /color to Claude Code UI in concert with instance profile
         transcript_path = payload.get("transcript_path", "")
         asyncio.create_task(_auto_name_instance(dict(instance), stop_context, transcript_path))
 
@@ -10168,15 +10356,17 @@ async def handle_stop(payload: dict) -> dict:
                 try:
                     data = json.loads(line)
                     content = data.get("message", {}).get("content")
-                    if isinstance(content, str):
+                    if isinstance(content, str) and content.strip():
                         tts_text = content
                     elif isinstance(content, list):
-                        # Extract text from content array
-                        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                        tts_text = "\n".join(texts)
-                    elif isinstance(content, dict) and "text" in content:
+                        # Extract text from content array (skip tool_use-only messages)
+                        texts = [c.get("text", "") for c in content if c.get("type") == "text" and c.get("text", "").strip()]
+                        if texts:
+                            tts_text = "\n".join(texts)
+                    elif isinstance(content, dict) and content.get("text", "").strip():
                         tts_text = content["text"]
-                    break
+                    if tts_text:
+                        break
                 except json.JSONDecodeError:
                     continue
 
@@ -10260,14 +10450,16 @@ async def handle_stop(payload: dict) -> dict:
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})
 
-    # Golden Throne: schedule follow-up if zealotry >= 4
-    zealotry = instance.get("zealotry") or 4
-    if zealotry >= 4 and not is_subagent_instance:
+    # Instance lifecycle retrigger — gated on instance_type, not raw zealotry
+    instance_type = instance.get("instance_type", "one_off")
+
+    if instance_type == "golden_throne" and not is_subagent_instance:
+        # Golden Throne: zealotry-based delay
+        zealotry = instance.get("zealotry") or 4
         delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, 1800)
         fire_at = datetime.now() + timedelta(seconds=delay_seconds)
         job_id = f"golden-throne-{session_id}"
 
-        # Cancel any existing timer (double-stop scenario)
         try:
             scheduler.remove_job(job_id)
         except Exception:
@@ -10296,6 +10488,36 @@ async def handle_stop(payload: dict) -> dict:
         await log_event("golden_throne_scheduled", instance_id=session_id,
                         details={"zealotry": zealotry, "delay_seconds": delay_seconds,
                                  "fire_at": fire_at.isoformat()})
+
+    elif instance_type == "sync" and not is_subagent_instance:
+        # Sync retrigger: immediate re-activation (just enough for stop hook plumbing)
+        delay_seconds = 3
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        job_id = f"sync-retrigger-{session_id}"
+
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=job_id,
+            replace_existing=True,
+            name=f"Sync Retrigger: {tab_name}",
+            misfire_grace_time=30,
+            jobstore='golden_throne',
+        )
+        result["sync_retrigger"] = {
+            "scheduled": True,
+            "delay_seconds": delay_seconds,
+            "fire_at": fire_at.isoformat(),
+        }
+        logger.info(f"Sync Retrigger: scheduled for {session_id[:12]} in {delay_seconds}s")
+
+    # one_off and archived: no retrigger
 
     return result
 
@@ -10611,26 +10833,36 @@ def _format_discord_injection(channel_name: str, content: str) -> str:
     return f"[Emperor via Discord #{channel_name}]: {clean}"
 
 
-async def _try_synced_injection(legion: str, message) -> bool:
-    """Try to inject a Discord message into the synced session for a legion.
+async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
+    """Try to inject a Discord message into a live instance for a legion.
 
-    Returns True if injection succeeded, False if no synced session or injection failed.
+    Args:
+        require_synced: If True, only target instances with synced=1 (Mechanicus pattern).
+                        If False, target any live instance (Custodes singleton pattern).
+    Returns True if injection succeeded, False if no matching instance or injection failed.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
-               LIMIT 1""",
-            (legion,)
-        )
+        if require_synced:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,)
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,)
+            )
         row = await cursor.fetchone()
         if not row:
             return False
 
     instance_id, tmux_pane, device_id = row
     if not tmux_pane:
-        logger.warning(f"Synced injection: instance {instance_id[:12]} has no tmux_pane, falling back")
+        logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
         return False
 
     formatted = _format_discord_injection(
@@ -10654,74 +10886,16 @@ async def _try_synced_injection(legion: str, message) -> bool:
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
-            logger.info(f"Synced injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
+            logger.info(f"Discord injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
             return True
         else:
-            logger.warning(f"Synced injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+            logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
             return False
     except asyncio.TimeoutError:
-        logger.warning(f"Synced injection timed out for {instance_id[:12]}")
+        logger.warning(f"Discord injection timed out for {instance_id[:12]}")
         return False
     except Exception as e:
-        logger.warning(f"Synced injection error: {e}")
-        return False
-
-
-async def _try_legion_injection(legion: str, message) -> bool:
-    """Try to inject a Discord message into ANY live instance for a legion.
-
-    Unlike _try_synced_injection, this does NOT require synced=1.
-    Used for Custodes singleton routing — all messages go to the one live instance.
-    Returns True if injection succeeded, False if no live instance or injection failed.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = ? AND status IN ('idle', 'processing')
-               LIMIT 1""",
-            (legion,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return False
-
-    instance_id, tmux_pane, device_id = row
-    if not tmux_pane:
-        logger.warning(f"Legion injection: instance {instance_id[:12]} has no tmux_pane, cannot inject")
-        return False
-
-    formatted = _format_discord_injection(
-        message.channel_name or "dm",
-        message.content or ""
-    )
-
-    try:
-        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
-        proc = await asyncio.create_subprocess_exec(
-            str(claude_cmd), "--instance", instance_id, formatted,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "PATH": ":".join([
-                str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                str(Path.home() / ".local" / "bin"),
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                os.environ.get("PATH", ""),
-            ])},
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode == 0:
-            logger.info(f"Legion injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
-            return True
-        else:
-            logger.warning(f"Legion injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
-            return False
-    except asyncio.TimeoutError:
-        logger.warning(f"Legion injection timed out for {instance_id[:12]}")
-        return False
-    except Exception as e:
-        logger.warning(f"Legion injection error: {e}")
+        logger.warning(f"Discord injection error: {e}")
         return False
 
 
@@ -10808,14 +10982,14 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger 1: @Mechanicus mention → try synced injection, fallback to one-off responder
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
-        injected = await _try_synced_injection("mechanicus", request)
+        injected = await _try_discord_injection("mechanicus", request, require_synced=True)
         if not injected:
             asyncio.create_task(_discord_respond(request, bot="mechanicus"))
         return {"received": True, "message_id": request.message_id}
 
     # Trigger 1.5: @Custodes mention → route to singleton (no one-off responder)
     if f"<@{CUSTODES_USER_ID}>" in content:
-        injected = await _try_legion_injection("custodes", request)
+        injected = await _try_discord_injection("custodes", request)
         if not injected:
             logger.warning("Custodes @mention but no live Custodes instance to route to")
         return {"received": True, "message_id": request.message_id}
@@ -10827,7 +11001,7 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger 2: Reply in a Custodes-owned channel → route to singleton (no one-off responder)
     if request.is_reply and request.channel_name in CUSTODES_CHANNELS:
-        injected = await _try_legion_injection("custodes", request)
+        injected = await _try_discord_injection("custodes", request)
         if not injected:
             logger.warning(f"Reply in #{request.channel_name} but no live Custodes instance")
 
@@ -11232,7 +11406,6 @@ async def inbox_create(request: InboxCreateRequest):
 OBSIDIAN_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian")
 WEB_SEARCH_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "web-search")
 DISCORD_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "discord")
-DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 
 
 async def _read_note_property(note_path: str, prop: str) -> str | None:
@@ -12154,11 +12327,27 @@ def _get_minimax_key() -> str:
 
 
 async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 1024) -> str:
-    """Send a chat message to Minimax and return the text response."""
+    """Send a chat message to Minimax and return the text response.
+
+    MiniMax M2.5 uses extended thinking by default. We set a thinking budget
+    so the model spends most tokens on the actual text response. If only
+    thinking blocks come back (no text), we extract from thinking as fallback.
+    """
     if not await minimax_limiter.acquire():
         logger.warning(f"MiniMax rate limited ({minimax_limiter.remaining} remaining)")
         return ""
     key = _get_minimax_key()
+
+    # Disable extended thinking — MiniMax M2.5 routes everything through
+    # thinking blocks via the Anthropic-compatible API, leaving zero text output.
+    body: dict = {
+        "model": _MINIMAX_MODEL,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_content}],
+        "thinking": {"type": "disabled"},
+    }
+
     async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(
             f"{_MINIMAX_BASE_URL}/v1/messages",
@@ -12167,21 +12356,29 @@ async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": _MINIMAX_MODEL,
-                "max_tokens": max_tokens,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_content}],
-            },
+            json=body,
         )
         resp.raise_for_status()
         data = resp.json()
         content = data.get("content") or []
         stop_reason = data.get("stop_reason", "?")
+
+        # Primary: extract text blocks
         text = "".join(
             block["text"] for block in content
             if block.get("type") == "text"
         )
+
+        # Fallback: if no text blocks, extract from thinking blocks
+        if not text:
+            thinking_text = "".join(
+                block.get("thinking", "") for block in content
+                if block.get("type") == "thinking"
+            )
+            if thinking_text:
+                logger.info(f"MiniMax: no text blocks, extracting from thinking ({len(thinking_text)} chars)")
+                text = thinking_text
+
         if not text:
             logger.warning(f"MiniMax empty response: stop_reason={stop_reason}, content={data.get('content')!r}")
         return text
@@ -12206,52 +12403,104 @@ STOP_EVALUATORS = {
             "- The agent is explaining what it DID (past tense), not what the user SHOULD DO\n"
             "- The agent needs physical-world action (restart an app, plug in a device)\n"
             "- The agent is in plan mode discussing approach\n\n"
-            "Analyze the agent's final message. If the agent is telling the user to perform "
-            "actions the agent could do itself, respond with:\n"
-            "VIOLATION: <1-2 sentence description of what the agent should do instead>\n\n"
-            "If the agent's message is acceptable, respond with exactly: PASS"
+            "Analyze the agent's final message. You may reason through your analysis freely, "
+            "but you MUST end your response with exactly one of these lines:\n\n"
+            "VERDICT: BLOCK <one-sentence description of what the agent should do instead>\n"
+            "VERDICT: CONTINUE\n\n"
+            "The VERDICT line must be the final line of your response."
         ),
-        "max_tokens": 256,
+        "max_tokens": 4096,
         "requires_session_doc": False,
     },
     "plan_auditor": {
         "system": (
             "You are a Plan Auditor. Given a session document and recent activity, "
-            "identify if any part of the Plan section needs updating based on what just happened. "
-            "If no updates needed, respond with exactly: PASS\n"
-            "Otherwise, respond with:\n"
-            "UPDATE: <2-3 sentence description of the specific plan changes needed>"
+            "identify if any part of the Plan section needs updating based on what just happened.\n\n"
+            "You may reason through your analysis freely, "
+            "but you MUST end your response with exactly one of these lines:\n\n"
+            "VERDICT: BLOCK The Plan section currently shows <current state> but <what changed>. "
+            "The Plan should be updated to <specific change>.\n"
+            "VERDICT: CONTINUE\n\n"
+            "The VERDICT line must be the final line of your response."
         ),
-        "max_tokens": 512,
+        "max_tokens": 4096,
         "requires_session_doc": True,
     },
 }
 
 
-def _parse_evaluator_result(evaluator_name: str, text: str) -> tuple[bool, str]:
-    """Parse MiniMax evaluator response into (should_nudge, finding)."""
+def _parse_verdict_from_tail(text: str) -> tuple[str | None, str]:
+    """Scan from the tail of a MiniMax response for a structured verdict.
+
+    Expected format at end of response:
+        VERDICT: BLOCK <finding>
+        VERDICT: CONTINUE
+
+    Returns (verdict, finding) where verdict is "block"/"continue"/None.
+    """
+    import re as _re
+    lines = text.strip().splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        match = _re.match(r"(?i)^VERDICT:\s*(BLOCK|CONTINUE)\s*(.*)", line)
+        if match:
+            verdict = match.group(1).lower()
+            finding = match.group(2).strip().rstrip(".").strip()
+            return verdict, finding[:300]
+    return None, ""
+
+
+async def _jury_interpret(evaluator_name: str, original_response: str) -> tuple[bool, str]:
+    """Fallback: spawn a second MiniMax call to interpret an unparseable response.
+
+    Cheap, fast, no reasoning — just yes/no on whether the first call decided to block.
+    """
+    label = evaluator_name.replace("_", " ")
+    system = (
+        f"A {label} evaluated an AI agent and produced the response below. "
+        "Did the evaluator decide the agent should be stopped/blocked/corrected? "
+        "Answer ONLY 'yes' or 'no'. No other reasoning, response, or preamble."
+    )
+    user_content = f"Evaluator response:\n\n{original_response[:2000]}"
+
+    try:
+        answer = await minimax_chat(system, user_content, max_tokens=256)
+        answer_lower = answer.strip().lower()
+        logger.info(f"StopEval: jury raw answer for {evaluator_name}: {answer_lower[:100]!r}")
+        # Check for "yes" anywhere — MiniMax may wrap it in thinking/reasoning
+        decided_block = "yes" in answer_lower and "no" not in answer_lower
+        if decided_block:
+            # Extract a usable finding from the original — first substantive line
+            for line in original_response.strip().splitlines():
+                line = line.strip()
+                if len(line) > 15 and not line.upper().startswith("VERDICT"):
+                    return True, line[:300]
+            return True, f"{label} flagged this session (details in transcript)"
+        return False, ""
+    except Exception as e:
+        logger.warning(f"StopEval jury failed for {evaluator_name}: {e}")
+        return False, ""
+
+
+def _parse_evaluator_result(evaluator_name: str, text: str) -> tuple[bool, str, bool]:
+    """Parse MiniMax evaluator response into (should_nudge, finding, needs_jury).
+
+    Scans from the tail for VERDICT: BLOCK/CONTINUE.
+    If no verdict found, returns needs_jury=True for fallback interpretation.
+    """
     text = text.strip()
-    if evaluator_name == "action_validator":
-        if text.upper().startswith("VIOLATION:"):
-            return True, text[len("VIOLATION:"):].strip()
-        return False, ""
-    elif evaluator_name == "plan_auditor":
-        if text.upper().startswith("UPDATE:"):
-            return True, text[len("UPDATE:"):].strip()
-        if "NO_UPDATE" in text or text.upper() == "PASS":
-            return False, ""
-        # Ambiguous response — treat non-trivial output as a finding
-        if len(text) > 20:
-            return True, text
-        return False, ""
-    # Generic fallback: VIOLATION/UPDATE prefix = nudge, PASS = no nudge
-    if text.upper().startswith("VIOLATION:"):
-        return True, text[len("VIOLATION:"):].strip()
-    if text.upper().startswith("UPDATE:"):
-        return True, text[len("UPDATE:"):].strip()
-    if text.upper() == "PASS":
-        return False, ""
-    return False, ""
+    if not text:
+        return False, "", False
+
+    verdict, finding = _parse_verdict_from_tail(text)
+
+    if verdict == "block":
+        return True, finding or f"{evaluator_name.replace('_', ' ').title()} flagged this session", False
+    if verdict == "continue":
+        return False, "", False
+
+    # No parseable verdict — needs jury fallback
+    return False, text, True
 
 
 def _build_evaluator_prompt(evaluator_name: str, ctx: dict) -> str:
@@ -12330,12 +12579,12 @@ async def _gather_evaluator_context(
 
 
 async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_path: str = "") -> None:
-    """Generate a session name via MiniMax if instance still has default name.
+    """Generate a session name via MiniMax if instance hasn't been explicitly named.
 
-    Called on first stop. If tab_name matches "Claude HH:MM" (the default),
-    MiniMax reads the transcript tail and generates a short descriptive name.
-    The name is applied via claude-cmd /rename; the status line auto-syncs
-    it to Token-API on the next message.
+    Called on first stop. If tab_name hasn't been set by our naming pipeline
+    (instance-name CLI or a prior auto-name), MiniMax reads the transcript tail
+    and generates a short kebab-case name. The name is applied to both the DB
+    and Claude Code UI via /rename + /color.
     """
     import re as _re
 
@@ -12343,9 +12592,13 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
     tab_name = instance.get("tab_name", "")
     logger.info(f"AutoName: checking {instance_id} tab_name={tab_name!r}")
 
-    # Only auto-name if still using default "Claude HH:MM" pattern
-    if not _re.match(r"^Claude \d{2}:\d{2}$", tab_name):
-        logger.info(f"AutoName: skipping {instance_id} — already named")
+    # Skip if already named by our pipeline (kebab-case = our convention).
+    # Auto-name if: default "Claude HH:MM", Claude Code auto-title (has spaces),
+    # or fallback "Claude Code" / empty.
+    is_our_name = bool(tab_name and " " not in tab_name
+                       and _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", tab_name))
+    if is_our_name:
+        logger.info(f"AutoName: skipping {instance_id} — already named ({tab_name!r})")
         return
 
     tmux_pane = instance.get("tmux_pane")
@@ -12372,20 +12625,25 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
         logger.warning(f"AutoName: skipping {instance_id} — MiniMax budget low ({minimax_limiter.remaining})")
         return
 
+    # Blocklist: meta/format names MiniMax parrots from prompt instructions
+    _name_blocklist = {"kebab-case", "example-name", "session-name", "coding-session",
+                       "test-name", "name-here", "your-name", "my-name", "new-name"}
+
     system_prompt = (
-        "Output a single kebab-case name for a coding session. "
-        "2-4 words, lowercase, hyphens only. "
+        "Output a single short name for a coding session. "
+        "Format: lowercase words joined by hyphens, 2-4 words total. "
         "Examples: auth-refactor, tmux-grid-expand, fix-deploy-pipeline. "
-        "RESPOND WITH ONLY THE NAME. No explanation. No reasoning. No quotes. Just the name."
+        "The name must describe WHAT the session worked on. "
+        "RESPOND WITH ONLY THE NAME. No explanation. No quotes. Just the name."
     )
     user_content = f"Transcript tail (last ~60 lines):\n\n{transcript_tail[:3000]}"
 
     try:
         name = await minimax_chat(system_prompt, user_content, max_tokens=32)
         name = name.strip().strip('"').strip("'").lower()
-        # Validate: must be kebab-case, 2-4 words, no spaces
+        # Validate: must be lowercase-hyphenated, 2-4 words, no spaces
         if not _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+){1,3}$", name):
-            # MiniMax sometimes returns prose — try to extract a kebab-case name from it
+            # MiniMax sometimes returns prose — try to extract a valid name from it
             match = _re.search(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+){1,3})\b", name)
             if match:
                 name = match.group(1)
@@ -12393,6 +12651,10 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
             else:
                 logger.warning(f"AutoName: MiniMax returned invalid name: {name[:100]!r}")
                 return
+        # Reject format-descriptor names that MiniMax parrots from the prompt
+        if name in _name_blocklist:
+            logger.warning(f"AutoName: MiniMax returned blocklisted name: {name!r}")
+            return
         logger.info(f"AutoName: naming {instance['id'][:12]} -> {name}")
 
         # Rename via Token-API directly (faster than claude-cmd for the API side)
@@ -12404,24 +12666,38 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
             )
             await db.commit()
 
-        # Also rename in Claude Code UI via tmux
+        # Also rename + recolor in Claude Code UI via tmux
+        # Send /rename and /color in concert with instance profile
         device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-        rename_cmd = f"/rename {name}"
+        # Resolve cc_color from profile_name (not a DB column)
+        cc_color = ""
+        profile_name = instance.get("profile_name", "")
+        if profile_name:
+            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                if p["name"] == profile_name:
+                    cc_color = p.get("cc_color", "")
+                    break
+        cmds = [f"/rename {name}"]
+        if cc_color:
+            cmds.append(f"/color {cc_color}")
+
         if device_id == LOCAL_DEVICE_NAME:
-            proc = await asyncio.create_subprocess_exec(
-                "claude-cmd", "--pane", tmux_pane, rename_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=10)
+            for cmd in cmds:
+                proc = await asyncio.create_subprocess_exec(
+                    "claude-cmd", "--pane", tmux_pane, cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
         else:
             # WSL: deliver via satellite /tmux/send-keys
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    await client.post(
-                        f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/send-keys",
-                        json={"pane": tmux_pane, "command": rename_cmd},
-                    )
+                    for cmd in cmds:
+                        await client.post(
+                            f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/send-keys",
+                            json={"pane": tmux_pane, "command": cmd},
+                        )
             except Exception as e:
                 logger.warning(f"AutoName: satellite delivery failed: {e}")
     except Exception as e:
@@ -12472,6 +12748,7 @@ async def _run_stop_evaluators(
     pending = set(tasks.values())
     nudge_evaluator = None
     nudge_finding = None
+    jury_queue: list[tuple[str, str]] = []  # (evaluator_name, raw_response)
 
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -12483,22 +12760,49 @@ async def _run_stop_evaluators(
                 logger.error(f"StopEval: {name} failed for {instance_id[:12]}: {e}")
                 continue
 
-            should_nudge, finding = _parse_evaluator_result(name, text)
+            should_nudge, finding, needs_jury = _parse_evaluator_result(name, text)
+            if needs_jury:
+                # Log tail of unparseable response for debugging
+                tail_preview = text.strip().splitlines()[-3:] if text.strip() else ["(empty)"]
+                logger.info(f"StopEval: {name} response tail: {' | '.join(tail_preview)[:200]}")
             if should_nudge and finding:
                 nudge_evaluator = name
                 nudge_finding = finding
                 logger.info(f"StopEval: {name} triggered for {instance_id[:12]}: {finding[:100]}")
-                # Cancel all remaining evaluators — nudge decision is made
                 for t in pending:
                     t.cancel()
                 pending = set()
                 break
+            elif needs_jury:
+                logger.info(f"StopEval: {name} unparseable for {instance_id[:12]}, queuing jury")
+                jury_queue.append((name, text))
             else:
                 logger.info(f"StopEval: {name} passed for {instance_id[:12]}")
 
+    # Jury fallback: interpret any unparseable responses
+    if not nudge_finding and jury_queue:
+        for eval_name, raw_response in jury_queue:
+            logger.info(f"StopEval: jury interpreting {eval_name} for {instance_id[:12]}")
+            should_nudge, finding = await _jury_interpret(eval_name, raw_response)
+            if should_nudge and finding:
+                nudge_evaluator = eval_name
+                nudge_finding = finding
+                logger.info(f"StopEval: jury confirmed {eval_name} for {instance_id[:12]}: {finding[:100]}")
+                break
+            else:
+                logger.info(f"StopEval: jury cleared {eval_name} for {instance_id[:12]}")
+
     if not nudge_finding:
-        # All evaluators passed — clear cooldown
+        # All evaluators passed — transition to idle (stop hook left it as processing)
         _recently_nudged.pop(instance_id, None)
+        (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(missing_ok=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE claude_instances SET status = 'idle' WHERE id = ? AND status = 'processing'",
+                (instance_id,)
+            )
+            await db.commit()
+        logger.info(f"StopEval: all passed for {instance_id[:12]} — status → idle")
         return
 
     # Append finding to transcript file
@@ -12519,6 +12823,7 @@ async def _run_stop_evaluators(
 
     # Record nudge timestamp BEFORE nudging
     _recently_nudged[instance_id] = time.time()
+    (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(missing_ok=True)
 
     # Nudge the instance
     try:

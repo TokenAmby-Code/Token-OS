@@ -5,18 +5,18 @@ import subprocess, time, json, datetime, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://localhost:7777"
-LOG_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md")
-FLEET_REPORT_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Fleet/fleet_status.md")
+LOG_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md"
+FLEET_REPORT_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Fleet/fleet_status.md"
 N = 10
 DAILY_BUDGET_USD = 2.00
-GUARDSMAN_BIN = os.path.expanduser("~/Scripts/cli-tools/bin/guardsman")
+GUARDSMAN_BIN = "/mnt/imperium/Scripts/cli-tools/bin/guardsman"
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
-    ("ls ~/Scripts/token-api/ | fleet_dispatch_poc.py is listed", "fallback"),
+    ("ls /mnt/imperium/Scripts/token-api/ | fleet_dispatch_poc.py is listed", "fallback"),
     ("curl -s localhost:7777/health | response contains a status field", "fallback"),
     ("date | output contains a valid year between 2020 and 2030", "fallback"),
-    ("head -3 ~/Scripts/token-api/CLAUDE.md | first lines describe Token-API or port 7777", "fallback"),
+    ("head -3 /mnt/imperium/Scripts/token-api/CLAUDE.md | first lines describe Token-API or port 7777", "fallback"),
 ]
 
 
@@ -54,7 +54,7 @@ def pull_tasks():
 def _scan_mars_tasks(limit: int) -> list:
     """Scan Mars/Tasks for autonomy: researchable files, fabricate guardsman tasks."""
     import glob as _glob
-    tasks_dir = os.path.expanduser("~/Imperium-ENV/Mars/Tasks")
+    tasks_dir = "/Volumes/Imperium/Imperium-ENV/Mars/Tasks"
     assertions = [
         "task file has a title and autonomy frontmatter",
         "this task file exists and has actionable content",

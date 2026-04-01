@@ -62,6 +62,28 @@ def init_database():
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
     if 'session_doc_id' not in columns:
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER")
+    if 'zealotry' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4")
+    if 'tmux_pane' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT")
+    if 'victory_at' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP")
+    if 'victory_reason' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT")
+    if 'primarch' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN primarch TEXT")
+    if 'legion' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'")
+    if 'synced' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0")
+    if 'instance_type' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'")
+        cursor.execute("""UPDATE claude_instances SET instance_type = CASE
+            WHEN synced = 1 AND status IN ('processing', 'idle') THEN 'sync'
+            WHEN victory_at IS NOT NULL THEN 'one_off'
+            WHEN zealotry >= 4 AND COALESCE(is_subagent, 0) = 0 THEN 'golden_throne'
+            ELSE 'one_off'
+        END""")
 
     # Migration: Convert two-field status (status + is_processing) to single enum
     # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
@@ -78,6 +100,7 @@ def init_database():
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)")
 
     # Create devices table
     cursor.execute("""
@@ -205,11 +228,18 @@ def init_database():
             file_path   TEXT NOT NULL UNIQUE,
             title       TEXT,
             project     TEXT,
+            cron_job_id TEXT,
             status      TEXT DEFAULT 'active',
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migration: add cron_job_id to session_documents
+    cursor.execute("PRAGMA table_info(session_documents)")
+    sd_columns = [col[1] for col in cursor.fetchall()]
+    if 'cron_job_id' not in sd_columns:
+        cursor.execute("ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT")
 
     # Create primarchs table (registry of primarch identities)
     cursor.execute("""
