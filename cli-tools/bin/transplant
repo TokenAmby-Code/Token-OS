@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# transplant - Move the current Claude session to a different directory
-# TAGS: instance
+# transplant - Move the current Claude session to a different directory or device
+# TAGS: instance, tmux
 # AUDIENCE: human, agent
 #
-# Usage: transplant <target-directory>
+# Usage: transplant [options] <target-directory>
 #
 # Kills the current Claude session and restarts it in the target directory
-# with conversation history preserved via --resume --fork-session.
-# Requires tmux. This is the same mechanism used by worktree-setup.
+# with conversation history preserved via --resume --continue.
+#
+# Supports local, remote (headless/relay), and primarch relaunch modes.
+# Uses instance-name for identity transfer instead of manual API calls.
 #
 # Examples:
 #   transplant ~/worktrees/askCivic/wt-main
-#   transplant /tmp/transplant-test
+#   transplant --primarch ~/other-project
+#   transplant --pane %5 ~/other-project
+#   transplant --host wsl /home/token/project
+#   transplant --dry-run /tmp/test
 
 set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}→${NC} $1"; }
-log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1"; }
+log_success() { echo -e "${GREEN}+${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}✗${NC} $1"; }
+log_error()   { echo -e "${RED}x${NC} $1"; }
+log_dry()     { echo -e "${CYAN}~${NC} $1"; }
 
 # --- Host mapping (reuses ssh-connect aliases) ---
 host_to_ssh() {
@@ -32,8 +42,27 @@ host_to_ssh() {
         mac)   echo "mini" ;;
         wsl)   echo "wsl" ;;
         phone) echo "phone" ;;
-        *)     echo "Error: unknown host '$1' (expected mac, wsl, phone)" >&2; exit 1 ;;
+        *)     log_error "Unknown host '$1' (expected mac, wsl, phone)"; exit 1 ;;
     esac
+}
+
+# Resolve Tailscale IP to machine name
+ip_to_machine() {
+    local ip="$1"
+    for machine in mac wsl phone; do
+        if [[ "$(imperium_cfg tailscale_ip "$machine" 2>/dev/null)" == "$ip" ]]; then
+            echo "$machine"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# Detect if we're inside an SSH session and resolve origin
+detect_ssh_origin() {
+    [[ -z "${SSH_CLIENT:-}" ]] && return 1
+    local origin_ip="${SSH_CLIENT%% *}"
+    ip_to_machine "$origin_ip"
 }
 
 usage() {
@@ -43,25 +72,34 @@ transplant - Move the current Claude session to a different directory or device
 Usage: transplant [options] <target-directory>
 
 Kills the current Claude session and restarts it in the target directory
-with conversation history preserved via --resume --fork-session.
-
-Local mode requires tmux (the claude wrapper auto-creates tmux sessions).
+with conversation history preserved via --resume --continue.
 
 Options:
-  -h, --help     Show this help message
-  --host <name>  Target device: mac, wsl, or phone
-  --relay        Interactive relay mode (default: headless)
+  -h, --help          Show this help message
+  --pane <id>         Target tmux pane (default: same pane)
+  --primarch [name]   Relaunch via primarch (auto-detects from env if no name)
+  --host <name>       Target device: mac, wsl, or phone
+  --relay             Interactive relay mode (with --host)
+  --dry-run           Show what would happen without executing
+  --plan              Prepare transplant but don't execute (use with /session-plan)
+  --execute-plan      Execute a previously prepared --plan transplant
+  --no-prompt         Don't auto-send resume prompt after restart
+  --test-recovery     Test the recovery safety net (simulates failed restart)
 
 Local examples:
   transplant ~/worktrees/askCivic/wt-main
-  transplant /tmp/transplant-test
+  transplant --primarch fabricator-general ~/project
+  transplant --plan --primarch vulkan ~/project
+  transplant --execute-plan
 
 Remote examples:
-  transplant --host wsl /home/token/project       # Headless: agent continues on WSL
-  transplant --host mac --relay ~/project          # Relay: pane becomes remote session
+  transplant --host wsl /home/token/project
+  transplant --host mac --relay ~/project
 EOF
     exit 0
 }
+
+# --- Shared utilities ---
 
 # Encode a path the way Claude Code does (/ and . become -)
 encode_claude_path() {
@@ -71,8 +109,7 @@ encode_claude_path() {
 # Walk process tree to find the Claude ancestor process
 find_claude_pid() {
     local current="$PPID"
-    if [[ "$(uname)" == "Darwin" ]]; then
-        # macOS: use ps (no /proc)
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
         for _ in 1 2 3 4 5 6 7 8; do
             [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
             local comm
@@ -84,7 +121,6 @@ find_claude_pid() {
             current=$(ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ') || break
         done
     else
-        # Linux: use /proc
         for _ in 1 2 3 4 5 6 7 8; do
             [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
             local comm
@@ -102,7 +138,7 @@ find_claude_pid() {
 # Get parent PID (cross-platform)
 get_ppid() {
     local pid=$1
-    if [[ "$(uname)" == "Darwin" ]]; then
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
         ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
     else
         awk '{print $4}' "/proc/$pid/stat" 2>/dev/null
@@ -124,22 +160,418 @@ find_tmux_pane() {
     done | head -1
 }
 
-# Parse args
+# Kill local Claude (signal escalation)
+kill_local_claude() {
+    local pid="$1"
+    trap '' INT HUP TERM
+
+    kill -INT "$pid" 2>/dev/null || true
+    sleep 1.5
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid" 2>/dev/null || true
+        sleep 2
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+# Build a fallback command that restores the original session in its original directory
+build_fallback_cmd() {
+    local source_dir="$1" session_id="$2" primarch_name="$3"
+    local claude_bin
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
+        claude_bin="claude"
+    else
+        claude_bin="\$HOME/.local/bin/claude"
+    fi
+    if [[ -n "$primarch_name" ]]; then
+        echo "cd '${source_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
+    else
+        echo "cd '${source_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
+    fi
+}
+
+# --- Recovery logging ---
+RECOVERY_LOG="${HOME}/.claude/transplant-pending/recovery.log"
+
+recovery_log() {
+    local level="$1" msg="$2"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$(dirname "$RECOVERY_LOG")"
+    echo "[$ts] [$level] $msg" >> "$RECOVERY_LOG"
+}
+
+# --- Recovery notification (TTS + log) ---
+recovery_notify() {
+    local msg="$1"
+    recovery_log "NOTIFY" "$msg"
+    # Fire-and-forget TTS notification
+    if command -v tts &>/dev/null; then
+        tts "Transplant recovery: $msg" &>/dev/null &
+    fi
+}
+
+# --- Unified recovery watchdog ---
+# Spawns a detached daemon that:
+# 1. Waits for Claude to exit
+# 2. Exits copy-mode if active
+# 3. Sends restart command
+# 4. Verifies restart succeeded
+# 5. If failed: cleans up handoff, fires fallback, notifies
+#
+# Args:
+#   $1 - mode: "local", "relay", or "headless"
+#   $2 - claude_pid to watch
+#   $3 - pane_target
+#   $4 - restart_cmd (the command to send to tmux)
+#   $5 - fallback_cmd (restores original session)
+#   $6 - process_pattern ("claude" for local, "ssh" for relay)
+#   $7 - session_id (for logging and headless remote check)
+#   $8 - ssh_target (only for headless mode, empty otherwise)
+recovery_watchdog() {
+    local mode="$1" watch_pid="$2" pane="$3" restart="$4" fallback="$5"
+    local pattern="${6:-claude}" session_id="${7:-unknown}" ssh_target="${8:-}"
+
+    local wait_timeout=20          # max iterations waiting for exit (0.5s each = 10s)
+    local verify_poll_interval=2   # seconds between verification checks
+    local verify_max_wait=30       # total seconds to wait for process to appear
+
+    if [[ "$mode" == "relay" ]]; then
+        verify_max_wait=40
+    elif [[ "$mode" == "headless" ]]; then
+        verify_max_wait=40
+    fi
+
+    local handoff_file="${HOME}/.claude/transplant-pending/${pane}"
+
+    (
+        exec 0</dev/null 1>/dev/null 2>/dev/null
+
+        recovery_log "START" "Watchdog spawned: mode=$mode pid=$watch_pid pane=$pane pattern=$pattern session=${session_id:0:12}"
+
+        # Step 1: Wait for Claude to exit
+        wait_count=0
+        while kill -0 "$watch_pid" 2>/dev/null; do
+            sleep 0.5
+            wait_count=$((wait_count + 1))
+            if [[ $wait_count -ge $wait_timeout ]]; then
+                recovery_log "WARN" "Timed out waiting for PID $watch_pid to exit"
+                break
+            fi
+        done
+        recovery_log "INFO" "Claude exited (waited ${wait_count} cycles)"
+        sleep 0.5
+
+        # Step 2: Exit copy-mode if active
+        if [[ -n "$pane" ]]; then
+            if [[ "$(tmux display-message -t "$pane" -p '#{pane_in_mode}' 2>/dev/null)" == "1" ]]; then
+                tmux send-keys -t "$pane" q
+                sleep 0.2
+                recovery_log "INFO" "Exited copy-mode on pane $pane"
+            fi
+        fi
+
+        if [[ "$mode" == "headless" ]]; then
+            # Step 3h: For headless, verify remote process is running
+            recovery_log "INFO" "Headless mode: checking remote process on $ssh_target"
+            sleep "$verify_delay_1"
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" "pgrep -f 'claude.*--resume.*$session_id'" &>/dev/null; then
+                recovery_log "OK" "Remote Claude verified on $ssh_target"
+                exit 0
+            fi
+            sleep "$verify_delay_2"
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" "pgrep -f 'claude.*--resume.*$session_id'" &>/dev/null; then
+                recovery_log "OK" "Remote Claude verified on $ssh_target (second check)"
+                exit 0
+            fi
+            # Remote failed — restore locally if we have a pane
+            recovery_log "FAIL" "Remote Claude not found on $ssh_target — firing fallback"
+            if [[ -n "$pane" ]]; then
+                # Clean up handoff file
+                rm -f "$handoff_file" 2>/dev/null
+                recovery_log "INFO" "Cleaned up handoff file: $handoff_file"
+                tmux send-keys -t "$pane" "$fallback" Enter
+                recovery_log "RECOVER" "Fallback sent to pane $pane"
+                recovery_notify "Headless transplant to $ssh_target failed. Session restored locally."
+            else
+                recovery_log "FAIL" "No pane to send fallback — manual recovery needed"
+                recovery_notify "Headless transplant failed. No pane for recovery. Manual intervention needed."
+            fi
+            exit 1
+        fi
+
+        # Clear the pane for a clean slate before sending any restart command
+        tmux send-keys -t "$pane" "clear" Enter
+        sleep 0.3
+
+        # Step 3: Check for return-trip file BEFORE sending restart.
+        # If a return trip is in progress, the SSH dying is expected — the remote
+        # killed Claude which killed SSH. Use the return-trip restart instead.
+        return_trip_file="${HOME}/.claude/transplant-pending/return-trip-restart"
+        if [[ -f "$return_trip_file" ]]; then
+            return_restart=$(cat "$return_trip_file" 2>/dev/null)
+            rm -f "$return_trip_file"
+            if [[ -n "$return_restart" ]]; then
+                recovery_log "INFO" "Return trip detected — using return-trip restart instead of relay restart"
+                tmux send-keys -t "$pane" "$return_restart" Enter
+                recovery_log "OK" "Return-trip restart sent to pane $pane"
+
+                # Verify the return-trip restart worked (poll instead of single check)
+                local rt_elapsed=0
+                local rt_found=false
+                while [[ $rt_elapsed -lt $verify_max_wait ]]; do
+                    sleep "$verify_poll_interval"
+                    rt_elapsed=$((rt_elapsed + verify_poll_interval))
+                    if verify_pane_has_process "$pane" "claude"; then
+                        recovery_log "OK" "Claude verified in pane $pane after return-trip restart (${rt_elapsed}s)"
+                        rt_found=true
+                        break
+                    fi
+                done
+                if [[ "$rt_found" != "true" ]]; then
+                    # Final guard before fallback
+                    if verify_pane_has_process "$pane" "claude"; then
+                        recovery_log "OK" "Claude found on final guard — aborting return-trip fallback"
+                    else
+                        recovery_log "WARN" "Claude not found after return-trip restart — firing original fallback"
+                        tmux send-keys -t "$pane" C-c
+                        sleep 0.3
+                        tmux send-keys -t "$pane" "$fallback" Enter
+                        recovery_log "RECOVER" "Fallback command sent to pane $pane"
+                        recovery_notify "Return-trip restart failed. Original session restored."
+                    fi
+                fi
+                exit 0
+            fi
+        fi
+
+        # Step 4: No return trip — send the normal restart command
+        tmux send-keys -t "$pane" "$restart" Enter
+        recovery_log "INFO" "Restart command sent to pane $pane"
+
+        # Step 5: Poll for process to appear (handles variable startup times)
+        local elapsed=0
+        local found=false
+        while [[ $elapsed -lt $verify_max_wait ]]; do
+            sleep "$verify_poll_interval"
+            elapsed=$((elapsed + verify_poll_interval))
+            if verify_pane_has_process "$pane" "$pattern"; then
+                recovery_log "OK" "Process '$pattern' verified in pane $pane after ${elapsed}s"
+                found=true
+                break
+            fi
+        done
+
+        if [[ "$found" == "true" ]]; then
+            exit 0
+        fi
+
+        recovery_log "WARN" "Process '$pattern' NOT found after ${verify_max_wait}s"
+
+        # Safety guard: re-check right before firing fallback.
+        # If claude is running, the fallback would inject text into its prompt.
+        if verify_pane_has_process "$pane" "$pattern"; then
+            recovery_log "OK" "Process '$pattern' found on final guard check — aborting fallback"
+            exit 0
+        fi
+
+        recovery_log "FAIL" "Restart failed — firing fallback for pane $pane"
+
+        # Clean up stale handoff file
+        rm -f "$handoff_file" 2>/dev/null
+        recovery_log "INFO" "Cleaned up handoff file: $handoff_file"
+
+        # Send fallback
+        tmux send-keys -t "$pane" C-c
+        sleep 0.3
+        tmux send-keys -t "$pane" "$fallback" Enter
+        recovery_log "RECOVER" "Fallback command sent to pane $pane"
+
+        recovery_notify "Transplant restart failed. Original session restored."
+    ) &
+    disown
+
+    recovery_log "INFO" "Watchdog daemon launched (PID: $!)"
+}
+
+# Verify a process is running in a tmux pane (recursive process tree walk)
+# For local: looks for "claude". For relay: looks for "ssh" (claude runs remotely).
+# Walks up to 5 levels deep to catch primarch → shell → claude chains.
+verify_pane_has_process() {
+    local pane_id="$1"
+    local pattern="${2:-claude}"
+    local max_depth="${3:-5}"
+    local pane_pid
+    pane_pid=$(tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+    [[ -z "$pane_pid" ]] && return 1
+    _walk_children "$pane_pid" "$pattern" "$max_depth" 0
+}
+
+# Recursive helper: walk process tree looking for pattern
+_walk_children() {
+    local parent="$1" pattern="$2" max_depth="$3" depth="$4"
+    [[ $depth -ge $max_depth ]] && return 1
+    local children
+    children=$(pgrep -P "$parent" 2>/dev/null) || return 1
+    for child in $children; do
+        local cmdline
+        cmdline=$(ps -p "$child" -o args= 2>/dev/null) || continue
+        if echo "$cmdline" | grep -q "$pattern"; then
+            return 0
+        fi
+        _walk_children "$child" "$pattern" "$max_depth" $((depth + 1)) && return 0
+    done
+    return 1
+}
+
+# Clean up old Token API instance
+cleanup_old_instance() {
+    local instance_id="$1"
+    curl -s -X DELETE "${TOKEN_API_URL:-http://localhost:7777}/api/instances/${instance_id}" >/dev/null 2>&1 || true
+}
+
+# Register pending transplant in Token-API (cross-device safe)
+# With --continue, the target session ID is the same as the source.
+register_transplant_pending() {
+    local instance_id="$1" target_session="$2"
+    curl -s -X PATCH "${TOKEN_API_URL:-http://localhost:7777}/api/instances/${instance_id}/transplant-pending?target_session=${target_session}" >/dev/null 2>&1 || true
+}
+
+# Query instance metadata from Token-API
+get_instance_metadata() {
+    local session_id="$1"
+    curl -s "${TOKEN_API_URL:-http://localhost:7777}/api/instances" 2>/dev/null | \
+        jq -r --arg id "$session_id" '.[] | select(.id == $id)' 2>/dev/null || echo "{}"
+}
+
+# --- Remote transcript transfer ---
+scp_transcript() {
+    local ssh_target="$1" target_dir="$2" source_jsonl="$3"
+    local remote_encoded
+    remote_encoded=$(encode_claude_path "$target_dir")
+    ssh "$ssh_target" "mkdir -p \$HOME/.claude/projects/${remote_encoded}"
+    scp -q "$source_jsonl" "${ssh_target}:~/.claude/projects/${remote_encoded}/"
+}
+
+# --- Copy + verify transcript locally ---
+copy_transcript_local() {
+    local source="$1" target_dir="$2"
+    mkdir -p "$target_dir"
+    cp "$source" "$target_dir/"
+
+    # Verify copy by comparing file sizes
+    local target_file="${target_dir}/$(basename "$source")"
+    local src_size tgt_size
+    src_size=$(stat -c%s "$source" 2>/dev/null || stat -f%z "$source" 2>/dev/null)
+    tgt_size=$(stat -c%s "$target_file" 2>/dev/null || stat -f%z "$target_file" 2>/dev/null)
+    if [[ "$src_size" != "$tgt_size" ]]; then
+        log_error "Transcript copy verification failed (${src_size} != ${tgt_size})"
+        rm -f "$target_file"
+        exit 1
+    fi
+}
+
+# --- Write transplant handoff file (per-pane lock + identity signal) ---
+write_transplant_handoff() {
+    local pane_id="$1" old_session_id="$2"
+    local handoff_dir="${HOME}/.claude/transplant-pending"
+    local handoff_file="${handoff_dir}/${pane_id}"
+
+    # Check for in-flight transplant (another transplant targeting this pane)
+    if [[ -f "$handoff_file" ]]; then
+        local existing
+        existing=$(cat "$handoff_file" 2>/dev/null)
+        log_error "Transplant already in flight for pane $pane_id (from ${existing:0:12}...)"
+        exit 1
+    fi
+
+    mkdir -p "$handoff_dir"
+    echo "$old_session_id" > "$handoff_file"
+}
+
+# --- Build restart command ---
+build_restart_cmd() {
+    local target_dir="$1" session_id="$2" primarch_name="$3" resume_prompt="$4"
+    local claude_bin
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
+        claude_bin="claude"
+    else
+        claude_bin="\$HOME/.local/bin/claude"
+    fi
+
+    local prompt_arg=""
+    if [[ -n "$resume_prompt" ]]; then
+        # Positional prompt arg goes after all flags (NOT -p, which is --print mode)
+        prompt_arg=" '${resume_prompt}'"
+    fi
+
+    if [[ -n "$primarch_name" ]]; then
+        echo "cd '${target_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue${prompt_arg}"
+    else
+        echo "cd '${target_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue${prompt_arg}"
+    fi
+}
+
+# --- Parse args ---
 TARGET_DIR=""
 REMOTE_HOST=""
 RELAY_MODE=false
+DRY_RUN=false
+PLAN_MODE=false
+EXECUTE_PLAN=false
+NO_PROMPT=false
+TARGET_PANE=""
+PRIMARCH_MODE=false
+PRIMARCH_NAME=""
+TEST_RECOVERY=false
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help) usage ;;
         --host)
             REMOTE_HOST="$2"
             shift 2
-            continue
             ;;
         --relay)
             RELAY_MODE=true
             shift
-            continue
+            ;;
+        --pane)
+            TARGET_PANE="$2"
+            shift 2
+            ;;
+        --primarch)
+            PRIMARCH_MODE=true
+            # Next arg is primarch name if it doesn't start with - and isn't a path
+            if [[ $# -ge 2 && "$2" != -* && "$2" != /* && "$2" != ~* && "$2" != .* ]]; then
+                PRIMARCH_NAME="$2"
+                shift
+            fi
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --plan)
+            PLAN_MODE=true
+            shift
+            ;;
+        --execute-plan)
+            EXECUTE_PLAN=true
+            shift
+            ;;
+        --no-prompt)
+            NO_PROMPT=true
+            shift
+            ;;
+        --test-recovery)
+            TEST_RECOVERY=true
+            shift
             ;;
         -*)
             log_error "Unknown option: $1"
@@ -157,9 +589,165 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+PLAN_FILE="${HOME}/.claude/transplant-pending/plan"
+
+# --- Execute a saved plan ---
+if $EXECUTE_PLAN; then
+    if [[ ! -f "$PLAN_FILE" ]]; then
+        log_error "No pending plan found at $PLAN_FILE"
+        echo "  Use 'transplant --plan <target-dir>' first"
+        exit 1
+    fi
+    # Re-invoke transplant with the saved args (strips --plan, adds nothing extra)
+    saved_args=$(cat "$PLAN_FILE")
+    rm -f "$PLAN_FILE"
+    log_info "Executing saved plan: transplant $saved_args"
+    eval "exec transplant $saved_args"
+fi
+
+# --- Test recovery mode ---
+# Simulates a failed transplant to verify the safety net.
+# Does NOT kill Claude or copy transcripts. Instead:
+# 1. Resolves the current pane and session
+# 2. Writes a handoff file
+# 3. Spawns the recovery watchdog with a deliberately bad restart command
+# 4. The watchdog will fail to verify, fire the fallback, clean up handoff, and notify
+# 5. The fallback command just echoes success (doesn't actually restart anything)
+if $TEST_RECOVERY; then
+    echo ""
+    echo "========================================="
+    echo " Recovery System Test"
+    echo "========================================="
+    echo ""
+
+    # We need tmux
+    if ! tmux display-message -p '#{session_name}' &>/dev/null; then
+        log_error "Not in tmux — test-recovery requires tmux"
+        exit 1
+    fi
+
+    # Find a target pane — use explicit --pane if given, otherwise find a non-claude bash pane
+    test_pane="$TARGET_PANE"
+    if [[ -z "$test_pane" ]]; then
+        # Find a pane running plain bash (not claude) to use as the test target
+        test_pane=$(tmux list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null | awk '$2 == "bash" {print $1; exit}')
+    fi
+    if [[ -z "$test_pane" ]]; then
+        log_error "No idle bash pane found — use --pane <id> to specify a target"
+        exit 1
+    fi
+    log_success "Test pane: $test_pane (commands will appear here)"
+
+    # Use a fake session ID and PID
+    test_session="test-recovery-$(date +%s)"
+    test_pid="$$"  # our own PID (will exit naturally when script ends)
+
+    # Clear recovery log for clean test output
+    mkdir -p "$(dirname "$RECOVERY_LOG")"
+    echo "--- TEST RECOVERY RUN $(date '+%Y-%m-%d %H:%M:%S') ---" >> "$RECOVERY_LOG"
+
+    # Write a handoff file (should get cleaned up by recovery)
+    handoff_dir="${HOME}/.claude/transplant-pending"
+    handoff_file="${handoff_dir}/${test_pane}"
+    mkdir -p "$handoff_dir"
+    echo "$test_session" > "$handoff_file"
+    log_success "Handoff file written: $handoff_file"
+
+    # Use a unique pattern that won't match anything real in the pane
+    test_pattern="__transplant_test_recovery_sentinel__"
+
+    # The "bad" restart command — a command that exits immediately (no matching process)
+    bad_restart="echo '[test-recovery] bad restart command fired — this is expected'"
+
+    # The fallback command — just echoes success
+    test_fallback="echo '[test-recovery] RECOVERY FIRED SUCCESSFULLY — safety net works'"
+
+    log_info "Spawning recovery watchdog with deliberate bad restart..."
+    log_info "Watchdog will look for pattern '$test_pattern' (won't match anything)"
+    echo ""
+
+    # Use a background sleep as the "claude process" to watch for exit
+    sleep 3 &
+    fake_pid=$!
+    log_info "Fake process to watch: PID $fake_pid (sleep 3)"
+
+    recovery_watchdog "local" "$fake_pid" "$test_pane" "$bad_restart" "$test_fallback" "$test_pattern" "$test_session"
+
+    log_info "Watchdog spawned. Waiting for fake process to exit..."
+    wait "$fake_pid" 2>/dev/null || true
+
+    log_info "Fake process exited. Watchdog will now:"
+    echo "  1. Detect exit"
+    echo "  2. Send bad restart command"
+    echo "  3. Wait 8s + 4s for verification"
+    echo "  4. Fail to find 'claude' process"
+    echo "  5. Fire fallback command"
+    echo "  6. Clean up handoff file"
+    echo "  7. Send TTS notification"
+    echo ""
+    log_info "Total wait: ~13s. Watch this pane and check $RECOVERY_LOG after."
+    echo ""
+
+    # Give the watchdog time to complete its full cycle, then verify
+    sleep 16
+
+    echo ""
+    echo "========================================="
+    echo " Test Results"
+    echo "========================================="
+    echo ""
+
+    # Check 1: Handoff file should be cleaned up
+    if [[ -f "$handoff_file" ]]; then
+        log_error "FAIL: Handoff file still exists (should have been cleaned up)"
+        test_pass=false
+    else
+        log_success "PASS: Handoff file cleaned up"
+        test_pass=true
+    fi
+
+    # Check 2: Recovery log should have entries (grep by pane ID, unique per run)
+    if grep -q "pane=$test_pane" "$RECOVERY_LOG" 2>/dev/null; then
+        log_success "PASS: Recovery log has entries for test pane"
+        # Show relevant log lines
+        echo ""
+        log_info "Recovery log entries:"
+        grep "$test_pane" "$RECOVERY_LOG" | while read -r line; do
+            echo "  $line"
+        done
+    else
+        log_error "FAIL: No recovery log entries found"
+        test_pass=false
+    fi
+
+    # Check 3: Should see FAIL and RECOVER entries for this pane
+    if grep -q "FAIL.*pane $test_pane" "$RECOVERY_LOG" 2>/dev/null; then
+        log_success "PASS: Recovery detected restart failure"
+    else
+        log_error "FAIL: Recovery did not detect restart failure"
+        test_pass=false
+    fi
+
+    if grep -q "RECOVER.*pane $test_pane" "$RECOVERY_LOG" 2>/dev/null; then
+        log_success "PASS: Fallback command was fired"
+    else
+        log_error "FAIL: Fallback command was not fired"
+        test_pass=false
+    fi
+
+    echo ""
+    if [[ "$test_pass" != "false" ]]; then
+        log_success "ALL TESTS PASSED — recovery system is working"
+    else
+        log_error "SOME TESTS FAILED — check output above"
+    fi
+    echo ""
+    exit 0
+fi
+
 if [[ -z "$TARGET_DIR" ]]; then
     log_error "Target directory required"
-    echo "Usage: transplant <target-directory>"
+    echo "Usage: transplant [options] <target-directory>"
     exit 1
 fi
 
@@ -173,113 +761,18 @@ fi
 
 SOURCE_DIR="$PWD"
 
-# --- Remote transcript transfer ---
-scp_transcript() {
-    local ssh_target="$1" target_dir="$2" source_jsonl="$3"
-    local remote_encoded
-    remote_encoded=$(encode_claude_path "$target_dir")
-    # ssh mkdir uses $HOME (expanded by remote shell)
-    # scp uses ~ (expanded by scp itself)
-    ssh "$ssh_target" "mkdir -p \$HOME/.claude/projects/${remote_encoded}"
-    scp -q "$source_jsonl" "${ssh_target}:~/.claude/projects/${remote_encoded}/"
-}
-
-# --- Kill local Claude (signal escalation) ---
-kill_local_claude() {
-    local pid="$1"
-
-    trap '' INT HUP TERM
-
-    kill -INT "$pid" 2>/dev/null || true
-    sleep 1.5
-
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -INT "$pid" 2>/dev/null || true
-        sleep 2
-    fi
-
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null || true
-    fi
-}
-
-# --- Clean up old Token API instance ---
-cleanup_old_instance() {
-    local instance_id="$1"
-    if command -v curl &>/dev/null; then
-        curl -s -X DELETE "http://localhost:7777/api/instances/${instance_id}" >/dev/null 2>&1 || true
-    fi
-}
-
-# --- Remote headless transplant ---
-transplant_remote_headless() {
-    local ssh_target="$1" session_id="$2" source_jsonl="$3" claude_pid="$4"
-
-    log_info "SCP transcript to $REMOTE_HOST..."
-    scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
-    log_success "Transcript copied to $REMOTE_HOST"
-
-    log_info "Spawning headless Claude on $REMOTE_HOST..."
-    local remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
-    ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup \$HOME/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session > $remote_log 2>&1 &"
-    log_success "Remote agent spawned"
-
-    echo ""
-    echo "  Host: $REMOTE_HOST ($ssh_target)"
-    echo "  Dir:  $TARGET_DIR"
-    echo "  Log:  ~/.subagent/logs/transplant-${session_id}.log"
-    echo "  Session: ${session_id:0:12}..."
-    echo ""
-
-    log_info "Killing local Claude..."
-    kill_local_claude "$claude_pid"
-    cleanup_old_instance "$session_id"
-}
-
-# --- Remote relay transplant ---
-transplant_remote_relay() {
-    local ssh_target="$1" session_id="$2" source_jsonl="$3" claude_pid="$4" pane_target="$5"
-
-    log_info "SCP transcript to $REMOTE_HOST..."
-    scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
-    log_success "Transcript copied to $REMOTE_HOST"
-
-    echo ""
-    log_info "Relay mode: local pane will SSH into $REMOTE_HOST..."
-    echo ""
-
-    # Spawn detached daemon: waits for Claude to die, then sends ssh command to tmux pane
-    (
-        exec 0</dev/null 1>/dev/null 2>/dev/null
-
-        wait_count=0
-        while kill -0 "$claude_pid" 2>/dev/null; do
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-            [[ $wait_count -ge 20 ]] && break
-        done
-        sleep 0.5
-
-        tmux send-keys -t "$pane_target" \
-            "ssh -t $ssh_target \"cd '$TARGET_DIR' && \\\$HOME/.local/bin/claude --resume '$session_id' --fork-session\"" \
-            Enter
-    ) &
-    disown
-
-    cleanup_old_instance "$session_id"
-    kill_local_claude "$claude_pid"
-}
+# === Phase 1: Gather State ===
 
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
+echo "========================================="
 echo " Session Transplant"
-echo "═══════════════════════════════════════════════════════════════"
+echo "========================================="
 echo ""
 echo "  From: $SOURCE_DIR"
 echo "  To:   ${REMOTE_HOST:+$REMOTE_HOST:}$TARGET_DIR"
 echo ""
 
-# Check tmux (required for local transplant and relay mode, not headless remote)
+# Check tmux
 HAVE_TMUX=false
 if tmux display-message -p '#{session_name}' &>/dev/null; then
     HAVE_TMUX=true
@@ -287,7 +780,7 @@ if tmux display-message -p '#{session_name}' &>/dev/null; then
 elif [[ -z "$REMOTE_HOST" ]] || $RELAY_MODE; then
     log_error "Not in tmux — transplant requires tmux (except headless remote)"
     echo ""
-    echo "  Manual: cd '$TARGET_DIR' && claude --continue --fork-session"
+    echo "  Manual: cd '$TARGET_DIR' && claude --resume --continue"
     exit 1
 else
     log_warn "No tmux (OK for headless remote)"
@@ -327,15 +820,196 @@ fi
 log_success "Session ID: ${session_id:0:12}..."
 
 source_jsonl="${source_project_dir}/${session_id}.jsonl"
-
 if [[ ! -f "$source_jsonl" ]]; then
     log_error "Session JSONL not found: $source_jsonl"
     exit 1
 fi
 
-# --- Branch: remote vs local ---
+# Get instance metadata from Token-API
+old_tab_name=""
+old_session_doc_id=""
+old_cc_color=""
+old_primarch=""
+if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+    instance_json=$(get_instance_metadata "$session_id")
+    if [[ -n "$instance_json" && "$instance_json" != "{}" ]]; then
+        old_tab_name=$(echo "$instance_json" | jq -r '.tab_name // empty' 2>/dev/null || true)
+        old_session_doc_id=$(echo "$instance_json" | jq -r '.session_doc_id // empty' 2>/dev/null || true)
+        old_cc_color=$(echo "$instance_json" | jq -r '.cc_color // empty' 2>/dev/null || true)
+        old_primarch=$(echo "$instance_json" | jq -r '.primarch // empty' 2>/dev/null || true)
+        [[ -n "$old_tab_name" ]] && log_success "Instance name: $old_tab_name"
+        [[ -n "$old_session_doc_id" ]] && log_success "Session doc: $old_session_doc_id"
+        [[ -n "$old_primarch" ]] && log_success "Primarch: $old_primarch"
+    fi
+fi
+
+# Resolve primarch name:
+# 1. Explicit --primarch <name> → use that
+# 2. --primarch (no name) → look up from instance DB, then fall back to env
+# 3. No --primarch flag but instance has primarch in DB → auto-imply (persona persists)
+if $PRIMARCH_MODE && [[ -z "$PRIMARCH_NAME" ]]; then
+    # --primarch given without name: resolve from DB or env
+    if [[ -n "$old_primarch" ]]; then
+        PRIMARCH_NAME="$old_primarch"
+        log_success "Primarch from instance DB: $PRIMARCH_NAME"
+    elif [[ -n "${TOKEN_API_PRIMARCH:-}" ]]; then
+        PRIMARCH_NAME="$TOKEN_API_PRIMARCH"
+        log_success "Primarch from env: $PRIMARCH_NAME"
+    else
+        log_error "No primarch name given and none found in instance DB or env"
+        echo "  Usage: transplant --primarch <name> <target-dir>"
+        exit 1
+    fi
+elif ! $PRIMARCH_MODE && [[ -n "$old_primarch" ]]; then
+    # No --primarch flag, but instance was running as a primarch → carry it through
+    PRIMARCH_MODE=true
+    PRIMARCH_NAME="$old_primarch"
+    log_success "Primarch implied from instance DB: $PRIMARCH_NAME"
+fi
+
+# Resolve target pane
+pane_target="$TARGET_PANE"
+if [[ -z "$pane_target" ]] && $HAVE_TMUX; then
+    pane_target=$(find_tmux_pane "$claude_pid")
+fi
+
+if [[ -z "$pane_target" && -z "$REMOTE_HOST" ]] || [[ -z "$pane_target" && $RELAY_MODE == true ]]; then
+    if [[ -n "$REMOTE_HOST" ]] && ! $RELAY_MODE; then
+        : # headless remote doesn't need a pane
+    else
+        log_error "Could not identify tmux pane"
+        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --continue"
+        exit 1
+    fi
+fi
+[[ -n "$pane_target" ]] && log_success "Tmux pane: $pane_target"
+
+# Build restart command
+RESUME_PROMPT=""
+if ! $NO_PROMPT; then
+    RESUME_PROMPT="Transplant complete. Resumed in ${TARGET_DIR}. Continue."
+fi
+restart_cmd=$(build_restart_cmd "$TARGET_DIR" "$session_id" "$PRIMARCH_NAME" "$RESUME_PROMPT")
+
+# --- Dry run output ---
+if $DRY_RUN; then
+    echo ""
+    log_dry "DRY RUN — no changes will be made"
+    echo ""
+    log_dry "Source JSONL: $source_jsonl"
+    if [[ -n "$REMOTE_HOST" ]]; then
+        log_dry "SCP to: $(host_to_ssh "$REMOTE_HOST"):~/.claude/projects/$(encode_claude_path "$TARGET_DIR")/"
+    else
+        log_dry "Copy to: ${HOME}/.claude/projects/$(encode_claude_path "$TARGET_DIR")/"
+    fi
+    log_dry "Restart: $restart_cmd"
+    log_dry "Target pane: ${pane_target:-N/A}"
+    $PRIMARCH_MODE && log_dry "Primarch: $PRIMARCH_NAME"
+    [[ -n "$old_tab_name" ]] && log_dry "Transfer name: $old_tab_name"
+    [[ -n "$old_session_doc_id" ]] && log_dry "Transfer session doc: $old_session_doc_id"
+    echo ""
+    exit 0
+fi
+
+# --- Plan mode: validate + save, don't execute ---
+if $PLAN_MODE; then
+    # Build the args to replay on --execute-plan (reconstruct without --plan)
+    plan_args=""
+    [[ -n "$REMOTE_HOST" ]] && plan_args="$plan_args --host $REMOTE_HOST"
+    $RELAY_MODE && plan_args="$plan_args --relay"
+    [[ -n "$TARGET_PANE" ]] && plan_args="$plan_args --pane $TARGET_PANE"
+    if $PRIMARCH_MODE; then
+        plan_args="$plan_args --primarch $PRIMARCH_NAME"
+    fi
+    $NO_PROMPT && plan_args="$plan_args --no-prompt"
+    plan_args="$plan_args '$TARGET_DIR'"
+
+    mkdir -p "$(dirname "$PLAN_FILE")"
+    echo "$plan_args" > "$PLAN_FILE"
+
+    echo ""
+    log_success "PLAN SAVED — transplant prepared but not executed"
+    echo ""
+    log_info "Target: ${REMOTE_HOST:+$REMOTE_HOST:}$TARGET_DIR"
+    $PRIMARCH_MODE && log_info "Primarch: $PRIMARCH_NAME"
+    [[ -n "$old_tab_name" ]] && log_info "Instance: $old_tab_name"
+    [[ -n "$old_session_doc_id" ]] && log_info "Session doc: $old_session_doc_id"
+    log_info "Restart: $restart_cmd"
+    echo ""
+    log_info "Enter plan mode now. When ready, run: transplant --execute-plan"
+    echo ""
+    exit 0
+fi
+
+# === Phase 2-4: Execute ===
+
+# Register pending transplant in DB (cross-device safe — file handoff only works locally)
+# With --continue, session ID stays the same, so target = source
+register_transplant_pending "$session_id" "$session_id"
+log_success "Transplant registered in DB"
+
 if [[ -n "$REMOTE_HOST" ]]; then
     ssh_target=$(host_to_ssh "$REMOTE_HOST")
+
+    # --- SSH return-trip detection ---
+    # If we're inside an SSH session and the target is where we came from,
+    # use the return-trip path: SCP transcript, schedule restart on origin's
+    # tmux, then kill Claude (which exits SSH, returning to origin pane).
+    SSH_ORIGIN=$(detect_ssh_origin || true)
+    if [[ -n "$SSH_ORIGIN" ]]; then
+        log_info "Inside SSH session (origin: $SSH_ORIGIN)"
+        if [[ "$SSH_ORIGIN" == "$REMOTE_HOST" ]]; then
+            log_info "Return trip detected — transplanting back to origin"
+
+            # SCP transcript to origin
+            log_info "SCP transcript to $REMOTE_HOST..."
+            scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
+            log_success "Transcript copied to $REMOTE_HOST"
+
+            # Build restart command for origin — use build_restart_cmd but override
+            # IMPERIUM_MACHINE to match the target, not this machine
+            origin_prompt=""
+            [[ -n "$RESUME_PROMPT" ]] && origin_prompt="${RESUME_PROMPT}"
+            # Force target machine context for correct binary path
+            saved_machine="${IMPERIUM_MACHINE:-}"
+            IMPERIUM_MACHINE="$REMOTE_HOST"
+            origin_restart=$(build_restart_cmd "$TARGET_DIR" "$session_id" "$PRIMARCH_NAME" "$origin_prompt")
+            IMPERIUM_MACHINE="$saved_machine"
+
+            # Write restart command to a file on origin.
+            # The return-trip-watcher daemon (spawned below) reads this file and
+            # sends the restart after SSH dies. The relay watchdog's return-trip
+            # file check (step 3) remains as a defensive fallback.
+            log_info "Writing return-trip restart file on $REMOTE_HOST..."
+            restart_file="\$HOME/.claude/transplant-pending/return-trip-restart"
+
+            ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" \
+                "mkdir -p \$HOME/.claude/transplant-pending && cat > $restart_file" \
+                <<< "$origin_restart" 2>/dev/null || {
+                    log_warn "Failed to write restart file on $REMOTE_HOST — restart manually"
+                    echo "  Command: $origin_restart"
+                }
+            log_success "Return-trip restart file written"
+
+            # Spawn return-trip-watcher on origin to handle the pane restart.
+            # This daemon watches for SSH to die, then sends the restart command.
+            # nohup + backgrounding ensures it outlives this SSH session.
+            log_info "Spawning return-trip-watcher on $REMOTE_HOST..."
+            ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" \
+                "nohup return-trip-watcher </dev/null >/dev/null 2>&1 &" 2>/dev/null || {
+                    log_warn "Failed to spawn return-trip-watcher — relay watchdog will handle it"
+                }
+            log_success "Return-trip-watcher spawned on $REMOTE_HOST"
+
+            echo ""
+            log_info "Killing local Claude to exit SSH session..."
+            echo ""
+            kill_local_claude "$claude_pid"
+            exit 0
+        else
+            log_info "Cross-hop detected ($SSH_ORIGIN → here → $REMOTE_HOST) — using direct route"
+        fi
+    fi
 
     # Pre-flight SSH check
     if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" true 2>/dev/null; then
@@ -344,95 +1018,111 @@ if [[ -n "$REMOTE_HOST" ]]; then
     fi
     log_success "SSH to $REMOTE_HOST ($ssh_target) OK"
 
+    # SCP transcript
+    log_info "SCP transcript to $REMOTE_HOST..."
+    scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
+    log_success "Transcript copied to $REMOTE_HOST"
+
     if $RELAY_MODE; then
-        # Relay needs tmux pane
-        pane_target=$(find_tmux_pane "$claude_pid")
-        if [[ -z "$pane_target" ]]; then
-            log_error "Could not identify tmux pane (required for relay mode)"
-            exit 1
+        echo ""
+        log_info "Relay mode: local pane will SSH into $REMOTE_HOST..."
+        echo ""
+
+        # Build relay restart command (ssh wrapping the remote claude command)
+        remote_cmd=""
+        remote_prompt=""
+        [[ -n "$RESUME_PROMPT" ]] && remote_prompt=" '${RESUME_PROMPT}'"
+        if [[ -n "$PRIMARCH_NAME" ]]; then
+            remote_cmd="cd '$TARGET_DIR' && primarch $PRIMARCH_NAME --resume '$session_id' --continue${remote_prompt}"
+        else
+            remote_cmd="cd '$TARGET_DIR' && \\\$HOME/.local/bin/claude --resume '$session_id' --continue${remote_prompt}"
         fi
-        log_success "Tmux pane: $pane_target"
-        transplant_remote_relay "$ssh_target" "$session_id" "$source_jsonl" "$claude_pid" "$pane_target"
+        relay_restart_cmd="ssh -t $ssh_target \"$remote_cmd\""
+
+        # Build fallback for recovery
+        fallback_cmd=$(build_fallback_cmd "$SOURCE_DIR" "$session_id" "$PRIMARCH_NAME")
+
+        # Spawn recovery watchdog — for relay, verify ssh process (claude runs remotely)
+        recovery_watchdog "relay" "$claude_pid" "$pane_target" "$relay_restart_cmd" "$fallback_cmd" "ssh" "$session_id"
+
+        # Write relay-origin file for return-trip-watcher to find later.
+        # When the Mac return trip fires, this tells the watcher which pane to target.
+        relay_origin_file="${HOME}/.claude/transplant-pending/relay-origin"
+        mkdir -p "$(dirname "$relay_origin_file")"
+        cat > "$relay_origin_file" <<RELAY_EOF
+PANE=${pane_target}
+SESSION_ID=${session_id}
+FALLBACK_CMD=${fallback_cmd}
+RELAY_EOF
+        log_success "Relay origin written (pane=$pane_target)"
+
+        cleanup_old_instance "$session_id"
+        kill_local_claude "$claude_pid"
     else
-        transplant_remote_headless "$ssh_target" "$session_id" "$source_jsonl" "$claude_pid"
+        # Headless remote
+        log_info "Spawning headless Claude on $REMOTE_HOST..."
+        local_remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
+        remote_launch=""
+        headless_prompt=""
+        [[ -n "$RESUME_PROMPT" ]] && headless_prompt=" '${RESUME_PROMPT}'"
+        if [[ -n "$PRIMARCH_NAME" ]]; then
+            remote_launch="primarch $PRIMARCH_NAME --resume '$session_id' --continue${headless_prompt}"
+        else
+            remote_launch="\$HOME/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --continue${headless_prompt}"
+        fi
+        ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup $remote_launch > $local_remote_log 2>&1 &"
+        log_success "Remote agent spawned"
+
+        echo ""
+        echo "  Host: $REMOTE_HOST ($ssh_target)"
+        echo "  Dir:  $TARGET_DIR"
+        echo "  Log:  ~/.subagent/logs/transplant-${session_id}.log"
+        echo "  Session: ${session_id:0:12}..."
+        echo ""
+
+        log_info "Killing local Claude..."
+
+        # Spawn headless recovery watchdog if we have a local tmux pane
+        if $HAVE_TMUX && [[ -n "$pane_target" ]]; then
+            fallback_cmd=$(build_fallback_cmd "$SOURCE_DIR" "$session_id" "$PRIMARCH_NAME")
+            recovery_watchdog "headless" "$claude_pid" "$pane_target" "" "$fallback_cmd" "claude" "$session_id" "$ssh_target"
+        fi
+
+        kill_local_claude "$claude_pid"
+        cleanup_old_instance "$session_id"
     fi
 else
-    # --- Local transplant (original logic) ---
+    # === Local transplant ===
 
-    # Copy JSONL to target project directory
+    # Copy transcript with verification
     target_encoded=$(encode_claude_path "$TARGET_DIR")
     target_project_dir="${HOME}/.claude/projects/${target_encoded}"
 
-    mkdir -p "$target_project_dir"
-    cp "$source_jsonl" "$target_project_dir/"
-    log_success "Transcript copied → ${target_project_dir}/"
-
-    # Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
-    pane_target=$(find_tmux_pane "$claude_pid")
-    if [[ -z "$pane_target" ]]; then
-        log_error "Could not identify tmux pane"
-        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --fork-session"
-        exit 1
-    fi
-    log_success "Tmux pane: $pane_target"
-
-    # Capture old instance name for transfer to new session
-    old_tab_name=""
-    old_instance_id="$session_id"
-    if command -v curl &>/dev/null && command -v jq &>/dev/null; then
-        old_tab_name=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-            jq -r --arg id "$old_instance_id" \
-            '.[] | select(.id == $id) | .tab_name // empty' 2>/dev/null || true)
+    if [[ "$source_project_dir" == "$target_project_dir" ]]; then
+        log_success "Same directory — transcript already in place"
+    else
+        copy_transcript_local "$source_jsonl" "$target_project_dir"
+        log_success "Transcript copied + verified"
     fi
 
     echo ""
     log_info "Transplanting session..."
+    $PRIMARCH_MODE && log_info "Primarch relaunch: $PRIMARCH_NAME"
     echo ""
 
-    # Spawn detached restart daemon
-    (
-        exec 0</dev/null 1>/dev/null 2>/dev/null
+    # Write handoff file: signals to SessionStart hook that this is a transplant.
+    # Also acts as a per-pane lock — prevents concurrent transplants to the same pane.
+    # The hook reads + deletes it atomically (mv then read).
+    if [[ -n "$pane_target" ]]; then
+        write_transplant_handoff "$pane_target" "$session_id"
+        log_success "Handoff written for pane $pane_target"
+    fi
 
-        # Wait for Claude to exit
-        wait_count=0
-        while kill -0 "$claude_pid" 2>/dev/null; do
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-            if [[ $wait_count -ge 20 ]]; then
-                break
-            fi
-        done
-        sleep 0.5
+    # Build fallback command for recovery
+    fallback_cmd=$(build_fallback_cmd "$SOURCE_DIR" "$session_id" "$PRIMARCH_NAME")
 
-        # Send restart command
-        tmux send-keys -t "$pane_target" \
-            "cd '$TARGET_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
-            Enter
-
-        # Transfer instance name and clean up old instance
-        if [[ -n "$old_tab_name" && -n "$old_instance_id" ]]; then
-            # Wait for new instance to register (up to 30s)
-            new_id=""
-            for attempt in $(seq 1 30); do
-                sleep 1
-                new_id=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-                    jq -r --arg dir "$TARGET_DIR" \
-                    '.[] | select(.working_dir == $dir and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | head -1 || true)
-                [[ -n "$new_id" ]] && break
-            done
-
-            if [[ -n "$new_id" ]]; then
-                # Transfer tab_name to new instance
-                curl -s -X PATCH "http://localhost:7777/api/instances/${new_id}/rename" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"tab_name\": \"${old_tab_name}\"}" >/dev/null 2>&1 || true
-            fi
-
-            # Delete old instance (belt + suspenders — SessionEnd may not fire on SIGKILL)
-            curl -s -X DELETE "http://localhost:7777/api/instances/${old_instance_id}" >/dev/null 2>&1 || true
-        fi
-    ) &
-    disown
+    # Spawn recovery watchdog (unified daemon handles wait → restart → verify → fallback)
+    recovery_watchdog "local" "$claude_pid" "$pane_target" "$restart_cmd" "$fallback_cmd" "claude" "$session_id"
 
     kill_local_claude "$claude_pid"
 fi

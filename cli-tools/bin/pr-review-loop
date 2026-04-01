@@ -24,6 +24,10 @@
 
 set -euo pipefail
 
+# Source shared libs
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/git-remote.sh"
+
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=900       # 15 minutes default
 GREPTILE_BOT="greptile-apps[bot]"
@@ -146,13 +150,13 @@ fi
 
 # Step 1: Push to remote (unless --no-push)
 if [[ "$NO_PUSH" == "false" ]]; then
-    log "🔄 Pushing to origin..."
+    log "🔄 Pushing to $GIT_GITHUB_REMOTE..."
     CURRENT_BRANCH=$(git branch --show-current)
-    git push origin "$CURRENT_BRANCH" || {
-        error "Failed to push to origin"
+    git push "$GIT_GITHUB_REMOTE" "$CURRENT_BRANCH" || {
+        error "Failed to push to $GIT_GITHUB_REMOTE"
         exit 1
     }
-    success "Pushed to origin"
+    success "Pushed to $GIT_GITHUB_REMOTE"
 else
     log "Skipping push (--no-push specified)"
 fi

@@ -11,9 +11,12 @@
 
 set -e
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 SCRATCHPAD="${SCRATCHPAD:-/tmp/macrodroid-state}"
 SSH_HOST="phone"
-PHONE_TAILSCALE_IP="100.102.92.24"
+PHONE_TAILSCALE_IP="$(imperium_cfg tailscale_ip phone)"
 PHONE_LOCAL_IP="${PHONE_LOCAL_IP:-192.168.0.89}"
 PHONE_HTTP_PORT="7777"
 EXPORT_FILE="EXPORT.mdr"

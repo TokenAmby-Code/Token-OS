@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-CLI_TOOLS_DIR="${CLI_TOOLS_DIR:-$HOME/Scripts/cli-tools}"
+CLI_TOOLS_DIR="${CLI_TOOLS_DIR:-/mnt/imperium/Scripts/cli-tools}"
 VENV_DIR="$CLI_TOOLS_DIR/.venv"
 PYTHON="${PYTHON:-python3}"
 CALLER_DIR="$(pwd)"

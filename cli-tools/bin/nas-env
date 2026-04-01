@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# nas-env — Print NAS path env vars (for eval or debugging)
+# TAGS: infrastructure
+# AUDIENCE: human + script
+#
+# Usage:
+#   nas-env              # Print vars for inspection
+#   eval "$(nas-env)"    # Set vars in current shell (alternative to sourcing)
+#   nas-env --check      # Verify NAS shares are accessible
+
+# Resolve lib relative to this script's actual location
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+source "$LIB_DIR/nas-path.sh"
+
+case "${1:-}" in
+    --check)
+        ok=true
+        for share in "$IMPERIUM" "$CIVIC"; do
+            if [[ -d "$share" ]]; then
+                echo "✓ $share"
+            else
+                echo "✗ $share (not mounted)"
+                ok=false
+            fi
+        done
+        $ok
+        ;;
+    --export)
+        # Machine-readable export statements (for eval)
+        echo "export IMPERIUM=\"$IMPERIUM\""
+        echo "export CIVIC=\"$CIVIC\""
+        echo "export SCRIPTS=\"$SCRIPTS\""
+        echo "export CLI_TOOLS=\"$CLI_TOOLS\""
+        ;;
+    -h|--help)
+        echo "nas-env — NAS path resolution"
+        echo ""
+        echo "  nas-env           Show resolved paths"
+        echo "  nas-env --check   Verify mounts are accessible"
+        echo "  nas-env --export  Print export statements (for eval)"
+        echo ""
+        echo "For scripts, source the lib directly:"
+        echo "  source \"\$CLI_TOOLS/lib/nas-path.sh\""
+        ;;
+    *)
+        echo "IMPERIUM=$IMPERIUM"
+        echo "CIVIC=$CIVIC"
+        echo "SCRIPTS=$SCRIPTS"
+        echo "CLI_TOOLS=$CLI_TOOLS"
+        ;;
+esac

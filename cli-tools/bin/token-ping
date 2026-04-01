@@ -28,13 +28,12 @@ import sys
 import json
 import time
 import os
-import platform
 import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
 
-API_URL = "http://localhost:7777" if platform.system() == "Darwin" else "http://100.95.109.23:7777"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 # ANSI colors
 RESET = "\033[0m"

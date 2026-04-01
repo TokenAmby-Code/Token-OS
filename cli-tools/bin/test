@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-DEPLOY_DIR="$HOME/Scripts/cli-tools/src/deploy"
+DEPLOY_DIR="/mnt/imperium/Scripts/cli-tools/src/deploy"
 
 # Check if help is requested
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then

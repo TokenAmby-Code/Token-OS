@@ -19,6 +19,10 @@
 
 set -euo pipefail
 
+# Source shared libs
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/git-remote.sh"
+
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=900       # 15 minutes max wait
 REVIEWERS=("greptile-apps" "github-actions" "bugbot")
@@ -145,7 +149,7 @@ do_merge() {
         fi
         if [[ -z "$base" ]]; then
             # Fall back to default branch
-            base=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')
+            base=$(git remote show "$GIT_GITHUB_REMOTE" 2>/dev/null | sed -n 's/.*HEAD branch: //p')
             base="${base:-main}"
         fi
     fi
@@ -170,9 +174,9 @@ do_merge() {
         main_worktree=$(git rev-parse --show-toplevel)
     fi
 
-    # Fetch latest from origin
-    git -C "$main_worktree" fetch origin "$base" || {
-        error "Failed to fetch origin/$base"
+    # Fetch latest from remote
+    git -C "$main_worktree" fetch "$GIT_GITHUB_REMOTE" "$base" || {
+        error "Failed to fetch $GIT_GITHUB_REMOTE/$base"
         exit 1
     }
 
@@ -194,7 +198,7 @@ do_merge() {
         exit 1
     }
 
-    git -C "$main_worktree" pull --ff-only origin "$base" || {
+    git -C "$main_worktree" pull --ff-only "$GIT_GITHUB_REMOTE" "$base" || {
         error "Failed to pull latest '$base'"
         exit 1
     }
@@ -210,9 +214,9 @@ do_merge() {
         exit 1
     }
 
-    log "Pushing '$base' to origin..."
-    git -C "$main_worktree" push origin "$base" || {
-        error "Failed to push '$base' to origin"
+    log "Pushing '$base' to $GIT_GITHUB_REMOTE..."
+    git -C "$main_worktree" push "$GIT_GITHUB_REMOTE" "$base" || {
+        error "Failed to push '$base' to $GIT_GITHUB_REMOTE"
         exit 1
     }
 
@@ -220,7 +224,7 @@ do_merge() {
 
     # Delete remote branch
     log "Deleting remote branch '$branch'..."
-    git push origin --delete "$branch" 2>/dev/null && \
+    git push "$GIT_GITHUB_REMOTE" --delete "$branch" 2>/dev/null && \
         success "Deleted remote branch '$branch'" || \
         warn "Could not delete remote branch '$branch' (may already be deleted)"
 
@@ -264,12 +268,12 @@ log "Creating PR in $REPO..."
 # Auto-push if branch has no remote tracking branch
 if ! git rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
     CURRENT_BRANCH=$(git branch --show-current)
-    log "Pushing branch to origin..."
-    git push -u origin "$CURRENT_BRANCH" || {
-        error "Failed to push branch '$CURRENT_BRANCH' to origin"
+    log "Pushing branch to $GIT_GITHUB_REMOTE..."
+    git push -u "$GIT_GITHUB_REMOTE" "$CURRENT_BRANCH" || {
+        error "Failed to push branch '$CURRENT_BRANCH' to $GIT_GITHUB_REMOTE"
         exit 1
     }
-    success "Pushed '$CURRENT_BRANCH' to origin"
+    success "Pushed '$CURRENT_BRANCH' to $GIT_GITHUB_REMOTE"
 fi
 
 # Create the PR and capture URL

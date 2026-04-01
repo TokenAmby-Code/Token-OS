@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# claude-cmd - Send a slash command or text to a Claude Code instance via tmux
+# TAGS: instance, tmux
+# AUDIENCE: agent, user
+#
+# Usage: claude-cmd [target] <command>
+#
+# Examples:
+#   claude-cmd "/color #ff9900"                    # Target own pane (default --self)
+#   claude-cmd --self "/rename auth-refactor"      # Explicit --self
+#   claude-cmd --pane %5 "/color red"              # Target specific tmux pane
+#   claude-cmd --instance abc123 "/resume"         # Target by instance ID
+#   claude-cmd --detach "/color #0099ff"           # Fire-and-forget (for hooks)
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
+# --- Help ---
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+claude-cmd - Send a slash command or text to a Claude Code instance via tmux
+
+Usage: claude-cmd [target] <command>
+
+Target modes (default: --self):
+  --self                  Target own Claude Code pane (PID walk from $PPID)
+  --pane <pane-id>        Target a specific tmux pane (e.g., %5)
+  --instance <id>         Target by Token-API instance ID (resolves PID → pane)
+
+Options:
+  --detach                Fire-and-forget in detached subshell (for hooks)
+  --help, -h              Show this help
+
+Examples:
+  claude-cmd "/color #ff9900"
+  claude-cmd --self "/rename auth-refactor"
+  claude-cmd --pane %5 "/resume"
+  claude-cmd --instance abc123 "////resume"
+  claude-cmd --detach "/color #0099ff"
+
+Notes:
+  - Claude Code strips $TMUX/$TMUX_PANE from tool env, so resolution uses
+    tmux commands directly (never env vars).
+  - When called from a Claude Code tool/hook context, --self walks the process
+    tree to find the claude ancestor PID, then maps it to a tmux pane.
+EOF
+    exit 0
+fi
+
+# --- PID Resolution Functions (from transplant pattern) ---
+
+# Find Claude ancestor PID by walking up process tree
+find_claude_pid() {
+    local current="${1:-$PPID}"
+    if [[ "$IMPERIUM_MACHINE" == "mac" ]]; then
+        for _ in 1 2 3 4 5 6 7 8; do
+            [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+            local comm
+            comm=$(ps -p "$current" -o comm= 2>/dev/null) || break
+            if [[ "$comm" == *"claude"* ]]; then
+                echo "$current"
+                return 0
+            fi
+            current=$(ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ') || break
+        done
+    else
+        for _ in 1 2 3 4 5 6 7 8; do
+            [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+            local comm
+            comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
+            if [[ "$comm" == "claude" ]]; then
+                echo "$current"
+                return 0
+            fi
+            current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
+        done
+    fi
+    return 1
+}
+
+# Get parent PID (cross-platform)
+get_ppid() {
+    local pid=$1
+    if [[ "$IMPERIUM_MACHINE" == "mac" ]]; then
+        ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
+    else
+        awk '{print $4}' "/proc/$pid/stat" 2>/dev/null
+    fi
+}
+
+# Find the tmux pane containing a given PID (walks ancestry)
+find_tmux_pane() {
+    local target_pid=$1
+    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+        local check_pid=$target_pid
+        while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
+            if [[ "$check_pid" == "$pane_pid" ]]; then
+                echo "$pane_id"
+                return 0
+            fi
+            check_pid=$(get_ppid "$check_pid") || break
+        done
+    done | head -1
+}
+
+# Resolve instance ID from Claude PID via session-pids cache
+resolve_instance_id() {
+    local claude_pid="$1"
+    local cache_file="${HOME}/.claude/session-pids/${claude_pid}"
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file" 2>/dev/null
+    fi
+}
+
+# --- Parse Arguments ---
+TARGET_MODE="self"
+TARGET_VALUE=""
+DETACH=false
+RESOLVE_ONLY=false
+NO_ESCAPE=false
+COMMAND=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --self)
+            TARGET_MODE="self"
+            shift
+            ;;
+        --pane)
+            TARGET_MODE="pane"
+            TARGET_VALUE="$2"
+            shift 2
+            ;;
+        --instance)
+            TARGET_MODE="instance"
+            TARGET_VALUE="$2"
+            shift 2
+            ;;
+        --detach)
+            DETACH=true
+            shift
+            ;;
+        --resolve-only)
+            RESOLVE_ONLY=true
+            shift
+            ;;
+        --no-escape)
+            NO_ESCAPE=true
+            shift
+            ;;
+        *)
+            COMMAND="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ "$RESOLVE_ONLY" != true ]] && [[ -z "$COMMAND" ]]; then
+    echo "Error: No command specified." >&2
+    echo "Usage: claude-cmd [target] <command>" >&2
+    exit 1
+fi
+
+# --- Remote Satellite Resolution ---
+# Maps device_id to satellite URL for cross-machine dispatch
+get_satellite_url() {
+    local device="$1"
+    case "$device" in
+        TokenPC)
+            local wsl_ip
+            wsl_ip=$(imperium_cfg tailscale_ip wsl 2>/dev/null || echo "100.66.10.74")
+            echo "http://${wsl_ip}:7777"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# --- Resolve Target Pane + Instance ID ---
+PANE=""
+INSTANCE_ID=""
+REMOTE=false
+REMOTE_DEVICE=""
+SATELLITE_URL=""
+
+case "$TARGET_MODE" in
+    self)
+        CLAUDE_PID=$(find_claude_pid 2>/dev/null || true)
+        if [[ -z "$CLAUDE_PID" ]]; then
+            echo "Error: Could not find Claude ancestor process." >&2
+            exit 1
+        fi
+        PANE=$(find_tmux_pane "$CLAUDE_PID")
+        if [[ -z "$PANE" ]]; then
+            echo "Error: Could not find tmux pane for Claude PID $CLAUDE_PID." >&2
+            exit 1
+        fi
+        INSTANCE_ID=$(resolve_instance_id "$CLAUDE_PID")
+        ;;
+    pane)
+        PANE="$TARGET_VALUE"
+        ;;
+    instance)
+        INSTANCE_ID="$TARGET_VALUE"
+        INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$TARGET_VALUE" 2>/dev/null || true)
+        if [[ -z "$INSTANCE_DATA" ]] || ! echo "$INSTANCE_DATA" | jq -e '.pid' >/dev/null 2>&1; then
+            echo "Error: Could not find instance '$TARGET_VALUE'." >&2
+            exit 1
+        fi
+
+        INSTANCE_PID=$(echo "$INSTANCE_DATA" | jq -r '.pid // empty' 2>/dev/null || true)
+        INSTANCE_DEVICE=$(echo "$INSTANCE_DATA" | jq -r '.device_id // "Mac-Mini"' 2>/dev/null || true)
+        INSTANCE_TMUX_PANE=$(echo "$INSTANCE_DATA" | jq -r '.tmux_pane // empty' 2>/dev/null || true)
+
+        # Determine local device name
+        LOCAL_DEVICE=$(imperium_cfg device_name 2>/dev/null || echo "${IMPERIUM_DEVICE_NAME:-Mac-Mini}")
+
+        if [[ "$INSTANCE_DEVICE" != "$LOCAL_DEVICE" ]]; then
+            # Remote instance — proxy through satellite
+            REMOTE=true
+            REMOTE_DEVICE="$INSTANCE_DEVICE"
+            SATELLITE_URL=$(get_satellite_url "$INSTANCE_DEVICE")
+            if [[ -z "$SATELLITE_URL" ]]; then
+                echo "Error: No satellite URL for device '$INSTANCE_DEVICE'." >&2
+                exit 1
+            fi
+            # Use tmux_pane from DB (registered by remote hook)
+            if [[ -n "$INSTANCE_TMUX_PANE" ]]; then
+                PANE="$INSTANCE_TMUX_PANE"
+            else
+                echo "Error: Remote instance '$TARGET_VALUE' on $INSTANCE_DEVICE has no tmux_pane stored." >&2
+                exit 1
+            fi
+        else
+            # Local instance — resolve pane from PID
+            if [[ -z "$INSTANCE_PID" ]]; then
+                echo "Error: Could not find PID for instance '$TARGET_VALUE'." >&2
+                exit 1
+            fi
+            PANE=$(find_tmux_pane "$INSTANCE_PID")
+            if [[ -z "$PANE" ]]; then
+                echo "Error: Could not find tmux pane for instance PID $INSTANCE_PID." >&2
+                exit 1
+            fi
+        fi
+        ;;
+esac
+
+# --- Resolve Only Mode ---
+if [[ "$RESOLVE_ONLY" == true ]]; then
+    echo "$PANE"
+    exit 0
+fi
+
+# --- Send Command ---
+# DB-based input lock ensures only one process sends keys to a pane at a time.
+# Without this, concurrent send-keys calls (instance-name + Golden Throne,
+# auto-color + ////resume) interleave in the PTY input buffer and
+# concatenate in Claude Code's prompt bar.
+send_command() {
+    local pane="$1"
+    local cmd="$2"
+    local instance_id="${INSTANCE_ID:-}"
+    local locker="claude-cmd-$$"
+
+    # Acquire DB lock if we have an instance ID
+    local locked=false
+    if [[ -n "$instance_id" ]]; then
+        local tries=0
+        while [[ $tries -lt 20 ]]; do
+            LOCK_RESP=$(curl -s --connect-timeout 1 --max-time 2 \
+                -X POST "$API_URL/api/instances/$instance_id/input-lock?locker=$locker" 2>/dev/null || true)
+            if echo "$LOCK_RESP" | grep -q '"acquired": true\|"acquired":true'; then
+                locked=true
+                break
+            fi
+            tries=$((tries + 1))
+            sleep 0.5
+        done
+    fi
+
+    if [[ "$REMOTE" == true ]]; then
+        # Proxy through satellite HTTP endpoint
+        SEND_RESP=$(curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$SATELLITE_URL/tmux/send-keys" \
+            -H "Content-Type: application/json" \
+            -d "{\"pane\": \"$pane\", \"command\": $(echo "$cmd" | jq -Rs .), \"no_escape\": $( [[ "$NO_ESCAPE" == true ]] && echo true || echo false )}" 2>/dev/null || true)
+
+        if ! echo "$SEND_RESP" | grep -q '"success"'; then
+            echo "Warning: Satellite send-keys may have failed: $SEND_RESP" >&2
+        fi
+    else
+        # Local tmux send-keys
+        # Clear any buffered input (skip when prompt is known-empty, e.g. after UserPromptSubmit)
+        if [[ "$NO_ESCAPE" != true ]]; then
+            tmux send-keys -t "$pane" C-u
+            sleep 0.3
+        fi
+        tmux send-keys -t "$pane" "$cmd" Enter
+    fi
+
+    # Hold briefly so Claude Code processes the Enter before anyone else sends
+    sleep 1
+
+    # Release DB lock
+    if [[ "$locked" == true ]]; then
+        curl -s --connect-timeout 1 --max-time 2 \
+            -X DELETE "$API_URL/api/instances/$instance_id/input-lock?locker=$locker" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+if [[ "$DETACH" == true ]]; then
+    (
+        exec 0</dev/null 1>/dev/null 2>/dev/null
+        send_command "$PANE" "$COMMAND"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+else
+    send_command "$PANE" "$COMMAND"
+    echo "Sent to $PANE: $COMMAND"
+fi

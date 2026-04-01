@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# victory - Declare Golden Throne victory for a Claude session or cron job
+# TAGS: golden-throne, session, cron
+# AUDIENCE: agent
+#
+# Usage:
+#     victory "reason"                     # Instance victory (auto-detects session)
+#     victory --cron <job_id> "reason"     # Cron job victory
+#     victory --cron <job_id> --run <run_id> "reason"  # Cron job victory for specific run
+#
+# Instance mode: Cancels any pending follow-up timer and records the victory reason.
+# Cron mode: Records victory on the cron job run and fires Discord notification.
+#
+# Instance mode requires CLAUDE_SESSION_ID or falls back to PID-based detection.
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+TOKEN_API="${TOKEN_API_URL:-http://localhost:7777}"
+
+# Parse flags
+MODE="instance"
+CRON_JOB_ID=""
+CRON_RUN_ID=""
+REASON=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cron)
+            MODE="cron"
+            CRON_JOB_ID="${2:?--cron requires a job_id}"
+            shift 2
+            ;;
+        --run)
+            CRON_RUN_ID="${2:?--run requires a run_id}"
+            shift 2
+            ;;
+        *)
+            REASON="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$REASON" ]]; then
+    echo "Usage: victory \"reason\"" >&2
+    echo "       victory --cron <job_id> \"reason\"" >&2
+    exit 1
+fi
+
+# ── Cron job victory ──────────────────────────────────────────
+if [[ "$MODE" == "cron" ]]; then
+    BODY="{\"reason\": $(echo "$REASON" | jq -Rs .)}"
+    [[ -n "$CRON_RUN_ID" ]] && BODY="{\"reason\": $(echo "$REASON" | jq -Rs .), \"run_id\": $CRON_RUN_ID}"
+
+    RESPONSE=$(curl -sf -X POST "${TOKEN_API}/api/cron/jobs/${CRON_JOB_ID}/victory" \
+        -H "Content-Type: application/json" \
+        -d "$BODY" 2>/dev/null) || {
+        echo "Error: Cron victory API call failed" >&2
+        exit 1
+    }
+
+    JOB_NAME=$(echo "$RESPONSE" | jq -r '.job_name // "unknown"')
+    echo "⚔️ IMPERIUM VICTORIOUS — [${JOB_NAME}] $REASON"
+    exit 0
+fi
+
+# ── Instance victory ─────────────────────────────────────────
+SESSION_ID="${CLAUDE_SESSION_ID:-}"
+
+# Fallback: resolve session_id from PID if env var not set
+if [[ -z "$SESSION_ID" ]]; then
+    # Walk up process tree to find claude PID
+    CLAUDE_PID=""
+    CURRENT="$$"
+    for _ in 1 2 3 4 5; do
+        [[ -z "$CURRENT" || "$CURRENT" == "1" ]] && break
+        COMM=$(cat "/proc/$CURRENT/comm" 2>/dev/null || true)
+        if [[ "$COMM" == "claude" ]]; then
+            CLAUDE_PID="$CURRENT"
+            break
+        fi
+        CURRENT=$(awk '{print $4}' "/proc/$CURRENT/stat" 2>/dev/null || true)
+    done
+
+    if [[ -n "$CLAUDE_PID" ]]; then
+        # Check session-pids cache
+        CACHE_FILE="$HOME/.claude/session-pids/$CLAUDE_PID"
+        if [[ -f "$CACHE_FILE" ]]; then
+            SESSION_ID=$(cat "$CACHE_FILE")
+        fi
+    fi
+
+    if [[ -z "$SESSION_ID" ]]; then
+        echo "Error: Could not determine session ID. Set CLAUDE_SESSION_ID or run from within a Claude session." >&2
+        exit 1
+    fi
+fi
+
+# POST victory
+RESPONSE=$(curl -sf -X POST "${TOKEN_API}/api/instances/${SESSION_ID}/victory" \
+    -H "Content-Type: application/json" \
+    -d "{\"reason\": $(echo "$REASON" | jq -Rs .)}" 2>/dev/null) || {
+    echo "Error: Victory API call failed" >&2
+    exit 1
+}
+
+TIMER_CANCELLED=$(echo "$RESPONSE" | jq -r '.timer_cancelled // false')
+echo "⚔️ IMPERIUM VICTORIOUS — $REASON"
+[[ "$TIMER_CANCELLED" == "true" ]] && echo "  Follow-up timer cancelled."

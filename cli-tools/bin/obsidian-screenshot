@@ -117,7 +117,7 @@ fi
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 
-OBSIDIAN_BIN="/home/token/Scripts/cli-tools/bin/obsidian"
+OBSIDIAN_BIN="/mnt/imperium/Scripts/cli-tools/bin/obsidian"
 if [[ ! -x "$OBSIDIAN_BIN" ]]; then
     error "obsidian CLI not found at $OBSIDIAN_BIN"
     exit 1

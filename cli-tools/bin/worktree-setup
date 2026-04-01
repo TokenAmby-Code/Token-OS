@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 # Ensure Homebrew is on PATH (Apple Silicon Macs, non-interactive shells)
 [[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
 
@@ -428,200 +431,15 @@ echo "════════════════════════�
 echo ""
 
 # ═══════════════════════════════════════════════════════════════
-# Session Transplant: kill Claude and restart in the worktree
+# Session Transplant: delegate to the transplant tool
 # ═══════════════════════════════════════════════════════════════
 
-# Encode a path the way Claude Code does (/ and . become -)
-encode_claude_path() {
-    echo "$1" | tr '/.' '-'
-}
-
-# Walk /proc to find the Claude ancestor process
-find_claude_pid() {
-    local current="$PPID"
-    for _ in 1 2 3 4 5 6 7 8; do
-        [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
-        local comm
-        comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
-        if [[ "$comm" == "claude" ]]; then
-            echo "$current"
-            return 0
-        fi
-        current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
-    done
-    return 1
-}
-
-# Find the tmux pane containing a given PID (walks ancestry)
-find_tmux_pane() {
-    local target_pid=$1
-    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
-        local check_pid=$target_pid
-        while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
-            if [[ "$check_pid" == "$pane_pid" ]]; then
-                echo "$pane_id"
-                return 0
-            fi
-            check_pid=$(awk '{print $4}' "/proc/$check_pid/stat" 2>/dev/null) || break
-        done
-    done | head -1
-}
-
-transplant_session() {
-    # Check preconditions
-    if [[ "$NO_TRANSPLANT" == "true" ]]; then
-        return 1
-    fi
-    # Claude strips $TMUX from tool env, so detect via tmux command
-    if ! tmux display-message -p '#{session_name}' &>/dev/null; then
-        log_info "Not in tmux — transplant skipped"
-        echo "  For auto-transplant, run Claude from tmux (or use the claude wrapper)"
-        echo ""
-        echo "  Manual: cd $WORKTREE_DIR && claude --continue --fork-session"
-        return 1
-    fi
-
-    # Find parent Claude process
-    local claude_pid
-    claude_pid=$(find_claude_pid) || {
-        log_warn "Claude PID not found — transplant skipped"
-        echo "  cd $WORKTREE_DIR"
-        return 1
-    }
-
-    # Find session ID from cache (written by SessionStart hook)
-    local session_id=""
-    if [[ -f "${HOME}/.claude/session-pids/${claude_pid}" ]]; then
-        session_id=$(cat "${HOME}/.claude/session-pids/${claude_pid}" 2>/dev/null)
-    fi
-
-    # Fallback: most recent JSONL in source project dir
-    # For bare repo worktrees, the "source" is wherever Claude is currently running
-    local source_cwd
-    source_cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null || pwd)
-    local source_encoded
-    source_encoded=$(encode_claude_path "$source_cwd")
-    local source_project_dir="${HOME}/.claude/projects/${source_encoded}"
-    if [[ -z "$session_id" && -d "$source_project_dir" ]]; then
-        local latest_jsonl
-        latest_jsonl=$(ls -t "$source_project_dir"/*.jsonl 2>/dev/null | head -1)
-        if [[ -n "$latest_jsonl" ]]; then
-            session_id=$(basename "$latest_jsonl" .jsonl)
-            log_warn "Session ID cache miss — using most recent JSONL: ${session_id:0:8}..."
-        fi
-    fi
-
-    if [[ -z "$session_id" ]]; then
-        log_warn "No session ID found — transplant skipped"
-        echo "  cd $WORKTREE_DIR"
-        return 1
-    fi
-
-    # Copy JSONL to target project directory
-    local target_encoded
-    target_encoded=$(encode_claude_path "$WORKTREE_DIR")
-    local target_project_dir="${HOME}/.claude/projects/${target_encoded}"
-    local source_jsonl="${source_project_dir}/${session_id}.jsonl"
-
-    if [[ ! -f "$source_jsonl" ]]; then
-        log_warn "Session JSONL not found: $source_jsonl"
-        echo "  cd $WORKTREE_DIR"
-        return 1
-    fi
-
-    mkdir -p "$target_project_dir"
-    cp "$source_jsonl" "$target_project_dir/"
-    log_success "Session transcript copied to worktree project dir"
-
-    # Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
-    local pane_target
-    pane_target=$(find_tmux_pane "$claude_pid")
-    if [[ -z "$pane_target" ]]; then
-        log_warn "Could not identify tmux pane — transplant skipped"
-        echo "  cd $WORKTREE_DIR && claude --resume $session_id --fork-session"
-        return 1
-    fi
-
-    # Capture old instance name for transfer to new session
-    local old_tab_name=""
-    local old_instance_id="$session_id"
-    if command -v curl &>/dev/null && command -v jq &>/dev/null; then
-        old_tab_name=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-            jq -r --arg id "$old_instance_id" \
-            '.[] | select(.id == $id) | .tab_name // empty' 2>/dev/null || true)
-    fi
-
-    log_info "Transplanting session to worktree..."
-
-    # Spawn a detached restart daemon that:
-    # 1. Waits for Claude to exit
-    # 2. Sends the restart command to the tmux pane's shell
-    (
-        exec 0</dev/null 1>/dev/null 2>/dev/null
-
-        # Wait for Claude to fully exit
-        local wait_count=0
-        while kill -0 "$claude_pid" 2>/dev/null; do
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-            if [[ $wait_count -ge 20 ]]; then
-                # 10 seconds max wait — give up
-                break
-            fi
-        done
-        sleep 0.5  # Grace period for shell to regain control
-
-        # Send restart command to the tmux pane
-        tmux send-keys -t "$pane_target" \
-            "cd '$WORKTREE_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
-            Enter
-
-        # Transfer instance name and clean up old instance
-        if [[ -n "$old_tab_name" && -n "$old_instance_id" ]]; then
-            # Wait for new instance to register (up to 30s)
-            local new_id=""
-            for attempt in $(seq 1 30); do
-                sleep 1
-                new_id=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-                    jq -r --arg dir "$WORKTREE_DIR" \
-                    '.[] | select(.working_dir == $dir and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | head -1 || true)
-                [[ -n "$new_id" ]] && break
-            done
-
-            if [[ -n "$new_id" ]]; then
-                # Transfer tab_name to new instance
-                curl -s -X PATCH "http://localhost:7777/api/instances/${new_id}/rename" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"tab_name\": \"${old_tab_name}\"}" >/dev/null 2>&1 || true
-            fi
-
-            # Delete old instance (belt + suspenders — SessionEnd may not fire on SIGKILL)
-            curl -s -X DELETE "http://localhost:7777/api/instances/${old_instance_id}" >/dev/null 2>&1 || true
-        fi
-    ) &
-    disown
-
-    # Ignore signals during shutdown — we must complete the kill
-    trap '' INT HUP TERM
-
-    # Kill Claude (SIGINT for graceful shutdown)
-    kill -INT "$claude_pid" 2>/dev/null || true
-    sleep 1.5
-
-    # Double-SIGINT if still alive (matches token-api pattern)
-    if kill -0 "$claude_pid" 2>/dev/null; then
-        kill -INT "$claude_pid" 2>/dev/null || true
-        sleep 2
-    fi
-
-    # Force kill as last resort
-    if kill -0 "$claude_pid" 2>/dev/null; then
-        kill -KILL "$claude_pid" 2>/dev/null || true
-    fi
-
-    exit 0
-}
-
-# Attempt transplant; if it fails or is skipped, show manual command
-transplant_session || echo "  cd $WORKTREE_DIR"
+if [[ "$NO_TRANSPLANT" == "true" ]]; then
+    echo "  cd $WORKTREE_DIR"
+elif command -v transplant &>/dev/null; then
+    transplant "$WORKTREE_DIR" || echo "  cd $WORKTREE_DIR"
+else
+    log_warn "transplant tool not found — skipping session transplant"
+    echo "  cd $WORKTREE_DIR"
+fi
 echo ""

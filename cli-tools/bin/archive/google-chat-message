@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-TEST_CMD="$HOME/Scripts/cli-tools/bin/test"
+TEST_CMD="/mnt/imperium/Scripts/cli-tools/bin/test"
 
 # Check if help is requested
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
@@ -44,7 +44,7 @@ echo "" >&2
 if [[ ! -f "$TEST_CMD" ]]; then
     echo "Error: test command not found at $TEST_CMD" >&2
     echo "Falling back to legacy implementation..." >&2
-    exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" google-chat-message "$@"
+    exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" google-chat-message "$@"
 fi
 
 # Forward all arguments to test command

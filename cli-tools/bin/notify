@@ -36,7 +36,7 @@ import subprocess
 import urllib.request
 import urllib.error
 
-API_URL = "http://localhost:7777"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 RED = "\033[31m"
 GREEN = "\033[32m"

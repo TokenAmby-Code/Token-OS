@@ -17,8 +17,8 @@ usage() {
     echo "Falls back to curl with browser user-agent if Defuddle fails." >&2
     echo "" >&2
     echo "Options:" >&2
-    echo "  --save path=\"...\"  Save output to Obsidian vault (Token-ENV by default)" >&2
-    echo "  --vault <name>     Obsidian vault name (default: Token-ENV)" >&2
+    echo "  --save path=\"...\"  Save output to Obsidian vault (Imperium-ENV by default)" >&2
+    echo "  --vault <name>     Obsidian vault name (default: Imperium-ENV)" >&2
     echo "  --json             Output raw Defuddle JSON (includes title, description, etc.)" >&2
     echo "  --batch <file>     Read URLs from file (one per line), output with --- separators" >&2
     echo "  -h, --help         Show this help" >&2
@@ -28,7 +28,7 @@ usage() {
 URLS=()
 BATCH_FILE=""
 SAVE_PATH=""
-VAULT="Token-ENV"
+VAULT="Imperium-ENV"
 OUTPUT_JSON=false
 
 while [[ $# -gt 0 ]]; do
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help) usage ;;
         --json) OUTPUT_JSON=true; shift ;;
         --vault)
-            VAULT="${2:-Token-ENV}"
+            VAULT="${2:-Imperium-ENV}"
             shift 2
             ;;
         --save)

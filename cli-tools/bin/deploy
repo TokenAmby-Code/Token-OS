@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
 DEPLOY_DIR="$(dirname "$(dirname "$SCRIPT_SELF")")/src/deploy"
 
@@ -244,7 +247,7 @@ if [[ "$RUN_PRO" == "true" ]]; then
 fi
 
 # Mac autoroute: bypass Makefile/trigger-deploy.js on macOS
-if [[ "$(uname -s)" == "Darwin" ]]; then
+if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
     DEPLOY_MAC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")/deploy-mac"
     if [[ -x "$DEPLOY_MAC" ]]; then
         exec "$DEPLOY_MAC" ${SERVICE:+"$SERVICE"} "${ARGS[@]+"${ARGS[@]}"}" \
@@ -436,7 +439,7 @@ PY
                 # Capture browser console output
                 echo ""
                 echo "=== Browser Console Output ==="
-                BROWSER_CONSOLE_BIN="$HOME/Scripts/cli-tools/bin/browser-console"
+                BROWSER_CONSOLE_BIN="${IMPERIUM:-/mnt/imperium}/Scripts/cli-tools/bin/browser-console"
                 if [[ -x "$BROWSER_CONSOLE_BIN" ]]; then
                     CONSOLE_OUTPUT=$("$BROWSER_CONSOLE_BIN" http://localhost:3000 --wait 3 2>&1) || true
                     echo "$CONSOLE_OUTPUT"

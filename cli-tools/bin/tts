@@ -21,7 +21,9 @@
 
 set -euo pipefail
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # Defaults
 INSTANCE_ID=""

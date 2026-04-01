@@ -10,7 +10,9 @@
 
 set -euo pipefail
 
-API="http://localhost:7777"
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+API="${TOKEN_API_URL:-http://localhost:7777}"
 SAVE_FILE="/tmp/timer-test-break-save"
 
 die() { echo "$1" >&2; exit 1; }

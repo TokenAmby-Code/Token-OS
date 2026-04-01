@@ -14,7 +14,10 @@
 
 set -e
 
-PHONE_TAILSCALE_IP="100.102.92.24"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+PHONE_TAILSCALE_IP="$(imperium_cfg tailscale_ip phone)"
 ADB_PORT=5555
 PHONE_TARGET="${PHONE_TAILSCALE_IP}:${ADB_PORT}"
 LOG_FILE="$HOME/.claude/shizuku-connect.log"
@@ -186,7 +189,7 @@ cmd_keepalive() {
         sleep 1
         if is_connected; then
             log "Keepalive: reconnected to phone"
-            curl -sf "http://localhost:7777/phone/event" \
+            curl -sf "${TOKEN_API_URL:-http://localhost:7777}/phone/event" \
                 -X POST \
                 -H "Content-Type: application/json" \
                 -d '{"event": "shizuku_adb_reconnected", "source": "mac_keepalive"}' \

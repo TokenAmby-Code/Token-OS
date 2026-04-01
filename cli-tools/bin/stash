@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stash - Cross-machine clipboard & file sharing via Token-API
+# Stash - Cross-machine clipboard & file sharing via NAS
 # TAGS: workflow
 # AUDIENCE: human
 #
@@ -12,19 +12,34 @@
 #   stash pull file.env -o /tmp/ Download to specific path
 #   stash list                   List all items
 #   stash clear                  Clear all items
-#   stash cp                     Copy local OS clipboard → stash
-#   stash paste                  Stash → local OS clipboard
+#   stash cp                     Copy local OS clipboard → stash (text or image)
+#   stash paste                  Stash → local OS clipboard (text or image)
+#   stash send                   Clipboard → stash → other machine's clipboard
 
 set -euo pipefail
 
-if [[ "$(uname -r)" == *microsoft* ]]; then
-    API_URL="http://100.95.109.23:7777"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+# NAS stash directory (platform-aware)
+if [[ "${IMPERIUM_MACHINE:-}" == "wsl" ]]; then
+    STASH_DIR="${IMPERIUM}/.stash"
+    OTHER_HOST="mac"
+elif [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
+    STASH_DIR="${IMPERIUM}/.stash"
+    OTHER_HOST="wsl"
 else
-    API_URL="http://localhost:7777"
+    echo "Unknown platform" >&2; exit 1
 fi
 
-# Platform clipboard helpers
-_clip_copy() {
+mkdir -p "$STASH_DIR/files"
+
+CLIP_TEXT="$STASH_DIR/clipboard"
+CLIP_IMG="$STASH_DIR/clipboard.png"
+
+# --- Platform clipboard helpers ---
+
+_clip_copy_text() {
     if command -v pbcopy &>/dev/null; then
         pbcopy
     elif command -v clip.exe &>/dev/null; then
@@ -34,7 +49,7 @@ _clip_copy() {
     fi
 }
 
-_clip_paste() {
+_clip_paste_text() {
     if command -v pbpaste &>/dev/null; then
         pbpaste
     elif command -v powershell.exe &>/dev/null; then
@@ -44,10 +59,86 @@ _clip_paste() {
     fi
 }
 
-# Help
+_clip_paste_image() {
+    local out="$1"
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
+        # Check if clipboard has image data, save as PNG
+        osascript -e '
+            try
+                set imgData to the clipboard as «class PNGf»
+                set outPath to POSIX file "'"$out"'"
+                set fh to open for access outPath with write permission
+                write imgData to fh
+                close access fh
+                return "ok"
+            on error
+                return "no_image"
+            end try
+        ' 2>/dev/null | grep -q "ok"
+    elif command -v powershell.exe &>/dev/null; then
+        # Windows path for the temp file (PowerShell needs a Windows path)
+        local winpath
+        winpath=$(wslpath -w "$out")
+        powershell.exe -NoProfile -Command '
+            Add-Type -Assembly System.Windows.Forms
+            $img = [System.Windows.Forms.Clipboard]::GetImage()
+            if ($img -ne $null) {
+                $img.Save("'"$winpath"'", [System.Drawing.Imaging.ImageFormat]::Png)
+                Write-Output "ok"
+            } else {
+                Write-Output "no_image"
+            }
+        ' 2>/dev/null | tr -d '\r' | grep -q "ok"
+    else
+        return 1
+    fi
+}
+
+_clip_copy_image() {
+    local src="$1"
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
+        osascript -e '
+            set imgPath to POSIX file "'"$src"'"
+            set the clipboard to (read imgPath as «class PNGf»)
+        ' 2>/dev/null
+    elif command -v powershell.exe &>/dev/null; then
+        local winpath
+        winpath=$(wslpath -w "$src")
+        powershell.exe -NoProfile -Command '
+            Add-Type -Assembly System.Windows.Forms
+            $img = [System.Drawing.Image]::FromFile("'"$winpath"'")
+            [System.Windows.Forms.Clipboard]::SetImage($img)
+        ' 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Clear whichever clipboard format is NOT being written
+_clear_other() {
+    local keep="$1"
+    if [[ "$keep" == "text" ]]; then
+        rm -f "$CLIP_IMG"
+    else
+        rm -f "$CLIP_TEXT"
+    fi
+}
+
+# Detect what's in stash: "image", "text", or "empty"
+_stash_type() {
+    if [[ -f "$CLIP_IMG" ]]; then
+        echo "image"
+    elif [[ -f "$CLIP_TEXT" ]]; then
+        echo "text"
+    else
+        echo "empty"
+    fi
+}
+
+# --- Help ---
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat << 'EOF'
-Stash - Cross-machine clipboard & file sharing via Token-API
+Stash - Cross-machine clipboard & file sharing via NAS
 
 Usage:
   stash                        Get clipboard → stdout
@@ -58,32 +149,81 @@ Usage:
   stash pull file.env -o /tmp/ Download to specific path
   stash list                   List all items
   stash clear                  Clear all items
-  stash cp                     Copy local OS clipboard → stash
-  stash paste                  Stash → local OS clipboard
+  stash cp                     Copy local OS clipboard → stash (text or image)
+  stash paste                  Stash → local OS clipboard (text or image)
+  stash send                   Clipboard → stash → other machine's clipboard
+
+Clipboard supports both text and images. Most recent cp wins —
+if you copy an image then copy text, paste gives you the text.
 EOF
     exit 0
 fi
+
+_age_human() {
+    local file="$1"
+    local mtime
+    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file")
+    local age=$(( $(date +%s) - mtime ))
+    if (( age < 60 )); then echo "${age}s"
+    elif (( age < 3600 )); then echo "$(( age / 60 ))m"
+    elif (( age < 86400 )); then echo "$(( age / 3600 ))h"
+    else echo "$(( age / 86400 ))d"; fi
+}
 
 CMD="${1:-}"
 
 case "$CMD" in
     list|ls)
-        curl -sf "$API_URL/api/stash" | jq -r '.items[] | "\(.name)\t\(.size) bytes\t\(.age_human) ago"' | column -t -s $'\t'
+        echo "=== Clipboard ==="
+        case "$(_stash_type)" in
+            text)
+                SIZE=$(wc -c < "$CLIP_TEXT" | tr -d ' ')
+                echo "  text: $SIZE bytes, $(_age_human "$CLIP_TEXT") ago"
+                ;;
+            image)
+                SIZE=$(wc -c < "$CLIP_IMG" | tr -d ' ')
+                echo "  image: $SIZE bytes, $(_age_human "$CLIP_IMG") ago"
+                ;;
+            empty)
+                echo "  (empty)"
+                ;;
+        esac
+        echo ""
+        echo "=== Files ==="
+        if ls "$STASH_DIR/files/"* &>/dev/null; then
+            for f in "$STASH_DIR/files/"*; do
+                NAME=$(basename "$f")
+                SIZE=$(wc -c < "$f" | tr -d ' ')
+                echo "  $NAME  ($SIZE bytes)"
+            done
+        else
+            echo "  (none)"
+        fi
         ;;
     clear)
-        curl -sf -X DELETE "$API_URL/api/stash" | jq -r '"Cleared \(.removed) item(s)"'
+        COUNT=0
+        for f in "$CLIP_TEXT" "$CLIP_IMG"; do
+            [[ -f "$f" ]] && rm "$f" && COUNT=$((COUNT + 1))
+        done
+        for f in "$STASH_DIR/files/"*; do
+            [[ -e "$f" ]] || continue
+            rm "$f"
+            COUNT=$((COUNT + 1))
+        done
+        echo "Cleared $COUNT item(s)"
         ;;
     push)
         shift
         if [[ $# -gt 0 && -f "$1" ]]; then
-            # File upload
             FNAME="$(basename "$1")"
-            curl -sf -X POST "$API_URL/api/stash/$FNAME/upload" -F "file=@$1" | jq -r '"Stored \(.name) (\(.size) bytes)"'
+            cp "$1" "$STASH_DIR/files/$FNAME"
+            SIZE=$(wc -c < "$STASH_DIR/files/$FNAME" | tr -d ' ')
+            echo "Stored $FNAME ($SIZE bytes)"
         else
-            # Stdin → clipboard
-            CONTENT="$(cat)"
-            PAYLOAD=$(jq -n --arg c "$CONTENT" '{content: $c}')
-            curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" | jq -r '"Stored \(.size) bytes to clipboard"'
+            cat > "$CLIP_TEXT"
+            _clear_other text
+            SIZE=$(wc -c < "$CLIP_TEXT" | tr -d ' ')
+            echo "Stored $SIZE bytes to clipboard"
         fi
         ;;
     pull)
@@ -95,29 +235,67 @@ case "$CMD" in
             OUTDIR="${2:?Missing output directory}"
         fi
         mkdir -p "$OUTDIR"
-        curl -sf "$API_URL/api/stash/$NAME" | jq -r '.content' > "$OUTDIR/$NAME"
-        echo "Downloaded $NAME → $OUTDIR/$NAME"
+        if [[ -f "$STASH_DIR/files/$NAME" ]]; then
+            cp "$STASH_DIR/files/$NAME" "$OUTDIR/$NAME"
+            echo "Downloaded $NAME → $OUTDIR/$NAME"
+        else
+            echo "File not found: $NAME" >&2; exit 1
+        fi
         ;;
     cp)
-        # Local clipboard → stash
-        CONTENT="$(_clip_paste)" || { echo "No clipboard tool available" >&2; exit 1; }
-        PAYLOAD=$(jq -n --arg c "$CONTENT" '{content: $c}')
-        curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" | jq -r '"Copied clipboard to stash (\(.size) bytes)"'
+        # Try image first, fall back to text. Most recent wins.
+        if _clip_paste_image "$CLIP_IMG"; then
+            _clear_other image
+            SIZE=$(wc -c < "$CLIP_IMG" | tr -d ' ')
+            echo "Copied image to stash ($SIZE bytes)"
+        else
+            _clip_paste_text > "$CLIP_TEXT" || { echo "No clipboard tool available" >&2; exit 1; }
+            _clear_other text
+            SIZE=$(wc -c < "$CLIP_TEXT" | tr -d ' ')
+            echo "Copied text to stash ($SIZE bytes)"
+        fi
         ;;
     paste)
-        # Stash → local clipboard
-        CONTENT=$(curl -sf "$API_URL/api/stash/_clipboard" | jq -r '.content')
-        echo -n "$CONTENT" | _clip_copy || { echo "$CONTENT"; exit 0; }
-        echo "Pasted stash to clipboard ($(echo -n "$CONTENT" | wc -c | tr -d ' ') bytes)"
+        case "$(_stash_type)" in
+            image)
+                _clip_copy_image "$CLIP_IMG" || { echo "Cannot paste image on this platform" >&2; exit 1; }
+                SIZE=$(wc -c < "$CLIP_IMG" | tr -d ' ')
+                echo "Pasted image to clipboard ($SIZE bytes)"
+                ;;
+            text)
+                cat "$CLIP_TEXT" | _clip_copy_text || { cat "$CLIP_TEXT"; exit 0; }
+                SIZE=$(wc -c < "$CLIP_TEXT" | tr -d ' ')
+                echo "Pasted text to clipboard ($SIZE bytes)"
+                ;;
+            empty)
+                echo "Stash clipboard is empty" >&2; exit 1
+                ;;
+        esac
+        ;;
+    send)
+        # Clipboard → stash → other machine's clipboard
+        if _clip_paste_image "$CLIP_IMG"; then
+            _clear_other image
+            SIZE=$(wc -c < "$CLIP_IMG" | tr -d ' ')
+            echo "Copied image to stash ($SIZE bytes)"
+        else
+            _clip_paste_text > "$CLIP_TEXT" || { echo "No clipboard tool available" >&2; exit 1; }
+            _clear_other text
+            SIZE=$(wc -c < "$CLIP_TEXT" | tr -d ' ')
+            echo "Copied text to stash ($SIZE bytes)"
+        fi
+        ssh-$OTHER_HOST "stash paste"
         ;;
     *)
         if [[ -z "$CMD" ]]; then
-            # No args: get clipboard → stdout
-            curl -sf "$API_URL/api/stash/_clipboard" | jq -r '.content'
+            case "$(_stash_type)" in
+                text)  cat "$CLIP_TEXT" ;;
+                image) echo "[image: $(wc -c < "$CLIP_IMG" | tr -d ' ') bytes in stash — use 'stash paste' to copy to clipboard]" ;;
+                empty) echo "Stash clipboard is empty" >&2; exit 1 ;;
+            esac
         elif [[ -n "$CMD" && "$CMD" != -* ]]; then
-            # Positional arg: set clipboard
-            PAYLOAD=$(jq -n --arg c "$CMD" '{content: $c}')
-            curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" >/dev/null
+            echo -n "$CMD" > "$CLIP_TEXT"
+            _clear_other text
             echo "Stashed $(echo -n "$CMD" | wc -c | tr -d ' ') bytes"
         else
             echo "Unknown command: $CMD" >&2

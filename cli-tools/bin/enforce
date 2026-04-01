@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# enforce - Unified enforcement tool (Discord + phone + TTS)
+# TAGS: claw, enforce, discord, phone
+# AUDIENCE: agent
+#
+# Usage: enforce <level> <message> [options]
+#
+# Levels:
+#   notify   — Discord @mention in channel + phone vibe + TTS
+#   warn     — Discord DM + phone vibe+beep + TTS
+#   enforce  — Discord DM + phone zap + TTS
+#   block    — Discord DM + phone zap + blocked state + TTS
+#
+# Options:
+#   --channel <name>     Discord channel for notify-level @mentions (default: briefing)
+#   --bot <name>         Discord bot identity (default: custodes)
+#   --source <name>      Origin context (default: agent)
+#   --legion <name>      Third-person framing for non-custodes: "stranded <legion>"
+#
+# Examples:
+#   enforce notify "Morning session waiting."
+#   enforce warn "10 minutes elapsed. Acknowledge morning session."
+#   enforce block "Morning session BLOCKED." --source morning
+#   enforce notify "Pipeline stalled" --bot mechanicus --legion mechanicus --channel fleet
+
+set -euo pipefail
+
+# Source machine config for TOKEN_API_URL
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/nas-path.sh" ]]; then
+  source "$SCRIPT_DIR/lib/nas-path.sh"
+fi
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+show_help() {
+  awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+}
+
+[[ $# -lt 2 ]] && { show_help; exit 1; }
+
+LEVEL="$1"; shift
+MESSAGE="$1"; shift
+
+# Defaults
+CHANNEL=""
+BOT="custodes"
+SOURCE="agent"
+LEGION=""
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --channel) CHANNEL="$2"; shift 2 ;;
+    --bot)     BOT="$2"; shift 2 ;;
+    --source)  SOURCE="$2"; shift 2 ;;
+    --legion)  LEGION="$2"; shift 2 ;;
+    --help|-h) show_help; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+# Build JSON payload
+PAYLOAD=$(jq -n \
+  --arg level "$LEVEL" \
+  --arg message "$MESSAGE" \
+  --arg source "$SOURCE" \
+  --arg bot "$BOT" \
+  --arg channel "$CHANNEL" \
+  --arg legion "$LEGION" \
+  '{
+    level: $level,
+    message: $message,
+    source: $source,
+    bot: $bot
+  }
+  + (if $channel != "" then {channel: $channel} else {} end)
+  + (if $legion != "" then {legion_context: $legion} else {} end)'
+)
+
+RESULT=$(curl -sf -X POST "$API_URL/api/enforce" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" 2>/dev/null) || die "Failed to reach Token-API at $API_URL"
+
+echo "$RESULT" | jq . 2>/dev/null || echo "$RESULT"
