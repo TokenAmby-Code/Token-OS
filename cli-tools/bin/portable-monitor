@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# portable-monitor — toggle portable monitor mode on the phone from any Mac terminal
+# TAGS: mobile, termux, tmux
+# AUDIENCE: human
+#
+# SSHes to the phone, sets the flag, updates the Termux toolbar, reloads settings.
+# No reconnect triggered — you're already in the right session on Mac.
+#
+# Usage: portable-monitor [on|off|auto]
+#   on   — portable-nav toolbar (large keys), phone connects to main session next time
+#   off  — mobile-nav toolbar (original keys), phone connects to phone session next time
+#   auto — clear overrides, restore auto-detection (prints detected state)
+
+MODE="${1:-}"
+
+if [[ -z "$MODE" ]]; then
+    # Query current state from phone
+    ssh phone "bash -ic 'portable-monitor auto'" 2>/dev/null
+    exit $?
+fi
+
+case "$MODE" in
+    on|off|auto) ;;
+    *)
+        echo "Usage: portable-monitor [on|off|auto]" >&2
+        exit 1
+        ;;
+esac
+
+ssh -t phone "bash -ic 'portable-monitor $MODE'"
+
+# Write local state file so the TUI sliver can show the current mode
+if [[ "$MODE" == "on" || "$MODE" == "off" ]]; then
+    echo "$MODE" > ~/.portable_monitor_state
+fi

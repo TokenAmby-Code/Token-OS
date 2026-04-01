@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# tmux-pane-status — Query Claude instance state across tmux panes
+# TAGS: tmux, context, observability, token-api
+# AUDIENCE: human, agent
+"""Show Claude instance state for all tmux panes.
+
+Combines:
+- Token-API instance data (status, name, session doc)
+- tmux-context state files (context %, tokens, cost)
+- tmux pane state (current command, activity)
+
+Usage:
+    tmux-pane-status              # Table of all Claude panes
+    tmux-pane-status --json       # Raw JSON output
+    tmux-pane-status --pane %4    # Single pane details
+    tmux-pane-status --idle       # Only show idle panes (waiting for input)
+    tmux-pane-status --hot        # Only show panes above 50% context
+"""
+
+import json
+import os
+import sys
+import subprocess
+import time
+import urllib.request
+
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+STATE_DIR = "/tmp/claude-panes"
+
+# ANSI colors
+RESET = "\033[0m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+
+
+def get_instances():
+    """Fetch all instances from Token-API."""
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/instances", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return []
+
+
+def get_pane_state(pane_id):
+    """Read tmux-context state file for a pane."""
+    safe_id = pane_id.lstrip("%")
+    state_file = os.path.join(STATE_DIR, f"pane-{safe_id}.json")
+    try:
+        with open(state_file) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def get_tmux_panes():
+    """List all tmux panes with their current command."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_current_command}\t#{pane_title}\t#{window_name}\t#{pane_active}"],
+            capture_output=True, text=True, timeout=3
+        )
+        panes = {}
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 5:
+                panes[parts[0]] = {
+                    "command": parts[1],
+                    "title": parts[2],
+                    "window": parts[3],
+                    "active": parts[4] == "1",
+                }
+        return panes
+    except Exception:
+        return {}
+
+
+def format_tokens(tokens):
+    """Format token count compactly."""
+    if tokens is None:
+        return "?"
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1_000:
+        return f"{tokens // 1_000}k"
+    return str(tokens)
+
+
+def pct_color(pct):
+    """Color based on context usage."""
+    if pct is None:
+        return DIM
+    if pct >= 70:
+        return RED
+    if pct >= 50:
+        return YELLOW
+    return GREEN
+
+
+def status_icon(status):
+    """Icon for instance status."""
+    icons = {
+        "idle": f"{GREEN}\u23f8{RESET}",        # ⏸ (paused = waiting for input)
+        "processing": f"{CYAN}\u26a1{RESET}",   # ⚡ (processing)
+        "stopped": f"{DIM}\u25cf{RESET}",        # ● (stopped)
+    }
+    return icons.get(status, f"{DIM}?{RESET}")
+
+
+def build_pane_info():
+    """Merge all data sources into per-pane records."""
+    instances = get_instances()
+    tmux_panes = get_tmux_panes()
+    records = []
+
+    # Index instances by tmux_pane
+    inst_by_pane = {}
+    for inst in instances:
+        pane = inst.get("tmux_pane")
+        if pane and not inst.get("stopped_at"):
+            inst_by_pane[pane] = inst
+
+    # Walk tmux panes that have Claude instances
+    for pane_id, pane_info in tmux_panes.items():
+        inst = inst_by_pane.get(pane_id)
+        if not inst:
+            # Not a Claude pane — check if it's running claude anyway
+            if "claude" not in pane_info.get("command", "").lower():
+                continue
+
+        state = get_pane_state(pane_id)
+        staleness = None
+        if state and state.get("updated_at"):
+            staleness = time.time() - state["updated_at"]
+
+        record = {
+            "pane_id": pane_id,
+            "window": pane_info.get("window", "?"),
+            "active": pane_info.get("active", False),
+            "name": inst.get("tab_name", "?") if inst else "?",
+            "status": inst.get("status", "unknown") if inst else "unknown",
+            "model": state.get("model", "?") if state else "?",
+            "context_pct": state.get("used_percentage") if state else None,
+            "tokens_in": state.get("total_input_tokens") if state else None,
+            "tokens_out": state.get("total_output_tokens") if state else None,
+            "context_size": state.get("context_window_size") if state else None,
+            "cost_usd": state.get("cost_usd") if state else None,
+            "session_doc": inst.get("session_doc_id") if inst else None,
+            "cc_color": inst.get("cc_color", "default") if inst else "default",
+            "state_age_s": staleness,
+            "device": inst.get("device_id", "?") if inst else "?",
+        }
+        records.append(record)
+
+    # Sort: active first, then by pane_id
+    records.sort(key=lambda r: (not r["active"], r["pane_id"]))
+    return records
+
+
+def print_table(records, filter_fn=None):
+    """Print a human-readable table."""
+    if filter_fn:
+        records = [r for r in records if filter_fn(r)]
+
+    if not records:
+        print(f"{DIM}No matching Claude panes found.{RESET}")
+        return
+
+    # Header
+    print(f"\n{BOLD}{'':2} {'Pane':6} {'Name':25} {'':5} {'Model':10} {'Context':12} {'Cost':8} {'Device'}{RESET}")
+    print(f"{DIM}{'─' * 80}{RESET}")
+
+    for r in records:
+        # Status icon
+        icon = status_icon(r["status"])
+
+        # Context display
+        pct = r["context_pct"]
+        color = pct_color(pct)
+        if pct is not None:
+            used = (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)
+            ctx_str = f"{color}{pct}%{RESET} {DIM}{format_tokens(used)}{RESET}"
+        else:
+            ctx_str = f"{DIM}--{RESET}"
+
+        # Cost
+        cost = r.get("cost_usd")
+        cost_str = f"${cost:.2f}" if cost is not None else "--"
+
+        # Active marker
+        marker = f"{CYAN}>{RESET}" if r["active"] else " "
+
+        # Name (truncate)
+        name = r["name"][:24]
+
+        # Trim model name
+        model = r["model"].split(" (")[0] if r["model"] else "?"
+
+        print(f" {marker} {r['pane_id']:6} {name:25} {icon:>5} {model:10} {ctx_str:>20} {cost_str:>8} {DIM}{r['device']}{RESET}")
+
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+
+    json_mode = "--json" in args
+    single_pane = None
+    filter_fn = None
+
+    for i, arg in enumerate(args):
+        if arg == "--pane" and i + 1 < len(args):
+            single_pane = args[i + 1]
+        elif arg == "--idle":
+            filter_fn = lambda r: r["status"] == "idle"
+        elif arg == "--hot":
+            filter_fn = lambda r: r.get("context_pct") is not None and r["context_pct"] >= 50
+
+    records = build_pane_info()
+
+    if single_pane:
+        records = [r for r in records if r["pane_id"] == single_pane]
+
+    if json_mode:
+        print(json.dumps(records, indent=2))
+    else:
+        print_table(records, filter_fn)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# tmux-dictate — Send dictation text to a tmux pane
+# TAGS: tmux, dictation, voice, send-keys
+# AUDIENCE: human + scripts
+#
+# Injects text into a target tmux pane via send-keys -l (literal).
+# Designed for voice dictation pipelines — Wispr Flow, AHK, or any
+# transcription tool can pipe output here.
+#
+# Usage:
+#   tmux-dictate "fix the auth bug in main.py"              # Send to current pane
+#   tmux-dictate -t main:grid.2 "check the tests"           # Send to specific pane
+#   tmux-dictate --submit "run the pipeline"                 # Send + Enter
+#   echo "transcribed text" | tmux-dictate --stdin           # Read from stdin
+#   tmux-dictate --clipboard                                 # Read from clipboard
+#   tmux-dictate --submit --target main:grid.2 "do it"       # Full combo
+
+set -euo pipefail
+
+# --- Defaults ---
+TARGET=""
+SUBMIT=false
+FROM_STDIN=false
+FROM_CLIPBOARD=false
+TEXT=""
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--target)
+            TARGET="$2"
+            shift 2
+            ;;
+        --submit|-s)
+            SUBMIT=true
+            shift
+            ;;
+        --stdin)
+            FROM_STDIN=true
+            shift
+            ;;
+        --clipboard|-c)
+            FROM_CLIPBOARD=true
+            shift
+            ;;
+        -h|--help)
+            cat <<'EOF'
+tmux-dictate — Send dictation text to a tmux pane
+
+Usage:
+  tmux-dictate [OPTIONS] "text to send"
+
+Options:
+  -t, --target PANE    Target pane (e.g., main:grid.2). Default: current pane.
+  -s, --submit         Send Enter after text (auto-submit)
+  --stdin              Read text from stdin
+  -c, --clipboard      Read text from clipboard (xclip/pbpaste)
+  -h, --help           Show this help
+
+Examples:
+  tmux-dictate "fix the auth bug"                    # Type into current pane
+  tmux-dictate -s "run tests"                        # Type + Enter
+  tmux-dictate -t main:grid.2 "check logs"           # Specific pane
+  echo "hello" | tmux-dictate --stdin -s             # Pipe from transcriber
+  tmux-dictate -c -s                                 # Clipboard + submit
+
+Designed for:
+  - Wispr Flow transcription output
+  - AHK dictation toggle pipelines
+  - Golden Throne ////resume pattern
+  - Any script that needs to inject prompts into Claude Code sessions
+EOF
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            TEXT="$1"
+            shift
+            ;;
+    esac
+done
+
+# --- Resolve text source ---
+if $FROM_CLIPBOARD; then
+    if command -v pbpaste &>/dev/null; then
+        TEXT=$(pbpaste)
+    elif command -v xclip &>/dev/null; then
+        TEXT=$(xclip -selection clipboard -o)
+    elif command -v xsel &>/dev/null; then
+        TEXT=$(xsel --clipboard --output)
+    elif command -v powershell.exe &>/dev/null; then
+        TEXT=$(powershell.exe -Command "Get-Clipboard" 2>/dev/null | tr -d '\r')
+    else
+        echo "Error: no clipboard tool found (pbpaste/xclip/xsel/powershell.exe)" >&2
+        exit 1
+    fi
+elif $FROM_STDIN; then
+    TEXT=$(cat)
+fi
+
+if [[ -z "$TEXT" ]]; then
+    echo "Error: no text provided. Use --help for usage." >&2
+    exit 1
+fi
+
+# --- Build send-keys command ---
+SEND_ARGS=()
+if [[ -n "$TARGET" ]]; then
+    SEND_ARGS+=(-t "$TARGET")
+fi
+
+# Send literal text (no key interpretation)
+tmux send-keys "${SEND_ARGS[@]}" -l "$TEXT"
+
+# Optionally submit
+if $SUBMIT; then
+    tmux send-keys "${SEND_ARGS[@]}" Enter
+fi

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# tmux-claude-exit — Gracefully exit Claude Code and stage resume command
+# TAGS: tmux, claude, exit, resume, keybind
+# AUDIENCE: human
+#
+# Sends Ctrl+C x3 to kill the current Claude session, then injects
+# `claude --resume "instance-name"` into bash history (via HISTFILE append)
+# and clears the terminal. The instance name comes from the tmux pane title,
+# which is set by Claude's /rename command.
+#
+# Usage:
+#     tmux-claude-exit              # Current pane
+#     tmux-claude-exit --pane %4    # Target a specific pane
+
+set -euo pipefail
+
+PANE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Helper: run tmux command with optional -t pane targeting
+_tmux() {
+    if [[ -n "$PANE" ]]; then
+        tmux "$@" -t "$PANE"
+    else
+        tmux "$@"
+    fi
+}
+
+# Grab the pane title (set by Claude /rename → becomes the instance name)
+# Strip Claude Code's ✳ prefix artifact before using for --resume search
+INSTANCE_NAME=$(_tmux display-message -p '#{pane_title}' 2>/dev/null || true)
+INSTANCE_NAME="${INSTANCE_NAME#✳ }"
+INSTANCE_NAME="${INSTANCE_NAME#✳}"
+
+# Send Ctrl+C three times with small delays
+for i in 1 2 3; do
+    _tmux send-keys C-c
+    sleep 0.2
+done
+
+# Buffer a clear immediately so Claude's exit output gets wiped fast
+_tmux send-keys "clear" Enter
+
+# Build the resume command
+if [[ -n "$INSTANCE_NAME" && "$INSTANCE_NAME" != "bash" && "$INSTANCE_NAME" != "zsh" ]]; then
+    RESUME_CMD="claude --resume \"${INSTANCE_NAME}\""
+else
+    # Fallback: no useful pane title, just use bare --resume for interactive picker
+    RESUME_CMD="claude --resume"
+fi
+
+# Add resume command to bash history, then clear again for a clean slate
+sleep 0.3
+_tmux send-keys "history -s $(printf '%q' "$RESUME_CMD") && clear" Enter

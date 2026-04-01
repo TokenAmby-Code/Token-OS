@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# tui-pane-guard — Lifecycle wrapper for TUI panes
+# TAGS: tmux, tui, lifecycle
+# AUDIENCE: script (called by tmux-workspace, not directly by user)
+#
+# Wraps the TUI monitor command with lifecycle hooks:
+#   - Traps Ctrl+C (SIGINT) → sets @TUI_DIRTY, then exits (no auto-restart)
+#   - Normal/crash exit → leaves no dirty bit (auto-restart kicks in)
+#
+# The pane must have remain-on-exit enabled and a pane-died hook that
+# checks @TUI_DIRTY before deciding whether to respawn.
+
+set -euo pipefail
+
+PANE_ID="${TMUX_PANE:-}"
+
+if [[ -z "$PANE_ID" ]]; then
+    echo "tui-pane-guard: must run inside a tmux pane" >&2
+    exit 1
+fi
+
+# Clear any stale dirty bit from a previous run
+tmux set-option -p -t "$PANE_ID" @TUI_DIRTY "false" 2>/dev/null || true
+
+# On intentional close (Ctrl+C), mark dirty so auto-restart skips this pane
+trap 'tmux set-option -p -t "$PANE_ID" @TUI_DIRTY "true" 2>/dev/null || true; exit 0' INT
+
+# Source machine identity for paths
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+# shellcheck source=../lib/nas-path.sh
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+TOKEN_API_DIR="${IMPERIUM:-/Volumes/Imperium}/Scripts/token-api"
+cd "$TOKEN_API_DIR"
+
+# Launch the TUI — exec replaces this shell so signals go straight to the TUI.
+# But we need the trap to fire, so we run it as a child and wait.
+if [[ "${IMPERIUM_MACHINE:-}" == "wsl" ]]; then
+    UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run python token-api-tui.py &
+else
+    uv run python token-api-tui.py &
+fi
+
+TUI_PID=$!
+wait $TUI_PID 2>/dev/null || true

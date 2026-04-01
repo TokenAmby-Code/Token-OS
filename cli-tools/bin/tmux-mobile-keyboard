@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# tmux-mobile-keyboard — auto-zoom active pane when phone keyboard opens
+# TAGS: tmux, mobile
+# AUDIENCE: agent
+#
+# Triggered by client-resized hook on the phone's grouped session.
+# On first resize, stores the max height as baseline.
+# When height drops significantly (keyboard open) → zoom active pane.
+# When height restores (keyboard closed) → unzoom (only if we zoomed it).
+
+SESSION="phone"
+RATIO=75  # percent — if height < RATIO% of baseline, keyboard is open
+
+# Get the phone client's height and width
+height=$(tmux list-clients -t "${SESSION}" -F '#{client_height}' 2>/dev/null | head -1)
+[[ -z "$height" || "$height" -eq 0 ]] && exit 0
+
+# Bail on portable monitor — wide display means we're not in true-mobile mode.
+# Prevents zoom from firing when keyboard opens/closes with monitor attached.
+width=$(tmux list-clients -t "${SESSION}" -F '#{client_width}' 2>/dev/null | head -1)
+[[ -n "$width" && "$width" -gt 150 ]] && exit 0
+
+# Track the max height we've ever seen as the baseline (no-keyboard height).
+# Only update baseline if new height is larger — prevents reconnect-with-keyboard
+# from poisoning the baseline with a short height.
+MIN_SANE_BASELINE=25  # phones are at least this tall without keyboard
+baseline=$(tmux show-option -qv -t "${SESSION}" @KB_BASELINE 2>/dev/null)
+if [[ -z "$baseline" || "$height" -gt "$baseline" ]]; then
+    baseline="$height"
+    tmux set-option -t "${SESSION}" @KB_BASELINE "$baseline"
+fi
+# If baseline is suspiciously small (reconnected with keyboard open), skip
+[[ "$baseline" -lt "$MIN_SANE_BASELINE" ]] && exit 0
+
+# Calculate threshold from baseline
+threshold=$(( baseline * RATIO / 100 ))
+
+# Get current state
+kb_zoomed=$(tmux show-option -qv -t "${SESSION}" @KB_ZOOM 2>/dev/null)
+pane_zoomed=$(tmux display-message -t "${SESSION}" -p '#{window_zoomed_flag}' 2>/dev/null)
+
+if [[ "$height" -lt "$threshold" ]]; then
+    # Keyboard open — zoom if not already zoomed
+    if [[ "$pane_zoomed" != "1" ]]; then
+        tmux resize-pane -Z -t "${SESSION}"
+        tmux set-option -t "${SESSION}" @KB_ZOOM true
+    fi
+elif [[ "$kb_zoomed" == "true" ]]; then
+    # Keyboard closed — unzoom only if we zoomed it
+    if [[ "$pane_zoomed" == "1" ]]; then
+        tmux resize-pane -Z -t "${SESSION}"
+    fi
+    tmux set-option -t "${SESSION}" @KB_ZOOM false
+fi
