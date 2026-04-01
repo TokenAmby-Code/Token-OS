@@ -27,6 +27,7 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 #Include audio-monitor.ahk
 #Include discord-ipc-mute.ahk
 #Include scroll-lock.ahk
+#Include *i dial-scroll.ahk  ; Antikater dial — enable when F13/F14 mapped
 #Include *i private.ahk  ; Optional include - won't error if missing
 
 ^Up:: Send "{Up}{Up}{Up}"
@@ -131,6 +132,87 @@ Media_Stop:: {  ; Skip current TTS
 
 ^!+w:: {  ; Ctrl+Alt+Shift+W = Work Action (reset idle)
     PostToTokenApi("/api/work-action", "")
+}
+
+^!c:: {  ; Ctrl+Win+C = Copy clipboard → stash → Mac clipboard
+    ToolTip("→ mac")
+    try {
+        RunWaitOutput('wsl.exe -d Ubuntu -e bash -lic "stash cp && ssh-mac \"stash paste\""')
+        ToolTip("→ mac ✓")
+    } catch {
+        ToolTip("→ mac ✗")
+    }
+    SetTimer(() => ToolTip(), -1500)
+}
+
+^!v:: {  ; Ctrl+Alt+V = Fetch Mac clipboard → paste here
+    ; Wootility sends #v to the same machine — swallow it before it hits Windows
+    Hotkey "#v", (*) => "", "On"
+    SetTimer(() => Hotkey("#v", "Off"), -500)
+    ToolTip("← mac")
+    try {
+        RunWaitOutput('wsl.exe -d Ubuntu -e bash -lic "ssh-mac \"stash cp\" && stash paste"')
+        ToolTip("← mac ✓")
+        Sleep 100
+        Send "^v"
+    } catch {
+        ToolTip("← mac ✗")
+    }
+    SetTimer(() => ToolTip(), -1500)
+}
+
+RunWaitOutput(cmd) {
+    tmpFile := A_Temp "\stash_output.txt"
+    RunWait(A_ComSpec ' /c ' cmd ' > "' tmpFile '" 2>&1',, "Hide")
+    try {
+        output := FileRead(tmpFile)
+        FileDelete(tmpFile)
+    } catch {
+        output := "no output"
+    }
+    return Trim(output, "`n`r ")
+}
+
+; --- Focus-aware app switching ---
+; Reads HWND from \\wsl.localhost\Ubuntu\tmp\.wt-focus-hwnd to identify the workspace terminal.
+; Maximized terminal = unfocused (just activate). Snapped = focused (snap target left 50%).
+
+GetWtHwnd() {
+    try {
+        hwnd := Trim(FileRead("\\wsl.localhost\Ubuntu\tmp\.wt-focus-hwnd"), "`n`r `t")
+        return hwnd ? Integer(hwnd) : 0
+    } catch
+        return 0
+}
+
+GetFocusMode() {
+    hwnd := GetWtHwnd()
+    if !hwnd || !WinExist("ahk_id " hwnd)
+        return "unfocused"
+    return WinGetMinMax("ahk_id " hwnd) = 1 ? "unfocused" : "focused"
+}
+
+FocusApp(winTitle) {
+    if !WinExist(winTitle)
+        return
+    if (GetFocusMode() = "focused") {
+        WinRestore(winTitle)
+        MonitorGetWorkArea(, &mL, &mT, &mR, &mB)
+        WinMove(mL, mT, (mR - mL) // 2, mB - mT, winTitle)
+    } else {
+        WinMaximize(winTitle)
+    }
+    WinActivate(winTitle)
+}
+
+^!1:: FocusApp("ahk_exe Obsidian.exe")
+^!2:: FocusApp("ahk_class Chrome_WidgetWin_1 ahk_exe vivaldi.exe")
+^!3:: {  ; Terminal — always just activate, it stays snapped right
+    hwnd := GetWtHwnd()
+    if hwnd && WinExist("ahk_id " hwnd)
+        WinActivate("ahk_id " hwnd)
+    else
+        WinActivate("ahk_class CASCADIA_HOSTING_WINDOW_CLASS")
 }
 
 ; --- Wispr Flow dictation tracking ---

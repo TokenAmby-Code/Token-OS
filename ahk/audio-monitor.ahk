@@ -19,7 +19,7 @@
 ; ========================================
 
 global AM_CONFIG := {
-    vaultName: "Token-ENV",
+    vaultName: "Imperium-ENV",
     pollingInterval: 5000,          ; Check every 5 seconds
     debounceCount: 2,                ; Require 2 consistent readings before switching
     manualLockDuration: 30,          ; Minutes to lock mode when manually set

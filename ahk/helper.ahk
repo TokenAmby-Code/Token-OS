@@ -1,6 +1,6 @@
 #Requires AutoHotkey v2.0
 
-; Simplified workspace map for Token-ENV
+; Simplified workspace map for Imperium-ENV
 wkspmap := Map()
 wkspmap.CaseSense := false
 wkspmap.Set(
