@@ -9,12 +9,11 @@ dependencies = [
     "pydantic>=2.10.0",
     "aiosqlite>=0.20.0",
     "rich>=13.9.0",
-    "apscheduler>=3.10.0",
+    "apscheduler[sqlalchemy]>=3.10.0",
     "requests>=2.32.5",
     "python-dotenv>=1.0.0",
     "langgraph>=0.2.0",
     "python-multipart>=0.0.22",
-    "sqlalchemy>=2.0.0",
 ]
 
 [dependency-groups]

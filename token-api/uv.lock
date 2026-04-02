@@ -54,6 +54,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9f/64/2e54428beba8d9992aa478bb8f6de9e4ecaa5f8f513bcfd567ed7fb0262d/apscheduler-3.11.2-py3-none-any.whl", hash = "sha256:ce005177f741409db4e4dd40a7431b76feb856b9dd69d57e0da49d6715bfd26d", size = 64439, upload-time = "2025-12-22T00:39:33.303Z" },
 ]
 
+[package.optional-dependencies]
+sqlalchemy = [
+    { name = "sqlalchemy" },
+]
+
 [[package]]
 name = "certifi"
 version = "2026.1.4"
@@ -889,7 +894,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "aiosqlite" },
-    { name = "apscheduler" },
+    { name = "apscheduler", extra = ["sqlalchemy"] },
     { name = "fastapi" },
     { name = "langgraph" },
     { name = "pydantic" },
@@ -897,7 +902,6 @@ dependencies = [
     { name = "python-multipart" },
     { name = "requests" },
     { name = "rich" },
-    { name = "sqlalchemy" },
     { name = "uvicorn" },
 ]
 
@@ -911,7 +915,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
-    { name = "apscheduler", specifier = ">=3.10.0" },
+    { name = "apscheduler", extras = ["sqlalchemy"], specifier = ">=3.10.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "langgraph", specifier = ">=0.2.0" },
     { name = "pydantic", specifier = ">=2.10.0" },
@@ -919,7 +923,6 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "rich", specifier = ">=13.9.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
 
