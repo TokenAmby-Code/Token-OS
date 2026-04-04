@@ -44,6 +44,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from cron_engine import CronEngine
+from schedule import router as schedule_router
 from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
     format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
@@ -199,7 +200,7 @@ ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "
 #   'default' = in-memory (cron engine jobs with unpicklable bound methods)
 #   'golden_throne' = SQLite-persisted (restart-safe date-trigger follow-ups)
 scheduler = AsyncIOScheduler(
-    jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH}')}
+    jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH.parent / "apscheduler.db"}')}
 )
 
 # Cron engine (initialized after DB in lifespan)
@@ -481,6 +482,8 @@ class DiscordMessageRequest(BaseModel):
     timestamp: Optional[str] = None
     is_dm: bool = False
     is_reply: bool = False
+    is_voice: bool = False
+    bot_name: Optional[str] = None
     reply_to_message_id: Optional[str] = None
     attachments: Optional[list] = None
     embeds: Optional[int] = 0
@@ -1501,6 +1504,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Slaanesh scheduling routes (Black Ships booking portal)
+app.include_router(schedule_router)
 
 
 # Instance Registration Endpoints
@@ -2801,10 +2807,10 @@ ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 120}
 
 
 def _load_golden_throne_sop() -> str:
-    """Load SOP prompt from file, with inline fallback."""
-    sop_path = Path.home() / ".claude" / "prompts" / "golden-throne-sop.md"
-    if sop_path.exists():
-        return sop_path.read_text()
+    """Default SOP for Golden Throne follow-ups.
+
+    Per-instance custom SOPs use the follow_up_sop column instead.
+    """
     return (
         "Read your session doc. Assess what remains. "
         "Act if clear, escalate if blocked. Update session doc. "
@@ -2813,10 +2819,10 @@ def _load_golden_throne_sop() -> str:
 
 
 async def _get_or_create_backrooms_pane() -> str:
-    """Get or create the backrooms tmux window for autonomous sessions.
+    """Split a new pane in the backrooms window for an autonomous session.
 
-    Returns the pane ID of the backrooms window. Creates it on-demand
-    if it doesn't exist — avoids cluttering the workspace until needed.
+    Each resume gets its own pane — backrooms is a dynamic process stack,
+    not a shared resource. Creates the backrooms window if it doesn't exist.
     """
     # Check if backrooms window exists
     proc = await asyncio.create_subprocess_exec(
@@ -2826,9 +2832,25 @@ async def _get_or_create_backrooms_pane() -> str:
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
     if proc.returncode == 0 and stdout.decode().strip():
+        # Window exists — split a new pane into it
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "split-window", "-t", "main:backrooms", "-d", "-P", "-F", "#{pane_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_split, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0 and stdout_split.decode().strip():
+            pane_id = stdout_split.decode().strip()
+            await asyncio.create_subprocess_exec(
+                "tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms",
+            )
+            logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
+            return pane_id
+        # split failed (too many panes?) — fall through to use first existing
+        logger.warning("Golden Throne: split-window failed, reusing existing backrooms pane")
         return stdout.decode().strip().split("\n")[0]
 
-    # Create backrooms window
+    # Create backrooms window (detached so it doesn't steal focus)
     proc = await asyncio.create_subprocess_exec(
         "tmux", "new-window", "-t", "main", "-n", "backrooms", "-d",
         stdout=asyncio.subprocess.PIPE,
@@ -2879,33 +2901,45 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
-    # Custom SOP: instance-level override, then default
-    custom_sop_path = instance.get("follow_up_sop")
-    if custom_sop_path:
-        expanded = Path(custom_sop_path).expanduser()
-        if expanded.exists():
-            sop_prompt = expanded.read_text()
-            logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
-        else:
-            logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
-            sop_prompt = _load_golden_throne_sop()
+    # Sync instances get a concise heartbeat — they already have full context.
+    # Golden Throne instances get the full SOP (Custodes protocol, etc.)
+    instance_type = instance.get("instance_type", "one_off")
+    if instance_type == "sync":
+        sop_prompt = (
+            "Sync retrigger: you stopped unexpectedly. "
+            "Read session doc, validate any in-flight work, "
+            "then AskUserQuestion to re-block."
+        )
+        logger.info(f"Golden Throne: sync retrigger for {session_id[:12]} — concise heartbeat")
     else:
-        sop_prompt = _load_golden_throne_sop()
+        # Custom SOP: instance-level override, then default
+        custom_sop_path = instance.get("follow_up_sop")
+        if custom_sop_path:
+            expanded = Path(custom_sop_path).expanduser()
+            if expanded.exists():
+                sop_prompt = expanded.read_text()
+                logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
+            else:
+                logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
+                sop_prompt = _load_golden_throne_sop()
+        else:
+            sop_prompt = _load_golden_throne_sop()
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
 
-    # Phone notification before satellite dispatch
-    zealotry = instance.get("zealotry") or 4
-    vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
-    try:
-        await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": vibe_intensity,
-            "tts_text": "Golden Throne resuming work",
-            "banner_text": f"Resuming: {tab_name}",
-        })
-    except Exception as e:
-        logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
+    # Phone notification before satellite dispatch (skip for sync — silent retrigger)
+    if instance_type != "sync":
+        zealotry = instance.get("zealotry") or 4
+        vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
+        try:
+            await asyncio.to_thread(_send_to_phone, "/notify", {
+                "vibe": vibe_intensity,
+                "tts_text": "Golden Throne resuming work",
+                "banner_text": f"Resuming: {tab_name}",
+            })
+        except Exception as e:
+            logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
 
     # Dispatch: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
@@ -2930,10 +2964,19 @@ async def golden_throne_followup(session_id: str):
             or (current_cmd[0:1].isdigit() and "." in current_cmd)  # version string like "2.1.88"
         )
         if cmd_is_claude:
-            # Claude alive in pane — inject SOP via claude-cmd send-keys
+            # Claude alive in pane — inject via claude-cmd send-keys.
+            # send-keys can only reliably deliver short single-line prompts.
+            # For long/multi-line SOPs, write to file and send a short read command.
+            MAX_SENDKEYS_LEN = 200
+            if len(sop_prompt) <= MAX_SENDKEYS_LEN and "\n" not in sop_prompt:
+                inject_prompt = sop_prompt
+            else:
+                sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
+                Path(sop_file).write_text(sop_prompt)
+                inject_prompt = f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "claude-cmd", "--pane", tmux_pane, sop_prompt,
+                    "claude-cmd", "--pane", tmux_pane, inject_prompt,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -5272,10 +5315,7 @@ def _send_enforce_to_phone(app_name: str, level: int) -> dict:
     return _send_to_phone(endpoint, params)
 
 
-DISCORD_FALLBACK_WEBHOOK = os.getenv(
-    "DISCORD_FALLBACK_WEBHOOK",
-    "https://discord.com/api/webhooks/1481081278190063828/Z7ObPIY-V-bKUkmC9rDhxajo4IssLE2kXirbqBxAGIJDvU8PwzY2tw2C91PadL5N2rlv",
-)
+DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
 
 
 async def _send_discord_fallback(app_name: str, level: int):
@@ -8027,26 +8067,31 @@ def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def speak_tts_wsl(message: str, voice: str, rate: int = 0) -> dict:
+def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bool = False) -> dict:
     """Speak a message via WSL satellite TTS (Windows SAPI voices).
 
     Blocks until satellite returns (speech complete or skipped).
+    When use_file_playback=True, uses synthesize-to-file + WMP playback
+    (supports pause/resume/speed). Otherwise uses direct SpeakAsync.
     """
     host = DESKTOP_CONFIG["host"]
     port = DESKTOP_CONFIG["port"]
     TTS_BACKEND["current"] = "wsl"
 
+    endpoint = "/tts/synth-and-play" if use_file_playback else "/tts/speak"
+    payload = {"message": message, "voice": voice, "rate": rate}
+
     try:
         resp = requests.post(
-            f"http://{host}:{port}/tts/speak",
-            json={"message": message, "voice": voice, "rate": rate},
-            timeout=300  # Long timeout — blocks until speech done
+            f"http://{host}:{port}{endpoint}",
+            json=payload,
+            timeout=300  # Long timeout — blocks until speech/playback done
         )
         TTS_BACKEND["current"] = None
 
         if resp.status_code == 200:
             data = resp.json()
-            method = "skipped" if data.get("skipped") else "wsl_sapi"
+            method = "skipped" if data.get("skipped") else data.get("method", "wsl_sapi")
             return {"success": data.get("success", False), "method": method, "voice": voice, "message": message[:50]}
         elif resp.status_code == 409:
             return {"success": False, "error": "satellite_busy"}
@@ -8066,7 +8111,8 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0) -> dict:
 
 
 def speak_tts(message: str, voice: str = None, rate: int = 0,
-              instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None) -> dict:
+              instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None,
+              use_file_playback: bool = False) -> dict:
     """Route TTS to WSL satellite (preferred) or Mac fallback.
 
     Args:
@@ -8076,6 +8122,7 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
         instance_id: Optional instance ID for logging
         wsl_voice: Windows SAPI voice name (for WSL)
         wsl_rate: Rate for WSL TTS (-10 to 10)
+        use_file_playback: If True, use file-based synthesis + WMP playback (supports transport controls)
     """
     if not message:
         return {"success": False, "error": "No message provided"}
@@ -8085,7 +8132,8 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
 
     # Try WSL first if voice available and satellite is up
     if wsl_voice and is_satellite_tts_available():
-        result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0)
+        result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0,
+                               use_file_playback=use_file_playback)
         if result.get("success"):
             return result
         # Any WSL failure → fallback to Mac
@@ -8169,12 +8217,14 @@ async def tts_queue_worker():
                             break
 
                     # Speak the message (run in executor to allow skip API to interrupt)
-                    logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice})")
+                    # Queue items use file-based playback for transport controls (pause/resume/speed)
+                    logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice}, file_playback=True)")
                     loop = asyncio.get_event_loop()
                     tts_result = await loop.run_in_executor(
                         None, functools.partial(
                             speak_tts, tts_current.message, mac_voice,
-                            0, tts_current.instance_id, wsl_voice, wsl_rate
+                            0, tts_current.instance_id, wsl_voice, wsl_rate,
+                            use_file_playback=True
                         )
                     )
                     logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
@@ -8837,13 +8887,21 @@ async def skip_tts(clear_queue: bool = False) -> dict:
     current_backend = TTS_BACKEND["current"]
 
     if current_backend == "wsl":
-        # Skip on WSL satellite
+        # Skip on WSL satellite — try both file playback stop and direct speak skip
         host = DESKTOP_CONFIG["host"]
         port = DESKTOP_CONFIG["port"]
         try:
-            resp = requests.post(f"http://{host}:{port}/tts/skip", timeout=3)
-            result["skipped"] = resp.status_code == 200
-            logger.info(f"TTS skip routed to WSL satellite: {resp.status_code}")
+            # First try stopping file playback (WMP)
+            resp = requests.post(f"http://{host}:{port}/tts/control",
+                                 json={"command": "stop"}, timeout=3)
+            if resp.status_code == 200:
+                result["skipped"] = True
+                logger.info("TTS skip routed to WSL satellite (file playback stop)")
+            else:
+                # Fall back to direct speak skip
+                resp = requests.post(f"http://{host}:{port}/tts/skip", timeout=3)
+                result["skipped"] = resp.status_code == 200
+                logger.info(f"TTS skip routed to WSL satellite (direct): {resp.status_code}")
         except Exception as e:
             logger.warning(f"TTS skip to WSL satellite failed (non-fatal): {e}")
 
@@ -10333,6 +10391,69 @@ async def handle_stop(payload: dict) -> dict:
         logger.info(f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications")
         return result
 
+    # ── Instance lifecycle retrigger — schedule before notifications ──
+    # Moved here so sync instances can schedule retrigger and return early (skip notifications).
+    instance_type = instance.get("instance_type", "one_off")
+
+    if instance_type == "golden_throne" and not is_subagent_instance:
+        zealotry = instance.get("zealotry") or 4
+        delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, 1800)
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        job_id = f"golden-throne-{session_id}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=job_id,
+            replace_existing=True,
+            name=f"Golden Throne: {tab_name}",
+            misfire_grace_time=300,
+            jobstore='golden_throne',
+        )
+        result["golden_throne"] = {
+            "scheduled": True,
+            "delay_seconds": delay_seconds,
+            "fire_at": fire_at.isoformat(),
+            "zealotry": zealotry,
+        }
+        logger.info(f"Golden Throne: scheduled follow-up for {session_id[:12]} in {delay_seconds}s (zealotry={zealotry})")
+        await log_event("golden_throne_scheduled", instance_id=session_id,
+                        details={"zealotry": zealotry, "delay_seconds": delay_seconds,
+                                 "fire_at": fire_at.isoformat()})
+
+    elif instance_type == "sync" and not is_subagent_instance:
+        delay_seconds = 3
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        job_id = f"sync-retrigger-{session_id}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=job_id,
+            replace_existing=True,
+            name=f"Sync Retrigger: {tab_name}",
+            misfire_grace_time=30,
+            jobstore='golden_throne',
+        )
+        result["sync_retrigger"] = {
+            "scheduled": True,
+            "delay_seconds": delay_seconds,
+            "fire_at": fire_at.isoformat(),
+        }
+        logger.info(f"Sync Retrigger: scheduled for {session_id[:12]} in {delay_seconds}s")
+        # Sync instances skip all notifications — retrigger is the only action needed.
+        result["action"] = "stop_processed_sync"
+        await log_event("hook_stop", instance_id=session_id, details={"sync": True})
+        return result
+
     # Extract TTS text from transcript (prefer embedded tail for remote access,
     # fall back to direct file read if local). Used by both mobile and desktop paths.
     transcript_tail = payload.get("transcript_tail")
@@ -10450,75 +10571,6 @@ async def handle_stop(payload: dict) -> dict:
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})
 
-    # Instance lifecycle retrigger — gated on instance_type, not raw zealotry
-    instance_type = instance.get("instance_type", "one_off")
-
-    if instance_type == "golden_throne" and not is_subagent_instance:
-        # Golden Throne: zealotry-based delay
-        zealotry = instance.get("zealotry") or 4
-        delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, 1800)
-        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
-        job_id = f"golden-throne-{session_id}"
-
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-
-        scheduler.add_job(
-            golden_throne_followup,
-            DateTrigger(run_date=fire_at),
-            args=[session_id],
-            id=job_id,
-            replace_existing=True,
-            name=f"Golden Throne: {tab_name}",
-            misfire_grace_time=300,
-            jobstore='golden_throne',
-        )
-        result["golden_throne"] = {
-            "scheduled": True,
-            "delay_seconds": delay_seconds,
-            "fire_at": fire_at.isoformat(),
-            "zealotry": zealotry,
-        }
-        logger.info(
-            f"Golden Throne: scheduled follow-up for {session_id[:12]} "
-            f"in {delay_seconds}s (zealotry={zealotry})"
-        )
-        await log_event("golden_throne_scheduled", instance_id=session_id,
-                        details={"zealotry": zealotry, "delay_seconds": delay_seconds,
-                                 "fire_at": fire_at.isoformat()})
-
-    elif instance_type == "sync" and not is_subagent_instance:
-        # Sync retrigger: immediate re-activation (just enough for stop hook plumbing)
-        delay_seconds = 3
-        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
-        job_id = f"sync-retrigger-{session_id}"
-
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-
-        scheduler.add_job(
-            golden_throne_followup,
-            DateTrigger(run_date=fire_at),
-            args=[session_id],
-            id=job_id,
-            replace_existing=True,
-            name=f"Sync Retrigger: {tab_name}",
-            misfire_grace_time=30,
-            jobstore='golden_throne',
-        )
-        result["sync_retrigger"] = {
-            "scheduled": True,
-            "delay_seconds": delay_seconds,
-            "fire_at": fire_at.isoformat(),
-        }
-        logger.info(f"Sync Retrigger: scheduled for {session_id[:12]} in {delay_seconds}s")
-
-    # one_off and archived: no retrigger
-
     return result
 
 
@@ -10576,7 +10628,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "//Token-NAS/Imperium/Scripts/ahk/voice-send-keys.ahk"{pane_arg} --navigate',
+            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "//Token-NAS/Imperium/Token-OS/ahk/voice-send-keys.ahk"{pane_arg} --navigate',
         }
 
     # Discord-hosted: post AskUserQuestion to Discord channel and notify phone
@@ -10965,6 +11017,16 @@ async def receive_discord_message(request: DiscordMessageRequest):
         return {"received": True, "message_id": request.message_id}
 
     content = request.content or ""
+
+    # Trigger V: Voice transcription → route to matching legion's instance
+    if request.is_voice and request.bot_name:
+        legion = request.bot_name  # "mechanicus", "custodes", etc.
+        injected = await _try_discord_injection(legion, request)
+        if injected:
+            logger.info(f"Voice [{legion}] injected into live instance")
+        else:
+            logger.info(f"Voice [{legion}] no live instance to route to (transcript logged)")
+        return {"received": True, "message_id": request.message_id, "voice": True, "injected": injected}
 
     # Trigger 0: bare URL in #forge → auto-clip to vault
     stripped = content.strip()

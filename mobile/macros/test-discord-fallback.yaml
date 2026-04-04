@@ -14,7 +14,7 @@ triggers:
 
 actions:
   - type: http_request
-    url: "https://discord.com/api/webhooks/1481081278190063828/Z7ObPIY-V-bKUkmC9rDhxajo4IssLE2kXirbqBxAGIJDvU8PwzY2tw2C91PadL5N2rlv"
+    url: "${DISCORD_FALLBACK_WEBHOOK}"
     method: POST
     body: '{"content":"POST /phone/enforce {\"level\":\"1\",\"app\":\"twitter\"}"}'
     content_type: "application/json"

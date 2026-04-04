@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-BRAVE_API_KEY="${BRAVE_API_KEY:-BSA-915OA3H5GGS01KL5E04_yANwPA8}"
+BRAVE_API_KEY="${BRAVE_API_KEY:?BRAVE_API_KEY must be set in environment}"
 BRAVE_ENDPOINT="https://api.search.brave.com/res/v1/web/search"
 
 # Defaults

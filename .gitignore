@@ -10,7 +10,11 @@
 ahk/private.ahk
 
 # Config files with secrets
+config.json
 mesh-pipe/config.json
+
+# MacroDroid binary exports (contain GPS geofences, webhook URLs, IPs)
+*.mdr
 
 # ====================================================
 # RUNTIME STATE & DATA
