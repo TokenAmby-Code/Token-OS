@@ -31,12 +31,11 @@ Notes:
     - Sleeping and idle modes omit balance (not meaningful to display).
 """
 
-import os
 import sys
 import json
 import urllib.request
 
-API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+API_URL = "http://localhost:7777"
 
 MODE_ICONS = {
     "working":      "\U0001f4bc",   # 💼

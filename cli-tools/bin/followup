@@ -2,4 +2,5 @@
 # Convenience shim for followup command
 # TAGS: workflow
 # AUDIENCE: human
-exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" followup "$@"
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh"
+exec "$CLI_TOOLS/bin/cli-wrapper" followup "$@"

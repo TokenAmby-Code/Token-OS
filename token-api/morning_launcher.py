@@ -152,7 +152,7 @@ def phase1_headless():
 
     env = dict(os.environ)
     extra_paths = [
-        os.path.expanduser("~/Scripts/cli-tools/bin"),
+        os.path.expanduser("~/Token-OS/cli-tools/bin"),
         os.path.expanduser("~/.local/bin"),
         "/opt/homebrew/bin",
         "/usr/local/bin",

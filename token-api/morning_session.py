@@ -116,7 +116,7 @@ def gather_context() -> dict:
     worktrees = []
     for repo_path in [
         "~/AskCivic/askcivic",
-        "~/Scripts/cli-tools/token-api",
+        "~/Token-OS/cli-tools/token-api",
     ]:
         expanded = os.path.expanduser(repo_path)
         if os.path.isdir(expanded):
@@ -243,7 +243,7 @@ def spawn_claude(prompt_text: str, session_id: str, is_resume: bool = False) -> 
     env = dict(os.environ)
     # Ensure Claude can find tools
     extra_paths = [
-        os.path.expanduser("~/Scripts/cli-tools/bin"),
+        os.path.expanduser("~/Token-OS/cli-tools/bin"),
         os.path.expanduser("~/.local/bin"),
         "/opt/homebrew/bin",
         "/usr/local/bin",

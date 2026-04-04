@@ -55,6 +55,9 @@ do_reset() {
         done < <(capture_running_commands)
     fi
 
+    # Kill stash window if grid was expanded
+    tmux kill-window -t "${SESSION}:_grid_stash" 2>/dev/null || true
+
     # Kill all panes except the first (tmux won't kill the last pane in a window)
     local panes
     panes=$(tmux list-panes -t "$TARGET" -F '#{pane_id}')
@@ -76,6 +79,7 @@ do_reset() {
 
     # Clear expanded state after rebuild
     tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none"
+    tmux set-option -w -t "$TARGET" @GRID_STASH "" 2>/dev/null || true
 
     if [[ "$mode" == "soft" && ${#saved_cmds[@]} -gt 0 ]]; then
         # Re-inject saved commands into grid panes (skip side panes)

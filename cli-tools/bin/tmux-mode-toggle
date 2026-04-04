@@ -16,7 +16,7 @@
 # Behavior:
 #   plan    → bypass  (1 press)
 #   bypass  → plan    (3 presses)
-#   no-mode → bypass  (3 presses, with warning — missing --dangerously-skip-permissions flag)
+#   no-mode → plan    (2 presses — instance lacks --dangerously-skip-permissions)
 #   accept  → bypass  (2 presses, with warning)
 
 set -euo pipefail
@@ -87,18 +87,14 @@ case "$MODE" in
         echo "accept → bypass"
         ;;
     none)
-        echo "WARNING: no mode detected — may be missing --dangerously-skip-permissions flag" >&2
-        echo "Attempting to reach bypass (3 presses)..." >&2
-        send_shift_tabs 3
-        # Verify we landed on bypass
+        send_shift_tabs 2
+        # Verify we landed on plan
         sleep 0.3
         TAIL=$(tmux capture-pane "${PANE_ARG[@]}" -p -S -5 2>/dev/null || true)
         VERIFY=$(detect_mode)
-        if [[ "$VERIFY" != "bypass" ]]; then
-            echo "ERROR: Could not reach bypass mode (landed on: $VERIFY)" >&2
-            echo "Instance likely launched without --dangerously-skip-permissions" >&2
-            exit 1
+        if [[ "$VERIFY" != "plan" ]]; then
+            echo "WARNING: expected plan mode but landed on: $VERIFY" >&2
         fi
-        echo "none → bypass"
+        echo "none → plan"
         ;;
 esac

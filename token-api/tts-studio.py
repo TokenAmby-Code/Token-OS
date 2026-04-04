@@ -384,11 +384,8 @@ def main():
                 if confirm.lower() == 'y':
                     # Actually update main.py
                     try:
-                        import platform
-                        if platform.system() == "Darwin":
-                            main_py_path = "/Volumes/Imperium/Scripts/token-api/main.py"
-                        else:
-                            main_py_path = "/mnt/imperium/Scripts/token-api/main.py"
+                        _token_os = os.environ.get("TOKEN_OS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                        main_py_path = os.path.join(_token_os, "token-api", "main.py")
 
                         with open(main_py_path, "r") as f:
                             content = f.read()

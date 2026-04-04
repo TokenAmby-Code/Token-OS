@@ -6,25 +6,31 @@ commands on behalf of token-api — same pattern as the phone's MacroDroid
 HTTP server.
 
 Endpoints:
-    GET  /health      — heartbeat
-    POST /enforce     — close a Windows process (brave, minecraft)
-    GET  /processes   — list distraction-relevant processes
-    POST /tts/speak   — speak text via Windows SAPI (blocking)
-    POST /tts/skip    — skip current TTS playback
-    POST /ahk/execute — execute a one-shot AHK v2 script
-    POST /restart     — git pull + restart
-    GET  /kvm/status  — DeskFlow watchdog state
-    POST /kvm/control — manual DeskFlow start/stop/hold
-    GET  /files/read    — read a file under ~/.claude/ (for cross-machine transcript fetch)
-    POST /tmux/send-keys — send a command to a tmux pane (cross-machine dispatch)
+    GET  /health           — heartbeat
+    POST /enforce          — close a Windows process (brave, minecraft)
+    GET  /processes        — list distraction-relevant processes
+    POST /tts/speak        — speak text via Windows SAPI direct (blocking, for voice-chat)
+    POST /tts/skip         — skip current TTS speech
+    POST /tts/synthesize   — synthesize text to WAV file (blocking)
+    POST /tts/control      — transport controls: pause/resume/stop (non-blocking)
+    POST /tts/synth-and-play — synthesize to WAV + speak via SAPI (blocking, for queued TTS)
+    GET  /tts/status       — current TTS engine state
+    POST /ahk/execute      — execute a one-shot AHK v2 script
+    POST /restart          — git pull + restart
+    GET  /kvm/status       — DeskFlow watchdog state
+    POST /kvm/control      — manual DeskFlow start/stop/hold
+    GET  /files/read       — read a file under ~/.claude/ (for cross-machine transcript fetch)
+    POST /tmux/send-keys   — send a command to a tmux pane (cross-machine dispatch)
 """
 
+import glob
 import json
 import os
 import subprocess
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -45,15 +51,26 @@ AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
 AHK_SCRIPTS_DIR = Path.home() / "Scripts" / "ahk"
 
 # PowerShell script for persistent TTS engine.
-# Uses SpeakAsync so the main loop stays responsive to skip/poll commands.
+# Uses SpeakAsync so the main loop stays responsive to skip/poll/pause/resume commands.
+# Also supports file-based synthesis (SetOutputToWaveFile) for replay/persistence.
+# Pause/Resume use SAPI native methods. Poll returns "Paused" state natively.
+#
 # Protocol: JSON commands on stdin, line responses on stdout.
-#   {"action":"speak","voice":"...","rate":N,"message":"..."} → "OK"
-#   {"action":"poll"}                                          → "Speaking" | "Ready"
-#   {"action":"skip"}                                          → "OK"
-#   "quit"                                                     → exits
+#   {"action":"speak","voice":"...","rate":N,"message":"..."}                      → "OK" | "VOICE_ERR"
+#   {"action":"poll"}                                                               → "Speaking" | "Ready" | "Paused"
+#   {"action":"skip"}                                                               → "OK"
+#   {"action":"pause"}                                                              → "OK"
+#   {"action":"resume"}                                                             → "OK"
+#   {"action":"synthesize","voice":"...","rate":N,"message":"...","file_id":"..."}  → "SYNTH_OK" | "SYNTH_ERR:..."
+#   "quit"                                                                          → exits
 TTS_ENGINE_PS = r"""
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+
+# Ensure TTS output directory exists
+$ttsDir = "C:\temp\tts"
+if (-not (Test-Path $ttsDir)) { New-Item -ItemType Directory -Path $ttsDir | Out-Null }
+
 [Console]::WriteLine("READY")
 [Console]::Out.Flush()
 
@@ -83,6 +100,39 @@ while ($true) {
             [Console]::WriteLine("OK")
             [Console]::Out.Flush()
         }
+        "pause" {
+            $synth.Pause()
+            [Console]::WriteLine("OK")
+            [Console]::Out.Flush()
+        }
+        "resume" {
+            $synth.Resume()
+            [Console]::WriteLine("OK")
+            [Console]::Out.Flush()
+        }
+        "synthesize" {
+            try {
+                $synth.SelectVoice($cmd.voice)
+            } catch {
+                [Console]::WriteLine("SYNTH_ERR:Voice not found: $($cmd.voice)")
+                [Console]::Out.Flush()
+                continue
+            }
+            $synth.Rate = [int]$cmd.rate
+            $wavPath = "$ttsDir\$($cmd.file_id).wav"
+            try {
+                $synth.SetOutputToWaveFile($wavPath)
+                $synth.Speak($cmd.message)
+                $synth.SetOutputToDefaultAudioDevice()
+                [Console]::WriteLine("SYNTH_OK")
+                [Console]::Out.Flush()
+            } catch {
+                # Restore default audio output even on failure
+                try { $synth.SetOutputToDefaultAudioDevice() } catch {}
+                [Console]::WriteLine("SYNTH_ERR:$($_.Exception.Message)")
+                [Console]::Out.Flush()
+            }
+        }
     }
 }
 $synth.Dispose()
@@ -105,6 +155,10 @@ class TTSEngine:
         self._io_lock = threading.Lock()
         self._speaking = False
         self._was_skipped = False
+        # Managed playback state (synth-and-speak path)
+        self._playing = False
+        self._play_paused = False
+        self._current_file: Optional[str] = None
 
     def _write_script(self):
         """Write the PS script to a Windows-accessible path."""
@@ -207,8 +261,8 @@ class TTSEngine:
         return {"success": True, "skipped": self._was_skipped}
 
     def skip(self) -> bool:
-        """Cancel current speech. Returns True if was speaking."""
-        if not self._speaking or self._process is None:
+        """Cancel current speech (direct or managed playback). Returns True if was active."""
+        if not (self._speaking or self._playing) or self._process is None:
             return False
         with self._io_lock:
             self._send({"action": "skip"})
@@ -227,6 +281,111 @@ class TTSEngine:
             except Exception:
                 self._kill()
         logger.info("TTS engine: Shutdown")
+
+    # ── File-based synthesis and playback ──
+
+    TTS_DIR_WSL = "/mnt/c/temp/tts"
+    TTS_DIR_WIN = r"C:\temp\tts"
+
+    def cleanup_old_files(self, max_age_seconds: int = 3600):
+        """Delete WAV files older than max_age_seconds from the TTS directory."""
+        try:
+            now = time.time()
+            for f in glob.glob(os.path.join(self.TTS_DIR_WSL, "*.wav")):
+                if now - os.path.getmtime(f) > max_age_seconds:
+                    os.unlink(f)
+                    logger.info(f"TTS cleanup: removed {os.path.basename(f)}")
+        except Exception as e:
+            logger.warning(f"TTS cleanup error: {e}")
+
+    def synthesize(self, message: str, voice: str, rate: int = 0, file_id: str = None) -> dict:
+        """Synthesize text to a WAV file using SAPI. Blocking — returns when file is written."""
+        self._ensure_running()
+        self.cleanup_old_files()
+
+        if not file_id:
+            file_id = str(uuid.uuid4())
+
+        with self._io_lock:
+            self._send({
+                "action": "synthesize",
+                "voice": voice,
+                "rate": rate,
+                "message": message,
+                "file_id": file_id,
+            })
+            resp = self._readline()
+
+        if resp == "SYNTH_OK":
+            wav_path_win = f"{self.TTS_DIR_WIN}\\{file_id}.wav"
+            wav_path_wsl = f"{self.TTS_DIR_WSL}/{file_id}.wav"
+            logger.info(f"TTS synthesize: {len(message)} chars -> {file_id}.wav")
+            return {"success": True, "file_id": file_id, "wav_path_win": wav_path_win, "wav_path_wsl": wav_path_wsl}
+        elif resp and resp.startswith("SYNTH_ERR:"):
+            error = resp[len("SYNTH_ERR:"):]
+            logger.warning(f"TTS synthesize failed: {error}")
+            return {"success": False, "error": error}
+        else:
+            logger.warning(f"TTS synthesize unexpected response: {resp}")
+            return {"success": False, "error": f"Unexpected response: {resp}"}
+
+    def synth_and_speak(self, message: str, voice: str, rate: int = 0) -> dict:
+        """Synthesize text to WAV (for replay/persistence) then speak it via SAPI.
+
+        Blocks until speech completes or is skipped. Supports pause/resume mid-speech.
+        """
+        synth_result = self.synthesize(message, voice, rate)
+        if not synth_result.get("success"):
+            return synth_result
+
+        self._playing = True
+        self._current_file = synth_result.get("wav_path_wsl")
+        speak_result = self.speak(message, voice, rate)
+        self._playing = False
+        self._play_paused = False
+        self._current_file = None
+
+        return {
+            **speak_result,
+            "file_id": synth_result.get("file_id"),
+            "wav_path_win": synth_result.get("wav_path_win"),
+        }
+
+    def play_control(self, command: str) -> dict:
+        """Send transport control (pause/resume/stop) to SAPI. Non-blocking."""
+        if not (self._speaking or self._playing) and command != "stop":
+            return {"success": False, "error": "Not speaking or playing"}
+        self._ensure_running()
+
+        # Map commands to SAPI actions
+        action_map = {"pause": "pause", "resume": "resume", "stop": "skip"}
+        action = action_map.get(command)
+        if not action:
+            return {"success": False, "error": f"Unknown command: {command}"}
+
+        with self._io_lock:
+            self._send({"action": action})
+            resp = self._readline()
+
+        if command == "pause":
+            self._play_paused = True
+        elif command == "resume":
+            self._play_paused = False
+        elif command == "stop":
+            self._was_skipped = True
+            self._play_paused = False
+
+        return {"success": True, "command": command}
+
+    def get_status(self) -> dict:
+        """Get current TTS engine status."""
+        return {
+            "speaking": self._speaking,
+            "playing": self._playing,
+            "paused": self._play_paused,
+            "current_file": self._current_file,
+            "engine_alive": self._process is not None and self._process.poll() is None,
+        }
 
 
 # Global TTS engine instance
@@ -779,10 +938,69 @@ def tts_speak(request: TTSSpeakRequest):
 
 @app.post("/tts/skip")
 async def tts_skip():
-    """Skip current TTS playback."""
-    was_speaking = tts_engine.skip()
-    logger.info(f"TTS: Skip requested (was_speaking={was_speaking})")
-    return {"success": True, "was_speaking": was_speaking}
+    """Skip current TTS playback (direct speak or file playback)."""
+    was_active = tts_engine.skip()
+    logger.info(f"TTS: Skip requested (was_active={was_active})")
+    return {"success": True, "was_speaking": was_active}
+
+
+# ── File-based TTS: synthesize to WAV + controlled playback ──
+
+class TTSSynthesizeRequest(BaseModel):
+    message: str
+    voice: str = "Microsoft David"
+    rate: int = 0
+
+class TTSControlRequest(BaseModel):
+    command: str   # pause, resume, stop
+
+class TTSSynthAndPlayRequest(BaseModel):
+    message: str
+    voice: str = "Microsoft David"
+    rate: int = 0
+
+
+@app.post("/tts/synthesize")
+def tts_synthesize(request: TTSSynthesizeRequest):
+    """Synthesize text to a WAV file using SAPI. Blocks until file is written."""
+    if tts_engine.is_speaking:
+        raise HTTPException(status_code=409, detail="SAPI is busy speaking")
+
+    logger.info(f"TTS synthesize: {len(request.message)} chars with {request.voice}")
+    return tts_engine.synthesize(request.message, request.voice, request.rate)
+
+
+@app.post("/tts/control")
+async def tts_control(request: TTSControlRequest):
+    """Transport control for SAPI speech (pause/resume/stop). Non-blocking."""
+    logger.info(f"TTS control: {request.command}")
+    return tts_engine.play_control(request.command)
+
+
+@app.post("/tts/synth-and-play")
+def tts_synth_and_play(request: TTSSynthAndPlayRequest):
+    """Synthesize text to WAV (for replay) then speak it via SAPI. Blocks until done."""
+    if tts_engine.is_speaking or tts_engine._playing:
+        raise HTTPException(status_code=409, detail="TTS engine is busy")
+
+    logger.info(f"TTS synth-and-play: {len(request.message)} chars with {request.voice}")
+    result = tts_engine.synth_and_speak(request.message, request.voice, request.rate)
+
+    method = "skipped" if result.get("skipped") else "wsl_sapi_file"
+    return {
+        "success": result.get("success", False),
+        "skipped": result.get("skipped", False),
+        "method": method,
+        "voice": request.voice,
+        "file_id": result.get("file_id"),
+        "message": request.message[:50],
+    }
+
+
+@app.get("/tts/status")
+async def tts_status():
+    """Get current TTS engine status (speaking, playing, paused, etc.)."""
+    return tts_engine.get_status()
 
 
 @app.post("/ahk/execute")
@@ -896,13 +1114,32 @@ async def tmux_send_keys(req: TmuxSendKeysRequest):
 
 
 def _get_or_create_backrooms_pane() -> str:
-    """Get or create the backrooms tmux window for autonomous sessions."""
+    """Split a new pane in the backrooms window for an autonomous session.
+
+    Each resume gets its own pane — backrooms is a dynamic process stack,
+    not a shared resource. Creates the backrooms window if it doesn't exist.
+    """
     # Check if backrooms window exists
     result = subprocess.run(
         ["tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}"],
         capture_output=True, text=True, timeout=5,
     )
     if result.returncode == 0 and result.stdout.strip():
+        # Window exists — split a new pane into it
+        split = subprocess.run(
+            ["tmux", "split-window", "-t", "main:backrooms", "-d", "-P", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if split.returncode == 0 and split.stdout.strip():
+            pane_id = split.stdout.strip()
+            subprocess.run(
+                ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms"],
+                timeout=5,
+            )
+            logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
+            return pane_id
+        # split failed (too many panes?) — fall through to use first existing pane
+        logger.warning("Golden Throne: split-window failed, reusing existing backrooms pane")
         return result.stdout.strip().split("\n")[0]
 
     # Create backrooms window (detached so it doesn't steal focus)

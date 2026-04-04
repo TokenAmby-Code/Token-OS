@@ -30,16 +30,12 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
-TOKEN_API_DIR="${IMPERIUM:-/Volumes/Imperium}/Scripts/token-api"
+TOKEN_API_DIR="${TOKEN_OS}/token-api"
 cd "$TOKEN_API_DIR"
 
 # Launch the TUI — exec replaces this shell so signals go straight to the TUI.
 # But we need the trap to fire, so we run it as a child and wait.
-if [[ "${IMPERIUM_MACHINE:-}" == "wsl" ]]; then
-    UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run python token-api-tui.py &
-else
-    uv run python token-api-tui.py &
-fi
+UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run python token-api-tui.py &
 
 TUI_PID=$!
 wait $TUI_PID 2>/dev/null || true

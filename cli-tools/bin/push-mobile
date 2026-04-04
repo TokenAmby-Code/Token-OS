@@ -18,7 +18,7 @@ set -euo pipefail
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh"
-MOBILE_DIR="${SCRIPTS}/mobile"
+MOBILE_DIR="${TOKEN_OS}/mobile"
 SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
 
 PUSH_BASHRC=false

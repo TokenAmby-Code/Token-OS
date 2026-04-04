@@ -19,7 +19,7 @@ Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `Scrip
 
 **Before NAS-dependent work**, verify mounts are live:
 ```bash
-ls "$IMPERIUM/Scripts/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED"
+ls "$IMPERIUM/Token-OS/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED"
 ls "$CIVIC/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED or LOCKED"
 ```
 If a mount is down, inform the user — do not attempt to remount (requires sudo).
@@ -86,7 +86,7 @@ confirm behavior is preserved. Don't mark a task complete without verification.
 
 Use tasks for anything with 3+ steps or that involves multiple files.
 
-## CLI Tools (`$IMPERIUM/Scripts/cli-tools/bin/`)
+## CLI Tools (`$IMPERIUM/Token-OS/cli-tools/bin/`)
 
 | Command | Purpose |
 |---------|---------|
@@ -165,7 +165,7 @@ Projects have their own CLAUDE.md files with project-specific guidance. Claude l
 
 Key projects:
 - `$CIVIC/ProcurementAgentAI/CLAUDE.md` - Main project (architecture + CLI tool docs)
-- `$IMPERIUM/Scripts/token-api/CLAUDE.md` - Token-API server
-- `$IMPERIUM/Scripts/mobile/CLAUDE.md` - Mobile/MacroDroid tools
+- `$IMPERIUM/Token-OS/token-api/CLAUDE.md` - Token-API server
+- `$IMPERIUM/Token-OS/mobile/CLAUDE.md` - Mobile/MacroDroid tools
 - `$IMPERIUM/Imperium-ENV/CLAUDE.md` - Primary Obsidian vault (Imperium)
 - `$CIVIC/Pax-ENV/CLAUDE.md` - Work Obsidian vault (obsidian-cli docs live here)

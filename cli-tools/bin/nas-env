@@ -31,7 +31,7 @@ case "${1:-}" in
         # Machine-readable export statements (for eval)
         echo "export IMPERIUM=\"$IMPERIUM\""
         echo "export CIVIC=\"$CIVIC\""
-        echo "export SCRIPTS=\"$SCRIPTS\""
+        echo "export TOKEN_OS=\"$TOKEN_OS\""
         echo "export CLI_TOOLS=\"$CLI_TOOLS\""
         ;;
     -h|--help)
@@ -47,7 +47,7 @@ case "${1:-}" in
     *)
         echo "IMPERIUM=$IMPERIUM"
         echo "CIVIC=$CIVIC"
-        echo "SCRIPTS=$SCRIPTS"
+        echo "TOKEN_OS=$TOKEN_OS"
         echo "CLI_TOOLS=$CLI_TOOLS"
         ;;
 esac

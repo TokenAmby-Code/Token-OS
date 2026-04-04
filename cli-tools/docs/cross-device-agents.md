@@ -84,7 +84,7 @@ phone → phone   (~/.ssh/config host alias for Termux via Tailscale)
 ### Prerequisites
 
 - SSH keys configured in `~/.ssh/config` for all targets
-- `/Volumes/Imperium/Scripts/cli-tools/bin/` in PATH on all devices (`scripts-sync` handles this)
+- `/Volumes/Imperium/Token-OS/cli-tools/bin/` in PATH on all devices (`scripts-sync` handles this)
 - Claude Code installed at `~/.local/bin/claude` on target devices
 
 ## Session Transcript Transfer

@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# vault-dispatch — Spawn a Claude instance in the vault, brief it, and transplant to work
+# TAGS: instance, workflow, dispatch
+# AUDIENCE: human, agent
+#
+# Usage:
+#   vault-dispatch <session-doc> <working-dir> [options]
+#   vault-dispatch --task <task-name> <working-dir> [options]
+#   vault-dispatch --list-free                    # Show free tmux panes
+#
+# The dispatch pattern:
+#   1. Find a free tmux pane (or use --pane)
+#   2. Launch Claude (or primarch) in the vault
+#   3. Send dispatch prompt: read session doc → gather context → transplant → work
+#
+# Examples:
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --primarch vulkan
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --pane %3
+#   vault-dispatch --list-free
+#   vault-dispatch --dry-run Mars/Sessions/my-session.md /home/token/project
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}>${NC} $1"; }
+log_success() { echo -e "${GREEN}+${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
+log_error()   { echo -e "${RED}x${NC} $1"; }
+log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+
+# --- Vault path ---
+VAULT_DIR="${IMPERIUM}/Imperium-ENV"
+if [[ ! -d "$VAULT_DIR" ]]; then
+    log_error "Vault not found: $VAULT_DIR"
+    exit 1
+fi
+
+# --- Free pane detection ---
+# Returns pane IDs that are running plain bash/zsh (no Claude, no TUI, no special process)
+# Excludes: panes in tui window, panes already running claude
+find_free_panes() {
+    local grid_panes=()
+    local other_panes=()
+    local seen=()
+    while IFS=$'\t' read -r pane_id cmd window_name; do
+        # Dedup (tmux list-panes -a can repeat across window iterations)
+        for s in "${seen[@]+"${seen[@]}"}"; do
+            [[ "$s" == "$pane_id" ]] && continue 2
+        done
+        seen+=("$pane_id")
+        # Skip TUI and backrooms windows
+        [[ "$window_name" == "tui" ]] && continue
+        [[ "$window_name" == "backrooms" ]] && continue
+        # Only consider panes running a shell (bash/zsh)
+        [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
+        # Verify no claude process in the pane's process tree
+        local pane_pid
+        pane_pid=$(tmux list-panes -a -F "#{pane_id} #{pane_pid}" 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+        if [[ -n "$pane_pid" ]]; then
+            if pgrep -P "$pane_pid" -f "claude" &>/dev/null; then
+                continue
+            fi
+        fi
+        # Prioritize grid panes over mobile/other
+        if [[ "$window_name" == "grid" ]]; then
+            grid_panes+=("$pane_id")
+        else
+            other_panes+=("$pane_id")
+        fi
+    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    # Grid first, then others
+    printf '%s\n' "${grid_panes[@]+"${grid_panes[@]}"}" "${other_panes[@]+"${other_panes[@]}"}"
+}
+
+# Show free panes with context
+list_free_panes() {
+    echo -e "\n${BOLD}Free tmux panes${NC}\n"
+    local found=false
+    local seen=()
+    while IFS=$'\t' read -r pane_id cmd window_name; do
+        for s in "${seen[@]+"${seen[@]}"}"; do
+            [[ "$s" == "$pane_id" ]] && continue 2
+        done
+        seen+=("$pane_id")
+        [[ "$window_name" == "tui" ]] && continue
+        [[ "$window_name" == "backrooms" ]] && continue
+        [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
+        local pane_pid
+        pane_pid=$(tmux list-panes -a -F "#{pane_id} #{pane_pid}" 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+        if [[ -n "$pane_pid" ]] && pgrep -P "$pane_pid" -f "claude" &>/dev/null; then
+            continue
+        fi
+        echo -e "  ${CYAN}${pane_id}${NC}  ${DIM}window:${NC}${window_name}  ${DIM}cmd:${NC}${cmd}"
+        found=true
+    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    if [[ "$found" != "true" ]]; then
+        echo -e "  ${DIM}No free panes available${NC}"
+    fi
+    echo ""
+}
+
+# --- Build dispatch prompt ---
+build_dispatch_prompt() {
+    local session_doc="$1"
+    local working_dir="$2"
+    local primarch_name="${3:-}"
+    local extra_context="${4:-}"
+
+    local prompt="You are dispatched to work on this session. Read your session doc at ${session_doc} first."
+
+    # Add linked notes instruction
+    prompt+=" Then read any related session docs or task notes linked in the frontmatter."
+
+    # Add architecture docs instruction
+    prompt+=" Read any architecture references mentioned in the session doc (wikilinks to Terra/Meta/ or Terra/Ultramar/)."
+
+    # Add assessment phase
+    prompt+=" Assess what can be done autonomously vs. what needs escalation."
+
+    # Add transplant instruction
+    prompt+=" Then transplant to the working directory: transplant ${working_dir}"
+    if [[ -n "$primarch_name" ]]; then
+        prompt+=" --primarch ${primarch_name}"
+    fi
+
+    # Add work instruction
+    prompt+=" Once transplanted, begin work following SOP: act autonomously on clear tasks, escalate ambiguity via discord send, update your session doc work log as you go. Do NOT use TTS."
+
+    # Add extra context if provided
+    if [[ -n "$extra_context" ]]; then
+        prompt+=" Additional context: ${extra_context}"
+    fi
+
+    echo "$prompt"
+}
+
+# --- Usage ---
+usage() {
+    cat << 'EOF'
+vault-dispatch — Spawn a Claude instance in the vault, brief it, transplant to work
+
+Usage:
+  vault-dispatch <session-doc> <working-dir> [options]
+  vault-dispatch --list-free
+
+Spawns Claude in the Imperium-ENV vault, sends a dispatch prompt that instructs
+the instance to read its session doc, gather context, then transplant to the
+target working directory and begin work.
+
+Arguments:
+  <session-doc>       Path relative to vault root (e.g., Mars/Sessions/2026-04-03-foo.md)
+  <working-dir>       Absolute path to the target working directory
+
+Options:
+  --pane <id>         Target tmux pane (default: auto-detect first free pane)
+  --primarch <name>   Launch as a primarch persona
+  --zealotry <1-5>    Set zealotry level for Golden Throne follow-ups (default: 3)
+  --context <text>    Extra context to include in the dispatch prompt
+  --dry-run           Show what would happen without executing
+  --list-free         List free tmux panes and exit
+  -h, --help          Show this help message
+
+Examples:
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --primarch vulkan
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --pane %7
+  vault-dispatch --list-free
+EOF
+    exit 0
+}
+
+# --- Parse args ---
+SESSION_DOC=""
+WORKING_DIR=""
+TARGET_PANE=""
+PRIMARCH_NAME=""
+ZEALOTRY=3
+EXTRA_CONTEXT=""
+DRY_RUN=false
+LIST_FREE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help) usage ;;
+        --list-free)
+            LIST_FREE=true
+            shift
+            ;;
+        --pane)
+            TARGET_PANE="$2"
+            shift 2
+            ;;
+        --primarch)
+            PRIMARCH_NAME="$2"
+            shift 2
+            ;;
+        --zealotry)
+            ZEALOTRY="$2"
+            shift 2
+            ;;
+        --context)
+            EXTRA_CONTEXT="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            if [[ -z "$SESSION_DOC" ]]; then
+                SESSION_DOC="$1"
+            elif [[ -z "$WORKING_DIR" ]]; then
+                WORKING_DIR="$1"
+            else
+                log_error "Too many arguments"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# --- List free panes mode ---
+if $LIST_FREE; then
+    list_free_panes
+    exit 0
+fi
+
+# --- Validate inputs ---
+if [[ -z "$SESSION_DOC" || -z "$WORKING_DIR" ]]; then
+    log_error "Both <session-doc> and <working-dir> are required"
+    echo "Usage: vault-dispatch <session-doc> <working-dir> [options]"
+    echo "       vault-dispatch --list-free"
+    exit 1
+fi
+
+# Validate session doc exists in vault
+if [[ ! -f "${VAULT_DIR}/${SESSION_DOC}" ]]; then
+    log_error "Session doc not found: ${VAULT_DIR}/${SESSION_DOC}"
+    exit 1
+fi
+
+# Validate working dir exists (resolve ~ and relative paths)
+WORKING_DIR=$(eval echo "$WORKING_DIR")
+if [[ ! -d "$WORKING_DIR" ]]; then
+    log_error "Working directory does not exist: $WORKING_DIR"
+    exit 1
+fi
+WORKING_DIR=$(cd "$WORKING_DIR" && pwd)
+
+# --- Check tmux ---
+if ! tmux display-message -p '#{session_name}' &>/dev/null; then
+    log_error "Not in tmux — vault-dispatch requires tmux"
+    exit 1
+fi
+
+# --- Resolve pane ---
+if [[ -z "$TARGET_PANE" ]]; then
+    # Auto-detect first free pane
+    TARGET_PANE=$(find_free_panes | head -1)
+    if [[ -z "$TARGET_PANE" ]]; then
+        log_error "No free tmux panes available"
+        echo ""
+        echo "  All grid panes are occupied. Options:"
+        echo "  1. Use --pane <id> to target a specific pane"
+        echo "  2. Stop an existing instance first"
+        echo ""
+        echo "  Current pane usage:"
+        tmux list-panes -a -F '  #{pane_id}  #{window_name}  #{pane_current_command}' 2>/dev/null | grep -v tui
+        exit 1
+    fi
+    log_success "Auto-selected free pane: $TARGET_PANE"
+else
+    # Validate specified pane exists
+    if ! tmux display-message -t "$TARGET_PANE" -p '#{pane_id}' &>/dev/null; then
+        log_error "Pane not found: $TARGET_PANE"
+        exit 1
+    fi
+    log_success "Using specified pane: $TARGET_PANE"
+fi
+
+# --- Build the dispatch prompt ---
+DISPATCH_PROMPT=$(build_dispatch_prompt "$SESSION_DOC" "$WORKING_DIR" "$PRIMARCH_NAME" "$EXTRA_CONTEXT")
+
+# --- Build the claude launch command ---
+CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "\$HOME/.local/bin/claude")
+
+if [[ -n "$PRIMARCH_NAME" ]]; then
+    LAUNCH_CMD="cd '${VAULT_DIR}' && primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
+else
+    LAUNCH_CMD="cd '${VAULT_DIR}' && ${CLAUDE_BIN} --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
+fi
+
+# --- Display summary ---
+echo ""
+echo -e "${BOLD}=========================================${NC}"
+echo -e "${BOLD} Vault Dispatch${NC}"
+echo -e "${BOLD}=========================================${NC}"
+echo ""
+echo -e "  ${DIM}Session doc:${NC}  $SESSION_DOC"
+echo -e "  ${DIM}Working dir:${NC}  $WORKING_DIR"
+echo -e "  ${DIM}Target pane:${NC}  $TARGET_PANE"
+[[ -n "$PRIMARCH_NAME" ]] && echo -e "  ${DIM}Primarch:${NC}    $PRIMARCH_NAME"
+echo -e "  ${DIM}Zealotry:${NC}    $ZEALOTRY"
+echo ""
+
+# --- Dry run ---
+if $DRY_RUN; then
+    log_dry "DRY RUN — no changes will be made"
+    echo ""
+    log_dry "Launch command:"
+    echo -e "  ${DIM}${LAUNCH_CMD}${NC}"
+    echo ""
+    log_dry "Dispatch prompt:"
+    echo -e "  ${DIM}${DISPATCH_PROMPT}${NC}"
+    echo ""
+    exit 0
+fi
+
+# --- Execute dispatch ---
+log_info "Dispatching to pane $TARGET_PANE..."
+
+# Clear the pane first
+tmux send-keys -t "$TARGET_PANE" "clear" Enter
+sleep 0.3
+
+# Send the launch command
+tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+
+log_success "Claude launched in vault"
+
+# --- Wait for Claude to start, then register with Token-API ---
+# Give Claude a moment to start and register itself
+(
+    sleep 8
+
+    # Try to find the new instance and set zealotry
+    if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+        API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
+        # Find instance in the target pane
+        instance_id=$(curl -s "${API_URL}/api/instances" 2>/dev/null | \
+            jq -r --arg pane "$TARGET_PANE" \
+            '.[] | select(.tmux_pane == $pane and (.stopped_at == null)) | .id' 2>/dev/null | head -1)
+
+        if [[ -n "$instance_id" ]]; then
+            # Set zealotry via Token-API
+            curl -s -X PATCH "${API_URL}/api/instances/${instance_id}" \
+                -H "Content-Type: application/json" \
+                -d "{\"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
+        fi
+    fi
+) &
+disown
+
+echo ""
+log_success "Dispatch complete"
+echo ""
+echo -e "  ${DIM}The instance will:${NC}"
+echo -e "  ${DIM}1. Read session doc at ${SESSION_DOC}${NC}"
+echo -e "  ${DIM}2. Gather context from linked notes${NC}"
+echo -e "  ${DIM}3. Transplant to ${WORKING_DIR}${NC}"
+echo -e "  ${DIM}4. Begin autonomous work${NC}"
+echo ""

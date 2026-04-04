@@ -3,7 +3,7 @@
 
 import { createServer } from 'http';
 
-export function createHttpServer(botClients, messageStore, config, logger) {
+export function createHttpServer(botClients, messageStore, config, logger, voiceManager = null) {
   // botClients: { mechanicus: client, custodes: client, ... } OR a single client object (legacy)
   // Normalize to a clients map
   const clients = (botClients && typeof botClients.sendMessage === 'function')
@@ -154,8 +154,7 @@ export function createHttpServer(botClients, messageStore, config, logger) {
       // GET /read — Read recent messages
       if (method === 'GET' && path === '/read') {
         const query = parseQuery(req.url);
-        // Accept named channels or raw numeric IDs (for thread reads)
-        const channelId = resolveChannel(query.channel) || (/^\d+$/.test(query.channel) ? query.channel : null);
+        const channelId = resolveChannel(query.channel);
         if (!channelId) return json(res, { error: `Unknown channel: ${query.channel}` }, 400);
 
         const limit = parseInt(query.limit) || 25;
@@ -361,6 +360,59 @@ export function createHttpServer(botClients, messageStore, config, logger) {
           channel_id: msg.channelId,
           timestamp: msg.createdAt.toISOString(),
         });
+      }
+
+      // GET /guild/channels — List ALL guild channels (including voice)
+      if (method === 'GET' && path === '/guild/channels') {
+        const guild = await discordClient.client.guilds.fetch(config.guild_id);
+        const channels = await guild.channels.fetch();
+        const list = channels
+          .filter(c => c !== null)
+          .map(c => ({ id: c.id, name: c.name, type: c.type, parent: c.parentId }))
+          .sort((a, b) => a.type - b.type || a.name.localeCompare(b.name));
+        return json(res, { channels: list });
+      }
+
+      // --- Voice endpoints ---
+
+      // POST /voice/join — Join a voice channel
+      if (method === 'POST' && path === '/voice/join') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        if (!body.channel_id) return json(res, { error: 'channel_id required' }, 400);
+        const result = await voiceManager.joinChannel(body.channel_id, body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // POST /voice/leave — Leave voice channel
+      if (method === 'POST' && path === '/voice/leave') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = await voiceManager.leaveChannel(body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // POST /voice/record — Start recording
+      if (method === 'POST' && path === '/voice/record') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = voiceManager.startRecording(body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // POST /voice/stop — Stop recording
+      if (method === 'POST' && path === '/voice/stop') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = voiceManager.stopRecording(body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // GET /voice/status — Voice connection status
+      if (method === 'GET' && path === '/voice/status') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const query = parseQuery(req.url);
+        return json(res, voiceManager.getStatus(query.bot));
       }
 
       // 404

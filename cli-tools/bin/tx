@@ -188,7 +188,7 @@ cmd_restart_pane() {
     pane_type=$(tmux show-options -pv -t "$pane_id" @PANE_TYPE 2>/dev/null || echo "")
 
     # Source machine identity for mobile shell init path
-    local mobile_shell_init="${CLI_TOOLS:-/Volumes/Imperium/Scripts/cli-tools}/tmux/mobile-shell-init.zsh"
+    local mobile_shell_init="${CLI_TOOLS}/tmux/mobile-shell-init.zsh"
 
     # Kill current process and respawn a fresh shell
     tmux respawn-pane -k -t "$pane_id"
@@ -232,7 +232,7 @@ cmd_restart_page() {
         log_success "Page '${window_name}' reset (${layout_origin} layout)"
     elif [[ "$window_name" == mobile-* ]]; then
         # Mobile window — kill extra panes and rebuild
-        local mobile_shell_init="${CLI_TOOLS:-/Volumes/Imperium/Scripts/cli-tools}/tmux/mobile-shell-init.zsh"
+        local mobile_shell_init="${CLI_TOOLS}/tmux/mobile-shell-init.zsh"
         local monitor_height=6
 
         # Kill all panes except the first
@@ -354,7 +354,6 @@ while IFS='=' read -r tty sess; do
         if ! tmux has-session -t "\$sess" 2>/dev/null; then
             tmux new-session -d -t '$SESSION_NAME' -s "\$sess" 2>/dev/null || true
             tmux select-window -t "\$sess:mobile-1" 2>/dev/null || true
-            tmux set-hook -t "\$sess" client-resized 'run-shell tmux-mobile-keyboard' 2>/dev/null || true
         fi
         tmux switch-client -c "\$tty" -t "\$sess" 2>/dev/null || true
     fi

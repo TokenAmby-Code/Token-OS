@@ -41,11 +41,19 @@ DialInput(dir) {
     if (timeSinceLast < DIAL_ACCEL_WINDOW_MS && timeSinceLast > 0)
         dialAccelMultiplier := Min(dialAccelMultiplier * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
 
-    ; Add to accumulator: base amount scaled by current acceleration
-    dialAccum += dir * DIAL_BASE_AMOUNT * dialAccelMultiplier
+    ; Every input guarantees at least 1 scroll line immediately
+    if (dir > 0)
+        MouseClick("WheelUp",,, 1)
+    else
+        MouseClick("WheelDown",,, 1)
 
-    ; Start timer if not running
-    if (!dialTimerRunning) {
+    ; Add surplus to accumulator for momentum (subtract the 1 we already sent)
+    surplus := (DIAL_BASE_AMOUNT * dialAccelMultiplier) - 1
+    if (surplus > 0)
+        dialAccum += dir * surplus
+
+    ; Start timer if we have accumulator debt to pay out
+    if (Abs(dialAccum) >= 1 && !dialTimerRunning) {
         dialTimerRunning := true
         SetTimer(DialScrollTick, DIAL_TICK_MS)
     }

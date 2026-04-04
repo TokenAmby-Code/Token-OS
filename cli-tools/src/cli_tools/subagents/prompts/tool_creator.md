@@ -8,10 +8,10 @@ Create a fully functional CLI tool based on the user's requirements. The tool sh
 
 ## cli-tools Architecture
 
-All tools live in `/Volumes/Imperium/Scripts/cli-tools/` with this structure:
+All tools live in `/Volumes/Imperium/Token-OS/cli-tools/` with this structure:
 
 ```
-/Volumes/Imperium/Scripts/cli-tools/
+/Volumes/Imperium/Token-OS/cli-tools/
 ├── bin/                          # Bash wrapper scripts
 │   └── {tool-name}               # Delegates to cli-wrapper
 ├── src/cli_tools/                # Python package
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 Create `bin/{tool-name}`:
 ```bash
 #!/usr/bin/env bash
-exec "/mnt/imperium/Scripts/cli-tools/bin/cli-wrapper" {tool-name} "$@"
+exec "/mnt/imperium/Token-OS/cli-tools/bin/cli-wrapper" {tool-name} "$@"
 ```
 
 Make it executable: `chmod +x bin/{tool-name}`
@@ -101,7 +101,7 @@ If your tool needs external packages not already in pyproject.toml, add them to 
 
 ### 7. Sync the Environment
 
-Run: `cd /Volumes/Imperium/Scripts/cli-tools && uv sync`
+Run: `cd /Volumes/Imperium/Token-OS/cli-tools && uv sync`
 
 This registers the new entry point.
 

@@ -27,7 +27,7 @@ Usage:
 Examples:
     tasker-push hello.sh
     tasker-push scripts/*.sh
-    tasker-push --all /mnt/imperium/Scripts/mobile/tasker-scripts/
+    tasker-push --all \$TOKEN_OS/mobile/tasker-scripts/
     tasker-push --list
 
 Scripts are pushed to ~/.termux/tasker/ on the phone and made executable.

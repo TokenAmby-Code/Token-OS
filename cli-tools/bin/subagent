@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 LOG_DIR="$HOME/.subagent/logs"
 CLAUDE_BIN="$HOME/.local/bin/claude"
 
@@ -254,7 +257,7 @@ run_remote() {
 
     # Build remote subagent command (pass through all flags except --host/--dir)
     # Use full path so the correct version is found regardless of remote SSH PATH
-    local remote_cmd="/mnt/imperium/Scripts/cli-tools/bin/subagent"
+    local remote_cmd="$(imperium_cfg nas_imperium "$REMOTE_HOST")/Token-OS/cli-tools/bin/subagent"
     case "$BACKEND" in
         codex)  remote_cmd+=" --codex" ;;
         claude) remote_cmd+=" --claude" ;;

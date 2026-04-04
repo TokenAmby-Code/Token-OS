@@ -9,14 +9,14 @@ LOG_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md"
 FLEET_REPORT_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Fleet/fleet_status.md"
 N = 10
 DAILY_BUDGET_USD = 2.00
-GUARDSMAN_BIN = "/mnt/imperium/Scripts/cli-tools/bin/guardsman"
+GUARDSMAN_BIN = os.environ.get("CLI_TOOLS", "/mnt/imperium/Token-OS/cli-tools") + "/bin/guardsman"
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
-    ("ls /mnt/imperium/Scripts/token-api/ | fleet_dispatch_poc.py is listed", "fallback"),
+    ("ls /mnt/imperium/Token-OS/token-api/ | fleet_dispatch_poc.py is listed", "fallback"),
     ("curl -s localhost:7777/health | response contains a status field", "fallback"),
     ("date | output contains a valid year between 2020 and 2030", "fallback"),
-    ("head -3 /mnt/imperium/Scripts/token-api/CLAUDE.md | first lines describe Token-API or port 7777", "fallback"),
+    ("head -3 /mnt/imperium/Token-OS/token-api/CLAUDE.md | first lines describe Token-API or port 7777", "fallback"),
 ]
 
 

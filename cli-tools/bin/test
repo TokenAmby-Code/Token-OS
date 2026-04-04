@@ -20,7 +20,10 @@
 
 set -euo pipefail
 
-DEPLOY_DIR="/mnt/imperium/Scripts/cli-tools/src/deploy"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+DEPLOY_DIR="$CLI_TOOLS/src/deploy"
 
 # Check if help is requested
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then

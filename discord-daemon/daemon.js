@@ -5,6 +5,8 @@
 import { createDiscordClient, createBotClients, loadConfig } from './discord-client.js';
 import { createHttpServer } from './http-server.js';
 import { createMessageStore } from './message-store.js';
+import { createVoiceManager } from './voice.js';
+import { createTranscriber } from './transcribe.js';
 import { writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -12,8 +14,9 @@ import { SlashCommandBuilder, Events } from 'discord.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
-const PID_FILE = join(BASE_DIR, 'daemon.pid');
-const LOG_DIR = join(BASE_DIR, 'logs');
+const LOCAL_DIR = join(process.env.HOME || '/tmp', '.discord-cli');
+const PID_FILE = join(LOCAL_DIR, 'daemon.pid');
+const LOG_DIR = join(LOCAL_DIR, 'logs');
 
 mkdirSync(LOG_DIR, { recursive: true });
 
@@ -61,7 +64,50 @@ async function main() {
   const botClients = createBotClients(config, logger);
   const discordClient = botClients['mechanicus'] || Object.values(botClients)[0];
 
-  const httpServer = createHttpServer(botClients, messageStore, config, logger);
+  const voiceManager = createVoiceManager(botClients, config, logger);
+  const transcriber = createTranscriber(config, logger);
+
+  // Wire transcriber to voice manager (callback now receives botName)
+  voiceManager.setTranscriptionCallback((userId, pcmBuffer, filepath, botName) => {
+    return transcriber.handleAudio(userId, pcmBuffer, filepath, botName);
+  });
+
+  // Forward transcription results to Token API
+  transcriber.onTranscription(async (result) => {
+    const botLabel = result.botName || 'voice';
+    logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);
+    try {
+      await fetch(`http://127.0.0.1:${config.token_api_port}/api/discord/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: `voice-${result.timestamp}`,
+          channel_id: `voice-${botLabel}`,
+          channel_name: `voice-${botLabel}`,
+          guild_id: config.guild_id,
+          author: {
+            id: result.userId,
+            username: 'voice',
+            displayName: 'Voice',
+            bot: false,
+          },
+          content: result.text,
+          timestamp: new Date(result.timestamp).toISOString(),
+          is_dm: false,
+          is_reply: false,
+          is_voice: true,
+          bot_name: botLabel,
+        }),
+      });
+    } catch {
+      // Token API might not be running
+    }
+  });
+
+  // Set up auto-join/leave for bots with assigned voice channels
+  voiceManager.setupAutoJoin();
+
+  const httpServer = createHttpServer(botClients, messageStore, config, logger, voiceManager);
 
   // Forward incoming messages to Token API if configured (main listening bot only)
   if (config.forward_to_token_api) {

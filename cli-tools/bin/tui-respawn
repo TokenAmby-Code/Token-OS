@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# tui-respawn — Force-restart all TUI monitor panes in the local tmux session
+# TAGS: tmux, tui, lifecycle
+# AUDIENCE: human, agent
+#
+# Usage:
+#   tui-respawn          # Respawn all TUI panes in session 'main'
+#   tui-respawn -s foo   # Respawn all TUI panes in session 'foo'
+#   tui-respawn --dry    # Show what would be respawned, don't act
+#
+# Works regardless of pane state: alive (kills + respawns), dead (respawns),
+# or dirty-flagged (clears flag + respawns). Uses @PANE_TYPE=tui tag set by
+# tmux-workspace to find monitor panes.
+
+set -euo pipefail
+
+SESSION="main"
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--session) SESSION="$2"; shift 2 ;;
+        --dry)        DRY_RUN=true; shift ;;
+        -h|--help)
+            echo "Usage: tui-respawn [-s session] [--dry]"
+            echo "  Respawn all TUI monitor panes in the given tmux session."
+            exit 0
+            ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "No tmux session '$SESSION'" >&2
+    exit 1
+fi
+
+count=0
+
+# Find all panes tagged as TUI monitors
+while IFS=$'\t' read -r pane_id pane_type window_name; do
+    if [[ "$pane_type" != "tui" ]]; then
+        continue
+    fi
+
+    count=$((count + 1))
+
+    if $DRY_RUN; then
+        echo "[dry] Would respawn $pane_id (window: $window_name)"
+        continue
+    fi
+
+    # Clear dirty flag so pane-died hook works again after this respawn
+    tmux set-option -p -t "$pane_id" @TUI_DIRTY "false" 2>/dev/null || true
+
+    # respawn-pane -k: kill any running process (or clear dead state) and restart
+    tmux respawn-pane -k -t "$pane_id" "tui-pane-guard"
+
+    echo "Respawned $pane_id (window: $window_name)"
+done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}	#{@PANE_TYPE}	#{window_name}')
+
+if [[ $count -eq 0 ]]; then
+    echo "No TUI panes found in session '$SESSION'"
+else
+    echo "Respawned $count TUI pane(s)"
+fi

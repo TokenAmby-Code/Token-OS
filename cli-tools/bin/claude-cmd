@@ -301,7 +301,9 @@ send_command() {
             tmux send-keys -t "$pane" C-u
             sleep 0.3
         fi
-        tmux send-keys -t "$pane" "$cmd" Enter
+        tmux send-keys -t "$pane" "$cmd"
+        sleep 0.3
+        tmux send-keys -t "$pane" Enter
     fi
 
     # Hold briefly so Claude Code processes the Enter before anyone else sends

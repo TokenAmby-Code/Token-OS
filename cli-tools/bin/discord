@@ -18,6 +18,11 @@
 #   channels                          List available channels
 #   thread create <channel> <name> [--bot <name>]       Create a public thread in a channel
 #   thread send <thread_id> <message> [--bot <name>]    Send a message to an existing thread
+#   voice join <channel_id>            Join a voice channel
+#   voice leave                        Leave voice channel
+#   voice record                       Start recording (audio capture)
+#   voice stop                         Stop recording
+#   voice status                       Voice connection status
 #
 # Channel aliases:
 #   fleet, forge, approvals, alerts, briefing, chat
@@ -548,6 +553,52 @@ parse_timeout() {
   fi
 }
 
+# --- Voice commands ---
+
+cmd_voice() {
+  local subcmd="${1:-status}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    join)
+      local channel_id="$1"
+      [[ -z "$channel_id" ]] && die "Usage: discord voice join <channel_id>"
+      local result
+      result=$(post "/voice/join" "{\"channel_id\":\"$channel_id\"}")
+      echo "$result" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Joined: {d.get(\"channelName\",\"unknown\")} ({d.get(\"channelId\")})")'
+      ;;
+    leave)
+      post "/voice/leave" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("Left voice channel" if d.get("left") else "Not connected")'
+      ;;
+    record)
+      post "/voice/record" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Recording: {d.get(\"recording\")}")'
+      ;;
+    stop)
+      post "/voice/stop" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Recording stopped")'
+      ;;
+    status)
+      get "/voice/status" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+state = "connected" if d.get("connected") else "disconnected"
+rec = "recording" if d.get("recording") else "idle"
+print(f"Voice: {state} | {rec} | listeners: {d.get(\"activeListeners\",0)} | state: {d.get(\"connectionState\",\"?\")}")
+if d.get("channelId"):
+    print(f"Channel: {d.get(\"channelId\")}")
+'
+      ;;
+    *)
+      echo "Usage: discord voice <join|leave|record|stop|status>"
+      echo ""
+      echo "  join <channel_id>   Join a voice channel"
+      echo "  leave               Leave voice channel"
+      echo "  record              Start recording (capture audio)"
+      echo "  stop                Stop recording"
+      echo "  status              Show voice connection status"
+      ;;
+  esac
+}
+
 # --- Main dispatch ---
 
 [[ $# -eq 0 ]] && show_help
@@ -567,6 +618,7 @@ case "$COMMAND" in
   status)    daemon_check; cmd_status ;;
   channels)  daemon_check; cmd_channels ;;
   thread)    daemon_check; cmd_thread "$@" ;;
+  voice)     daemon_check; cmd_voice "$@" ;;
   -h|--help|help) show_help ;;
   *)         die "Unknown command: $COMMAND. Run 'discord --help' for usage." ;;
 esac

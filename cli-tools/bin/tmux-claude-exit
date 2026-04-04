@@ -3,10 +3,9 @@
 # TAGS: tmux, claude, exit, resume, keybind
 # AUDIENCE: human
 #
-# Sends Ctrl+C x3 to kill the current Claude session, then injects
-# `claude --resume "instance-name"` into bash history (via HISTFILE append)
-# and clears the terminal. The instance name comes from the tmux pane title,
-# which is set by Claude's /rename command.
+# Sends Ctrl+C x3 to kill the current Claude session, then captures
+# the resume command from Claude's exit output, stages it in shell
+# history, and clears the terminal.
 #
 # Usage:
 #     tmux-claude-exit              # Current pane
@@ -24,20 +23,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Helper: run tmux command with optional -t pane targeting
+# Resolve target pane — run-shell doesn't set $TMUX_PANE but does set
+# the target for display-message. Prefix with % since display-message
+# inside run-shell strips the % from #{pane_id}.
+if [[ -z "$PANE" ]]; then
+    _id=$(tmux display-message -p '#{pane_id}' 2>/dev/null) || true
+    if [[ -n "$_id" && "$_id" != %* ]]; then
+        PANE="%${_id}"
+    elif [[ -n "$_id" ]]; then
+        PANE="$_id"
+    fi
+fi
+
+# Helper: run tmux command with -t pane targeting after the subcommand
+# e.g. _tmux send-keys C-c → tmux send-keys -t %3 C-c
 _tmux() {
+    local subcmd="$1"; shift
     if [[ -n "$PANE" ]]; then
-        tmux "$@" -t "$PANE"
+        tmux "$subcmd" -t "$PANE" "$@"
     else
-        tmux "$@"
+        tmux "$subcmd" "$@"
     fi
 }
-
-# Grab the pane title (set by Claude /rename → becomes the instance name)
-# Strip Claude Code's ✳ prefix artifact before using for --resume search
-INSTANCE_NAME=$(_tmux display-message -p '#{pane_title}' 2>/dev/null || true)
-INSTANCE_NAME="${INSTANCE_NAME#✳ }"
-INSTANCE_NAME="${INSTANCE_NAME#✳}"
 
 # Send Ctrl+C three times with small delays
 for i in 1 2 3; do
@@ -45,17 +52,55 @@ for i in 1 2 3; do
     sleep 0.2
 done
 
-# Buffer a clear immediately so Claude's exit output gets wiped fast
-_tmux send-keys "clear" Enter
+# Wait for Claude to print its exit output (resume command)
+sleep 1
 
-# Build the resume command
-if [[ -n "$INSTANCE_NAME" && "$INSTANCE_NAME" != "bash" && "$INSTANCE_NAME" != "zsh" ]]; then
-    RESUME_CMD="claude --resume \"${INSTANCE_NAME}\""
-else
-    # Fallback: no useful pane title, just use bare --resume for interactive picker
+# Capture the resume command from Claude's exit output.
+# Handles line-wrapping (panes are often 47-50 chars wide) and
+# rejects RHS noise (pane borders, /buddy panel text).
+RESUME_CMD=$(tmux capture-pane -p -t "$PANE" -S -20 2>/dev/null | python3 -c '
+import sys, re
+
+lines = sys.stdin.read().split("\n")
+box_chars = set("│╭╮╰╯┌┐└┘├┤┬┴┼─╭╮╯╰")
+
+for i in range(len(lines) - 1, -1, -1):
+    line = lines[i]
+    if any(c in box_chars for c in line):
+        continue
+    if "claude --resume" not in line:
+        continue
+
+    m = re.search(r"claude --resume\s+(.*)$", line)
+    if not m:
+        continue
+
+    arg = m.group(1).strip()
+    cmd = "claude --resume " + arg
+
+    # Detect truncation: unclosed quote or partial UUID
+    needs_next = False
+    if arg.startswith(chr(34)) and not arg.endswith(chr(34)):
+        needs_next = True
+    elif re.match(r"^[a-f0-9-]+$", arg) and len(arg) < 36:
+        needs_next = True
+
+    if needs_next and i + 1 < len(lines):
+        nxt = lines[i + 1].strip()
+        if nxt and not any(c in box_chars for c in nxt) and not re.match(r"^(tokenclaw|\$|%)", nxt):
+            cmd = cmd + nxt
+
+    print(cmd)
+    sys.exit(0)
+' 2>/dev/null)
+
+if [[ -z "$RESUME_CMD" ]]; then
     RESUME_CMD="claude --resume"
 fi
 
-# Add resume command to bash history, then clear again for a clean slate
-sleep 0.3
-_tmux send-keys "history -s $(printf '%q' "$RESUME_CMD") && clear" Enter
+# Stage resume command in shell history, then clear
+PANE_SHELL=$(_tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo "")
+case "$PANE_SHELL" in
+    *zsh*)  _tmux send-keys "print -s $(printf '%q' "$RESUME_CMD") && clear" Enter ;;
+    *)      _tmux send-keys "history -s $(printf '%q' "$RESUME_CMD") && clear" Enter ;;
+esac

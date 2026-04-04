@@ -24,6 +24,17 @@ if [[ -z "$TARGET" ]]; then
     TARGET="${SESSION}:${WINDOW}"
 fi
 
+# If grid panes are stashed (true fullscreen active), retract first
+GRID_EXP=$(tmux show-options -wv -t "$TARGET" @GRID_EXPANDED 2>/dev/null || echo "none")
+if [[ "$GRID_EXP" != "none" ]]; then
+    GRID_STASH=$(tmux show-options -wv -t "$TARGET" @GRID_STASH 2>/dev/null || echo "")
+    if [[ -n "$GRID_STASH" ]]; then
+        tmux-grid-expand --retract
+        # retract already calls us back, so exit to avoid double-reset
+        exit 0
+    fi
+fi
+
 # Read mode state
 FOCUSED=$(tmux show-options -wv -t "$TARGET" @FOCUSED 2>/dev/null || echo "false")
 LAYOUT_ORIGIN=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
@@ -131,3 +142,4 @@ done <<< "$grid_data"
 
 tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none" 2>/dev/null || true
 tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
+tmux set-option -w -t "$TARGET" @GRID_STASH "" 2>/dev/null || true

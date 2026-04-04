@@ -47,7 +47,7 @@ fi
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TOKEN_API_DIR="${IMPERIUM:-/mnt/imperium}/Scripts/token-api"
+TOKEN_API_DIR="${TOKEN_OS}/token-api"
 TOKEN_API_SCRIPT="token-api-tui.py"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────

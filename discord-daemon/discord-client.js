@@ -64,14 +64,18 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
   // Send-only bots (custodes, inquisition) only need Guilds to send to channels.
   const isListener = resolvedBotConfig?.default === true || botName === 'mechanicus';
 
+  // Bots with assigned voice channels need GuildVoiceStates for auto-join/leave
+  const hasVoiceChannel = !!(config.voice_channels?.[botName]);
+
   const client = new Client(isListener ? {
-    // Full intents: read ALL message content, DMs, reactions
+    // Full intents: read ALL message content, DMs, reactions, voice states
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.DirectMessages,
       GatewayIntentBits.GuildMessageReactions,
+      GatewayIntentBits.GuildVoiceStates,
     ],
     partials: [
       Partials.Channel,
@@ -79,8 +83,10 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
       Partials.Reaction,
     ],
   } : {
-    // Minimal intents: send-only bots only need Guilds to fetch channels
-    intents: [GatewayIntentBits.Guilds],
+    // Non-listener bots: Guilds + GuildVoiceStates if they have a voice channel
+    intents: hasVoiceChannel
+      ? [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+      : [GatewayIntentBits.Guilds],
   });
 
   // Event: ready

@@ -7,13 +7,13 @@
 #   token-restart              # Full restart: Mac + WSL + phone TUI
 #   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
-#   token-restart --tui-only   # Signal TUI restarts only (no server restart)
+#   token-restart --tui-only   # Respawn all TUI panes (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
-# NAS era: no git sync needed — all devices read from /Volumes/Imperium/Scripts.
+# NAS era: no git sync needed — all devices read from /Volumes/Imperium/Token-OS.
 
 set -euo pipefail
 
@@ -38,9 +38,6 @@ WSL_PORT=7777
 LABEL="ai.openclaw.tokenapi"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
-# Signal dir
-SIGNAL_DIR="$HOME/.claude"
-
 is_mac() {
     [[ "$IMPERIUM_MACHINE" == "mac" ]]
 }
@@ -53,7 +50,7 @@ Usage:
     token-restart              Full restart (Mac → WSL → phone)
     token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
-    token-restart --tui-only   Signal TUI restarts only (no server restart)
+    token-restart --tui-only   Respawn all TUI panes via tmux (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
@@ -62,13 +59,13 @@ Usage:
     When run from a non-Mac device, proxies to Mac via SSH.
 
 Flow:
-    1. Restart Mac token-api (launchctl) + write Mac TUI signals
+    1. Restart Mac token-api (launchctl) + respawn Mac TUI panes
     2. Restart WSL satellite (HTTP → restart, SSH fallback)
-    3. Signal phone TUI restart (SSH)
+    3. Respawn TUI panes on WSL + phone via SSH (tui-respawn)
     4. Health-check all, print summary
 
 Notes:
-    - All devices read from NAS (/Volumes/Imperium/Scripts) — no sync needed
+    - All devices read from NAS (/Volumes/Imperium/Token-OS) — no sync needed
     - WSL and phone steps are fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
@@ -89,7 +86,7 @@ remote_restart() {
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
     [[ "${ACTION}" == "tui-only" ]] && flags="$flags --tui-only"
 
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "/Volumes/Imperium/Scripts/cli-tools/bin/token-restart${flags}" 2>&1; then
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
         echo -e "  ${GREEN}✓${NC} Remote restart completed"
     else
@@ -102,7 +99,7 @@ remote_restart() {
 remote_status() {
     echo -e "${BOLD}=== Multi-Device Status (via Mac) ===${NC}"
     echo ""
-    ssh -o ConnectTimeout=5 -o BatchMode=yes mini "/Volumes/Imperium/Scripts/cli-tools/bin/token-restart --status" 2>&1 || {
+    ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart --status" 2>&1 || {
         echo -e "  ${RED}✗${NC} Cannot reach Mac via SSH"
         # Fall back to direct health checks
         echo ""
@@ -120,14 +117,36 @@ remote_status() {
     }
 }
 
-# ============ TUI Signals ============
+# ============ TUI Respawn ============
 
-write_tui_signals() {
-    local signal_data="{\"reason\":\"token-restart\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-    mkdir -p "$SIGNAL_DIR"
-    for suffix in desktop mobile; do
-        echo "$signal_data" > "$SIGNAL_DIR/tui-restart-${suffix}.signal"
-    done
+respawn_local_tui() {
+    if command -v tui-respawn &>/dev/null; then
+        tui-respawn 2>/dev/null || true
+    else
+        echo -e "  ${YELLOW}⚠${NC} tui-respawn not found locally"
+    fi
+}
+
+respawn_wsl_tui() {
+    local nas_path
+    nas_path="$(imperium_cfg nas_imperium wsl)"
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes wsl \
+        "${nas_path}/Token-OS/cli-tools/bin/tui-respawn" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} WSL TUI panes respawned"
+    else
+        echo -e "  ${YELLOW}⚠${NC} WSL unreachable or no tmux session, skipping TUI respawn"
+    fi
+}
+
+respawn_phone_tui() {
+    local nas_path
+    nas_path="$(imperium_cfg nas_imperium phone 2>/dev/null || echo "")"
+    if [[ -n "$nas_path" ]] && ssh -o ConnectTimeout=3 -o BatchMode=yes phone \
+        "${nas_path}/Token-OS/cli-tools/bin/tui-respawn" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Phone TUI panes respawned"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Phone unreachable or no tmux session, skipping TUI respawn"
+    fi
 }
 
 # ============ Mac ============
@@ -180,8 +199,35 @@ kill_server() {
     echo "Note: launchd will auto-restart unless you 'launchctl bootout gui/501/${LABEL}'"
 }
 
+sync_venv_if_needed() {
+    local lockfile="${TOKEN_OS}/token-api/uv.lock"
+    local checksum_file="$HOME/.local/venvs/token-api/.uv-lock-checksum"
+    local venv_dir="$HOME/.local/venvs/token-api"
+
+    if [[ ! -f "$lockfile" ]]; then
+        return 0
+    fi
+
+    local current_checksum
+    current_checksum=$(shasum -a 256 "$lockfile" 2>/dev/null | cut -d' ' -f1)
+    local stored_checksum=""
+    [[ -f "$checksum_file" ]] && stored_checksum=$(cat "$checksum_file" 2>/dev/null)
+
+    if [[ "$current_checksum" != "$stored_checksum" ]]; then
+        echo -e "${BLUE}→${NC} uv.lock changed, syncing venv..."
+        if (cd "${TOKEN_OS}/token-api" && UV_PROJECT_ENVIRONMENT="$venv_dir" uv sync 2>&1); then
+            echo "$current_checksum" > "$checksum_file"
+            echo -e "  ${GREEN}✓${NC} Venv synced"
+        else
+            echo -e "  ${YELLOW}⚠${NC} Venv sync failed (continuing with existing venv)"
+        fi
+    fi
+}
+
 restart_mac() {
     echo -e "${BLUE}→${NC} Restarting Mac token-api..."
+
+    sync_venv_if_needed
 
     launchctl kickstart -k gui/501/${LABEL} 2>/dev/null || {
         echo "  Service not loaded, bootstrapping..."
@@ -288,17 +334,6 @@ get_phone_status() {
     fi
 }
 
-restart_phone_tui() {
-    echo -e "${BLUE}→${NC} Signaling phone TUI restart..."
-    local signal_data="{\"reason\":\"token-restart\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-    if ssh -o ConnectTimeout=3 -o BatchMode=yes phone \
-        "mkdir -p ~/.claude && echo '${signal_data}' > ~/.claude/tui-restart-mobile.signal" 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} Phone TUI signal written"
-    else
-        echo -e "  ${YELLOW}⚠${NC} Phone unreachable, skipping"
-    fi
-}
-
 # ============ Status ============
 
 get_status_all() {
@@ -350,21 +385,26 @@ full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 1. Mac restart + TUI signals
+    # 1. Mac restart + local TUI respawn
     restart_mac || true
-    write_tui_signals
+    echo -e "${BLUE}→${NC} Respawning local TUI panes..."
+    respawn_local_tui
     echo ""
 
-    # 2. WSL and phone in parallel
+    # 2. WSL restart + remote TUI respawn (parallel)
     restart_wsl &
     local wsl_pid=$!
-    restart_phone_tui &
-    local phone_pid=$!
 
     wait $wsl_pid 2>/dev/null || true
-    wait $phone_pid 2>/dev/null || true
 
-    # 3. Summary
+    # 3. Respawn TUI panes on remote machines
+    echo ""
+    echo -e "${BLUE}→${NC} Respawning remote TUI panes..."
+    respawn_wsl_tui &
+    respawn_phone_tui &
+    wait
+
+    # 4. Summary
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
     if check_mac_health; then
@@ -459,18 +499,14 @@ case "$ACTION" in
         restart_wsl
         ;;
     tui-only)
-        echo -e "${BLUE}→${NC} Signaling TUI restarts (no server restart)..."
-        write_tui_signals
-        echo -e "  ${GREEN}✓${NC} Mac TUI signals written"
-        # Write WSL TUI signals via SSH
-        signal_data="{\"reason\":\"token-restart --tui-only\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-        if ssh -o ConnectTimeout=3 -o BatchMode=yes wsl \
-            "mkdir -p ~/.claude && for s in desktop mobile; do echo '${signal_data}' > ~/.claude/tui-restart-\${s}.signal; done" 2>/dev/null; then
-            echo -e "  ${GREEN}✓${NC} WSL TUI signals written"
-        else
-            echo -e "  ${YELLOW}⚠${NC} WSL unreachable, skipping"
-        fi
-        restart_phone_tui
+        echo -e "${BOLD}=== TUI Respawn (all machines) ===${NC}"
+        echo ""
+        echo -e "${BLUE}→${NC} Respawning local TUI panes..."
+        respawn_local_tui
+        echo -e "${BLUE}→${NC} Respawning remote TUI panes..."
+        respawn_wsl_tui &
+        respawn_phone_tui &
+        wait
         ;;
     restart)
         if [[ -n "$DEPLOY_FROM" ]]; then

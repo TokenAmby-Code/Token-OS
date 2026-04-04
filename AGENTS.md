@@ -1,6 +1,6 @@
 # Scripts - Generic Utility Scripts and Tools
 
-**Location**: `/Volumes/Imperium/Scripts/`
+**Location**: `/Volumes/Imperium/Token-OS/`
 **Purpose**: Generic utility scripts, tools, and services
 **Last Updated**: 2026-02-15
 **Status**: MOVED from `~/.openclaw/workspace/Scripts` to `/Volumes/Imperium/Scripts` (generic, not OpenClaw-specific)
@@ -21,7 +21,7 @@ Scripts/
 
 ### Token API (port 7777)
 
-**Location**: `/Volumes/Imperium/Scripts/token-api/`
+**Location**: `/Volumes/Imperium/Token-OS/token-api/`
 **Mac Service**: LaunchAgent `ai.openclaw.tokenapi`
 **WSL Satellite**: systemd `token-satellite.service` (enforcement, `/restart`)
 **Logs**: `~/.claude/token-api-stdout.log`, `~/.claude/token-api-stderr.log`
@@ -39,11 +39,11 @@ Scripts/
 - `token-restart --status`: All-device health check
 - `curl http://localhost:7777/health`: Health check
 
-**See**: `/Volumes/Imperium/Scripts/token-api/CLAUDE.md` for details
+**See**: `/Volumes/Imperium/Token-OS/token-api/CLAUDE.md` for details
 
 ### Discord Daemon (port 7779)
 
-**Location**: `/Volumes/Imperium/Scripts/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
+**Location**: `/Volumes/Imperium/Token-OS/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
 **Service**: LaunchAgent `ai.tokenclaw.discord` (KeepAlive)
 **Logs**: `~/.discord-cli/logs/` (also `launchd-stdout.log` for console output)
 
@@ -106,7 +106,7 @@ Agents can:
 ### Executor Fleet Deployment
 
 ```bash
-/Volumes/Imperium/Scripts/Shell/deploy-executor-fleet.sh
+/Volumes/Imperium/Token-OS/Shell/deploy-executor-fleet.sh
 ```
 
 Deploys 6 executors:
@@ -121,13 +121,13 @@ Deploys 6 executors:
 
 ```bash
 # Create snapshot before risky operation
-/Volumes/Imperium/Scripts/Shell/safety-snapshot.sh pre-deployment
+/Volumes/Imperium/Token-OS/Shell/safety-snapshot.sh pre-deployment
 
 # Rollback if something breaks
-/Volumes/Imperium/Scripts/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
+/Volumes/Imperium/Token-OS/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
 
 # Check safety status
-/Volumes/Imperium/Scripts/Shell/safety-dashboard.sh
+/Volumes/Imperium/Token-OS/Shell/safety-dashboard.sh
 ```
 
 ---

@@ -1,4 +1,4 @@
-#!/Users/tokenclaw/Scripts/token-api/.venv/bin/python
+#!/Users/tokenclaw/Token-OS/token-api/.venv/bin/python
 """
 Render specific TUI panels to SVG/text for debugging.
 

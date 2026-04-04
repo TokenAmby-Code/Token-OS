@@ -104,9 +104,9 @@ Located at `~/.openclaw/workspace/context/`:
 | Path | Source |
 |------|--------|
 | `context/root/AGENTS.md` | `~/AGENTS.md` (copy) |
-| `context/scripts/AGENTS.md` | `/Volumes/Imperium/Scripts/AGENTS.md` (symlink) |
-| `context/token-api/AGENTS.md` | `/Volumes/Imperium/Scripts/token-api/AGENTS.md` (symlink) |
-| `context/mobile/AGENTS.md` | `/Volumes/Imperium/Scripts/mobile/AGENTS.md` (symlink) |
+| `context/scripts/AGENTS.md` | `/Volumes/Imperium/Token-OS/AGENTS.md` (symlink) |
+| `context/token-api/AGENTS.md` | `/Volumes/Imperium/Token-OS/token-api/AGENTS.md` (symlink) |
+| `context/mobile/AGENTS.md` | `/Volumes/Imperium/Token-OS/mobile/AGENTS.md` (symlink) |
 | `context/claw-env/AGENTS.md` | `~/Claw-ENV/AGENTS.md` (symlink) |
 | `context/token-env/AGENTS.md` | `~/Token-ENV/AGENTS.md` (symlink) |
 

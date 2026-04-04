@@ -29,8 +29,24 @@ TUI_WINDOW="tui"
 MOBILE_WINDOW_PREFIX="mobile"
 MOBILE_WINDOW_COUNT=3
 MOBILE_MONITOR_HEIGHT=6
-MOBILE_SHELL_INIT="${CLI_TOOLS:-/Volumes/Imperium/Scripts/cli-tools}/tmux/mobile-shell-init.zsh"
-TOKEN_API_DIR="${IMPERIUM:-/Volumes/Imperium}/Scripts/token-api"
+MOBILE_SHELL_INIT="${CLI_TOOLS}/tmux/mobile-shell-init.zsh"
+TOKEN_API_DIR="${TOKEN_OS}/token-api"
+
+# --- Per-window default directories ---
+# Map window names to their default working directory.
+# Unmatched windows default to $HOME.
+window_dir() {
+    case "$1" in
+        bridge)    echo "$HOME" ;;
+        grid)      echo "$HOME" ;;
+        tui)       echo "${TOKEN_API_DIR}" ;;
+        backrooms) echo "$HOME" ;;
+        mobile-1)  echo "$HOME" ;;
+        mobile-2)  echo "$HOME" ;;
+        mobile-3)  echo "$HOME" ;;
+        *)         echo "$HOME" ;;
+    esac
+}
 
 # --- Proportions ---
 # Side columns: ~15% each, center grid: ~70%
@@ -49,6 +65,8 @@ init_tui_lifecycle() {
 create_grid_window() {
     local session="$1"
     local window="$2"
+    local wdir
+    wdir="$(window_dir "${window}")"
 
     # Get current window width to calculate absolute sizes
     local total_w
@@ -65,22 +83,22 @@ create_grid_window() {
 
     # Start with a single pane — this becomes the left side column
     # Split right: left side | rest
-    tmux split-window -h -t "${session}:${window}.1" -l $((total_w - side_w - 1))
+    tmux split-window -h -t "${session}:${window}.1" -l $((total_w - side_w - 1)) -c "$wdir"
 
     # Now pane 1 = left side, pane 2 = rest
     # Split pane 2 to carve out the right side column
-    tmux split-window -h -t "${session}:${window}.2" -l "${side_w}"
+    tmux split-window -h -t "${session}:${window}.2" -l "${side_w}" -c "$wdir"
 
     # Now: pane 1 = left side, pane 2 = center, pane 3 = right side
     # Split center into left-center and right-center
-    tmux split-window -h -t "${session}:${window}.2" -l "${center_half}"
+    tmux split-window -h -t "${session}:${window}.2" -l "${center_half}" -c "$wdir"
 
     # Now: pane 1 = left side, pane 2 = center-left, pane 3 = center-right, pane 4 = right side
     # Split center-left vertically
-    tmux split-window -v -t "${session}:${window}.2" -l "${half_h}"
+    tmux split-window -v -t "${session}:${window}.2" -l "${half_h}" -c "$wdir"
 
     # Split center-right vertically
-    tmux split-window -v -t "${session}:${window}.4" -l "${half_h}"
+    tmux split-window -v -t "${session}:${window}.4" -l "${half_h}" -c "$wdir"
 
     # Final pane layout (6 panes):
     #   1: left side column (full height)
@@ -114,6 +132,8 @@ create_grid_window() {
 create_bridge_window() {
     local session="$1"
     local window="$2"
+    local wdir
+    wdir="$(window_dir "${window}")"
 
     local total_w
     total_w=$(tmux display-message -t "${session}:${window}" -p '#{window_width}')
@@ -128,16 +148,16 @@ create_bridge_window() {
     local half_h=$((total_h / 2))
 
     # Pane 1 starts as full width — split off right column
-    tmux split-window -h -t "${session}:${window}.1" -l "${right_w}"
+    tmux split-window -h -t "${session}:${window}.1" -l "${right_w}" -c "$wdir"
 
     # Pane 1 = left (grid area), pane 2 = right column
     # Split grid area into left and right halves
-    tmux split-window -h -t "${session}:${window}.1" -l "${grid_half}"
+    tmux split-window -h -t "${session}:${window}.1" -l "${grid_half}" -c "$wdir"
 
     # Pane 1 = grid-left, pane 2 = grid-right, pane 3 = right col
     # Split each grid column vertically
-    tmux split-window -v -t "${session}:${window}.1" -l "${half_h}"
-    tmux split-window -v -t "${session}:${window}.3" -l "${half_h}"
+    tmux split-window -v -t "${session}:${window}.1" -l "${half_h}" -c "$wdir"
+    tmux split-window -v -t "${session}:${window}.3" -l "${half_h}" -c "$wdir"
 
     # Final layout (5 panes):
     #   1: top-left grid
@@ -172,7 +192,7 @@ create_bridge_window() {
 
 create_tui_window() {
     local session="$1"
-    tmux new-window -t "${session}" -n "${TUI_WINDOW}" -c "${TOKEN_API_DIR}"
+    tmux new-window -t "${session}" -n "${TUI_WINDOW}" -c "$(window_dir "${TUI_WINDOW}")"
     tmux set-option -p -t "${session}:${TUI_WINDOW}.1" @PANE_TYPE "tui"
     init_tui_lifecycle "${session}:${TUI_WINDOW}.1"
     tmux send-keys -t "${session}:${TUI_WINDOW}" "exec tui-pane-guard" Enter
@@ -180,7 +200,7 @@ create_tui_window() {
 
 create_backrooms_window() {
     local session="$1"
-    tmux new-window -t "${session}" -n "backrooms" -d
+    tmux new-window -t "${session}" -n "backrooms" -d -c "$(window_dir backrooms)"
     tmux set-option -p -t "${session}:backrooms.1" @PANE_TYPE "backrooms"
 }
 
@@ -190,7 +210,9 @@ create_mobile_windows() {
 
     for i in $(seq 1 "$count"); do
         local win_name="${MOBILE_WINDOW_PREFIX}-${i}"
-        tmux new-window -t "${session}" -n "${win_name}"
+        local wdir
+        wdir="$(window_dir "${win_name}")"
+        tmux new-window -t "${session}" -n "${win_name}" -c "$wdir"
 
         local total_h
         total_h=$(tmux display-message -t "${session}:${win_name}" -p '#{window_height}')
@@ -198,10 +220,10 @@ create_mobile_windows() {
         local half_terminal=$((terminal_area / 2))
 
         # Split off monitor at top (pane 1 stays small, pane 2 gets the rest)
-        tmux split-window -v -t "${session}:${win_name}.1" -l "${terminal_area}"
+        tmux split-window -v -t "${session}:${win_name}.1" -l "${terminal_area}" -c "$wdir"
 
         # Split the terminal area in half (pane 2 → top terminal, pane 3 → bottom terminal)
-        tmux split-window -v -t "${session}:${win_name}.2" -l "${half_terminal}"
+        tmux split-window -v -t "${session}:${win_name}.2" -l "${half_terminal}" -c "$wdir"
 
         # Final layout: pane 1 = monitor (top, crushed), pane 2 = terminal A, pane 3 = terminal B
         tmux set-option -p -t "${session}:${win_name}.1" @GRID_STATE "mini"
@@ -428,7 +450,7 @@ if $WINDOW_ONLY; then
         exit 1
     fi
     session=$(tmux display-message -p '#{session_name}')
-    tmux new-window -t "${session}" -n "${WINDOW_NAME}"
+    tmux new-window -t "${session}" -n "${WINDOW_NAME}" -c "$(window_dir "${WINDOW_NAME}")"
     create_grid_window "${session}" "${WINDOW_NAME}"
     echo "Grid window added to session '${session}'"
     exit 0
@@ -484,7 +506,7 @@ if $PORTABLE_MODE; then
     fi
 
     PORTABLE_SESSION="portable"
-    PORTABLE_STATUS="/Volumes/Imperium/Scripts/cli-tools/tmux/tmux-portable-status.conf"
+    PORTABLE_STATUS="${CLI_TOOLS}/tmux/tmux-portable-status.conf"
 
     # Kill stale portable session if it exists
     tmux kill-session -t "${PORTABLE_SESSION}" 2>/dev/null || true
@@ -508,7 +530,7 @@ if $MAC_MODE; then
         echo "Use --attach to connect, or kill it first with: tmux kill-session -t ${SESSION_NAME}"
         exit 0
     fi
-    tmux new-session -d -s "${SESSION_NAME}" -n "${BRIDGE_WINDOW}" -x 220 -y 50
+    tmux new-session -d -s "${SESSION_NAME}" -n "${BRIDGE_WINDOW}" -x 220 -y 50 -c "$(window_dir "${BRIDGE_WINDOW}")"
     create_bridge_window "${SESSION_NAME}" "${BRIDGE_WINDOW}"
     create_backrooms_window "${SESSION_NAME}"
     create_mobile_windows "${SESSION_NAME}"
@@ -534,7 +556,7 @@ fi
 
 # Create session with the grid window
 # -x/-y needed when no client is attached (headless creation)
-tmux new-session -d -s "${SESSION_NAME}" -n "${WINDOW_NAME}" -x 240 -y 60
+tmux new-session -d -s "${SESSION_NAME}" -n "${WINDOW_NAME}" -x 240 -y 60 -c "$(window_dir "${WINDOW_NAME}")"
 create_grid_window "${SESSION_NAME}" "${WINDOW_NAME}"
 
 # Add the TUI window (dedicated for vertical monitor)

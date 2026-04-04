@@ -89,8 +89,8 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
-SCRIPTS = os.environ.get("SCRIPTS") or f"{IMPERIUM}/Scripts"
-CLI_TOOLS = os.environ.get("CLI_TOOLS") or f"{SCRIPTS}/cli-tools"
+TOKEN_OS = os.environ.get("TOKEN_OS") or f"{IMPERIUM}/Token-OS"
+CLI_TOOLS = os.environ.get("CLI_TOOLS") or f"{TOKEN_OS}/cli-tools"
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
 
 # All Tailscale IPs for device resolution (replaces DEVICE_IPS in main.py)

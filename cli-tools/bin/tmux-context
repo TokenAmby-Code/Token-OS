@@ -253,10 +253,10 @@ def check_pre_compact(pane_id, pct):
 
 
 def enforce_bypass_mode(pane_id):
-    """Detect invalid mode (accept-edits or none) and correct to bypass.
+    """Detect invalid mode and correct: accept-edits → bypass, no-mode → plan.
 
-    Only plan and bypass are valid modes. If accept-edits or no-mode is
-    detected, fires tmux-mode-toggle in background to correct.
+    Only plan and bypass are valid modes. Fires tmux-mode-toggle in
+    background to correct. No-mode targets plan (instance lacks bypass flag).
     """
     if not pane_id or not os.environ.get("TMUX"):
         return

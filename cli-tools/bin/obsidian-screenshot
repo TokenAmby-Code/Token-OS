@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
 # ── Colors / logging ─────────────────────────────────────────────────────────
 
 CYAN='\033[0;36m'
@@ -117,7 +120,7 @@ fi
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 
-OBSIDIAN_BIN="/mnt/imperium/Scripts/cli-tools/bin/obsidian"
+OBSIDIAN_BIN="$CLI_TOOLS/bin/obsidian"
 if [[ ! -x "$OBSIDIAN_BIN" ]]; then
     error "obsidian CLI not found at $OBSIDIAN_BIN"
     exit 1

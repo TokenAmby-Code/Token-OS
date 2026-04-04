@@ -242,7 +242,7 @@ GET    /api/vault/*                # Vault queries
 ## Project Structure
 
 ```
-/home/token/Scripts/token-api/
+/mnt/imperium/Token-OS/token-api/
 ├── main.py                 # FastAPI app entry point
 ├── config.py               # Configuration & device definitions
 ├── models/
@@ -472,7 +472,7 @@ CREATE INDEX idx_events_time ON events(created_at DESC);
 
 ## Next Steps
 
-1. [ ] Create FastAPI project structure in `/home/token/Scripts/token-api/`
+1. [ ] Create FastAPI project structure in `/mnt/imperium/Token-OS/token-api/`
 2. [ ] Initialize SQLite schema (extend agents.db or create token-api.db)
 3. [ ] Implement instance registration endpoints with SSH detection
 4. [ ] Implement profile assignment from pool

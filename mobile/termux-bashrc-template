@@ -169,7 +169,7 @@ PROPS
 # All tmux keys use prefix (\u0000 = ^Space)
 extra-keys = [ \
   [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u00005", display: '5'}, {macro: "\u0015toggle-toolbar\n", display: '⇄'}, {key: 'KEYBOARD', display: '⌨'}], \
-  [{macro: "\u0000p", display: '←prev'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000z", display: 'zoom'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, 'ESC'] \
+  [{macro: "\u0000p", display: '←prev'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000e", display: 'expand'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, 'ESC'] \
 ]
 extra-keys-style = key-height:90,key-gap:4,key-border:1
 terminal-transcript-rows = 10000
@@ -281,7 +281,7 @@ mac() {
     if is_portable_monitor; then
         _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
     else
-        _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 \\; set-hook client-resized 'run-shell tmux-mobile-keyboard' 2>/dev/null || exec zsh -il"
+        _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 2>/dev/null || exec zsh -il"
     fi
 
     local retries=0
@@ -314,7 +314,7 @@ wsl() {
     elif is_portable_monitor; then
         ssh -t wsl "bash -ic 'tmux attach -t main 2>/dev/null || tx start'"
     else
-        ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 \\; set-hook client-resized 'run-shell tmux-mobile-keyboard' 2>/dev/null || exec bash -il"
+        ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 2>/dev/null || exec bash -il"
     fi
 }
 

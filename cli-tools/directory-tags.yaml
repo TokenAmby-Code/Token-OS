@@ -11,14 +11,14 @@ $IMPERIUM/Imperium-ENV:
 $CIVIC:
   tags: [deploy, db, git, pr, worktree, instance, workflow, system]
 
-$IMPERIUM/Scripts/token-api:
+$IMPERIUM/Token-OS/token-api:
   tags: [token-api, deploy, instance]
 
-$IMPERIUM/Scripts/mobile:
+$IMPERIUM/Token-OS/mobile:
   tags: [mobile, macrodroid]
 
-$IMPERIUM/Scripts/cli-tools:
+$IMPERIUM/Token-OS/cli-tools:
   tags: [all]
 
-$IMPERIUM/Scripts:
+$IMPERIUM/Token-OS:
   tags: [git, workflow, system, instance]

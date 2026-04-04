@@ -439,7 +439,7 @@ PY
                 # Capture browser console output
                 echo ""
                 echo "=== Browser Console Output ==="
-                BROWSER_CONSOLE_BIN="${IMPERIUM:-/mnt/imperium}/Scripts/cli-tools/bin/browser-console"
+                BROWSER_CONSOLE_BIN="${CLI_TOOLS}/bin/browser-console"
                 if [[ -x "$BROWSER_CONSOLE_BIN" ]]; then
                     CONSOLE_OUTPUT=$("$BROWSER_CONSOLE_BIN" http://localhost:3000 --wait 3 2>&1) || true
                     echo "$CONSOLE_OUTPUT"

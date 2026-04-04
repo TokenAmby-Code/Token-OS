@@ -506,6 +506,6 @@ Then push to `~/storage/downloads/` for broader app access.
 ## Adding New Trigger/Action Types
 
 The generator is extensible. To add new types, edit:
-`/Volumes/Imperium/Scripts/cli-tools/bin/macrodroid-gen`
+`/Volumes/Imperium/Token-OS/cli-tools/bin/macrodroid-gen`
 
 Use existing builders as templates. The format is derived from MacroDroid's export format - export a macro with the desired action to see the JSON structure.

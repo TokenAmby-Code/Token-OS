@@ -5,8 +5,8 @@
 #   IMPERIUM_MACHINE — Machine identifier: mac, wsl, phone
 #   IMPERIUM         — Root of the Imperium NAS share
 #   CIVIC            — Root of the Civic NAS share
-#   SCRIPTS          — Scripts directory ($IMPERIUM/Scripts)
-#   CLI_TOOLS        — CLI tools directory ($SCRIPTS/cli-tools)
+#   TOKEN_OS         — Token-OS directory ($IMPERIUM/Token-OS)
+#   CLI_TOOLS        — CLI tools directory ($TOKEN_OS/cli-tools)
 #   TOKEN_API_URL    — Token-API base URL (localhost on mac, tailscale elsewhere)
 #
 # Functions:
@@ -118,6 +118,6 @@ imperium_cfg() {
 # ============================================================
 export IMPERIUM="$(imperium_cfg nas_imperium)"
 export CIVIC="$(imperium_cfg nas_civic)"
-export SCRIPTS="$IMPERIUM/Scripts"
-export CLI_TOOLS="$SCRIPTS/cli-tools"
+export TOKEN_OS="$IMPERIUM/Token-OS"
+export CLI_TOOLS="$TOKEN_OS/cli-tools"
 export TOKEN_API_URL="${TOKEN_API_URL:-$(imperium_cfg token_api_url)}"
