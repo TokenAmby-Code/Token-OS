@@ -38,6 +38,7 @@ import tempfile
 import requests
 import httpx
 from pydantic import BaseModel, Field
+from session_doc_helpers import update_victory_frontmatter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.interval import IntervalTrigger
@@ -3251,28 +3252,52 @@ async def get_zealotry(instance_id: str):
 
 @app.post("/api/instances/{instance_id}/victory")
 async def declare_victory(instance_id: str, request: Request):
-    """Declare victory for an instance — cancel follow-up timer, record reason."""
+    """Declare victory for an instance — cancel follow-up timer, record reason, update session doc."""
     body = await request.json()
     reason = body.get("reason")
     if not reason:
         raise HTTPException(status_code=400, detail="reason is required")
+    deliverables = body.get("deliverables")  # Optional list of strings
 
     now = datetime.now().isoformat()
+    session_doc_updated = False
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tab_name FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,)
         )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
         tab_name = row["tab_name"] or instance_id[:12]
+        session_doc_id = row["session_doc_id"]
 
+        # DB write (existing behavior)
         await db.execute(
             "UPDATE claude_instances SET victory_at = ?, victory_reason = ?, instance_type = 'one_off' WHERE id = ?",
             (now, reason, instance_id)
         )
         await db.commit()
+
+        # Session doc frontmatter write (dual-write)
+        if session_doc_id:
+            try:
+                cursor = await db.execute(
+                    "SELECT file_path FROM session_documents WHERE id = ?",
+                    (session_doc_id,)
+                )
+                doc_row = await cursor.fetchone()
+                if doc_row and doc_row["file_path"]:
+                    fp = Path(doc_row["file_path"])
+                    if fp.exists():
+                        await asyncio.to_thread(
+                            update_victory_frontmatter,
+                            fp, reason, now, deliverables
+                        )
+                        session_doc_updated = True
+                        logger.info(f"Victory: Updated session doc {session_doc_id} frontmatter")
+            except Exception as e:
+                logger.warning(f"Victory: Session doc frontmatter update failed: {e}")
 
     # Cancel pending follow-up timer
     timer_cancelled = False
@@ -3293,8 +3318,11 @@ async def declare_victory(instance_id: str, request: Request):
 
     logger.info(f"Golden Throne: VICTORY for {instance_id[:12]} — {reason}")
     await log_event("golden_throne_victory", instance_id=instance_id,
-                    details={"reason": reason, "timer_cancelled": timer_cancelled})
-    return {"instance_id": instance_id, "victory": True, "timer_cancelled": timer_cancelled}
+                    details={"reason": reason, "timer_cancelled": timer_cancelled,
+                             "session_doc_updated": session_doc_updated,
+                             "deliverables": deliverables})
+    return {"instance_id": instance_id, "victory": True, "timer_cancelled": timer_cancelled,
+            "session_doc_updated": session_doc_updated}
 
 
 @app.post("/api/instances/{instance_id}/golden-throne/trigger")
