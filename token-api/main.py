@@ -44,6 +44,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from cron_engine import CronEngine
+from db_schema import init_database_async
 from schedule import router as schedule_router
 from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
@@ -1338,7 +1339,7 @@ async def lifespan(app: FastAPI):
     _restore_twitter_zap_cooldown()
 
     # Startup
-    await init_db()
+    await init_database_async(DB_PATH)
     await load_tasks_from_db()
     timer_load_from_db()
     await restore_desktop_state()

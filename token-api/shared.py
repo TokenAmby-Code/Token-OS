@@ -22,8 +22,11 @@ logger = logging.getLogger("token_api")
 # ============ Configuration ============
 
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
-DEFAULT_SESSIONS_DIR = Path.home() / "Imperium-ENV" / "Terra" / "Sessions"
-MARS_SESSIONS_DIR = Path.home() / "Imperium-ENV" / "Mars" / "Sessions"
+_imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
+if not _imperium_root.exists():
+    _imperium_root = Path.home()
+DEFAULT_SESSIONS_DIR = _imperium_root / "Imperium-ENV" / "Terra" / "Sessions"
+MARS_SESSIONS_DIR = _imperium_root / "Imperium-ENV" / "Mars" / "Sessions"
 SERVER_PORT = 7777
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"

@@ -103,7 +103,7 @@ create_stack_pane() {
     local target="${session}:${window}"
 
     # Ensure the window exists
-    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qx "$window"; then
+    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qE "^${window}(\([0-9]*\))?$"; then
         log_error "Window '$window' does not exist in session '$session'"
         return 1
     fi
