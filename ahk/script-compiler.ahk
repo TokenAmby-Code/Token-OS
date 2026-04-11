@@ -114,8 +114,16 @@ MButton:: {
     }
 }
 
-Media_Stop:: {  ; Skip current TTS
+Media_Stop:: {  ; Pause/Play toggle TTS
+    PostToTokenApi("/api/tts/control", '{"command":"toggle"}')
+}
+
+Media_Next:: {  ; Skip current TTS (play next in queue)
     PostToTokenApi("/api/tts/skip", "")
+}
+
+Media_Prev:: {  ; Restart current TTS message from beginning
+    PostToTokenApi("/api/tts/control", '{"command":"restart"}')
 }
 
 ^!w:: {                       ; Ctrl+Alt+W

@@ -362,6 +362,19 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         });
       }
 
+      // POST /thread/archive — Archive a thread (removes from active UI)
+      if (method === 'POST' && path === '/thread/archive') {
+        const body = await parseBody(req);
+        if (!body.thread_id) return json(res, { error: 'thread_id required' }, 400);
+
+        const thread = await resolveClient(body.bot).client.channels.fetch(body.thread_id);
+        await thread.setArchived(true);
+        // Re-fetch to confirm archived state
+        const updated = await resolveClient(body.bot).client.channels.fetch(body.thread_id, { force: true });
+        logger.info(`Archived thread ${body.thread_id} ("${thread.name}") — confirmed: ${updated.archived}`);
+        return json(res, { thread_id: updated.id, name: updated.name, archived: updated.archived, locked: updated.locked });
+      }
+
       // GET /guild/channels — List ALL guild channels (including voice)
       if (method === 'GET' && path === '/guild/channels') {
         const guild = await discordClient.client.guilds.fetch(config.guild_id);

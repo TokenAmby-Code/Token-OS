@@ -26,19 +26,17 @@ You are a followup agent. Your task requires code implementation via Claude Code
 TASK: {task}
 
 INSTRUCTIONS:
-1. Delegate the implementation to Claude Code by running:
-   claude -p "{escaped_task}"
-2. Capture the output
-3. Log your result to memory/followup_log.md in this format:
+1. Implement the task directly — you ARE Claude Code
+2. Log your result to memory/followup_log.md in this format:
    [{timestamp}] FOLLOWUP: {name} | ROUTE: claude-code | RESULT: <what was implemented>
-4. If Claude Code fails, log the error and reason
+3. If the implementation fails, log the error and reason
 
 {expiry_notice}\
 RULES:
 - Do NOT delete any cron jobs
 - Do NOT modify openclaw.json
 - Do NOT restart the gateway
-- Always delegate coding work to claude -p, do not attempt it yourself"""
+- Do NOT use claude -p to delegate — implement directly"""
 
 EXPIRY_NOTICE = """\
 EXPIRY: This recurring job expires after {expires}. When the expiry condition is met,

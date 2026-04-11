@@ -16,6 +16,7 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
@@ -237,14 +238,17 @@ case "$TARGET_MODE" in
                 exit 1
             fi
         else
-            # Local instance — resolve pane from PID
-            if [[ -z "$INSTANCE_PID" ]]; then
-                echo "Error: Could not find PID for instance '$TARGET_VALUE'." >&2
-                exit 1
+            # Local instance — resolve pane from PID, fall back to DB tmux_pane
+            PANE=""
+            if [[ -n "$INSTANCE_PID" ]]; then
+                PANE=$(find_tmux_pane "$INSTANCE_PID")
             fi
-            PANE=$(find_tmux_pane "$INSTANCE_PID")
+            if [[ -z "$PANE" && -n "$INSTANCE_TMUX_PANE" ]]; then
+                # PID stale (process restarted) but DB pane is likely correct
+                PANE="$INSTANCE_TMUX_PANE"
+            fi
             if [[ -z "$PANE" ]]; then
-                echo "Error: Could not find tmux pane for instance PID $INSTANCE_PID." >&2
+                echo "Error: Could not find tmux pane for instance '$TARGET_VALUE' (PID $INSTANCE_PID, DB pane: $INSTANCE_TMUX_PANE)." >&2
                 exit 1
             fi
         fi
@@ -295,11 +299,16 @@ send_command() {
             echo "Warning: Satellite send-keys may have failed: $SEND_RESP" >&2
         fi
     else
-        # Local tmux send-keys
-        # Clear any buffered input (skip when prompt is known-empty, e.g. after UserPromptSubmit)
-        if [[ "$NO_ESCAPE" != true ]]; then
-            tmux send-keys -t "$pane" C-u
-            sleep 0.3
+        # Local tmux send-keys (guarded — waits if user is typing)
+        if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-10}"; then
+            echo "Warning: user input not cleared in $pane — aborting injection" >&2
+            # Release lock before returning
+            if [[ "$locked" == true ]]; then
+                curl -s --connect-timeout 1 --max-time 2 \
+                    -X DELETE "$API_URL/api/instances/$instance_id/input-lock?locker=$locker" \
+                    >/dev/null 2>&1 || true
+            fi
+            return 1
         fi
         tmux send-keys -t "$pane" "$cmd"
         sleep 0.3

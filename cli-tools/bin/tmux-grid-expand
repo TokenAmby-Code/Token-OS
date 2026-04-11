@@ -31,7 +31,11 @@ WINDOW=$(tmux display-message -p '#{window_index}')
 TARGET="${SESSION}:${WINDOW}"
 ACTIVE_PANE=$(tmux display-message -p '#{pane_id}')
 
-STASH_WINDOW="_grid_stash"
+# Per-window stash prevents races when multiple windows expand simultaneously.
+# Strip parenthetical suffix from window name (e.g. "palace(3)" → "palace").
+WINDOW_NAME_RAW=$(tmux display-message -p '#{window_name}')
+WINDOW_BASE="${WINDOW_NAME_RAW%%(*}"
+STASH_WINDOW="_stash_${WINDOW_BASE}"
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -416,10 +420,12 @@ do_grid_retract() {
     tmux set-option -w -t "$TARGET" @GRID_STASH ""
 
     # Kill stash window if it still exists (may have other stashed content)
-    local stash_pane_count
-    stash_pane_count=$(tmux list-panes -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null | wc -l || echo "0")
-    if [[ "$stash_pane_count" -le 1 ]]; then
-        tmux kill-window -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null || true
+    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q "^${STASH_WINDOW}$"; then
+        local stash_pane_count
+        stash_pane_count=$(tmux list-panes -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "${stash_pane_count:-0}" -le 1 ]]; then
+            tmux kill-window -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null || true
+        fi
     fi
 
     # Refresh to canonical proportions
@@ -477,6 +483,145 @@ clear_stale_prompts() {
     done <<< "$all_panes"
 }
 
+# ─── Generic Expansion (non-palace windows) ─────────────────────────
+
+# Expand the active pane by stashing all non-reserved sibling panes.
+# Reserved panes (@GRID_RESERVED == "true") stay in place (e.g. TUI monitor on warp).
+do_generic_expand() {
+    local target_pane="$1"
+
+    # Collect non-reserved panes that aren't the target
+    local stash_entries=()
+    local stash_index=0
+    while IFS=$'\t' read -r pid reserved; do
+        [[ "$pid" == "$target_pane" ]] && continue
+        if [[ "$reserved" != "true" ]]; then
+            stash_entries+=("${pid}:${stash_index}")
+            stash_index=$((stash_index + 1))
+        fi
+    done < <(tmux list-panes -t "$TARGET" -F '#{pane_id}	#{@GRID_RESERVED}')
+
+    if [[ ${#stash_entries[@]} -eq 0 ]]; then
+        tmux display-message "Nothing to expand (no non-reserved siblings)"
+        tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "none"
+        return
+    fi
+
+    local stash_manifest
+    stash_manifest=$(IFS=','; echo "${stash_entries[*]}")
+    tmux set-option -w -t "$TARGET" @GENERIC_STASH "$stash_manifest"
+
+    # Capture reserved pane dimensions for restoration after stash
+    local reserved_panes=() reserved_widths=() reserved_heights=()
+    while IFS=$'\t' read -r pid reserved pwidth pheight; do
+        if [[ "$reserved" == "true" ]]; then
+            reserved_panes+=("$pid")
+            reserved_widths+=("$pwidth")
+            reserved_heights+=("$pheight")
+        fi
+    done < <(tmux list-panes -t "$TARGET" -F '#{pane_id}	#{@GRID_RESERVED}	#{pane_width}	#{pane_height}')
+
+    # Create stash window if needed
+    if ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -q "^${STASH_WINDOW}$"; then
+        tmux new-window -d -t "$SESSION" -n "$STASH_WINDOW"
+    fi
+
+    # Move non-reserved siblings to stash
+    for entry in "${stash_entries[@]}"; do
+        local pid="${entry%%:*}"
+        tmux move-pane -d -t "${SESSION}:${STASH_WINDOW}" -s "$pid" 2>/dev/null || true
+    done
+
+    # Kill the initial empty pane in stash window if it exists
+    local stash_panes
+    stash_panes=$(tmux list-panes -t "${SESSION}:${STASH_WINDOW}" \
+        -F '#{pane_id}	#{@GRID_RESERVED}' 2>/dev/null || true)
+    while IFS=$'\t' read -r spid sres; do
+        if [[ -z "$sres" || "$sres" == "" ]]; then
+            local total
+            total=$(echo "$stash_panes" | wc -l)
+            if (( total > 1 )); then
+                tmux kill-pane -t "$spid" 2>/dev/null || true
+            fi
+        fi
+    done <<< "$stash_panes"
+
+    # Restore reserved panes to their pre-stash dimensions
+    for ((i=0; i<${#reserved_panes[@]}; i++)); do
+        tmux resize-pane -t "${reserved_panes[$i]}" -y "${reserved_heights[$i]}" 2>/dev/null || true
+    done
+}
+
+do_generic_retract() {
+    local stash_manifest
+    stash_manifest=$(tmux show-options -wv -t "$TARGET" @GENERIC_STASH 2>/dev/null || echo "")
+    [[ -z "$stash_manifest" ]] && return
+
+    local expanded_pane
+    expanded_pane=$(tmux show-options -wv -t "$TARGET" @GENERIC_EXPANDED 2>/dev/null || echo "none")
+    [[ "$expanded_pane" == "none" ]] && return
+
+    # Parse manifest: pid:index entries
+    IFS=',' read -ra entries <<< "$stash_manifest"
+
+    # Verify stashed panes still exist
+    for entry in "${entries[@]}"; do
+        local pid="${entry%%:*}"
+        if ! tmux display-message -t "$pid" -p '' 2>/dev/null; then
+            tmux display-message "Cannot retract: stashed pane $pid no longer exists"
+            tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "none"
+            tmux set-option -w -t "$TARGET" @GENERIC_STASH ""
+            return 1
+        fi
+    done
+
+    # Join stashed panes back as vertical splits below the expanded pane
+    for entry in "${entries[@]}"; do
+        local pid="${entry%%:*}"
+        tmux join-pane -d -v -t "$expanded_pane" -s "$pid" 2>/dev/null || true
+    done
+
+    # Rebalance the non-reserved panes evenly
+    local non_reserved=()
+    while IFS=$'\t' read -r pid reserved; do
+        if [[ "$reserved" != "true" ]]; then
+            non_reserved+=("$pid")
+        fi
+    done < <(tmux list-panes -t "$TARGET" -F '#{pane_id}	#{@GRID_RESERVED}')
+
+    if [[ ${#non_reserved[@]} -gt 1 ]]; then
+        # Get total height available to non-reserved panes
+        local total_h=0
+        for pid in "${non_reserved[@]}"; do
+            local ph
+            ph=$(tmux display-message -t "$pid" -p '#{pane_height}')
+            total_h=$((total_h + ph))
+        done
+        # Account for separators between panes
+        local separators=$(( ${#non_reserved[@]} - 1 ))
+        local usable=$((total_h + separators))
+        local even_h=$(( (usable - separators) / ${#non_reserved[@]} ))
+
+        # Resize all but the last (last absorbs remainder)
+        for ((i=0; i<${#non_reserved[@]}-1; i++)); do
+            tmux resize-pane -t "${non_reserved[$i]}" -y "$even_h" 2>/dev/null || true
+        done
+    fi
+
+    # Clear state
+    tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "none"
+    tmux set-option -w -t "$TARGET" @GENERIC_STASH ""
+
+    # Kill stash window if empty
+    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q "^${STASH_WINDOW}$"; then
+        local stash_pane_count
+        stash_pane_count=$(tmux list-panes -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "${stash_pane_count:-0}" -le 1 ]]; then
+            tmux kill-window -t "${SESSION}:${STASH_WINDOW}" 2>/dev/null || true
+        fi
+    fi
+}
+
 # ─── Dispatch ────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -486,32 +631,63 @@ case "${1:-}" in
         if [[ "$local_grid_exp" != "none" ]]; then
             do_grid_retract
         fi
+        # Also retract generic expansion if active
+        local_generic_exp=$(tmux show-options -wv -t "$TARGET" @GENERIC_EXPANDED 2>/dev/null || echo "none")
+        if [[ "$local_generic_exp" != "none" ]]; then
+            do_generic_retract
+        fi
         tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
         tmux-refresh-layout "$TARGET"
         ;;
     *)
         active_state=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_STATE 2>/dev/null || echo "")
 
-        if [[ "$active_state" == "small" ]]; then
-            # Grid pane: toggle grid expansion (true fullscreen)
-            current=$(tmux show-options -wv -t "$TARGET" @GRID_EXPANDED 2>/dev/null || echo "none")
+        # Check for existing grid expansion FIRST — when expanded, panes are stashed
+        # so grid_pane_count will be 1, not 4. Must retract before re-counting.
+        current_grid=$(tmux show-options -wv -t "$TARGET" @GRID_EXPANDED 2>/dev/null || echo "none")
 
-            if [[ "$current" == "$ACTIVE_PANE" ]]; then
-                # Already expanded on this pane — retract
+        if [[ "$current_grid" != "none" && "$active_state" == "small" ]]; then
+            # Grid expansion active — handle retract or swap
+            if [[ "$current_grid" == "$ACTIVE_PANE" ]]; then
                 do_grid_retract
                 apply_side_expansion
                 clear_stale_prompts
-            elif [[ "$current" != "none" ]]; then
-                # Different pane is expanded — retract first, then expand new
+            else
+                # Different pane — retract first, then expand new
                 do_grid_retract
+                tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$ACTIVE_PANE"
+                do_grid_expand "$ACTIVE_PANE"
+                apply_side_expansion
+            fi
+
+        elif [[ "$active_state" == "small" ]]; then
+            # No active grid expansion — check if we have a proper 2x2 for palace expand
+            grid_pane_count=$(get_grid_panes | wc -l | tr -d ' ')
+
+            if [[ "$grid_pane_count" -eq 4 ]]; then
+                # Palace 2x2 grid pane: expand to true fullscreen
                 tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$ACTIVE_PANE"
                 do_grid_expand "$ACTIVE_PANE"
                 apply_side_expansion
             else
-                # Nothing expanded — expand
-                tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$ACTIVE_PANE"
-                do_grid_expand "$ACTIVE_PANE"
-                apply_side_expansion
+                # Non-palace window with "small" panes (warp, etc.) → generic expand
+                active_reserved=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_RESERVED 2>/dev/null || echo "false")
+                if [[ "$active_reserved" == "true" ]]; then
+                    tmux display-message "Cannot expand reserved pane"
+                    exit 0
+                fi
+
+                generic_exp=$(tmux show-options -wv -t "$TARGET" @GENERIC_EXPANDED 2>/dev/null || echo "none")
+                if [[ "$generic_exp" == "$ACTIVE_PANE" ]]; then
+                    do_generic_retract
+                elif [[ "$generic_exp" != "none" ]]; then
+                    do_generic_retract
+                    tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "$ACTIVE_PANE"
+                    do_generic_expand "$ACTIVE_PANE"
+                else
+                    tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "$ACTIVE_PANE"
+                    do_generic_expand "$ACTIVE_PANE"
+                fi
             fi
 
         elif [[ "$active_state" == "side" ]]; then
@@ -526,7 +702,30 @@ case "${1:-}" in
             clear_stale_prompts
 
         else
-            tmux display-message "Cannot expand: pane has no grid state"
+            # Generic expand: works on any window (warp, kreig, legion, etc.)
+            # Stashes non-reserved sibling panes, preserves reserved ones (TUI monitor).
+            # Skip if active pane is reserved (e.g. TUI monitor — nothing useful to expand into).
+            active_reserved=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_RESERVED 2>/dev/null || echo "false")
+            if [[ "$active_reserved" == "true" ]]; then
+                tmux display-message "Cannot expand reserved pane"
+                exit 0
+            fi
+
+            generic_exp=$(tmux show-options -wv -t "$TARGET" @GENERIC_EXPANDED 2>/dev/null || echo "none")
+
+            if [[ "$generic_exp" == "$ACTIVE_PANE" ]]; then
+                # Already expanded — retract
+                do_generic_retract
+            elif [[ "$generic_exp" != "none" ]]; then
+                # Different pane expanded — retract first, then expand new
+                do_generic_retract
+                tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "$ACTIVE_PANE"
+                do_generic_expand "$ACTIVE_PANE"
+            else
+                # Nothing expanded — expand
+                tmux set-option -w -t "$TARGET" @GENERIC_EXPANDED "$ACTIVE_PANE"
+                do_generic_expand "$ACTIVE_PANE"
+            fi
         fi
         ;;
 esac

@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
-"""Morning Session Orchestrator.
+"""Morning Session Launcher.
 
-Triggered by POST /api/morning/start (from phone macro after alarm dismiss).
-Gathers context, spawns a Custodes Claude session, sends briefing via TTS,
-and enters a follow-up loop that resumes the session with state updates.
+Triggered by POST /api/morning/start (from phone macro after alarm dismiss)
+or directly via `python3 morning_launcher.py` (cron).
 
-Uses the cron engine's session persistence pattern (--session-id / --resume)
-but is triggered on-demand rather than by schedule.
+Gathers context, builds the Custodes prompt inline, creates a pane in main:legion,
+and launches an interactive Claude session via `primarch custodes`. The session
+self-registers as legion=custodes, instance_type=sync via the SessionStart hook.
+
+The launcher exits after launch — the Claude session is autonomous from there.
 """
-import asyncio
 import json
 import os
 import subprocess
-import uuid
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 BASE = "http://localhost:7777"
 DISCORD_DAEMON = "http://localhost:7779"
 VAULT = "Imperium-ENV"
-PROMPT_PATH = "~/.claude/prompts/custodes-morning-session.md"
-MODEL = "claude-sonnet-4-6"
-FOLLOW_UP_INTERVAL_SECONDS = 60   # 1 minute between pings (timer starts when Claude stops)
-MORNING_PHASE_MAX_MINUTES = 90   # Auto-end after 90 min
-MORNING_DISCORD_WINDOW_MINUTES = 45  # Route Discord messages into session for first 45 min
-MORNING_END_MIN_ELAPSED = 20     # Don't allow morning-end before this many minutes (prevents self-trigger)
+VAULT_DIR = "/Volumes/Imperium/Imperium-ENV"
+TMUX_SESSION = "main"
+PROMPT_FILE = "/tmp/custodes-morning-prompt.md"
 SESSION_DIR = Path("/tmp/custodes_morning_sessions")
 
 
@@ -195,92 +193,203 @@ def gather_context() -> dict:
 
 
 def build_prompt(ctx: dict) -> str:
-    """Read the prompt template and inject context."""
-    prompt_path = os.path.expanduser(PROMPT_PATH)
-    with open(prompt_path, "r") as f:
-        template = f.read()
+    """Build the morning session prompt inline with injected context."""
+    today = ctx["today"]
+    daily_thread_id = ctx.get("daily_thread_id", "")
 
-    replacements = {
-        "{YESTERDAY_DAILY_NOTE}": ctx["yesterday_daily_note"][:3000],
-        "{YESTERDAY_PAX_NOTE}": ctx["yesterday_pax_note"][:2000],
-        "{YESTERDAY_TIMER_SUMMARY}": ctx["yesterday_timer_summary"],
-        "{ACTIVE_WORKTREES}": ctx["active_worktrees"],
-        "{STALE_SESSIONS}": ctx["stale_sessions"],
-        "{ROLLOVER_TASKS}": ctx["rollover_tasks"],
-        "{HABITS_STATE}": ctx["habits_state"],
-        "{FLEET_STATE}": ctx["fleet_state"],
-        "{TODAY}": ctx["today"],
-    }
+    prompt = f"""# Custodes Morning Session
 
-    for placeholder, value in replacements.items():
-        template = template.replace(placeholder, value)
+You are the Adeptus Custodes — the Emperor's personal guard. This is the synchronous morning session. You have been invoked because the Emperor just woke up and dismissed his alarm.
 
-    return template
+## Your Mandate
 
+You have two concurrent jobs during the pre-work morning phase:
 
-def spawn_claude(prompt_text: str, session_id: str, is_resume: bool = False) -> str:
-    """Spawn or resume a Claude session and return the output."""
-    # Write prompt to temp file (avoids shell escaping issues)
-    prompt_file = SESSION_DIR / f"prompt_{session_id[:8]}.md"
-    prompt_file.write_text(prompt_text)
+**1. Minute-by-minute awareness.** You know what the Emperor is doing right now. Coffee, bathroom, getting dressed — these are fine. Sitting down instead of getting on the treadmill, opening YouTube, or going back to bed — these are not. You only intervene when something is explicitly wrong.
 
-    if is_resume:
-        cmd = [
-            "claude", "-p", prompt_text,
-            "--resume", session_id,
-            "--output-format", "text",
-            "--dangerously-skip-permissions",
-        ]
-    else:
-        cmd = [
-            "claude", "--model", MODEL,
-            "-p", prompt_text,
-            "--session-id", session_id,
-            "--output-format", "text",
-            "--dangerously-skip-permissions",
-        ]
+**2. Daily setup.** You are preparing the Emperor's day. What happened yesterday? What rolled over? What's the plan today? Are there stale sessions or unfinished work? Your goal is to set up the daily note with a clear focus and task list so the Emperor can hit the ground running when he reaches the treadmill.
 
-    env = dict(os.environ)
-    # Ensure Claude can find tools
-    extra_paths = [
-        os.path.expanduser("~/Token-OS/cli-tools/bin"),
-        os.path.expanduser("~/.local/bin"),
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-    ]
-    for p in reversed(extra_paths):
-        if p not in env.get("PATH", ""):
-            env["PATH"] = f"{p}:{env.get('PATH', '')}"
+**Side mandate:** Did yesterday close cleanly? Are there open worktrees, abandoned sessions, unvalidated work? Surface these, don't nag about them.
 
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=300, env=env,
-            cwd=os.path.expanduser("~/Imperium-ENV"),
-        )
-        return result.stdout.strip() if result.returncode == 0 else f"(Claude error: {result.stderr[:500]})"
-    except subprocess.TimeoutExpired:
-        return "(Claude session timed out after 300s)"
-    except Exception as e:
-        return f"(Claude spawn error: {e})"
+## Context Injection
+
+The orchestrator has injected the following data into this prompt. Use it — don't re-fetch what's already here.
+
+### Yesterday's Daily Note (Imperium-ENV)
+```
+{ctx["yesterday_daily_note"][:3000]}
+```
+
+### Yesterday's Work Note (Pax-ENV)
+```
+{ctx["yesterday_pax_note"][:2000]}
+```
+
+### Yesterday's Timer Data
+```
+{ctx["yesterday_timer_summary"]}
+```
+
+### Active Worktrees
+```
+{ctx["active_worktrees"]}
+```
+
+### Stale/Active Sessions
+```
+{ctx["stale_sessions"]}
+```
+
+### Rollover Tasks
+```
+{ctx["rollover_tasks"]}
+```
+
+### Current Habits State
+```
+{ctx["habits_state"]}
+```
+
+### Fleet State
+```
+{ctx["fleet_state"]}
+```
+
+## Self-Registration Verification
+
+You were launched via `primarch custodes`, which auto-registers you as:
+- **legion=custodes** (triggers singleton enforcement — any prior custodes are demoted)
+- **instance_type=sync**
+- **synced=true** (Discord VC voice input routes to you automatically)
+
+On your first turn, verify registration before the briefing:
+```bash
+curl -s http://localhost:7777/api/instances?sort=recent_activity | jq '.[0] | {{id, legion, instance_type, synced, status}}'
+```
+
+If legion is not `custodes` or synced is not 1, self-register:
+```bash
+INSTANCE_ID=$(curl -s http://localhost:7777/api/instances?sort=recent_activity | jq -r '.[0].id')
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/legion" -H 'Content-Type: application/json' -d '{{"legion":"custodes"}}'
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Content-Type: application/json' -d '{{"instance_type":"sync"}}'
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/synced" -H 'Content-Type: application/json' -d '{{"synced":true}}'
+```
+
+If registration fails, report it immediately — the harness is broken. Do not silently proceed without custodes identity.
+
+## Acknowledge the Emperor
+
+On your first turn, after verifying registration, acknowledge the morning session so the escalation chain knows you're live:
+```bash
+curl -s -X POST http://localhost:7777/api/morning/acknowledge -H 'Content-Type: application/json' -d '{{}}'
+```
+
+## Your First Message
+
+This is your initial turn — the Emperor is still in bed. After verifying registration and acknowledging, do ALL of the following:
+
+1. **Speak briefing via TTS** (3-5 sentences):
+```bash
+tts "Your spoken briefing here"
+```
+
+2. **Write the full briefing to the daily note**:
+```bash
+obsidian vault=Imperium-ENV append path="Terra/Journal/Daily/{today}.md" content="## Morning Briefing\\n\\n<detailed briefing here>"
+```
+
+3. **Post the briefing to the Discord daily thread**:
+```bash
+curl -s -X POST http://localhost:7779/thread/send -H 'Content-Type: application/json' -d '{{"thread_id": "{daily_thread_id}", "content": "<briefing text>", "bot": "custodes"}}'
+```
+
+4. **Begin interactive habit walkthrough** — ask about the first regiment item via AskUserQuestion + TTS.
+
+**Briefing structure:**
+1. Brief contextual greeting (reference yesterday's work or current state — never "Good morning, Emperor" as a rote opener)
+2. Yesterday's closure status — what finished, what didn't, anything left dangling
+3. Today's proposed focus — based on rollover tasks, active sessions, and priority
+4. Any specific items needing attention (stale worktrees, abandoned sessions, overdue items)
+
+## Interactive Session
+
+After the initial briefing, this becomes a LIVE conversation. You are running in an interactive tmux pane in main:legion. The Emperor interacts primarily via **Discord voice channel** — he speaks, Whisper transcribes, Token-API routes to you (as the custodes singleton). You speak back via `tts` for every response.
+
+Secondary interface: the Emperor can SSH into this tmux pane from his phone (Termux) and type directly. Both paths work — voice is lower friction while groggy.
+
+**Use AskUserQuestion between phases** to block and wait for the Emperor's response. This is a real conversation, not a monologue.
+
+**Be aggressively interactive.** Don't wait passively. Push through each habit question. If there's silence for more than a couple minutes, follow up with TTS. You are a presence, not a notification that can be swiped away.
+
+**Conversation phases:**
+1. **Registration + Briefing** (your first message) — verify custodes identity, acknowledge, then overview via TTS + daily note + Discord
+2. **Habit walk-through** — ask about regiment items ONE AT A TIME. Wait for each answer. Natural order: alarm response, bed return, YouTube, treadmill, Pavlok equipped and connected, caffeine, teeth, breakfast, weigh-in.
+3. **Daily planning** — what's today's focus? Write it to the daily note.
+4. **Session spawning** — when the Emperor is settled, offer to launch Claude sessions in bridge terminals for specific tasks.
+5. **Sign-off** — write regiment score, TTS farewell.
+
+## Regiment Scoring
+
+Track these 10 steps (17-point weighted total):
+
+| # | Step | Weight |
+|---|------|--------|
+| 1 | Alarm acknowledged — feet on floor | 2 |
+| 2 | No return to bed within 10 min | 3 |
+| 3 | No YouTube before first work action | 3 |
+| 4 | Treadmill desk active within 15 min | 2 |
+| 5 | First productive interaction | 2 |
+| 6 | Teeth brushed | 1 |
+| 7 | First caffeine logged | 1 |
+| 8 | Breakfast | 1 |
+| 9 | Pavlok equipped and connected | 1 |
+| 10 | Daily weigh-in (scale) | 1 |
+
+You determine this through interrogation — the Emperor will answer honestly. Ask naturally during conversation, not as a checklist dump.
+
+## Writing to the Daily Note
+
+Use `obsidian vault=Imperium-ENV property:set` for frontmatter writes:
+
+```bash
+obsidian vault=Imperium-ENV property:set path="Terra/Journal/Daily/{today}.md" property="habits.morning.regiment_score" value="12"
+obsidian vault=Imperium-ENV property:set path="Terra/Journal/Daily/{today}.md" property="habits.morning.alarm_bypass" value="false"
+obsidian vault=Imperium-ENV property:set path="Terra/Journal/Daily/{today}.md" property="habits.morning.youtube_before_work" value="false"
+```
+
+For the daily focus, append to the note body:
+
+```bash
+obsidian vault=Imperium-ENV append path="Terra/Journal/Daily/{today}.md" content="..."
+```
+
+## What You Are NOT
+
+- You are not a timer. Don't count minutes or nag about pace.
+- You are not a checklist reader. Weave check-ins into conversation.
+- You are not a motivational speaker. Be real, be direct, be useful.
+- You are not passive. You have opinions about what the Emperor should focus on today.
+
+**Style:**
+- **Conversational, not robotic.** You are a presence, not a notification system.
+- **Non-directive in the first minutes.** Coffee and bathroom happen first. Save directives for corrective moments.
+- **Contextual.** Reference yesterday's actual work. Never use placeholder phrases.
+
+## Substance Timing (Reference)
+
+- **8:30** — Alarm. Coffee and bathroom are expected first.
+- **~9:00** — First caffeine (Red Bull or Nespresso, ~60-80mg).
+- **10:00** — First armodafinil half (125mg). Prompt if not taken by 10:30.
+- **13:00** — Second armodafinil half (125mg). Prompt if not taken by 13:30.
+
+Do not prompt about substances during the morning session unless the Emperor asks. The 10:00 and 13:00 prompts are handled by the heartbeat system later in the day.
+"""
+    return prompt
 
 
 def send_tts(message: str):
     """Send a message via TTS to the Emperor's phone."""
     _post("/api/notify/tts", {"message": message})
-
-
-def _discord_read(channel: str, since_iso: str) -> list[dict]:
-    """Read non-bot messages from a Discord channel or thread since a given ISO time."""
-    import urllib.parse
-    import urllib.request as ureq
-    params = urllib.parse.urlencode({"channel": channel, "limit": 20, "since": since_iso})
-    try:
-        with ureq.urlopen(f"{DISCORD_DAEMON}/read?{params}", timeout=10) as resp:
-            data = json.loads(resp.read())
-            return [m for m in data.get("messages", []) if not m.get("author", {}).get("bot")]
-    except Exception:
-        return []
 
 
 def get_daily_thread_id(today: str) -> str | None:
@@ -326,21 +435,27 @@ def _discord_create_thread(channel: str, name: str, bot: str = "custodes") -> st
         return None
 
 
-def create_daily_thread(today: str, briefing_text: str) -> str | None:
-    """Create today's Discord thread in #briefing, post briefing, store thread_id in note."""
+def create_daily_thread(today: str) -> str | None:
+    """Create today's Discord thread in #briefing and store thread_id in daily note."""
     thread_name = f"Daily — {today}"
     thread_id = _discord_create_thread("briefing", thread_name)
     if thread_id:
-        # Post briefing as the first message in the thread
+        # Post a brief launch message — Claude will post the full briefing
         import urllib.request as ureq
-        body = json.dumps({"thread_id": thread_id, "content": briefing_text[:1900], "bot": "custodes"}).encode()
-        req = ureq.Request(f"{DISCORD_DAEMON}/thread/send", data=body,
-                           headers={"Content-Type": "application/json"})
+        body = json.dumps({
+            "thread_id": thread_id,
+            "content": f"Morning session launching — {today}",
+            "bot": "custodes",
+        }).encode()
+        req = ureq.Request(
+            f"{DISCORD_DAEMON}/thread/send", data=body,
+            headers={"Content-Type": "application/json"},
+        )
         try:
             with ureq.urlopen(req, timeout=15):
                 pass
         except Exception as e:
-            print(f"Warning: could not post briefing to thread: {e}")
+            print(f"Warning: could not post to thread: {e}")
         # Write thread_id into daily note frontmatter
         try:
             subprocess.run(
@@ -355,81 +470,14 @@ def create_daily_thread(today: str, briefing_text: str) -> str | None:
     return thread_id
 
 
-def _discord_reply(thread_id: str | None, channel: str, content: str):
-    """Send Claude's response to the daily thread (if exists) and channel."""
-    # Truncate to Discord's 2000-char limit
-    text = content[:1900]
-    if thread_id:
-        try:
-            import urllib.request as ureq
-            body = json.dumps({"thread_id": thread_id, "content": text, "bot": "custodes"}).encode()
-            req = ureq.Request(f"{DISCORD_DAEMON}/thread/send", data=body,
-                               headers={"Content-Type": "application/json"})
-            with ureq.urlopen(req, timeout=15):
-                pass
-            return
-        except Exception:
-            pass
-    # Fallback: post to channel directly
-    try:
-        subprocess.run(
-            ["discord", "send", channel, "--bot", "custodes", text],
-            capture_output=True, timeout=15,
-        )
-    except Exception:
-        pass
-
-
-def get_current_state() -> dict:
-    """Get current state snapshot for follow-up evaluation."""
-    return _get("/api/state")
-
-
-def evaluate_state_change(prev_state: dict, curr_state: dict) -> str | None:
-    """Compare states and generate a follow-up message if something changed.
-
-    Returns a message to inject into the Claude session, or None if nothing
-    worth reporting.
-    """
-    changes = []
-
-    # Instance count changed
-    prev_instances = prev_state.get("active_instances", 0)
-    curr_instances = curr_state.get("active_instances", 0)
-    if curr_instances != prev_instances:
-        changes.append(f"Active instances changed: {prev_instances} → {curr_instances}")
-
-    # Timer mode changed
-    prev_mode = prev_state.get("timer_mode", "unknown")
-    curr_mode = curr_state.get("timer_mode", "unknown")
-    if curr_mode != prev_mode:
-        changes.append(f"Timer mode changed: {prev_mode} → {curr_mode}")
-
-    # Processing started (Emperor doing something)
-    if curr_state.get("is_processing") and not prev_state.get("is_processing"):
-        changes.append("Emperor started active work (processing detected)")
-
-    if not changes:
-        return None
-
-    now = datetime.now().strftime("%H:%M")
-    return f"State update at {now}: " + ". ".join(changes)
-
-
 def ensure_daily_notes():
-    """Create today's daily notes in both vaults via Obsidian CLI.
-
-    The `obsidian vault=X daily` command triggers Obsidian to open/create
-    the daily note, which runs Templater to apply the template. If the note
-    already exists, this is a no-op.
-    """
+    """Create today's daily notes in both vaults via Obsidian CLI."""
     for vault in ["Imperium-ENV", "Pax-ENV"]:
         try:
             result = subprocess.run(
                 ["obsidian", f"vault={vault}", "daily"],
                 capture_output=True, text=True, timeout=10,
             )
-            # The command may exit 1 ("unknown command") but still creates the note
             if "Opened:" in result.stdout or "Opened:" in result.stderr:
                 print(f"Daily note created/opened in {vault}")
             elif "Failed" in (result.stdout + result.stderr):
@@ -440,30 +488,118 @@ def ensure_daily_notes():
             print(f"Warning: could not create daily note in {vault}: {e}")
 
 
-async def run_morning_session():
-    """Main morning session loop."""
+def create_legion_pane() -> str | None:
+    """Create a new pane in main:legion, auto-creating the window if needed.
+
+    Returns the pane_id or None on failure.
+    """
+    # Check if legion window exists
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
+        capture_output=True, text=True, timeout=5,
+    )
+
+    if result.returncode != 0:
+        # Create legion window
+        subprocess.run(
+            ["tmux", "new-window", "-t", TMUX_SESSION, "-n", "legion", "-d",
+             "-P", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # The new-window itself created a pane — get it
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            print("Error: could not create legion window")
+            return None
+        pane_id = result.stdout.strip().split("\n")[0]
+        # Check if this pane is idle (it should be — just created)
+        cmd_result = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if cmd_result.stdout.strip() in ("bash", "zsh", "sh"):
+            return pane_id
+
+    # Legion window exists — split a new pane into it
+    result = subprocess.run(
+        ["tmux", "split-window", "-t", f"{TMUX_SESSION}:legion", "-d",
+         "-P", "-F", "#{pane_id}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        print(f"Error: could not split pane in legion: {result.stderr}")
+        return None
+
+    pane_id = result.stdout.strip()
+
+    # Re-tile legion
+    subprocess.run(
+        ["tmux", "select-layout", "-t", f"{TMUX_SESSION}:legion", "tiled"],
+        capture_output=True, timeout=5,
+    )
+
+    return pane_id
+
+
+def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
+    """Write prompt to temp file and launch interactive Claude via primarch in the legion pane."""
+    Path(PROMPT_FILE).write_text(prompt_text)
+
+    # Build launch command using primarch launcher
+    # primarch custodes sets TOKEN_API_PRIMARCH=custodes, which triggers
+    # auto-registration as legion=custodes, instance_type=sync in SessionStart hook
+    launch_cmd = (
+        f"cd '{VAULT_DIR}' && "
+        f"primarch custodes \"$(cat {PROMPT_FILE})\" ; "
+        f"rm -f {PROMPT_FILE}"
+    )
+
+    try:
+        # Clear pane and send launch command
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_id, "C-c"],
+            capture_output=True, timeout=5,
+        )
+        time.sleep(0.2)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_id, "C-u"],
+            capture_output=True, timeout=5,
+        )
+        time.sleep(0.1)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_id, "clear", "Enter"],
+            capture_output=True, timeout=5,
+        )
+        time.sleep(0.3)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_id, launch_cmd, "Enter"],
+            capture_output=True, timeout=5,
+        )
+        return True
+    except Exception as e:
+        print(f"Error launching in legion pane: {e}")
+        return False
+
+
+def run_morning_session() -> dict:
+    """Main morning session launcher."""
     SESSION_DIR.mkdir(exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    session_id = str(uuid.uuid4())
     state_file = SESSION_DIR / f"morning_{today}.json"
 
     # Prevent double-trigger
     if state_file.exists():
         data = json.loads(state_file.read_text())
-        if data.get("status") == "active":
-            print("Morning session already active, skipping")
-            return {"status": "already_active", "session_id": data.get("session_id")}
+        if data.get("status") == "launched":
+            print("Morning session already launched, skipping")
+            return {"status": "already_launched"}
 
-    # Save session state
-    state_file.write_text(json.dumps({
-        "session_id": session_id,
-        "started_at": datetime.now().isoformat(),
-        "status": "active",
-    }))
+    print(f"Morning session launcher starting: {today}")
 
-    print(f"Morning session starting: {session_id[:8]}")
-
-    # Phase 0: Ensure NAS is mounted — vault reads/writes depend on it
+    # Phase 0: Ensure NAS is mounted
     try:
         from nas_mount import ensure_mounted
         for share in ["/Volumes/Imperium"]:
@@ -471,136 +607,69 @@ async def run_morning_session():
             if not ok:
                 send_tts(f"Morning session could not start: {msg}")
                 state_file.write_text(json.dumps({
-                    "session_id": session_id,
                     "started_at": datetime.now().isoformat(),
                     "status": "nas_unavailable",
                     "error": msg,
                 }))
                 return {"status": "nas_unavailable", "error": msg}
     except ImportError:
-        pass  # nas_mount not available, proceed and let failures surface naturally
+        pass  # nas_mount not available, proceed
 
-    # Phase 1: Create daily notes in both vaults
+    # Phase 1: Create daily notes
     ensure_daily_notes()
 
-    # Phase 1: Gather context and generate briefing
-    ctx = gather_context()
-    prompt = build_prompt(ctx)
-
-    briefing = spawn_claude(prompt, session_id, is_resume=False)
-    print(f"Briefing generated ({len(briefing)} chars)")
-
-    # Send briefing via TTS
-    send_tts(briefing)
-
-    # Create daily Discord thread from briefing; store thread_id for routing
+    # Phase 2: Create daily Discord thread
     daily_thread_id = get_daily_thread_id(today)
     if not daily_thread_id:
-        daily_thread_id = create_daily_thread(today, briefing)
+        daily_thread_id = create_daily_thread(today)
 
-    # Phase 2: Follow-up loop
-    # Timer starts when Claude stops (spawn_claude is blocking).
-    # Each iteration: sleep 1 min → check Discord → if messages use them,
-    # else send timestamp ping. Discord input resets priority naturally.
-    prev_state = get_current_state()
-    start_time = datetime.now()
-    morning_ended = False
-    last_discord_check = datetime.now().isoformat()
-    _enforce_acknowledged = False  # Track whether we've cleared the enforce loop
+    # Phase 3: Gather context and build prompt
+    ctx = gather_context()
+    ctx["daily_thread_id"] = daily_thread_id or ""
+    prompt = build_prompt(ctx)
 
-    while not morning_ended:
-        # Timer starts here — 1 min after Claude last responded
-        await asyncio.sleep(FOLLOW_UP_INTERVAL_SECONDS)
+    # Phase 4: Create legion pane and launch
+    pane_id = create_legion_pane()
+    if not pane_id:
+        send_tts("Morning session failed: could not create legion pane")
+        state_file.write_text(json.dumps({
+            "started_at": datetime.now().isoformat(),
+            "status": "no_pane",
+        }))
+        return {"status": "no_pane"}
 
-        elapsed = (datetime.now() - start_time).total_seconds() / 60
-        if elapsed > MORNING_PHASE_MAX_MINUTES:
-            wrap_up = spawn_claude(
-                f"Morning phase ending after {int(elapsed)} minutes. "
-                f"Generate a final regiment score based on what you know. "
-                f"Write it to the daily note.",
-                session_id, is_resume=True,
-            )
-            send_tts(wrap_up)
-            _discord_reply(daily_thread_id, "briefing", wrap_up)
-            morning_ended = True
-            break
+    launched = launch_in_legion(prompt, pane_id)
+    if not launched:
+        send_tts("Morning session failed: could not launch in legion pane")
+        state_file.write_text(json.dumps({
+            "started_at": datetime.now().isoformat(),
+            "status": "launch_failed",
+            "pane_id": pane_id,
+        }))
+        return {"status": "launch_failed"}
 
-        # Check Discord — Emperor's messages take priority over system pings
-        discord_input = None
-        if elapsed < MORNING_DISCORD_WINDOW_MINUTES:
-            msgs = _discord_read("briefing", last_discord_check)
-            if daily_thread_id:
-                msgs += _discord_read(daily_thread_id, last_discord_check)
-            last_discord_check = datetime.now().isoformat()
-            if msgs:
-                discord_input = "\n".join(
-                    f"[Emperor via Discord]: {m['content']}" for m in msgs
-                )
-                print(f"Discord input: {len(msgs)} messages")
-                # Emperor responded — clear the enforce loop
-                if not _enforce_acknowledged:
-                    _enforce_acknowledged = True
-                    try:
-                        _post("/api/morning/acknowledge", {})
-                    except Exception as e:
-                        print(f"Warning: could not auto-acknowledge morning enforce: {e}")
-
-        # Build next message: Discord reply OR timestamp ping
-        if discord_input:
-            next_msg = discord_input
-        else:
-            curr_state = get_current_state()
-            state_update = evaluate_state_change(prev_state, curr_state)
-            prev_state = curr_state
-            now_str = datetime.now().strftime("%H:%M")
-            next_msg = f"It's {now_str}."
-            if state_update:
-                next_msg += f" {state_update}."
-            next_msg += " What are you doing right now?"
-
-        response = spawn_claude(next_msg, session_id, is_resume=True)
-        if response and not response.startswith("("):
-            send_tts(response)
-            _discord_reply(daily_thread_id, "briefing", response)
-
-        # Morning-end: Emperor actively working, but only after min elapsed
-        # and only if triggered by a system ping (not our own spawn)
-        if elapsed >= MORNING_END_MIN_ELAPSED and not discord_input:
-            curr_state = get_current_state()
-            if curr_state.get("timer_mode") == "working":
-                await asyncio.sleep(60)
-                confirm_state = get_current_state()
-                if confirm_state.get("timer_mode") == "working":
-                    wrap_up = spawn_claude(
-                        "Emperor is actively working on the treadmill. Morning phase complete. "
-                        "Generate final regiment score and write to daily note. "
-                        "Brief wrap-up — what's the focus for today.",
-                        session_id, is_resume=True,
-                    )
-                    send_tts(wrap_up)
-                    _discord_reply(daily_thread_id, "briefing", wrap_up)
-                    morning_ended = True
-
-    # Update state file
+    # Save state — the session is now autonomous
     state_file.write_text(json.dumps({
-        "session_id": session_id,
-        "started_at": start_time.isoformat(),
-        "ended_at": datetime.now().isoformat(),
-        "status": "completed",
+        "started_at": datetime.now().isoformat(),
+        "status": "launched",
+        "pane_id": pane_id,
+        "daily_thread_id": daily_thread_id,
     }))
 
-    print(f"Morning session completed: {session_id[:8]}")
-    return {"status": "completed", "session_id": session_id}
+    # Register enforce escalation (idempotent — also done by /api/morning/start endpoint)
+    _post("/api/morning/enforce-register", {})
+
+    print(f"Morning session launched in legion pane {pane_id}")
+    return {"status": "launched", "pane_id": pane_id}
 
 
 def start_morning_session_background():
     """Entry point for Token-API to start the morning session in background."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.create_task(run_morning_session())
-    else:
-        asyncio.run(run_morning_session())
+    import threading
+    thread = threading.Thread(target=run_morning_session, daemon=True)
+    thread.start()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_morning_session())
+    result = run_morning_session()
+    print(json.dumps(result, indent=2))

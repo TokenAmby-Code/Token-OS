@@ -109,6 +109,16 @@
             "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/agent-catch-release.sh",
+            "timeout": 15000
+          }
+        ]
       }
     ],
     "PermissionRequest": [

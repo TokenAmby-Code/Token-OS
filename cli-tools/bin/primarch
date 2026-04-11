@@ -123,7 +123,6 @@ idx = content.find(marker)
 if idx < 0:
     parts = content.split('---', 2)
     body = parts[2].strip() if len(parts) >= 3 else content.strip()
-    if len(body) > 2000: body = body[:2000] + '...'
     print(body)
 else:
     rest = content[idx + len(marker):].strip()

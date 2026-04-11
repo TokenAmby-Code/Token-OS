@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Source typing guard
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/tmux-guard.sh"
+
 PANE=""
 STATUS_ONLY=false
 
@@ -65,6 +69,14 @@ fi
 # Calculate presses needed and send them
 send_shift_tabs() {
     local count=$1
+    # Wait for user to finish typing before injecting mode toggles
+    local guard_pane=""
+    for arg in "${PANE_ARG[@]}"; do
+        [[ "$arg" != "-t" ]] && guard_pane="$arg"
+    done
+    if [[ -n "$guard_pane" ]]; then
+        tmux_wait_for_clear "$guard_pane" 10 || { echo "Aborted: user is typing" >&2; return 1; }
+    fi
     for ((i = 0; i < count; i++)); do
         tmux send-keys "${PANE_ARG[@]}" BTab
         # Small delay so Claude Code registers each keypress

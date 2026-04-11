@@ -58,16 +58,26 @@ fi
     tmux send-keys -t "$PANE" Enter
     log "Submitted /btw reprompt, polling for response"
 
-    # --- Step 4: Poll for dismiss sentinel ---
+    # --- Step 4: Poll for btw completion ---
+    # Wait for "Answering..." to appear (btw started), then wait for it
+    # to disappear (btw finished). Simpler and more robust than matching
+    # the dismiss dialog text which changes across versions.
     MAX_WAIT=120
     ELAPSED=0
+    SAW_ANSWERING=false
     while (( ELAPSED < MAX_WAIT )); do
         sleep 1
         ELAPSED=$((ELAPSED + 1))
 
         CONTENT=$(tmux capture-pane -p -t "$PANE" -S -200 2>/dev/null) || continue
 
-        if echo "$CONTENT" | grep -qE "Press (Space|Enter|Escape).*dismiss"; then
+        if tmux capture-pane -p -t "$PANE" -S -3 2>/dev/null | grep -q "Answering"; then
+            SAW_ANSWERING=true
+            continue
+        fi
+
+        # Answering disappeared — btw is done (or never started yet)
+        if [[ "$SAW_ANSWERING" == true ]]; then
             log "btw complete after ${ELAPSED}s"
             echo "$CONTENT" > "${HOME}/.claude/logs/btw-pane-dump.txt"
 
@@ -80,31 +90,32 @@ lines = sys.stdin.read().split("\n")
 # Find dismiss line (scan from bottom)
 end = None
 for i in range(len(lines) - 1, -1, -1):
-    if "dismiss" in lines[i].lower() and "press" in lines[i].lower():
+    if "dismiss" in lines[i].lower() and "escape" in lines[i].lower():
         end = i
         break
 if end is None:
     sys.exit(1)
 
-# Find where the btw response starts
-# Strategy 1: <<<END>>> delimiter
-# Strategy 2: echoed /btw command → blank line → response
+# Find where the btw response starts.
+# Scan bottom-up from dismiss for <<<END>>> delimiter. The btw panel
+# echoes the submitted command (indented), so <<<END>>> appears twice:
+#   ❯ /btw ... <<<END>>>        ← original prompt (starts with ❯)
+#     /btw... <<<END>>>          ← indented echo
+#     response text...
+#   dismiss line
+# We need the SECOND hit scanning up (skip the indented echo).
 btw_echo_end = None
+hits = 0
 
 for i in range(end - 1, -1, -1):
     if "<<<END>>>" in lines[i]:
-        btw_echo_end = i
-        break
-
-if btw_echo_end is None:
-    for i in range(end - 1, -1, -1):
-        stripped = lines[i].strip()
-        if stripped.startswith("/btw"):
-            for j in range(i + 1, end):
-                if not lines[j].strip():
-                    btw_echo_end = j
-                    break
+        hits += 1
+        if hits == 2:
+            btw_echo_end = i
             break
+        # First hit is the echo — record it as fallback
+        if hits == 1:
+            btw_echo_end = i
 
 if btw_echo_end is None:
     btw_echo_end = max(0, end - 20)

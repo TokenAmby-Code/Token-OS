@@ -1,13 +1,13 @@
 ---
 name: session-plan
-description: "Vault-first launch protocol: gather context in Pax-ENV, create worktree, transplant into plan mode. The standard way to start implementation sessions."
+description: "Vault-first launch protocol: gather context in the vault, create worktree, transplant into plan mode. The standard way to start implementation sessions."
 ---
 
 # Session Plan — Vault Launch Protocol
 
 The flow is: **vault → worktree → plan → execute.** No exceptions.
 
-Start in Pax-ENV where context is cheap. Exhaust the vault. Create the worktree. Transplant with `--plan`. Design the approach. Get approval. Execute.
+Start in the vault where context is cheap. Exhaust the vault. Create the worktree. Transplant with `--plan`. Design the approach. Get approval. Execute.
 
 ## When to Use
 
@@ -15,11 +15,17 @@ Start in Pax-ENV where context is cheap. Exhaust the vault. Create the worktree.
 - Picking up a session doc that needs a worktree
 - Any time the user says "session plan" or invokes `/session-plan`
 
-## Assumptions
+## Project Detection
 
-- You can reach **Pax-ENV** (the Obsidian vault) via `obsidian vault=Pax-ENV`
-- The askCivic project config exists at `~/.config/worktrees/askCivic.conf`
-- Worktrees live at `~/worktrees/askCivic/wt-<name>`
+The pipeline auto-detects the project from your current working directory:
+
+| CWD | Default Project | Default Vault |
+|-----|----------------|---------------|
+| `$IMPERIUM/Imperium-ENV` | Token-OS | Imperium-ENV |
+| `$CIVIC/Pax-ENV` | askCivic | Pax-ENV |
+| Worktree path | From worktree config | From session doc |
+
+Override with `--project <name>` on `worktree-setup`. Available configs: `ls ~/.config/worktrees/`.
 
 ---
 
@@ -33,15 +39,19 @@ You are in the vault. **Read everything relevant before leaving.** Vault context
 4. **Read, don't skim** — the vault docs you skip now are the ones you'll wish you had after transplant prunes context
 
 ```bash
+# Determine your vault from CWD or session doc
+# Imperium-ENV: vault=Imperium-ENV
+# Pax-ENV: vault=Pax-ENV
+
 # Search for the topic and related terms
-obsidian vault=Pax-ENV search:context query="<topic>"
-obsidian vault=Pax-ENV search:context query="<related-term>"
+obsidian vault=<name> search:context query="<topic>"
+obsidian vault=<name> search:context query="<related-term>"
 
 # Read every hit — and follow their wikilinks
-obsidian vault=Pax-ENV read path="<note>.md"
+obsidian vault=<name> read path="<note>.md"
 
 # Check backlinks for notes that reference what you found
-obsidian vault=Pax-ENV backlinks path="<key-note>.md"
+obsidian vault=<name> backlinks path="<key-note>.md"
 ```
 
 **Done when:** You've read every note that touches the task. Not when you've found "enough."
@@ -88,72 +98,70 @@ If the current instance is already a primarch, transplant carries it automatical
 
 ## Phase 4: Pick or Create a Worktree
 
-This is the landing zone decision. Survey **both machines**, then decide.
+This is the landing zone decision. Survey available worktrees, then decide.
 
 ### Survey all worktrees
 
 ```bash
-# Authoritative list — the bare repo knows about ALL worktrees across all machines
+# List worktree configs
+ls ~/.config/worktrees/
+
+# For askCivic:
 git -C /Volumes/Civic/askcivic.git worktree list
 
-# Local worktrees only
-ls ~/worktrees/askCivic/
+# For Token-OS:
+git -C /Volumes/Imperium/token-os.git worktree list
 
-# Staged worktrees (exported from another machine, ready to import)
+# Local worktrees
+ls ~/worktrees/<project>/
+
+# Staged worktrees (exported from another machine)
 worktree-sync status
 ```
 
 The bare repo output shows paths from both machines:
-- `/Users/tokenclaw/worktrees/askCivic/wt-*` → Mac worktrees
-- `/home/token/worktrees/askCivic/wt-*` → WSL worktrees
+- `/Users/tokenclaw/worktrees/<project>/wt-*` → Mac worktrees
+- `/home/token/worktrees/<project>/wt-*` → WSL worktrees
 - `prunable` flag → worktree directory is missing (stale reference, or on the other machine)
 
 ### Decision tree
 
-1. **Worktree exists locally** (e.g., `~/worktrees/askCivic/wt-<name>`)
-   - Target: `~/worktrees/askCivic/wt-<name>`
+1. **Worktree exists locally** (e.g., `~/worktrees/<project>/wt-<name>`)
+   - Target: `~/worktrees/<project>/wt-<name>`
    - No setup needed, go to Phase 5
 
-2. **Worktree exists on the other machine** (e.g., `/home/token/worktrees/askCivic/wt-<name>`)
+2. **Worktree exists on the other machine** (e.g., `/home/token/worktrees/<project>/wt-<name>`)
    - **Ask the user:** "The `<name>` worktree is checked out on WSL/Mac. Should I:"
      - **a) Transplant cross-device** — work on it where it lives
        ```bash
-       transplant --host wsl /home/token/worktrees/askCivic/wt-<name>
+       transplant --host wsl /home/token/worktrees/<project>/wt-<name>
        ```
      - **b) Pull it to this machine** — export from there, import here
        ```bash
-       # On the remote machine (via ssh):
-       ssh-wsl "worktree-sync export <branch-name>"  # or ssh-mac
-       # Then locally:
+       ssh-wsl "worktree-sync export <branch-name>"
        worktree-sync import <branch-name>
        ```
      - **c) Create a fresh local worktree** on the same branch (if no uncommitted work there)
        ```bash
        worktree-setup <branch-name> --existing --no-transplant
        ```
-   - Let the user decide — the right choice depends on whether there's uncommitted work, which machine they want to be on, etc.
+   - Let the user decide — the right choice depends on uncommitted work, preferred machine, etc.
 
 3. **Worktree is staged on NAS** (exported from another machine, shown in `worktree-sync status`)
    ```bash
    worktree-sync import <branch-name>
    ```
-   - Target: `~/worktrees/askCivic/wt-<name>`
 
 4. **Task needs main** (hotfix, quick change, no branch needed)
-   - Target: `~/worktrees/askCivic/wt-main`
+   - Target: `~/worktrees/<project>/wt-main`
    - No setup needed, go to Phase 5
 
 5. **Task needs a new worktree** (new feature, new branch)
    ```bash
-   worktree-setup <branch-name> --no-transplant
+   worktree-setup <branch-name> --no-transplant [--project <project>]
    ```
    - `--no-transplant` because we handle that ourselves in Phase 5
-   - Target: `~/worktrees/askCivic/wt-<name>`
-
-6. **Different project entirely**
-   ```bash
-   worktree-setup <branch-name> --project <project> --no-transplant
-   ```
+   - Target: `~/worktrees/<project>/wt-<name>`
 
 ### Naming convention
 
@@ -166,11 +174,11 @@ The bare repo output shows paths from both machines:
 Transplant to the worktree **with `--plan`**. This is not optional — you always plan before executing.
 
 ```bash
-transplant --plan [--primarch <name>] ~/worktrees/askCivic/wt-<name>
+transplant --plan [--primarch <name>] ~/worktrees/<project>/wt-<name>
 ```
 
 The `--plan` transplant:
-1. Kills the current session in Pax-ENV and restarts in the worktree with `--resume`
+1. Kills the current session in the vault and restarts in the worktree with `--resume`
 2. The new session lands with a fresh context + the plan prompt
 3. You explore the codebase and design the implementation approach in plan mode
 4. Plan gatekeeper hook rejects the first plan with a directive to update the session doc
@@ -198,24 +206,41 @@ This clears the plan-mode exploration context and starts a clean session with on
 
 ```bash
 # The flow: vault → worktree → plan → execute
+
 # 1. Exhaust the vault (Phase 1)
-obsidian vault=Pax-ENV search:context query="<topic>"
-obsidian vault=Pax-ENV read path="<note>.md"
+obsidian vault=<name> search:context query="<topic>"
+obsidian vault=<name> read path="<note>.md"
 
 # 2. Create worktree (Phase 4)
-worktree-setup <branch-name> --no-transplant
+worktree-setup <branch-name> --no-transplant [--project <project>]
 
 # 3. Transplant into plan mode (Phase 5)
-transplant --plan --primarch fabricator-general ~/worktrees/askCivic/wt-<name>
+transplant --plan [--primarch <name>] ~/worktrees/<project>/wt-<name>
 # ... design approach ... user approves ...
 transplant --execute-plan
 
-# Survey worktrees
-git -C /Volumes/Civic/askcivic.git worktree list
+# Survey worktrees (pick the right bare repo for your project)
+git -C <bare-repo-path> worktree list
 worktree-sync status
 
 # Cleanup after merge
 worktree-delete <branch-name> -b
+```
+
+## Automated Dispatch (Backrooms / Fleet)
+
+For autonomous work without manual intervention:
+
+```bash
+# One-shot: vault → read session doc → transplant → work
+vault-dispatch <session-doc> <working-dir> [--primarch <name>]
+
+# Full cycle: vault → worktree → implement → PR → merge → cleanup
+work-loop dispatch <session-doc> [--primarch <name>] [--branch <name>]
+
+# Monitor backrooms
+tx br status
+tx br cleanup
 ```
 
 ## Anti-Patterns

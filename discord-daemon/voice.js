@@ -92,7 +92,8 @@ export function createVoiceManager(botClients, config, logger) {
       await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
       logger.info(`Voice [${botName}]: joined channel ${channel.name} (${voiceChannelId})`);
     } catch (err) {
-      state.connection.destroy();
+      // state.connection may have been nulled by a concurrent leaveChannel during the wait
+      if (state.connection) state.connection.destroy();
       state.connection = null;
       state.channelId = null;
       throw new Error(`Failed to join voice channel: ${err.message}`);
@@ -119,7 +120,7 @@ export function createVoiceManager(botClients, config, logger) {
 
   // Chunking config
   const MAX_CHUNK_SECONDS = 15;
-  const SILENCE_FLUSH_MS = 1500; // Flush after 1.5s of silence
+  const SILENCE_FLUSH_MS = 1500; // Flush after 1.5s of silence (raised from 0.8s — was cutting sentences)
   const BYTES_PER_SECOND = 48000 * 2; // 48kHz mono s16le
   const MAX_CHUNK_BYTES = MAX_CHUNK_SECONDS * BYTES_PER_SECOND;
 
@@ -137,19 +138,11 @@ export function createVoiceManager(botClients, config, logger) {
     // Filter out Discord silence frames before they hit the Opus decoder.
     // During silence, Discord sends padding frames (0xF8 0xFF 0xFE etc.)
     // that corrupt the decoder. We filter these and use them as silence signals.
-    let packetCount = 0;
     const silenceFilter = new Transform({
       transform(chunk, encoding, callback) {
-        packetCount++;
-        // Log first 20 packets to understand the frame format
-        if (packetCount <= 20) {
-          const hex = chunk.slice(0, 8).toString('hex');
-          logger.debug(`Voice [${botName}]: packet #${packetCount} len=${chunk.length} hex=${hex}`);
-        }
-        // Discord silence frames are typically small Opus frames.
-        // Common patterns: 0xF8 prefix (3-5 bytes), or very small frames during gaps.
-        const isSilence = chunk.length <= 5;
-        if (isSilence) {
+        // Discord silence frames are ≤5 bytes (typically 3 bytes: 0xF8 0xFF 0xFE).
+        // Speech frames are 40-80+ bytes. Filter silence to prevent Opus decoder corruption.
+        if (chunk.length <= 5) {
           silenceFilter.emit('silence');
           callback();
         } else {

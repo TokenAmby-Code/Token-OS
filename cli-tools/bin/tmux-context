@@ -6,7 +6,7 @@
 1. Displays context % in Claude Code's status line
 2. Sets @CONTEXT_INFO pane option for tmux pane border display
 3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
-4. Triggers pre-compact /session-update at configurable threshold
+4. Nudges agent to plan mode at 125k token threshold (non-blocking)
 5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
 
 Enriches display with Token-API instance data (voice, session doc).
@@ -30,8 +30,8 @@ import urllib.request
 
 # --- Config ---
 STATE_DIR = "/tmp/claude-panes"
-FLUSH_THRESHOLD = 70  # percent — inject /session-update
-FLUSH_COOLDOWN = 300  # seconds — don't re-flush within 5 minutes
+FLUSH_TOKEN_THRESHOLD = 125_000  # used context tokens — nudge agent to plan mode for refocus
+FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
 MODE_ENFORCE_COOLDOWN = 8  # seconds — don't re-check mode within 8s of last correction
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
@@ -43,6 +43,34 @@ CYAN = "\033[36m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+
+def tmux_pane_has_input(pane_id):
+    """Check if a pane has pending user input. Returns True if user is typing."""
+    import re
+    try:
+        output = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        # Get last non-empty line
+        lines = [l for l in output.splitlines() if l.strip()]
+        if not lines:
+            return False
+        last = lines[-1]
+        # Empty Claude Code prompt: just ">" with optional whitespace/box chars
+        if re.match(r'^[\s│░▒▓]*>\s*$', last):
+            return False
+        # Shell prompt ending with marker, nothing after
+        if re.search(r'[$%#>❯]\s*$', last):
+            return False
+        # No prompt marker at all — likely output, not input line
+        if not re.search(r'[$%#>❯]', last):
+            return False
+        # Content after prompt marker — user is typing
+        return True
+    except Exception:
+        return False
 
 
 def read_input():
@@ -215,7 +243,6 @@ def write_state(pane_id, data, pct, model_name, session_id, instance):
         state["tab_name"] = instance.get("tab_name")
         state["instance_id"] = instance.get("id")
         state["cc_color"] = instance.get("cc_color")
-        state["tts_state"] = instance.get("_tts_state", "")
     try:
         with open(state_file, "w") as f:
             json.dump(state, f)
@@ -223,11 +250,15 @@ def write_state(pane_id, data, pct, model_name, session_id, instance):
         pass
 
 
-def check_pre_compact(pane_id, pct):
-    """If context crosses threshold, inject /session-update. Idempotent via cooldown."""
+def check_pre_compact(pane_id, pct, total_tokens):
+    """If context crosses token threshold, nudge agent to plan mode for refocus. Non-blocking.
+    Uses pct * total to derive actual context-window usage (not cumulative session tokens)."""
     if not pane_id or not os.environ.get("TMUX"):
         return
-    if pct is None or pct < FLUSH_THRESHOLD:
+    if pct is None or total_tokens is None:
+        return
+    context_tokens = int(total_tokens * pct / 100)
+    if context_tokens < FLUSH_TOKEN_THRESHOLD:
         return
 
     safe_id = pane_id.lstrip("%")
@@ -249,7 +280,14 @@ def check_pre_compact(pane_id, pct):
     except Exception:
         pass
 
-    os.system(f'tmux send-keys -t "{pane_id}" "/session-update" Enter')
+    # Guard: don't inject if user is typing
+    if tmux_pane_has_input(pane_id):
+        return
+
+    # Non-blocking nudge: tell agent to wrap up then enter plan mode.
+    # Plan-gatekeeper hook will catch ExitPlanMode and force session doc update.
+    msg = "Context threshold reached. Wrap up your immediate task, then switch to plan mode to refocus."
+    os.system(f'tmux send-keys -t "{pane_id}" "{msg}" Enter')
 
 
 def enforce_bypass_mode(pane_id):
@@ -345,19 +383,8 @@ def main():
     if instance:
         session_doc = instance.get("_session_doc_title") or short_session_doc(instance.get("session_doc_id")) if instance.get("session_doc_id") else ""
 
-    # --- TTS state: speaking / queued ---
-    tts_label = ""
-    if instance:
-        inst_id = instance.get("id", "")
-        tts_status = api_get("/api/notify/queue/status", timeout=0.5)
-        if tts_status:
-            current = tts_status.get("current")
-            if current and current.get("instance_id") == inst_id:
-                tts_label = "\U0001f50a"  # 🔊 speaking
-            elif any(q.get("instance_id") == inst_id for q in tts_status.get("queue", [])):
-                tts_label = "\U0001f508"  # 🔈 queued
-        if instance and tts_label:
-            instance["_tts_state"] = "speaking" if tts_label == "\U0001f50a" else "queued"
+    # TTS state: now owned by Token-API (pushes @TTS_STATE to pane directly).
+    # tmux-context no longer polls /api/notify/queue/status.
 
     # --- Name sync: tmux pane title → Token-API tab_name ---
     # Only sync kebab-case names (our naming convention). Claude Code auto-generates
@@ -384,8 +411,6 @@ def main():
     border_parts = [
         f"{model_name} {pct_str} {used_str}/{total_str}",
     ]
-    if tts_label:
-        border_parts.append(tts_label)
     if voice:
         border_parts.append(voice)
     if session_doc:
@@ -399,7 +424,7 @@ def main():
     write_state(pane_id, data, pct, model_name, session_id, instance)
 
     # --- 3. Check pre-compact threshold ---
-    check_pre_compact(pane_id, pct)
+    check_pre_compact(pane_id, pct, total_tokens)
 
     # --- 4. Output status line for Claude Code ---
     color = context_color(pct)
@@ -408,8 +433,7 @@ def main():
     voice_str = f" {DIM}{voice}{RESET}" if voice else ""
     doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
 
-    tts_str = f" {tts_label}" if tts_label else ""
-    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{voice_str}{doc_str}{tts_str}")
+    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{voice_str}{doc_str}")
 
     # --- 5. Enforce bypass mode (auto-correct accept-edits/no-mode) ---
     enforce_bypass_mode(pane_id)

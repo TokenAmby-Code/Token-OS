@@ -15,6 +15,10 @@
 
 set -euo pipefail
 
+# Source typing guard
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/tmux-guard.sh"
+
 TARGET=""
 TEXT=""
 FROM_STDIN=false
@@ -135,9 +139,9 @@ if $DRY_RUN; then
     exit 0
 fi
 
-# --- Send the prompt ---
-# Use send-keys -l for literal text, then Enter to submit
-tmux send-keys -t "$TARGET" -l "$TEXT"
-tmux send-keys -t "$TARGET" Enter
+# --- Send the prompt (guarded) ---
+# Wait for user to finish typing before injecting
+tmux_send_guarded -t "$TARGET" -l "$TEXT"
+tmux_send_guarded -t "$TARGET" Enter
 
 echo "Prompt injected into $TARGET" >&2

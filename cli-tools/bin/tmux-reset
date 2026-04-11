@@ -74,7 +74,7 @@ do_reset() {
     if [[ "$LAYOUT_ORIGIN" == "wsl" ]]; then
         tmux-workspace --window-reset "$WINDOW_NAME"
     elif [[ "$LAYOUT_ORIGIN" == "mac" ]]; then
-        tmux-workspace --bridge-reset "$WINDOW_NAME"
+        tmux-workspace --palace-reset "$WINDOW_NAME"
     fi
 
     # Clear expanded state after rebuild
@@ -117,8 +117,8 @@ case "${1:-}" in
         ;;
     *)
         tmux display-menu -T "Reset Workspace" \
-            "Reset formatting (preserve processes)" r "run-shell 'tmux-reset --do-soft'" \
-            "Full wipe (start fresh)" w "run-shell 'tmux-reset --do-hard'" \
+            "Reset formatting (preserve processes)" r "run-shell 'tmux-run tmux-reset --do-soft'" \
+            "Full wipe (start fresh)" w "run-shell 'tmux-run tmux-reset --do-hard'" \
             "" \
             "Cancel" q ""
         ;;

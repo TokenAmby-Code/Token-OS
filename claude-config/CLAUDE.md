@@ -91,6 +91,11 @@ Use tasks for anything with 3+ steps or that involves multiple files.
 | Command | Purpose |
 |---------|---------|
 | `instance-name` | Session naming |
+| `transplant` | Move session to different directory/device with history preserved |
+| `worktree-setup` | Create git worktrees from NAS bare repos |
+| `vault-dispatch` | Spawn Claude in vault, brief it, transplant to work |
+| `work-loop` | Full cycle: vault → worktree → implement → PR → merge → cleanup |
+| `tx br` | Backrooms dispatch/status/cleanup (`tx backrooms`) |
 | `cloud-logs` | Cloud Run logs |
 | `db-query` | Cloud SQL access |
 | `db-migrate` | SQL migrations |
@@ -101,6 +106,33 @@ Use tasks for anything with 3+ steps or that involves multiple files.
 | `time-convert` | Timezone conversion |
 
 Full docs: `$CIVIC/ProcurementAgentAI/CLAUDE.md` or use slash commands (`/pr`, `/test`, `/logs`, `/deploy`, `/db-query`).
+
+## Worktree Pipeline — Vault to Implementation
+
+The standard flow for implementation work is: **vault → worktree → plan → execute.**
+
+Use the `/session-plan` skill to run this flow. It handles project detection, vault research, worktree creation, and transplant orchestration.
+
+```
+Vault (Imperium-ENV or Pax-ENV)
+  ↓ /session-plan — exhaust vault context
+  ↓ worktree-setup <branch> --no-transplant
+  ↓ transplant --plan ~/worktrees/<project>/wt-<branch>
+Worktree (plan mode)
+  ↓ explore codebase, design approach
+  ↓ transplant --execute-plan
+Worktree (implementation)
+  ↓ implement, test, /pr
+```
+
+**For autonomous dispatch** (no human in the loop):
+```bash
+vault-dispatch <session-doc> <working-dir> [--primarch <name>]   # one-shot
+work-loop dispatch <session-doc> [--branch <name>]               # full cycle to PR merge
+tx br "prompt"                                                     # quick backrooms task
+```
+
+**Worktree configs:** `~/.config/worktrees/<project>.conf` — project auto-detected from CWD.
 
 ## Vault Mind — Obsidian as Extended Cognition
 

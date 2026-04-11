@@ -7,6 +7,7 @@
 #   push-mobile -b              # Push bashrc
 #   push-mobile -p              # Push termux.properties
 #   push-mobile -m              # Push macros folder
+#   push-mobile -t              # Push tmux.conf + toolbar-toggle script
 #   push-mobile -bp             # Push bashrc + properties
 #   push-mobile -a              # Push everything
 #
@@ -23,6 +24,7 @@ SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
 
 PUSH_BASHRC=false
 PUSH_PROPERTIES=false
+PUSH_TMUX=false
 PUSH_MACROS=false
 DRY_RUN=false
 
@@ -45,15 +47,18 @@ push-mobile - Push Termux config and macros to phone
 Usage:
     push-mobile -b, --bashrc        Push bashrc
     push-mobile -p, --properties    Push termux.properties
+    push-mobile -t, --tmux          Push tmux.conf + toolbar-toggle script
     push-mobile -m, --macros        Push macros folder
     push-mobile -a, --all           Push everything
     push-mobile --dry-run           Preview without doing anything
 
-Combine flags:  push-mobile -bp       (bashrc + properties)
+Combine flags:  push-mobile -bpt      (bashrc + properties + tmux)
 
 Files:
     -b  mobile/termux-bashrc-template      → phone:~/.bashrc
     -p  mobile/termux-properties-template   → phone:~/.termux/termux.properties
+    -t  mobile/termux-tmux.conf            → phone:~/.tmux.conf
+        mobile/termux-toolbar-toggle       → phone:~/.local/bin/termux-toolbar-toggle
     -m  mobile/macros/                      → phone:~/macros/
 EOF
 }
@@ -63,8 +68,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help) show_help; exit 0 ;;
         --bashrc) PUSH_BASHRC=true; shift ;;
         --properties) PUSH_PROPERTIES=true; shift ;;
+        --tmux) PUSH_TMUX=true; shift ;;
         --macros) PUSH_MACROS=true; shift ;;
-        --all) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_MACROS=true; shift ;;
+        --all) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_TMUX=true; PUSH_MACROS=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -[bpma]*)
             # Parse combined short flags: -bp, -bpm, -a, etc.
@@ -73,8 +79,9 @@ while [[ $# -gt 0 ]]; do
                 case "${flags:$i:1}" in
                     b) PUSH_BASHRC=true ;;
                     p) PUSH_PROPERTIES=true ;;
+                    t) PUSH_TMUX=true ;;
                     m) PUSH_MACROS=true ;;
-                    a) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_MACROS=true ;;
+                    a) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_TMUX=true; PUSH_MACROS=true ;;
                     *) echo -e "${RED}Unknown flag: -${flags:$i:1}${NC}" >&2; exit 1 ;;
                 esac
             done
@@ -85,7 +92,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Require at least one target
-if ! $PUSH_BASHRC && ! $PUSH_PROPERTIES && ! $PUSH_MACROS; then
+if ! $PUSH_BASHRC && ! $PUSH_PROPERTIES && ! $PUSH_TMUX && ! $PUSH_MACROS; then
     show_help
     exit 1
 fi
@@ -130,6 +137,34 @@ if $PUSH_PROPERTIES; then
         else
             log_err "termux.properties failed"
         fi
+    fi
+fi
+
+if $PUSH_TMUX; then
+    tmux_src="${MOBILE_DIR}/termux-tmux.conf"
+    toggle_src="${MOBILE_DIR}/termux-toolbar-toggle"
+    if [[ ! -f "$tmux_src" ]]; then
+        log_err "Not found: ${tmux_src}"
+    elif [[ "$DRY_RUN" == true ]]; then
+        log_dry "tmux.conf → phone:~/.tmux.conf"
+        log_dry "toolbar-toggle → phone:~/.local/bin/termux-toolbar-toggle"
+    else
+        log_info "Pushing tmux config..."
+        ssh $SSH_OPTS phone "mkdir -p ~/.local/bin" 2>/dev/null
+        if scp -q "$tmux_src" phone:~/.tmux.conf; then
+            log_ok "tmux.conf"; ((pushed++))
+        else
+            log_err "tmux.conf failed"
+        fi
+        if [[ -f "$toggle_src" ]]; then
+            if scp -q "$toggle_src" phone:~/.local/bin/termux-toolbar-toggle; then
+                ssh $SSH_OPTS phone "chmod +x ~/.local/bin/termux-toolbar-toggle" 2>/dev/null
+                log_ok "toolbar-toggle"
+            else
+                log_err "toolbar-toggle failed"
+            fi
+        fi
+        ssh $SSH_OPTS phone "tmux source-file ~/.tmux.conf" 2>/dev/null && log_ok "tmux reloaded" || true
     fi
 fi
 

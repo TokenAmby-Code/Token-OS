@@ -29,6 +29,17 @@ ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
 # Resolve token-api URL from environment (set in nas-path.sh)
 API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 
+# Resolve claude-cmd with fallback to known NAS paths
+# Claude Code strips PATH during hook execution, so `command -v` may fail
+CLAUDE_CMD=$(command -v claude-cmd 2>/dev/null) || true
+if [[ -z "$CLAUDE_CMD" ]]; then
+  for _p in /Volumes/Imperium/Token-OS/cli-tools/bin/claude-cmd /mnt/imperium/Token-OS/cli-tools/bin/claude-cmd; do
+    if [[ -x "$_p" ]]; then CLAUDE_CMD="$_p"; break; fi
+  done
+fi
+# Fallback to no-op if claude-cmd is not found anywhere
+: "${CLAUDE_CMD:=false}"
+
 # Inject shell environment variables for device detection and primarch identity
 if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" ]]; then
   JQ_FILTER=".env //= {} | .env"
@@ -67,9 +78,22 @@ fi
 # Resolve tmux pane via PID walk when env var is stripped (Claude Code strips $TMUX_PANE)
 # Inject into payload so Token-API can store it for cross-machine dispatch
 if [[ -z "$TMUX_PANE" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
-  RESOLVED_PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
+  RESOLVED_PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$RESOLVED_PANE" ]]; then
     HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg p "$RESOLVED_PANE" '.tmux_pane = $p') || true
+    # Also resolve @PANE_ID (human-readable label like "palace:TR") for DB-driven resurrection
+    RESOLVED_LABEL=$(tmux show-options -pv -t "$RESOLVED_PANE" @PANE_ID 2>/dev/null || true)
+    if [[ -n "$RESOLVED_LABEL" ]]; then
+      HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg l "$RESOLVED_LABEL" '.pane_label = $l') || true
+    fi
+  fi
+fi
+
+# When $TMUX_PANE IS available, still resolve @PANE_ID for DB persistence
+if [[ -n "$TMUX_PANE" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+  RESOLVED_LABEL=$(tmux show-options -pv -t "$TMUX_PANE" @PANE_ID 2>/dev/null || true)
+  if [[ -n "$RESOLVED_LABEL" ]]; then
+    HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg l "$RESOLVED_LABEL" '.pane_label = $l') || true
   fi
 fi
 
@@ -91,7 +115,7 @@ fi
 if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   TRANSPLANT_PANE=""
   if [[ -n "$CLAUDE_PID" ]]; then
-    TRANSPLANT_PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
+    TRANSPLANT_PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   fi
 
   if [[ -n "$TRANSPLANT_PANE" ]]; then
@@ -139,7 +163,7 @@ fi
 
 # Drain pending UI commands on UserPromptSubmit (user just pressed Enter, prompt bar is empty)
 if [[ "$ACTION_TYPE" == "UserPromptSubmit" ]]; then
-  PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
+  PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" ]]; then
     PANE_SAFE=$(echo "$PANE" | tr -d '%')
     PENDING_FILE="${HOME}/.claude/pending-ui-cmds/${PANE_SAFE}"
@@ -154,10 +178,10 @@ if [[ "$ACTION_TYPE" == "UserPromptSubmit" ]]; then
           while IFS=' ' read -r cmd_pane cmd_rest; do
             last_pane="$cmd_pane"
             if [[ "$first" == true ]]; then
-              claude-cmd --no-escape --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
+              $CLAUDE_CMD --no-escape --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
               first=false
             else
-              claude-cmd --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
+              $CLAUDE_CMD --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
             fi
           done < "$DRAIN_FILE"
           [[ -n "$last_pane" ]] && tmux send-keys -t "$last_pane" C-u 2>/dev/null || true
@@ -194,20 +218,29 @@ if [[ "$ACTION_TYPE" == "PreToolUse" ]]; then
     [[ "${HOOK_DEBUG:-0}" == "1" ]] && echo "[$(date '+%H:%M:%S')] local_exec: $LOCAL_EXEC" >> "$LOG_FILE"
   fi
 elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+  # Clear stale tmux-context flush marker so fresh context window gets fresh threshold
+  if [[ -n "$TMUX_PANE" ]]; then
+    SAFE_PANE="${TMUX_PANE#%}"
+    rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null
+  fi
+
   RESPONSE=$(echo "${HOOK_INPUT}" | \
     curl -s --connect-timeout 2 --max-time 3 \
       -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
       -H "Content-Type: application/json" \
       -d @- 2>/dev/null) || true
 
-  # Defer auto-color to next UserPromptSubmit via pending-ui-cmds
+  # Defer auto-color + auto-rename to next UserPromptSubmit via pending-ui-cmds
+  # Ensures inline display stays in sync after re-registration, plan mode, resume, etc.
   COLOR=$(echo "$RESPONSE" | jq -r '.cc_color // empty' 2>/dev/null)
-  PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
-  if [[ -n "$COLOR" && -n "$PANE" ]]; then
+  TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null)
+  PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
+  if [[ -n "$PANE" && ( -n "$COLOR" || -n "$TAB_NAME" ) ]]; then
     PENDING_DIR="${HOME}/.claude/pending-ui-cmds"
     mkdir -p "$PENDING_DIR"
     PANE_SAFE=$(echo "$PANE" | tr -d '%')
-    echo "$PANE /color $COLOR" >> "$PENDING_DIR/${PANE_SAFE}"
+    [[ -n "$TAB_NAME" ]] && echo "$PANE /rename $TAB_NAME" >> "$PENDING_DIR/${PANE_SAFE}"
+    [[ -n "$COLOR" ]] && echo "$PANE /color $COLOR" >> "$PENDING_DIR/${PANE_SAFE}"
   fi
 else
   (

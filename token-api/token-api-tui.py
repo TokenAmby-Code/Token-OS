@@ -13,7 +13,7 @@ Controls:
   arrow/jk  - Select instance/cron job (up/down)
   g/G       - Jump to first/last
   [/]       - Switch table (Instances/Cron)
-  h/l       - Switch info panel (Events/Logs/Deploy/Monitor/Timer)
+  h/l       - Switch info panel (Events/Logs/Deploy/Monitor/Timer/tmux)
   Enter     - Open selected instance in new terminal tab
   r         - Rename selected instance
   y         - Copy resume command to clipboard (yank)
@@ -113,7 +113,7 @@ archived_selected_index = 0
 _evaluating_instances: set[str] = set()  # instance IDs currently in evaluator phase
 _throbber_tick = 0  # cycles 0-3 on each refresh for evaluator throbber
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
-PANEL_PAGE_MAX = 4  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor, 4=Timer Stats
+PANEL_PAGE_MAX = 5  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor, 4=Timer Stats, 5=tmux
 deploy_active = False
 deploy_log_path = None
 deploy_metadata = {}
@@ -1446,6 +1446,55 @@ def create_deploy_logs_panel(max_lines: int = 8) -> Panel:
     return Panel(content, title=title, border_style="yellow")
 
 
+TMUX_CMD_LOG = Path("/tmp/.tmux-cmd.log")
+
+
+def create_tmux_log_panel(max_lines: int = 8) -> Panel:
+    """Create a panel showing tmux command output from the shared log file."""
+    if not TMUX_CMD_LOG.exists():
+        content = Text("No tmux command output yet", style="dim")
+        return Panel(content, title="tmux", border_style="blue")
+
+    try:
+        raw_lines = TMUX_CMD_LOG.read_text().splitlines()
+        tail_lines = raw_lines[-max_lines:] if len(raw_lines) > max_lines else raw_lines
+
+        if not tail_lines:
+            content = Text("tmux log empty", style="dim")
+            return Panel(content, title="tmux", border_style="blue")
+
+        content = Text()
+        for i, line in enumerate(tail_lines):
+            if i > 0:
+                content.append("\n")
+            line = strip_ansi(line)
+
+            if line.startswith("[") and "]" in line:
+                # Timestamp header: [HH:MM:SS] command:
+                bracket_end = line.index("]") + 1
+                content.append(line[:bracket_end], style="dim")
+                rest = line[bracket_end:]
+                if rest.rstrip().endswith(":"):
+                    content.append(rest, style="cyan bold")
+                else:
+                    content.append(rest)
+            elif line == "---":
+                content.append(line, style="dim")
+            elif "error" in line.lower() or "fail" in line.lower():
+                content.append(line, style="red")
+            elif "skip" in line.lower() or "warn" in line.lower():
+                content.append(line, style="yellow")
+            elif "success" in line.lower() or "complete" in line.lower() or "restored" in line.lower():
+                content.append(line, style="green")
+            else:
+                content.append(line)
+
+    except Exception:
+        content = Text("Could not read tmux log", style="dim red")
+
+    return Panel(content, title="tmux", border_style="blue")
+
+
 def create_instance_details_panel(instance: dict, todos_data: dict, compact: bool = False) -> Panel:
     """Create a panel showing details for the selected instance.
 
@@ -2247,8 +2296,10 @@ def create_info_panel(max_lines: int = 8) -> Panel:
         return create_deploy_logs_panel(max_lines=max_lines)
     elif panel_page == 3:
         return create_monitor_panel(max_lines=max_lines)
-    else:
+    elif panel_page == 4:
         return create_timer_stats_panel(max_lines=max_lines)
+    else:
+        return create_tmux_log_panel(max_lines=max_lines)
 
 
 def create_status_bar(instances: list, selected_idx: int) -> Text:
@@ -2261,7 +2312,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
 
     if narrow:
         # Compact status bar with timer state inline
-        page_indicators = {0: "E", 1: "L", 2: "D", 3: "M", 4: "T"}
+        page_indicators = {0: "E", 1: "L", 2: "D", 3: "M", 4: "T", 5: "X"}
         page_indicator = page_indicators.get(panel_page, "?")
 
         text = Text()
@@ -2296,7 +2347,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
 
     # Normal status bar
     # Page indicator
-    page_names = ["Events", "Logs", "Deploy", "Monitor", "Timer"]
+    page_names = ["Events", "Logs", "Deploy", "Monitor", "Timer", "tmux"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
 
     # Filter indicator
@@ -2640,7 +2691,7 @@ def generate_help_screen() -> Layout:
             ("g", "Jump to first item"),
             ("G", "Jump to last item"),
             ("[ / ]", "Switch table (Instances / Cron / Archived)"),
-            ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer)"),
+            ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer/tmux)"),
             ("f", "Cycle filter (all / active / stopped)"),
             ("o", "Change sort order"),
             ("a", "Toggle subagent visibility"),

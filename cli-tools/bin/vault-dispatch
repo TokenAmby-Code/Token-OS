@@ -9,8 +9,9 @@
 #   vault-dispatch --list-free                    # Show free tmux panes
 #
 # The dispatch pattern:
-#   1. Find a free tmux pane (or use --pane)
-#   2. Launch Claude (or primarch) in the vault
+#   1. Create a new pane in a stack window (legion/kreig) or find a free pane
+#      in a reuse window (palace/warp)
+#   2. Launch Claude (or primarch) in the vault via shell function
 #   3. Send dispatch prompt: read session doc → gather context → transplant → work
 #
 # Examples:
@@ -48,9 +49,79 @@ if [[ ! -d "$VAULT_DIR" ]]; then
     exit 1
 fi
 
-# --- Free pane detection ---
+# --- Pane claim mechanism ---
+# Prevents race conditions when multiple dispatchers scan for free panes simultaneously.
+# Claims are tmpfiles with noclobber; stale claims (>60s) are reaped automatically.
+CLAIM_DIR="/tmp/claude-panes"
+CLAIM_TTL=60  # seconds — claims older than this are considered stale
+
+claim_pane() {
+    local pane_id="$1"
+    local claim_file="${CLAIM_DIR}/claim-${pane_id#%}"
+    mkdir -p "$CLAIM_DIR"
+    # Reap stale claim first
+    if [[ -f "$claim_file" ]]; then
+        local age
+        age=$(( $(date +%s) - $(stat -f %m "$claim_file" 2>/dev/null || echo 0) ))
+        if (( age > CLAIM_TTL )); then
+            rm -f "$claim_file"
+        fi
+    fi
+    # Atomic claim via noclobber
+    if (set -o noclobber; echo "$$:$(date +%s)" > "$claim_file") 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+release_claim() {
+    local pane_id="$1"
+    rm -f "${CLAIM_DIR}/claim-${pane_id#%}" 2>/dev/null || true
+}
+
+# --- Stack windows (legion/kreig) vs reuse windows (palace/warp) ---
+STACK_WINDOWS=("legion" "kreig")
+
+is_stack_window() {
+    local win="$1"
+    for sw in "${STACK_WINDOWS[@]}"; do
+        [[ "$win" == "$sw" ]] && return 0
+    done
+    return 1
+}
+
+# Get the window name for a pane ID
+pane_window() {
+    tmux display-message -t "$1" -p '#{window_name}' 2>/dev/null
+}
+
+# Create a new pane in a stack window via split-window.
+# Returns the new pane ID. The pane is born as a clean shell — no backstop.
+create_stack_pane() {
+    local window="${1:-legion}"
+    local session="main"
+    local target="${session}:${window}"
+
+    # Ensure the window exists
+    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qx "$window"; then
+        log_error "Window '$window' does not exist in session '$session'"
+        return 1
+    fi
+
+    # Split a new pane in the stack window (vertical split, starts in $HOME)
+    local new_pane
+    new_pane=$(tmux split-window -t "$target" -d -P -F '#{pane_id}' -c "$HOME" 2>/dev/null)
+    if [[ -z "$new_pane" ]]; then
+        log_error "Failed to split new pane in $target"
+        return 1
+    fi
+
+    echo "$new_pane"
+}
+
+# --- Free pane detection (for palace/warp reuse) ---
 # Returns pane IDs that are running plain bash/zsh (no Claude, no TUI, no special process)
-# Excludes: panes in tui window, panes already running claude
+# Only scans reuse windows (palace, warp). Stack windows (legion, kreig) always split.
 find_free_panes() {
     local grid_panes=()
     local other_panes=()
@@ -61,9 +132,10 @@ find_free_panes() {
             [[ "$s" == "$pane_id" ]] && continue 2
         done
         seen+=("$pane_id")
-        # Skip TUI and backrooms windows
+        # Skip TUI, backrooms, and stack windows
         [[ "$window_name" == "tui" ]] && continue
         [[ "$window_name" == "backrooms" ]] && continue
+        is_stack_window "$window_name" && continue
         # Only consider panes running a shell (bash/zsh)
         [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
         # Verify no claude process in the pane's process tree
@@ -74,8 +146,19 @@ find_free_panes() {
                 continue
             fi
         fi
-        # Prioritize grid panes over mobile/other
-        if [[ "$window_name" == "grid" ]]; then
+        # Skip panes with active (non-stale) claims
+        local claim_file="${CLAIM_DIR}/claim-${pane_id#%}"
+        if [[ -f "$claim_file" ]]; then
+            local age
+            age=$(( $(date +%s) - $(stat -f %m "$claim_file" 2>/dev/null || echo 0) ))
+            if (( age <= CLAIM_TTL )); then
+                continue
+            fi
+            # Stale claim — reap it
+            rm -f "$claim_file"
+        fi
+        # Prioritize palace panes over mobile/other
+        if [[ "$window_name" == "palace" ]]; then
             grid_panes+=("$pane_id")
         else
             other_panes+=("$pane_id")
@@ -103,7 +186,20 @@ list_free_panes() {
         if [[ -n "$pane_pid" ]] && pgrep -P "$pane_pid" -f "claude" &>/dev/null; then
             continue
         fi
-        echo -e "  ${CYAN}${pane_id}${NC}  ${DIM}window:${NC}${window_name}  ${DIM}cmd:${NC}${cmd}"
+        # Check for active claim
+        local claim_file="${CLAIM_DIR}/claim-${pane_id#%}"
+        local claim_tag=""
+        if [[ -f "$claim_file" ]]; then
+            local age
+            age=$(( $(date +%s) - $(stat -f %m "$claim_file" 2>/dev/null || echo 0) ))
+            if (( age <= CLAIM_TTL )); then
+                claim_tag="  ${YELLOW}(claimed)${NC}"
+                # Still show it, but marked — skip if you only want truly free
+            else
+                rm -f "$claim_file"
+            fi
+        fi
+        echo -e "  ${CYAN}${pane_id}${NC}  ${DIM}window:${NC}${window_name}  ${DIM}cmd:${NC}${cmd}${claim_tag}"
         found=true
     done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}" 2>/dev/null)
     if [[ "$found" != "true" ]]; then
@@ -165,18 +261,22 @@ Arguments:
   <working-dir>       Absolute path to the target working directory
 
 Options:
-  --pane <id>         Target tmux pane (default: auto-detect first free pane)
+  --window, -w <name> Target window (default: legion). Stack windows (legion, kreig)
+                      create a new pane. Reuse windows (palace, warp) scan for free panes.
+  --pane <id>         Target a specific pane (overrides --window). In stack windows,
+                      still creates a new pane rather than reusing.
   --primarch <name>   Launch as a primarch persona
   --zealotry <1-5>    Set zealotry level for Golden Throne follow-ups (default: 3)
   --context <text>    Extra context to include in the dispatch prompt
   --dry-run           Show what would happen without executing
-  --list-free         List free tmux panes and exit
+  --list-free         List free tmux panes (reuse windows only) and exit
   -h, --help          Show this help message
 
 Examples:
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w kreig
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --primarch vulkan
-  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --pane %7
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w palace
   vault-dispatch --list-free
 EOF
     exit 0
@@ -186,6 +286,7 @@ EOF
 SESSION_DOC=""
 WORKING_DIR=""
 TARGET_PANE=""
+TARGET_WINDOW=""
 PRIMARCH_NAME=""
 ZEALOTRY=3
 EXTRA_CONTEXT=""
@@ -209,6 +310,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --zealotry)
             ZEALOTRY="$2"
+            shift 2
+            ;;
+        --window|-w)
+            TARGET_WINDOW="$2"
             shift 2
             ;;
         --context)
@@ -271,41 +376,91 @@ if ! tmux display-message -p '#{session_name}' &>/dev/null; then
     exit 1
 fi
 
-# --- Resolve pane ---
-if [[ -z "$TARGET_PANE" ]]; then
-    # Auto-detect first free pane
-    TARGET_PANE=$(find_free_panes | head -1)
-    if [[ -z "$TARGET_PANE" ]]; then
-        log_error "No free tmux panes available"
-        echo ""
-        echo "  All grid panes are occupied. Options:"
-        echo "  1. Use --pane <id> to target a specific pane"
-        echo "  2. Stop an existing instance first"
-        echo ""
-        echo "  Current pane usage:"
-        tmux list-panes -a -F '  #{pane_id}  #{window_name}  #{pane_current_command}' 2>/dev/null | grep -v tui
-        exit 1
+# --- Resolve pane (skip for dry-run to avoid side effects) ---
+# Three paths:
+#   1. --pane specified: use it directly (manual override)
+#   2. --window specified (or default "legion"): stack windows split, reuse windows scan
+#   3. No flags: default to legion (stack)
+PANE_MODE=""  # "stack" or "reuse"
+
+if $DRY_RUN; then
+    TARGET_WINDOW="${TARGET_WINDOW:-legion}"
+    if is_stack_window "$TARGET_WINDOW"; then
+        PANE_MODE="stack"
+        TARGET_PANE="(new pane in $TARGET_WINDOW)"
+    else
+        PANE_MODE="reuse"
+        TARGET_PANE="(first free pane)"
     fi
-    log_success "Auto-selected free pane: $TARGET_PANE"
-else
-    # Validate specified pane exists
+elif [[ -n "$TARGET_PANE" ]]; then
+    # Manual pane override — validate it exists
     if ! tmux display-message -t "$TARGET_PANE" -p '#{pane_id}' &>/dev/null; then
         log_error "Pane not found: $TARGET_PANE"
         exit 1
     fi
-    log_success "Using specified pane: $TARGET_PANE"
+    # Determine mode from the pane's window
+    pane_win=$(pane_window "$TARGET_PANE")
+    if is_stack_window "$pane_win"; then
+        # Even with --pane in a stack window, split a new pane instead of reusing
+        log_warn "Pane $TARGET_PANE is in stack window '$pane_win' — creating new pane instead"
+        TARGET_PANE=$(create_stack_pane "$pane_win") || exit 1
+        PANE_MODE="stack"
+    else
+        if ! claim_pane "$TARGET_PANE"; then
+            log_error "Pane $TARGET_PANE already claimed by another dispatch"
+            exit 1
+        fi
+        PANE_MODE="reuse"
+    fi
+    log_success "Using pane: $TARGET_PANE ($PANE_MODE)"
+else
+    # No --pane specified. Use --window or default to legion.
+    TARGET_WINDOW="${TARGET_WINDOW:-legion}"
+
+    if is_stack_window "$TARGET_WINDOW"; then
+        # Stack window: always create a new pane
+        TARGET_PANE=$(create_stack_pane "$TARGET_WINDOW") || exit 1
+        PANE_MODE="stack"
+        log_success "Created new pane in $TARGET_WINDOW: $TARGET_PANE"
+    else
+        # Reuse window: scan for free panes
+        TARGET_PANE=""
+        while IFS= read -r candidate; do
+            [[ -z "$candidate" ]] && continue
+            if claim_pane "$candidate"; then
+                TARGET_PANE="$candidate"
+                break
+            fi
+        done < <(find_free_panes)
+        if [[ -z "$TARGET_PANE" ]]; then
+            log_error "No free panes in reuse windows (palace/warp)"
+            echo ""
+            echo "  Options:"
+            echo "  1. Use --window legion (default) to create a stack pane"
+            echo "  2. Use --pane <id> to target a specific pane"
+            echo "  3. Stop an existing instance first"
+            exit 1
+        fi
+        PANE_MODE="reuse"
+        log_success "Auto-selected free pane: $TARGET_PANE (claimed)"
+    fi
+fi
+
+# Release claim on early exit (only matters for reuse panes)
+if [[ "$PANE_MODE" == "reuse" ]]; then
+    trap 'release_claim "$TARGET_PANE"' ERR
 fi
 
 # --- Build the dispatch prompt ---
 DISPATCH_PROMPT=$(build_dispatch_prompt "$SESSION_DOC" "$WORKING_DIR" "$PRIMARCH_NAME" "$EXTRA_CONTEXT")
 
 # --- Build the claude launch command ---
-CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "\$HOME/.local/bin/claude")
-
+# Use the shell function (loaded via .zshrc) not the raw binary — the wrapper
+# handles auto-cd, primarch routing, and env setup.
 if [[ -n "$PRIMARCH_NAME" ]]; then
     LAUNCH_CMD="cd '${VAULT_DIR}' && primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
 else
-    LAUNCH_CMD="cd '${VAULT_DIR}' && ${CLAUDE_BIN} --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
+    LAUNCH_CMD="cd '${VAULT_DIR}' && claude --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
 fi
 
 # --- Display summary ---
@@ -337,19 +492,30 @@ fi
 # --- Execute dispatch ---
 log_info "Dispatching to pane $TARGET_PANE..."
 
-# Clear the pane first
-tmux send-keys -t "$TARGET_PANE" "clear" Enter
-sleep 0.3
-
-# Send the launch command
-tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+if [[ "$PANE_MODE" == "stack" ]]; then
+    # Stack pane: born clean from split-window, inherits default shell (zsh).
+    # Shell functions (claude, primarch) load from .zshrc automatically.
+    # Brief pause for shell init before sending command.
+    sleep 0.5
+    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+else
+    # Reuse pane: clear existing content, then launch.
+    # Pane is already running an interactive shell with functions loaded.
+    tmux send-keys -t "$TARGET_PANE" "clear" Enter
+    sleep 0.3
+    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+fi
 
 log_success "Claude launched in vault"
 
-# --- Wait for Claude to start, then register with Token-API ---
-# Give Claude a moment to start and register itself
+# --- Wait for Claude to start, then release claim and register with Token-API ---
+# The claim prevented races during pane selection (reuse mode only). Once claude
+# is running, the process tree check in find_free_panes takes over as source of truth.
 (
     sleep 8
+
+    # Release the dispatch claim (no-op for stack panes which don't use claims)
+    [[ "$PANE_MODE" == "reuse" ]] && release_claim "$TARGET_PANE"
 
     # Try to find the new instance and set zealotry
     if command -v curl &>/dev/null && command -v jq &>/dev/null; then

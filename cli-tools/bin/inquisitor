@@ -35,4 +35,10 @@ fi
 FALLBACK_PERSONA="You are an Inquisitor — the Emperor's execution arm. Born with a command. Die with a report. Validate all sub-agent output aggressively. No untested code. No frankenmerge. Report with metrics: agents dispatched, discarded, integrated."
 SYSTEM_PROMPT="${PERSONA:-$FALLBACK_PERSONA}"
 
-exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" -p "$TASK"
+# In a legion tmux pane, run interactive (so pane stays alive for follow-ups).
+# Outside tmux or in a subshell, use -p for headless one-shot.
+if [[ -n "${TMUX:-}" ]] && tmux display-message -p '#{window_name}' 2>/dev/null | grep -qE '^(grid|legion)'; then
+    exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" "$TASK"
+else
+    exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" -p "$TASK"
+fi

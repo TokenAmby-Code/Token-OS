@@ -35,11 +35,20 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Detect default project from PWD (vault → project mapping)
+detect_default_project() {
+    case "$PWD" in
+        */Imperium-ENV*) echo "Token-OS" ;;
+        */Pax-ENV*)      echo "askCivic" ;;
+        *)               echo "askCivic" ;;
+    esac
+}
+
 # Defaults
 DRY_RUN=false
 FORCE=false
 SKIP_SYNC=false
-PROJECT="askCivic"
+PROJECT="$(detect_default_project)"
 SUBCOMMAND=""
 BRANCH_NAME=""
 

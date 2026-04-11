@@ -17,6 +17,10 @@
 
 set -euo pipefail
 
+# Source typing guard
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/tmux-guard.sh"
+
 # --- Defaults ---
 TARGET=""
 SUBMIT=false
@@ -112,10 +116,10 @@ if [[ -n "$TARGET" ]]; then
     SEND_ARGS+=(-t "$TARGET")
 fi
 
-# Send literal text (no key interpretation)
-tmux send-keys "${SEND_ARGS[@]}" -l "$TEXT"
+# Send literal text (guarded — waits if user is typing)
+tmux_send_guarded "${SEND_ARGS[@]}" -l "$TEXT"
 
 # Optionally submit
 if $SUBMIT; then
-    tmux send-keys "${SEND_ARGS[@]}" Enter
+    tmux_send_guarded "${SEND_ARGS[@]}" Enter
 fi

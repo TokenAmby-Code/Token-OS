@@ -56,7 +56,7 @@ fi
 #   ssh_alias     — SSH config host alias for this machine
 #   device_name   — Canonical device name (matches Token-API DEVICE_IPS)
 #   shell         — Default interactive shell (zsh/bash)
-#   tmux_layout   — Workspace layout (bridge/grid)
+#   tmux_layout   — Palace pane layout (mac-palace=5-pane right-col / wsl-palace=6-pane side-cols)
 
 # --- Mac Mini ---
 _IMPERIUM_CFG_mac_nas_imperium="/Volumes/Imperium"
@@ -66,7 +66,7 @@ _IMPERIUM_CFG_mac_token_api_url="http://localhost:7777"
 _IMPERIUM_CFG_mac_ssh_alias="mini"
 _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
-_IMPERIUM_CFG_mac_tmux_layout="bridge"
+_IMPERIUM_CFG_mac_tmux_layout="mac-palace"
 
 # --- WSL (Ubuntu on Windows PC) ---
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
@@ -76,7 +76,7 @@ _IMPERIUM_CFG_wsl_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
 _IMPERIUM_CFG_wsl_shell="bash"
-_IMPERIUM_CFG_wsl_tmux_layout="grid"
+_IMPERIUM_CFG_wsl_tmux_layout="wsl-palace"
 
 # --- Phone (Termux) ---
 _IMPERIUM_CFG_phone_nas_imperium=""
@@ -86,7 +86,7 @@ _IMPERIUM_CFG_phone_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
 _IMPERIUM_CFG_phone_shell="bash"
-_IMPERIUM_CFG_phone_tmux_layout="grid"
+_IMPERIUM_CFG_phone_tmux_layout="wsl-palace"
 
 # --- Linux fallback ---
 _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
@@ -96,7 +96,7 @@ _IMPERIUM_CFG_linux_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
-_IMPERIUM_CFG_linux_tmux_layout="grid"
+_IMPERIUM_CFG_linux_tmux_layout="wsl-palace"
 
 # ============================================================
 # CONFIG LOOKUP FUNCTION

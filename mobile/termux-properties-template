@@ -12,14 +12,14 @@
 # Row 3 (bottom): | ~ / - LEFT DOWN RIGHT (symbols + arrows)
 #
 # Hold behaviors:
-#   - Hold HOME → captures tmux pane to clipboard
+#   - Hold HOME → captures tmux pane to clipboard (prefix+y → tmux run-shell)
 #   - Hold UP → types 'claude' + Enter
 #   - Hold END → PASTE
 #   - Hold | → @
 #   - Hold DOWN → types 'exit' + Enter
 extra-keys = [ \
   ['DRAWER', {macro: "\u001b[Z", display: '⇧Tab'}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
-  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "tmux capture-pane -p | termux-clipboard-set\n", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
   [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 

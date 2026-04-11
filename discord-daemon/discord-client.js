@@ -2,37 +2,94 @@
 // Subscribes to ALL messages in configured channels (not just pings)
 
 import { Client, GatewayIntentBits, Partials, Events } from 'discord.js';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, '..', 'config.json');
+const ENV_PATH = join(process.env.HOME, '.discord-cli', '.env');
+
+// Load .env file into a map (does not pollute process.env)
+function loadEnvFile() {
+  if (!existsSync(ENV_PATH)) return {};
+  const vars = {};
+  for (const line of readFileSync(ENV_PATH, 'utf-8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq > 0) vars[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+  }
+  return vars;
+}
+
+const envTokens = loadEnvFile();
 
 export function loadConfig() {
   return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
 }
 
+// Map keychain service names to .env variable names
+const KEYCHAIN_TO_ENV = {
+  'discord-bot-token': 'DISCORD_BOT_TOKEN',
+  'discord-bot-token-custodes': 'DISCORD_BOT_TOKEN_CUSTODES',
+  'discord-bot-token-inquisition': 'DISCORD_BOT_TOKEN_INQUISITION',
+  'discord-bot-token-imperial-guard': 'DISCORD_BOT_TOKEN_IMPERIAL_GUARD',
+};
+
+// Backfill .env from keychain so launchd can use it next boot
+function backfillEnv(config) {
+  try {
+    const bots = config.bots || {};
+    const lines = [];
+    for (const [, botCfg] of Object.entries(bots)) {
+      const svc = botCfg.keychain_service;
+      const envKey = KEYCHAIN_TO_ENV[svc];
+      if (!svc || !envKey) continue;
+      try {
+        const token = execSync(
+          `security find-generic-password -s "${svc}" -w`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+        ).trim();
+        if (token) lines.push(`${envKey}=${token}`);
+      } catch { /* skip missing tokens */ }
+    }
+    if (lines.length > 0) {
+      writeFileSync(ENV_PATH, lines.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
+    }
+  } catch { /* non-fatal — .env is a convenience cache */ }
+}
+
 function getToken(config, botConfig = null) {
-  // If a specific bot config is provided, use its keychain_service
   const keychainService = botConfig?.keychain_service
     || config.token_keychain_service
     || config.bots?.mechanicus?.keychain_service;
 
+  // Priority 1: .env file (reliable for launchd)
+  if (keychainService) {
+    const envKey = KEYCHAIN_TO_ENV[keychainService];
+    if (envKey && envTokens[envKey]) return envTokens[envKey];
+  }
+
+  // Priority 2: macOS keychain (+ backfill .env for next boot)
   if (config.token_source === 'keychain' && keychainService) {
     try {
       const token = execSync(
         `security find-generic-password -s "${keychainService}" -w`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
       ).trim();
-      if (token) return token;
+      if (token) {
+        // Keychain worked — backfill .env so launchd has it next time
+        if (!existsSync(ENV_PATH)) backfillEnv(config);
+        return token;
+      }
     } catch {
-      // Fall through to fallback
+      // Fall through
     }
   }
 
-  // Fallback: read from openclaw.json
+  // Priority 3: fallback JSON file
   if (config.token_fallback_file && config.token_fallback_path) {
     try {
       const filePath = config.token_fallback_file.replace('~', process.env.HOME);

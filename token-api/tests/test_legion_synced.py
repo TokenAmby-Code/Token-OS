@@ -36,31 +36,15 @@ from main import (
 from init_db import init_database
 
 
-# ── Fixtures ──────────────────────────────────────────────────
-
-
-def _run_async(coro):
-    """Run an async coroutine in a fresh event loop."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
-
 @pytest.fixture(autouse=True)
 def _init_db():
     """Initialize a fresh test database for each test.
 
-    Uses sync init_database() for base schema, then runs async init_db()
-    from main.py to apply all column migrations (legion, synced, etc.).
+    Uses the canonical sync wrapper, which now covers the full schema.
     """
     if Path(_test_db.name).exists():
         Path(_test_db.name).unlink()
     init_database()
-    # Run async migrations (adds columns like legion, synced, transplant_target_session, etc.)
-    from main import init_db as async_init_db
-    _run_async(async_init_db())
     yield
     if Path(_test_db.name).exists():
         Path(_test_db.name).unlink()

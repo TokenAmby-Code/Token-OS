@@ -928,15 +928,16 @@ if $PLAN_MODE; then
     echo "$plan_args" > "$PLAN_FILE"
 
     echo ""
-    log_success "PLAN SAVED — transplant prepared but not executed"
+    log_success "Plan saved to $PLAN_FILE"
     echo ""
     log_info "Target: ${REMOTE_HOST:+$REMOTE_HOST:}$TARGET_DIR"
     $PRIMARCH_MODE && log_info "Primarch: $PRIMARCH_NAME"
     [[ -n "$old_tab_name" ]] && log_info "Instance: $old_tab_name"
     [[ -n "$old_session_doc_id" ]] && log_info "Session doc: $old_session_doc_id"
-    log_info "Restart: $restart_cmd"
     echo ""
-    log_info "Enter plan mode now. When ready, run: transplant --execute-plan"
+    log_info "Transplant validated but NOT executed yet."
+    log_info "Enter plan mode, design your approach, then run: transplant --execute-plan"
+    log_info "(This will kill the current session and restart in the target directory.)"
     echo ""
     exit 0
 fi

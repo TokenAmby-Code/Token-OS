@@ -24,6 +24,9 @@
 #   tx refresh            # Reset panes to canonical proportions
 #   tx list               # List all tmux sessions
 #   tx kill [session]     # Kill a session (default: main)
+#   tx kreig "prompt"     # Dispatch background task (alias: tx kr)
+#   tx legion bump        # Bump current pane to legion window
+#   tx legion recall      # Recall pane from legion to palace
 #   tx help               # Show this help
 
 set -euo pipefail
@@ -32,6 +35,8 @@ set -euo pipefail
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+# shellcheck source=../lib/pane-id.sh
+source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -52,7 +57,7 @@ SESSION_NAME="main"
 # --- Workspace flag detection ---
 # Flags that belong to tmux-workspace, not raw tmux.
 # If someone does `tx --focus` or `tx --mac`, route to the right subcommand.
-WORKSPACE_FLAGS=(--attach --window --mobile --mac --portable --focus --unfocus --toggle-focus --window-reset --bridge-reset)
+WORKSPACE_FLAGS=(--attach --window --warp --mobile --mac --portable --focus --unfocus --toggle-focus --window-reset --palace-reset --bridge-reset)
 
 is_workspace_flag() {
     local flag="$1"
@@ -79,7 +84,7 @@ tx — tmux wrapper
 SESSION
   tx              status / start
   tx start        create + attach
-  tx start --mac  mac bridge layout
+  tx start --mac  mac palace layout
   tx portable     attach portable mon
   tx restart (-r) kill + recreate
   tx restart --pane  reset pane
@@ -102,6 +107,17 @@ AGENTS
   tx resume --find-claude "..."
     auto-find Claude pane
 
+KREIG
+  tx kr "prompt"  dispatch task
+  tx kr status    list panes
+  tx kr cleanup   kill dead
+
+LEGION
+  tx legion bump    move pane out
+  tx legion recall  bring pane back
+  tx legion status  list reservists
+  tx legion cleanup kill dead
+
 KEYBINDS (prefix = Ctrl-Space)
   h/j/k/l   navigate panes
   H/J/K/L   resize panes
@@ -121,7 +137,7 @@ tx — Imperium tmux wrapper
 Session:
   tx                  status, or start if no tmux
   tx start            create + attach workspace
-  tx start --mac      mac bridge layout
+  tx start --mac      mac palace layout
   tx portable         attach with portable monitor status bar
   tx restart, tx -r   kill + recreate session
   tx restart --pane   reset active pane to default state
@@ -141,6 +157,21 @@ Layout:
 Agents:
   tx resume "prompt"  inject into Claude pane
     --find-claude     auto-detect Claude pane
+
+Kreig:
+  tx kreig "prompt"         dispatch task to new pane (alias: tx kr)
+    --label name            custom label (auto-derived if omitted)
+    --dir path              working directory (default: Imperium-ENV)
+  tx kreig status           list all kreig panes
+  tx kreig cleanup          kill dead panes, re-tile survivors
+    --all                   kill ALL panes (including running)
+
+Legion:
+  tx legion bump [--pane %id]   move pane to legion (default: current)
+  tx legion recall [--pane %id] move pane back to palace
+  tx legion status              list all legion panes
+  tx legion cleanup             kill dead panes
+    --all                       kill ALL panes (including running)
 
 Advanced:
   tx workspace [...]  forward to tmux-workspace
@@ -187,9 +218,6 @@ cmd_restart_pane() {
     local pane_type
     pane_type=$(tmux show-options -pv -t "$pane_id" @PANE_TYPE 2>/dev/null || echo "")
 
-    # Source machine identity for mobile shell init path
-    local mobile_shell_init="${CLI_TOOLS}/tmux/mobile-shell-init.zsh"
-
     # Kill current process and respawn a fresh shell
     tmux respawn-pane -k -t "$pane_id"
 
@@ -198,14 +226,6 @@ cmd_restart_pane() {
         # TUI pane — relaunch via guard (handles auto-restart lifecycle)
         sleep 0.3
         tmux send-keys -t "$pane_id" "exec tui-pane-guard" Enter
-    elif [[ "$grid_state" == "small" ]]; then
-        # Check if this is a mobile window (has @PANE_CLEAN set)
-        local pane_clean
-        pane_clean=$(tmux show-options -pv -t "$pane_id" @PANE_CLEAN 2>/dev/null || echo "")
-        if [[ -n "$pane_clean" ]]; then
-            sleep 0.3
-            tmux send-keys -t "$pane_id" "source ${mobile_shell_init} && clear" Enter
-        fi
     fi
 
     log_success "Pane ${pane_id} restarted (${pane_type:-$grid_state})"
@@ -227,12 +247,11 @@ cmd_restart_page() {
 
     # Detect window type and rebuild
     if [[ -n "$layout_origin" ]]; then
-        # Grid or bridge window — delegate to tmux-reset hard wipe
+        # Palace (grid or bridge layout) — delegate to tmux-reset hard wipe
         tmux-reset --do-hard
         log_success "Page '${window_name}' reset (${layout_origin} layout)"
-    elif [[ "$window_name" == mobile-* ]]; then
-        # Mobile window — kill extra panes and rebuild
-        local mobile_shell_init="${CLI_TOOLS}/tmux/mobile-shell-init.zsh"
+    elif [[ "$window_name" == "warp" || "$window_name" == warp* ]]; then
+        # Warp window — kill extra panes and rebuild
         local monitor_height=6
 
         # Kill all panes except the first
@@ -247,7 +266,7 @@ cmd_restart_page() {
             tmux kill-pane -t "$pid"
         done <<< "$panes"
 
-        # Rebuild mobile layout from surviving pane
+        # Rebuild warp layout from surviving pane
         local total_h
         total_h=$(tmux display-message -t "$target" -p '#{window_height}')
         local terminal_area=$((total_h - monitor_height - 2))
@@ -257,29 +276,20 @@ cmd_restart_page() {
         tmux split-window -v -t "${target}.2" -l "${half_terminal}"
 
         # Set pane metadata
-        tmux set-option -p -t "${target}.1" @GRID_STATE "mini"
-        tmux set-option -p -t "${target}.2" @GRID_STATE "small"
-        tmux set-option -p -t "${target}.3" @GRID_STATE "small"
+        pane_tag "${target}.1" "warp:MON"
         tmux set-option -p -t "${target}.1" @PANE_TYPE "tui"
+        pane_tag "${target}.2" "warp:T"
+        pane_tag "${target}.3" "warp:B"
         tmux set-option -p -t "${target}.1" @GRID_RESERVED "true"
         tmux set-option -p -t "${target}.2" @GRID_RESERVED "false"
         tmux set-option -p -t "${target}.3" @GRID_RESERVED "false"
-        tmux set-option -p -t "${target}.1" @PANE_CLEAN "true"
-        tmux set-option -p -t "${target}.2" @PANE_CLEAN "true"
-        tmux set-option -p -t "${target}.3" @PANE_CLEAN "true"
 
-        # TUI lifecycle: auto-restart unless intentionally closed
-        tmux set-option -p -t "${target}.1" remain-on-exit on
-        tmux set-hook -p -t "${target}.1" pane-died \
-            "if -F '#{==:#{@TUI_DIRTY},true}' '' 'respawn-pane -k -t #{pane_id} tui-pane-guard'"
         tmux send-keys -t "${target}.1" "exec tui-pane-guard" Enter
-        tmux send-keys -t "${target}.2" "source ${mobile_shell_init} && clear" Enter
-        tmux send-keys -t "${target}.3" "source ${mobile_shell_init} && clear" Enter
         tmux select-pane -t "${target}.2"
 
-        log_success "Page '${window_name}' reset (mobile layout)"
+        log_success "Page '${window_name}' reset (warp layout)"
     else
-        log_error "Unknown window type — no @LAYOUT_ORIGIN and not a mobile window."
+        log_error "Unknown window type — no @LAYOUT_ORIGIN and not a warp window."
         return 1
     fi
 }
@@ -287,6 +297,9 @@ cmd_restart_page() {
 cmd_restart() {
     local session="$SESSION_NAME"
     local layout_args=("$@")
+
+    # Snapshot active instances before kill for resurrection
+    tmux-resurrect snapshot 2>/dev/null || true
 
     if in_tmux; then
         local current_session
@@ -305,9 +318,29 @@ cmd_restart() {
         local client_map="/tmp/.tx-restart-clients"
         tmux list-clients -F '#{client_tty}=#{session_name}' > "$client_map" 2>/dev/null
 
-        # Park ALL clients on a temp session so they survive the kill/recreate.
-        # This keeps both Mac terminals and phone SSH connections alive.
+        # Park local clients on a temp session; detach remote (phone/SSH) clients.
+        # Parking all clients on one session causes aggressive-resize to shrink
+        # to the smallest client (phone), mangling the Mac display.
         tmux new-session -d -s _tx_restart -x 80 -y 24 2>/dev/null || true
+        # Display whimsical holding art while workspace rebuilds
+        tmux send-keys -t _tx_restart "cat <<'SERVITOR'
+
+
+             ╔══════════════════════════════════════╗
+             ║                                      ║
+             ║    ₍ᐢ..ᐢ₎    Rebuilding workspace   ║
+             ║   ╭∪──∪╮                             ║
+             ║   │ ≽^•⩊•^≼ │   The Machine Spirit   ║
+             ║   │  is     │   stirs from slumber... ║
+             ║   │ pleased │                         ║
+             ║   ╰────────╯       ⚙ ⚙ ⚙             ║
+             ║                                      ║
+             ║      Praise the Omnissiah.           ║
+             ║                                      ║
+             ╚══════════════════════════════════════╝
+
+
+SERVITOR" Enter
         # Build list of all sessions in the group. session_group is empty on
         # tmux <3.5 for non-grouped sessions, so fall back to matching by name.
         local all_group_sessions
@@ -318,7 +351,14 @@ cmd_restart() {
         while IFS=' ' read -r client_tty client_sess; do
             for gs in $all_group_sessions; do
                 if [[ "$client_sess" == "$gs" ]]; then
-                    tmux switch-client -c "$client_tty" -t _tx_restart 2>/dev/null || true
+                    # Detect remote clients (phone/SSH) by checking if TTY is a pts (pseudo-terminal)
+                    if [[ "$client_tty" == */pts/* ]]; then
+                        # Remote client — detach instead of parking (prevents resize contamination)
+                        tmux detach-client -t "$client_tty" 2>/dev/null || true
+                    else
+                        # Local client — park on holding session
+                        tmux switch-client -c "$client_tty" -t _tx_restart 2>/dev/null || true
+                    fi
                     break
                 fi
             done
@@ -341,6 +381,10 @@ sleep 0.3
 # Recreate the workspace
 tmux-workspace 2>/dev/null || true
 
+# Resurrect Claude instances from snapshot
+sleep 0.5
+tmux-resurrect restore 2>/dev/null || true
+
 # Restore each client to its original session type.
 # Clients that were on the group leader (main) go back to main.
 # Clients that were on a grouped session (phone) get a fresh grouped
@@ -353,7 +397,7 @@ while IFS='=' read -r tty sess; do
         # Was on a grouped session — recreate it with mobile setup
         if ! tmux has-session -t "\$sess" 2>/dev/null; then
             tmux new-session -d -t '$SESSION_NAME' -s "\$sess" 2>/dev/null || true
-            tmux select-window -t "\$sess:mobile-1" 2>/dev/null || true
+            tmux select-window -t "\$sess:warp" 2>/dev/null || true
         fi
         tmux switch-client -c "\$tty" -t "\$sess" 2>/dev/null || true
     fi
@@ -366,7 +410,7 @@ rm -f "$restart_script"
 RESTARTEOF
         chmod +x "$restart_script"
 
-        tmux run-shell -b "$restart_script"
+        tmux run-shell -b "tmux-run bash $restart_script"
         return
     fi
 
@@ -387,7 +431,11 @@ RESTARTEOF
         sleep 0.3
     fi
 
-    tmux-workspace --attach ${layout_args[@]+"${layout_args[@]}"} || true
+    # Create workspace without attach, resurrect, then attach
+    tmux-workspace ${layout_args[@]+"${layout_args[@]}"} || true
+    sleep 0.5
+    tmux-resurrect restore 2>/dev/null || true
+    exec tmux attach-session -t "$SESSION_NAME"
 }
 
 cmd_exit() {
@@ -436,7 +484,7 @@ cmd_status() {
 
         echo -e "${BOLD}Panes:${RESET}"
         tmux list-panes -t "$target" \
-            -F "  #{pane_id}  #{@GRID_STATE}  #{pane_width}x#{pane_height}  #{pane_current_command}#{?@GRID_RESERVED, [reserved],}" \
+            -F "  #{pane_id}  #{@PANE_ID}  #{@GRID_STATE}  #{pane_width}x#{pane_height}  #{pane_current_command}#{?@GRID_RESERVED, [reserved],}" \
             2>/dev/null || true
     fi
 }
@@ -445,6 +493,276 @@ cmd_list() {
     if ! tmux list-sessions 2>/dev/null; then
         log_warn "No tmux sessions running."
     fi
+}
+
+cmd_kreig() {
+    local subcmd="${1:-status}"
+    shift 2>/dev/null || true
+
+    local TOKEN_API="${TOKEN_API_URL:-http://localhost:7777}"
+
+    case "$subcmd" in
+        # tx kreig "prompt text" — dispatch a single task
+        status|cleanup)
+            # handled below
+            ;;
+        *)
+            # Anything else is a prompt — dispatch it
+            local prompt="$subcmd${*:+ $*}"
+            if [[ -z "$prompt" ]]; then
+                log_error "Usage: tx kreig \"prompt text\" [--label name] [--dir path]"
+                return 1
+            fi
+
+            # Parse optional flags from remaining args (already shifted once)
+            local label="" working_dir="/Volumes/Imperium/Imperium-ENV"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --label) label="$2"; shift 2 ;;
+                    --dir)   working_dir="$2"; shift 2 ;;
+                    *)       prompt="$prompt $1"; shift ;;
+                esac
+            done
+
+            # Auto-generate label from first few words if not provided
+            if [[ -z "$label" ]]; then
+                label=$(echo "$prompt" | tr -d '"'"'" | cut -c1-40 | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+            fi
+
+            log_info "Dispatching to kreig: ${label}"
+
+            local payload
+            payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'tasks': [{
+        'label': sys.argv[1],
+        'prompt': sys.argv[2],
+        'working_dir': sys.argv[3],
+        'source': 'tx-kreig'
+    }]
+}))
+" "$label" "$prompt" "$working_dir")
+
+            local result
+            result=$(curl -s -X POST "${TOKEN_API}/api/kreig/dispatch" \
+                -H "Content-Type: application/json" \
+                -d "$payload" 2>/dev/null)
+
+            if [[ $? -ne 0 ]] || [[ -z "$result" ]]; then
+                log_error "Token-API not responding at ${TOKEN_API}"
+                return 1
+            fi
+
+            local pane_id status_val
+            pane_id=$(echo "$result" | python3 -c "import sys,json; r=json.load(sys.stdin)['results'][0]; print(r.get('pane_id',''))" 2>/dev/null)
+            status_val=$(echo "$result" | python3 -c "import sys,json; r=json.load(sys.stdin)['results'][0]; print(r.get('status',''))" 2>/dev/null)
+
+            if [[ "$status_val" == "launched" ]]; then
+                log_success "Launched in pane ${pane_id}"
+                # Rebalance the kreig window
+                tmux select-layout -t "main:kreig" tiled 2>/dev/null || true
+            else
+                local err
+                err=$(echo "$result" | python3 -c "import sys,json; r=json.load(sys.stdin)['results'][0]; print(r.get('error','unknown'))" 2>/dev/null)
+                log_error "Dispatch failed: ${err}"
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+
+    case "$subcmd" in
+        status)
+            local result
+            result=$(curl -s "${TOKEN_API}/api/kreig/status" 2>/dev/null)
+            if [[ $? -ne 0 ]] || [[ -z "$result" ]]; then
+                log_error "Token-API not responding"
+                return 1
+            fi
+
+            local total
+            total=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
+
+            if [[ "$total" == "0" ]]; then
+                log_info "No kreig panes active."
+                return 0
+            fi
+
+            echo -e "${BOLD}Kreig${RESET} (${total} panes):"
+            echo ""
+            echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data['panes']:
+    status = '🟢 running' if p['claude_running'] else '⚪ idle'
+    task = p.get('task') or '(no label)'
+    inst = ''
+    if p.get('instance'):
+        i = p['instance']
+        inst = f\" [{i.get('tab_name','')}]\"
+    print(f\"  {p['pane_id']}  {status}  {task}{inst}\")
+" 2>/dev/null
+            ;;
+
+        cleanup)
+            local kill_all=""
+            [[ "${1:-}" == "--all" ]] && kill_all='true'
+
+            local body="{}"
+            [[ -n "$kill_all" ]] && body='{"kill_all": true}'
+
+            local result
+            result=$(curl -s -X POST "${TOKEN_API}/api/kreig/cleanup" \
+                -H "Content-Type: application/json" \
+                -d "$body" 2>/dev/null)
+
+            local killed surviving
+            killed=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['killed'])" 2>/dev/null)
+            surviving=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['surviving'])" 2>/dev/null)
+            log_success "Cleaned up: ${killed} killed, ${surviving} surviving"
+            ;;
+    esac
+}
+
+cmd_legion() {
+    local subcmd="${1:-status}"
+    shift 2>/dev/null || true
+
+    local TOKEN_API="${TOKEN_API_URL:-http://localhost:7777}"
+
+    case "$subcmd" in
+        bump)
+            # Default to current pane
+            local target_pane=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --pane) target_pane="$2"; shift 2 ;;
+                    *)      shift ;;
+                esac
+            done
+
+            if [[ -z "$target_pane" ]]; then
+                if ! in_tmux; then
+                    log_error "Must be inside tmux or specify --pane"
+                    return 1
+                fi
+                target_pane=$(tmux display-message -p '#{pane_id}')
+            fi
+
+            local result
+            result=$(curl -s -X POST "${TOKEN_API}/api/legion/bump" \
+                -H "Content-Type: application/json" \
+                -d "{\"pane_id\": \"${target_pane}\"}" 2>/dev/null)
+
+            if [[ $? -ne 0 ]] || [[ -z "$result" ]]; then
+                log_error "Token-API not responding at ${TOKEN_API}"
+                return 1
+            fi
+
+            local status_val
+            status_val=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+            if [[ "$status_val" == "bumped" ]]; then
+                log_success "Pane ${target_pane} bumped to legion"
+            else
+                local err
+                err=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null)
+                log_error "Bump failed: ${err}"
+                return 1
+            fi
+            ;;
+
+        recall)
+            local target_pane=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --pane) target_pane="$2"; shift 2 ;;
+                    *)      shift ;;
+                esac
+            done
+
+            if [[ -z "$target_pane" ]]; then
+                log_error "Usage: tx legion recall --pane %ID"
+                return 1
+            fi
+
+            local result
+            result=$(curl -s -X POST "${TOKEN_API}/api/legion/recall" \
+                -H "Content-Type: application/json" \
+                -d "{\"pane_id\": \"${target_pane}\"}" 2>/dev/null)
+
+            if [[ $? -ne 0 ]] || [[ -z "$result" ]]; then
+                log_error "Token-API not responding at ${TOKEN_API}"
+                return 1
+            fi
+
+            local status_val
+            status_val=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+            if [[ "$status_val" == "recalled" ]]; then
+                log_success "Pane ${target_pane} recalled to palace"
+            else
+                local err
+                err=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null)
+                log_error "Recall failed: ${err}"
+                return 1
+            fi
+            ;;
+
+        status)
+            local result
+            result=$(curl -s "${TOKEN_API}/api/legion/status" 2>/dev/null)
+            if [[ $? -ne 0 ]] || [[ -z "$result" ]]; then
+                log_error "Token-API not responding"
+                return 1
+            fi
+
+            local total
+            total=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
+
+            if [[ "$total" == "0" ]]; then
+                log_info "No legion panes active."
+                return 0
+            fi
+
+            echo -e "${BOLD}Legion${RESET} (${total} panes):"
+            echo ""
+            echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data['panes']:
+    status = '🟢 running' if p['claude_running'] else '⚪ idle'
+    inst = ''
+    if p.get('instance'):
+        i = p['instance']
+        inst = f\" [{i.get('tab_name','')}]\"
+    print(f\"  {p['pane_id']}  {status}{inst}\")
+" 2>/dev/null
+            ;;
+
+        cleanup)
+            local kill_all=""
+            [[ "${1:-}" == "--all" ]] && kill_all='true'
+
+            local body="{}"
+            [[ -n "$kill_all" ]] && body='{"kill_all": true}'
+
+            local result
+            result=$(curl -s -X POST "${TOKEN_API}/api/legion/cleanup" \
+                -H "Content-Type: application/json" \
+                -d "$body" 2>/dev/null)
+
+            local killed surviving
+            killed=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['killed'])" 2>/dev/null)
+            surviving=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['surviving'])" 2>/dev/null)
+            log_success "Cleaned up: ${killed} killed, ${surviving} surviving"
+            ;;
+
+        *)
+            log_error "Unknown legion subcommand: ${subcmd}"
+            echo -e "  Use: ${BOLD}tx legion bump|recall|status|cleanup${RESET}"
+            return 1
+            ;;
+    esac
 }
 
 cmd_kill() {
@@ -502,7 +820,7 @@ if is_workspace_flag "$CMD"; then
         --mac)     echo -e "  Use: ${BOLD}tx start --mac${RESET}"; exit 1 ;;
         --portable) echo -e "  Use: ${BOLD}tx portable${RESET}"; exit 1 ;;
         --attach)  echo -e "  Use: ${BOLD}tx start${RESET}"; exit 1 ;;
-        --mobile)  echo -e "  Use: ${BOLD}tx workspace --mobile${RESET}"; exit 1 ;;
+        --mobile|--warp) echo -e "  Use: ${BOLD}tx workspace --warp${RESET}"; exit 1 ;;
         --window)  echo -e "  Use: ${BOLD}tx workspace --window${RESET}"; exit 1 ;;
         *)         echo -e "  Use: ${BOLD}tx workspace ${CMD}${RESET}"; exit 1 ;;
     esac
@@ -570,6 +888,15 @@ case "$CMD" in
         ;;
     resume)
         exec tmux-resume "$@"
+        ;;
+    resurrect)
+        exec tmux-resurrect "$@"
+        ;;
+    kreig|kr|backrooms|br)
+        cmd_kreig "$@"
+        ;;
+    legion)
+        cmd_legion "$@"
         ;;
     refresh)
         exec tmux-refresh-layout "$@"

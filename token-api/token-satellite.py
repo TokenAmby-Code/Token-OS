@@ -159,6 +159,10 @@ class TTSEngine:
         self._playing = False
         self._play_paused = False
         self._current_file: Optional[str] = None
+        # Track current message for restart
+        self._current_message: Optional[str] = None
+        self._current_voice: Optional[str] = None
+        self._current_rate: int = 0
 
     def _write_script(self):
         """Write the PS script to a Windows-accessible path."""
@@ -340,10 +344,16 @@ class TTSEngine:
 
         self._playing = True
         self._current_file = synth_result.get("wav_path_wsl")
+        self._current_message = message
+        self._current_voice = voice
+        self._current_rate = rate
         speak_result = self.speak(message, voice, rate)
         self._playing = False
         self._play_paused = False
         self._current_file = None
+        self._current_message = None
+        self._current_voice = None
+        self._current_rate = 0
 
         return {
             **speak_result,
@@ -352,7 +362,34 @@ class TTSEngine:
         }
 
     def play_control(self, command: str) -> dict:
-        """Send transport control (pause/resume/stop) to SAPI. Non-blocking."""
+        """Send transport control (pause/resume/stop/toggle/restart) to SAPI. Non-blocking."""
+        # Resolve toggle to pause or resume
+        if command == "toggle":
+            if self._play_paused:
+                command = "resume"
+            elif self._speaking or self._playing:
+                command = "pause"
+            else:
+                return {"success": False, "error": "Not speaking or playing"}
+
+        # Restart: stop current speech, re-speak same message from beginning
+        if command == "restart":
+            if not self._current_message:
+                return {"success": False, "error": "No current message to restart"}
+            # Stop current speech
+            with self._io_lock:
+                self._send({"action": "skip"})
+                self._readline()
+            self._play_paused = False
+            # Re-speak the same message (non-blocking — speak polls in its own thread)
+            with self._io_lock:
+                self._send({"action": "speak", "voice": self._current_voice,
+                            "rate": self._current_rate, "message": self._current_message})
+                resp = self._readline()
+            if resp != "OK":
+                return {"success": False, "error": f"Restart speak failed: {resp}"}
+            return {"success": True, "command": "restart"}
+
         if not (self._speaking or self._playing) and command != "stop":
             return {"success": False, "error": "Not speaking or playing"}
         self._ensure_running()
@@ -815,6 +852,31 @@ class GoldenThroneFollowupRequest(BaseModel):
     prompt: str
 
 
+def _announce_to_mac():
+    """Background thread: announce satellite startup to Mac Token-API."""
+    import socket
+    time.sleep(3)  # Let the server finish binding
+    hostname = socket.gethostname()
+    payload = {"hostname": hostname, "port": 7777}
+    for attempt in range(1, 4):
+        try:
+            resp = http_requests.post(
+                f"{MAC_API_BASE}/api/satellite/announce",
+                json=payload,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                logger.info(f"Startup announcement acknowledged by Mac (attempt {attempt})")
+                return
+            else:
+                logger.warning(f"Mac announce returned {resp.status_code} (attempt {attempt})")
+        except Exception as e:
+            logger.warning(f"Mac announce failed (attempt {attempt}/3): {e}")
+        if attempt < 3:
+            time.sleep(5)
+    logger.error("Startup announcement to Mac failed after 3 attempts (non-fatal)")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Warm up TTS engine and start DeskFlow watchdog."""
@@ -823,6 +885,8 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"TTS engine warm-up failed (will retry on first speak): {e}")
     deskflow_watchdog.start()
+    # Announce to Mac in background thread (non-blocking, non-fatal)
+    threading.Thread(target=_announce_to_mac, daemon=True).start()
 
 
 @app.get("/health")
@@ -952,7 +1016,7 @@ class TTSSynthesizeRequest(BaseModel):
     rate: int = 0
 
 class TTSControlRequest(BaseModel):
-    command: str   # pause, resume, stop
+    command: str   # pause, resume, stop, toggle, restart
 
 class TTSSynthAndPlayRequest(BaseModel):
     message: str
@@ -1113,52 +1177,52 @@ async def tmux_send_keys(req: TmuxSendKeysRequest):
         raise HTTPException(status_code=500, detail=f"tmux send-keys failed: {e}")
 
 
-def _get_or_create_backrooms_pane() -> str:
-    """Split a new pane in the backrooms window for an autonomous session.
+def _get_or_create_kreig_pane() -> str:
+    """Split a new pane in the kreig window for an autonomous session.
 
-    Each resume gets its own pane — backrooms is a dynamic process stack,
-    not a shared resource. Creates the backrooms window if it doesn't exist.
+    Each resume gets its own pane — kreig is a dynamic process stack,
+    not a shared resource. Creates the kreig window if it doesn't exist.
     """
-    # Check if backrooms window exists
+    # Check if kreig window exists
     result = subprocess.run(
-        ["tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}"],
+        ["tmux", "list-panes", "-t", "main:kreig", "-F", "#{pane_id}"],
         capture_output=True, text=True, timeout=5,
     )
     if result.returncode == 0 and result.stdout.strip():
         # Window exists — split a new pane into it
         split = subprocess.run(
-            ["tmux", "split-window", "-t", "main:backrooms", "-d", "-P", "-F", "#{pane_id}"],
+            ["tmux", "split-window", "-t", "main:kreig", "-d", "-P", "-F", "#{pane_id}"],
             capture_output=True, text=True, timeout=5,
         )
         if split.returncode == 0 and split.stdout.strip():
             pane_id = split.stdout.strip()
             subprocess.run(
-                ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms"],
+                ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "kreig"],
                 timeout=5,
             )
-            logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
+            logger.info(f"Golden Throne: split new kreig pane {pane_id}")
             return pane_id
         # split failed (too many panes?) — fall through to use first existing pane
-        logger.warning("Golden Throne: split-window failed, reusing existing backrooms pane")
+        logger.warning("Golden Throne: split-window failed, reusing existing kreig pane")
         return result.stdout.strip().split("\n")[0]
 
-    # Create backrooms window (detached so it doesn't steal focus)
+    # Create kreig window (detached so it doesn't steal focus)
     subprocess.run(
-        ["tmux", "new-window", "-t", "main", "-n", "backrooms", "-d"],
+        ["tmux", "new-window", "-t", "main", "-n", "kreig", "-d"],
         timeout=5,
     )
 
     # Get pane ID and tag it
     result = subprocess.run(
-        ["tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}"],
+        ["tmux", "list-panes", "-t", "main:kreig", "-F", "#{pane_id}"],
         capture_output=True, text=True, timeout=5,
     )
     pane_id = result.stdout.strip().split("\n")[0]
     subprocess.run(
-        ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms"],
+        ["tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "kreig"],
         timeout=5,
     )
-    logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
+    logger.info(f"Golden Throne: created kreig window (pane {pane_id})")
     return pane_id
 
 
@@ -1201,9 +1265,9 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 logger.error(f"Golden Throne: send-keys failed for {pane}: {e}")
                 raise HTTPException(status_code=500, detail=f"send-keys failed: {e}")
         else:
-            # Claude not running — resume in backrooms with SOP prompt
+            # Claude not running — resume in kreig with SOP prompt
             try:
-                backrooms_pane = _get_or_create_backrooms_pane()
+                kreig_pane = _get_or_create_kreig_pane()
                 working_dir = os.path.expanduser(req.working_dir)
                 # Write SOP to temp file (avoids shell escaping)
                 sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
@@ -1213,13 +1277,13 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                     f'--resume {req.session_id} --dangerously-skip-permissions'
                 )
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", backrooms_pane, resume_cmd, "Enter"],
+                    ["tmux", "send-keys", "-t", kreig_pane, resume_cmd, "Enter"],
                     timeout=5,
                 )
                 transport = "resume"
                 logger.info(
-                    f"Golden Throne: resumed {req.session_id[:12]} in backrooms "
-                    f"pane={backrooms_pane} via claude --resume"
+                    f"Golden Throne: resumed {req.session_id[:12]} in kreig "
+                    f"pane={kreig_pane} via claude --resume"
                 )
             except Exception as e:
                 logger.error(f"Golden Throne: resume failed for {req.session_id[:12]}: {e}")

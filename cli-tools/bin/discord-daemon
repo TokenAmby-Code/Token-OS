@@ -11,7 +11,7 @@
 set -euo pipefail
 
 DAEMON_DIR="$HOME/.discord-cli"
-NODE_DIR="$DAEMON_DIR/node"
+NODE_DIR="/Volumes/Imperium/Token-OS/discord-daemon"
 PID_FILE="$DAEMON_DIR/daemon.pid"
 LOG_DIR="$DAEMON_DIR/logs"
 DAEMON_URL="http://127.0.0.1:7779"

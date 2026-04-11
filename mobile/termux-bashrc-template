@@ -137,7 +137,7 @@ _write_termux_props() {
 # ~/.termux/termux.properties — mobile-nav toolbar (true mobile, 3 rows, key-height:40)
 extra-keys = [ \
   ['DRAWER', {macro: "\u001b[Z", display: '⇧Tab'}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
-  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "tmux capture-pane -p | termux-clipboard-set\n", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
   [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 extra-keys-style = key-height:40,key-gap:0,key-border:0
@@ -152,7 +152,7 @@ PROPS
 # ⇄ swaps to portable-pager toolbar (window numbers + nav keys)
 # 2 rows (vs 3 on mobile) with tall keys + visible borders = unmistakable difference
 extra-keys = [ \
-  [{macro: "\u0015toggle-toolbar\n", display: '⇄'}, 'ESC', {key: 'CTRL', popup: 'SHIFT'}, {key: 'ALT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{macro: "\u0000T", display: '⇄'}, 'ESC', {key: 'CTRL', popup: 'SHIFT'}, {key: 'ALT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
   [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
 ]
 extra-keys-style = key-height:90,key-gap:4,key-border:1
@@ -168,7 +168,7 @@ PROPS
 # Row 2: prev/next window, detach, zoom, rename, kill-pane, ESC
 # All tmux keys use prefix (\u0000 = ^Space)
 extra-keys = [ \
-  [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u00005", display: '5'}, {macro: "\u0015toggle-toolbar\n", display: '⇄'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u00005", display: '5'}, {macro: "\u0000T", display: '⇄'}, {key: 'KEYBOARD', display: '⌨'}], \
   [{macro: "\u0000p", display: '←prev'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000e", display: 'expand'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, 'ESC'] \
 ]
 extra-keys-style = key-height:90,key-gap:4,key-border:1
@@ -264,7 +264,7 @@ alias t=tx
 
 # mac: SSH to Mac. From tx panes → plain SSH. Standalone → SSH then attach tmux.
 # Portable monitor → main session (full workspace).
-# Phone → grouped session 'phone' on main:mobile-1 with keyboard auto-zoom hook.
+# Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 mac() {
     if [[ -n "$TMUX" ]]; then
@@ -281,7 +281,7 @@ mac() {
     if is_portable_monitor; then
         _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
     else
-        _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 2>/dev/null || exec zsh -il"
+        _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t warp 2>/dev/null || exec zsh -il"
     fi
 
     local retries=0
@@ -306,7 +306,7 @@ mac() {
 
 # wsl: SSH to WSL. From tx panes → plain SSH. Standalone → SSH then attach tmux.
 # Portable monitor → main session (full workspace).
-# Phone → grouped session 'phone' on main:mobile-1 with keyboard auto-zoom hook.
+# Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 wsl() {
     if [[ -n "$TMUX" ]]; then
@@ -314,7 +314,7 @@ wsl() {
     elif is_portable_monitor; then
         ssh -t wsl "bash -ic 'tmux attach -t main 2>/dev/null || tx start'"
     else
-        ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t mobile-1 2>/dev/null || exec bash -il"
+        ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t warp 2>/dev/null || exec bash -il"
     fi
 }
 

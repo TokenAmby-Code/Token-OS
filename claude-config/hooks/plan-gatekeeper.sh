@@ -81,7 +81,32 @@ if [[ -f "$GATE" ]]; then
   exit 0
 else
   touch "$GATE"
-  MSG="We will clear context with this plan file. Have we updated the session doc with assumptions made, unvalidated code, completed tasks, and design decisions? Your plan file should orbit the session document — they should not duplicate concerns and the session doc is authoritative. The plan file is for the specific next task and context management. Your next plan will be automatically approved."
-  log "First pass — bouncing with session doc reminder"
+
+  # Resolve session doc ID and path from instance via Token-API
+  SESSION_DOC_PATH=""
+  DOC_ID=""
+  API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+  if [[ -n "$SESSION_ID" ]]; then
+    INSTANCE=$(curl -sf --max-time 2 "${API_URL}/api/instances/${SESSION_ID}" 2>/dev/null || echo "{}")
+    DOC_ID=$(echo "$INSTANCE" | jq -r '.session_doc_id // empty' 2>/dev/null)
+    if [[ -n "$DOC_ID" ]]; then
+      DOC=$(curl -sf --max-time 2 "${API_URL}/api/session-docs/${DOC_ID}" 2>/dev/null || echo "{}")
+      SESSION_DOC_PATH=$(echo "$DOC" | jq -r '.file_path // .title // empty' 2>/dev/null)
+    fi
+  fi
+
+  # Build the rejection message — this IS the session-update mechanism.
+  # Agents enter plan mode → gatekeeper bounces with merge instructions →
+  # agent updates doc → resubmits → auto-approved. No /session-update skill needed.
+  if [[ -n "$SESSION_DOC_PATH" && -n "$DOC_ID" ]]; then
+    DOC_INSTRUCTION="Merge your update to session doc ${SESSION_DOC_PATH} (ID: ${DOC_ID}) using: curl -s -X POST ${API_URL}/api/session-docs/${DOC_ID}/merge -H 'Content-Type: application/json' -d '{\"content\": \"<your update>\", \"source\": \"agent\"}'"
+  elif [[ -n "$DOC_ID" ]]; then
+    DOC_INSTRUCTION="Merge your update to session doc ID ${DOC_ID} using: curl -s -X POST ${API_URL}/api/session-docs/${DOC_ID}/merge -H 'Content-Type: application/json' -d '{\"content\": \"<your update>\", \"source\": \"agent\"}'"
+  else
+    DOC_INSTRUCTION="No session doc linked. Create one with: instance-name \"<name>\" --session"
+  fi
+
+  MSG="Before clearing context, update your session document. ${DOC_INSTRUCTION} — Include: completed work, assumptions made, unvalidated code, design decisions, and remaining tasks. The session doc is authoritative — your plan file should orbit it, not duplicate it. The plan file is for the specific next task and context management. Your next ExitPlanMode will be automatically approved."
+  log "First pass — bouncing with merge instructions (doc: ${DOC_ID:-none}, path: ${SESSION_DOC_PATH:-unknown})"
   echo "{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"deny\",\"message\":\"$MSG\"}}}"
 fi
