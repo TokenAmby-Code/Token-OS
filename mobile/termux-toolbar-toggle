@@ -1,0 +1,73 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-toolbar-toggle — swap between toolbar modes.
+# Called by tmux bind-key T via run-shell (non-interactive, no .bashrc).
+# Deployed to phone:~/.local/bin/termux-toolbar-toggle by push-mobile.
+
+set -euo pipefail
+
+PROPS="$HOME/.termux/termux.properties"
+MODE_FILE="$HOME/.toolbar-mode"
+current=$(cat "$MODE_FILE" 2>/dev/null || echo "mobile-nav")
+
+# Determine next mode based on current
+case "$current" in
+    mobile-nav)      next="mobile-tmux" ;;
+    mobile-tmux)     next="mobile-nav" ;;
+    portable-nav)    next="portable-pager" ;;
+    portable-pager)  next="portable-nav" ;;
+    *)               next="mobile-nav" ;;
+esac
+
+# Shared settings appended to every mode
+shared_settings() {
+    cat << 'EOF'
+terminal-transcript-rows = 10000
+enforce-char-based-input = true
+volume-keys = volume
+EOF
+}
+
+case "$next" in
+    mobile-nav)
+        cat > "$PROPS" << 'TOOLBAR'
+extra-keys = [ \
+  ['DRAWER', {macro: "\u001b[Z", display: '⇧Tab'}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
+]
+extra-keys-style = key-height:40,key-gap:0,key-border:0
+TOOLBAR
+        ;;
+    mobile-tmux)
+        cat > "$PROPS" << 'TOOLBAR'
+extra-keys = [ \
+  [{macro: "\u0000h", display: '←h'}, {macro: "\u0000j", display: '↓j'}, {macro: "\u0000k", display: '↑k'}, {macro: "\u0000l", display: '→l'}, {macro: "\u0000|", display: 'v-split'}, {macro: "\u0000-", display: 'h-split'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000p", display: '←prev'}, {macro: "\u0000T", display: '⇄'}], \
+  [{macro: "\u0000e", display: 'expand'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, {macro: "\u0000y", display: '📋'}, 'ESC', {macro: "\u0000", display: '^␣'}] \
+]
+extra-keys-style = key-height:40,key-gap:0,key-border:0
+TOOLBAR
+        ;;
+    portable-nav)
+        cat > "$PROPS" << 'TOOLBAR'
+extra-keys = [ \
+  [{macro: "\u0000T", display: '⇄'}, 'ESC', {key: 'CTRL', popup: 'SHIFT'}, {key: 'ALT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {macro: "\u0012", display: '^R'}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
+]
+extra-keys-style = key-height:90,key-gap:4,key-border:1
+TOOLBAR
+        ;;
+    portable-pager)
+        cat > "$PROPS" << 'TOOLBAR'
+extra-keys = [ \
+  [{macro: "\u00001", display: '1'}, {macro: "\u00002", display: '2'}, {macro: "\u00003", display: '3'}, {macro: "\u00004", display: '4'}, {macro: "\u00005", display: '5'}, {macro: "\u0000T", display: '⇄'}, {key: 'KEYBOARD', display: '⌨'}], \
+  [{macro: "\u0000p", display: '←prev'}, {macro: "\u0000n", display: '→next'}, {macro: "\u0000d", display: 'detach'}, {macro: "\u0000e", display: 'expand'}, {macro: "\u0000,", display: 'rename'}, {macro: "\u0000x", display: 'kill'}, 'ESC'] \
+]
+extra-keys-style = key-height:90,key-gap:4,key-border:1
+TOOLBAR
+        ;;
+esac
+
+shared_settings >> "$PROPS"
+echo "$next" > "$MODE_FILE"
+termux-reload-settings

@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# tmux-audit — Workspace state coherence checker
+# TAGS: tmux, lifecycle, audit
+# AUDIENCE: system (called by tmux-shuttle, tx, dispatch, and stale-check fallback)
+#
+# Single sweeper that validates system-level assertions about workspace state.
+# Event-driven primary (called after pane-interactive ops) with a lazy stale
+# fallback. Each assertion is a self-contained function.
+#
+# Assertions:
+#   backburner  — No idle shells in legion/kreig; backstop placeholder management
+#   grid        — Palace power grid has expected pane count
+#   tui         — TUI monitor panes are alive, not dead/stuck
+#   layout      — Pane proportions haven't drifted
+#
+# Usage:
+#   tmux-audit                   # Run all assertions (debounced)
+#   tmux-audit --force           # Skip debounce
+#   tmux-audit --stale N         # Only run if last audit was > N minutes ago
+#   tmux-audit --only backburner # Run a single assertion
+
+set -eo pipefail
+
+STAMP_FILE="/tmp/.tmux-audit-last-run"
+DEBOUNCE_SECONDS=5
+SESSION="main"
+
+# --- Args ---
+FORCE=false
+STALE_MINUTES=""
+ONLY=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) FORCE=true; shift ;;
+        --stale) STALE_MINUTES="$2"; shift 2 ;;
+        --only)  ONLY="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+# --- Stale check ---
+if [[ -n "$STALE_MINUTES" && -f "$STAMP_FILE" ]]; then
+    last_run=$(cat "$STAMP_FILE" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    elapsed=$(( (now - last_run) / 60 ))
+    if [[ $elapsed -lt $STALE_MINUTES ]]; then
+        exit 0
+    fi
+fi
+
+# --- Debounce ---
+if [[ "$FORCE" != "true" && -f "$STAMP_FILE" ]]; then
+    last_run=$(cat "$STAMP_FILE" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    if [[ $(( now - last_run )) -lt $DEBOUNCE_SECONDS ]]; then
+        exit 0
+    fi
+fi
+
+date +%s > "$STAMP_FILE"
+
+# --- Guard: tmux must be running ---
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    exit 0
+fi
+
+# ============================================================
+# ASSERTION: backburner
+# No idle shells in legion/kreig. Backstop placeholder management.
+# ============================================================
+assert_backburner() {
+    local IDLE_SHELLS="bash zsh sh fish"
+
+    is_idle_shell() {
+        local cmd="$1"
+        for s in $IDLE_SHELLS; do
+            [[ "$cmd" == "$s" ]] && return 0
+        done
+        return 1
+    }
+
+    for win in legion kreig; do
+        local pane_data
+        pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
+            -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}' 2>/dev/null) || continue
+
+        local idle_panes=() backstop_panes=() real_panes=()
+
+        while IFS=$'\t' read -r pid cmd ptype; do
+            [[ -z "$pid" ]] && continue
+            if [[ "$ptype" == "backstop" ]]; then
+                backstop_panes+=("$pid")
+            elif is_idle_shell "$cmd"; then
+                idle_panes+=("$pid")
+            else
+                real_panes+=("$pid")
+            fi
+        done <<< "$pane_data"
+
+        local total=$(( ${#idle_panes[@]} + ${#backstop_panes[@]} + ${#real_panes[@]} ))
+        local changed=false
+
+        # Real work present + backstop → cull backstop
+        if [[ ${#real_panes[@]} -gt 0 && ${#backstop_panes[@]} -gt 0 ]]; then
+            for pid in "${backstop_panes[@]}"; do
+                tmux kill-pane -t "$pid" 2>/dev/null || true
+                (( total-- )) || true
+            done
+            backstop_panes=()
+            changed=true
+        fi
+
+        # Kill idle shells; convert last-standing to backstop
+        for pid in "${idle_panes[@]}"; do
+            if [[ $total -le 1 && ${#backstop_panes[@]} -eq 0 ]]; then
+                tmux respawn-pane -k -t "$pid" "tmux-backstop" 2>/dev/null || true
+                backstop_panes+=("$pid")
+                changed=true
+                continue
+            fi
+            tmux kill-pane -t "$pid" 2>/dev/null || true
+            (( total-- )) || true
+            changed=true
+        done
+
+        if [[ "$changed" == "true" ]]; then
+            tmux select-layout -t "${SESSION}:${win}" tiled 2>/dev/null || true
+        fi
+    done
+}
+
+# ============================================================
+# ASSERTION: grid
+# Palace power grid has expected pane count (4 grid + sides).
+# ============================================================
+assert_grid() {
+    # Only check if palace window exists
+    tmux list-panes -t "${SESSION}:palace" -F '' 2>/dev/null || return 0
+
+    local layout_origin
+    layout_origin=$(tmux show-options -wv -t "${SESSION}:palace" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+
+    local expected_grid=4
+    local expected_total
+    case "$layout_origin" in
+        wsl) expected_total=6 ;;  # 4 grid + 2 sides
+        mac) expected_total=5 ;;  # 4 grid + 1 right col (TUI)
+        *)   return 0 ;;         # Unknown layout, skip
+    esac
+
+    local actual
+    actual=$(tmux list-panes -t "${SESSION}:palace" -F '' 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ "$actual" -ne "$expected_total" ]]; then
+        echo "grid: palace has $actual panes, expected $expected_total ($layout_origin layout)"
+    fi
+}
+
+# ============================================================
+# ASSERTION: tui
+# TUI monitor panes are alive (not remain-on-exit dead state).
+# ============================================================
+assert_tui() {
+    while IFS=$'\t' read -r pid ptype dead win; do
+        [[ "$ptype" != "tui" ]] && continue
+        if [[ "$dead" == "1" ]]; then
+            # Check dirty flag — if intentionally stopped, leave it
+            local dirty
+            dirty=$(tmux show-options -pv -t "$pid" @TUI_DIRTY 2>/dev/null || echo "false")
+            if [[ "$dirty" != "true" ]]; then
+                tmux respawn-pane -k -t "$pid" "tui-pane-guard" 2>/dev/null || true
+                echo "tui: respawned dead TUI pane $pid in $win"
+            fi
+        fi
+    done < <(tmux list-panes -s -t "$SESSION" \
+        -F '#{pane_id}	#{@PANE_TYPE}	#{pane_dead}	#{window_name}' 2>/dev/null || true)
+}
+
+# ============================================================
+# ASSERTION: layout
+# Palace pane proportions haven't drifted from canonical sizing.
+# Light check: only flags, doesn't auto-fix (refresh-layout is destructive
+# if the user intentionally resized).
+# ============================================================
+assert_layout() {
+    # Check if expanded mode is active — skip audit during expand
+    local expanded
+    expanded=$(tmux show-options -wv -t "${SESSION}:palace" @GRID_EXPANDED 2>/dev/null || echo "none")
+    if [[ "$expanded" != "none" && -n "$expanded" ]]; then
+        return 0
+    fi
+
+    # Check if focused — different expected layout
+    local focused
+    focused=$(tmux show-options -wv -t "${SESSION}:palace" @FOCUSED 2>/dev/null || echo "false")
+    if [[ "$focused" == "true" ]]; then
+        return 0
+    fi
+
+    # Basic check: are any grid panes unreasonably small? (< 10 cols or < 5 rows)
+    while IFS=$'\t' read -r pid w h state; do
+        [[ "$state" != "small" ]] && continue
+        if [[ "$w" -lt 10 || "$h" -lt 5 ]]; then
+            echo "layout: grid pane $pid is ${w}x${h} — may need refresh"
+        fi
+    done < <(tmux list-panes -t "${SESSION}:palace" \
+        -F '#{pane_id}	#{pane_width}	#{pane_height}	#{@GRID_STATE}' 2>/dev/null || true)
+}
+
+# ============================================================
+# RUN ASSERTIONS
+# ============================================================
+run_assertion() {
+    local name="$1"
+    case "$name" in
+        backburner) assert_backburner ;;
+        grid)       assert_grid ;;
+        tui)        assert_tui ;;
+        layout)     assert_layout ;;
+        *) echo "Unknown assertion: $name" ;;
+    esac
+}
+
+if [[ -n "$ONLY" ]]; then
+    run_assertion "$ONLY"
+else
+    assert_backburner
+    assert_grid
+    assert_tui
+    assert_layout
+fi

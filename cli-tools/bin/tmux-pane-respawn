@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# tmux-pane-respawn — Global pane-died hook handler
+# TAGS: tmux, lifecycle
+# AUDIENCE: system (called by tmux pane-died hook, not directly)
+#
+# Respawns any dead pane. TUI panes get special handling:
+# - Skips respawn if @TUI_DIRTY=true (intentional stop via tui-respawn or manual)
+# - Restarts with tui-pane-guard instead of the default shell
+#
+# Non-TUI panes get a 1s delay to prevent tight crash loops.
+
+set -euo pipefail
+
+PANE_ID="${1:?Usage: tmux-pane-respawn <pane_id>}"
+
+# Check if pane still exists (race: hook fires but pane already killed by layout change)
+if ! tmux has-session -t "$PANE_ID" 2>/dev/null; then
+    exit 0
+fi
+
+PANE_TYPE=$(tmux show-options -pv -t "$PANE_ID" @PANE_TYPE 2>/dev/null || echo "")
+
+if [[ "$PANE_TYPE" == "tui" ]]; then
+    TUI_DIRTY=$(tmux show-options -pv -t "$PANE_ID" @TUI_DIRTY 2>/dev/null || echo "false")
+    if [[ "$TUI_DIRTY" == "true" ]]; then
+        exit 0
+    fi
+    tmux respawn-pane -k -t "$PANE_ID" tui-pane-guard
+elif [[ "$PANE_TYPE" == "backstop" ]]; then
+    tmux respawn-pane -k -t "$PANE_ID" tmux-backstop
+else
+    sleep 1
+    tmux respawn-pane -t "$PANE_ID"
+fi

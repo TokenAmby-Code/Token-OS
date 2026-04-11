@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# tmux-run — Execute a command and capture stdout/stderr to the tmux log
+# TAGS: tmux, logging
+# AUDIENCE: system (wrapper for run-shell commands)
+#
+# All tmux run-shell bindings route through this so output goes to a log file
+# instead of polluting interactive panes. The TUI reads this log in its
+# "tmux" info panel.
+#
+# Usage:
+#   tmux-run <command> [args...]    # Run command, log output
+#   tmux-run --tail [N]             # Tail the log (default 20 lines)
+#   tmux-run --clear                # Truncate the log
+
+TMUX_CMD_LOG="/tmp/.tmux-cmd.log"
+
+case "${1:-}" in
+    --tail)
+        tail -n "${2:-20}" "$TMUX_CMD_LOG" 2>/dev/null
+        exit 0
+        ;;
+    --clear)
+        : > "$TMUX_CMD_LOG"
+        exit 0
+        ;;
+    "")
+        echo "Usage: tmux-run <command> [args...]" >&2
+        exit 1
+        ;;
+esac
+
+# Run the command, capture combined stdout+stderr
+output=$("$@" 2>&1) || true
+
+# Only log if there's actual output
+if [[ -n "$output" ]]; then
+    ts=$(date '+%H:%M:%S')
+    cmd_name=$(basename "$1")
+    # Append timestamped output, keep log bounded (~500 lines)
+    {
+        echo "[$ts] $cmd_name:"
+        echo "$output"
+        echo "---"
+    } >> "$TMUX_CMD_LOG"
+
+    # Trim log if it exceeds 500 lines
+    if [[ -f "$TMUX_CMD_LOG" ]] && (( $(wc -l < "$TMUX_CMD_LOG") > 500 )); then
+        tail -n 300 "$TMUX_CMD_LOG" > "${TMUX_CMD_LOG}.tmp" && mv "${TMUX_CMD_LOG}.tmp" "$TMUX_CMD_LOG"
+    fi
+fi

@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# claude-dispatch — Unified Claude launch backend
+# TAGS: instance, dispatch, launcher
+# AUDIENCE: human, agent
+#
+# All launch paths converge here: shell aliases, claude-launcher TUI,
+# vault-dispatch, /api/dispatch endpoint, and cron jobs.
+#
+# Usage:
+#   claude-dispatch [options]
+#
+# Options:
+#   --dir <path>           Working directory (default: pwd)
+#   --primarch <name>      Persona to launch as
+#   --zealotry <1-5>       Golden Throne persistence level
+#   --sync                 Enable sync session mode
+#   --session-doc <path>   Session doc (vault-dispatch style briefing)
+#   --prompt <text>        Initial prompt to pipe in
+#   --pane <id>            Target tmux pane (default: current shell)
+#   --dry-run              Print what would happen, don't execute
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# --- Defaults ---
+WORK_DIR=""
+PRIMARCH=""
+ZEALOTRY=""
+SYNC=false
+SESSION_DOC=""
+PROMPT=""
+TARGET_PANE=""
+DRY_RUN=false
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dir)        WORK_DIR="$2"; shift 2 ;;
+        --primarch)   PRIMARCH="$2"; shift 2 ;;
+        --zealotry)   ZEALOTRY="$2"; shift 2 ;;
+        --sync)       SYNC=true; shift ;;
+        --session-doc) SESSION_DOC="$2"; shift 2 ;;
+        --prompt)     PROMPT="$2"; shift 2 ;;
+        --pane)       TARGET_PANE="$2"; shift 2 ;;
+        --dry-run)    DRY_RUN=true; shift ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# --- Resolve working directory ---
+WORK_DIR="${WORK_DIR:-$(pwd)}"
+WORK_DIR=$(eval echo "$WORK_DIR")
+if [[ ! -d "$WORK_DIR" ]]; then
+    echo -e "${RED}Working directory does not exist: $WORK_DIR${NC}" >&2
+    exit 1
+fi
+WORK_DIR=$(cd "$WORK_DIR" && pwd)
+
+# --- Vault path ---
+VAULT_DIR="${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV"
+
+# --- Build the prompt payload ---
+FULL_PROMPT=""
+
+# Session doc briefing (vault-dispatch style)
+if [[ -n "$SESSION_DOC" ]]; then
+    local_doc="${VAULT_DIR}/${SESSION_DOC}"
+    if [[ -f "$local_doc" ]]; then
+        FULL_PROMPT="Read your session document at [[${SESSION_DOC}]] using /vault-mind, then transplant to ${WORK_DIR} and begin work."
+    else
+        echo -e "${YELLOW}Warning: session doc not found: ${local_doc}${NC}" >&2
+        FULL_PROMPT="Session doc ${SESSION_DOC} was specified but not found. Proceed with the prompt below."
+    fi
+fi
+
+# Explicit prompt
+if [[ -n "$PROMPT" ]]; then
+    if [[ -n "$FULL_PROMPT" ]]; then
+        FULL_PROMPT="${FULL_PROMPT}
+
+${PROMPT}"
+    else
+        FULL_PROMPT="$PROMPT"
+    fi
+fi
+
+# Sync session instruction
+if $SYNC; then
+    SYNC_INSTRUCTION="You are in SYNC SESSION mode. The Emperor is present and actively working alongside you. Use AskUserQuestion between work cycles to stay synchronized. Never idle — always have a next action or question ready."
+    if [[ -n "$FULL_PROMPT" ]]; then
+        FULL_PROMPT="${SYNC_INSTRUCTION}
+
+${FULL_PROMPT}"
+    else
+        FULL_PROMPT="$SYNC_INSTRUCTION"
+    fi
+fi
+
+# --- Build the launch command ---
+CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")
+LAUNCH_ARGS=("--dangerously-skip-permissions")
+
+if [[ -n "$PRIMARCH" ]]; then
+    # Use primarch binary instead of raw claude
+    PRIMARCH_BIN=$(command -v primarch 2>/dev/null || echo "$(dirname "$(readlink -f "$0")")/primarch")
+    if [[ ! -x "$PRIMARCH_BIN" ]]; then
+        echo -e "${RED}Primarch binary not found${NC}" >&2
+        exit 1
+    fi
+    LAUNCH_BIN="$PRIMARCH_BIN"
+    LAUNCH_ARGS=("$PRIMARCH")  # primarch handles its own flags
+else
+    LAUNCH_BIN="$CLAUDE_BIN"
+fi
+
+# --- Dry run ---
+if $DRY_RUN; then
+    echo -e "${CYAN}${BOLD}claude-dispatch (dry run)${NC}"
+    echo -e "  ${DIM}dir:${NC}         $WORK_DIR"
+    [[ -n "$PRIMARCH" ]]    && echo -e "  ${DIM}primarch:${NC}    $PRIMARCH"
+    [[ -n "$ZEALOTRY" ]]    && echo -e "  ${DIM}zealotry:${NC}    $ZEALOTRY"
+    $SYNC                   && echo -e "  ${DIM}sync:${NC}        yes"
+    [[ -n "$SESSION_DOC" ]] && echo -e "  ${DIM}session-doc:${NC} $SESSION_DOC"
+    [[ -n "$TARGET_PANE" ]] && echo -e "  ${DIM}pane:${NC}        $TARGET_PANE"
+    echo -e "  ${DIM}binary:${NC}      $LAUNCH_BIN"
+    if [[ -n "$FULL_PROMPT" ]]; then
+        echo -e "  ${DIM}prompt:${NC}"
+        echo "$FULL_PROMPT" | sed 's/^/    /'
+    fi
+    exit 0
+fi
+
+# --- Zealotry registration (background) ---
+if [[ -n "$ZEALOTRY" ]]; then
+    (
+        sleep 8
+        if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+            API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+            # Find the most recent instance in this directory
+            instance_id=$(curl -s "${API_URL}/api/instances" 2>/dev/null | \
+                jq -r --arg dir "$WORK_DIR" \
+                '.[] | select(.working_dir == $dir and (.stopped_at == null)) | .id' 2>/dev/null | tail -1)
+            if [[ -n "$instance_id" ]]; then
+                curl -s -X PATCH "${API_URL}/api/instances/${instance_id}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
+            fi
+        fi
+    ) &
+    disown
+fi
+
+# --- Execute ---
+if [[ -n "$TARGET_PANE" ]]; then
+    # Remote pane dispatch via tmux send-keys
+    # Write prompt to temp file to avoid shell escaping issues
+    if [[ -n "$FULL_PROMPT" ]]; then
+        PROMPT_FILE="/tmp/claude-dispatch-$$.md"
+        printf '%s' "$FULL_PROMPT" > "$PROMPT_FILE"
+        if [[ -n "$PRIMARCH" ]]; then
+            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | primarch ${PRIMARCH}"
+        else
+            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | claude --dangerously-skip-permissions"
+        fi
+    else
+        if [[ -n "$PRIMARCH" ]]; then
+            CMD="cd '${WORK_DIR}' && primarch ${PRIMARCH}"
+        else
+            CMD="cd '${WORK_DIR}' && claude --dangerously-skip-permissions"
+        fi
+    fi
+
+    tmux send-keys -t "$TARGET_PANE" "clear" Enter
+    sleep 0.3
+    tmux send-keys -t "$TARGET_PANE" "$CMD" Enter
+    echo -e "${GREEN}+${NC} Dispatched to pane $TARGET_PANE"
+else
+    # Local shell dispatch — exec into claude
+    cd "$WORK_DIR"
+
+    if [[ -n "$FULL_PROMPT" ]]; then
+        # Pipe prompt as first message
+        if [[ -n "$PRIMARCH" ]]; then
+            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        else
+            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        fi
+    else
+        exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+    fi
+fi

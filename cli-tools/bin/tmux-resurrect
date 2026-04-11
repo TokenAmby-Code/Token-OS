@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# tmux-resurrect — Snapshot and restore Claude Code instances across tmux restarts
+# TAGS: tmux, resurrection, instances
+# AUDIENCE: machine
+#
+# Two modes:
+#   tmux-resurrect snapshot   — Save active instances to /tmp/.tx-resurrect.json
+#   tmux-resurrect restore    — Resume instances from snapshot into current workspace
+#
+# Snapshot captures: session_id, working_dir, @PANE_ID, primarch, instance_type
+# Restore maps @PANE_ID → new tmux pane target, runs `claude --resume` in each.
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+# shellcheck source=../lib/nas-path.sh
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+# shellcheck source=../lib/pane-id.sh
+source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
+
+SNAPSHOT_FILE="/tmp/.tx-resurrect.json"
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
+# Known NAS mount prefixes across all machines (from nas-path.sh registry)
+_NAS_PREFIXES=("/Volumes/Imperium" "/mnt/imperium")
+
+# Translate a working_dir from any machine's NAS path to the local $IMPERIUM.
+# e.g. on Mac: /mnt/imperium/Foo → /Volumes/Imperium/Foo
+_localize_path() {
+    local path="$1"
+    for prefix in "${_NAS_PREFIXES[@]}"; do
+        if [[ "$path" == "$prefix"* && "$prefix" != "$IMPERIUM" ]]; then
+            echo "${IMPERIUM}${path#$prefix}"
+            return
+        fi
+    done
+    echo "$path"
+}
+
+# --- Snapshot: capture active instances before kill ---
+do_snapshot() {
+    # Query Token-API for all non-stopped instances on this device
+    local response
+    response=$(curl -sf "${API_URL}/api/instances" 2>/dev/null) || {
+        echo "resurrect: Token-API unreachable, skipping snapshot" >&2
+        return 1
+    }
+
+    # Extract resurrection-relevant fields for non-stopped, local instances.
+    # Uses Python because jq isn't guaranteed on all machines.
+    python3 -c "
+import json, sys
+
+instances = json.loads(sys.stdin.read())
+result = []
+for inst in instances:
+    if inst.get('status') == 'stopped':
+        continue
+    # Only snapshot instances with a tmux pane (local, visible)
+    pane = inst.get('tmux_pane', '') or ''
+    if not pane:
+        continue
+    result.append({
+        'session_id': inst.get('id', ''),
+        'working_dir': inst.get('working_dir', '') or '',
+        'tmux_pane': pane,
+        'pane_label': inst.get('pane_label', '') or '',
+        'primarch': inst.get('primarch', '') or '',
+        'instance_type': inst.get('instance_type', '') or 'one_off',
+        'tab_name': inst.get('tab_name', '') or '',
+        'legion': inst.get('legion', '') or '',
+        'zealotry': inst.get('zealotry', 4),
+        'was_processing': inst.get('status') == 'processing',
+    })
+json.dump(result, sys.stdout, indent=2)
+print()
+" <<< "$response" > "$SNAPSHOT_FILE"
+
+    local count
+    count=$(python3 -c "import json; print(len(json.load(open('$SNAPSHOT_FILE'))))")
+    echo "resurrect: snapshot saved (${count} instances) → ${SNAPSHOT_FILE}"
+}
+
+# --- Enrich snapshot (legacy safety net) ---
+# Now that pane_label is stored in DB, this is only needed for backward compat
+# with instances registered before the pane_label migration.
+enrich_snapshot() {
+    local pane_map
+    pane_map=$(tmux list-panes -a -F '#{pane_id} #{@PANE_ID} #{window_name}' 2>/dev/null || echo "")
+
+    python3 -c "
+import json, sys
+
+pane_id_map = {}
+window_map = {}
+for line in '''${pane_map}'''.strip().split('\n'):
+    if not line.strip():
+        continue
+    parts = line.split(None, 2)
+    if len(parts) >= 2:
+        tmux_id = parts[0]
+        pane_id = parts[1] if parts[1] != '(null)' else ''
+        win_name = parts[2] if len(parts) >= 3 else ''
+        if pane_id:
+            pane_id_map[tmux_id] = pane_id
+        window_map[tmux_id] = win_name
+
+snapshot = json.load(open('$SNAPSHOT_FILE'))
+for inst in snapshot:
+    tmux_pane = inst.get('tmux_pane', '')
+    inst['pane_id'] = pane_id_map.get(tmux_pane, '')
+    inst['window'] = window_map.get(tmux_pane, '')
+json.dump(snapshot, sys.stdout, indent=2)
+print()
+" > "${SNAPSHOT_FILE}.tmp" && mv "${SNAPSHOT_FILE}.tmp" "$SNAPSHOT_FILE"
+
+    echo "resurrect: enriched snapshot with @PANE_ID mappings"
+}
+
+# --- Restore: resume instances (DB-first, snapshot fallback) ---
+do_restore() {
+    # Try DB-driven restore first
+    if _restore_from_db; then
+        rm -f "$SNAPSHOT_FILE"
+        return 0
+    fi
+
+    # Fallback to snapshot file
+    echo "resurrect: DB restore failed, falling back to snapshot..."
+    _restore_from_snapshot
+}
+
+# --- DB-driven restore ---
+_restore_from_db() {
+    local response
+    response=$(curl -sf "${API_URL}/api/instances" 2>/dev/null) || {
+        echo "resurrect: Token-API unreachable, cannot restore from DB" >&2
+        return 1
+    }
+
+    # Filter: local device, has pane_label, not subagent, non-stopped OR recently stopped (<60s)
+    local local_device
+    local_device=$(imperium_cfg device_name)
+    local restore_list
+    restore_list=$(python3 -c "
+import json, sys
+from datetime import datetime, timedelta
+
+local_device = '$local_device'
+instances = json.loads(sys.stdin.read())
+now = datetime.now()
+stale_cutoff = (now - timedelta(hours=24)).isoformat()
+recent_stop_cutoff = (now - timedelta(seconds=60)).isoformat()
+result = []
+for inst in instances:
+    if inst.get('is_subagent'):
+        continue
+    if inst.get('device_id', '') != local_device:
+        continue
+    label = inst.get('pane_label', '') or ''
+    if not label:
+        continue
+
+    status = inst.get('status', '')
+    if status == 'stopped':
+        # Include recently stopped instances (killed during tx restart)
+        stopped_at = inst.get('stopped_at', '') or ''
+        if not stopped_at or stopped_at < recent_stop_cutoff:
+            continue
+        # Use pre_stop_status to determine if it was processing
+        pre_status = inst.get('pre_stop_status', '') or 'idle'
+        was_processing = pre_status == 'processing'
+    else:
+        # Still alive — active in last 24h
+        last = inst.get('last_activity', '') or ''
+        if last and last < stale_cutoff:
+            continue
+        was_processing = status == 'processing'
+
+    result.append({
+        'session_id': inst.get('id', ''),
+        'working_dir': inst.get('working_dir', '') or '',
+        'pane_label': label,
+        'tab_name': inst.get('tab_name', '') or '',
+        'was_processing': was_processing,
+        'last_activity': inst.get('last_activity', '') or '',
+    })
+
+# Dedup by pane_label — keep the most recently active instance per pane
+by_label = {}
+for r in result:
+    lbl = r['pane_label']
+    if lbl not in by_label or r['last_activity'] > by_label[lbl]['last_activity']:
+        by_label[lbl] = r
+result = list(by_label.values())
+for r in result:
+    del r['last_activity']
+
+json.dump(result, sys.stdout)
+" <<< "$response") || return 1
+
+    local count
+    count=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$restore_list")
+    if [[ "$count" == "0" ]]; then
+        echo "resurrect: no resumable instances in DB"
+        return 0
+    fi
+
+    echo "resurrect: restoring ${count} instances from DB..."
+
+    python3 -c "
+import json, sys
+for inst in json.loads(sys.stdin.read()):
+    sid = inst['session_id']
+    wd = inst['working_dir'] or '\$HOME'
+    label = inst['pane_label']
+    proc = '1' if inst.get('was_processing') else '0'
+    print(f'{sid}\t{wd}\t{label}\t{proc}')
+" <<< "$restore_list" | while IFS=$'\t' read -r session_id working_dir pane_label was_processing; do
+        local target=""
+
+        if [[ -n "$pane_label" ]]; then
+            target=$(pane_resolve "$pane_label")
+        fi
+
+        if [[ -z "$target" ]]; then
+            echo "  skip: ${pane_label} — pane not found (kreig/expendable)" >&2
+            continue
+        fi
+
+        # Check pane is idle (not already running claude)
+        local cmd
+        cmd=$(tmux display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
+        if [[ "$cmd" == *claude* ]]; then
+            echo "  skip: ${pane_label} — claude already running" >&2
+            continue
+        fi
+
+        # Translate NAS paths to local mount (safety net)
+        working_dir=$(_localize_path "$working_dir")
+
+        if [[ "$was_processing" == "1" ]]; then
+            echo "  ${pane_label} (${target}) ← session ${session_id:0:8}... [auto-continue]"
+        else
+            echo "  ${pane_label} (${target}) ← session ${session_id:0:8}..."
+        fi
+        tmux send-keys -t "$target" "cd '${working_dir}' && claude --resume '${session_id}'" Enter
+        sleep 1.5  # Give claude time to start or fail
+
+        # Validate: check if resume actually worked
+        local pane_output
+        pane_output=$(tmux capture-pane -t "$target" -p -S -5 2>/dev/null || true)
+        if echo "$pane_output" | grep -qiE "no conversation found|error|not found|ENOENT"; then
+            echo "  FAIL: ${pane_label} — resume failed, clearing pane" >&2
+            tmux send-keys -t "$target" C-c 2>/dev/null || true
+            sleep 0.2
+            tmux send-keys -t "$target" C-c 2>/dev/null || true
+        elif [[ "$was_processing" == "1" ]]; then
+            # Instance was mid-work — nudge it to continue after resume loads
+            sleep 2
+            tmux send-keys -t "$target" "continue where you left off" Enter
+        fi
+        sleep 0.3
+    done
+
+    echo "resurrect: restore complete (DB-driven)"
+    return 0
+}
+
+# --- Snapshot-based restore (legacy fallback) ---
+_restore_from_snapshot() {
+    if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+        echo "resurrect: no snapshot found at ${SNAPSHOT_FILE}" >&2
+        return 1
+    fi
+
+    local count
+    count=$(python3 -c "import json; print(len(json.load(open('$SNAPSHOT_FILE'))))")
+    if [[ "$count" == "0" ]]; then
+        echo "resurrect: snapshot empty, nothing to restore"
+        rm -f "$SNAPSHOT_FILE"
+        return 0
+    fi
+
+    echo "resurrect: restoring ${count} instances from snapshot..."
+
+    local claimed_panes=""
+
+    python3 -c "
+import json
+for inst in json.load(open('$SNAPSHOT_FILE')):
+    sid = inst.get('session_id', '')
+    wd = inst.get('working_dir', '') or '\$HOME'
+    pane_id = inst.get('pane_id', '') or inst.get('pane_label', '')
+    window = inst.get('window', '')
+    proc = '1' if inst.get('was_processing') else '0'
+    if sid:
+        print(f'{sid}\t{wd}\t{pane_id}\t{window}\t{proc}')
+" | while IFS=$'\t' read -r session_id working_dir pane_id window was_processing; do
+        local target=""
+
+        if [[ -n "$pane_id" ]]; then
+            target=$(pane_resolve "$pane_id")
+        fi
+
+        if [[ -z "$target" && -n "$window" ]]; then
+            target=$(tmux list-panes -t "main:${window}" -F '#{pane_id}' 2>/dev/null \
+                | while read -r candidate; do
+                    if echo "$claimed_panes" | grep -qF "$candidate"; then
+                        continue
+                    fi
+                    local pcmd
+                    pcmd=$(tmux display-message -t "$candidate" -p '#{pane_current_command}' 2>/dev/null || echo "")
+                    if [[ "$pcmd" != *claude* ]]; then
+                        echo "$candidate"
+                        break
+                    fi
+                done)
+        fi
+
+        if [[ -z "$target" ]]; then
+            echo "  skip: ${pane_id:-${window}:?} — no matching pane" >&2
+            continue
+        fi
+
+        local cmd
+        cmd=$(tmux display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
+        if [[ "$cmd" == *claude* ]]; then
+            echo "  skip: ${pane_id:-$target} — claude already running" >&2
+            continue
+        fi
+
+        claimed_panes="${claimed_panes} ${target}"
+
+        # Translate NAS paths to local mount (safety net)
+        working_dir=$(_localize_path "$working_dir")
+
+        local label="${pane_id:-${window}}"
+        if [[ "$was_processing" == "1" ]]; then
+            echo "  ${label} (${target}) ← session ${session_id:0:8}... [auto-continue]"
+        else
+            echo "  ${label} (${target}) ← session ${session_id:0:8}..."
+        fi
+        tmux send-keys -t "$target" "cd '${working_dir}' && claude --resume '${session_id}'" Enter
+        sleep 1.5
+
+        # Validate: check if resume actually worked
+        local pane_output
+        pane_output=$(tmux capture-pane -t "$target" -p -S -5 2>/dev/null || true)
+        if echo "$pane_output" | grep -qiE "no conversation found|error|not found|ENOENT"; then
+            echo "  FAIL: ${label} — resume failed, clearing pane" >&2
+            tmux send-keys -t "$target" C-c 2>/dev/null || true
+            sleep 0.2
+            tmux send-keys -t "$target" C-c 2>/dev/null || true
+        elif [[ "$was_processing" == "1" ]]; then
+            sleep 2
+            tmux send-keys -t "$target" "continue where you left off" Enter
+        fi
+        sleep 0.3
+    done
+
+    echo "resurrect: restore complete (snapshot)"
+    rm -f "$SNAPSHOT_FILE"
+}
+
+# --- Main ---
+case "${1:-}" in
+    snapshot)
+        do_snapshot
+        # Enrich is now optional — pane_label lives in DB.
+        # Still run it for backward compat with pre-migration instances.
+        enrich_snapshot
+        ;;
+    restore)
+        do_restore
+        ;;
+    *)
+        echo "Usage: tmux-resurrect {snapshot|restore}" >&2
+        exit 1
+        ;;
+esac

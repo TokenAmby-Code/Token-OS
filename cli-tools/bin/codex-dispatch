@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# codex-dispatch — Launch Codex exec with Token-API session tracking
+#
+# Usage: codex-dispatch <working-dir> <prompt>
+#
+# Registers SessionStart/SessionEnd with Token-API, then runs codex exec
+# in full-auto mode with JSON output.
+
+set -euo pipefail
+
+# ── Args ─────────────────────────────────────────────────────────
+if [[ $# -lt 2 ]]; then
+  echo "Usage: codex-dispatch <working-dir> <prompt>" >&2
+  exit 64
+fi
+
+WORKING_DIR="$1"
+shift
+PROMPT="$*"
+
+if [[ ! -d "$WORKING_DIR" ]]; then
+  echo "Error: working directory does not exist: $WORKING_DIR" >&2
+  exit 65
+fi
+
+# ── Dependencies ─────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+if [[ -f "$LIB_DIR/nas-path.sh" ]]; then
+  source "$LIB_DIR/nas-path.sh"
+elif [[ -n "${IMPERIUM:-}" && -f "$IMPERIUM/Token-OS/cli-tools/lib/nas-path.sh" ]]; then
+  source "$IMPERIUM/Token-OS/cli-tools/lib/nas-path.sh"
+fi
+
+API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Error: codex not found in PATH" >&2
+  exit 66
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq not found in PATH" >&2
+  exit 67
+fi
+
+# ── Session ID ───────────────────────────────────────────────────
+SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+# ── Hook helpers ─────────────────────────────────────────────────
+post_hook() {
+  local action_type="$1"
+  local payload="$2"
+  curl -s --connect-timeout 2 --max-time 5 \
+    -X POST "${API_URL}/api/hooks/${action_type}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" >/dev/null 2>&1 || true
+}
+
+build_env_object() {
+  local env_obj="{}"
+  [[ -n "${SSH_CLIENT:-}" ]]         && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
+  [[ -n "${TMUX:-}" ]]              && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
+  [[ -n "${TMUX_PANE:-}" ]]         && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX_PANE" '. + {TMUX_PANE: $v}')
+  [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
+  echo "$env_obj"
+}
+
+# ── SessionStart ─────────────────────────────────────────────────
+ENV_OBJ=$(build_env_object)
+START_PAYLOAD=$(jq -nc \
+  --arg sid "$SESSION_ID" \
+  --arg wd "$WORKING_DIR" \
+  --arg prompt "$PROMPT" \
+  --argjson env "$ENV_OBJ" \
+  '{
+    session_id: $sid,
+    working_dir: $wd,
+    prompt: $prompt,
+    env: $env,
+    agent_type: "codex"
+  }')
+
+post_hook "SessionStart" "$START_PAYLOAD"
+
+# ── Cleanup on exit ──────────────────────────────────────────────
+cleanup() {
+  local exit_code=$?
+  local end_payload
+  end_payload=$(jq -nc \
+    --arg sid "$SESSION_ID" \
+    --arg wd "$WORKING_DIR" \
+    --argjson code "$exit_code" \
+    '{
+      session_id: $sid,
+      working_dir: $wd,
+      exit_code: $code,
+      agent_type: "codex"
+    }')
+  post_hook "SessionEnd" "$end_payload"
+}
+trap cleanup EXIT
+
+# ── Launch Codex ─────────────────────────────────────────────────
+# Interactive TUI mode by default (readable in tmux panes).
+# Use CODEX_HEADLESS=1 for non-interactive JSON output.
+if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
+  OUTPUT_FILE="/tmp/codex-${SESSION_ID}.md"
+  exec codex exec "$PROMPT" -C "$WORKING_DIR" --full-auto --json -o "$OUTPUT_FILE"
+else
+  exec codex "$PROMPT" -C "$WORKING_DIR" --full-auto
+fi

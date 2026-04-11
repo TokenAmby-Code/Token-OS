@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# discord-routing - Diagnose the Discord voice/mention routing chain
+# TAGS: discord, voice, routing, diagnostic
+# AUDIENCE: agent, user
+"""Diagnose the Discord voice/mention injection routing chain.
+
+Checks each legion's routing path: DB instance lookup → tmux_pane → pane alive →
+voice-chat status. Prints a status table and fix suggestions.
+
+Usage:
+    discord-routing              # Full diagnostic
+    discord-routing --json       # JSON output for programmatic use
+    discord-routing --fix        # Print fix commands only
+    discord-routing -h, --help   # Show help
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path.home() / ".claude" / "agents.db"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+
+# Legions that have Discord bots routing to them
+ROUTABLE_LEGIONS = ["custodes", "mechanicus"]
+
+
+def get_db():
+    if not DB_PATH.exists():
+        return None
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def api_get(path: str):
+    """GET from Token-API, return parsed JSON or None."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--connect-timeout", "2", "--max-time", "5",
+             f"{API_URL}{path}"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+    except (json.JSONDecodeError, Exception):
+        pass
+    return None
+
+
+def get_live_panes():
+    """Return set of alive tmux pane IDs."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return set(result.stdout.strip().split("\n"))
+    except Exception:
+        pass
+    return set()
+
+
+def check_api_reachable():
+    """Check if Token-API is reachable."""
+    data = api_get("/api/status")
+    return data is not None
+
+
+def check_dictation_state():
+    """Check dictation endpoint for voice_chat_instance."""
+    return api_get("/api/dictation")
+
+
+def check_voice_chat_sessions():
+    """Check all voice-chat sessions via API."""
+    # No bulk endpoint — we check per-instance after finding them
+    return {}
+
+
+def check_legion(legion: str, db, live_panes: set):
+    """Check the full routing chain for a legion. Returns a diagnostic dict."""
+    result = {
+        "legion": legion,
+        "instance_id": None,
+        "instance_status": None,
+        "synced": None,
+        "tmux_pane": None,
+        "pane_alive": False,
+        "voice_chat": False,
+        "last_activity": None,
+        "input_lock": None,
+        "issues": [],
+        "fixes": [],
+        "verdict": "BROKEN",
+    }
+
+    if db is None:
+        result["issues"].append("agents.db not found")
+        result["fixes"].append(f"Ensure {DB_PATH} exists (Token-API creates it)")
+        return result
+
+    # Query matching what _try_discord_injection does
+    # Custodes: any live instance. Mechanicus: synced instances only.
+    if legion == "mechanicus":
+        query = """
+            SELECT id, tmux_pane, status, synced, last_activity, input_lock, device_id, pid
+            FROM claude_instances
+            WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+            ORDER BY last_activity DESC LIMIT 1
+        """
+    else:
+        query = """
+            SELECT id, tmux_pane, status, synced, last_activity, input_lock, device_id, pid
+            FROM claude_instances
+            WHERE legion = ? AND status IN ('idle', 'processing')
+            ORDER BY last_activity DESC LIMIT 1
+        """
+
+    cursor = db.cursor()
+    cursor.execute(query, (legion,))
+    row = cursor.fetchone()
+
+    if not row:
+        result["issues"].append(f"No live {legion} instance in DB")
+        if legion == "mechanicus":
+            result["issues"].append("(mechanicus requires synced=1)")
+            # Check if there's an unsynced instance
+            cursor.execute(
+                "SELECT id, synced, status FROM claude_instances WHERE legion = ? AND status IN ('idle', 'processing') LIMIT 1",
+                (legion,)
+            )
+            unsynced = cursor.fetchone()
+            if unsynced:
+                result["fixes"].append(
+                    f"Unsynced instance exists: {unsynced['id']}. "
+                    f"Fix: curl -X PATCH {API_URL}/api/instances/{unsynced['id']} "
+                    f"-H 'Content-Type: application/json' -d '{{\"synced\": true}}'"
+                )
+            else:
+                result["fixes"].append(f"Launch a {legion} instance with synced mode")
+        elif legion == "custodes":
+            result["fixes"].append(
+                "Launch a custodes instance: primarch custodes"
+            )
+            # Check if there's a stopped one
+            cursor.execute(
+                "SELECT id, status FROM claude_instances WHERE legion = ? ORDER BY last_activity DESC LIMIT 1",
+                (legion,)
+            )
+            stopped = cursor.fetchone()
+            if stopped:
+                result["fixes"].append(
+                    f"Found stopped instance {stopped['id']} (status={stopped['status']}). "
+                    f"May need a fresh launch."
+                )
+        return result
+
+    # Instance found
+    result["instance_id"] = row["id"]
+    result["instance_status"] = row["status"]
+    result["synced"] = bool(row["synced"])
+    result["tmux_pane"] = row["tmux_pane"]
+    result["last_activity"] = row["last_activity"]
+    result["input_lock"] = row["input_lock"]
+
+    # Check tmux_pane
+    if not row["tmux_pane"]:
+        result["issues"].append("No tmux_pane set on instance")
+        result["fixes"].append(
+            f"Set pane: curl -X PATCH {API_URL}/api/instances/{row['id']} "
+            f"-H 'Content-Type: application/json' -d '{{\"tmux_pane\": \"<PANE_ID>\"}}'"
+        )
+        return result
+
+    # Check pane alive
+    if row["tmux_pane"] in live_panes:
+        result["pane_alive"] = True
+    else:
+        result["issues"].append(f"tmux pane {row['tmux_pane']} is dead")
+        result["fixes"].append(
+            f"Pane {row['tmux_pane']} no longer exists. Instance may need restart."
+        )
+
+    # Check input_lock
+    if row["input_lock"]:
+        result["issues"].append(f"Input lock held: {row['input_lock']}")
+        # Check staleness
+        if row["last_activity"]:
+            try:
+                last = datetime.fromisoformat(row["last_activity"].replace("Z", "+00:00"))
+                age = (datetime.now(last.tzinfo) if last.tzinfo else datetime.now()) - last
+                if age.total_seconds() > 30:
+                    result["fixes"].append(
+                        f"Stale lock ({int(age.total_seconds())}s old). "
+                        f"Fix: curl -X DELETE {API_URL}/api/instances/{row['id']}/input-lock"
+                    )
+            except (ValueError, TypeError):
+                pass
+
+    # Check voice-chat status
+    vc_data = api_get(f"/api/instances/{row['id']}/voice-chat")
+    if vc_data and vc_data.get("active"):
+        result["voice_chat"] = True
+
+    # Determine verdict
+    if not result["issues"]:
+        result["verdict"] = "OK"
+    elif result["pane_alive"] and not any("tmux_pane" in i for i in result["issues"]):
+        # Pane alive but minor issues (e.g., input lock)
+        result["verdict"] = "WARN"
+
+    return result
+
+
+def print_table(results, dictation_data, api_ok):
+    """Print a formatted status table."""
+    # Header
+    print()
+    print(f"  Discord Routing Diagnostic")
+    print(f"  Token-API: {API_URL} {'[OK]' if api_ok else '[UNREACHABLE]'}")
+    if dictation_data:
+        vc_inst = dictation_data.get("voice_chat_instance")
+        dictation_on = dictation_data.get("active", False)
+        print(f"  Dictation: {'ON' if dictation_on else 'OFF'}"
+              f"  |  Voice-chat instance: {vc_inst or 'none'}")
+    print()
+
+    # Table
+    cols = ["Legion", "Instance", "Status", "Pane", "Alive", "Voice", "Verdict"]
+    widths = [12, 14, 11, 8, 7, 7, 8]
+
+    header = "  ".join(c.ljust(w) for c, w in zip(cols, widths))
+    sep = "  ".join("-" * w for w in widths)
+    print(f"  {header}")
+    print(f"  {sep}")
+
+    for r in results:
+        inst = (r["instance_id"] or "-")[:14]
+        status = r["instance_status"] or "-"
+        pane = r["tmux_pane"] or "-"
+        alive = "yes" if r["pane_alive"] else "no"
+        voice = "yes" if r["voice_chat"] else "no"
+        verdict = r["verdict"]
+
+        row = [
+            r["legion"].ljust(widths[0]),
+            inst.ljust(widths[1]),
+            status.ljust(widths[2]),
+            pane.ljust(widths[3]),
+            alive.ljust(widths[4]),
+            voice.ljust(widths[5]),
+            verdict.ljust(widths[6]),
+        ]
+        print(f"  {'  '.join(row)}")
+
+    print()
+
+    # Issues and fixes
+    any_issues = False
+    for r in results:
+        if r["issues"]:
+            if not any_issues:
+                print("  Issues:")
+                any_issues = True
+            for issue in r["issues"]:
+                print(f"    [{r['legion']}] {issue}")
+
+    if any_issues:
+        print()
+
+    any_fixes = False
+    for r in results:
+        if r["fixes"]:
+            if not any_fixes:
+                print("  Suggested fixes:")
+                any_fixes = True
+            for fix in r["fixes"]:
+                print(f"    [{r['legion']}] {fix}")
+
+    if any_fixes:
+        print()
+
+    if not any_issues:
+        print("  All routing chains healthy.")
+        print()
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        return
+
+    json_mode = "--json" in args
+    fix_mode = "--fix" in args
+
+    # Run checks
+    api_ok = check_api_reachable()
+    dictation_data = check_dictation_state()
+    db = get_db()
+    live_panes = get_live_panes()
+
+    results = []
+    for legion in ROUTABLE_LEGIONS:
+        results.append(check_legion(legion, db, live_panes))
+
+    if db:
+        db.close()
+
+    if json_mode:
+        output = {
+            "api_reachable": api_ok,
+            "api_url": API_URL,
+            "dictation": dictation_data,
+            "legions": results,
+        }
+        print(json.dumps(output, indent=2, default=str))
+        return
+
+    if fix_mode:
+        any_fixes = False
+        for r in results:
+            for fix in r["fixes"]:
+                print(fix)
+                any_fixes = True
+        if not any_fixes:
+            print("No fixes needed — all routing chains healthy.")
+        return
+
+    print_table(results, dictation_data, api_ok)
+
+
+if __name__ == "__main__":
+    main()

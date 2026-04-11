@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# tmux-backstop — Placeholder process for empty backburner windows
+# TAGS: tmux, lifecycle
+# AUDIENCE: system (spawned by backburner reaper, not directly by user)
+#
+# Displays idle ascii art and blocks forever. Exists to hold a window
+# open when no real work is running. Gets culled automatically when
+# real panes arrive (the reaper kills backstop panes on sight if
+# siblings exist).
+#
+# Pane type: @PANE_TYPE=backstop
+
+# Tag self
+if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux set-option -p -t "$TMUX_PANE" @PANE_TYPE "backstop" 2>/dev/null || true
+fi
+
+clear
+cat << 'EOF'
+
+
+         _______________
+        |  ___________  |
+        | |           | |
+        | |   AWAIT   | |
+        | |  ORDERS   | |
+        | |___________| |
+        |_______________|
+            _|___|_
+           / _____ \
+          / /     \ \
+         /_/       \_\
+
+         [ STANDING BY ]
+
+
+EOF
+
+# Block forever — backstop is a sentinel, not a worker.
+# Sleep in a loop so signals (kill) work cleanly.
+while true; do
+    sleep 86400
+done
