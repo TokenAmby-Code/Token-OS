@@ -17,15 +17,13 @@ import uuid
 import asyncio
 import logging
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from apscheduler.triggers.date import DateTrigger
-
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR,
     PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
@@ -81,6 +79,12 @@ _pending_background_tasks: dict = {}  # session_id -> count
 # Tracks recent evaluator nudges to prevent re-evaluation loops on stop.
 _recently_nudged: dict[str, float] = {}
 NUDGE_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Tracks stop-hook self-evaluation blocks. When a golden_throne or sync instance
+# stops, StopValidate blocks once with a self-eval prompt. If the agent stops again
+# (self-eval complete, chose not to continue), the second stop passes through.
+_self_eval_pending: dict[str, float] = {}  # session_id -> timestamp of block
+SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 
 # Legion → Discord bot name mapping
@@ -829,79 +833,16 @@ async def handle_stop(payload: dict) -> dict:
         logger.info(f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications")
         return result
 
-    # ── Instance lifecycle retrigger — schedule before notifications ──
-    # Moved here so sync instances can schedule retrigger and return early (skip notifications).
+    # ── Instance lifecycle retrigger ──
+    # Golden Throne and sync retriggering is now handled by StopValidate
+    # (synchronous gate in stop-validator.sh). The agent self-evaluates and
+    # decides whether to continue or allow the stop. No timer scheduling needed.
+    # This async Stop handler only processes notifications/TTS for stopped instances.
+
+    # Sync instances that passed through StopValidate don't need notifications
+    # (the self-eval prompt already gave them a chance to continue).
     instance_type = instance.get("instance_type", "one_off")
-
-    if instance_type == "golden_throne" and not is_subagent_instance:
-        zealotry = instance.get("zealotry") or 4
-        delay_seconds = _main().ZEALOTRY_DELAY_MAP.get(zealotry, 1800)
-        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
-        job_id = f"golden-throne-{session_id}"
-        try:
-            _main().scheduler.remove_job(job_id)
-        except Exception:
-            pass
-        _main().scheduler.add_job(
-            _main().golden_throne_followup,
-            DateTrigger(run_date=fire_at),
-            args=[session_id],
-            id=job_id,
-            replace_existing=True,
-            name=f"Golden Throne: {tab_name}",
-            misfire_grace_time=300,
-            jobstore='golden_throne',
-        )
-        result["golden_throne"] = {
-            "scheduled": True,
-            "delay_seconds": delay_seconds,
-            "fire_at": fire_at.isoformat(),
-            "zealotry": zealotry,
-        }
-        logger.info(f"Golden Throne: scheduled follow-up for {session_id[:12]} in {delay_seconds}s (zealotry={zealotry})")
-        await log_event("golden_throne_scheduled", instance_id=session_id,
-                        details={"zealotry": zealotry, "delay_seconds": delay_seconds,
-                                 "fire_at": fire_at.isoformat()})
-
-    elif instance_type == "sync" and not is_subagent_instance:
-        # ── ScheduleWakeup detection ──
-        # If the session's last tool call was ScheduleWakeup, the SDK will handle
-        # the wakeup internally. Don't retrigger — it causes ~80+ spurious pings.
-        _transcript_tail = payload.get("transcript_tail", "")
-        has_schedule_wakeup = "ScheduleWakeup" in _transcript_tail
-
-        if has_schedule_wakeup:
-            logger.info(f"Sync: {session_id[:12]} has active ScheduleWakeup — skipping retrigger")
-            result["action"] = "stop_processed_sync_wakeup"
-            result["schedule_wakeup_detected"] = True
-            await log_event("hook_stop", instance_id=session_id,
-                            details={"sync": True, "schedule_wakeup": True, "skipped_retrigger": True})
-            return result
-
-        delay_seconds = 3
-        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
-        job_id = f"sync-retrigger-{session_id}"
-        try:
-            _main().scheduler.remove_job(job_id)
-        except Exception:
-            pass
-        _main().scheduler.add_job(
-            _main().golden_throne_followup,
-            DateTrigger(run_date=fire_at),
-            args=[session_id],
-            id=job_id,
-            replace_existing=True,
-            name=f"Sync Retrigger: {tab_name}",
-            misfire_grace_time=30,
-            jobstore='golden_throne',
-        )
-        result["sync_retrigger"] = {
-            "scheduled": True,
-            "delay_seconds": delay_seconds,
-            "fire_at": fire_at.isoformat(),
-        }
-        logger.info(f"Sync Retrigger: scheduled for {session_id[:12]} in {delay_seconds}s")
-        # Sync instances skip all notifications — retrigger is the only action needed.
+    if instance_type == "sync" and not is_subagent_instance:
         result["action"] = "stop_processed_sync"
         await log_event("hook_stop", instance_id=session_id, details={"sync": True})
         return result
@@ -1180,6 +1121,98 @@ async def handle_notification(payload: dict) -> dict:
     return {"success": True, "action": "sound_played", "sound": sound_file, "result": result}
 
 
+# ============ Stop Hook Self-Evaluation (Compacted Retrigger) ============
+
+_SELF_EVAL_PROMPT = (
+    "You stopped. Read your session doc. "
+    "If there's active work remaining or a session to maintain, "
+    "run a recovery action (ScheduleWakeup, continue working, or escalate via Discord). "
+    "If this was a clean exit or victory, do nothing — allow the stop."
+)
+
+
+async def handle_stop_validate(payload: dict) -> dict:
+    """StopValidate: synchronous gate that can block a stop with a self-evaluation prompt.
+
+    Replaces the old MiniMax retrigger dispatch + Golden Throne timer system.
+    Golden Throne and sync instances get blocked once — the agent self-evaluates
+    and decides whether to continue or allow the stop. Second stop passes through.
+    """
+    session_id = payload.get("session_id")
+    if not session_id:
+        return {}  # no decision — allow stop
+
+    # ── Check if this is a second stop (self-eval already issued) ──
+    now = time.time()
+    if session_id in _self_eval_pending:
+        issued_at = _self_eval_pending.pop(session_id)
+        elapsed = now - issued_at
+        logger.info(
+            f"StopValidate: {session_id[:12]} self-eval complete "
+            f"({elapsed:.1f}s) — allowing stop"
+        )
+        await log_event("stop_validate_pass", instance_id=session_id,
+                        details={"reason": "self_eval_complete", "elapsed": elapsed})
+        return {}  # no decision — allow stop
+
+    # ── Expire stale entries ──
+    stale = [sid for sid, ts in _self_eval_pending.items()
+             if now - ts > SELF_EVAL_TTL_SECONDS]
+    for sid in stale:
+        del _self_eval_pending[sid]
+
+    # ── Look up instance ──
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, instance_type, is_subagent, victory_at FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        instance = await cursor.fetchone()
+
+    if not instance:
+        return {}  # unknown instance — allow stop
+
+    instance = dict(instance)
+    instance_type = instance.get("instance_type", "one_off")
+
+    # ── Skip: subagents never get self-eval ──
+    if instance.get("is_subagent"):
+        return {}
+
+    # ── Skip: victory already declared ──
+    if instance.get("victory_at"):
+        return {}
+
+    # ── Skip: one-off instances don't need self-eval ──
+    if instance_type == "one_off":
+        return {}
+
+    # ── ScheduleWakeup detection: don't block if the SDK is handling wakeup ──
+    transcript_tail = payload.get("transcript_tail", "")
+    if "ScheduleWakeup" in transcript_tail:
+        logger.info(f"StopValidate: {session_id[:12]} has active ScheduleWakeup — allowing stop")
+        await log_event("stop_validate_pass", instance_id=session_id,
+                        details={"reason": "schedule_wakeup_active"})
+        return {}
+
+    # ── Block: golden_throne and sync instances get self-eval prompt ──
+    if instance_type in ("golden_throne", "sync"):
+        _self_eval_pending[session_id] = now
+        logger.info(
+            f"StopValidate: blocking {session_id[:12]} ({instance_type}) "
+            f"with self-eval prompt"
+        )
+        await log_event("stop_validate_block", instance_id=session_id,
+                        details={"instance_type": instance_type})
+        return {
+            "decision": "block",
+            "reason": _SELF_EVAL_PROMPT,
+        }
+
+    return {}  # default: allow stop
+
+
 # Hook dispatcher endpoint
 @router.post("/api/hooks/{action_type}")
 async def dispatch_hook(action_type: str, payload: dict, request: Request) -> dict:
@@ -1195,6 +1228,7 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         "UserPromptSubmit": handle_prompt_submit,
         "PostToolUse": handle_post_tool_use,
         "Stop": handle_stop,
+        "StopValidate": handle_stop_validate,
         "PreToolUse": handle_pre_tool_use,
         "Notification": handle_notification,
     }
