@@ -77,6 +77,7 @@ from routes.hooks import (
     router as hooks_router,
     HookResponse, PreToolUseResponse,
     _post_tool_debounce, _pending_background_tasks, _recently_nudged,
+    _update_session_doc_frontmatter,
 )
 
 # Configure logging for TUI capture
@@ -3259,6 +3260,8 @@ async def declare_victory(instance_id: str, request: Request):
         raise HTTPException(status_code=400, detail="reason is required")
     deliverables = body.get("deliverables")  # Optional list of strings
 
+    deliverables = body.get("deliverables", [])
+
     now = datetime.now().isoformat()
     session_doc_updated = False
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3277,6 +3280,22 @@ async def declare_victory(instance_id: str, request: Request):
             "UPDATE claude_instances SET victory_at = ?, victory_reason = ?, instance_type = 'one_off' WHERE id = ?",
             (now, reason, instance_id)
         )
+
+        # Write victory data to session doc frontmatter
+        if session_doc_id:
+            cursor = await db.execute(
+                "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
+            )
+            doc_row = await cursor.fetchone()
+            if doc_row and doc_row[0]:
+                fm_updates = {
+                    "victory": "declared",
+                    "victory_reason": reason,
+                }
+                if deliverables:
+                    fm_updates["deliverables"] = deliverables
+                _update_session_doc_frontmatter(doc_row[0], fm_updates)
+
         await db.commit()
 
         # Session doc frontmatter write (dual-write)
@@ -10815,6 +10834,19 @@ created: {today}{project_line}
 agents: []
 instance_ids: []{primarch_line}
 status: active
+type: session
+start_time: null
+end_time: null
+duration_minutes: null
+pool: null
+legion: null
+faction: null
+victory_conditions: []
+victory: pending
+victory_reason: null
+deliverables: []
+instance_type: one_off
+zealotry: 4
 ---
 
 # Session: {title}

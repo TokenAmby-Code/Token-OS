@@ -92,6 +92,15 @@ fi
 
 mkdir -p "$(dirname "$SESSION_DOC_ABS")"
 
+START_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+# Derive pool from parent CWD: civic/pax dirs → pk, everything else → personal
+if echo "$PARENT_CWD" | grep -qiE '(Pax-ENV|askcivic|civic)'; then
+  POOL="pk"
+else
+  POOL="personal"
+fi
+
 cat > "$SESSION_DOC_ABS" << SESSIONEOF
 ---
 session_doc_id: null
@@ -103,6 +112,19 @@ status: active
 type: session
 origin: catch-and-release
 related_session_docs: []
+start_time: ${START_TIME}
+end_time: null
+duration_minutes: null
+pool: ${POOL}
+legion: null
+primarch: null
+faction: null
+victory_conditions: []
+victory: pending
+victory_reason: null
+deliverables: []
+instance_type: one_off
+zealotry: 4
 ---
 
 # ${AGENT_DESC}
