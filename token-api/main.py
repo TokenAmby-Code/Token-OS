@@ -2835,8 +2835,10 @@ async def golden_throne_followup(session_id: str):
     if instance_type == "sync":
         sop_prompt = (
             "Sync retrigger: you stopped unexpectedly. "
-            "Read session doc, validate any in-flight work, "
-            "then AskUserQuestion to re-block."
+            "Read session doc, validate any in-flight work. "
+            "ESCALATE: send a Discord message or TTS notification to alert the Emperor. "
+            "If escalation fails and you cannot recover, kill this session via tmux prefix+Q. "
+            "Do NOT just re-enter a failing AskUserQuestion loop — that causes Sisyphus retrigger storms."
         )
         logger.info(f"Golden Throne: sync retrigger for {session_id[:12]} — concise heartbeat")
     else:

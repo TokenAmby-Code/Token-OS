@@ -864,6 +864,20 @@ async def handle_stop(payload: dict) -> dict:
                                  "fire_at": fire_at.isoformat()})
 
     elif instance_type == "sync" and not is_subagent_instance:
+        # ── ScheduleWakeup detection ──
+        # If the session's last tool call was ScheduleWakeup, the SDK will handle
+        # the wakeup internally. Don't retrigger — it causes ~80+ spurious pings.
+        _transcript_tail = payload.get("transcript_tail", "")
+        has_schedule_wakeup = "ScheduleWakeup" in _transcript_tail
+
+        if has_schedule_wakeup:
+            logger.info(f"Sync: {session_id[:12]} has active ScheduleWakeup — skipping retrigger")
+            result["action"] = "stop_processed_sync_wakeup"
+            result["schedule_wakeup_detected"] = True
+            await log_event("hook_stop", instance_id=session_id,
+                            details={"sync": True, "schedule_wakeup": True, "skipped_retrigger": True})
+            return result
+
         delay_seconds = 3
         fire_at = datetime.now() + timedelta(seconds=delay_seconds)
         job_id = f"sync-retrigger-{session_id}"
