@@ -12,12 +12,16 @@ import {
   AudioPlayerStatus,
   StreamType,
 } from '@discordjs/voice';
-import { createWriteStream, mkdirSync } from 'fs';
+import { createWriteStream, mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { Events } from 'discord.js';
 import prism from 'prism-media';
+
+const execFileAsync = promisify(execFile);
 
 const AUDIO_DIR = join(process.env.HOME || '/tmp', '.discord-cli', 'audio');
 mkdirSync(AUDIO_DIR, { recursive: true });
@@ -51,6 +55,8 @@ export function createVoiceManager(botClients, config, logger) {
         recording: false,
         activeSubscriptions: new Map(),
         channelId: null,
+        player: null,       // AudioPlayer for playback
+        playing: false,      // Currently playing audio
       });
     }
     return botStates.get(botName);
@@ -82,7 +88,7 @@ export function createVoiceManager(botClients, config, logger) {
       guildId: guildId,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false, // MUST be false to receive audio
-      selfMute: true,  // Muted by default (no playback yet)
+      selfMute: false, // Unmuted to support audio playback
     });
 
     state.channelId = voiceChannelId;
@@ -398,6 +404,140 @@ export function createVoiceManager(botClients, config, logger) {
     }
   }
 
+  // --- Audio Playback ---
+
+  function getOrCreatePlayer(botName) {
+    const state = getBotState(botName);
+    if (state.player) return state.player;
+
+    const player = createAudioPlayer();
+
+    player.on(AudioPlayerStatus.Playing, () => {
+      state.playing = true;
+      logger.info(`Voice [${botName}]: playback started`);
+    });
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      state.playing = false;
+      logger.debug(`Voice [${botName}]: playback idle`);
+    });
+
+    player.on('error', (err) => {
+      state.playing = false;
+      logger.error(`Voice [${botName}]: player error: ${err.message}`);
+    });
+
+    state.player = player;
+    return player;
+  }
+
+  /**
+   * Play an audio file through a bot's voice connection.
+   * Supports: WAV, MP3, OGG, AIFF, and raw PCM (s16le 48kHz mono).
+   */
+  async function playAudio(filePath, botName = 'mechanicus') {
+    const state = getBotState(botName);
+    if (!state.connection) {
+      throw new Error(`Bot '${botName}' not connected to a voice channel`);
+    }
+
+    if (!existsSync(filePath)) {
+      throw new Error(`Audio file not found: ${filePath}`);
+    }
+
+    const player = getOrCreatePlayer(botName);
+
+    // Subscribe the connection to this player (idempotent)
+    state.connection.subscribe(player);
+
+    // Determine input type from extension
+    const ext = filePath.split('.').pop().toLowerCase();
+    let resource;
+
+    if (ext === 'pcm') {
+      // Raw PCM: s16le 48kHz mono — wrap in ffmpeg to produce Opus
+      resource = createAudioResource(filePath, {
+        inputType: StreamType.Raw,
+      });
+    } else {
+      // WAV, MP3, OGG, AIFF — discord.js/voice handles via ffmpeg
+      resource = createAudioResource(filePath);
+    }
+
+    // Wait for completion
+    return new Promise((resolve, reject) => {
+      const onIdle = () => {
+        cleanup();
+        resolve({ played: true, file: filePath, botName });
+      };
+      const onError = (err) => {
+        cleanup();
+        reject(err);
+      };
+      function cleanup() {
+        player.removeListener(AudioPlayerStatus.Idle, onIdle);
+        player.removeListener('error', onError);
+      }
+
+      player.on(AudioPlayerStatus.Idle, onIdle);
+      player.on('error', onError);
+      player.play(resource);
+
+      logger.info(`Voice [${botName}]: playing ${filePath}`);
+    });
+  }
+
+  function stopPlayback(botName = 'mechanicus') {
+    const state = getBotState(botName);
+    if (!state.player) return { stopped: false, reason: 'no player' };
+    state.player.stop(true);
+    state.playing = false;
+    logger.info(`Voice [${botName}]: playback stopped`);
+    return { stopped: true, botName };
+  }
+
+  /**
+   * Generate TTS audio via macOS `say` and play through Discord voice.
+   * Creates a temporary AIFF file, plays it, then cleans up.
+   */
+  async function playTTS(message, botName = 'mechanicus', opts = {}) {
+    const state = getBotState(botName);
+    if (!state.connection) {
+      throw new Error(`Bot '${botName}' not connected to a voice channel`);
+    }
+
+    const voice = opts.voice || 'Daniel';
+    const rate = opts.rate || 190;
+    const timestamp = Date.now();
+    const outFile = join(AUDIO_DIR, `tts-${botName}-${timestamp}.aiff`);
+
+    // Generate TTS to file using macOS say
+    try {
+      await execFileAsync('say', [
+        '-v', voice,
+        '-r', String(rate),
+        '-o', outFile,
+        message,
+      ], { timeout: 30_000 });
+    } catch (err) {
+      throw new Error(`TTS generation failed: ${err.message}`);
+    }
+
+    logger.info(`Voice [${botName}]: TTS generated ${outFile} (${message.length} chars, voice=${voice})`);
+
+    // Play the generated file
+    try {
+      const result = await playAudio(outFile, botName);
+      // Clean up temp file after playback
+      try { unlinkSync(outFile); } catch {}
+      return { ...result, tts: true, voice, message: message.slice(0, 80) };
+    } catch (err) {
+      // Clean up on error too
+      try { unlinkSync(outFile); } catch {}
+      throw err;
+    }
+  }
+
   return {
     joinChannel,
     leaveChannel,
@@ -405,6 +545,9 @@ export function createVoiceManager(botClients, config, logger) {
     stopRecording,
     getStatus,
     setupAutoJoin,
+    playAudio,
+    stopPlayback,
+    playTTS,
     setTranscriptionCallback(cb) { onTranscription = cb; },
   };
 }

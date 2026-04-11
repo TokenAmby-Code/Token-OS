@@ -293,7 +293,7 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         const guild = await discordClient.client.guilds.fetch(config.guild_id);
         const opts = {
           name: body.name,
-          type: 0, // GuildText
+          type: body.type ?? 0, // 0 = GuildText, 2 = GuildVoice
         };
         if (body.topic) opts.topic = body.topic;
         if (body.parent_id) opts.parent = body.parent_id;
@@ -426,6 +426,35 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
         const query = parseQuery(req.url);
         return json(res, voiceManager.getStatus(query.bot));
+      }
+
+      // POST /voice/play — Play an audio file in voice channel
+      if (method === 'POST' && path === '/voice/play') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        if (!body.file) return json(res, { error: 'file path required' }, 400);
+        const result = await voiceManager.playAudio(body.file, body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // POST /voice/stop-playback — Stop current audio playback
+      if (method === 'POST' && path === '/voice/stop-playback') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = voiceManager.stopPlayback(body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
+      // POST /voice/tts — Generate TTS to file and play in voice channel
+      if (method === 'POST' && path === '/voice/tts') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        if (!body.message) return json(res, { error: 'message required' }, 400);
+        const result = await voiceManager.playTTS(body.message, body.bot || 'mechanicus', {
+          voice: body.voice,
+          rate: body.rate,
+        });
+        return json(res, result);
       }
 
       // 404
