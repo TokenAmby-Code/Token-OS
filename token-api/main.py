@@ -2829,31 +2829,20 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
-    # Sync instances get a concise heartbeat — they already have full context.
-    # Golden Throne instances get the full SOP (Custodes protocol, etc.)
+    # SOP selection: custom per-instance override, then default.
+    # (Sync retrigger path removed — sync instances now self-evaluate via StopValidate.)
     instance_type = instance.get("instance_type", "one_off")
-    if instance_type == "sync":
-        sop_prompt = (
-            "Sync retrigger: you stopped unexpectedly. "
-            "Read session doc, validate any in-flight work. "
-            "ESCALATE: send a Discord message or TTS notification to alert the Emperor. "
-            "If escalation fails and you cannot recover, kill this session via tmux prefix+Q. "
-            "Do NOT just re-enter a failing AskUserQuestion loop — that causes Sisyphus retrigger storms."
-        )
-        logger.info(f"Golden Throne: sync retrigger for {session_id[:12]} — concise heartbeat")
-    else:
-        # Custom SOP: instance-level override, then default
-        custom_sop_path = instance.get("follow_up_sop")
-        if custom_sop_path:
-            expanded = Path(custom_sop_path).expanduser()
-            if expanded.exists():
-                sop_prompt = expanded.read_text()
-                logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
-            else:
-                logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
-                sop_prompt = _load_golden_throne_sop()
+    custom_sop_path = instance.get("follow_up_sop")
+    if custom_sop_path:
+        expanded = Path(custom_sop_path).expanduser()
+        if expanded.exists():
+            sop_prompt = expanded.read_text()
+            logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
         else:
+            logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
+    else:
+        sop_prompt = _load_golden_throne_sop()
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
