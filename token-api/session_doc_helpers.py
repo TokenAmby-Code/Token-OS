@@ -1,14 +1,21 @@
 """Session doc frontmatter read/write utility.
 
-Parses YAML between --- fences, updates fields without clobbering body content.
-Uses PyYAML for robust parsing/serialization, handles arrays, nulls, and
-multiline strings correctly.
+Hybrid approach:
+- Batch frontmatter mutations use PyYAML (parse, update N fields, write once)
+- Single-property ops and note read/append/create use the obsidian CLI
+
+All Obsidian note interactions should go through this module.
 """
 
+import asyncio
+import logging
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class _ObsidianDumper(yaml.SafeDumper):
@@ -94,14 +101,26 @@ def serialize_frontmatter(fm: dict[str, Any], body: str) -> str:
     return f"---\n{yaml_str}\n---\n{body}"
 
 
-def update_frontmatter(file_path: Path, updates: dict[str, Any]) -> dict[str, Any]:
+def update_frontmatter(
+    file_path: Path,
+    updates: dict[str, Any],
+    delete_keys: Optional[list[str]] = None,
+) -> dict[str, Any]:
     """Read a session doc, merge updates into frontmatter, write back.
+
+    Args:
+        file_path: Path to the markdown file.
+        updates: Key-value pairs to set/overwrite in frontmatter.
+        delete_keys: Keys to remove from frontmatter (applied after updates).
 
     Returns the updated frontmatter dict.
     Raises FileNotFoundError if the file doesn't exist.
     """
     fm, body = read_frontmatter(file_path)
     fm.update(updates)
+    if delete_keys:
+        for key in delete_keys:
+            fm.pop(key, None)
     new_content = serialize_frontmatter(fm, body)
     file_path.write_text(new_content, encoding="utf-8")
     return fm
@@ -154,3 +173,113 @@ def update_victory_frontmatter(
     new_content = serialize_frontmatter(fm, body)
     file_path.write_text(new_content, encoding="utf-8")
     return fm
+
+
+# ============ Obsidian CLI Wrappers ============
+# For single-property ops, note reads, appends, creates — thin wrappers
+# around the obsidian CLI. These shell out to the CLI which handles
+# cross-platform differences (WSL proxies to Obsidian.exe, macOS uses filesystem).
+
+
+def _obsidian_cmd(vault: str, command: str, **kwargs) -> list[str]:
+    """Build an obsidian CLI command list."""
+    cmd = ["obsidian", f"vault={vault}", command]
+    for key, value in kwargs.items():
+        cmd.append(f'{key}={value}')
+    return cmd
+
+
+def obsidian_property_set(vault: str, path: str, prop: str, value: str) -> bool:
+    """Set a single frontmatter property via the obsidian CLI (sync)."""
+    try:
+        result = subprocess.run(
+            _obsidian_cmd(vault, "property:set", path=path, property=prop, value=value),
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.warning(f"obsidian property:set failed: {e}")
+        return False
+
+
+def obsidian_property_read(vault: str, path: str, prop: str) -> Optional[str]:
+    """Read a single frontmatter property via the obsidian CLI (sync)."""
+    try:
+        result = subprocess.run(
+            _obsidian_cmd(vault, "property:read", path=path, property=prop),
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+    except Exception as e:
+        logger.warning(f"obsidian property:read failed: {e}")
+        return None
+
+
+def obsidian_read(vault: str, path: str) -> Optional[str]:
+    """Read a note's full content via the obsidian CLI (sync)."""
+    try:
+        result = subprocess.run(
+            _obsidian_cmd(vault, "read", path=path),
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return None
+    except Exception as e:
+        logger.warning(f"obsidian read failed: {e}")
+        return None
+
+
+def obsidian_append(vault: str, path: str, content: str) -> bool:
+    """Append content to a note's body via the obsidian CLI (sync)."""
+    try:
+        result = subprocess.run(
+            _obsidian_cmd(vault, "append", path=path, content=content),
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.warning(f"obsidian append failed: {e}")
+        return False
+
+
+def obsidian_create(vault: str, path: str, content: str) -> bool:
+    """Create a new note via the obsidian CLI (sync). Returns False if it already exists."""
+    try:
+        result = subprocess.run(
+            _obsidian_cmd(vault, "create", path=path, content=content),
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.warning(f"obsidian create failed: {e}")
+        return False
+
+
+# Async variants — run CLI calls off the event loop
+
+async def async_obsidian_property_set(vault: str, path: str, prop: str, value: str) -> bool:
+    """Set a single frontmatter property via obsidian CLI (async)."""
+    return await asyncio.to_thread(obsidian_property_set, vault, path, prop, value)
+
+
+async def async_obsidian_property_read(vault: str, path: str, prop: str) -> Optional[str]:
+    """Read a single frontmatter property via obsidian CLI (async)."""
+    return await asyncio.to_thread(obsidian_property_read, vault, path, prop)
+
+
+async def async_obsidian_read(vault: str, path: str) -> Optional[str]:
+    """Read a note's full content via obsidian CLI (async)."""
+    return await asyncio.to_thread(obsidian_read, vault, path)
+
+
+async def async_obsidian_append(vault: str, path: str, content: str) -> bool:
+    """Append content to a note body via obsidian CLI (async)."""
+    return await asyncio.to_thread(obsidian_append, vault, path, content)
+
+
+async def async_obsidian_create(vault: str, path: str, content: str) -> bool:
+    """Create a new note via obsidian CLI (async)."""
+    return await asyncio.to_thread(obsidian_create, vault, path, content)

@@ -38,7 +38,7 @@ import tempfile
 import requests
 import httpx
 from pydantic import BaseModel, Field
-from session_doc_helpers import update_victory_frontmatter
+from session_doc_helpers import update_frontmatter, update_victory_frontmatter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.interval import IntervalTrigger
@@ -3761,12 +3761,10 @@ def _write_productivity_score(date_str: str, score: int):
             print(f"TIMER: No daily note for {date_str}, skipping score write")
             return
 
-        content = note_path.read_text(encoding="utf-8")
-        updated = _merge_frontmatter(content, {
+        update_frontmatter(note_path, {
             "productivity_score": score,
             "timer_completed": True,
         })
-        note_path.write_text(updated, encoding="utf-8")
         print(f"TIMER: Wrote productivity score {score} to {date_str}")
     except Exception as e:
         print(f"TIMER: Failed to write productivity score: {e}")
@@ -3952,88 +3950,36 @@ def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
         logger.warning(f"Daily note not found: {note_path}")
         return False
 
-    try:
-        content = note_path.read_text(encoding="utf-8")
-    except Exception as e:
-        logger.error(f"Failed to read daily note: {e}")
-        return False
-
-    # Parse frontmatter (between --- delimiters)
-    if not content.startswith("---"):
-        logger.warning("Daily note has no frontmatter")
-        return False
-
-    end_idx = content.index("---", 3)
-    frontmatter = content[3:end_idx].strip()
-    body = content[end_idx:]  # includes closing ---
-
     # Build new fields from check-in data
     config = CHECKIN_SCHEDULE.get(checkin_type, {})
     time_suffix = config.get("time_suffix", "")
 
-    new_fields = {}
+    updates = {}
     if data.get("energy") is not None and time_suffix:
-        new_fields[f"energy_{time_suffix}"] = data["energy"]
+        updates[f"energy_{time_suffix}"] = data["energy"]
     if data.get("focus") is not None and time_suffix:
-        new_fields[f"focus_{time_suffix}"] = data["focus"]
+        updates[f"focus_{time_suffix}"] = data["focus"]
     if data.get("mood") is not None and time_suffix:
-        new_fields[f"mood_{time_suffix}"] = data["mood"]
+        updates[f"mood_{time_suffix}"] = data["mood"]
     if data.get("plan") is not None and time_suffix:
-        new_fields[f"checkin_plan_{time_suffix}"] = data["plan"]
+        updates[f"checkin_plan_{time_suffix}"] = data["plan"]
     if data.get("notes") is not None and time_suffix:
-        new_fields[f"checkin_notes_{time_suffix}"] = f'"{data["notes"]}"'
+        updates[f"checkin_notes_{time_suffix}"] = data["notes"]
 
-    if not new_fields:
+    if not updates:
         return False
 
-    # Parse existing frontmatter lines into ordered dict
-    lines = frontmatter.split("\n")
-    fm_lines = []
-    existing_keys = set()
-    for line in lines:
-        if ":" in line:
-            key = line.split(":", 1)[0].strip()
-            existing_keys.add(key)
-        fm_lines.append(line)
-
-    # Update existing keys or append new ones
-    for key, value in new_fields.items():
-        field_line = f"{key}: {value}"
-        if key in existing_keys:
-            # Replace existing line
-            for i, line in enumerate(fm_lines):
-                if line.startswith(f"{key}:"):
-                    fm_lines[i] = field_line
-                    break
-        else:
-            fm_lines.append(field_line)
-
     # Also update top-level energy/focus/mood to latest value (for meta-bind widgets)
-    top_level_updates = {}
     if data.get("energy") is not None:
-        top_level_updates["energy"] = data["energy"]
+        updates["energy"] = data["energy"]
     if data.get("focus") is not None:
-        top_level_updates["focus"] = data["focus"]
+        updates["focus"] = data["focus"]
     if data.get("mood") is not None:
-        top_level_updates["mood"] = data["mood"]
-
-    for key, value in top_level_updates.items():
-        field_line = f"{key}: {value}"
-        if key in existing_keys:
-            for i, line in enumerate(fm_lines):
-                if line.startswith(f"{key}:"):
-                    fm_lines[i] = field_line
-                    break
-        else:
-            fm_lines.append(field_line)
-
-    # Reconstruct file
-    new_frontmatter = "\n".join(fm_lines)
-    new_content = f"---\n{new_frontmatter}\n{body}"
+        updates["mood"] = data["mood"]
 
     try:
-        note_path.write_text(new_content, encoding="utf-8")
-        logger.info(f"Updated daily note frontmatter: {list(new_fields.keys())}")
+        update_frontmatter(note_path, updates)
+        logger.info(f"Updated daily note frontmatter: {list(updates.keys())}")
         return True
     except Exception as e:
         logger.error(f"Failed to write daily note: {e}")
@@ -4592,8 +4538,7 @@ def _sync_generate_daily_analytics(date_str: str):
     # 2. Write summary fields to daily note frontmatter
     note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
     if note_path.exists():
-        content = note_path.read_text(encoding="utf-8")
-        fm_updates = {
+        update_frontmatter(note_path, {
             "timer_total_shifts": summary["total_shifts"],
             "timer_enforcements": enforcement_count,
             "timer_twitter_shifts": twitter_shifts,
@@ -4601,9 +4546,7 @@ def _sync_generate_daily_analytics(date_str: str):
             "timer_min_break": format_timer_time(min_balance if min_balance != float("inf") else 0),
             "timer_avg_instances": summary["avg_active_instances"],
             "timer_max_instances": summary["max_active_instances"],
-        }
-        updated = _merge_frontmatter(content, fm_updates)
-        note_path.write_text(updated, encoding="utf-8")
+        })
 
     # Wipe timer_shifts table
     conn.execute("DELETE FROM timer_shifts")
@@ -4625,63 +4568,6 @@ async def generate_daily_timer_analytics(date_str: str):
     except Exception as e:
         print(f"TIMER: Failed to generate daily analytics: {e}")
 
-
-def _merge_frontmatter(content: str, updates: dict) -> str:
-    """Merge key-value pairs into a markdown file's YAML front matter."""
-    lines = content.split("\n")
-
-    # Find existing front matter boundaries
-    fm_start = -1
-    fm_end = -1
-    for i, line in enumerate(lines):
-        if line.strip() == "---":
-            if fm_start == -1:
-                fm_start = i
-            else:
-                fm_end = i
-                break
-
-    if fm_start == -1 or fm_end == -1:
-        # No front matter - create it
-        fm_lines = ["---"]
-        for key, value in updates.items():
-            fm_lines.append(f"{key}: {_format_yaml_value(value)}")
-        fm_lines.append("---")
-        return "\n".join(fm_lines) + "\n" + content
-
-    # Parse existing front matter
-    existing = {}
-    for i in range(fm_start + 1, fm_end):
-        line = lines[i]
-        if ": " in line:
-            key, _, val = line.partition(": ")
-            existing[key.strip()] = val.strip()
-
-    # Merge updates
-    existing.update({k: _format_yaml_value(v) for k, v in updates.items()})
-
-    # Rebuild
-    fm_lines = ["---"]
-    for key, value in existing.items():
-        fm_lines.append(f"{key}: {value}")
-    fm_lines.append("---")
-
-    before = lines[:fm_start]
-    after = lines[fm_end + 1:]
-    return "\n".join(before + fm_lines + after)
-
-
-def _format_yaml_value(value) -> str:
-    """Format a Python value for YAML front matter."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str) and (":" in value or " " in value):
-        return f'"{value}"'
-    return str(value)
 
 
 def _sync_update_daily_note():
@@ -4708,8 +4594,7 @@ def _sync_update_daily_note():
     except Exception:
         pass  # Silently skip if DB query fails
     
-    content = note_path.read_text(encoding="utf-8")
-    updates = {
+    update_frontmatter(note_path, {
         "timer_status": timer_engine.current_mode.value,
         "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
         "timer_break_earned": format_timer_time(
@@ -4721,9 +4606,7 @@ def _sync_update_daily_note():
         "timer_sessions": session_count,
         "timer_mode_changes": mode_change_count,
         "last_timer_update": datetime.now().strftime("%H:%M:%S"),
-    }
-    updated = _merge_frontmatter(content, updates)
-    note_path.write_text(updated, encoding="utf-8")
+    })
 
 
 async def timer_update_daily_note():
@@ -10967,58 +10850,15 @@ async def _update_doc_agents_list(db, doc_id: int) -> None:
 
     primarch_name = doc_row[1]
 
-    content = fp.read_text()
-    # Update agents list
-    content = re.sub(
-        r'^agents:.*$',
-        f'agents: [{", ".join(agents)}]',
-        content,
-        count=1,
-        flags=re.MULTILINE
-    )
-    # Update instance_ids
-    ids_str = ", ".join(instance_ids)
-    if re.search(r'^instance_ids:.*$', content, re.MULTILINE):
-        content = re.sub(
-            r'^instance_ids:.*$',
-            f'instance_ids: [{ids_str}]',
-            content,
-            count=1,
-            flags=re.MULTILINE
-        )
-    else:
-        # Insert after agents line
-        content = re.sub(
-            r'^(agents:.*$)',
-            f'\\1\ninstance_ids: [{ids_str}]',
-            content,
-            count=1,
-            flags=re.MULTILINE
-        )
-    # Update primarch
+    updates = {
+        "agents": agents,
+        "instance_ids": instance_ids,
+    }
     if primarch_name:
-        if re.search(r'^primarch:.*$', content, re.MULTILINE):
-            content = re.sub(
-                r'^primarch:.*$',
-                f'primarch: {primarch_name}',
-                content,
-                count=1,
-                flags=re.MULTILINE
-            )
-        else:
-            # Insert after instance_ids line
-            content = re.sub(
-                r'^(instance_ids:.*$)',
-                f'\\1\nprimarch: {primarch_name}',
-                content,
-                count=1,
-                flags=re.MULTILINE
-            )
-    else:
-        # Remove primarch line if no primarch
-        content = re.sub(r'^primarch:.*\n', '', content, count=1, flags=re.MULTILINE)
+        updates["primarch"] = primarch_name
+    delete_keys = ["primarch"] if not primarch_name else None
 
-    fp.write_text(content)
+    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
 
 
 async def _handle_orphan_doc(doc_id: int) -> None:
