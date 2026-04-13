@@ -32,6 +32,7 @@ from shared import (
     log_event,
 )
 from routes.tts import queue_tts, play_sound
+from session_doc_helpers import update_frontmatter, read_frontmatter
 
 logger = logging.getLogger("token_api")
 
@@ -96,7 +97,7 @@ _LEGION_BOT_MAP = {
 }
 
 
-# ============ Session Doc Frontmatter Helpers ============
+# ============ Session Doc Pool Derivation ============
 
 def _derive_pool(working_dir: str | None) -> str:
     """Derive pool from working directory: civic/pax dirs → pk, everything else → personal."""
@@ -106,61 +107,6 @@ def _derive_pool(working_dir: str | None) -> str:
     if any(tok in wd_lower for tok in ("pax-env", "askcivic", "/civic/", "/pax/")):
         return "pk"
     return "personal"
-
-
-def _update_session_doc_frontmatter(file_path: str | Path, updates: dict) -> bool:
-    """Update YAML frontmatter fields in a session doc markdown file.
-
-    Args:
-        file_path: Path to the session doc markdown file.
-        updates: Dict of {field_name: value} to set in the frontmatter.
-
-    Returns:
-        True if file was updated, False otherwise.
-    """
-    fp = Path(file_path)
-    if not fp.exists():
-        return False
-
-    content = fp.read_text()
-    # Must have YAML frontmatter delimiters
-    if not content.startswith("---"):
-        return False
-
-    end_idx = content.index("---", 3) if "---" in content[3:] else -1
-    if end_idx == -1:
-        return False
-
-    frontmatter = content[3:end_idx]
-    body = content[end_idx:]
-
-    for field, value in updates.items():
-        # Format the value for YAML
-        if value is None:
-            yaml_val = "null"
-        elif isinstance(value, bool):
-            yaml_val = "true" if value else "false"
-        elif isinstance(value, (int, float)):
-            yaml_val = str(value)
-        elif isinstance(value, list):
-            if not value:
-                yaml_val = "[]"
-            else:
-                yaml_val = "[" + ", ".join(json.dumps(v) for v in value) + "]"
-        else:
-            yaml_val = str(value)
-
-        # Try to replace existing field
-        pattern = rf'^{re.escape(field)}:.*$'
-        new_line = f"{field}: {yaml_val}"
-        if re.search(pattern, frontmatter, re.MULTILINE):
-            frontmatter = re.sub(pattern, new_line, frontmatter, count=1, flags=re.MULTILINE)
-        else:
-            # Append before end of frontmatter
-            frontmatter = frontmatter.rstrip("\n") + f"\n{new_line}\n"
-
-    fp.write_text("---" + frontmatter + body)
-    return True
 
 
 # ============ Claude Code Hook Handlers ============
@@ -578,14 +524,16 @@ async def handle_session_start(payload: dict) -> dict:
             )
             doc_row = await cursor.fetchone()
             if doc_row and doc_row[0]:
-                start_time = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                pool = _derive_pool(working_dir)
-                fm_updates = {"start_time": start_time, "pool": pool}
-                if auto_legion:
-                    fm_updates["legion"] = auto_legion
-                if primarch_name:
-                    fm_updates["primarch"] = primarch_name
-                _update_session_doc_frontmatter(doc_row[0], fm_updates)
+                fp = Path(doc_row[0])
+                if fp.exists():
+                    start_time = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    pool = _derive_pool(working_dir)
+                    fm_updates = {"start_time": start_time, "pool": pool}
+                    if auto_legion:
+                        fm_updates["legion"] = auto_legion
+                    if primarch_name:
+                        fm_updates["primarch"] = primarch_name
+                    await asyncio.to_thread(update_frontmatter, fp, fm_updates)
 
     logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}{f' [legion:{auto_legion}]' if auto_legion else ''}")
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
@@ -634,22 +582,21 @@ async def handle_session_end(payload: dict) -> dict:
             )
             doc_row = await cursor.fetchone()
             if doc_row and doc_row[0]:
-                end_time = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                # Read start_time from frontmatter to compute duration
-                duration_minutes = None
-                try:
-                    doc_content = Path(doc_row[0]).read_text()
-                    start_match = re.search(r'^start_time:\s*(\S+)', doc_content, re.MULTILINE)
-                    if start_match and start_match.group(1) != "null":
-                        start_dt = datetime.fromisoformat(start_match.group(1).replace("Z", "+00:00"))
-                        end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-                        duration_minutes = round((end_dt - start_dt).total_seconds() / 60)
-                except Exception:
-                    pass
-                fm_updates = {"end_time": end_time}
-                if duration_minutes is not None:
-                    fm_updates["duration_minutes"] = duration_minutes
-                _update_session_doc_frontmatter(doc_row[0], fm_updates)
+                fp = Path(doc_row[0])
+                if fp.exists():
+                    end_time = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    fm_updates = {"end_time": end_time}
+                    # Read start_time to compute duration
+                    try:
+                        fm, _ = read_frontmatter(fp)
+                        start_time = fm.get("start_time")
+                        if start_time and start_time != "null":
+                            start_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                            fm_updates["duration_minutes"] = round((end_dt - start_dt).total_seconds() / 60)
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(update_frontmatter, fp, fm_updates)
 
         # Count non-subagent active instances BEFORE stopping
         cursor = await db.execute(
