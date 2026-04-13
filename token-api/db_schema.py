@@ -391,6 +391,111 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
 
+        # ── Legion Pane Recolor System ──────────────────────────────
+        # Queue table: background processor reads this and applies tmux pane colors.
+        # SQLite trigger fires on ANY legion column update, catching all entry points.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pane_recolor_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                legion TEXT NOT NULL,
+                tmux_pane TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Trigger: whenever legion changes on an instance, queue a recolor
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_legion_recolor
+            AFTER UPDATE OF legion ON claude_instances
+            WHEN OLD.legion IS NOT NEW.legion
+               OR (OLD.legion IS NULL AND NEW.legion IS NOT NULL)
+            BEGIN
+                INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane)
+                VALUES (NEW.id, NEW.legion, NEW.tmux_pane);
+            END
+        """)
+
+        # ── Pane State Queue (@CC_STATE) ──
+        # Trigger-driven pane variable updates. Any status change on claude_instances
+        # queues a tmux set-option, so @CC_STATE stays in sync without caller cooperation.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pane_state_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                variable TEXT NOT NULL,
+                value TEXT NOT NULL,
+                tmux_pane TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_status_pane_state
+            AFTER UPDATE OF status ON claude_instances
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                VALUES (NEW.id, '@CC_STATE', NEW.status, NEW.tmux_pane);
+            END
+        """)
+
+        # ── Session Doc Sync Queue ──
+        # Trigger-driven session doc frontmatter updates. Fires on status change,
+        # tab rename, doc link, and doc unlink — keeps agents: list coherent.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_doc_sync_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id INTEGER NOT NULL,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # When status changes on an instance with a session doc, queue sync
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_status
+            AFTER UPDATE OF status ON claude_instances
+            WHEN OLD.status IS NOT NEW.status AND NEW.session_doc_id IS NOT NULL
+            BEGIN
+                INSERT INTO session_doc_sync_queue (doc_id, reason)
+                VALUES (NEW.session_doc_id, 'status_changed');
+            END
+        """)
+
+        # When tab_name changes, queue sync
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_rename
+            AFTER UPDATE OF tab_name ON claude_instances
+            WHEN OLD.tab_name IS NOT NEW.tab_name AND NEW.session_doc_id IS NOT NULL
+            BEGIN
+                INSERT INTO session_doc_sync_queue (doc_id, reason)
+                VALUES (NEW.session_doc_id, 'tab_renamed');
+            END
+        """)
+
+        # When session_doc_id is set on an instance, queue sync for the new doc
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_linked
+            AFTER UPDATE OF session_doc_id ON claude_instances
+            WHEN NEW.session_doc_id IS NOT NULL AND (OLD.session_doc_id IS NULL OR OLD.session_doc_id != NEW.session_doc_id)
+            BEGIN
+                INSERT INTO session_doc_sync_queue (doc_id, reason)
+                VALUES (NEW.session_doc_id, 'doc_linked');
+            END
+        """)
+
+        # When session_doc_id is cleared, queue sync for the OLD doc
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_unlinked
+            AFTER UPDATE OF session_doc_id ON claude_instances
+            WHEN OLD.session_doc_id IS NOT NULL AND (NEW.session_doc_id IS NULL OR OLD.session_doc_id != NEW.session_doc_id)
+            BEGIN
+                INSERT INTO session_doc_sync_queue (doc_id, reason)
+                VALUES (OLD.session_doc_id, 'doc_unlinked');
+            END
+        """)
+
         device_seed = [
             ("Mac-Mini", "Mac Mini", "local", "100.95.109.23", "tts_sound", None, "macos_say"),
             ("desktop", "Desktop", "local", "100.66.10.74", "tts_sound", None, "windows_sapi"),

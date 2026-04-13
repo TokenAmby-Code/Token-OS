@@ -40,8 +40,8 @@ if [[ "$SUBAGENT_TYPE" == "Explore" ]]; then
   exit 0
 fi
 
-# --- Also allow claude-code-guide, statusline-setup (lightweight built-in types) ---
-if [[ "$SUBAGENT_TYPE" == "claude-code-guide" || "$SUBAGENT_TYPE" == "statusline-setup" ]]; then
+# --- Also allow Plan, claude-code-guide, statusline-setup (lightweight built-in types) ---
+if [[ "$SUBAGENT_TYPE" == "Plan" || "$SUBAGENT_TYPE" == "claude-code-guide" || "$SUBAGENT_TYPE" == "statusline-setup" ]]; then
   log "ALLOW ${SUBAGENT_TYPE} agent: ${AGENT_DESC}"
   exit 0
 fi

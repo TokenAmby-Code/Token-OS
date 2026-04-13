@@ -202,6 +202,17 @@ DEVICE_IPS = {
 # [MOVED to shared.py / routes/tts.py] — was: # Voice pool: foreign-accent voices are the primar
 
 
+# ── Legion Pane Recolor ──────────────────────────────────────
+# Dark-tinted tmux backgrounds per legion. Subtle but unmistakable.
+# "default" means no custom bg (reset to terminal default).
+LEGION_PANE_COLORS = {
+    "custodes":   "#302800",   # dark gold
+    "mechanicus": "#300808",   # dark red
+    "civic":      "#083010",   # dark green
+    "astartes":   "default",   # no tint (default legion)
+}
+
+
 # Scheduler instance — dual job stores:
 #   'default' = in-memory (cron engine jobs with unpicklable bound methods)
 #   'golden_throne' = SQLite-persisted (restart-safe date-trigger follow-ups)
@@ -1383,6 +1394,15 @@ async def lifespan(app: FastAPI):
     # Start phone heartbeat monitor
     asyncio.create_task(phone_heartbeat_worker())
     print("Phone heartbeat monitor started")
+    # Start legion pane recolor worker
+    asyncio.create_task(legion_pane_recolor_worker())
+    print("Legion pane recolor worker started")
+    # Start pane state worker (@CC_STATE)
+    asyncio.create_task(pane_state_worker())
+    print("Pane state worker started")
+    # Start session doc sync worker
+    asyncio.create_task(session_doc_sync_worker())
+    print("Session doc sync worker started")
     await run_overdue_tasks()
     yield
 
@@ -8013,6 +8033,167 @@ async def enforce_break_exhausted_impl() -> dict:
     }
 
 
+async def legion_pane_recolor_worker():
+    """Background worker that processes the pane_recolor_queue table.
+
+    The SQLite trigger `trg_legion_recolor` fires on any UPDATE to the legion
+    column, inserting a row here. This worker polls every second, reads pending
+    recolors, and applies `tmux select-pane -P 'bg=...'` to each pane.
+    Catches ALL legion change entry points without caller cooperation.
+    """
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id, instance_id, legion, tmux_pane FROM pane_recolor_queue ORDER BY id"
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(1)
+                    continue
+
+                processed_ids = []
+                for row in rows:
+                    queue_id = row["id"]
+                    instance_id = row["instance_id"]
+                    legion = row["legion"] or "astartes"
+                    tmux_pane = row["tmux_pane"]
+
+                    # If trigger didn't capture tmux_pane, look it up
+                    if not tmux_pane:
+                        cur2 = await db.execute(
+                            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                            (instance_id,)
+                        )
+                        pane_row = await cur2.fetchone()
+                        tmux_pane = pane_row["tmux_pane"] if pane_row else None
+
+                    if tmux_pane:
+                        bg = LEGION_PANE_COLORS.get(legion, "default")
+                        try:
+                            if bg == "default":
+                                cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", "bg=default"]
+                            else:
+                                cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", f"bg={bg}"]
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await proc.wait()
+                            logger.info(f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})")
+                        except Exception as e:
+                            logger.warning(f"Legion recolor failed for {tmux_pane}: {e}")
+
+                    processed_ids.append(queue_id)
+
+                # Clear processed entries
+                if processed_ids:
+                    placeholders = ",".join("?" * len(processed_ids))
+                    await db.execute(
+                        f"DELETE FROM pane_recolor_queue WHERE id IN ({placeholders})",
+                        processed_ids,
+                    )
+                    await db.commit()
+
+        except Exception as e:
+            logger.error(f"Legion recolor worker error: {e}")
+
+        await asyncio.sleep(1)
+
+
+async def pane_state_worker():
+    """Process pane_state_queue — push tmux pane variables (@CC_STATE etc).
+
+    The SQLite trigger `trg_status_pane_state` fires on any UPDATE to the status
+    column, inserting a row here. This worker polls every second, reads pending
+    state changes, and applies `tmux set-option -p` to each pane.
+    """
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id, instance_id, variable, value, tmux_pane FROM pane_state_queue ORDER BY id"
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(1)
+                    continue
+
+                processed = []
+                for row in rows:
+                    pane = row["tmux_pane"]
+                    if not pane:
+                        cur2 = await db.execute(
+                            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (row["instance_id"],)
+                        )
+                        r = await cur2.fetchone()
+                        pane = r["tmux_pane"] if r else None
+                    if pane:
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                "tmux", "set-option", "-p", "-t", pane, row["variable"], row["value"],
+                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await proc.wait()
+                            logger.info(f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})")
+                        except Exception as e:
+                            logger.warning(f"Pane state set failed for {pane}: {e}")
+                    processed.append(row["id"])
+
+                if processed:
+                    ph = ",".join("?" * len(processed))
+                    await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
+                    await db.commit()
+        except Exception as e:
+            logger.error(f"Pane state worker error: {e}")
+        await asyncio.sleep(1)
+
+
+async def session_doc_sync_worker():
+    """Process session_doc_sync_queue — update frontmatter when DB state changes.
+
+    SQLite triggers fire on status change, tab rename, doc link, and doc unlink,
+    inserting rows here. This worker deduplicates by doc_id per batch and calls
+    _update_doc_agents_list() to sync the agents: list in the session doc.
+    """
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id, doc_id, reason FROM session_doc_sync_queue ORDER BY id"
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(2)
+                    continue
+
+                # Deduplicate: only process each doc_id once per batch
+                seen_docs = set()
+                processed = []
+                for row in rows:
+                    doc_id = row["doc_id"]
+                    processed.append(row["id"])
+                    if doc_id not in seen_docs:
+                        seen_docs.add(doc_id)
+                        try:
+                            await _update_doc_agents_list(db, doc_id)
+                            logger.info(f"Doc sync: doc {doc_id} updated (reason: {row['reason']})")
+                        except Exception as e:
+                            logger.warning(f"Doc sync failed for doc {doc_id}: {e}")
+
+                if processed:
+                    ph = ",".join("?" * len(processed))
+                    await db.execute(f"DELETE FROM session_doc_sync_queue WHERE id IN ({ph})", processed)
+                    await db.commit()
+        except Exception as e:
+            logger.error(f"Session doc sync worker error: {e}")
+        await asyncio.sleep(2)
+
+
 async def clear_stale_processing_flags():
     """Background worker that auto-clears status='processing' for instances inactive > 5 minutes."""
     while True:
@@ -8738,6 +8919,45 @@ def _format_discord_injection(channel_name: str, content: str) -> str:
     return f"[Emperor via Discord #{channel_name}]: {clean}"
 
 
+async def _discord_voice_error(legion: str, transcript: str):
+    """Send a TTS error message back through Discord voice so the operator knows they weren't heard.
+
+    No silent failures — if voice input can't route, the operator gets immediate audio feedback.
+    """
+    # Determine why injection failed
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, status, tmux_pane FROM claude_instances WHERE legion = ? ORDER BY last_activity DESC LIMIT 1",
+            (legion,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        reason = f"No {legion} instance is running."
+    elif row[1] not in ("idle", "processing"):
+        reason = f"{legion.capitalize()} instance is {row[1]}, not active."
+    elif not row[2]:
+        reason = f"{legion.capitalize()} instance has no terminal attached."
+    else:
+        reason = f"{legion.capitalize()} injection failed."
+
+    error_msg = f"Voice not received. {reason}"
+    logger.warning(f"Voice error feedback [{legion}]: {error_msg} (transcript: {transcript[:60]})")
+
+    try:
+        import requests as _req
+        import functools
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, functools.partial(
+            _req.post,
+            f"{DISCORD_DAEMON_URL}/voice/tts",
+            json={"message": error_msg, "bot": legion, "voice": "Samantha", "rate": 200},
+            timeout=30,
+        ))
+    except Exception as e:
+        logger.error(f"Voice error feedback TTS failed: {e}")
+
+
 async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
     """Try to inject a Discord message into a live instance for a legion.
 
@@ -8878,7 +9098,9 @@ async def receive_discord_message(request: DiscordMessageRequest):
         if injected:
             logger.info(f"Voice [{legion}] injected into live instance")
         else:
-            logger.info(f"Voice [{legion}] no live instance to route to (transcript logged)")
+            # No silent failures — TTS the error back through Discord so the operator knows
+            logger.warning(f"Voice [{legion}] injection failed — sending voice error feedback")
+            asyncio.create_task(_discord_voice_error(legion, request.content))
         return {"received": True, "message_id": request.message_id, "voice": True, "injected": injected}
 
     # Trigger 0: bare URL in #forge → auto-clip to vault
@@ -9387,9 +9609,10 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             vault_output = stdout.decode("utf-8", errors="replace").strip()
 
             if vault_output:
-                # Filter to Terra/Ultramar/ paths only
+                # Filter to active vault domains (exclude STC/ legacy content)
+                active_prefixes = ("Terra/", "Mars/", "Warp/", "Aspirants/")
                 for line in vault_output.splitlines():
-                    if line.startswith("Terra/Ultramar/"):
+                    if any(line.startswith(p) for p in active_prefixes):
                         raw_vault_lines.append(line)
 
                 if raw_vault_lines:
@@ -9415,7 +9638,12 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 fname = line.split(":")[0] if ":" in line else line
                 if fname not in seen:
                     seen.add(fname)
-                    note_name = fname.replace("Terra/Ultramar/", "").replace(".md", "")
+                    # Strip domain prefix for wikilink (Terra/Ultramar/Foo.md → Foo)
+                    note_name = fname.replace(".md", "")
+                    for prefix in ("Terra/Ultramar/", "Terra/Meta/", "Terra/Sessions/", "Mars/Tasks/", "Mars/Sessions/", "Mars/Fleet/", "Aspirants/"):
+                        if note_name.startswith(prefix):
+                            note_name = note_name[len(prefix):]
+                            break
                     fallback_links.append(f"- [[{note_name}]]")
             if fallback_links:
                 sections.append(f"### Similar Notes\n\n{chr(10).join(fallback_links[:5])}")
@@ -11276,9 +11504,6 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
         )
         await db.commit()
 
-        # Update agents list in the new doc
-        await _update_doc_agents_list(db, doc_id)
-
     # Handle orphan cleanup for old doc
     if old_doc_id and old_doc_id != doc_id:
         await _handle_orphan_doc(old_doc_id)
@@ -11360,9 +11585,6 @@ async def unassign_doc_from_instance(instance_id: str):
             (instance_id,)
         )
         await db.commit()
-
-        # Update agents list in the old doc
-        await _update_doc_agents_list(db, old_doc_id)
 
     # Handle orphan cleanup
     await _handle_orphan_doc(old_doc_id)

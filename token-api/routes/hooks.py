@@ -233,6 +233,15 @@ async def handle_session_start(payload: dict) -> dict:
                 )
                 await db.commit()
 
+                # Queue legion pane recolor (tmux_pane changed, trigger won't fire since legion didn't)
+                _transplant_legion = existing_row["legion"] if hasattr(existing_row, '__getitem__') and existing_row["legion"] else "astartes"
+                if _transplant_legion != "astartes" and tmux_pane:
+                    await db.execute(
+                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
+                        (session_id, _transplant_legion, tmux_pane)
+                    )
+                    await db.commit()
+
                 # Resolve preserved profile for color
                 cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
                 updated_inst = await cursor.fetchone()
@@ -311,8 +320,14 @@ async def handle_session_start(payload: dict) -> dict:
 
                 await db.commit()
 
-                if session_doc_id:
-                    await _main()._update_doc_agents_list(db, session_doc_id)
+                # Queue legion pane recolor (tmux_pane changed via supplant, trigger won't fire)
+                _supplant_legion = old_inst["legion"] if old_inst["legion"] else "astartes"
+                if _supplant_legion != "astartes" and tmux_pane:
+                    await db.execute(
+                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
+                        (session_id, _supplant_legion, tmux_pane)
+                    )
+                    await db.commit()
 
                 # Resolve cc_color from preserved profile
                 preserved_profile = old_inst["profile_name"]
@@ -564,7 +579,7 @@ async def handle_session_end(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id, tmux_pane, legion FROM claude_instances WHERE id = ?",
             (session_id,)
         )
         row = await cursor.fetchone()
@@ -574,6 +589,8 @@ async def handle_session_end(payload: dict) -> dict:
 
         is_subagent = row[2]
         session_doc_id = row[3]
+        _stop_pane = row[4]
+        _stop_legion = row[5] or "astartes"
 
         # Populate end_time and duration_minutes in session doc frontmatter
         if session_doc_id and not is_subagent:
@@ -609,6 +626,14 @@ async def handle_session_end(payload: dict) -> dict:
             "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
             (now, session_id)
         )
+
+        # Reset pane background on stop (clear legion tint so stale colors don't linger)
+        if _stop_pane and _stop_legion != "astartes":
+            await db.execute(
+                "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
+                (session_id, _stop_pane)
+            )
+
         await db.commit()
 
         # Check remaining active instances

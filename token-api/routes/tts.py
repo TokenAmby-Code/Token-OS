@@ -42,6 +42,7 @@ from shared import (
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     DESKTOP_STATE,
+    DISCORD_DAEMON_URL,
     is_satellite_tts_available,
 )
 
@@ -285,14 +286,69 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
         return {"success": False, "error": str(e)}
 
 
+def _get_discord_voice_bot() -> str | None:
+    """Check if operator is in a Discord voice channel (any bot connected = operator present).
+
+    Returns the bot name if one is connected, None otherwise. Cached for 5s.
+    """
+    now = time.time()
+    cache = _get_discord_voice_bot
+    if hasattr(cache, '_result') and now - cache._checked < 5:
+        return cache._result
+
+    try:
+        resp = requests.get(f"{DISCORD_DAEMON_URL}/voice/status", timeout=1)
+        if resp.status_code == 200:
+            statuses = resp.json()
+            for bot_name, status in statuses.items():
+                if status.get("connected"):
+                    cache._result = bot_name
+                    cache._checked = now
+                    return bot_name
+    except Exception:
+        pass
+
+    cache._result = None
+    cache._checked = now
+    return None
+
+
+def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int = 0) -> dict:
+    """Route TTS through Discord voice channel. Device-agnostic — audio plays wherever the operator is listening."""
+    mac_voice = voice or "Daniel"
+    wpm = 190 if rate == 0 else 175 + (rate * 15)
+    wpm = max(80, min(300, wpm))
+
+    try:
+        resp = requests.post(
+            f"{DISCORD_DAEMON_URL}/voice/tts",
+            json={"message": message, "bot": bot_name, "voice": mac_voice, "rate": wpm},
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("played"):
+                return {"success": True, "method": "discord_voice", "bot": bot_name, "voice": mac_voice, "message": message[:50]}
+        return {"success": False, "error": f"Discord TTS returned {resp.status_code}"}
+    except requests.Timeout:
+        return {"success": False, "error": "discord_tts_timeout"}
+    except Exception as e:
+        logger.warning(f"TTS Discord: failed ({e}), will fall through to local")
+        return {"success": False, "error": str(e)}
+
+
 def speak_tts(message: str, voice: str = None, rate: int = 0,
               instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None,
               use_file_playback: bool = False) -> dict:
-    """Route TTS to WSL satellite (preferred) or Mac fallback.
+    """Route TTS to Discord voice (if operator in VC), WSL satellite, or Mac fallback.
+
+    Priority: Discord voice > WSL satellite > Mac local.
+    Discord override is automatic — if operator is in any voice channel, TTS plays there.
+    This makes TTS device-agnostic: audio follows the listener, not the machine.
 
     Args:
         message: Text to speak
-        voice: macOS voice name (for Mac fallback)
+        voice: macOS voice name (for Mac fallback / Discord TTS voice)
         rate: Rate for Mac TTS
         instance_id: Optional instance ID for logging
         wsl_voice: Windows SAPI voice name (for WSL)
@@ -304,6 +360,14 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
 
     # Clean markdown syntax for natural TTS output
     message = clean_markdown_for_tts(message)
+
+    # Discord voice override: if operator is in a VC, route all TTS there
+    discord_bot = _get_discord_voice_bot()
+    if discord_bot:
+        result = speak_tts_discord(message, discord_bot, voice, rate)
+        if result.get("success"):
+            return result
+        logger.info(f"TTS: Discord failed ({result.get('error')}), falling back to local")
 
     # Try WSL first if voice available and satellite is up
     if wsl_voice and is_satellite_tts_available():
