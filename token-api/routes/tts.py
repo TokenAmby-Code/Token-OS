@@ -92,6 +92,15 @@ class SoundRequest(BaseModel):
 class QueueTTSRequest(BaseModel):
     instance_id: str
     message: str
+    queue_target: str = "pause"  # "hot" or "pause"
+
+
+class PromoteRequest(BaseModel):
+    instance_id: Optional[str] = None  # If set, promote that instance's items
+
+
+class PlayPaneRequest(BaseModel):
+    instance_id: str  # Promote all items from this instance to hot queue
 
 
 # ============ TTS/Notification System ============
@@ -392,11 +401,16 @@ class TTSQueueItem:
     voice: str
     sound: str
     tab_name: str
+    queue_target: str = "pause"  # "hot" or "pause"
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
+    tmux_pane: Optional[str] = None  # pane ID for @TTS_STATE tracking
 
-# Global TTS queue state
-tts_queue: Deque[TTSQueueItem] = deque()
+# Global TTS queue state — two-queue model
+# Hot queue: auto-plays immediately (VC/sync sessions, promoted items)
+# Pause queue: accumulates silently, requires explicit promote to play
+hot_queue: Deque[TTSQueueItem] = deque()
+pause_queue: Deque[TTSQueueItem] = deque()
 tts_current: Optional[TTSQueueItem] = None
 tts_current_process: Optional[subprocess.Popen] = None  # Current TTS/sound process for skip support
 tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. actual failure)
@@ -404,16 +418,40 @@ tts_queue_lock = asyncio.Lock()
 tts_worker_task: Optional[asyncio.Task] = None
 
 
+def _set_tts_state(pane_id: Optional[str], state: str):
+    """Set @TTS_STATE on a tmux pane. Fire-and-forget."""
+    if not pane_id:
+        return
+    try:
+        if state:
+            subprocess.run(
+                ["tmux", "set-option", "-p", "-t", pane_id, "@TTS_STATE", state],
+                capture_output=True, timeout=2
+            )
+        else:
+            subprocess.run(
+                ["tmux", "set-option", "-p", "-u", "-t", pane_id, "@TTS_STATE"],
+                capture_output=True, timeout=2
+            )
+    except Exception:
+        pass  # fire and forget
+
+
 async def tts_queue_worker():
-    """Background worker that processes TTS queue sequentially."""
+    """Background worker that processes TTS hot queue sequentially.
+
+    Only drains from hot_queue. Pause queue items must be promoted to hot
+    queue via /api/tts/queue/promote or /api/tts/queue/play-pane before
+    they will play.
+    """
     global tts_current
 
     while True:
         try:
-            # Wait for items in queue
+            # Wait for items in hot queue
             async with tts_queue_lock:
-                if tts_queue:
-                    tts_current = tts_queue.popleft()
+                if hot_queue:
+                    tts_current = hot_queue.popleft()
                 else:
                     tts_current = None
 
@@ -428,6 +466,9 @@ async def tts_queue_worker():
                         "tab_name": tts_current.tab_name
                     }
                 )
+
+                # Set @TTS_STATE on source pane
+                _set_tts_state(tts_current.tmux_pane, "speaking")
 
                 # Play notification sound first (run in executor to not block event loop)
                 sound_result = None
@@ -500,6 +541,8 @@ async def tts_queue_worker():
                 else:
                     logger.info(f"TTS worker: muted mode, sound only for {tts_current.instance_id}")
 
+                # Clear @TTS_STATE on source pane
+                _set_tts_state(tts_current.tmux_pane, "")
                 tts_current = None
                 await asyncio.sleep(0.5)  # Brief pause between items
             else:
@@ -519,8 +562,15 @@ def _is_quiet_hours() -> bool:
     return hour >= 23 or hour < 9
 
 
-async def queue_tts(instance_id: str, message: str) -> dict:
-    """Queue a TTS message for an instance, using their profile's voice/sound."""
+async def queue_tts(instance_id: str, message: str, queue_target: str = "pause") -> dict:
+    """Queue a TTS message for an instance, using their profile's voice/sound.
+
+    Args:
+        instance_id: The instance ID that triggered TTS.
+        message: The text to speak.
+        queue_target: "hot" for immediate playback (VC/sync sessions),
+                      "pause" for silent accumulation (default).
+    """
     # Silence TTS during quiet hours (11 PM - 9 AM)
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
@@ -535,7 +585,7 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT tab_name, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
+            "SELECT tab_name, tts_voice, notification_sound, tts_mode, tmux_pane FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
@@ -546,12 +596,15 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     voice = row["tts_voice"] or "Microsoft David"
     sound = row["notification_sound"] or "chimes.wav"
     tab_name = row["tab_name"] or instance_id
+    tmux_pane = row["tmux_pane"] if "tmux_pane" in row.keys() else None
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
-    # voice-chat behaves like verbose for TTS purposes
-    if instance_mode == "voice-chat":
+    # voice-chat forces hot queue — it's an active session
+    is_voice_chat = instance_mode == "voice-chat"
+    if is_voice_chat:
         instance_mode = "verbose"
+        queue_target = "hot"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose
     mode_rank = {"verbose": 0, "muted": 1, "silent": 2}
@@ -568,7 +621,9 @@ async def queue_tts(instance_id: str, message: str) -> dict:
             message="",  # Empty message = no speech
             voice=voice,
             sound=sound,
-            tab_name=tab_name
+            tab_name=tab_name,
+            queue_target=queue_target,
+            tmux_pane=tmux_pane,
         )
     else:
         item = TTSQueueItem(
@@ -576,12 +631,18 @@ async def queue_tts(instance_id: str, message: str) -> dict:
             message=message,
             voice=voice,
             sound=sound,
-            tab_name=tab_name
+            tab_name=tab_name,
+            queue_target=queue_target,
+            tmux_pane=tmux_pane,
         )
 
     async with tts_queue_lock:
-        tts_queue.append(item)
-        position = len(tts_queue)
+        if queue_target == "hot":
+            hot_queue.append(item)
+            position = len(hot_queue)
+        else:
+            pause_queue.append(item)
+            position = len(pause_queue)
 
     # Log queued event
     await log_event(
@@ -590,30 +651,45 @@ async def queue_tts(instance_id: str, message: str) -> dict:
         details={
             "message": message[:100],
             "voice": voice,
-            "position": position
+            "position": position,
+            "queue": queue_target,
         }
     )
+
+    # Chime notification for pause queue arrivals so user knows something landed
+    if queue_target == "pause":
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, play_sound, "chimes.wav")
+        except Exception:
+            pass
 
     return {
         "success": True,
         "queued": True,
         "position": position,
+        "queue": queue_target,
         "voice": voice,
-        "sound": sound
+        "sound": sound,
+    }
+
+
+def _queue_item_to_dict(item: TTSQueueItem) -> dict:
+    """Serialize a TTSQueueItem for API responses."""
+    return {
+        "instance_id": item.instance_id,
+        "tab_name": item.tab_name,
+        "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
+        "voice": item.voice,
+        "queue": item.queue_target,
+        "queued_at": item.queued_at.isoformat(),
     }
 
 
 def get_tts_queue_status() -> dict:
     """Get current TTS queue status for dashboard."""
-    queue_list = []
-    for item in tts_queue:
-        queue_list.append({
-            "instance_id": item.instance_id,
-            "tab_name": item.tab_name,
-            "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
-            "voice": item.voice,
-            "queued_at": item.queued_at.isoformat()
-        })
+    hot_list = [_queue_item_to_dict(item) for item in hot_queue]
+    pause_list = [_queue_item_to_dict(item) for item in pause_queue]
 
     current = None
     if tts_current:
@@ -626,8 +702,13 @@ def get_tts_queue_status() -> dict:
 
     return {
         "current": current,
-        "queue": queue_list,
-        "queue_length": len(queue_list),
+        "hot_queue": hot_list,
+        "hot_queue_length": len(hot_list),
+        "pause_queue": pause_list,
+        "pause_queue_length": len(pause_list),
+        # Backward compat: "queue" = combined, "queue_length" = total
+        "queue": hot_list + pause_list,
+        "queue_length": len(hot_list) + len(pause_list),
         "backend": TTS_BACKEND["current"],
         "satellite_available": TTS_BACKEND["satellite_available"],
         "global_mode": TTS_GLOBAL_MODE["mode"],
@@ -688,13 +769,19 @@ async def skip_tts(clear_queue: bool = False) -> dict:
 
     # else: nothing playing, no-op
 
-    # Clear queue if requested
+    # Clear both queues if requested
     if clear_queue:
         async with tts_queue_lock:
-            result["cleared"] = len(tts_queue)
-            tts_queue.clear()
-            if result["cleared"] > 0:
-                logger.info(f"Cleared {result['cleared']} items from TTS queue")
+            cleared = len(hot_queue) + len(pause_queue)
+            hot_queue.clear()
+            pause_queue.clear()
+            result["cleared"] = cleared
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} items from TTS queues (hot + pause)")
+
+    # Clear @TTS_STATE if we skipped the current item
+    if result["skipped"] and tts_current:
+        _set_tts_state(tts_current.tmux_pane, "")
 
     return result
 
@@ -902,13 +989,63 @@ async def queue_tts_message(request: QueueTTSRequest):
     Messages are played sequentially - if another TTS is playing, this will queue.
     Returns the queue position.
     """
-    return await queue_tts(request.instance_id, request.message)
+    return await queue_tts(request.instance_id, request.message, queue_target=request.queue_target)
 
 
 @router.get("/api/notify/queue/status")
 async def get_queue_status():
     """Get current TTS queue status."""
     return get_tts_queue_status()
+
+
+@router.post("/api/tts/queue/promote")
+async def promote_from_pause(request: PromoteRequest):
+    """Move item(s) from pause queue to the front of hot queue.
+
+    Body: {} → promotes the next item.
+    Body: {"instance_id": "xxx"} → promotes all items from that instance.
+    """
+    promoted = 0
+    async with tts_queue_lock:
+        if not pause_queue:
+            return {"success": True, "promoted": 0, "reason": "pause_queue_empty"}
+
+        if request.instance_id:
+            # Promote all items from this instance
+            to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
+            for item in to_promote:
+                pause_queue.remove(item)
+                item.queue_target = "hot"
+                hot_queue.appendleft(item)
+                promoted += 1
+        else:
+            # Promote the next (oldest) item
+            item = pause_queue.popleft()
+            item.queue_target = "hot"
+            hot_queue.appendleft(item)
+            promoted = 1
+
+    logger.info(f"Promoted {promoted} item(s) from pause to hot queue")
+    return {"success": True, "promoted": promoted}
+
+
+@router.post("/api/tts/queue/play-pane")
+async def play_pane(request: PlayPaneRequest):
+    """Promote all items from a specific instance to the front of hot queue.
+
+    Equivalent to promote with instance_id, provided as a convenience endpoint.
+    """
+    promoted = 0
+    async with tts_queue_lock:
+        to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
+        for item in to_promote:
+            pause_queue.remove(item)
+            item.queue_target = "hot"
+            hot_queue.appendleft(item)
+            promoted += 1
+
+    logger.info(f"play-pane: Promoted {promoted} item(s) for {request.instance_id} to hot queue")
+    return {"success": True, "promoted": promoted, "instance_id": request.instance_id}
 
 
 @router.post("/api/tts/skip")
