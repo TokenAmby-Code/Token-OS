@@ -43,7 +43,9 @@ from shared import (
     TTS_GLOBAL_MODE,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
+    VOICE_CHAT_SESSIONS,
     is_satellite_tts_available,
+    is_phone_reachable,
 )
 
 logger = logging.getLogger("token_api")
@@ -346,14 +348,52 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
         return {"success": False, "error": str(e)}
 
 
+def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
+    """Determine which device should receive TTS output.
+
+    Priority cascade:
+    1. Discord voice — if any bot is connected to a VC
+    2. Geofence — if user is away from home, phone only (skip WSL/Mac)
+    3. WSL satellite — if satellite is healthy
+    4. Phone — if reachable
+    5. Mac — last resort, local speakers
+
+    Returns:
+        {"device": "discord"|"wsl"|"phone"|"mac", "reason": str, "discord_bot": str|None}
+    """
+    # 1. Discord voice channel — operator in VC means audio goes there
+    discord_bot = _get_discord_voice_bot()
+    if discord_bot:
+        return {"device": "discord", "reason": "operator in voice channel", "discord_bot": discord_bot}
+
+    # 2. Geofence — away from home means phone-only
+    location_zone = DESKTOP_STATE.get("location_zone")
+    if location_zone is not None and location_zone != "home":
+        # User is at gym, campus, or other known zone — phone is the only option
+        if is_phone_reachable():
+            return {"device": "phone", "reason": f"geofence: {location_zone}", "discord_bot": None}
+        # Phone unreachable while away — Mac as last resort (shouldn't happen often)
+        return {"device": "mac", "reason": f"geofence: {location_zone}, phone unreachable", "discord_bot": None}
+
+    # 3. WSL satellite — best audio quality when at home
+    if wsl_voice and is_satellite_tts_available():
+        return {"device": "wsl", "reason": "satellite healthy", "discord_bot": None}
+
+    # 4. Phone — reachable as secondary home device
+    if is_phone_reachable():
+        return {"device": "phone", "reason": "wsl unavailable, phone reachable", "discord_bot": None}
+
+    # 5. Mac — local speakers as last resort
+    return {"device": "mac", "reason": "last resort, local speakers", "discord_bot": None}
+
+
 def speak_tts(message: str, voice: str = None, rate: int = 0,
               instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None,
               use_file_playback: bool = False) -> dict:
-    """Route TTS to Discord voice (if operator in VC), WSL satellite, or Mac fallback.
+    """Route TTS to the best available device via resolve_tts_device().
 
-    Priority: Discord voice > WSL satellite > Mac local.
-    Discord override is automatic — if operator is in any voice channel, TTS plays there.
-    This makes TTS device-agnostic: audio follows the listener, not the machine.
+    Dispatches to speak_tts_discord(), speak_tts_wsl(), speak_tts_mac(), or phone
+    notification based on the resolved device. Falls through on failure.
 
     Args:
         message: Text to speak
@@ -370,23 +410,45 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
     # Clean markdown syntax for natural TTS output
     message = clean_markdown_for_tts(message)
 
-    # Discord voice override: if operator is in a VC, route all TTS there
-    discord_bot = _get_discord_voice_bot()
-    if discord_bot:
-        result = speak_tts_discord(message, discord_bot, voice, rate)
+    routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
+    device = routing["device"]
+    logger.info(f"TTS: Routing to {device} ({routing['reason']})")
+
+    # Dispatch with fallthrough on failure
+    if device == "discord":
+        result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
             return result
-        logger.info(f"TTS: Discord failed ({result.get('error')}), falling back to local")
+        logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
+        # Re-resolve skipping discord — try WSL/phone/mac
+        if wsl_voice and is_satellite_tts_available():
+            result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0,
+                                   use_file_playback=use_file_playback)
+            if result.get("success"):
+                return result
+        if is_phone_reachable() and _send_to_phone:
+            result = _send_to_phone("/notify", {"tts_text": message})
+            if result.get("success"):
+                return result
+        return speak_tts_mac(message, voice, rate)
 
-    # Try WSL first if voice available and satellite is up
-    if wsl_voice and is_satellite_tts_available():
+    if device == "wsl":
         result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0,
                                use_file_playback=use_file_playback)
         if result.get("success"):
             return result
-        # Any WSL failure → fallback to Mac
         logger.info(f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})")
+        return speak_tts_mac(message, voice, rate)
 
+    if device == "phone":
+        if _send_to_phone:
+            result = _send_to_phone("/notify", {"tts_text": message})
+            if result.get("success"):
+                return result
+            logger.info(f"TTS: Phone failed ({result.get('error')}), falling back to Mac")
+        return speak_tts_mac(message, voice, rate)
+
+    # device == "mac" (or unknown)
     return speak_tts_mac(message, voice, rate)
 
 
@@ -826,6 +888,31 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
 
 
 # ============ TTS Endpoints ============
+
+@router.get("/api/tts/routing")
+async def get_tts_routing():
+    """Return the current TTS routing target and reasoning.
+
+    Useful for debugging and TUI display — shows which device would
+    receive TTS right now and why.
+    """
+    routing = resolve_tts_device()
+    location_zone = DESKTOP_STATE.get("location_zone")
+    in_meeting = DESKTOP_STATE.get("in_meeting", False)
+    global_mode = TTS_GLOBAL_MODE.get("mode", "verbose")
+
+    return {
+        "routing": routing,
+        "context": {
+            "location_zone": location_zone,
+            "in_meeting": in_meeting,
+            "global_mode": global_mode,
+            "satellite_available": is_satellite_tts_available(),
+            "phone_reachable": is_phone_reachable(),
+            "discord_vc_active": routing["device"] == "discord",
+        },
+    }
+
 
 @router.post("/api/notify")
 async def send_notification(request: NotifyRequest):
