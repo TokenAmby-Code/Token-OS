@@ -42,7 +42,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 notification_sound TEXT,
                 pid INTEGER,
                 status TEXT DEFAULT 'idle',
-                is_processing INTEGER DEFAULT 0,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 stopped_at TIMESTAMP
@@ -52,10 +51,8 @@ async def init_database_async(db_path: Path | None = None) -> None:
         cursor = await db.execute("PRAGMA table_info(claude_instances)")
         columns = {col[1] for col in await cursor.fetchall()}
         instance_migrations = [
-            ("is_processing", "ALTER TABLE claude_instances ADD COLUMN is_processing INTEGER DEFAULT 0"),
             ("working_dir", "ALTER TABLE claude_instances ADD COLUMN working_dir TEXT"),
             ("is_subagent", "ALTER TABLE claude_instances ADD COLUMN is_subagent INTEGER DEFAULT 0"),
-            ("spawner", "ALTER TABLE claude_instances ADD COLUMN spawner TEXT"),
             ("tts_mode", "ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'"),
             ("session_doc_id", "ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER"),
             ("zealotry", "ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4"),
@@ -63,7 +60,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("victory_at", "ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP"),
             ("victory_reason", "ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT"),
             ("input_lock", "ALTER TABLE claude_instances ADD COLUMN input_lock TEXT"),
-            ("primarch", "ALTER TABLE claude_instances ADD COLUMN primarch TEXT"),
             ("transplant_target_session", "ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT"),
             ("legion", "ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'"),
             ("synced", "ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0"),
@@ -71,9 +67,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
             ("instance_type", "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'"),
-            ("pane_label", "ALTER TABLE claude_instances ADD COLUMN pane_label TEXT"),
-            ("pre_stop_status", "ALTER TABLE claude_instances ADD COLUMN pre_stop_status TEXT"),
-            ("retrigger_count", "ALTER TABLE claude_instances ADD COLUMN retrigger_count INTEGER DEFAULT 0"),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -87,16 +80,11 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 ELSE 'one_off'
             END""")
 
-        cursor = await db.execute("SELECT COUNT(*) FROM claude_instances WHERE status = 'active'")
-        if (await cursor.fetchone())[0] > 0:
-            await db.execute("""
-                UPDATE claude_instances SET status = CASE
-                    WHEN status = 'active' AND is_processing = 1 THEN 'processing'
-                    WHEN status = 'active' AND is_processing = 0 THEN 'idle'
-                    ELSE status
-                END
-            """)
-            await db.commit()
+        # Drop dead columns (phase 1 DB thinning)
+        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
+        drop_targets = dead_columns & columns
+        for col in drop_targets:
+            await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")

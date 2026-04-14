@@ -77,8 +77,9 @@ from routes.hooks import (
     router as hooks_router,
     HookResponse, PreToolUseResponse,
     _post_tool_debounce, _pending_background_tasks, _recently_nudged,
-    _update_session_doc_frontmatter,
+    NUDGE_COOLDOWN_SECONDS,
 )
+from session_doc_helpers import update_frontmatter as _update_session_doc_frontmatter
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -547,18 +548,14 @@ async def init_db():
                 notification_sound TEXT,
                 pid INTEGER,
                 status TEXT DEFAULT 'idle',
-                is_processing INTEGER DEFAULT 0,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 stopped_at TIMESTAMP
             )
         """)
 
-        # Migration: add is_processing column if it doesn't exist
         cursor = await db.execute("PRAGMA table_info(claude_instances)")
         columns = [col[1] for col in await cursor.fetchall()]
-        if 'is_processing' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN is_processing INTEGER DEFAULT 0")
         if 'working_dir' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN working_dir TEXT")
         if 'tts_mode' not in columns:
@@ -575,8 +572,6 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT")
         if 'input_lock' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN input_lock TEXT")
-        if 'primarch' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN primarch TEXT")
         if 'transplant_target_session' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT")
         if 'legion' not in columns:
@@ -606,18 +601,11 @@ async def init_db():
         if 'cron_job_id' not in sd_columns:
             await db.execute("ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT")
 
-        # Migration: Convert two-field status (status + is_processing) to single enum
-        # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
-        cursor = await db.execute("SELECT COUNT(*) FROM claude_instances WHERE status = 'active'")
-        if (await cursor.fetchone())[0] > 0:
-            await db.execute("""
-                UPDATE claude_instances SET status = CASE
-                    WHEN status = 'active' AND is_processing = 1 THEN 'processing'
-                    WHEN status = 'active' AND is_processing = 0 THEN 'idle'
-                    ELSE status
-                END
-            """)
-            await db.commit()
+        # Drop dead columns (phase 1 DB thinning)
+        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
+        drop_targets = dead_columns & set(columns)
+        for col in drop_targets:
+            await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
@@ -3314,7 +3302,7 @@ async def declare_victory(instance_id: str, request: Request):
                 }
                 if deliverables:
                     fm_updates["deliverables"] = deliverables
-                _update_session_doc_frontmatter(doc_row[0], fm_updates)
+                _update_session_doc_frontmatter(Path(doc_row[0]), fm_updates)
 
         await db.commit()
 
@@ -9585,9 +9573,48 @@ MiniMax is for mass, not precision. 300 prompts per 5 hours budget. Notes enter 
 The system uses an Obsidian vault (Imperium-ENV) as its knowledge base. Terra/ is personal domain, Mars/ is mechanicus/agent operations."""
 
 
-async def run_implantation(note_path: str, title: str, note_type: str, source: str, skip_trials: bool = False) -> None:
+async def run_implantation(note_path: str, title: str, note_type: str, source: str, skip_trials: bool = False, emperor_feedback: str = "") -> None:
     """Stage 2: Implantation — async enrichment of an inbox note with vault matches and research swarm."""
     try:
+        # Sisyphus guard — track implantation count, cap at 2 re-implantations
+        MAX_IMPLANT_CYCLES = 3  # initial + 2 retries
+        implant_count_str = await _read_note_property(note_path, "implant_count") or "0"
+        try:
+            implant_count = int(implant_count_str)
+        except ValueError:
+            implant_count = 0
+
+        if implant_count >= MAX_IMPLANT_CYCLES:
+            logger.warning(f"Implantation halted for '{title}': max cycles reached ({implant_count}/{MAX_IMPLANT_CYCLES}). Holding for manual intervention.")
+            # Set status to held so it doesn't re-enter the loop
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                    f"path={note_path}", "property=status", "value=held",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=15)
+            except Exception:
+                pass
+            # Notify in thread
+            thread_id = await _read_note_property(note_path, "thread_id")
+            if thread_id:
+                await _post_to_aspirant_thread(thread_id,
+                    f"**⏸️ Implantation Halted**\nMax cycles reached ({implant_count}). Status set to `held` — needs manual intervention or Emperor direction.")
+            return
+
+        # Increment implant count
+        implant_count += 1
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f"path={note_path}", "property=implant_count", f"value={implant_count}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception:
+            pass
+
         # Budget check — swarm costs ~14-18 queries per note
         if minimax_limiter.remaining < 25:
             logger.warning(f"Implantation skipped for '{title}': MiniMax budget low ({minimax_limiter.remaining} remaining)")
@@ -9652,9 +9679,15 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         # Step 1: Generate diverse search queries via MiniMax
         search_queries = []
         try:
+            # Build query generator input with vault context + Emperor feedback if available
+            query_input = f"Note title: {title}\nNote type: {note_type}"
+            if vault_context_str:
+                query_input += f"\n\nExisting vault context (related notes found in the Obsidian vault):\n{vault_context_str[:1000]}"
+            if emperor_feedback:
+                query_input += f"\n\nIMPORTANT — Emperor's feedback from a previous failed cycle (research the RIGHT domain this time):\n{emperor_feedback[:1000]}"
             query_response = await minimax_chat(
                 system_prompt=IMPLANTATION_ROLES["query_generator"]["system"],
-                user_content=f"Note title: {title}\nNote type: {note_type}",
+                user_content=query_input,
                 max_tokens=IMPLANTATION_ROLES["query_generator"]["max_tokens"],
             )
             if query_response and query_response.strip():
@@ -9825,15 +9858,18 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         except Exception as e:
             logger.warning(f"Implantation: property:set failed for '{title}': {e}")
 
-        await log_event("implantation_complete", device_id="minimax", details={
-            "path": note_path,
-            "title": title,
-            "type": note_type,
-            "source": source,
-            "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
-            "has_web_research": bool(consolidated or researcher_outputs),
-            "researcher_count": len(researcher_outputs),
-        })
+        try:
+            await log_event("implantation_complete", device_id="minimax", details={
+                "path": note_path,
+                "title": title,
+                "type": note_type,
+                "source": source,
+                "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
+                "has_web_research": bool(consolidated or researcher_outputs),
+                "researcher_count": len(researcher_outputs),
+            })
+        except Exception as e:
+            logger.warning(f"Implantation: log_event failed for '{title}': {e}")
         logger.info(f"Implantation complete for '{title}' ({note_path})")
 
         # Post implantation summary to aspirant thread
@@ -9998,11 +10034,14 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
         except Exception as e:
             logger.warning(f"Trials: Discord notification failed for '{title}': {e}")
 
-        await log_event("trials_initiated", device_id="sonnet", details={
-            "path": note_path,
-            "title": title,
-            "type": note_type,
-        })
+        try:
+            await log_event("trials_initiated", device_id="sonnet", details={
+                "path": note_path,
+                "title": title,
+                "type": note_type,
+            })
+        except Exception as e:
+            logger.warning(f"Trials: log_event failed for '{title}': {e}")
 
     except Exception as e:
         logger.error(f"Trials failed for '{title}': {e}", exc_info=True)
@@ -10126,25 +10165,29 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
             )
             await _post_to_aspirant_thread(thread_id, thread_msg)
 
-        await log_event("trials_verdict", device_id="sonnet", details={
-            "path": note_path,
-            "title": title,
-            "type": note_type,
-            "verdict": "pass" if is_pass else "fail",
-            "status": new_status,
-        })
+        try:
+            await log_event("trials_verdict", device_id="sonnet", details={
+                "path": note_path,
+                "title": title,
+                "type": note_type,
+                "verdict": "pass" if is_pass else "fail",
+                "status": new_status,
+            })
+        except Exception as e:
+            logger.warning(f"Trials verdict: log_event failed for '{title}': {e}")
         logger.info(f"Trials verdict for '{title}': {new_status}")
 
-        # On FAIL, re-dispatch to implantation for additional research per CLAUDE.md spec
+        # On FAIL, re-dispatch to implantation with Emperor's feedback so next cycle knows what went wrong
         if not is_pass:
             source = await _read_note_property(note_path, "source") or "re-implant"
-            logger.info(f"Trials failed for '{title}': re-dispatching to implantation")
+            logger.info(f"Trials failed for '{title}': re-dispatching to implantation with Emperor feedback")
             asyncio.create_task(run_implantation(
                 note_path=note_path,
                 title=title,
                 note_type=note_type,
                 source=source,
                 skip_trials=False,
+                emperor_feedback=emperor_response,
             ))
 
     except Exception as e:
@@ -10338,12 +10381,15 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
             )
             await _post_to_aspirant_thread(thread_id, deploy_msg)
 
-        await log_event("deployment", device_id="guilliman", details={
-            "source_path": note_path,
-            "destination_path": destination_path,
-            "title": title,
-            "type": note_type,
-        })
+        try:
+            await log_event("deployment", device_id="guilliman", details={
+                "source_path": note_path,
+                "destination_path": destination_path,
+                "title": title,
+                "type": note_type,
+            })
+        except Exception as e:
+            logger.warning(f"Deployment: log_event failed for '{title}': {e}")
         logger.info(f"Deployment complete: '{title}' -> {destination_path}")
 
     except Exception as e:
@@ -11293,7 +11339,7 @@ async def get_session_doc(doc_id: int):
 
         # Get linked instances
         cursor = await db.execute(
-            "SELECT id, tab_name, status, working_dir, is_processing FROM claude_instances WHERE session_doc_id = ?",
+            "SELECT id, tab_name, status, working_dir FROM claude_instances WHERE session_doc_id = ?",
             (doc_id,)
         )
         instances = [dict(r) for r in await cursor.fetchall()]
@@ -12071,13 +12117,13 @@ async def get_state():
     # Instances
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
 
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active' AND is_processing = 1"
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'processing'"
         )
         row = await cursor.fetchone()
         processing_count = row[0] if row else 0
