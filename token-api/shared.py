@@ -127,6 +127,41 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+# Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
+PHONE_TTS_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 2,
+    "reachable": None,          # True/False/None (unknown)
+    "last_health_check": 0,
+    "health_check_ttl": 30,     # Re-probe phone every 30s
+}
+
+
+def is_phone_reachable() -> bool:
+    """Check if the phone's MacroDroid HTTP server is reachable. Cached with 30s TTL."""
+    import requests
+
+    now = time.time()
+    if (PHONE_TTS_CONFIG["reachable"] is not None
+            and now - PHONE_TTS_CONFIG["last_health_check"] < PHONE_TTS_CONFIG["health_check_ttl"]):
+        return PHONE_TTS_CONFIG["reachable"]
+
+    host = PHONE_TTS_CONFIG["host"]
+    port = PHONE_TTS_CONFIG["port"]
+    try:
+        resp = requests.get(f"http://{host}:{port}/notify", params={"ping": "1"}, timeout=2)
+        available = resp.status_code == 200
+    except Exception:
+        available = False
+
+    PHONE_TTS_CONFIG["reachable"] = available
+    PHONE_TTS_CONFIG["last_health_check"] = now
+    if available:
+        logger.info("TTS: Phone reachable for TTS routing")
+    return available
+
+
 # ============ Desktop State ============
 
 DESKTOP_STATE = {
