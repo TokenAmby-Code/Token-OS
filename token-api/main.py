@@ -60,6 +60,8 @@ from shared import (
     is_satellite_tts_available,
     log_event, log_event_sync,
     DISCORD_DAEMON_URL,
+    VOICE_CHAT_SESSIONS, DICTATION_STATE,
+    PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
 )
 from routes.tts import (
     router as tts_router,
@@ -73,6 +75,7 @@ from routes.tts import (
     # Queue state (needed by lifespan)
     tts_worker_task,
 )
+from routes.voice import router as voice_router
 from routes.hooks import (
     router as hooks_router,
     HookResponse, PreToolUseResponse,
@@ -1445,6 +1448,7 @@ app.add_middleware(
 # Slaanesh scheduling routes (Black Ships booking portal)
 app.include_router(schedule_router)
 app.include_router(tts_router)
+app.include_router(voice_router)
 app.include_router(hooks_router)
 
 
@@ -2393,197 +2397,6 @@ async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
     return {"released": True}
 
 
-class VoiceChangeRequest(BaseModel):
-    voice: str
-
-
-@app.get("/api/voices")
-async def list_voices():
-    """List all available TTS voices from the profile pool."""
-    all_profiles = PROFILES + FALLBACK_VOICES
-    voices = []
-    for profile in all_profiles:
-        wsl_voice = profile["wsl_voice"]
-        short_name = wsl_voice.replace("Microsoft ", "")
-        is_fallback = profile in FALLBACK_VOICES
-        voices.append({
-            "voice": wsl_voice,
-            "mac_voice": profile["mac_voice"],
-            "short_name": short_name,
-            "profile_name": profile["name"],
-            "fallback": is_fallback,
-        })
-    return {"voices": voices}
-
-
-def find_voice_linear_probe(used_voices: set) -> str | None:
-    """Find an available WSL voice using random offset + linear probe.
-
-    Picks a random starting index in PROFILES (foreign accents), then iterates
-    circularly until finding a voice not in used_voices. Falls back to
-    FALLBACK_VOICES, then returns None if everything is taken.
-    """
-    n = len(PROFILES)
-    if n > 0:
-        start = random.randint(0, n - 1)
-        for i in range(n):
-            idx = (start + i) % n
-            voice = PROFILES[idx]["wsl_voice"]
-            if voice not in used_voices:
-                return voice
-
-    # Try fallback voices
-    for fb in FALLBACK_VOICES:
-        if fb["wsl_voice"] not in used_voices:
-            return fb["wsl_voice"]
-
-    return None
-
-
-@app.patch("/api/instances/{instance_id}/voice")
-async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
-    """Change an instance's TTS voice with collision handling.
-
-    If the target voice is already in use by another instance, that instance
-    gets bumped using random offset + linear probe to find an open slot.
-    No cascade - bumped instance just finds the next available voice.
-    """
-    all_voices = {p["wsl_voice"] for p in PROFILES + FALLBACK_VOICES}
-    if request.voice not in all_voices:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
-        )
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Get all instances and their voices
-        cursor = await db.execute("SELECT id, tts_voice, tab_name FROM claude_instances")
-        rows = await cursor.fetchall()
-
-        instance_to_voice = {row[0]: row[1] for row in rows}
-        instance_to_name = {row[0]: row[2] for row in rows}
-        voice_to_instance = {row[1]: row[0] for row in rows if row[1]}
-
-        if instance_id not in instance_to_voice:
-            raise HTTPException(status_code=404, detail="Instance not found")
-
-        original_voice = instance_to_voice[instance_id]
-        if original_voice == request.voice:
-            return {"status": "no_change", "instance_id": instance_id, "voice": request.voice}
-
-        # Changes to apply: [(instance_id, old_voice, new_voice), ...]
-        changes = [(instance_id, original_voice, request.voice)]
-
-        # Check for collision
-        holder = voice_to_instance.get(request.voice)
-        if holder and holder != instance_id:
-            # Collision! Bump the holder to a new voice
-            holder_old_voice = instance_to_voice[holder]
-
-            # Build set of voices that will be in use after our change
-            # (exclude original_voice since we're freeing it, include request.voice since we're taking it)
-            used_after = set(voice_to_instance.keys())
-            used_after.discard(original_voice)  # We're freeing this
-            used_after.add(request.voice)  # We're taking this
-
-            # Find new voice for bumped instance via linear probe
-            new_voice_for_holder = find_voice_linear_probe(used_after)
-            if not new_voice_for_holder:
-                # All voices in use, give them the voice we just freed
-                new_voice_for_holder = original_voice
-
-            changes.append((holder, holder_old_voice, new_voice_for_holder))
-
-        # Apply all changes to database
-        for iid, _, new_voice in changes:
-            await db.execute(
-                "UPDATE claude_instances SET tts_voice = ? WHERE id = ?",
-                (new_voice, iid)
-            )
-        await db.commit()
-
-    # Log events for each change
-    for iid, old_v, new_v in changes:
-        name = instance_to_name.get(iid, iid[:8])
-        await log_event(
-            "instance_voice_changed",
-            instance_id=iid,
-            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id}
-        )
-
-    # Build response
-    bumps = [
-        {"instance_id": iid, "name": instance_to_name.get(iid, iid[:8]), "old": old_v, "new": new_v}
-        for iid, old_v, new_v in changes
-    ]
-
-    return {
-        "status": "voice_changed",
-        "instance_id": instance_id,
-        "voice": request.voice,
-        "changes": bumps
-    }
-
-
-@app.patch("/api/instances/{instance_id}/tts-mode")
-async def set_instance_tts_mode(instance_id: str, request: Request):
-    """Set TTS mode for an instance: verbose, muted, or silent."""
-    body = await request.json()
-    mode = body.get("mode", "verbose")
-    if mode not in ("verbose", "muted", "silent", "voice-chat"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?", (instance_id,))
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-
-        old_mode = row["tts_mode"] or "verbose"
-        old_voice = row["tts_voice"]
-        old_sound = row["notification_sound"]
-
-        if mode == "silent":
-            # Release voice slot
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE id = ?",
-                (mode, instance_id)
-            )
-        elif mode in ("verbose", "voice-chat") and not old_voice:
-            # Re-assign voice from pool
-            cursor2 = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
-            )
-            rows = await cursor2.fetchall()
-            used_voices = {r[0] for r in rows}
-            profile, _ = get_next_available_profile(used_voices)
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
-                (mode, profile["wsl_voice"], profile["notification_sound"], instance_id)
-            )
-        else:
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-                (mode, instance_id)
-            )
-        await db.commit()
-
-    # Manage voice chat session based on mode transition
-    if mode == "voice-chat":
-        VOICE_CHAT_SESSIONS[instance_id] = {
-            "active": True,
-            "started_at": datetime.now().isoformat()
-        }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]} (via tts_mode)")
-    elif old_mode == "voice-chat" and mode != "voice-chat":
-        VOICE_CHAT_SESSIONS.pop(instance_id, None)
-        logger.info(f"Voice chat ENDED for {instance_id[:12]} (via tts_mode)")
-
-    await log_event("tts_mode_changed", instance_id=instance_id, details={"mode": mode})
-    return {"status": "ok", "instance_id": instance_id, "mode": mode}
-
-
 @app.post("/api/instances/{instance_id}/activity")
 async def update_instance_activity(instance_id: str, request: ActivityRequest):
     """Update instance processing state. Called by hooks on prompt_submit and stop."""
@@ -2661,81 +2474,6 @@ async def get_instance_todos(instance_id: str):
         }
     except Exception as e:
         return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0, "error": str(e)}
-
-
-@app.post("/api/instances/{instance_id}/voice-chat")
-async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: str = ""):
-    """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'.
-
-    Args:
-        tmux_pane: Target tmux pane for send-keys (e.g., 'main:grid.2').
-                   If empty, AHK script will use default.
-    """
-    if active:
-        VOICE_CHAT_SESSIONS[instance_id] = {
-            "active": True,
-            "started_at": datetime.now().isoformat(),
-            "tmux_pane": tmux_pane or "",
-        }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]} (pane: {tmux_pane or 'default'})")
-    else:
-        VOICE_CHAT_SESSIONS.pop(instance_id, None)
-        logger.info(f"Voice chat ENDED for {instance_id[:12]}")
-    # Keep tts_mode column in sync
-    new_mode = "voice-chat" if active else "verbose"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-            (new_mode, instance_id)
-        )
-        await db.commit()
-    return {"instance_id": instance_id, "voice_chat": active, "tmux_pane": tmux_pane}
-
-
-@app.get("/api/instances/{instance_id}/voice-chat")
-async def get_voice_chat_status(instance_id: str):
-    """Check if instance is in voice chat mode."""
-    session = VOICE_CHAT_SESSIONS.get(instance_id)
-    return {"active": session is not None, "session": session}
-
-
-@app.post("/api/instances/{instance_id}/voice-chat/listening")
-async def toggle_listening(instance_id: str, active: bool = True):
-    """Toggle listening (dictation/mic) state. Delegates to global dictation state."""
-    DICTATION_STATE["active"] = active
-    DICTATION_STATE["updated_at"] = datetime.now().isoformat()
-    logger.info(f"Dictation {'ON' if active else 'OFF'} (via voice-chat/listening for {instance_id[:12]})")
-    return {"instance_id": instance_id, "listening": active}
-
-
-@app.post("/api/dictation")
-async def set_dictation_state(active: bool):
-    """Set global dictation (Wispr Flow) state. Called by AHK on every toggle."""
-    DICTATION_STATE["active"] = active
-    DICTATION_STATE["updated_at"] = datetime.now().isoformat()
-    logger.info(f"Dictation {'ON' if active else 'OFF'}")
-
-    # When dictation ends, flush any queued pedal enter after buffer delay
-    if not active and PEDAL_STATE["enter_queued"]:
-        _schedule_pedal_enter(PEDAL_BUFFER_MS)
-
-    return {"active": active}
-
-
-@app.get("/api/dictation")
-async def get_dictation_state():
-    """Get current dictation state. Used by AHK for explicit on/off decisions."""
-    # Also report if any voice chat session is active
-    voice_chat_instance = None
-    for instance_id, session in VOICE_CHAT_SESSIONS.items():
-        if session.get("active"):
-            voice_chat_instance = instance_id
-            break
-    return {
-        "active": DICTATION_STATE["active"],
-        "updated_at": DICTATION_STATE["updated_at"],
-        "voice_chat_instance": voice_chat_instance,
-    }
 
 
 # ============ Golden Throne API ============
@@ -3739,25 +3477,7 @@ DISTRACTION_PATTERNS = [
 
 # [MOVED to shared.py / routes/tts.py] — was: # Windows satellite server config (token-satellite
 
-# Voice chat state — tracks which instances are in voice conversation mode
-VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
-
-# Global dictation state — tracks whether Wispr Flow is currently active
-# Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
-#             voice-select-other (explicit on/off during voice chat)
-DICTATION_STATE = {"active": False, "updated_at": None}
-
-# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
-PEDAL_STATE = {
-    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
-    "enter_queued": False,          # enter waiting for dictation buffer to expire
-    "queued_task": None,            # asyncio.Task for delayed enter send
-    "bypass_active": False,         # single-tap bypass window after buffered enter
-    "bypass_start": 0.0,           # when bypass window started
-}
-PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
-PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
-PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
+# [MOVED to shared.py] — VOICE_CHAT_SESSIONS, DICTATION_STATE, PEDAL_STATE, pedal constants
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
 VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
@@ -5103,6 +4823,10 @@ def _send_to_phone(endpoint: str, params: dict) -> dict:
 # Wire TTS route dependencies
 from routes.tts import init_deps as tts_init_deps
 tts_init_deps(send_to_phone=_send_to_phone)
+
+# Wire voice route dependencies
+from routes.voice import init_deps as voice_init_deps
+voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
 
 def _send_enforce_to_phone(app_name: str, level: int) -> dict:
     """Send enforcement level to phone using v3 params.

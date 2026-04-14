@@ -149,6 +149,30 @@ DESKTOP_STATE = {
 }
 
 
+# ============ Voice Chat & Dictation State ============
+# These live in shared.py so both main.py and routes/voice.py can access them.
+
+# Voice chat state — tracks which instances are in voice conversation mode
+VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
+
+# Global dictation state — tracks whether Wispr Flow is currently active
+# Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
+#             voice-select-other (explicit on/off during voice chat)
+DICTATION_STATE = {"active": False, "updated_at": None}
+
+# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
+PEDAL_STATE = {
+    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
+    "enter_queued": False,          # enter waiting for dictation buffer to expire
+    "queued_task": None,            # asyncio.Task for delayed enter send
+    "bypass_active": False,         # single-tap bypass window after buffered enter
+    "bypass_start": 0.0,           # when bypass window started
+}
+PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
+PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
+PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
+
+
 # ============ Discord ============
 
 DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
