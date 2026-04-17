@@ -595,6 +595,8 @@ async def init_db():
                 WHEN zealotry >= 4 AND COALESCE(is_subagent, 0) = 0 THEN 'golden_throne'
                 ELSE 'one_off'
             END""")
+        if 'primarch' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN primarch TEXT")
 
         # Migration: add primarch_name and cron_job_id to session_documents
         cursor = await db.execute("PRAGMA table_info(session_documents)")
@@ -605,7 +607,7 @@ async def init_db():
             await db.execute("ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT")
 
         # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
+        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "is_processing"}
         drop_targets = dead_columns & set(columns)
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
@@ -1218,35 +1220,64 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
-async def restore_desktop_state():
-    """Restore DESKTOP_STATE from last known event on startup.
+RESTART_STATE_PATH = Path(__file__).parent / "restart_state.json"
 
-    Prevents state desync when the server restarts while AHK is still running.
-    AHK tracks its own internal mode and only sends changes, so if the server
-    resets to 'silence' but AHK thinks it's in 'video', no detection is sent
-    until the next mode *transition* on the AHK side.
+# Keys that must NOT survive a restart — derived from live signals or boot-time config.
+_RESTART_STATE_DENYLIST = {
+    "startup_time",        # reset per boot
+    "startup_grace_secs",  # config, reset per boot
+    "ahk_reachable",       # live heartbeat — unknown until AHK checks in
+    "ahk_last_heartbeat",  # live heartbeat
+}
 
-    Timer state is restored separately via timer_load_from_db() before this.
+
+def save_restart_state() -> None:
+    """Dump DESKTOP_STATE to disk for pragma-once consumption on next startup.
+
+    Called during graceful shutdown. Only surviveable keys are persisted
+    (see _RESTART_STATE_DENYLIST). Failure is non-fatal — next boot just
+    starts fresh.
     """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Restore current_mode from the last desktop_mode_change event
-            cursor = await db.execute(
-                "SELECT details FROM events WHERE event_type = 'desktop_mode_change' ORDER BY id DESC LIMIT 1"
-            )
-            row = await cursor.fetchone()
-            if row:
-                details = json.loads(row[0])
-                restored_mode = details.get("new_mode")
-                if restored_mode and restored_mode in VALID_DETECTION_MODES:
-                    DESKTOP_STATE["current_mode"] = restored_mode
-                    DESKTOP_STATE["in_meeting"] = (restored_mode == "meeting")
-                    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-                    print(f"Restored desktop mode: {restored_mode} (from last event)")
-                    return
-        print("No previous desktop mode found, defaulting to silence")
+        persistable = {k: v for k, v in DESKTOP_STATE.items() if k not in _RESTART_STATE_DENYLIST}
+        payload = {
+            "saved_at": datetime.now().isoformat(),
+            "desktop_state": persistable,
+        }
+        RESTART_STATE_PATH.write_text(json.dumps(payload, indent=2))
+        print(f"Restart state saved: {sorted(persistable.keys())}")
     except Exception as e:
-        print(f"Failed to restore desktop state: {e}")
+        print(f"Failed to save restart state: {e}")
+
+
+def restore_restart_state() -> None:
+    """Read restart_state.json, apply to DESKTOP_STATE, then delete it.
+
+    Pragma-once: the file is consumed and removed so a subsequent crash-reboot
+    (which didn't go through graceful shutdown) boots fresh rather than
+    restoring potentially-stale state. If no file exists, this is a no-op.
+    """
+    if not RESTART_STATE_PATH.exists():
+        print("No restart state found, starting fresh")
+        return
+    try:
+        payload = json.loads(RESTART_STATE_PATH.read_text())
+        persisted = payload.get("desktop_state", {})
+        saved_at = payload.get("saved_at", "unknown")
+        applied = []
+        for key, value in persisted.items():
+            if key in _RESTART_STATE_DENYLIST:
+                continue
+            DESKTOP_STATE[key] = value
+            applied.append(key)
+        print(f"Restored restart state (saved {saved_at}): {sorted(applied)}")
+    except Exception as e:
+        print(f"Failed to restore restart state: {e}")
+    finally:
+        try:
+            RESTART_STATE_PATH.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"Failed to delete restart state: {e}")
 
 
 async def run_overdue_tasks():
@@ -1346,7 +1377,7 @@ async def lifespan(app: FastAPI):
     await init_database_async(DB_PATH)
     await load_tasks_from_db()
     timer_load_from_db()
-    await restore_desktop_state()
+    restore_restart_state()
     # Sync timer activity layer with restored desktop mode
     desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
     now_ms = int(time.monotonic() * 1000)
@@ -1404,6 +1435,9 @@ async def lifespan(app: FastAPI):
             f.write(f"--- SERVER STOPPING at {timestamp} ---\n")
     except Exception:
         pass
+
+    # Persist ephemeral state for next startup (pragma-once consumption).
+    save_restart_state()
 
     # Shutdown
     if _tts_mod.tts_worker_task:
@@ -2843,7 +2877,8 @@ async def set_zealotry(instance_id: str, request: Request):
 
 # ── Legion / Synced Session Endpoints ─────────────────────────
 
-ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic"}
+ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic", "fabricator"}
+SINGLETON_LEGIONS = {"custodes", "fabricator"}
 
 
 @app.patch("/api/instances/{instance_id}/legion")
@@ -3413,6 +3448,61 @@ async def get_instance(instance_id: str):
                     instance["cc_color"] = p.get("cc_color", "default")
                     break
         return instance
+
+
+_KNOWN_VAULTS = ("Imperium-ENV", "Pax-ENV", "Civic-ENV")
+
+
+def _derive_vault_and_relative(file_path: str) -> tuple[str, str]:
+    """Split an absolute session-doc path into (vault_name, vault_relative_path).
+
+    file_path may be stored as absolute (/Volumes/Imperium/Imperium-ENV/Terra/…)
+    or as vault-relative (Terra/Sessions/…). Writers vary by machine; readers
+    need a normalized form for the obsidian:// URI and the obsidian CLI.
+    """
+    for vault in _KNOWN_VAULTS:
+        marker = f"/{vault}/"
+        idx = file_path.find(marker)
+        if idx >= 0:
+            return vault, file_path[idx + len(marker):]
+    return "Imperium-ENV", file_path
+
+
+@app.get("/api/panes/{tmux_pane}/session-doc")
+async def pane_session_doc(tmux_pane: str):
+    """Resolve the session doc linked to a tmux pane.
+
+    Returns {vault, file_path (vault-relative), absolute_path, title, doc_id,
+    instance_id}. 404 if no instance for the pane, or no linked session doc.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT ci.id AS instance_id, sd.id AS doc_id, sd.file_path,
+                      sd.title, sd.project
+               FROM claude_instances ci
+               LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+               WHERE ci.tmux_pane = ?
+               ORDER BY ci.last_activity DESC
+               LIMIT 1""",
+            (tmux_pane,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"No instance for pane {tmux_pane}")
+        if not row["doc_id"]:
+            raise HTTPException(404, f"Instance {row['instance_id']} has no session doc")
+
+        vault, rel = _derive_vault_and_relative(row["file_path"])
+        return {
+            "instance_id": row["instance_id"],
+            "doc_id": row["doc_id"],
+            "vault": vault,
+            "file_path": rel,
+            "absolute_path": row["file_path"],
+            "title": row["title"],
+            "project": row["project"],
+        }
 
 
 # Dashboard Endpoint
@@ -8108,7 +8198,23 @@ def _register_morning_expected_response(session_type: str = "morning_session") -
             name=f"Morning Enforce L{level}",
             misfire_grace_time=120,
         )
-    logger.info(f"Morning enforce registered: {session_type}, escalations scheduled at +5/+10/+15 min")
+
+    # Schedule instance health check at +90s — detects 401, crash, dead pane
+    health_fire_at = base + timedelta(seconds=90)
+    health_job_id = "morning-health-check"
+    try:
+        scheduler.remove_job(health_job_id)
+    except Exception:
+        pass
+    scheduler.add_job(
+        _morning_health_check,
+        DateTrigger(run_date=health_fire_at),
+        id=health_job_id,
+        replace_existing=True,
+        name="Morning Health Check",
+        misfire_grace_time=120,
+    )
+    logger.info(f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s")
 
 
 @app.post("/api/morning/enforce-register")
@@ -8120,17 +8226,127 @@ async def register_morning_enforce():
     """
     _register_morning_expected_response("morning_session")
     await log_event("morning_enforce_registered", device_id="cron")
-    return {"status": "registered", "escalations": ["+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
+    return {"status": "registered", "escalations": ["+90s health-check", "+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
 
 
 
 def _cancel_morning_escalations() -> None:
-    """Cancel all pending escalation jobs (called on acknowledge/override)."""
-    for level in [1, 2, 3]:
+    """Cancel all pending escalation jobs and health check (called on acknowledge/override)."""
+    for job_id in ["morning-enforce-l1", "morning-enforce-l2", "morning-enforce-l3", "morning-health-check"]:
         try:
-            scheduler.remove_job(f"morning-enforce-l{level}")
+            scheduler.remove_job(job_id)
         except Exception:
             pass
+
+
+def _morning_health_check() -> None:
+    """APScheduler callback at +90s: verify the morning Claude instance is alive.
+
+    Checks if the instance acknowledged (meaning it booted, authenticated, and
+    ran its first tool). If not, captures the tmux pane to detect 401/crash,
+    sends TTS alert, and dispatches a self-heal investigation agent.
+    """
+    state = MORNING_ENFORCE_STATE
+    if state["status"] not in ("pending",):
+        logger.info(f"Morning health check: status={state['status']}, no action needed")
+        return
+
+    # Check if acknowledged_at was set (instance called /api/morning/acknowledge)
+    if state.get("acknowledged_at"):
+        logger.info("Morning health check: already acknowledged, healthy")
+        return
+
+    # Not acknowledged after 90s — check the pane for signs of life
+    logger.warning("Morning health check: no acknowledgement after 90s, inspecting pane")
+
+    pane_id = None
+    error_signature = None
+    pane_output = ""
+
+    # Read pane_id from state file
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        state_file = Path("/tmp/custodes_morning_sessions") / f"morning_{today}.json"
+        if state_file.exists():
+            state_data = json.loads(state_file.read_text())
+            pane_id = state_data.get("pane_id")
+    except Exception as e:
+        logger.warning(f"Morning health check: could not read state file: {e}")
+
+    # Capture pane output to detect failure signatures
+    if pane_id:
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", pane_id, "-p"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pane_output = result.stdout
+        except Exception as e:
+            logger.warning(f"Morning health check: pane capture failed: {e}")
+            pane_output = f"[pane capture error: {e}]"
+
+    # Detect known failure signatures
+    failure_signatures = ["401", "/login", "authentication_error", "Invalid authentication", "ECONNREFUSED"]
+    for sig in failure_signatures:
+        if sig.lower() in pane_output.lower():
+            error_signature = sig
+            break
+
+    if not error_signature and pane_output.strip():
+        # Pane has output but no error signature — might just be slow, give benefit of doubt
+        # Check if there's any sign of Claude running (prompt indicators)
+        if any(indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]):
+            logger.info("Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain")
+            return
+
+    # ── Failure confirmed — alert and self-heal ──
+    failure_reason = error_signature or "no response and no Claude activity detected"
+    logger.error(f"Morning health check FAILED: {failure_reason}")
+
+    # 1. TTS alert
+    speak_checkin_tts("Morning session launch failed. Dispatching investigation.")
+
+    # 2. Log event
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                log_event("morning_health_check_failed", details={
+                    "reason": failure_reason,
+                    "pane_id": pane_id,
+                    "pane_snippet": pane_output[-500:] if pane_output else None,
+                }),
+                loop,
+            ).result(timeout=5)
+    except Exception as e:
+        logger.warning(f"Morning health check: event log failed: {e}")
+
+    # 3. Dispatch self-heal investigation agent
+    try:
+        diag_prompt = (
+            f"Morning session health check failed at +90s. Failure reason: {failure_reason}. "
+            f"Pane {pane_id or 'unknown'} output snippet: {pane_output[-300:] if pane_output else 'empty'}. "
+            "Investigate the root cause (auth expiry, CLI crash, network issue, etc.), "
+            "attempt to fix it if possible (e.g. kill dead pane, re-auth), "
+            "and report findings to Discord #briefing channel. "
+            "If the fix requires user interaction (like /login), send TTS instructions."
+        )
+        subprocess.Popen(
+            [
+                "claude", "--print", "--output-format", "text",
+                "--model", "sonnet",
+                "--allowedTools", "Bash,Read,Grep,Glob,Write",
+                "-p", diag_prompt,
+            ],
+            cwd="/Volumes/Imperium/Imperium-ENV",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        logger.info("Morning health check: self-heal agent dispatched")
+    except Exception as e:
+        logger.error(f"Morning health check: self-heal dispatch failed: {e}")
+        # Last resort: just TTS what went wrong
+        speak_checkin_tts(f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent.")
 
 
 def _morning_escalate(level: int) -> None:
@@ -8740,6 +8956,15 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
 _discord_seen_ids: set = set()
 _DISCORD_DEDUP_MAX = 200
 
+# Aspirant thread gating — prevents bot message spam without Emperor engagement.
+# Key = thread_id, Value = number of allowed posts before gate closes.
+# 0 = gated (no bot posts allowed). >0 = that many posts allowed.
+# New threads start at 2 (implantation + trials initial posts; gene-seed goes direct).
+# Emperor reply sets to 1 (one response per Emperor message).
+_aspirant_thread_gates: dict[str, int] = {}
+# Queued messages for gated threads — posted when gate opens.
+_aspirant_gated_queue: dict[str, list[tuple[str, str]]] = {}  # thread_id -> [(message, bot)]
+
 
 @app.post("/api/discord/message")
 async def receive_discord_message(request: DiscordMessageRequest):
@@ -8802,6 +9027,20 @@ async def receive_discord_message(request: DiscordMessageRequest):
         return {"received": True, "message_id": request.message_id}
 
     content = request.content or ""
+
+    # --- Aspirant thread gating: Emperor replied → open gate + flush queued messages ---
+    # Thread messages arrive with channel_id = thread snowflake ID
+    if request.channel_id in _aspirant_thread_gates:
+        _aspirant_thread_gates[request.channel_id] = 1  # Allow one bot response
+        logger.info(f"Aspirant gate opened for thread {request.channel_id} (Emperor replied)")
+        # Flush one queued message (gate will close again after posting)
+        queued = _aspirant_gated_queue.get(request.channel_id, [])
+        if queued:
+            msg, bot = queued.pop(0)
+            if not queued:
+                _aspirant_gated_queue.pop(request.channel_id, None)
+            asyncio.create_task(_post_to_aspirant_thread(request.channel_id, msg, bot=bot))
+            logger.info(f"Flushed 1 gated message for thread {request.channel_id} ({len(queued)} remaining)")
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
@@ -9210,6 +9449,10 @@ async def inbox_create(request: InboxCreateRequest):
             if resp.status_code == 200:
                 thread_data = resp.json()
                 thread_id = thread_data.get("thread_id")
+                # Register thread in gating registry — initial pipeline gets a free pass
+                # Allow 2 posts: implantation summary + trials initiation
+                # (gene-seed post goes direct, not through _post_to_aspirant_thread)
+                _aspirant_thread_gates[thread_id] = 2
                 logger.info(f"Inbox: created aspirant thread '{safe_title}' -> {thread_id}")
 
                 # Store thread_id in note frontmatter
@@ -9272,8 +9515,19 @@ async def _read_note_property(note_path: str, prop: str) -> str | None:
         return None
 
 
-async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes") -> None:
-    """Post a message to an aspirant's thread in #aspirants."""
+async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes", bypass_gate: bool = False) -> None:
+    """Post a message to an aspirant's thread in #aspirants.
+
+    Respects thread gating: if gate is closed, queues the message instead.
+    Gate closes after each successful post (prevents consecutive bot messages).
+    Use bypass_gate=True for initial pipeline messages (gene-seed notification).
+    """
+    allowed = _aspirant_thread_gates.get(thread_id, 0)
+    if not bypass_gate and allowed <= 0:
+        # Gate closed — queue the message
+        _aspirant_gated_queue.setdefault(thread_id, []).append((message, bot))
+        logger.info(f"Aspirant thread {thread_id} gated — queued message ({len(_aspirant_gated_queue[thread_id])} pending)")
+        return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(f"{DISCORD_DAEMON_URL}/send", json={
@@ -9282,6 +9536,9 @@ async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "cus
                 "content": message[:2000],
                 "bot": bot,
             })
+        # Decrement allowance (0 = gated until Emperor replies)
+        if not bypass_gate:
+            _aspirant_thread_gates[thread_id] = max(0, allowed - 1)
     except Exception as e:
         logger.warning(f"Failed to post to aspirant thread {thread_id}: {e}")
 
@@ -9346,10 +9603,35 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         sections = []
 
-        # --- Phase 1a: Similar note search (vault) ---
+        # --- Phase 0: Read gene-seed content from the aspirant note ---
+        gene_seed_content = ""
+        try:
+            note_file = OBSIDIAN_VAULT_PATH / note_path
+            if note_file.exists():
+                raw = note_file.read_text(encoding="utf-8")
+                # Extract gene-seed from the callout block
+                in_geneseed = False
+                gs_lines = []
+                for line in raw.splitlines():
+                    if "> [!dna]" in line:
+                        in_geneseed = True
+                        continue
+                    if in_geneseed:
+                        if line.startswith("> "):
+                            gs_lines.append(line[2:])
+                        elif line.strip() == ">":
+                            gs_lines.append("")
+                        else:
+                            break
+                gene_seed_content = "\n".join(gs_lines).strip()
+        except Exception as e:
+            logger.warning(f"Implantation: could not read gene-seed from '{title}': {e}")
+
+        # --- Phase 1a: Similar note search (vault) — enriched with full note reads ---
         vault_synthesis = None
         raw_vault_lines = []
         vault_context_str = ""
+        vault_context_full = ""  # enriched: full content of top matching notes
         try:
             proc = await asyncio.create_subprocess_exec(
                 OBSIDIAN_CLI, "vault=Imperium-ENV", "search:context", f'query={title}',
@@ -9368,6 +9650,42 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
                 if raw_vault_lines:
                     vault_context_str = "\n".join(raw_vault_lines[:50])  # cap context size
+
+                    # Enrichment: read full content of top matching notes
+                    matched_paths = []
+                    seen_paths = set()
+                    for line in raw_vault_lines:
+                        fpath = line.split(":")[0] if ":" in line else line.strip()
+                        if fpath and fpath not in seen_paths and fpath.endswith(".md"):
+                            seen_paths.add(fpath)
+                            matched_paths.append(fpath)
+                    matched_paths = matched_paths[:5]  # top 5 matches
+
+                    full_note_contents = []
+                    total_chars = 0
+                    MAX_VAULT_CONTEXT = 6000  # char budget for full note reads
+                    for mpath in matched_paths:
+                        if total_chars >= MAX_VAULT_CONTEXT:
+                            break
+                        try:
+                            mfile = OBSIDIAN_VAULT_PATH / mpath
+                            if mfile.exists():
+                                mcontent = mfile.read_text(encoding="utf-8")
+                                # Strip frontmatter for context
+                                if mcontent.startswith("---"):
+                                    end_fm = mcontent.find("---", 3)
+                                    if end_fm != -1:
+                                        mcontent = mcontent[end_fm + 3:].strip()
+                                # Cap per-note at 1500 chars
+                                mcontent = mcontent[:1500]
+                                full_note_contents.append(f"### [[{mpath}]]\n{mcontent}")
+                                total_chars += len(mcontent)
+                        except Exception:
+                            pass
+
+                    if full_note_contents:
+                        vault_context_full = "\n\n---\n\n".join(full_note_contents)
+
                     vault_synthesis = await minimax_chat(
                         system_prompt=IMPLANTATION_ROLES["vault_relevance"]["system"],
                         user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context_str}",
@@ -9403,9 +9721,13 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         # Step 1: Generate diverse search queries via MiniMax
         search_queries = []
         try:
-            # Build query generator input with vault context + Emperor feedback if available
+            # Build query generator input with gene-seed + vault context + Emperor feedback
             query_input = f"Note title: {title}\nNote type: {note_type}"
-            if vault_context_str:
+            if gene_seed_content:
+                query_input += f"\n\nGene-seed (the Emperor's original note content):\n{gene_seed_content[:1500]}"
+            if vault_context_full:
+                query_input += f"\n\nExisting vault knowledge (full content of related notes):\n{vault_context_full[:3000]}"
+            elif vault_context_str:
                 query_input += f"\n\nExisting vault context (related notes found in the Obsidian vault):\n{vault_context_str[:1000]}"
             if emperor_feedback:
                 query_input += f"\n\nIMPORTANT — Emperor's feedback from a previous failed cycle (research the RIGHT domain this time):\n{emperor_feedback[:1000]}"
@@ -9448,7 +9770,7 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         )
 
         # Step 3: Fire MiniMax researcher calls in parallel
-        vault_brief = vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic."
+        vault_brief = vault_context_full[:3000] if vault_context_full else (vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic.")
 
         async def _research(query: str, web_output: str) -> str:
             """One researcher synthesizes their search results."""
@@ -9510,8 +9832,8 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 f"and fail to ground research in our system's context.\n\n"
                 f"The note being researched is titled: \"{title}\"\n"
                 f"Note type: {note_type}\n"
-                f"Original note content: a note about this topic in our Imperium system.\n\n"
-                f"Existing vault knowledge:\n{vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.'}\n\n"
+                f"Gene-seed (Emperor's original note content):\n{gene_seed_content[:1000] if gene_seed_content else '(title only — no body content)'}\n\n"
+                f"Existing vault knowledge:\n{vault_context_full[:4000] if vault_context_full else (vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.')}\n\n"
                 f"Here is the Guard's consolidated research output:\n\n---\n{review_input}\n---\n\n"
                 f"Your task:\n"
                 f"1. REMOVE any fabricated/hallucinated URLs (fake protocols like imperium://, made-up domains). Keep only real, verifiable URLs.\n"
@@ -9552,6 +9874,21 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         if not sections:
             logger.info(f"Implantation: no enrichment content for '{title}', skipping append")
             return
+
+        # Strip old pipeline artifacts on re-implantation (prevents snowball accumulation)
+        if implant_count > 0:
+            try:
+                note_file = OBSIDIAN_VAULT_PATH / note_path
+                if note_file.exists():
+                    raw = note_file.read_text(encoding="utf-8")
+                    # Find first ## Implantation and truncate everything after it
+                    marker_idx = raw.find("\n## Implantation")
+                    if marker_idx != -1:
+                        cleaned = raw[:marker_idx].rstrip() + "\n\n"
+                        note_file.write_text(cleaned, encoding="utf-8")
+                        logger.info(f"Implantation: stripped old pipeline artifacts from '{title}'")
+            except Exception as e:
+                logger.warning(f"Implantation: failed to strip old artifacts from '{title}': {e}")
 
         implant_content = f"## Implantation\n\n" + "\n\n".join(sections)
 
@@ -9609,14 +9946,14 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         # --- Fire Trials phase ---
         if not skip_trials:
-            asyncio.create_task(run_trials(note_path, title, note_type))
+            asyncio.create_task(run_trials(note_path, title, note_type, vault_context=vault_context_full))
             logger.info(f"Trials dispatched for '{title}'")
 
     except Exception as e:
         logger.error(f"Implantation failed for '{title}': {e}", exc_info=True)
 
 
-async def run_trials(note_path: str, title: str, note_type: str) -> None:
+async def run_trials(note_path: str, title: str, note_type: str, vault_context: str = "") -> None:
     """Stage 3: Trials — Custodes Sonnet challenge of an implanted note."""
     try:
         logger.info(f"Trials: starting for '{title}' ({note_path})")
@@ -9659,6 +9996,7 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
             f"the Inquisition review. If the research failed, note that the idea needs better research — don't conflate "
             f"research failure with idea failure.\n\n"
             f"The note's declared type is: {note_type}\n\n"
+            f"{'## Existing Vault Knowledge' + chr(10) + chr(10) + 'Use this to ground your challenges in how the system actually works:' + chr(10) + chr(10) + vault_context[:4000] + chr(10) + chr(10) if vault_context else ''}"
             f"Here is the full note content:\n\n---\n{note_content}\n---\n\n"
             f"Produce exactly THREE sections in this format (use Obsidian callout syntax):\n\n"
             f"## Trials\n\n"
@@ -9901,18 +10239,10 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
             logger.warning(f"Trials verdict: log_event failed for '{title}': {e}")
         logger.info(f"Trials verdict for '{title}': {new_status}")
 
-        # On FAIL, re-dispatch to implantation with Emperor's feedback so next cycle knows what went wrong
+        # On FAIL: do NOT auto-re-implant — wait for Emperor to engage in the thread.
+        # The old behavior created infinite implant → trial → fail → re-implant loops.
         if not is_pass:
-            source = await _read_note_property(note_path, "source") or "re-implant"
-            logger.info(f"Trials failed for '{title}': re-dispatching to implantation with Emperor feedback")
-            asyncio.create_task(run_implantation(
-                note_path=note_path,
-                title=title,
-                note_type=note_type,
-                source=source,
-                skip_trials=False,
-                emperor_feedback=emperor_response,
-            ))
+            logger.info(f"Trials failed for '{title}': awaiting Emperor feedback in thread (no auto-re-implant)")
 
     except Exception as e:
         logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
@@ -10219,7 +10549,18 @@ IMPLANTATION_ROLES = {
         "max_tokens": 512,
     },
     "query_generator": {
-        "system": "You are a research strategist. Given a note title and content, generate 12 diverse web search queries that would help research this topic thoroughly. Include: direct queries, related concepts, opposing viewpoints, practical applications, recent news, and technical deep-dives. Return ONLY the queries, one per line, no numbering or bullets.",
+        "system": (
+            "You are a research strategist for the Imperium of Claude — an agent orchestration system "
+            "built with Claude Code, Obsidian vaults, Discord bots, tmux, and Python/FastAPI. "
+            "Given a note title, its gene-seed content, and existing vault context, generate 12 diverse "
+            "web search queries that would help research this topic thoroughly. "
+            "CRITICAL: Ground your queries in the ACTUAL domain of the note. If the title contains words "
+            "that have multiple meanings (e.g., 'aspirant', 'pipeline', 'vault', 'fleet', 'guard'), use "
+            "the gene-seed content and vault context to determine the correct domain. DO NOT generate "
+            "queries about unrelated domains (industrial pipelines, military aspirants, bank vaults, etc.). "
+            "Include: direct queries, related technical concepts, implementation patterns, recent developments, "
+            "and deep-dives. Return ONLY the queries, one per line, no numbering or bullets."
+        ),
         "max_tokens": 512,
     },
     "consolidator": {
