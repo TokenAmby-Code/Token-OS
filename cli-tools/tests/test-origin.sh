@@ -83,6 +83,19 @@ _reset_origin
 IMPERIUM_MACHINE=mac
 assert_eq "fallback.no_tmux_with_explicit_machine" "mac" "$(origin_machine)"
 
+# Bare SSH shell (no tmux): SSH_CONNECTION env drives resolution
+_reset_origin
+SSH_CONNECTION='100.66.10.74 44321 100.95.109.23 22'
+assert_eq "bare_ssh.wsl_client" "wsl" "$(origin_machine)"
+
+_reset_origin
+SSH_CONNECTION='100.102.92.24 50001 100.95.109.23 22'
+assert_eq "bare_ssh.phone_client" "phone" "$(origin_machine)"
+
+_reset_origin
+SSH_CONNECTION='192.168.1.50 12345 100.95.109.23 22'
+assert_eq "bare_ssh.unknown_client" "unknown" "$(origin_machine)"
+
 # ============================================================
 # _origin_machine_from_ip (pure mapping)
 # ============================================================

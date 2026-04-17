@@ -26,6 +26,8 @@ _IMPERIUM_ORIGIN_LOADED=1
 # Get the tmux client PID for the invoking client, or empty if not in tmux.
 _origin_client_pid() {
     [[ -n "${1:-}" ]] && { echo "$1"; return; }
+    # No tmux context at all → no client_pid
+    [[ -z "${TMUX:-}" && -z "${TMUX_PANE:-}" ]] && return
     tmux display-message -p '#{client_pid}' 2>/dev/null || true
 }
 
@@ -95,45 +97,53 @@ _origin_machine_from_ip() {
 
 # Resolve the machine that invoked this action.
 # Usage: origin_machine [client_pid]
+#
+# Three transport paths:
+#   1. tmux — walk client_pid up to sshd ancestor, read remote peer IP
+#   2. bare SSH (no tmux) — read SSH_CONNECTION from current env
+#   3. local shell — fall back to $IMPERIUM_MACHINE (self)
 origin_machine() {
-    # 1. Env override
+    # Env override wins over everything
     if [[ -n "${IMPERIUM_ORIGIN_MACHINE:-}" ]]; then
         echo "$IMPERIUM_ORIGIN_MACHINE"
         return 0
     fi
 
-    local client_pid
+    local client_pid cache_file=""
     client_pid=$(_origin_client_pid "${1:-}")
 
-    # No tmux context → invocation is local to the current machine.
-    if [[ -z "$client_pid" ]]; then
-        echo "${IMPERIUM_MACHINE:-unknown}"
-        return 0
-    fi
-
-    # 2. Cache
-    local cache_file
-    cache_file=$(_origin_cache_path "$client_pid" machine)
-    if [[ -r "$cache_file" ]]; then
-        cat "$cache_file"
-        return 0
-    fi
-
-    # 3. Live resolution
-    local sshd_pid peer_ip resolved
-    if sshd_pid=$(_origin_find_sshd_ancestor "$client_pid"); then
-        peer_ip=$(_origin_ssh_peer_ip "$sshd_pid")
-        if [[ -n "$peer_ip" ]]; then
-            resolved=$(_origin_machine_from_ip "$peer_ip")
-        else
-            resolved="unknown"
+    # Cache only applies when we have a stable client_pid
+    if [[ -n "$client_pid" ]]; then
+        cache_file=$(_origin_cache_path "$client_pid" machine)
+        if [[ -r "$cache_file" ]]; then
+            cat "$cache_file"
+            return 0
         fi
+    fi
+
+    local resolved
+    if [[ -n "$client_pid" ]]; then
+        # tmux context: walk process tree for sshd ancestor
+        local sshd_pid peer_ip
+        if sshd_pid=$(_origin_find_sshd_ancestor "$client_pid"); then
+            peer_ip=$(_origin_ssh_peer_ip "$sshd_pid")
+            if [[ -n "$peer_ip" ]]; then
+                resolved=$(_origin_machine_from_ip "$peer_ip")
+            else
+                resolved="unknown"
+            fi
+        else
+            resolved="${IMPERIUM_MACHINE:-unknown}"
+        fi
+    elif [[ -n "${SSH_CONNECTION:-}" ]]; then
+        # Bare SSH shell (no tmux): SSH_CONNECTION="<client_ip> <client_port> <server_ip> <server_port>"
+        local peer_ip="${SSH_CONNECTION%% *}"
+        resolved=$(_origin_machine_from_ip "$peer_ip")
     else
-        # No sshd ancestor → local client on the tmux server's machine
+        # Local shell on this machine
         resolved="${IMPERIUM_MACHINE:-unknown}"
     fi
 
-    # Best-effort cache write
     [[ -n "$cache_file" ]] && echo "$resolved" > "$cache_file" 2>/dev/null
     echo "$resolved"
 }
