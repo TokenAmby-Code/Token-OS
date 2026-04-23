@@ -41,6 +41,7 @@ from session_doc_helpers import (
     update_frontmatter, read_frontmatter,
     create_session_doc_file, _update_doc_agents_list,
 )
+from enforcement_service import close_distraction_windows
 
 logger = logging.getLogger("token_api")
 
@@ -765,7 +766,7 @@ async def handle_session_end(payload: dict) -> dict:
     # Handle productivity enforcement if needed
     result = {"success": True, "action": "stopped", "instance_id": session_id}
     if remaining_active == 0 and DESKTOP_STATE.get("current_mode") == "video":
-        enforce_result = _main().close_distraction_windows()
+        enforce_result = close_distraction_windows()
         result["enforcement_triggered"] = True
         result["enforcement_result"] = enforce_result
 
