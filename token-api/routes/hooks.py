@@ -813,7 +813,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
     exited_idle = TimerEvent.MODE_CHANGED in result.events
     if exited_idle:
         new_mode = shared.timer_engine.current_mode.value
-        await _main().timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
+        await shared.timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
         logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
 
     # Golden Throne: cancel any pending follow-up (user is active)

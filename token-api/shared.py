@@ -293,3 +293,40 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
 # instead of reaching back through the _main() lazy import.
 timer_engine = None   # token_api.timer.TimerEngine
 scheduler = None      # apscheduler.schedulers.asyncio.AsyncIOScheduler
+
+
+# ============ Timer Analytics ============
+
+def _sync_log_shift(old_mode, new_mode: str, trigger: str, source: str,
+                    phone_app=None, details=None):
+    """Log a timer mode shift to the analytics table (sync, for thread offload)."""
+    import sqlite3
+    from datetime import datetime as _dt
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+    )
+    active_instances = cursor.fetchone()[0]
+
+    conn.execute(
+        """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
+           break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
+         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
+         timer_engine.total_work_time_ms, active_instances, phone_app, details)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_log_shift(old_mode, new_mode: str, trigger: str, source: str,
+                          phone_app=None, details=None):
+    """Log a timer mode shift to the analytics table (async wrapper)."""
+    import asyncio
+    try:
+        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
+    except Exception as e:
+        print(f"TIMER: Failed to log shift: {e}")
