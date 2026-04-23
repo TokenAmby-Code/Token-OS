@@ -42,6 +42,7 @@ from session_doc_helpers import (
     create_session_doc_file, _update_doc_agents_list,
 )
 from enforcement_service import close_distraction_windows
+from phone_service import _send_to_phone, send_pavlok_stimulus, check_instance_count_pavlok
 
 logger = logging.getLogger("token_api")
 
@@ -746,7 +747,7 @@ async def handle_session_end(payload: dict) -> dict:
 
     # Instance count Pavlok signals (skip subagents)
     if not is_subagent:
-        await _main().check_instance_count_pavlok(remaining_non_sub, was_active)
+        await check_instance_count_pavlok(remaining_non_sub, was_active)
 
     # Spawn stop_hook.py to generate transcript + wikilink (session doc or daily note fallback)
     if not is_subagent:
@@ -1082,7 +1083,7 @@ async def handle_stop(payload: dict) -> dict:
         }
         if tts_text:
             notify_params["tts_text"] = tts_text[:300]
-        phone_result = await asyncio.to_thread(_main()._send_to_phone, "/notify", notify_params)
+        phone_result = await asyncio.to_thread(_send_to_phone, "/notify", notify_params)
         result["notification"] = phone_result
         logger.info(f"Hook: Stop {session_id[:12]}... -> mobile v3 notify ({len(tts_text or '')} chars)")
         return result
@@ -1114,7 +1115,7 @@ async def handle_stop(payload: dict) -> dict:
 
     # Pavlok vibe notification (skip for subagents)
     if not instance.get("is_subagent"):
-        vibe_result = _main().send_pavlok_stimulus(
+        vibe_result = send_pavlok_stimulus(
             stimulus_type="vibe",
             value=30,
             reason="claude_finished",
@@ -1208,7 +1209,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                         f"**Question:** {q_text}"
                     ))
                     # Also phone notify so Emperor knows to check Discord
-                    asyncio.create_task(asyncio.to_thread(_main()._send_to_phone, "/notify", {
+                    asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
                         "vibe": 40,
                         "tts_text": f"Claude is asking a question in Discord.",
                         "banner_text": q_parts[0][:80],
@@ -1221,7 +1222,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         if questions:
             q_text = questions[0].get("question", "")[:200]
             if q_text:
-                asyncio.create_task(asyncio.to_thread(_main()._send_to_phone, "/notify", {
+                asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
                     "vibe": 40,
                     "beep": 30,
                     "tts_text": f"Claude is asking: {q_text}",
@@ -1410,4 +1411,3 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         logger.error(f"Hook handler error ({action_type}): {e}")
         await log_event("hook_error", details={"action_type": action_type, "error": str(e)})
         return {"success": False, "action": "handler_error", "error": str(e)}
-
