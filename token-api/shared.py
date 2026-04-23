@@ -127,6 +127,41 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+# Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
+PHONE_TTS_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 2,
+    "reachable": None,          # True/False/None (unknown)
+    "last_health_check": 0,
+    "health_check_ttl": 30,     # Re-probe phone every 30s
+}
+
+
+def is_phone_reachable() -> bool:
+    """Check if the phone's MacroDroid HTTP server is reachable. Cached with 30s TTL."""
+    import requests
+
+    now = time.time()
+    if (PHONE_TTS_CONFIG["reachable"] is not None
+            and now - PHONE_TTS_CONFIG["last_health_check"] < PHONE_TTS_CONFIG["health_check_ttl"]):
+        return PHONE_TTS_CONFIG["reachable"]
+
+    host = PHONE_TTS_CONFIG["host"]
+    port = PHONE_TTS_CONFIG["port"]
+    try:
+        resp = requests.get(f"http://{host}:{port}/notify", params={"ping": "1"}, timeout=2)
+        available = resp.status_code == 200
+    except Exception:
+        available = False
+
+    PHONE_TTS_CONFIG["reachable"] = available
+    PHONE_TTS_CONFIG["last_health_check"] = now
+    if available:
+        logger.info("TTS: Phone reachable for TTS routing")
+    return available
+
+
 # ============ Desktop State ============
 
 DESKTOP_STATE = {
@@ -147,6 +182,30 @@ DESKTOP_STATE = {
     # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
     "in_meeting": False,
 }
+
+
+# ============ Voice Chat & Dictation State ============
+# These live in shared.py so both main.py and routes/voice.py can access them.
+
+# Voice chat state — tracks which instances are in voice conversation mode
+VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
+
+# Global dictation state — tracks whether Wispr Flow is currently active
+# Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
+#             voice-select-other (explicit on/off during voice chat)
+DICTATION_STATE = {"active": False, "updated_at": None}
+
+# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
+PEDAL_STATE = {
+    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
+    "enter_queued": False,          # enter waiting for dictation buffer to expire
+    "queued_task": None,            # asyncio.Task for delayed enter send
+    "bypass_active": False,         # single-tap bypass window after buffered enter
+    "bypass_start": 0.0,           # when bypass window started
+}
+PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
+PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
+PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
 
 
 # ============ Discord ============

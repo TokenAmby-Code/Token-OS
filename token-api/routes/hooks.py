@@ -1085,8 +1085,8 @@ async def handle_pre_tool_use(payload: dict) -> dict:
             if tts_parts:
                 tts_message = " ".join(tts_parts)
                 try:
-                    await queue_tts(session_id, tts_message)
-                    logger.info(f"PreToolUse: Voice chat TTS queued for {session_id[:12]}: {tts_message[:80]}")
+                    await queue_tts(session_id, tts_message, queue_target="hot")
+                    logger.info(f"PreToolUse: Voice chat TTS queued (hot) for {session_id[:12]}: {tts_message[:80]}")
                 except Exception as e:
                     logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
 
