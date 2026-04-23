@@ -30,9 +30,16 @@ from shared import (
     get_next_available_profile,
     DESKTOP_STATE, DISCORD_DAEMON_URL,
     log_event,
+    VOICE_CHAT_SESSIONS,
+    resolve_device_from_ip,
+    is_subagent_pid,
 )
+from timer import TimerEvent
 from routes.tts import queue_tts, play_sound
-from session_doc_helpers import update_frontmatter, read_frontmatter
+from session_doc_helpers import (
+    update_frontmatter, read_frontmatter,
+    create_session_doc_file, _update_doc_agents_list,
+)
 
 logger = logging.getLogger("token_api")
 
@@ -154,11 +161,58 @@ async def handle_session_start(payload: dict) -> dict:
     client_ip = payload.get("_client_ip")
     if not source_ip:
         source_ip = client_ip
-    device_id = _main().resolve_device_from_ip(client_ip) if client_ip else "Mac-Mini"
+    device_id = resolve_device_from_ip(client_ip) if client_ip else "Mac-Mini"
 
     # Detect primarch (env var) and transplant-from (file-based handoff injected by hook)
     primarch_name = env.get("TOKEN_API_PRIMARCH", "")
     transplant_from = payload.get("transplant_from", "")
+    launcher = payload.get("launcher") or env.get("TOKEN_API_LAUNCHER", "")
+    engine = payload.get("engine") or env.get("TOKEN_API_ENGINE", "")
+    dispatch_target = payload.get("dispatch_target") or env.get("TOKEN_API_DISPATCH_TARGET", "")
+    dispatch_window = payload.get("dispatch_window") or env.get("TOKEN_API_DISPATCH_WINDOW", "")
+    dispatch_mode = payload.get("dispatch_mode") or env.get("TOKEN_API_DISPATCH_MODE", "")
+    dispatch_slot = payload.get("dispatch_slot") or env.get("TOKEN_API_DISPATCH_SLOT", "")
+    dispatch_session_doc_path = payload.get("dispatch_session_doc_path") or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", "")
+    target_working_dir = payload.get("target_working_dir") or env.get("TOKEN_API_TARGET_WORKING_DIR", "")
+    launch_mode = payload.get("launch_mode") or env.get("TOKEN_API_LAUNCH_MODE", "")
+    transplant_expected_raw = payload.get("transplant_expected")
+    if transplant_expected_raw is None:
+        transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
+    transplant_expected = str(transplant_expected_raw).lower() in {"1", "true", "yes"}
+
+    async def _resolve_dispatch_session_doc(db) -> int | None:
+        """Resolve or create the explicitly dispatched session doc."""
+        if not dispatch_session_doc_path:
+            return None
+
+        fp = Path(dispatch_session_doc_path)
+        if not fp.is_absolute():
+            fp = Path(DEFAULT_SESSIONS_DIR.parent.parent) / dispatch_session_doc_path
+
+        fp = fp.resolve()
+        if not fp.exists():
+            logger.warning(f"Dispatch session doc path does not exist: {fp}")
+            return None
+
+        cursor = await db.execute(
+            "SELECT id FROM session_documents WHERE file_path = ?",
+            (str(fp),)
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return existing[0]
+
+        fm, _ = await asyncio.to_thread(read_frontmatter, fp)
+        doc_title = fm.get("title") or fp.stem.replace("-", " ")
+        doc_project = fm.get("project")
+        doc_status = fm.get("status") or "active"
+        now_ts = datetime.now().isoformat()
+        cursor = await db.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (doc_title, str(fp), doc_project, doc_status, now_ts, now_ts)
+        )
+        return cursor.lastrowid
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -423,7 +477,18 @@ async def handle_session_start(payload: dict) -> dict:
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id = None
-        if primarch_name:
+        dispatch_bound_doc = False
+
+        if dispatch_session_doc_path:
+            session_doc_id = await _resolve_dispatch_session_doc(db)
+            dispatch_bound_doc = session_doc_id is not None
+            if session_doc_id:
+                await db.execute(
+                    "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+                    (session_doc_id, session_id)
+                )
+
+        if primarch_name and not dispatch_bound_doc:
             cursor = await db.execute(
                 "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
                 (primarch_name,)
@@ -470,7 +535,7 @@ async def handle_session_start(payload: dict) -> dict:
                             (doc_title, str(fp), None, cron_job_id, now_ts, now_ts)
                         )
                         session_doc_id = cursor.lastrowid
-                        _main().create_session_doc_file(fp, doc_title, session_doc_id)
+                        create_session_doc_file(fp, doc_title, session_doc_id)
                         auto_created_doc = True
             else:
                 # Interactive sessions: create doc with "{cwd_basename} {date}"
@@ -488,7 +553,7 @@ async def handle_session_start(payload: dict) -> dict:
                     (doc_title, str(fp), None, now_ts, now_ts)
                 )
                 session_doc_id = cursor.lastrowid
-                _main().create_session_doc_file(fp, doc_title, session_doc_id)
+                create_session_doc_file(fp, doc_title, session_doc_id)
                 auto_created_doc = True
 
             if session_doc_id:
@@ -529,7 +594,7 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Update frontmatter if we linked a session doc
         if session_doc_id:
-            await _main()._update_doc_agents_list(db, session_doc_id)
+            await _update_doc_agents_list(db, session_doc_id)
 
             # Populate start_time and pool in session doc frontmatter
             cursor = await db.execute(
@@ -548,11 +613,29 @@ async def handle_session_start(payload: dict) -> dict:
                         fm_updates["primarch"] = primarch_name
                     await asyncio.to_thread(update_frontmatter, fp, fm_updates)
 
-    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}{f' [legion:{auto_legion}]' if auto_legion else ''}")
+    logger.info(
+        f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})"
+        f"{' [subagent]' if is_subagent else ''}"
+        f"{f' [primarch:{primarch_name}]' if primarch_name else ''}"
+        f"{f' [legion:{auto_legion}]' if auto_legion else ''}"
+        f"{f' [launcher:{launcher}]' if launcher else ''}"
+        f"{f' [dispatch:{dispatch_target}]' if dispatch_target else ''}"
+    )
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
                     details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
                              "is_subagent": is_subagent, "subagent_env": subagent_env or None,
-                             "primarch": primarch_name or None})
+                             "primarch": primarch_name or None,
+                             "launcher": launcher or None,
+                             "engine": engine or None,
+                             "dispatch_target": dispatch_target or None,
+                             "dispatch_window": dispatch_window or None,
+                             "dispatch_mode": dispatch_mode or None,
+                             "dispatch_slot": dispatch_slot or None,
+                             "dispatch_session_doc_path": dispatch_session_doc_path or None,
+                             "target_working_dir": target_working_dir or None,
+                             "launch_mode": launch_mode or None,
+                             "transplant_expected": transplant_expected,
+                             "dispatch_bound_doc": dispatch_bound_doc})
 
     return {
         "success": True,
@@ -726,7 +809,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
     now_ms = int(time.monotonic() * 1000)
     old_mode = _main().timer_engine.current_mode.value
     result = _main().timer_engine.set_productivity(True, now_ms)
-    exited_idle = _main().TimerEvent.MODE_CHANGED in result.events
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
     if exited_idle:
         new_mode = _main().timer_engine.current_mode.value
         await _main().timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
@@ -897,7 +980,7 @@ async def handle_stop(payload: dict) -> dict:
     # ── Subagent detection: skip all notifications for subagents ──
     # DB flag covers subagent-CLI spawned instances; PID check covers Task tool subagents.
     pid = payload.get("pid")
-    is_subagent_instance = bool(instance.get("is_subagent")) or bool(pid and _main().is_subagent_pid(pid))
+    is_subagent_instance = bool(instance.get("is_subagent")) or bool(pid and is_subagent_pid(pid))
     if is_subagent_instance:
         result["action"] = "stop_processed_subagent"
         logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
@@ -1071,7 +1154,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Voice chat: when AskUserQuestion fires for a voice-chat-active instance,
     # 1) TTS the question text so the user hears it spoken
     # 2) trigger AHK to auto-select "Other" and start dictation
-    if tool_name == "AskUserQuestion" and session_id and session_id in _main().VOICE_CHAT_SESSIONS:
+    if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
         # Extract and speak question text
         questions = tool_input.get("questions", [])
         if questions:
@@ -1090,7 +1173,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
 
         # Return local_exec so generic-hook.sh runs AHK on WSL
         # voice-send-keys.ahk uses tmux send-keys — no WinActivate needed
-        vc_session = _main().VOICE_CHAT_SESSIONS.get(session_id, {})
+        vc_session = VOICE_CHAT_SESSIONS.get(session_id, {})
         tmux_pane = vc_session.get("tmux_pane", "")
         pane_arg = f' "{tmux_pane}"' if tmux_pane else ""
         logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]} (pane: {tmux_pane or 'default'})")
@@ -1131,7 +1214,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                     logger.info(f"PreToolUse: AskUserQuestion posted to Discord #{discord_channel} for {session_id[:12]}")
 
     # Phone notification for AskUserQuestion (non-voice-chat, non-discord-hosted instances)
-    if tool_name == "AskUserQuestion" and session_id and session_id not in _main().VOICE_CHAT_SESSIONS and not _ask_handled_by_discord:
+    if tool_name == "AskUserQuestion" and session_id and session_id not in VOICE_CHAT_SESSIONS and not _ask_handled_by_discord:
         questions = tool_input.get("questions", [])
         if questions:
             q_text = questions[0].get("question", "")[:200]
@@ -1325,5 +1408,4 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         logger.error(f"Hook handler error ({action_type}): {e}")
         await log_event("hook_error", details={"action_type": action_type, "error": str(e)})
         return {"success": False, "action": "handler_error", "error": str(e)}
-
 

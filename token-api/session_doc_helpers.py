@@ -10,6 +10,7 @@ All Obsidian note interactions should go through this module.
 import asyncio
 import logging
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -283,3 +284,76 @@ async def async_obsidian_append(vault: str, path: str, content: str) -> bool:
 async def async_obsidian_create(vault: str, path: str, content: str) -> bool:
     """Create a new note via obsidian CLI (async)."""
     return await asyncio.to_thread(obsidian_create, vault, path, content)
+
+
+# ============ Session Doc File Management ============
+
+def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None) -> None:
+    """Create the markdown file for a session document."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    project_line = f"\nproject: {project}" if project else ""
+    primarch_line = f"\nprimarch: {primarch_name}" if primarch_name else ""
+    content = f"""---
+session_doc_id: {doc_id}
+created: {today}{project_line}
+agents: []
+instance_ids: []{primarch_line}
+status: active
+type: session
+start_time: null
+end_time: null
+duration_minutes: null
+pool: null
+legion: null
+faction: null
+victory_conditions: []
+victory: pending
+victory_reason: null
+deliverables: []
+instance_type: one_off
+zealotry: 4
+---
+
+# Session: {title}
+
+## Plan
+
+_No plan defined yet._
+
+## Activity Log
+
+"""
+    file_path.write_text(content)
+
+
+async def _update_doc_agents_list(db, doc_id: int) -> None:
+    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
+    cursor = await db.execute(
+        "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
+        (doc_id,)
+    )
+    rows = await cursor.fetchall()
+    agents = [r[1] for r in rows if r[1]]
+    instance_ids = [r[0] for r in rows if r[0]]
+
+    cursor = await db.execute("SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
+    doc_row = await cursor.fetchone()
+    if not doc_row:
+        return
+
+    fp = Path(doc_row[0])
+    if not fp.exists():
+        return
+
+    primarch_name = doc_row[1]
+
+    updates = {
+        "agents": agents,
+        "instance_ids": instance_ids,
+    }
+    if primarch_name:
+        updates["primarch"] = primarch_name
+    delete_keys = ["primarch"] if not primarch_name else None
+
+    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
