@@ -54,6 +54,7 @@ from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
     format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
 )
+import shared
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR, SERVER_PORT,
     CRASH_LOG_PATH, STASH_DIR, STASH_MAX_AGE_HOURS,
@@ -219,6 +220,7 @@ LEGION_PANE_COLORS = {
 scheduler = AsyncIOScheduler(
     jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH.parent / "apscheduler.db"}')}
 )
+shared.scheduler = scheduler
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
@@ -3083,6 +3085,7 @@ VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gy
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
+shared.timer_engine = timer_engine
 
 
 def reset_idle_timer():
