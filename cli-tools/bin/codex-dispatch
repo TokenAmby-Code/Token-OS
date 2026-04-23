@@ -144,9 +144,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+BYPASS_FLAG=""
+if [[ "${CODEX_DANGEROUS_BYPASS:-1}" == "1" ]]; then
+  BYPASS_FLAG="--dangerously-bypass-approvals-and-sandbox"
+else
+  BYPASS_FLAG="--full-auto"
+fi
+
 if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
   OUTPUT_FILE="/tmp/codex-${SESSION_ID}.md"
-  codex exec "$PROMPT" -C "$WORKING_DIR" --full-auto --json -o "$OUTPUT_FILE"
+  codex exec "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
 else
-  codex "$PROMPT" -C "$WORKING_DIR" --full-auto
+  codex "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
 fi
