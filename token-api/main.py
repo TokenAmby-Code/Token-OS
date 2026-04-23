@@ -77,6 +77,10 @@ from phone_service import (
     _send_to_phone,
     send_pavlok_stimulus,
     check_instance_count_pavlok,
+    TWITTER_ZAP_COOLDOWN_FILE,
+    TWITTER_ZAP_COOLDOWN_SECS,
+    _persist_twitter_zap_cooldown,
+    _restore_twitter_zap_cooldown,
 )
 from routes.tts import (
     router as tts_router,
@@ -3381,9 +3385,6 @@ async def append_daily_note(request: DailyNoteAppendRequest):
     return {"ok": True, "date": today, "appended_chars": len(block)}
 
 
-TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
-TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
-
 # ============ Enforcement Cascade v3 ============
 # Server-driven escalation. Phone executes v3 param-based endpoints.
 # Fallback chain: phone /enforce|/notify → server-side Pavlok API → Discord webhook.
@@ -3419,31 +3420,7 @@ ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
 DISCORD_FALLBACK_TIMEOUT = 30      # 30s to wait for app_close via Discord
 
 
-def _persist_twitter_zap_cooldown():
-    """Write twitter zap wall-clock time to file so it survives restarts."""
-    try:
-        TWITTER_ZAP_COOLDOWN_FILE.write_text(str(time.time()))
-    except Exception as e:
-        print(f"WARN: Failed to persist twitter zap cooldown: {e}")
-
-
-def _restore_twitter_zap_cooldown():
-    """On startup, restore twitter zap cooldown from file.
-    If a zap happened less than 30 min ago, set twitter_zapped=True to block phantom opens."""
-    try:
-        if TWITTER_ZAP_COOLDOWN_FILE.exists():
-            last_zap_wall = float(TWITTER_ZAP_COOLDOWN_FILE.read_text().strip())
-            elapsed = time.time() - last_zap_wall
-            if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
-                PHONE_STATE["twitter_zapped"] = True
-                PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
-                print(f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked.")
-            else:
-                print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
-                TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
-    except Exception as e:
-        print(f"WARN: Failed to restore twitter zap cooldown: {e}")
-
+# [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
 
 # Shizuku restart state
 SHIZUKU_STATE = {
@@ -4136,40 +4113,7 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
         logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
 
-# ============ Phone v3 Endpoints ============
-
-def _send_to_phone(endpoint: str, params: dict) -> dict:
-    """Send v3 params to phone's MacroDroid HTTP endpoint.
-
-    Args:
-        endpoint: "/notify", "/enforce", or "/zap"
-        params: v3 query params (vibe, beep, zap, tts_text, banner_text, etc.)
-
-    Returns dict with success status. On failure, caller should fall back to
-    server-side Pavlok API or Discord webhook.
-    """
-    host = PHONE_CONFIG["host"]
-    port = PHONE_CONFIG["port"]
-    timeout = PHONE_CONFIG["timeout"]
-    url = f"http://{host}:{port}{endpoint}"
-
-    try:
-        response = requests.get(url, params=params, timeout=timeout)
-        PHONE_STATE["reachable"] = True
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE v3: {endpoint} params={params} -> {response.status_code}")
-        return {"success": response.status_code == 200, "status_code": response.status_code}
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-        PHONE_STATE["reachable"] = False
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE v3: {endpoint} UNREACHABLE: {e}")
-        return {"success": False, "error": type(e).__name__}
-    except Exception as e:
-        PHONE_STATE["reachable"] = False
-        print(f"PHONE v3: {endpoint} ERROR: {e}")
-        return {"success": False, "error": str(e)}
-
-
+# [MOVED to phone_service.py] — _send_to_phone
 
 # Wire TTS route dependencies
 from routes.tts import init_deps as tts_init_deps

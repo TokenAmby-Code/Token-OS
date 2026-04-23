@@ -6,11 +6,13 @@ without reaching back through the _main() lazy import.
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 import requests
 
 from shared import (
+    DB_PATH,
     PHONE_CONFIG,
     PHONE_STATE,
     PAVLOK_CONFIG,
@@ -20,7 +22,36 @@ from shared import (
 
 logger = logging.getLogger("token_api")
 
+TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
+TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
+
 _last_widget_push = {"mode": None, "active": None}
+
+
+def _persist_twitter_zap_cooldown():
+    """Write twitter zap wall-clock time to file so it survives restarts."""
+    try:
+        TWITTER_ZAP_COOLDOWN_FILE.write_text(str(time.time()))
+    except Exception as e:
+        print(f"WARN: Failed to persist twitter zap cooldown: {e}")
+
+
+def _restore_twitter_zap_cooldown():
+    """On startup, restore twitter zap cooldown from file.
+    If a zap happened less than 30 min ago, set twitter_zapped=True to block phantom opens."""
+    try:
+        if TWITTER_ZAP_COOLDOWN_FILE.exists():
+            last_zap_wall = float(TWITTER_ZAP_COOLDOWN_FILE.read_text().strip())
+            elapsed = time.time() - last_zap_wall
+            if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
+                PHONE_STATE["twitter_zapped"] = True
+                PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
+                print(f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked.")
+            else:
+                print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
+                TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"WARN: Failed to restore twitter zap cooldown: {e}")
 
 
 def push_phone_widget(mode: str, active_count: int):
