@@ -208,6 +208,56 @@ PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before
 PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
 
 
+# ============ Device Resolution ============
+
+DEVICE_IPS = {
+    "100.102.92.24": "Token-S24",    # Phone
+    "100.69.198.87": "TokenPC",      # Windows PC
+    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
+    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
+    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
+}
+
+LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
+
+
+def resolve_device_from_ip(ip: str) -> str:
+    """Map Tailscale IPs to known devices."""
+    return DEVICE_IPS.get(ip, "unknown")
+
+
+def is_local_device(device_id: str) -> bool:
+    """Check if device_id refers to a machine where we can manage processes locally."""
+    return device_id in LOCAL_DEVICES
+
+
+# ============ Process Utilities ============
+
+def is_pid_claude(pid: int) -> bool:
+    """Check if the given PID belongs to a claude process."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() == "claude"
+    except (OSError, PermissionError):
+        return False
+
+
+def get_parent_pid(pid: int) -> Optional[int]:
+    """Get the parent PID of a process from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+            return int(fields[3])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_subagent_pid(pid: int) -> bool:
+    """Return True if this claude process was spawned by another claude process."""
+    parent = get_parent_pid(pid)
+    return bool(parent and parent != 1 and is_pid_claude(parent))
+
+
 # ============ Discord ============
 
 DISCORD_DAEMON_URL = "http://127.0.0.1:7779"

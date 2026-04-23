@@ -38,7 +38,10 @@ import tempfile
 import requests
 import httpx
 from pydantic import BaseModel, Field
-from session_doc_helpers import update_frontmatter, update_victory_frontmatter
+from session_doc_helpers import (
+    update_frontmatter, update_victory_frontmatter,
+    create_session_doc_file, _update_doc_agents_list,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.interval import IntervalTrigger
@@ -62,6 +65,8 @@ from shared import (
     DISCORD_DAEMON_URL,
     VOICE_CHAT_SESSIONS, DICTATION_STATE,
     PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
+    DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device,
+    is_pid_claude, get_parent_pid, is_subagent_pid,
 )
 from routes.tts import (
     router as tts_router,
@@ -194,16 +199,7 @@ def _asyncio_exception_handler(loop, context):
 # Install global exception handlers
 sys.excepthook = _global_exception_handler
 
-# Device IP mapping for SSH detection
-DEVICE_IPS = {
-    "100.102.92.24": "Token-S24",    # Phone
-    "100.69.198.87": "TokenPC",      # Windows PC
-    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
-    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
-    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
-}
-
-# [MOVED to shared.py / routes/tts.py] — was: # Voice pool: foreign-accent voices are the primar
+# [MOVED to shared.py] — DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device
 
 
 # ── Legion Pane Recolor ──────────────────────────────────────
@@ -530,21 +526,7 @@ async def get_db():
 
 # [MOVED to shared.py / routes/tts.py] — was: async def log_event(event_type: str, instance_id: 
 
-def resolve_device_from_ip(ip: str) -> str:
-    """Map Tailscale IPs to known devices."""
-    return DEVICE_IPS.get(ip, "unknown")
-
-
-# Devices where we can inspect local PIDs, send signals, etc.
-LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
-
-
-def is_local_device(device_id: str) -> bool:
-    """Check if device_id refers to a machine where we can manage processes locally."""
-    return device_id in LOCAL_DEVICES
-
-
-# [MOVED to shared.py / routes/tts.py] — was: def get_next_available_profile(used_wsl_voices: se
+# [MOVED to shared.py] — resolve_device_from_ip, LOCAL_DEVICES, is_local_device
 
 # ============ Scheduled Task System ============
 
@@ -1280,29 +1262,7 @@ async def find_claude_pid_by_workdir(working_dir: str) -> Optional[int]:
     return None
 
 
-def is_pid_claude(pid: int) -> bool:
-    """Check if the given PID belongs to a claude process."""
-    try:
-        with open(f"/proc/{pid}/comm", "r") as f:
-            return f.read().strip() == "claude"
-    except (OSError, PermissionError):
-        return False
-
-
-def get_parent_pid(pid: int) -> Optional[int]:
-    """Get the parent PID of a process from /proc/<pid>/stat."""
-    try:
-        with open(f"/proc/{pid}/stat", "r") as f:
-            fields = f.read().split()
-            return int(fields[3])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def is_subagent_pid(pid: int) -> bool:
-    """Return True if this claude process was spawned by another claude process."""
-    parent = get_parent_pid(pid)
-    return bool(parent and parent != 1 and is_pid_claude(parent))
+# [MOVED to shared.py] — is_pid_claude, get_parent_pid, is_subagent_pid
 
 
 @app.post("/api/instances/{instance_id}/kill")
@@ -10710,75 +10670,7 @@ async def get_all_primarchs_from_db(db) -> list:
     return result
 
 
-def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None) -> None:
-    """Create the markdown file for a session document."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
-    project_line = f"\nproject: {project}" if project else ""
-    primarch_line = f"\nprimarch: {primarch_name}" if primarch_name else ""
-    content = f"""---
-session_doc_id: {doc_id}
-created: {today}{project_line}
-agents: []
-instance_ids: []{primarch_line}
-status: active
-type: session
-start_time: null
-end_time: null
-duration_minutes: null
-pool: null
-legion: null
-faction: null
-victory_conditions: []
-victory: pending
-victory_reason: null
-deliverables: []
-instance_type: one_off
-zealotry: 4
----
-
-# Session: {title}
-
-## Plan
-
-_No plan defined yet._
-
-## Activity Log
-
-"""
-    file_path.write_text(content)
-
-
-async def _update_doc_agents_list(db, doc_id: int) -> None:
-    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
-    cursor = await db.execute(
-        "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
-        (doc_id,)
-    )
-    rows = await cursor.fetchall()
-    agents = [r[1] for r in rows if r[1]]
-    instance_ids = [r[0] for r in rows if r[0]]
-
-    cursor = await db.execute("SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
-    doc_row = await cursor.fetchone()
-    if not doc_row:
-        return
-
-    fp = Path(doc_row[0])
-    if not fp.exists():
-        return
-
-    primarch_name = doc_row[1]
-
-    updates = {
-        "agents": agents,
-        "instance_ids": instance_ids,
-    }
-    if primarch_name:
-        updates["primarch"] = primarch_name
-    delete_keys = ["primarch"] if not primarch_name else None
-
-    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
+# [MOVED to session_doc_helpers.py] — create_session_doc_file, _update_doc_agents_list
 
 
 async def _handle_orphan_doc(doc_id: int) -> None:
