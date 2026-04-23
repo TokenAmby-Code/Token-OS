@@ -19,6 +19,7 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/claude-dispatch"
+CODEX_DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/codex-dispatch"
 IMPERIUM_ROOT="${IMPERIUM:-/Volumes/Imperium}"
 CIVIC_ROOT="${CIVIC:-/Volumes/Civic}"
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
@@ -132,10 +133,37 @@ create_worktree() {
 }
 
 # =============================================================================
-# Step 2: Persona selector
+# Step 2: Engine selector
+# =============================================================================
+select_engine() {
+    local options=(
+        "Claude — interactive AI assistant"
+        "Codex — autonomous coding agent"
+    )
+
+    local selected
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
+        --prompt="Engine > " \
+        --header="Select launch engine" \
+        --height=~6 \
+        --layout=reverse \
+        --no-info \
+        --cycle); then
+        return 130
+    fi
+
+    case "$selected" in
+        Claude*) echo "claude" ;;
+        Codex*)  echo "codex" ;;
+        *)       echo "claude" ;;
+    esac
+}
+
+# =============================================================================
+# Step 3: Persona selector (Claude only)
 # =============================================================================
 select_persona() {
-    local options=("None (vanilla claude)")
+    local options=("None")
 
     if [[ -f "$DB_PATH" ]] && command -v sqlite3 &>/dev/null; then
         while IFS=$'\t' read -r name title; do
@@ -146,7 +174,7 @@ select_persona() {
     local selected
     if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Persona > " \
-        --header="Select persona (or None for vanilla)" \
+        --header="Select persona (or None for default Claude)" \
         --height=~15 \
         --layout=reverse \
         --no-info \
@@ -162,7 +190,7 @@ select_persona() {
 }
 
 # =============================================================================
-# Step 3: Mode selector
+# Step 4: Mode selector (Claude only)
 # =============================================================================
 select_mode() {
     local options=(
@@ -249,13 +277,35 @@ case "$SELECTED" in
         ;;
 esac
 
-# Step 2: Persona
+# Step 2: Engine
+if ! ENGINE=$(select_engine); then
+    echo "Cancelled."
+    exit 130
+fi
+
+if [[ "$ENGINE" == "codex" ]]; then
+    # Codex path — no persona/mode, dispatch directly to target dir
+    CODEX_DIR="${TRANSPLANT_DIR:-$LAUNCH_VAULT}"
+
+    echo ""
+    echo -e "${DIM}Launching:${NC}"
+    echo -e "  ${DIM}engine:${NC}    codex"
+    echo -e "  ${DIM}dir:${NC}       $CODEX_DIR"
+    echo ""
+
+    clear
+    exec "$CODEX_DISPATCH_BIN" --launcher "claude-launcher" "$CODEX_DIR" ""
+fi
+
+# Claude path — continue with persona + mode selectors
+
+# Step 3: Persona
 if ! PERSONA=$(select_persona); then
     echo "Cancelled."
     exit 130
 fi
 
-# Step 3: Mode
+# Step 4: Mode
 if ! MODE=$(select_mode); then
     echo "Cancelled."
     exit 130
@@ -280,6 +330,7 @@ esac
 # Summary
 echo ""
 echo -e "${DIM}Launching:${NC}"
+echo -e "  ${DIM}engine:${NC}    claude"
 echo -e "  ${DIM}vault:${NC}     $LAUNCH_VAULT"
 [[ -n "$TRANSPLANT_DIR" ]] && echo -e "  ${DIM}target:${NC}    $TRANSPLANT_DIR"
 [[ -n "$PERSONA" ]]        && echo -e "  ${DIM}persona:${NC}   $PERSONA"
