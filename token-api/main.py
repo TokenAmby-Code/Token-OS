@@ -97,6 +97,7 @@ from routes.tts import (
 from routes.voice import router as voice_router
 from routes.hooks import (
     router as hooks_router,
+    init_deps as hooks_init_deps,
     HookResponse, PreToolUseResponse,
     _post_tool_debounce, _pending_background_tasks, _recently_nudged,
     NUDGE_COOLDOWN_SECONDS,
@@ -1846,7 +1847,7 @@ class LogsResponse(BaseModel):
 
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
-    """Rename an instance's tab_name. Also updates linked session doc title.
+    """Rename an instance's tab_name. Auto-generated docs may mirror the title.
 
     Enforces kebab-case: strips ✳ artifacts, lowercases, converts spaces to
     hyphens, removes non-alphanumeric chars, truncates to 4 words.
@@ -1863,7 +1864,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
+            "SELECT id, tab_name, session_doc_id, session_doc_policy FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
@@ -1873,13 +1874,15 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
 
         old_name = row[1]
         session_doc_id = row[2]
+        session_doc_policy = row[3]
         await db.execute(
             "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
             (request.tab_name, instance_id)
         )
 
-        # Also update session doc title if linked
-        if session_doc_id:
+        # Only auto-generated per-instance docs should mirror renames.
+        session_doc_updated = bool(session_doc_id and session_doc_policy in {"interactive_auto", "cron_created"})
+        if session_doc_updated:
             now = datetime.now().isoformat()
             await db.execute(
                 "UPDATE session_documents SET title = ?, updated_at = ? WHERE id = ?",
@@ -1893,7 +1896,8 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         "instance_renamed",
         instance_id=instance_id,
         details={"old_name": old_name, "new_name": request.tab_name,
-                 "session_doc_updated": bool(session_doc_id)}
+                 "session_doc_updated": session_doc_updated,
+                 "session_doc_policy": session_doc_policy}
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
@@ -10747,7 +10751,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
 
         # Assign
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_assigned' WHERE id = ?",
             (doc_id, instance_id)
         )
         await db.commit()
@@ -10796,7 +10800,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
 
         # Assign to instance
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_created' WHERE id = ?",
             (doc_id, instance_id)
         )
         await db.commit()
@@ -10829,7 +10833,7 @@ async def unassign_doc_from_instance(instance_id: str):
             return {"instance_id": instance_id, "unassigned": False, "reason": "No doc was assigned"}
 
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = NULL WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = NULL, session_doc_policy = NULL WHERE id = ?",
             (instance_id,)
         )
         await db.commit()
@@ -11372,6 +11376,16 @@ async def get_state():
             "pending_window": sorted(pending_windows),
         },
     }
+
+
+# Wire hook-route dependencies after hook-owned callbacks are defined.
+hooks_init_deps(
+    scheduler=scheduler,
+    timer_engine=shared.timer_engine,
+    timer_log_shift=shared.timer_log_shift,
+    run_stop_evaluators=_run_stop_evaluators,
+    auto_name_instance=_auto_name_instance,
+)
 
 
 if __name__ == "__main__":

@@ -69,6 +69,17 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
             ("instance_type", "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'"),
+            ("launcher", "ALTER TABLE claude_instances ADD COLUMN launcher TEXT"),
+            ("engine", "ALTER TABLE claude_instances ADD COLUMN engine TEXT"),
+            ("dispatch_target", "ALTER TABLE claude_instances ADD COLUMN dispatch_target TEXT"),
+            ("dispatch_window", "ALTER TABLE claude_instances ADD COLUMN dispatch_window TEXT"),
+            ("dispatch_mode", "ALTER TABLE claude_instances ADD COLUMN dispatch_mode TEXT"),
+            ("dispatch_slot", "ALTER TABLE claude_instances ADD COLUMN dispatch_slot TEXT"),
+            ("dispatch_session_doc_path", "ALTER TABLE claude_instances ADD COLUMN dispatch_session_doc_path TEXT"),
+            ("target_working_dir", "ALTER TABLE claude_instances ADD COLUMN target_working_dir TEXT"),
+            ("launch_mode", "ALTER TABLE claude_instances ADD COLUMN launch_mode TEXT"),
+            ("transplant_expected", "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0"),
+            ("session_doc_policy", "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT"),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
