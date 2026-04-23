@@ -190,6 +190,7 @@ if [[ -n "$TARGET_PANE" ]]; then
     echo -e "${GREEN}+${NC} Dispatched to pane $TARGET_PANE"
 else
     # Local shell dispatch — exec into claude
+    clear
     cd "$WORK_DIR"
 
     if [[ -n "$FULL_PROMPT" ]]; then
