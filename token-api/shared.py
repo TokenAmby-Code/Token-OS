@@ -285,3 +285,11 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
             (event_type, instance_id, device_id, json.dumps(details) if details else None)
         )
         await db.commit()
+
+
+# ============ App Singletons ============
+# Set by main.py after module-level initialization.
+# hooks.py and other route modules import via `import shared; shared.timer_engine.xxx`
+# instead of reaching back through the _main() lazy import.
+timer_engine = None   # token_api.timer.TimerEngine
+scheduler = None      # apscheduler.schedulers.asyncio.AsyncIOScheduler

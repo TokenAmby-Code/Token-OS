@@ -24,6 +24,7 @@ from typing import Optional
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+import shared
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR,
     PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
@@ -733,7 +734,7 @@ async def handle_session_end(payload: dict) -> dict:
 
     # Golden Throne: cancel any pending follow-up (session terminated)
     try:
-        _main().scheduler.remove_job(f"golden-throne-{session_id}")
+        shared.scheduler.remove_job(f"golden-throne-{session_id}")
         logger.info(f"Golden Throne: cancelled follow-up for {session_id[:12]} (session end)")
     except Exception:
         pass
@@ -807,17 +808,17 @@ async def handle_prompt_submit(payload: dict) -> dict:
 
     # Signal productivity — sets prod active, exits IDLE if needed
     now_ms = int(time.monotonic() * 1000)
-    old_mode = _main().timer_engine.current_mode.value
-    result = _main().timer_engine.set_productivity(True, now_ms)
+    old_mode = shared.timer_engine.current_mode.value
+    result = shared.timer_engine.set_productivity(True, now_ms)
     exited_idle = TimerEvent.MODE_CHANGED in result.events
     if exited_idle:
-        new_mode = _main().timer_engine.current_mode.value
+        new_mode = shared.timer_engine.current_mode.value
         await _main().timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
         logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
 
     # Golden Throne: cancel any pending follow-up (user is active)
     try:
-        _main().scheduler.remove_job(f"golden-throne-{session_id}")
+        shared.scheduler.remove_job(f"golden-throne-{session_id}")
         logger.info(f"Golden Throne: cancelled follow-up for {session_id[:12]} (user prompt)")
     except Exception:
         pass
@@ -857,7 +858,7 @@ async def handle_post_tool_use(payload: dict) -> dict:
 
     # Signal productivity — active tool use = real work
     now_ms = int(time.monotonic() * 1000)
-    _main().timer_engine.set_productivity(True, now_ms)
+    shared.timer_engine.set_productivity(True, now_ms)
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
