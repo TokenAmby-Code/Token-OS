@@ -163,7 +163,14 @@ select_engine() {
 # Step 3: Persona selector (Claude only)
 # =============================================================================
 select_persona() {
-    local options=("None")
+    local engine="${1:-claude}"
+    local default_label="Astartes"
+
+    if [[ "$engine" == "codex" ]]; then
+        default_label="Sisters of Battle"
+    fi
+
+    local options=("$default_label")
 
     if [[ -f "$DB_PATH" ]] && command -v sqlite3 &>/dev/null; then
         while IFS=$'\t' read -r name title; do
@@ -174,7 +181,7 @@ select_persona() {
     local selected
     if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Persona > " \
-        --header="Select persona (or None for default Claude)" \
+        --header="Select persona" \
         --height=~15 \
         --layout=reverse \
         --no-info \
@@ -182,7 +189,7 @@ select_persona() {
         return 130
     fi
 
-    if [[ "$selected" == "None"* ]]; then
+    if [[ "$selected" == "$default_label" ]]; then
         echo ""
     else
         echo "$selected" | cut -d' ' -f1
@@ -300,7 +307,7 @@ fi
 # Claude path — continue with persona + mode selectors
 
 # Step 3: Persona
-if ! PERSONA=$(select_persona); then
+if ! PERSONA=$(select_persona "$ENGINE"); then
     echo "Cancelled."
     exit 130
 fi
