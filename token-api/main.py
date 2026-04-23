@@ -3776,39 +3776,8 @@ async def check_instance_count_pavlok(remaining_active: int, was_active: int):
 # ============ Timer I/O Functions ============
 
 
-def _sync_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
-                    phone_app: str | None = None, details: str | None = None):
-    """Log a timer mode shift to the analytics table (sync, for thread offload)."""
-    import sqlite3
-    from datetime import datetime as _dt
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    # Get active non-subagent instance count
-    cursor = conn.execute(
-        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
-    )
-    active_instances = cursor.fetchone()[0]
-
-    conn.execute(
-        """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
-           break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
-         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
-         timer_engine.total_work_time_ms, active_instances, phone_app, details)
-    )
-    conn.commit()
-    conn.close()
-
-
-async def timer_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
-                          phone_app: str | None = None, details: str | None = None):
-    """Log a timer mode shift to the analytics table (async wrapper)."""
-    try:
-        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
-    except Exception as e:
-        print(f"TIMER: Failed to log shift: {e}")
+# [MOVED to shared.py] — _sync_log_shift, timer_log_shift
+from shared import _sync_log_shift, timer_log_shift
 
 
 def _sync_generate_daily_analytics(date_str: str):
