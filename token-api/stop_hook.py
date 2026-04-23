@@ -750,7 +750,7 @@ def main():
     print(f"[info] Transcript ~{tokens_est} tokens ({len(transcript)} chars)", file=sys.stderr)
 
     # Mutex: cron instances must be explicitly marked stopped
-    if instance and str(instance.get("spawner", "")).startswith("cron:"):
+    if instance and instance.get("origin_type") == "cron":
         mark_cron_instance_stopped(session_id)
 
     tab_name = instance.get("tab_name", session_id[:8]) if instance else session_id[:8]

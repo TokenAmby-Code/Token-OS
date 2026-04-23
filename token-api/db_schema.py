@@ -81,7 +81,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END""")
 
         # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
+        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "is_processing"}
         drop_targets = dead_columns & columns
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")

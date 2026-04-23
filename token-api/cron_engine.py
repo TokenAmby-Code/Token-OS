@@ -654,15 +654,16 @@ class CronEngine:
     async def _check_instance_mutex(self, job: dict) -> bool:
         """Return True if no live claude instance exists for this job.
 
-        Cron workers tag their instance with spawner='cron:<job_name>' via
-        TOKEN_API_SUBAGENT. If a previous run's instance is still alive
-        (status != 'stopped'), skip this run to avoid pileup.
+        Checks via session_documents.cron_job_id join (spawner column was dropped).
+        If a previous run's instance is still alive (status != 'stopped'), skip this
+        run to avoid pileup.
         """
-        spawner_prefix = f"cron:{job['name']}"
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM claude_instances WHERE spawner LIKE ? AND status != 'stopped'",
-                (f"{spawner_prefix}%",),
+                """SELECT COUNT(*) FROM claude_instances ci
+                   JOIN session_documents sd ON ci.session_doc_id = sd.id
+                   WHERE sd.cron_job_id = ? AND ci.status != 'stopped'""",
+                (job["id"],),
             )
             count = (await cursor.fetchone())[0]
         if count > 0:
