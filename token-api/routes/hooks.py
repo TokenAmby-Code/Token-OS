@@ -139,7 +139,6 @@ async def handle_session_start(payload: dict) -> dict:
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
     is_subagent = 1 if subagent_env else 0
-    spawner = subagent_env or None
 
     # Capture tmux pane for Golden Throne transport and cross-machine dispatch
     # Claude Code strips $TMUX_PANE from hook env, so also check top-level payload
@@ -148,7 +147,7 @@ async def handle_session_start(payload: dict) -> dict:
 
     # Auto-name subagents
     if is_subagent and not payload.get("env", {}).get("CLAUDE_TAB_NAME"):
-        tab_name = f"sub: {spawner}"
+        tab_name = f"sub: {subagent_env or 'agent'}"
 
     # Resolve device_id from HTTP client IP (where the instance actually runs)
     # SSH_CLIENT gives the SSH origin (Mac), not the instance's machine (WSL)
@@ -397,10 +396,10 @@ async def handle_session_start(payload: dict) -> dict:
             """INSERT INTO claude_instances
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
-                is_subagent, spawner, tmux_pane, primarch,
+                is_subagent, tmux_pane, primarch,
                 discord_hosted, discord_channel,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 internal_session_id,
@@ -414,7 +413,6 @@ async def handle_session_start(payload: dict) -> dict:
                 profile["notification_sound"],
                 payload.get("pid"),
                 is_subagent,
-                spawner,
                 tmux_pane,
                 primarch_name or None,
                 _prior_discord_hosted,
@@ -553,7 +551,7 @@ async def handle_session_start(payload: dict) -> dict:
     logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}{f' [legion:{auto_legion}]' if auto_legion else ''}")
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
                     details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
-                             "is_subagent": is_subagent, "spawner": spawner,
+                             "is_subagent": is_subagent, "subagent_env": subagent_env or None,
                              "primarch": primarch_name or None})
 
     return {
