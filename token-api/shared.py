@@ -162,6 +162,49 @@ def is_phone_reachable() -> bool:
     return available
 
 
+# ============ Phone / Pavlok State ============
+
+PHONE_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 5,
+    # === TEST SHIM - REMOVE AFTER TESTING ===
+    # Set to True to bypass break time check and force blocking
+    "test_force_block": False,
+    # =========================================
+}
+
+PHONE_STATE = {
+    "current_app": None,  # Current distraction app or None
+    "last_activity": None,
+    "is_distracted": False,
+    "reachable": None,  # Last known reachability status
+    "last_reachable_check": None,
+    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
+    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
+    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
+    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
+}
+
+PHONE_HEARTBEAT = {
+    "last_seen": None,      # datetime (UTC) or None
+    "device_id": None,
+    "alert_state": None,    # None, "beep", "zap"
+}
+
+PAVLOK_CONFIG = {
+    "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
+    "token": os.getenv("PAVLOK_API_TOKEN"),
+    "enabled": True,
+    "cooldown_seconds": 30,
+    "default_zap_value": 50,
+}
+
+PAVLOK_STATE = {
+    "last_stimulus_at": None,
+}
+
+
 # ============ Desktop State ============
 
 DESKTOP_STATE = {

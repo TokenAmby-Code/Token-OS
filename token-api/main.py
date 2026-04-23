@@ -61,6 +61,8 @@ from shared import (
     PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
     get_next_available_profile,
     DESKTOP_CONFIG, TTS_BACKEND, TTS_GLOBAL_MODE, DESKTOP_STATE,
+    PHONE_CONFIG, PHONE_STATE, PHONE_HEARTBEAT,
+    PAVLOK_CONFIG, PAVLOK_STATE,
     is_satellite_tts_available,
     log_event, log_event_sync,
     DISCORD_DAEMON_URL,
@@ -68,6 +70,13 @@ from shared import (
     PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
     DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device,
     is_pid_claude, get_parent_pid, is_subagent_pid,
+)
+from phone_service import (
+    push_phone_widget,
+    push_phone_widget_async,
+    _send_to_phone,
+    send_pavlok_stimulus,
+    check_instance_count_pavlok,
 )
 from routes.tts import (
     router as tts_router,
@@ -3372,69 +3381,6 @@ async def append_daily_note(request: DailyNoteAppendRequest):
     return {"ok": True, "date": today, "appended_chars": len(block)}
 
 
-# Phone HTTP server config (MacroDroid on phone via Tailscale)
-PHONE_CONFIG = {
-    "host": "100.102.92.24",
-    "port": 7777,
-    "timeout": 5,
-    # === TEST SHIM - REMOVE AFTER TESTING ===
-    # Set to True to bypass break time check and force blocking
-    "test_force_block": False,
-    # =========================================
-}
-
-# Last widget state pushed to phone (dedup)
-_last_widget_push = {"mode": None, "active": None}
-
-
-def push_phone_widget(mode: str, active_count: int):
-    """Push timer mode + active instance count to phone MacroDroid widget endpoint.
-
-    Only pushes if the state actually changed (deduped via _last_widget_push).
-    Runs synchronously via requests (fire-and-forget from async via create_task + to_thread).
-    """
-    if _last_widget_push["mode"] == mode and _last_widget_push["active"] == active_count:
-        return  # no change
-
-    host = PHONE_CONFIG["host"]
-    port = PHONE_CONFIG["port"]
-    timeout = PHONE_CONFIG["timeout"]
-    url = f"http://{host}:{port}/widget-update?mode={mode}&instances={active_count}"
-
-    try:
-        response = requests.get(url, timeout=timeout)
-        _last_widget_push["mode"] = mode
-        _last_widget_push["active"] = active_count
-        print(f"WIDGET: Pushed mode={mode} instances={active_count} -> {response.status_code}")
-    except Exception as e:
-        print(f"WIDGET: Push failed: {e}")
-
-
-async def push_phone_widget_async(mode: str, active_count: int):
-    """Async wrapper for push_phone_widget."""
-    await asyncio.to_thread(push_phone_widget, mode, active_count)
-
-
-# Phone activity state (tracks current app from MacroDroid)
-PHONE_STATE = {
-    "current_app": None,  # Current distraction app or None
-    "last_activity": None,
-    "is_distracted": False,
-    "reachable": None,  # Last known reachability status
-    "last_reachable_check": None,
-    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
-    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
-    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
-    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
-}
-
-# Phone heartbeat state (absence-of-signal detection)
-PHONE_HEARTBEAT = {
-    "last_seen": None,      # datetime (UTC) or None
-    "device_id": None,
-    "alert_state": None,    # None, "beep", "zap"
-}
-
 TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
 TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
 
@@ -3677,100 +3623,6 @@ def parse_macrodroid_trigger(raw: str) -> dict:
 def parse_macrodroid_trigger_app(raw: str) -> str:
     parsed = parse_macrodroid_trigger(raw)
     return parsed.get("app", parsed.get("raw", ""))
-
-
-# ============ Pavlok Shock Watch ============
-PAVLOK_CONFIG = {
-    "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
-    "token": os.getenv("PAVLOK_API_TOKEN"),
-    "enabled": True,
-    "cooldown_seconds": 30,
-    "default_zap_value": 50,
-}
-
-PAVLOK_STATE = {
-    "last_stimulus_at": None,
-}
-
-
-def send_pavlok_stimulus(
-    stimulus_type: str = "zap",
-    value: int | None = None,
-    reason: str = "manual",
-    respect_cooldown: bool = True,
-) -> dict:
-    """Send a stimulus (zap/beep/vibe) to the Pavlok watch."""
-    if not PAVLOK_CONFIG["token"]:
-        return {"skipped": True, "reason": "no_token", "hint": "Set PAVLOK_API_TOKEN in .env"}
-    if not PAVLOK_CONFIG["enabled"]:
-        return {"skipped": True, "reason": "disabled"}
-
-    now = datetime.now()
-    if respect_cooldown and PAVLOK_STATE["last_stimulus_at"]:
-        last = datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
-        elapsed = (now - last).total_seconds()
-        if elapsed < PAVLOK_CONFIG["cooldown_seconds"]:
-            return {"skipped": True, "reason": "cooldown", "remaining": round(PAVLOK_CONFIG["cooldown_seconds"] - elapsed)}
-
-    if value is None:
-        value = PAVLOK_CONFIG["default_zap_value"]
-
-    try:
-        response = requests.post(
-            PAVLOK_CONFIG["api_url"],
-            headers={"Authorization": PAVLOK_CONFIG["token"]},
-            json={"stimulus": {"stimulusType": stimulus_type, "stimulusValue": value}},
-            timeout=10,
-        )
-        PAVLOK_STATE["last_stimulus_at"] = now.isoformat()
-        print(f"PAVLOK: {stimulus_type} value={value} reason={reason} -> {response.status_code}")
-        return {
-            "success": response.status_code == 200,
-            "type": stimulus_type,
-            "value": value,
-            "reason": reason,
-            "status_code": response.status_code,
-        }
-    except requests.exceptions.Timeout:
-        print(f"PAVLOK: Timeout sending {stimulus_type}")
-        return {"success": False, "error": "timeout", "reason": reason}
-    except requests.exceptions.ConnectionError:
-        print(f"PAVLOK: Connection error sending {stimulus_type}")
-        return {"success": False, "error": "connection_error", "reason": reason}
-    except Exception as e:
-        print(f"PAVLOK: Error sending {stimulus_type}: {e}")
-        return {"success": False, "error": str(e), "reason": reason}
-
-
-async def check_instance_count_pavlok(remaining_active: int, was_active: int):
-    """Send Pavlok signals when Claude instance count drops critically.
-
-    - Drops to 1 (from 2+): double vibe as warning
-    - Drops to 0: zap as penalty
-    Skips if was_active was already at or below threshold (no regression).
-    Phone-first, server-side Pavlok API fallback.
-    """
-    if remaining_active == 1 and was_active >= 2:
-        print(f"INSTANCE COUNT: Dropped to 1 (from {was_active}), double vibe")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 50, "banner_text": f"1 Claude remaining (was {was_active})",
-        })
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
-        await asyncio.sleep(3)
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {"vibe": 50})
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
-        await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
-    elif remaining_active == 0 and was_active >= 1:
-        print(f"INSTANCE COUNT: All Claude instances stopped, zap")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 80, "beep": 50, "tts_text": "All Claude instances stopped",
-            "banner_text": "All Claudes stopped",
-        })
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="zap", value=50, reason="all_claudes_stopped", respect_cooldown=False)
-        await log_event("instance_count_zero", details={"was": was_active})
 
 
 # ============ Timer I/O Functions ============
