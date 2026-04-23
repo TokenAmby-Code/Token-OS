@@ -20,6 +20,7 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/claude-dispatch"
 IMPERIUM_ROOT="${IMPERIUM:-/Volumes/Imperium}"
+CIVIC_ROOT="${CIVIC:-/Volumes/Civic}"
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
 
 # --- Colors ---
@@ -43,8 +44,8 @@ select_target() {
     local options=()
 
     # Vault-only options (no transplant — stay in vault)
-    options+=("Imperium-ENV (vault only)")
-    [[ -d "${IMPERIUM_ROOT}/Pax-ENV" ]] && options+=("Pax-ENV (vault only)")
+    options+=("Imperium-ENV")
+    [[ -d "${CIVIC_ROOT}/Pax-ENV" ]] && options+=("Pax-ENV")
 
     # Worktree creation options
     options+=("+ New Token-OS worktree")
@@ -59,13 +60,13 @@ select_target() {
             [[ -d "$wt/.git" || -f "$wt/.git" ]] || continue
             local branch
             branch=$(basename "$wt")
-            options+=("$wt ($project_name/$branch)")
+            options+=("$project_name/$branch")
         done
     done
 
     # NAS project dirs (Token-OS, askCivic source)
     [[ -d "${IMPERIUM_ROOT}/Token-OS" ]] && options+=("${IMPERIUM_ROOT}/Token-OS (NAS)")
-    [[ -d "/Volumes/Civic/askCivic" ]] && options+=("/Volumes/Civic/askCivic (NAS)")
+    [[ -d "${CIVIC_ROOT}/askCivic" ]] && options+=("${CIVIC_ROOT}/askCivic (NAS)")
 
     # Recent working dirs from token-api
     local api_url="${TOKEN_API_URL:-http://localhost:7777}"
@@ -92,13 +93,15 @@ except: pass
     done <<< "$recent_dirs"
 
     local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Target > " \
         --header="Where should the agent work? (transplant target)" \
         --height=~20 \
         --layout=reverse \
         --no-info \
-        --cycle) || { echo ""; return; }
+        --cycle); then
+        return 130
+    fi
 
     echo "$selected"
 }
@@ -141,13 +144,15 @@ select_persona() {
     fi
 
     local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Persona > " \
         --header="Select persona (or None for vanilla)" \
         --height=~15 \
         --layout=reverse \
         --no-info \
-        --cycle) || { echo ""; return; }
+        --cycle); then
+        return 130
+    fi
 
     if [[ "$selected" == "None"* ]]; then
         echo ""
@@ -167,13 +172,15 @@ select_mode() {
     )
 
     local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Mode > " \
         --header="Select launch mode" \
         --height=~8 \
         --layout=reverse \
         --no-info \
-        --cycle) || { echo "normal"; return; }
+        --cycle); then
+        return 130
+    fi
 
     case "$selected" in
         Normal*)          echo "normal" ;;
@@ -191,7 +198,7 @@ resolve_vault() {
     # Pax-ENV or askCivic targets launch from Pax-ENV
     case "$target" in
         *Pax-ENV*|*askCivic*|*/Civic/*)
-            echo "${IMPERIUM_ROOT}/Pax-ENV"
+            echo "${CIVIC_ROOT}/Pax-ENV"
             ;;
         *)
             echo "${IMPERIUM_ROOT}/Imperium-ENV"
@@ -203,26 +210,26 @@ resolve_vault() {
 # Main
 # =============================================================================
 
+clear
 echo -e "${CYAN}${BOLD}Claude Launcher${NC}"
 echo ""
 
 # Step 1: Transplant target
-SELECTED=$(select_target)
-if [[ -z "$SELECTED" ]]; then
+if ! SELECTED=$(select_target); then
     echo "Cancelled."
-    exit 0
+    exit 130
 fi
 
 # Handle special selections
 TRANSPLANT_DIR=""
 case "$SELECTED" in
-    "Imperium-ENV (vault only)")
+    "Imperium-ENV")
         TRANSPLANT_DIR=""  # No transplant — stay in vault
         LAUNCH_VAULT="${IMPERIUM_ROOT}/Imperium-ENV"
         ;;
-    "Pax-ENV (vault only)")
+    "Pax-ENV")
         TRANSPLANT_DIR=""
-        LAUNCH_VAULT="${IMPERIUM_ROOT}/Pax-ENV"
+        LAUNCH_VAULT="${CIVIC_ROOT}/Pax-ENV"
         ;;
     "+ New Token-OS worktree")
         TRANSPLANT_DIR=$(create_worktree "Token-OS") || exit 1
@@ -230,20 +237,29 @@ case "$SELECTED" in
         ;;
     "+ New askCivic worktree")
         TRANSPLANT_DIR=$(create_worktree "askCivic") || exit 1
-        LAUNCH_VAULT="${IMPERIUM_ROOT}/Pax-ENV"
+        LAUNCH_VAULT="${CIVIC_ROOT}/Pax-ENV"
         ;;
     *)
-        # Extract path from "path (label)" format
-        TRANSPLANT_DIR=$(echo "$SELECTED" | sed 's/ ([^)]*) *$//')
+        if [[ "$SELECTED" == */* && "$SELECTED" != /* ]]; then
+            TRANSPLANT_DIR="$HOME/worktrees/$SELECTED"
+        else
+            TRANSPLANT_DIR=$(echo "$SELECTED" | sed 's/ ([^)]*) *$//')
+        fi
         LAUNCH_VAULT=$(resolve_vault "$SELECTED")
         ;;
 esac
 
 # Step 2: Persona
-PERSONA=$(select_persona)
+if ! PERSONA=$(select_persona); then
+    echo "Cancelled."
+    exit 130
+fi
 
 # Step 3: Mode
-MODE=$(select_mode)
+if ! MODE=$(select_mode); then
+    echo "Cancelled."
+    exit 130
+fi
 
 # Build dispatch args — launch dir is always the vault
 DISPATCH_ARGS=("--dir" "$LAUNCH_VAULT")
