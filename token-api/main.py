@@ -18,6 +18,7 @@ import random
 import asyncio
 import functools
 import logging
+import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -2437,36 +2438,8 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
     return False, "not_duplicate"
 
 
-async def _dispatch_custodes_intervention(prompt: str) -> dict:
-    """Inject a state intervention into the live synced Custodes singleton."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND synced = 1
-                 AND status IN ('idle', 'processing')
-               ORDER BY last_activity DESC
-               LIMIT 1"""
-        )
-        row = await cursor.fetchone()
-
-    if not row:
-        logger.info("Custodes state hook: no live synced singleton; suppressing delivery")
-        return {"dispatched": False, "reason": "no_live_custodes_singleton"}
-
-    instance = dict(row)
-    tmux_pane = instance.get("tmux_pane")
-    if not tmux_pane:
-        logger.info(f"Custodes state hook: {instance['id'][:12]} has no tmux pane")
-        return {"dispatched": False, "reason": "no_tmux_pane", "instance_id": instance["id"]}
-
-    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-    if device_id != LOCAL_DEVICE_NAME:
-        logger.info(f"Custodes state hook: synced singleton is remote ({device_id}); v1 suppresses delivery")
-        return {"dispatched": False, "reason": "remote_singleton_suppressed", "instance_id": instance["id"]}
-
+async def _inject_custodes_prompt_to_pane(prompt: str, tmux_pane: str, *, instance_id: str | None = None) -> dict:
+    """Inject a Custodes prompt into a known tmux pane."""
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
@@ -2485,13 +2458,184 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
         if proc.returncode != 0:
             reason = f"claude-cmd failed: rc={proc.returncode}"
             logger.warning(f"Custodes state hook: {reason}: {stderr.decode()[:200]}")
-            return {"dispatched": False, "reason": reason, "instance_id": instance["id"]}
+            return {"dispatched": False, "reason": reason, "instance_id": instance_id, "tmux_pane": tmux_pane}
     except Exception as exc:
         logger.warning(f"Custodes state hook: delivery failed: {exc}")
-        return {"dispatched": False, "reason": f"delivery_failed: {exc}", "instance_id": instance["id"]}
+        return {
+            "dispatched": False,
+            "reason": f"delivery_failed: {exc}",
+            "instance_id": instance_id,
+            "tmux_pane": tmux_pane,
+        }
 
-    logger.info(f"Custodes state hook: delivered to {instance['id'][:12]} pane={tmux_pane}")
-    return {"dispatched": True, "reason": "dispatched", "instance_id": instance["id"], "tmux_pane": tmux_pane}
+    logger.info(f"Custodes state hook: delivered pane={tmux_pane} instance={instance_id or 'unknown'}")
+    return {"dispatched": True, "reason": "dispatched", "instance_id": instance_id, "tmux_pane": tmux_pane}
+
+
+async def _find_custodes_tmux_pane() -> str | None:
+    """Recover a live Custodes pane from tmux when DB singleton tracking is stale."""
+    custodes_bg = LEGION_PANE_COLORS["custodes"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-a",
+            "-F", "#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_bg}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: tmux pane recovery failed: {exc}")
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    candidates: list[str] = []
+    for line in stdout.decode().splitlines():
+        try:
+            pane_id, window_name, current_cmd, pane_bg = line.split("\t", 3)
+        except ValueError:
+            continue
+        cmd_is_claude = (
+            "claude" in current_cmd.lower()
+            or (current_cmd[0:1].isdigit() and "." in current_cmd)
+        )
+        if pane_bg == custodes_bg and cmd_is_claude:
+            candidates.append(pane_id)
+        elif window_name == "legion" and pane_bg == custodes_bg:
+            candidates.append(pane_id)
+
+    return candidates[0] if candidates else None
+
+
+async def _create_custodes_legion_pane() -> str | None:
+    """Create or split the local legion window and return a pane id."""
+    try:
+        exists = await asyncio.create_subprocess_exec(
+            "tmux", "list-windows", "-t", "main", "-F", "#{window_name}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(exists.communicate(), timeout=5)
+        windows = stdout.decode().splitlines() if exists.returncode == 0 else []
+
+        if "legion" in windows:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "split-window", "-t", "main:legion", "-d", "-P", "-F", "#{pane_id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "new-window", "-t", "main", "-n", "legion", "-d", "-P", "-F", "#{pane_id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        pane_stdout, pane_stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            logger.warning(f"Custodes state hook: could not create legion pane: {pane_stderr.decode()[:200]}")
+            return None
+        pane_id = pane_stdout.decode().strip().splitlines()[0]
+
+        await asyncio.create_subprocess_exec(
+            "tmux", "select-layout", "-t", "main:legion", "tiled",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return pane_id
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: legion pane creation failed: {exc}")
+        return None
+
+
+async def _launch_custodes_for_intervention(prompt: str) -> dict:
+    """Launch a new Custodes singleton carrying the missed state-hook prompt."""
+    pane_id = await _create_custodes_legion_pane()
+    if not pane_id:
+        return {"dispatched": False, "reason": "custodes_launch_no_pane"}
+
+    prompt_file = Path(tempfile.gettempdir()) / f"custodes-state-hook-{uuid.uuid4().hex}.md"
+    launch_prompt = (
+        "Custodes state hook fired while no live synced Custodes singleton was registered. "
+        "Register yourself as legion=custodes, instance_type=sync, synced=true, then handle this intervention.\n\n"
+        f"{prompt}"
+    )
+    prompt_file.write_text(launch_prompt)
+    launch_cmd = (
+        f"cd {shlex.quote('/Volumes/Imperium/Imperium-ENV')} && "
+        f"primarch custodes \"$(cat {shlex.quote(str(prompt_file))})\" ; "
+        f"rm -f {shlex.quote(str(prompt_file))}"
+    )
+
+    try:
+        for keys in (["C-c"], ["C-u"], ["clear", "Enter"], [launch_cmd, "Enter"]):
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", pane_id, *keys,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.sleep(0.1)
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: launch failed pane={pane_id}: {exc}")
+        return {"dispatched": False, "reason": f"custodes_launch_failed: {exc}", "tmux_pane": pane_id}
+
+    logger.warning(f"Custodes state hook: launched new Custodes singleton pane={pane_id}")
+    return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": pane_id}
+
+
+async def _dispatch_custodes_intervention(prompt: str) -> dict:
+    """Inject into Custodes, recovering or launching the singleton if needed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = 'custodes'
+                 AND synced = 1
+                 AND status IN ('idle', 'processing')
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane)
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning("Custodes state hook: no live singleton found; launching new Custodes")
+        return await _launch_custodes_for_intervention(prompt)
+
+    instance = dict(row)
+    tmux_pane = instance.get("tmux_pane")
+    if not tmux_pane:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning(f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement")
+        return await _launch_custodes_for_intervention(prompt)
+
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    if device_id != LOCAL_DEVICE_NAME:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning(f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement")
+        return await _launch_custodes_for_intervention(prompt)
+
+    return await _inject_custodes_prompt_to_pane(prompt, tmux_pane, instance_id=instance["id"])
 
 
 async def handle_custodes_state_event(
