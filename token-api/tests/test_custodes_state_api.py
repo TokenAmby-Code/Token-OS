@@ -64,7 +64,19 @@ def _events(event_type):
     return [dict(row) for row in rows]
 
 
-def test_no_live_custodes_logs_event_but_does_not_dispatch(client):
+def test_no_live_custodes_launches_replacement(client, monkeypatch):
+    launches = []
+
+    async def fake_find():
+        return None
+
+    async def fake_launch(prompt):
+        launches.append(prompt)
+        return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": "%9"}
+
+    monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find)
+    monkeypatch.setattr(main, "_launch_custodes_for_intervention", fake_launch)
+
     resp = client.post(
         "/api/custodes/state-event",
         json={"event_type": "idle_timeout", "source": "timer_worker"},
@@ -73,10 +85,40 @@ def test_no_live_custodes_logs_event_but_does_not_dispatch(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["received"] is True
-    assert data["intervention_dispatched"] is False
-    assert data["reason"] == "no_live_custodes_singleton"
+    assert data["intervention_dispatched"] is True
+    assert data["reason"] == "launched_new_custodes"
+    assert len(launches) == 1
     assert len(_events("custodes_state_event")) == 1
     assert len(_events("custodes_intervention")) == 1
+
+
+def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
+    injections = []
+
+    async def fake_find():
+        return "%310"
+
+    async def fake_inject(prompt, tmux_pane, *, instance_id=None):
+        injections.append((prompt, tmux_pane, instance_id))
+        return {"dispatched": True, "reason": "dispatched", "tmux_pane": tmux_pane, "instance_id": instance_id}
+
+    async def fake_launch(prompt):
+        raise AssertionError("should recover pane before launching")
+
+    monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find)
+    monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fake_inject)
+    monkeypatch.setattr(main, "_launch_custodes_for_intervention", fake_launch)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={"event_type": "idle_timeout", "source": "timer_worker"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is True
+    assert data["reason"] == "recovered_tmux_pane"
+    assert injections[0][1] == "%310"
 
 
 def test_live_custodes_dispatches_once(client, monkeypatch):
