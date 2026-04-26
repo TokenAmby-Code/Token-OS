@@ -54,6 +54,12 @@ from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
     format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
 )
+from custodes_state_policy import (
+    StateEvent,
+    evaluate_state_event,
+    build_dedupe_key,
+    normalize_severity,
+)
 import shared
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR, SERVER_PORT,
@@ -312,6 +318,14 @@ class TaskExecutionResponse(BaseModel):
     duration_ms: Optional[int]
     result: Optional[dict]
     retry_count: int
+
+
+class CustodesStateEventRequest(BaseModel):
+    event_type: str
+    source: str
+    instance_id: Optional[str] = None
+    severity: Optional[int] = None
+    payload: Optional[dict] = None
 
 
 # [MOVED to shared.py / routes/tts.py] — was: class NotifyRequest(BaseModel):
@@ -2359,6 +2373,211 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     return {"nudged": True, "reason": reason[:200]}
 
 
+
+_CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
+_custodes_state_debounce: dict[str, dict] = {}
+
+
+def _custodes_state_snapshot() -> dict:
+    """Small /api/state-style snapshot for Custodes policy prompts."""
+    return {
+        "timer": {
+            "current_mode": timer_engine.current_mode.value,
+            "break_balance_ms": timer_engine.break_balance_ms,
+            "total_work_time_ms": timer_engine.total_work_time_ms,
+        },
+        "phone": {
+            "current_app": PHONE_STATE.get("current_app"),
+            "is_distracted": PHONE_STATE.get("is_distracted", False),
+            "last_activity": PHONE_STATE.get("last_activity"),
+        },
+        "desktop": {
+            "current_mode": DESKTOP_STATE.get("current_mode", "silence"),
+            "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+            "location_zone": DESKTOP_STATE.get("location_zone"),
+        },
+    }
+
+
+async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tuple[bool, str]:
+    """Return (suppressed, reason) using memory plus recent event-log history."""
+    now = time.time()
+    cached = _custodes_state_debounce.get(dedupe_key)
+    if cached and now - cached["at"] < _CUSTODES_STATE_DEBOUNCE_SECONDS:
+        if severity <= cached.get("severity", 1):
+            return True, "memory_debounce"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT details
+               FROM events
+               WHERE event_type = 'custodes_intervention'
+                 AND created_at > datetime('now', '-20 minutes')
+               ORDER BY created_at DESC
+               LIMIT 100"""
+        )
+        rows = await cursor.fetchall()
+
+    for (details_json,) in rows:
+        if not details_json:
+            continue
+        try:
+            details = json.loads(details_json)
+        except Exception:
+            continue
+        if details.get("dedupe_key") != dedupe_key:
+            continue
+        if not (details.get("delivery") or {}).get("dispatched"):
+            continue
+        previous_severity = normalize_severity(details.get("severity"))
+        if severity <= previous_severity:
+            _custodes_state_debounce[dedupe_key] = {"at": now, "severity": previous_severity}
+            return True, "event_log_debounce"
+
+    return False, "not_duplicate"
+
+
+async def _dispatch_custodes_intervention(prompt: str) -> dict:
+    """Inject a state intervention into the live synced Custodes singleton."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = 'custodes'
+                 AND synced = 1
+                 AND status IN ('idle', 'processing')
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        logger.info("Custodes state hook: no live synced singleton; suppressing delivery")
+        return {"dispatched": False, "reason": "no_live_custodes_singleton"}
+
+    instance = dict(row)
+    tmux_pane = instance.get("tmux_pane")
+    if not tmux_pane:
+        logger.info(f"Custodes state hook: {instance['id'][:12]} has no tmux pane")
+        return {"dispatched": False, "reason": "no_tmux_pane", "instance_id": instance["id"]}
+
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    if device_id != LOCAL_DEVICE_NAME:
+        logger.info(f"Custodes state hook: synced singleton is remote ({device_id}); v1 suppresses delivery")
+        return {"dispatched": False, "reason": "remote_singleton_suppressed", "instance_id": instance["id"]}
+
+    try:
+        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        proc = await asyncio.create_subprocess_exec(
+            str(claude_cmd), "--pane", tmux_pane, prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": ":".join([
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ])},
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            reason = f"claude-cmd failed: rc={proc.returncode}"
+            logger.warning(f"Custodes state hook: {reason}: {stderr.decode()[:200]}")
+            return {"dispatched": False, "reason": reason, "instance_id": instance["id"]}
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: delivery failed: {exc}")
+        return {"dispatched": False, "reason": f"delivery_failed: {exc}", "instance_id": instance["id"]}
+
+    logger.info(f"Custodes state hook: delivered to {instance['id'][:12]} pane={tmux_pane}")
+    return {"dispatched": True, "reason": "dispatched", "instance_id": instance["id"], "tmux_pane": tmux_pane}
+
+
+async def handle_custodes_state_event(
+    event_type: str,
+    source: str,
+    *,
+    instance_id: str | None = None,
+    severity: int | None = None,
+    payload: dict | None = None,
+) -> dict:
+    """Internal router for state events that may wake Custodes."""
+    event = StateEvent(
+        event_type=event_type,
+        source=source,
+        instance_id=instance_id,
+        severity=severity,
+        payload=payload or {},
+    )
+    dedupe_key = build_dedupe_key(event)
+    normalized_severity = normalize_severity(severity)
+
+    await log_event("custodes_state_event", instance_id=instance_id, device_id=source, details={
+        "event_type": event_type,
+        "source": source,
+        "severity": normalized_severity,
+        "dedupe_key": dedupe_key,
+        "payload": payload or {},
+    })
+
+    intervention = evaluate_state_event(event, _custodes_state_snapshot())
+    if intervention is None:
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": dedupe_key,
+            "reason": "no_policy_match",
+        }
+
+    suppressed, dedupe_reason = await _custodes_state_dedupe_decision(
+        intervention.dedupe_key,
+        intervention.severity,
+    )
+    if suppressed:
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": intervention.dedupe_key,
+            "reason": dedupe_reason,
+        }
+
+    delivery = await _dispatch_custodes_intervention(intervention.prompt)
+    if delivery.get("dispatched"):
+        _custodes_state_debounce[intervention.dedupe_key] = {
+            "at": time.time(),
+            "severity": intervention.severity,
+        }
+
+    await log_event("custodes_intervention", instance_id=delivery.get("instance_id") or instance_id,
+                    device_id=source, details={
+                        "event_type": intervention.event_type,
+                        "dedupe_key": intervention.dedupe_key,
+                        "severity": intervention.severity,
+                        "prompt": intervention.prompt,
+                        "delivery": delivery,
+                    })
+
+    return {
+        "received": True,
+        "intervention_dispatched": bool(delivery.get("dispatched")),
+        "dedupe_key": intervention.dedupe_key,
+        "reason": delivery.get("reason", intervention.reason),
+    }
+
+
+@app.post("/api/custodes/state-event")
+async def custodes_state_event_endpoint(request: CustodesStateEventRequest):
+    """Internal state-hook ingestion point for immediate Custodes interventions."""
+    return await handle_custodes_state_event(
+        request.event_type,
+        request.source,
+        instance_id=request.instance_id,
+        severity=request.severity,
+        payload=request.payload,
+    )
+
+
 @app.post("/api/instances/{instance_id}/nudge")
 async def nudge_instance_endpoint(instance_id: str, request: Request):
     """Immediate followup — MiniMax escalation path.
@@ -4184,6 +4403,12 @@ async def _enforcement_cascade_worker(app_name: str):
 
     print(f"CASCADE START: app={app_name}")
     await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
+    await handle_custodes_state_event(
+        "enforcement_cascade_started",
+        "phone",
+        severity=2,
+        payload={"app": app_name},
+    )
 
     # Level 0: Discord fallback (soft close)
     await _send_discord_fallback(app_name, 1)
@@ -4578,6 +4803,17 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "enforcement": enforce_result
             }
         )
+        asyncio.create_task(handle_custodes_state_event(
+            "desktop_mode_blocked",
+            "desktop",
+            severity=2,
+            payload={
+                "desktop_mode": detected_mode,
+                "reason": reason,
+                "window_title": window_title,
+                "active_instances": active_count,
+            },
+        ))
 
         raise HTTPException(
             status_code=403,
@@ -4937,6 +5173,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "enforcement": "cascade_started"
             }
         )
+        asyncio.create_task(handle_custodes_state_event(
+            "phone_distraction_blocked",
+            "phone",
+            severity=2,
+            payload={
+                "app": app_name,
+                "phone_app": app_name,
+                "display_name": display_name,
+                "reason": "no_break_no_productivity",
+            },
+        ))
 
         return PhoneActivityResponse(
             allowed=False,
@@ -5115,6 +5362,12 @@ async def handle_break_exhausted():
     """
     result = await enforce_break_exhausted_impl()
     await log_event("break_exhausted_enforcement", details=result)
+    await handle_custodes_state_event(
+        "break_exhausted",
+        "api",
+        severity=2,
+        payload={"break_balance_ms": timer_engine.break_balance_ms, "result": result},
+    )
 
     if not result.get("enforced"):
         return {"enforced": False, "reason": "no_active_distractions"}
@@ -6771,6 +7024,11 @@ async def timer_worker():
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
                     await timer_log_shift("idle", "break", trigger="idle_timeout", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "idle_timeout",
+                        "timer_worker",
+                        payload={"timer_mode": "break"},
+                    ))
                     _current_session_id = await timer_start_session("break", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
@@ -6783,6 +7041,12 @@ async def timer_worker():
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
                     await timer_log_shift("multitasking", "distracted", trigger="distraction_timeout", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "distraction_timeout",
+                        "timer_worker",
+                        severity=2,
+                        payload={"timer_mode": "distracted"},
+                    ))
                     _current_session_id = await timer_start_session("distracted", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
@@ -6801,6 +7065,12 @@ async def timer_worker():
                 elif event == TimerEvent.BREAK_EXHAUSTED:
                     await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
                                          trigger="enforcement", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "break_exhausted",
+                        "timer_worker",
+                        severity=2,
+                        payload={"break_balance_ms": timer_engine.break_balance_ms},
+                    ))
                     asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
                     print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
@@ -7460,7 +7730,7 @@ def _morning_health_check() -> None:
         logger.info(f"Morning health check: status={state['status']}, no action needed")
         return
 
-    # Check if acknowledged_at was set (instance called /api/morning/acknowledge)
+    # Check if acknowledged_at was set by Emperor-origin Discord/API acknowledgement.
     if state.get("acknowledged_at"):
         logger.info("Morning health check: already acknowledged, healthy")
         return
