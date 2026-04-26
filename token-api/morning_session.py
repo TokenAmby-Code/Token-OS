@@ -277,16 +277,13 @@ curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/synced" -H 'C
 
 If registration fails, report it immediately — the harness is broken. Do not silently proceed without custodes identity.
 
-## Acknowledge the Emperor
+## Enforcement Acknowledgement
 
-On your first turn, after verifying registration, acknowledge the morning session so the escalation chain knows you're live:
-```bash
-curl -s -X POST http://localhost:7777/api/morning/acknowledge -H 'Content-Type: application/json' -d '{{}}'
-```
+Do not acknowledge the morning session yourself. The acknowledgement signal is user-originated: the Emperor must answer through Discord voice/text or explicitly call `/api/morning/acknowledge`. Your job is to prompt for that response and continue once it arrives.
 
 ## Your First Message
 
-This is your initial turn — the Emperor is still in bed. After verifying registration and acknowledging, do ALL of the following:
+This is your initial turn — the Emperor is still in bed. After verifying registration, do ALL of the following:
 
 1. **Speak briefing via TTS** (3-5 sentences):
 ```bash
