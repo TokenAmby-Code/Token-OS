@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+tmux-multiprompt - Fan one prompt out to selected, window, or active agent panes.
+
+MVP delivery states:
+  accepted  prompt pasted into pane
+  busy      pane appears to have user input pending
+  rejected  pane/db/target is missing or invalid
+
+Use --dry-run first. Without --dry-run this writes directly into tmux panes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+
+VICTORY_SWEEP_PROMPT = (
+    "Create a status report. What actions are left to take on this task? "
+    "Have we aggressively validated everything we can, including restarting or deploying "
+    "in order to ping live endpoints or use real commands? Is the session doc up to date? "
+    "Are vault references up to date? Are we committed, pushed, and code reviewed? "
+    "If the answer to all of these is yes, look into Ultramar and find the best location "
+    "to interweave this new knowledge, and where to mark the prescriptive tasks complete "
+    "in the daily note or other prescriptive files. After you have found the references, "
+    "assume the Guilliman persona and write the docs. Escalate with me for an official "
+    "declaration of victory."
+)
+
+
+@dataclass(frozen=True)
+class Pane:
+    pane_id: str
+    session: str
+    window: str
+    pane_type: str
+    reserved: str
+    current_command: str
+
+
+@dataclass(frozen=True)
+class Instance:
+    instance_id: str
+    tab_name: str
+    status: str
+    tmux_pane: str
+    legion: str
+
+
+def run_tmux(*args: str, input_text: str | None = None, check: bool = True) -> str:
+    result = subprocess.run(
+        ["tmux", *args],
+        input=input_text,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"tmux {' '.join(args)} failed")
+    return result.stdout
+
+
+def current_pane() -> str:
+    return run_tmux("display-message", "-p", "#{pane_id}").strip()
+
+
+def current_window_target() -> str:
+    return run_tmux("display-message", "-p", "#{session_name}:#{window_index}").strip()
+
+
+def list_panes(target: str | None = None) -> dict[str, Pane]:
+    fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{@PANE_TYPE}\t#{@GRID_RESERVED}\t#{pane_current_command}"
+    args = ["list-panes"]
+    if target:
+        args.extend(["-t", target])
+    else:
+        args.append("-a")
+    args.extend(["-F", fmt])
+    panes: dict[str, Pane] = {}
+    for line in run_tmux(*args).splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6:
+            continue
+        pane_id, session, window, pane_type, reserved, current_command = parts
+        panes[pane_id] = Pane(pane_id, session, window, pane_type, reserved, current_command)
+    return panes
+
+
+def load_instances() -> dict[str, Instance]:
+    if not DB_PATH.exists():
+        return {}
+    query = """
+        SELECT id, COALESCE(tab_name, '') AS tab_name, status,
+               COALESCE(tmux_pane, '') AS tmux_pane, COALESCE(legion, '') AS legion
+        FROM claude_instances
+        WHERE status IN ('idle', 'processing')
+          AND COALESCE(tmux_pane, '') != ''
+          AND COALESCE(is_subagent, 0) = 0
+        ORDER BY last_activity DESC
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query).fetchall()
+    return {
+        row["tmux_pane"]: Instance(
+            instance_id=row["id"],
+            tab_name=row["tab_name"],
+            status=row["status"],
+            tmux_pane=row["tmux_pane"],
+            legion=row["legion"],
+        )
+        for row in rows
+    }
+
+
+def pane_has_input(pane_id: str) -> bool:
+    capture = run_tmux("capture-pane", "-t", pane_id, "-p", check=False)
+    lines = [line.rstrip() for line in capture.splitlines() if line.strip()]
+    if not lines:
+        return False
+    last_line = lines[-1]
+    if re.search(r"^[\s│░▒▓]*>\s*$", last_line):
+        return False
+    if re.search(r"[$%#>❯]\s*$", last_line):
+        return False
+    if not re.search(r"[$%#>❯]", last_line):
+        return False
+    return True
+
+
+def resolve_targets(scope: str, pane_override: str | None = None) -> tuple[list[tuple[Pane, Instance | None]], list[dict]]:
+    panes = list_panes()
+    instances = load_instances()
+    rejected: list[dict] = []
+
+    if pane_override:
+        pane = panes.get(pane_override)
+        if not pane:
+            return [], [{"pane": pane_override, "state": "rejected", "reason": "pane not found"}]
+        return [(pane, instances.get(pane_override))], []
+
+    if scope == "selected":
+        pane_id = current_pane()
+        pane = panes.get(pane_id)
+        if not pane:
+            return [], [{"pane": pane_id, "state": "rejected", "reason": "selected pane not found"}]
+        return [(pane, instances.get(pane_id))], []
+
+    if scope in {"window", "page"}:
+        window_panes = list_panes(current_window_target())
+        targets = []
+        for pane_id, pane in window_panes.items():
+            inst = instances.get(pane_id)
+            if inst:
+                targets.append((pane, inst))
+        return targets, rejected
+
+    if scope in {"all-active", "all"}:
+        targets = []
+        for pane_id, inst in instances.items():
+            pane = panes.get(pane_id)
+            if not pane:
+                rejected.append({
+                    "instance_id": inst.instance_id,
+                    "tab_name": inst.tab_name,
+                    "pane": pane_id,
+                    "state": "rejected",
+                    "reason": "tmux pane not live",
+                })
+                continue
+            if pane.window.startswith("_stash"):
+                rejected.append({
+                    "instance_id": inst.instance_id,
+                    "tab_name": inst.tab_name,
+                    "pane": pane_id,
+                    "state": "rejected",
+                    "reason": "pane is stashed",
+                })
+                continue
+            targets.append((pane, inst))
+        return targets, rejected
+
+    raise ValueError(f"unknown scope: {scope}")
+
+
+def deliver(pane: Pane, prompt: str, *, submit: bool, dry_run: bool, force: bool) -> dict:
+    if pane.reserved == "true" or pane.pane_type in {"tui", "backstop"}:
+        return {"pane": pane.pane_id, "state": "rejected", "reason": f"reserved/{pane.pane_type or 'unknown'} pane"}
+
+    if not force and pane_has_input(pane.pane_id):
+        return {"pane": pane.pane_id, "state": "busy", "reason": "pending input detected"}
+
+    if dry_run:
+        return {"pane": pane.pane_id, "state": "accepted", "reason": "dry-run"}
+
+    buffer_name = f"multiprompt_{os.getpid()}_{pane.pane_id.lstrip('%')}"
+    run_tmux("load-buffer", "-b", buffer_name, "-", input_text=prompt)
+    try:
+        run_tmux("paste-buffer", "-t", pane.pane_id, "-b", buffer_name)
+        if submit:
+            # Codex/Claude Code treat tmux's Enter key name as a literal newline
+            # in some prompt states. C-m is the carriage-return submit event.
+            run_tmux("send-keys", "-t", pane.pane_id, "C-m")
+    finally:
+        run_tmux("delete-buffer", "-b", buffer_name, check=False)
+    return {"pane": pane.pane_id, "state": "accepted", "reason": "pasted"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fan one prompt out to tmux agent panes.")
+    parser.add_argument("--scope", choices=["selected", "window", "page", "all-active", "all"], default="selected")
+    parser.add_argument("--prompt", help="Prompt text to send")
+    parser.add_argument("--prompt-file", type=Path, help="Read prompt text from file")
+    parser.add_argument("--victory-sweep", action="store_true", help="Use the canonical status/victory sweep prompt")
+    parser.add_argument("--pane", help="Target one explicit tmux pane ID, overriding --scope")
+    parser.add_argument("--no-submit", action="store_true", help="Paste prompt but do not press Enter")
+    parser.add_argument("--force", action="store_true", help="Send even if pending input is detected")
+    parser.add_argument("--dry-run", action="store_true", help="Resolve targets and report without sending")
+    parser.add_argument("--json", action="store_true", help="Emit JSON results")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    prompt_sources = [bool(args.prompt), bool(args.prompt_file), args.victory_sweep]
+    if sum(prompt_sources) != 1:
+        print("Error: provide exactly one of --prompt, --prompt-file, or --victory-sweep", file=sys.stderr)
+        return 2
+
+    if args.victory_sweep:
+        prompt = VICTORY_SWEEP_PROMPT
+    elif args.prompt_file:
+        prompt = args.prompt_file.read_text()
+    else:
+        prompt = args.prompt
+
+    if not prompt or not prompt.strip():
+        print("Error: prompt is empty", file=sys.stderr)
+        return 2
+
+    targets, rejected = resolve_targets(args.scope, args.pane)
+    results = []
+    for pane, inst in targets:
+        result = deliver(pane, prompt, submit=not args.no_submit, dry_run=args.dry_run, force=args.force)
+        if inst:
+            result.update({"instance_id": inst.instance_id, "tab_name": inst.tab_name, "legion": inst.legion})
+        result.update({"window": pane.window, "command": pane.current_command})
+        results.append(result)
+    results.extend(rejected)
+
+    if args.json:
+        print(json.dumps({"scope": args.scope, "count": len(results), "results": results}, indent=2))
+    else:
+        for result in results:
+            name = result.get("tab_name") or result.get("window") or "-"
+            pane = result.get("pane", "-")
+            state = result.get("state", "-")
+            reason = result.get("reason", "")
+            print(f"{state:8} {pane:>5} {name} {reason}")
+        print(f"targets: {len(results)}")
+
+    return 1 if any(r.get("state") == "rejected" for r in results) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

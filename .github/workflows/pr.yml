@@ -53,38 +53,38 @@ jobs:
 
       - name: Format check (ruff)
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff format --check .)
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev ruff format --check .)
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff format --check .)
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev ruff format --check .)
           fi
 
       - name: Lint (ruff)
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff check .)
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev ruff check .)
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff check .)
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev ruff check .)
           fi
 
       - name: Typecheck (mypy)
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run mypy --ignore-missing-imports .)
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev mypy --ignore-missing-imports .)
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run mypy --ignore-missing-imports .)
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev mypy --ignore-missing-imports .)
           fi
 
       - name: Test (pytest)
         run: |
-          if [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run pytest --tb=short)
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run --group dev pytest --tb=short)
           fi
-          if [ -d token-api/tests ]; then
-            (cd token-api && uv run pytest --tb=short)
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run --group dev pytest --tb=short)
           fi
 
   # CodeRabbit GitHub App posts its own `coderabbit` commit status. Branch

@@ -53,44 +53,44 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff format --check .) || echo "::warning::ruff format check failed (cli-tools)"
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev ruff format --check .) || echo "::warning::ruff format check failed (cli-tools)"
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff format --check .) || echo "::warning::ruff format check failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev ruff format --check .) || echo "::warning::ruff format check failed (token-api)"
           fi
 
       - name: Lint (ruff)
         id: lint
         continue-on-error: true
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff check .) || echo "::warning::ruff check failed (cli-tools)"
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev ruff check .) || echo "::warning::ruff check failed (cli-tools)"
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff check .) || echo "::warning::ruff check failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev ruff check .) || echo "::warning::ruff check failed (token-api)"
           fi
 
       - name: Typecheck (mypy)
         id: types
         continue-on-error: true
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (cli-tools)"
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --group dev mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (cli-tools)"
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --group dev mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (token-api)"
           fi
 
       - name: Test (pytest)
         id: test
         continue-on-error: true
         run: |
-          if [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run pytest -x --tb=short) || echo "::warning::pytest failed (cli-tools)"
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run --group dev pytest -x --tb=short) || echo "::warning::pytest failed (cli-tools)"
           fi
-          if [ -d token-api/tests ]; then
-            (cd token-api && uv run pytest -x --tb=short) || echo "::warning::pytest failed (token-api)"
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run --group dev pytest -x --tb=short) || echo "::warning::pytest failed (token-api)"
           fi
 
       - name: CodeRabbit chill review
