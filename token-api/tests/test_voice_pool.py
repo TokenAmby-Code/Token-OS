@@ -3,12 +3,9 @@
 Uses a temporary SQLite database via TOKEN_API_DB env var.
 """
 
-import asyncio
 import uuid
 
 import pytest
-import pytest_asyncio
-import aiosqlite
 
 PROFILES = []
 FALLBACK_VOICES = []
@@ -124,20 +121,25 @@ class TestVoiceAssignmentAPI:
     @pytest.fixture
     def client(self, app_env, monkeypatch):
         """Create a test client for the FastAPI app."""
+
         async def _noop_push(*args, **kwargs):
             return None
 
         monkeypatch.setattr(app_env.main, "push_phone_widget_async", _noop_push)
         from fastapi.testclient import TestClient
+
         return TestClient(app_env.main.app)
 
     def _register(self, client, name: str) -> dict:
         """Helper to register an instance and return the response."""
-        resp = client.post("/api/instances/register", json={
-            "instance_id": str(uuid.uuid4()),
-            "tab_name": name,
-            "working_dir": f"/tmp/test-{name}",
-        })
+        resp = client.post(
+            "/api/instances/register",
+            json={
+                "instance_id": str(uuid.uuid4()),
+                "tab_name": name,
+                "working_dir": f"/tmp/test-{name}",
+            },
+        )
         assert resp.status_code == 200, f"Registration failed: {resp.text}"
         return resp.json()
 

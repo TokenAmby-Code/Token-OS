@@ -20,7 +20,7 @@ import random
 import string
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,11 +74,13 @@ def _generate_mock_token(audience: str) -> str:
     """
     import base64
 
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
-    ).decode().rstrip("=")
+    header = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+        .decode()
+        .rstrip("=")
+    )
 
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     payload_data = {
         "aud": audience,
         "azp": "113421852997393319348",
@@ -89,9 +91,7 @@ def _generate_mock_token(audience: str) -> str:
         "iss": "https://accounts.google.com",
         "sub": "113421852997393319348",
     }
-    payload = base64.urlsafe_b64encode(
-        json.dumps(payload_data).encode()
-    ).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
 
     # Mock signature - base64url encoded placeholder (256 bytes = RS256 signature size)
     # This is NOT cryptographically valid but passes base64 validation
@@ -144,7 +144,7 @@ def build_payload(
     project_root = _detect_project_root()
     template = _load_template(project_root)
 
-    event_time = datetime.now(timezone.utc).isoformat()
+    event_time = datetime.now(UTC).isoformat()
     message_id = _generate_message_id()
     target_url = server_url or _get_server_url()
 

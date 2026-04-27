@@ -233,9 +233,36 @@ dictationObserver:start()
 middleTap:start()
 dialScrollTap:start()
 
+-- Watchdog: macOS disables eventtaps after timeout / CPU starvation / sleep wake.
+-- Without this, F13/F14 dial scroll silently dies and only `hs.reload()` revives it.
+-- Poll every 15s and resurrect any tap that has been killed.
+local watchedTaps = {
+    {name = "leftTap",          tap = leftTap},
+    {name = "dictationObserver", tap = dictationObserver},
+    {name = "middleTap",         tap = middleTap},
+    {name = "dialScrollTap",     tap = dialScrollTap},
+}
+local tapWatchdog = hs.timer.doEvery(15, function()
+    for _, entry in ipairs(watchedTaps) do
+        if not entry.tap:isEnabled() then
+            entry.tap:start()
+            print("[Ring] Watchdog: restarted dead eventtap (" .. entry.name .. ")")
+        end
+    end
+end)
+
+-- Reload when NAS comes back online (canonical config lives there; stale dofile
+-- references survive in memory, but a clean reload keeps the surface honest).
+hs.fs.volume.new(function(event, info)
+    if event == hs.fs.volume.didMount and info and info.path == "/Volumes/Imperium" then
+        print("[Ring] Imperium re-mounted — reloading")
+        hs.timer.doAfter(2, hs.reload)
+    end
+end):start()
+
 hs.notify.show("D06 Pro Ring", "State machine loaded",
-    "L:tap=Enter(2x) hold=paste | M:'. ' | R:dictation")
-print("D06 Pro Ring state machine loaded")
+    "L:tap=Enter(2x) hold=paste | M:'. ' | R:dictation | watchdog 15s")
+print("D06 Pro Ring state machine loaded (watchdog active)")
 
 -- ===== Voice Transcription Bridge =====
 -- Exposes HTTP server for daemon → Wispr Flow transcription

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
 from .models import (
@@ -28,11 +28,7 @@ def build_restart_plan(
     a registry snapshot that already reflects the current device's instance view.
     """
 
-    pane_by_label = {
-        pane.pane_role: pane
-        for pane in workspace.iter_panes()
-        if pane.pane_role
-    }
+    pane_by_label = {pane.pane_role: pane for pane in workspace.iter_panes() if pane.pane_role}
     legal_labels = _legal_restart_labels(workspace)
     issues: list[CoherenceIssue] = []
     resumes: list[PlannedResume] = []
@@ -67,7 +63,6 @@ def build_restart_plan(
             )
 
     for inst in candidates:
-
         target_pane = pane_by_label.get(inst.pane_label)
         if target_pane is None:
             if inst.pane_label in legal_labels:
@@ -202,7 +197,7 @@ def _recently_active(instance: InstanceRegistryEntry) -> bool:
     activity = _parse_dt(instance.last_activity)
     if activity is None:
         return True
-    now = datetime.now(activity.tzinfo or timezone.utc)
+    now = datetime.now(activity.tzinfo or UTC)
     if activity.tzinfo is None and now.tzinfo is not None:
         now = now.replace(tzinfo=None)
     return activity >= now - timedelta(hours=24)
@@ -214,7 +209,7 @@ def _recently_stopped(instance: InstanceRegistryEntry) -> bool:
     stopped = _parse_dt(instance.stopped_at)
     if stopped is None:
         return False
-    now = datetime.now(stopped.tzinfo or timezone.utc)
+    now = datetime.now(stopped.tzinfo or UTC)
     if stopped.tzinfo is None and now.tzinfo is not None:
         now = now.replace(tzinfo=None)
     return stopped >= now - timedelta(seconds=60)
@@ -285,9 +280,7 @@ def _resume_disposition(instance: InstanceRegistryEntry) -> ResumeDisposition:
     return ResumeDisposition.RESUME
 
 
-def _resume_reason(
-    instance: InstanceRegistryEntry, disposition: ResumeDisposition
-) -> str:
+def _resume_reason(instance: InstanceRegistryEntry, disposition: ResumeDisposition) -> str:
     if disposition is ResumeDisposition.RESUME_AND_CONTINUE:
         return "instance was processing before restart"
     if disposition is ResumeDisposition.RESUME:

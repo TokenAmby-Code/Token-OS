@@ -9,48 +9,54 @@ Owns:
 Uses dependency injection from main.py for runtime-owned callbacks.
 """
 
+import asyncio
+import json
+import logging
 import os
 import re
-import json
+import subprocess
 import time
 import uuid
-import asyncio
-import logging
-import subprocess
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any, Callable
+from typing import Any
 
 import aiosqlite
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
+
 import shared
+from enforcement_service import close_distraction_windows
 from instance_mutation import (
     _fetch_instance_row,
     sanctioned_delete_instance,
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
+from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavlok_stimulus
+from routes.tts import play_sound, queue_tts
+from session_doc_helpers import (
+    _update_doc_agents_list,
+    read_frontmatter,
+    resolve_session_doc_for_start,
+    update_frontmatter,
+)
 from shared import (
-    DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR,
-    PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
-    get_next_available_profile,
-    DESKTOP_STATE, DISCORD_DAEMON_URL,
-    log_event, append_workflow_event,
+    DB_PATH,
+    DESKTOP_STATE,
+    DISCORD_DAEMON_URL,
+    FALLBACK_VOICES,
+    PROFILES,
+    ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
-    resolve_device_from_ip,
+    append_workflow_event,
+    get_next_available_profile,
     is_subagent_pid,
+    log_event,
+    resolve_device_from_ip,
 )
 from timer import TimerEvent
-from routes.tts import queue_tts, play_sound
-from session_doc_helpers import (
-    update_frontmatter, read_frontmatter,
-    create_session_doc_file, _update_doc_agents_list,
-    resolve_or_create_session_doc_for_path,
-    resolve_session_doc_for_start,
-)
-from enforcement_service import close_distraction_windows
-from phone_service import _send_to_phone, send_pavlok_stimulus, check_instance_count_pavlok
 
 logger = logging.getLogger("token_api")
 
@@ -95,17 +101,20 @@ def _require_dep(name: str, value):
 
 # ============ Hook Models ============
 
+
 class HookResponse(BaseModel):
     """Standard response for hook handlers."""
+
     success: bool = True
     action: str
-    details: Optional[dict] = None
+    details: dict | None = None
 
 
 class PreToolUseResponse(BaseModel):
     """Response for PreToolUse hooks that can block operations."""
-    permissionDecision: Optional[str] = None  # "allow" or "deny"
-    permissionDecisionReason: Optional[str] = None
+
+    permissionDecision: str | None = None  # "allow" or "deny"
+    permissionDecisionReason: str | None = None
 
 
 # ============ Hook Handler State ============
@@ -190,38 +199,44 @@ async def _apply_instance_workflow_state(
     now = datetime.now().isoformat()
     workflow_events = []
     if session_doc_id:
-        workflow_events.append({
-            "workflow_state": workflow_state,
-            "event_type": "session_doc_bound",
-            "event_owner": event_owner,
-            "details": {
-                "session_doc_id": session_doc_id,
-                "session_doc_policy": session_doc_policy,
-                "continuity_binding_source": continuity_binding_source,
-            },
-        })
+        workflow_events.append(
+            {
+                "workflow_state": workflow_state,
+                "event_type": "session_doc_bound",
+                "event_owner": event_owner,
+                "details": {
+                    "session_doc_id": session_doc_id,
+                    "session_doc_policy": session_doc_policy,
+                    "continuity_binding_source": continuity_binding_source,
+                },
+            }
+        )
     if previous_session_doc_id != session_doc_id:
-        workflow_events.append({
-            "workflow_state": workflow_state,
-            "event_type": "continuity_binding_changed",
-            "event_owner": event_owner,
-            "details": {
-                "old_session_doc_id": previous_session_doc_id,
-                "new_session_doc_id": session_doc_id,
-                "continuity_binding_source": continuity_binding_source,
-                "session_doc_policy": session_doc_policy,
-            },
-        })
+        workflow_events.append(
+            {
+                "workflow_state": workflow_state,
+                "event_type": "continuity_binding_changed",
+                "event_owner": event_owner,
+                "details": {
+                    "old_session_doc_id": previous_session_doc_id,
+                    "new_session_doc_id": session_doc_id,
+                    "continuity_binding_source": continuity_binding_source,
+                    "session_doc_policy": session_doc_policy,
+                },
+            }
+        )
     if workflow_state and previous_workflow_state != workflow_state:
-        workflow_events.append({
-            "workflow_state": workflow_state,
-            "event_type": "workflow_state_changed",
-            "event_owner": event_owner,
-            "details": {
-                "old_workflow_state": previous_workflow_state,
-                "new_workflow_state": workflow_state,
-            },
-        })
+        workflow_events.append(
+            {
+                "workflow_state": workflow_state,
+                "event_type": "workflow_state_changed",
+                "event_owner": event_owner,
+                "details": {
+                    "old_workflow_state": previous_workflow_state,
+                    "new_workflow_state": workflow_state,
+                },
+            }
+        )
 
     updates = {
         "session_doc_id": session_doc_id,
@@ -240,7 +255,9 @@ async def _apply_instance_workflow_state(
         db,
         instance_id=instance_id,
         updates=updates,
-        mutation_type="continuity_binding_changed" if previous_session_doc_id != session_doc_id else "instance_updated",
+        mutation_type="continuity_binding_changed"
+        if previous_session_doc_id != session_doc_id
+        else "instance_updated",
         write_source="hooks",
         actor=event_owner,
         workflow_events=workflow_events,
@@ -255,15 +272,25 @@ async def handle_wrapper_start(payload: dict) -> dict:
     )
     details = {
         "wrapper_launch_id": wrapper_launch_id,
-        "launcher": _normalize_text(payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")),
-        "engine": _normalize_text(payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")),
+        "launcher": _normalize_text(
+            payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")
+        ),
+        "engine": _normalize_text(
+            payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")
+        ),
         "cwd": _normalize_text(payload.get("cwd")),
-        "tmux_pane": _normalize_text(payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")),
+        "tmux_pane": _normalize_text(
+            payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")
+        ),
         "pid": payload.get("pid"),
         "source": "wrapper",
     }
     await log_event("wrapper_start", details=details)
-    return {"success": True, "action": "wrapper_start_logged", "wrapper_launch_id": wrapper_launch_id}
+    return {
+        "success": True,
+        "action": "wrapper_start_logged",
+        "wrapper_launch_id": wrapper_launch_id,
+    }
 
 
 async def handle_wrapper_end(payload: dict) -> dict:
@@ -274,10 +301,16 @@ async def handle_wrapper_end(payload: dict) -> dict:
     )
     details = {
         "wrapper_launch_id": wrapper_launch_id,
-        "launcher": _normalize_text(payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")),
-        "engine": _normalize_text(payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")),
+        "launcher": _normalize_text(
+            payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")
+        ),
+        "engine": _normalize_text(
+            payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")
+        ),
         "cwd": _normalize_text(payload.get("cwd")),
-        "tmux_pane": _normalize_text(payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")),
+        "tmux_pane": _normalize_text(
+            payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")
+        ),
         "pid": payload.get("pid"),
         "exit_code": payload.get("exit_code"),
         "source": "wrapper",
@@ -287,6 +320,7 @@ async def handle_wrapper_end(payload: dict) -> dict:
 
 
 # ============ Session Doc Pool Derivation ============
+
 
 def _derive_pool(working_dir: str | None) -> str:
     """Derive pool from working directory: civic/pax dirs → pk, everything else → personal."""
@@ -301,6 +335,7 @@ def _derive_pool(working_dir: str | None) -> str:
 # ============ Claude Code Hook Handlers ============
 # Centralized handling for all Claude Code hooks
 # Replaces shell scripts with Python for better reliability and debugging
+
 
 async def handle_session_start(payload: dict) -> dict:
     """Handle SessionStart hook - register new Claude instance."""
@@ -350,14 +385,31 @@ async def handle_session_start(payload: dict) -> dict:
     transplant_from = payload.get("transplant_from", "")
     launcher = _normalize_text(payload.get("launcher") or env.get("TOKEN_API_LAUNCHER", ""))
     engine = _normalize_text(payload.get("engine") or env.get("TOKEN_API_ENGINE", ""))
-    dispatch_target = _normalize_text(payload.get("dispatch_target") or env.get("TOKEN_API_DISPATCH_TARGET", ""))
-    dispatch_window = _normalize_text(payload.get("dispatch_window") or env.get("TOKEN_API_DISPATCH_WINDOW", ""))
-    dispatch_mode = _normalize_text(payload.get("dispatch_mode") or env.get("TOKEN_API_DISPATCH_MODE", ""))
-    dispatch_slot = _normalize_text(payload.get("dispatch_slot") or env.get("TOKEN_API_DISPATCH_SLOT", ""))
-    dispatch_session_doc_path = _normalize_text(payload.get("dispatch_session_doc_path") or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", ""))
-    target_working_dir = _normalize_text(payload.get("target_working_dir") or env.get("TOKEN_API_TARGET_WORKING_DIR", ""))
-    launch_mode = _normalize_text(payload.get("launch_mode") or env.get("TOKEN_API_LAUNCH_MODE", ""))
-    wrapper_launch_id = _normalize_text(payload.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", ""))
+    dispatch_target = _normalize_text(
+        payload.get("dispatch_target") or env.get("TOKEN_API_DISPATCH_TARGET", "")
+    )
+    dispatch_window = _normalize_text(
+        payload.get("dispatch_window") or env.get("TOKEN_API_DISPATCH_WINDOW", "")
+    )
+    dispatch_mode = _normalize_text(
+        payload.get("dispatch_mode") or env.get("TOKEN_API_DISPATCH_MODE", "")
+    )
+    dispatch_slot = _normalize_text(
+        payload.get("dispatch_slot") or env.get("TOKEN_API_DISPATCH_SLOT", "")
+    )
+    dispatch_session_doc_path = _normalize_text(
+        payload.get("dispatch_session_doc_path")
+        or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", "")
+    )
+    target_working_dir = _normalize_text(
+        payload.get("target_working_dir") or env.get("TOKEN_API_TARGET_WORKING_DIR", "")
+    )
+    launch_mode = _normalize_text(
+        payload.get("launch_mode") or env.get("TOKEN_API_LAUNCH_MODE", "")
+    )
+    wrapper_launch_id = _normalize_text(
+        payload.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
+    )
     transplant_expected_raw = payload.get("transplant_expected")
     if transplant_expected_raw is None:
         transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
@@ -382,10 +434,7 @@ async def handle_session_start(payload: dict) -> dict:
         db.row_factory = aiosqlite.Row
 
         # Check if already registered
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (session_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
         existing_row = await cursor.fetchone()
 
         # --- Supplant logic: reuse existing instance row instead of creating new ---
@@ -394,8 +443,7 @@ async def handle_session_start(payload: dict) -> dict:
 
         # 1. Check DB for pending transplant targeting this session (cross-device safe)
         cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE transplant_target_session = ?",
-            (session_id,)
+            "SELECT id FROM claude_instances WHERE transplant_target_session = ?", (session_id,)
         )
         db_transplant_row = await cursor.fetchone()
         if db_transplant_row:
@@ -419,7 +467,7 @@ async def handle_session_start(payload: dict) -> dict:
             # Primarch singleton: find most recent instance with this primarch name
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE primarch = ? ORDER BY registered_at DESC LIMIT 1",
-                (primarch_name,)
+                (primarch_name,),
             )
             row = await cursor.fetchone()
             if row:
@@ -434,7 +482,10 @@ async def handle_session_start(payload: dict) -> dict:
                 resolved_session_doc_id = None
                 resolved_session_doc_policy = None
                 if dispatch_session_doc_path or primarch_name or origin_type == "cron":
-                    resolved_session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
+                    (
+                        resolved_session_doc_id,
+                        resolved_session_doc_policy,
+                    ) = await resolve_session_doc_for_start(
                         db,
                         dispatch_session_doc_path=dispatch_session_doc_path,
                         primarch_name=primarch_name or None,
@@ -470,7 +521,9 @@ async def handle_session_start(payload: dict) -> dict:
                         "victory_reason": None,
                         "input_lock": None,
                         "transplant_target_session": None,
-                        "primarch": primarch_name or existing_row["primarch"] if hasattr(existing_row, '__getitem__') else primarch_name,
+                        "primarch": primarch_name or existing_row["primarch"]
+                        if hasattr(existing_row, "__getitem__")
+                        else primarch_name,
                         "session_doc_id": resolved_session_doc_id or existing_row["session_doc_id"],
                         "wrapper_launch_id": wrapper_launch_id or existing_row["wrapper_launch_id"],
                         "launcher": launcher or existing_row["launcher"],
@@ -479,11 +532,14 @@ async def handle_session_start(payload: dict) -> dict:
                         "dispatch_window": dispatch_window or existing_row["dispatch_window"],
                         "dispatch_mode": dispatch_mode or existing_row["dispatch_mode"],
                         "dispatch_slot": dispatch_slot or existing_row["dispatch_slot"],
-                        "dispatch_session_doc_path": dispatch_session_doc_path or existing_row["dispatch_session_doc_path"],
-                        "target_working_dir": target_working_dir or existing_row["target_working_dir"],
+                        "dispatch_session_doc_path": dispatch_session_doc_path
+                        or existing_row["dispatch_session_doc_path"],
+                        "target_working_dir": target_working_dir
+                        or existing_row["target_working_dir"],
                         "launch_mode": launch_mode or existing_row["launch_mode"],
                         "transplant_expected": 1 if transplant_expected else 0,
-                        "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
+                        "session_doc_policy": session_doc_policy
+                        or existing_row["session_doc_policy"],
                     },
                     mutation_type="instance_updated",
                     write_source="hooks",
@@ -502,16 +558,22 @@ async def handle_session_start(payload: dict) -> dict:
                 await db.commit()
 
                 # Queue legion pane recolor (tmux_pane changed, trigger won't fire since legion didn't)
-                _transplant_legion = existing_row["legion"] if hasattr(existing_row, '__getitem__') and existing_row["legion"] else "astartes"
+                _transplant_legion = (
+                    existing_row["legion"]
+                    if hasattr(existing_row, "__getitem__") and existing_row["legion"]
+                    else "astartes"
+                )
                 if _transplant_legion != "astartes" and tmux_pane:
                     await db.execute(
                         "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
-                        (session_id, _transplant_legion, tmux_pane)
+                        (session_id, _transplant_legion, tmux_pane),
                     )
                     await db.commit()
 
                 # Resolve preserved profile for color
-                cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
+                cursor = await db.execute(
+                    "SELECT * FROM claude_instances WHERE id = ?", (session_id,)
+                )
                 updated_inst = await cursor.fetchone()
                 cc_color = "default"
                 hex_color = "#666666"
@@ -522,7 +584,9 @@ async def handle_session_start(payload: dict) -> dict:
                             hex_color = p.get("color", "#666666")
                             break
 
-                logger.info(f"Hook: SessionStart transplant-refresh {session_id[:12]}... ({working_dir}) [device:{device_id}]")
+                logger.info(
+                    f"Hook: SessionStart transplant-refresh {session_id[:12]}... ({working_dir}) [device:{device_id}]"
+                )
                 return {
                     "success": True,
                     "action": "transplant_refreshed",
@@ -530,7 +594,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "profile": updated_inst["profile_name"] if updated_inst else None,
                     "color": hex_color,
                     "cc_color": cc_color,
-                    "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None
+                    "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
                 }
             else:
                 # No transplant signal — normal re-registration, no-op
@@ -538,10 +602,7 @@ async def handle_session_start(payload: dict) -> dict:
 
         if supplant_id:
             # Fetch the old instance to preserve its config
-            cursor = await db.execute(
-                "SELECT * FROM claude_instances WHERE id = ?",
-                (supplant_id,)
-            )
+            cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (supplant_id,))
             old_inst = await cursor.fetchone()
 
             if old_inst:
@@ -550,7 +611,10 @@ async def handle_session_start(payload: dict) -> dict:
                 resolved_session_doc_id = None
                 resolved_session_doc_policy = None
                 if dispatch_session_doc_path or primarch_name or origin_type == "cron":
-                    resolved_session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
+                    (
+                        resolved_session_doc_id,
+                        resolved_session_doc_policy,
+                    ) = await resolve_session_doc_for_start(
                         db,
                         dispatch_session_doc_path=dispatch_session_doc_path,
                         primarch_name=primarch_name or None,
@@ -596,7 +660,8 @@ async def handle_session_start(payload: dict) -> dict:
                         "dispatch_window": dispatch_window or old_inst["dispatch_window"],
                         "dispatch_mode": dispatch_mode or old_inst["dispatch_mode"],
                         "dispatch_slot": dispatch_slot or old_inst["dispatch_slot"],
-                        "dispatch_session_doc_path": dispatch_session_doc_path or old_inst["dispatch_session_doc_path"],
+                        "dispatch_session_doc_path": dispatch_session_doc_path
+                        or old_inst["dispatch_session_doc_path"],
                         "target_working_dir": target_working_dir or old_inst["target_working_dir"],
                         "launch_mode": launch_mode or old_inst["launch_mode"],
                         "transplant_expected": 1 if transplant_expected else 0,
@@ -615,7 +680,7 @@ async def handle_session_start(payload: dict) -> dict:
                 if primarch_name and not session_doc_id:
                     cursor = await db.execute(
                         "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-                        (primarch_name,)
+                        (primarch_name,),
                     )
                     link_row = await cursor.fetchone()
                     if link_row and link_row[0]:
@@ -641,7 +706,9 @@ async def handle_session_start(payload: dict) -> dict:
                     previous_session_doc_id=old_inst["session_doc_id"],
                     previous_workflow_state=old_inst["workflow_state"],
                 )
-                dispatch_bound_doc = (session_doc_policy or old_inst["session_doc_policy"]) == "dispatch_explicit"
+                dispatch_bound_doc = (
+                    session_doc_policy or old_inst["session_doc_policy"]
+                ) == "dispatch_explicit"
 
                 await db.commit()
 
@@ -650,7 +717,7 @@ async def handle_session_start(payload: dict) -> dict:
                 if _supplant_legion != "astartes" and tmux_pane:
                     await db.execute(
                         "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
-                        (session_id, _supplant_legion, tmux_pane)
+                        (session_id, _supplant_legion, tmux_pane),
                     )
                     await db.commit()
 
@@ -665,11 +732,25 @@ async def handle_session_start(payload: dict) -> dict:
                             hex_color = p.get("color", "#666666")
                             break
 
-                supplant_source = f"transplant:{transplant_from}" if transplant_from else f"primarch:{primarch_name}"
-                logger.info(f"Hook: SessionStart supplanted {supplant_id[:12]}... → {session_id[:12]}... ({working_dir}) [{supplant_source}]")
-                await log_event("instance_supplanted", instance_id=session_id, device_id=device_id,
-                                details={"old_id": supplant_id, "tab_name": old_inst["tab_name"],
-                                         "source": supplant_source, "primarch": primarch_name or None})
+                supplant_source = (
+                    f"transplant:{transplant_from}"
+                    if transplant_from
+                    else f"primarch:{primarch_name}"
+                )
+                logger.info(
+                    f"Hook: SessionStart supplanted {supplant_id[:12]}... → {session_id[:12]}... ({working_dir}) [{supplant_source}]"
+                )
+                await log_event(
+                    "instance_supplanted",
+                    instance_id=session_id,
+                    device_id=device_id,
+                    details={
+                        "old_id": supplant_id,
+                        "tab_name": old_inst["tab_name"],
+                        "source": supplant_source,
+                        "primarch": primarch_name or None,
+                    },
+                )
 
                 return {
                     "success": True,
@@ -679,7 +760,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "profile": preserved_profile,
                     "color": hex_color,
                     "cc_color": cc_color,
-                    "session_doc_id": session_doc_id
+                    "session_doc_id": session_doc_id,
                 }
 
         # --- Normal registration (no supplant) ---
@@ -716,7 +797,7 @@ async def handle_session_start(payload: dict) -> dict:
                       target_working_dir, launch_mode, transplant_expected,
                       session_doc_policy, session_doc_id, workflow_state
                FROM claude_instances WHERE id = ?""",
-            (session_id,)
+            (session_id,),
         )
         _prior_row = await cursor.fetchone()
         if _prior_row:
@@ -756,7 +837,9 @@ async def handle_session_start(payload: dict) -> dict:
         dispatch_window = dispatch_window or _prior_dispatch.get("dispatch_window")
         dispatch_mode = dispatch_mode or _prior_dispatch.get("dispatch_mode")
         dispatch_slot = dispatch_slot or _prior_dispatch.get("dispatch_slot")
-        dispatch_session_doc_path = dispatch_session_doc_path or _prior_dispatch.get("dispatch_session_doc_path")
+        dispatch_session_doc_path = dispatch_session_doc_path or _prior_dispatch.get(
+            "dispatch_session_doc_path"
+        )
         target_working_dir = target_working_dir or _prior_dispatch.get("target_working_dir")
         launch_mode = launch_mode or _prior_dispatch.get("launch_mode")
         if not transplant_expected:
@@ -849,7 +932,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "SELECT legion FROM cron_jobs WHERE id = ?", (cron_job_id,)
                 )
                 cron_row = await cursor.fetchone()
-                auto_legion = (cron_row[0] if cron_row and cron_row[0] else "mechanicus")
+                auto_legion = cron_row[0] if cron_row and cron_row[0] else "mechanicus"
             else:
                 auto_legion = "mechanicus"
         elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
@@ -908,23 +991,32 @@ async def handle_session_start(payload: dict) -> dict:
         f"{f' [launcher:{launcher}]' if launcher else ''}"
         f"{f' [dispatch:{dispatch_target}]' if dispatch_target else ''}"
     )
-    await log_event("instance_registered", instance_id=session_id, device_id=device_id,
-                    details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
-                             "is_subagent": is_subagent, "subagent_env": subagent_env or None,
-                             "primarch": primarch_name or None,
-                             "launcher": launcher or None,
-                             "wrapper_launch_id": wrapper_launch_id or None,
-                             "engine": engine or None,
-                             "dispatch_target": dispatch_target or None,
-                             "dispatch_window": dispatch_window or None,
-                             "dispatch_mode": dispatch_mode or None,
-                             "dispatch_slot": dispatch_slot or None,
-                             "dispatch_session_doc_path": dispatch_session_doc_path or None,
-                             "target_working_dir": target_working_dir or None,
-                             "launch_mode": launch_mode or None,
-                             "transplant_expected": transplant_expected,
-                             "dispatch_bound_doc": dispatch_bound_doc,
-                             "session_doc_policy": session_doc_policy})
+    await log_event(
+        "instance_registered",
+        instance_id=session_id,
+        device_id=device_id,
+        details={
+            "tab_name": tab_name,
+            "origin_type": origin_type,
+            "source": "hook",
+            "is_subagent": is_subagent,
+            "subagent_env": subagent_env or None,
+            "primarch": primarch_name or None,
+            "launcher": launcher or None,
+            "wrapper_launch_id": wrapper_launch_id or None,
+            "engine": engine or None,
+            "dispatch_target": dispatch_target or None,
+            "dispatch_window": dispatch_window or None,
+            "dispatch_mode": dispatch_mode or None,
+            "dispatch_slot": dispatch_slot or None,
+            "dispatch_session_doc_path": dispatch_session_doc_path or None,
+            "target_working_dir": target_working_dir or None,
+            "launch_mode": launch_mode or None,
+            "transplant_expected": transplant_expected,
+            "dispatch_bound_doc": dispatch_bound_doc,
+            "session_doc_policy": session_doc_policy,
+        },
+    )
 
     return {
         "success": True,
@@ -933,7 +1025,7 @@ async def handle_session_start(payload: dict) -> dict:
         "profile": profile["name"] if not is_subagent else None,
         "color": profile.get("color") if not is_subagent else None,
         "cc_color": profile.get("cc_color") if not is_subagent else None,
-        "session_doc_id": session_doc_id
+        "session_doc_id": session_doc_id,
     }
 
 
@@ -952,7 +1044,7 @@ async def handle_session_end(payload: dict) -> dict:
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
                       tmux_pane, legion, workflow_state
                FROM claude_instances WHERE id = ?""",
-            (session_id,)
+            (session_id,),
         )
         row = await cursor.fetchone()
 
@@ -981,9 +1073,13 @@ async def handle_session_end(payload: dict) -> dict:
                         fm, _ = read_frontmatter(fp)
                         start_time = fm.get("start_time")
                         if start_time and start_time != "null":
-                            start_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+                            start_dt = datetime.fromisoformat(
+                                str(start_time).replace("Z", "+00:00")
+                            )
                             end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-                            fm_updates["duration_minutes"] = round((end_dt - start_dt).total_seconds() / 60)
+                            fm_updates["duration_minutes"] = round(
+                                (end_dt - start_dt).total_seconds() / 60
+                            )
                     except Exception:
                         pass
                     await asyncio.to_thread(update_frontmatter, fp, fm_updates)
@@ -995,19 +1091,26 @@ async def handle_session_end(payload: dict) -> dict:
         count_row = await cursor.fetchone()
         was_active = count_row[0] if count_row else 0
 
-        workflow_events = [{
-            "workflow_state": "closed",
-            "event_type": "workflow_closed",
-            "event_owner": "hooks",
-            "details": {"source": "session_end"},
-        }]
-        if _prior_workflow_state != "closed":
-            workflow_events.append({
+        workflow_events = [
+            {
                 "workflow_state": "closed",
-                "event_type": "workflow_state_changed",
+                "event_type": "workflow_closed",
                 "event_owner": "hooks",
-                "details": {"old_workflow_state": _prior_workflow_state, "new_workflow_state": "closed"},
-            })
+                "details": {"source": "session_end"},
+            }
+        ]
+        if _prior_workflow_state != "closed":
+            workflow_events.append(
+                {
+                    "workflow_state": "closed",
+                    "event_type": "workflow_state_changed",
+                    "event_owner": "hooks",
+                    "details": {
+                        "old_workflow_state": _prior_workflow_state,
+                        "new_workflow_state": "closed",
+                    },
+                }
+            )
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
@@ -1033,7 +1136,7 @@ async def handle_session_end(payload: dict) -> dict:
         if _stop_pane and _stop_legion != "astartes":
             await db.execute(
                 "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
-                (session_id, _stop_pane)
+                (session_id, _stop_pane),
             )
 
         await db.commit()
@@ -1060,8 +1163,9 @@ async def handle_session_end(payload: dict) -> dict:
         pass
 
     logger.info(f"Hook: SessionEnd stopped {session_id[:12]}...")
-    await log_event("instance_stopped", instance_id=session_id, device_id=row[1],
-                    details={"source": "hook"})
+    await log_event(
+        "instance_stopped", instance_id=session_id, device_id=row[1], details={"source": "hook"}
+    )
 
     # Instance count Pavlok signals (skip subagents)
     if not is_subagent:
@@ -1076,9 +1180,11 @@ async def handle_session_end(payload: dict) -> dict:
                     ["python3", str(stop_hook_script), session_id],
                     stdout=subprocess.DEVNULL,
                     stderr=open("/tmp/stop_hook.log", "a"),
-                    start_new_session=True
+                    start_new_session=True,
                 )
-                logger.info(f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id or 'none, daily note fallback'})")
+                logger.info(
+                    f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id or 'none, daily note fallback'})"
+                )
             except Exception as e:
                 logger.warning(f"Hook: SessionEnd failed to spawn stop_hook: {e}")
 
@@ -1103,16 +1209,15 @@ async def handle_prompt_submit(payload: dict) -> dict:
         _pending_background_tasks[session_id] -= 1
         if _pending_background_tasks[session_id] <= 0:
             del _pending_background_tasks[session_id]
-        logger.info(f"PromptSubmit: background task returned for {session_id[:12]} (pending: {_pending_background_tasks.get(session_id, 0)})")
+        logger.info(
+            f"PromptSubmit: background task returned for {session_id[:12]} (pending: {_pending_background_tasks.get(session_id, 0)})"
+        )
 
     now = datetime.now().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (session_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
         existing = await cursor.fetchone()
         if not existing:
             return {"success": False, "action": "not_found"}
@@ -1152,7 +1257,12 @@ async def handle_prompt_submit(payload: dict) -> dict:
         pass
 
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
-    return {"success": True, "action": "processing", "instance_id": session_id, "exited_idle": exited_idle}
+    return {
+        "success": True,
+        "action": "processing",
+        "instance_id": session_id,
+        "exited_idle": exited_idle,
+    }
 
 
 async def handle_post_tool_use(payload: dict) -> dict:
@@ -1221,6 +1331,7 @@ async def _post_discord_mirror(channel: str, bot: str, content: str):
         payload["thread_id"] = channel
     try:
         import urllib.request as _urllib_req
+
         data = json.dumps(payload).encode()
         req = _urllib_req.Request(
             f"{DISCORD_DAEMON_URL}/send",
@@ -1249,10 +1360,7 @@ async def handle_stop(payload: dict) -> dict:
     # Get instance info
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (session_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
         instance = await cursor.fetchone()
 
     if not instance:
@@ -1274,7 +1382,9 @@ async def handle_stop(payload: dict) -> dict:
     has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
 
     # Determine if evaluators will run (they own the idle transition)
-    will_evaluate = (not is_subagent_instance_quick and not has_pending_background and not is_sync_instance)
+    will_evaluate = (
+        not is_subagent_instance_quick and not has_pending_background and not is_sync_instance
+    )
 
     async with aiosqlite.connect(DB_PATH) as db:
         if will_evaluate or is_sync_instance:
@@ -1301,24 +1411,32 @@ async def handle_stop(payload: dict) -> dict:
     # Skips subagents, sync instances, and intermediate stops.
     if will_evaluate:
         session_doc_id = instance.get("session_doc_id")
-        stop_context = payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
+        stop_context = (
+            payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
+        )
         # Signal TUI that evaluators are running for this instance
         _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
         _tui_signal_dir.mkdir(exist_ok=True)
         (_tui_signal_dir / f"evaluating-{session_id}").touch()
-        asyncio.create_task(_require_dep("run_stop_evaluators", _run_stop_evaluators)(
-            session_id, session_doc_id, stop_context, tab_name
-        ))
+        asyncio.create_task(
+            _require_dep("run_stop_evaluators", _run_stop_evaluators)(
+                session_id, session_doc_id, stop_context, tab_name
+            )
+        )
         # Auto-name: generate kebab-case name if not explicitly named by our pipeline
         # Also sends /rename + /color to Claude Code UI in concert with instance profile
         transcript_path = payload.get("transcript_path", "")
-        asyncio.create_task(_require_dep("auto_name_instance", _auto_name_instance)(dict(instance), stop_context, transcript_path))
+        asyncio.create_task(
+            _require_dep("auto_name_instance", _auto_name_instance)(
+                dict(instance), stop_context, transcript_path
+            )
+        )
 
     result = {
         "success": True,
         "action": "stop_processed",
         "instance_id": session_id,
-        "device_id": device_id
+        "device_id": device_id,
     }
 
     # ── Subagent detection: skip all notifications for subagents ──
@@ -1327,13 +1445,17 @@ async def handle_stop(payload: dict) -> dict:
     is_subagent_instance = bool(instance.get("is_subagent")) or bool(pid and is_subagent_pid(pid))
     if is_subagent_instance:
         result["action"] = "stop_processed_subagent"
-        logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
+        logger.info(
+            f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications"
+        )
         return result
 
     # Intermediate stop: background subagents still pending. Update state but skip notifications.
     if _pending_background_tasks.get(session_id, 0) > 0:
         result["action"] = "stop_processed_intermediate"
-        logger.info(f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications")
+        logger.info(
+            f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications"
+        )
         return result
 
     # ── Instance lifecycle retrigger ──
@@ -1362,7 +1484,7 @@ async def handle_stop(payload: dict) -> dict:
         transcript_lines = transcript_tail.splitlines()
     elif transcript_path and os.path.exists(transcript_path):
         try:
-            with open(transcript_path, 'r') as f:
+            with open(transcript_path) as f:
                 transcript_lines = f.readlines()
         except Exception as e:
             logger.warning(f"Failed to read transcript: {e}")
@@ -1377,7 +1499,11 @@ async def handle_stop(payload: dict) -> dict:
                         tts_text = content
                     elif isinstance(content, list):
                         # Extract text from content array (skip tool_use-only messages)
-                        texts = [c.get("text", "") for c in content if c.get("type") == "text" and c.get("text", "").strip()]
+                        texts = [
+                            c.get("text", "")
+                            for c in content
+                            if c.get("type") == "text" and c.get("text", "").strip()
+                        ]
                         if texts:
                             tts_text = "\n".join(texts)
                     elif isinstance(content, dict) and content.get("text", "").strip():
@@ -1390,30 +1516,30 @@ async def handle_stop(payload: dict) -> dict:
     # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
     if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):
         discord_bot = _LEGION_BOT_MAP.get(instance.get("legion", ""), "mechanicus")
-        asyncio.create_task(_post_discord_mirror(
-            instance["discord_channel"], discord_bot, tts_text
-        ))
+        asyncio.create_task(
+            _post_discord_mirror(instance["discord_channel"], discord_bot, tts_text)
+        )
 
     # Sanitize TTS text (remove markdown formatting and normalize whitespace)
     if tts_text:
         # Strip markdown headers (must be before newline conversion)
-        tts_text = re.sub(r'^#{1,6}\s*', '', tts_text, flags=re.MULTILINE)
+        tts_text = re.sub(r"^#{1,6}\s*", "", tts_text, flags=re.MULTILINE)
         # Strip markdown bold/italic
-        tts_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', tts_text)  # **bold**
-        tts_text = re.sub(r'\*([^*]+)\*', r'\1', tts_text)      # *italic*
-        tts_text = re.sub(r'__([^_]+)__', r'\1', tts_text)      # __bold__
-        tts_text = re.sub(r'_([^_]+)_', r'\1', tts_text)        # _italic_
+        tts_text = re.sub(r"\*\*([^*]+)\*\*", r"\1", tts_text)  # **bold**
+        tts_text = re.sub(r"\*([^*]+)\*", r"\1", tts_text)  # *italic*
+        tts_text = re.sub(r"__([^_]+)__", r"\1", tts_text)  # __bold__
+        tts_text = re.sub(r"_([^_]+)_", r"\1", tts_text)  # _italic_
         # Strip inline code
-        tts_text = re.sub(r'`([^`]+)`', r'\1', tts_text)
+        tts_text = re.sub(r"`([^`]+)`", r"\1", tts_text)
         # Strip code blocks
-        tts_text = re.sub(r'```[\s\S]*?```', '', tts_text)
+        tts_text = re.sub(r"```[\s\S]*?```", "", tts_text)
         # Strip bullet points and list markers
-        tts_text = re.sub(r'^[\s]*[-*+]\s+', '', tts_text, flags=re.MULTILINE)
-        tts_text = re.sub(r'^[\s]*\d+\.\s+', '', tts_text, flags=re.MULTILINE)
+        tts_text = re.sub(r"^[\s]*[-*+]\s+", "", tts_text, flags=re.MULTILINE)
+        tts_text = re.sub(r"^[\s]*\d+\.\s+", "", tts_text, flags=re.MULTILINE)
         # Convert newlines to spaces
-        tts_text = tts_text.replace('\n', ' ')
+        tts_text = tts_text.replace("\n", " ")
         # Normalize multiple spaces
-        tts_text = re.sub(r' +', ' ', tts_text)
+        tts_text = re.sub(r" +", " ", tts_text)
         tts_text = tts_text.strip()
 
     # Mobile path: v3 /notify with TTS + banner + vibe
@@ -1426,7 +1552,9 @@ async def handle_stop(payload: dict) -> dict:
             notify_params["tts_text"] = tts_text[:300]
         phone_result = await asyncio.to_thread(_send_to_phone, "/notify", notify_params)
         result["notification"] = phone_result
-        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile v3 notify ({len(tts_text or '')} chars)")
+        logger.info(
+            f"Hook: Stop {session_id[:12]}... -> mobile v3 notify ({len(tts_text or '')} chars)"
+        )
         return result
 
     # Desktop path: TTS and notification
@@ -1450,7 +1578,9 @@ async def handle_stop(payload: dict) -> dict:
         result["tts"] = tts_result
     else:
         # Just play notification sound without TTS
-        logger.info(f"Hook: Stop no TTS text (tts_enabled={tts_enabled}, has_text={bool(tts_text)})")
+        logger.info(
+            f"Hook: Stop no TTS text (tts_enabled={tts_enabled}, has_text={bool(tts_text)})"
+        )
         play_sound(notification_sound)
         result["sound"] = {"played": notification_sound}
 
@@ -1465,7 +1595,11 @@ async def handle_stop(payload: dict) -> dict:
         result["pavlok_vibe"] = vibe_result
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
-    await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})
+    await log_event(
+        "hook_stop",
+        instance_id=session_id,
+        details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0},
+    )
 
     return result
 
@@ -1494,7 +1628,9 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Track background Task subagents so Stop hooks can detect intermediate vs final stops.
     if tool_name == "Task" and tool_input.get("run_in_background"):
         _pending_background_tasks[session_id] = _pending_background_tasks.get(session_id, 0) + 1
-        logger.info(f"PreToolUse: Task background launched for {session_id[:12]} (pending: {_pending_background_tasks[session_id]})")
+        logger.info(
+            f"PreToolUse: Task background launched for {session_id[:12]} (pending: {_pending_background_tasks[session_id]})"
+        )
         return {"success": True, "action": "allowed"}
 
     # Voice chat: when AskUserQuestion fires for a voice-chat-active instance,
@@ -1513,7 +1649,9 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 tts_message = " ".join(tts_parts)
                 try:
                     await queue_tts(session_id, tts_message, queue_target="hot")
-                    logger.info(f"PreToolUse: Voice chat TTS queued (hot) for {session_id[:12]}: {tts_message[:80]}")
+                    logger.info(
+                        f"PreToolUse: Voice chat TTS queued (hot) for {session_id[:12]}: {tts_message[:80]}"
+                    )
                 except Exception as e:
                     logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
 
@@ -1522,7 +1660,9 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         vc_session = VOICE_CHAT_SESSIONS.get(session_id, {})
         tmux_pane = vc_session.get("tmux_pane", "")
         pane_arg = f' "{tmux_pane}"' if tmux_pane else ""
-        logger.info(f"PreToolUse: Voice chat local_exec for {session_id[:12]} (pane: {tmux_pane or 'default'})")
+        logger.info(
+            f"PreToolUse: Voice chat local_exec for {session_id[:12]} (pane: {tmux_pane or 'default'})"
+        )
         return {
             "success": True,
             "action": "allowed",
@@ -1535,7 +1675,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT discord_hosted, discord_channel, legion FROM claude_instances WHERE id = ?",
-                (session_id,)
+                (session_id,),
             )
             dh_row = await cursor.fetchone()
         if dh_row and dh_row[0] and dh_row[1]:
@@ -1547,31 +1687,53 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 q_parts = [q.get("question", "") for q in questions if q.get("question")]
                 if q_parts:
                     q_text = "\n".join(q_parts)
-                    asyncio.create_task(_post_discord_mirror(
-                        discord_channel, discord_bot,
-                        f"**Question:** {q_text}"
-                    ))
+                    asyncio.create_task(
+                        _post_discord_mirror(
+                            discord_channel, discord_bot, f"**Question:** {q_text}"
+                        )
+                    )
                     # Also phone notify so Emperor knows to check Discord
-                    asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
-                        "vibe": 40,
-                        "tts_text": f"Claude is asking a question in Discord.",
-                        "banner_text": q_parts[0][:80],
-                    }))
-                    logger.info(f"PreToolUse: AskUserQuestion posted to Discord #{discord_channel} for {session_id[:12]}")
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            _send_to_phone,
+                            "/notify",
+                            {
+                                "vibe": 40,
+                                "tts_text": "Claude is asking a question in Discord.",
+                                "banner_text": q_parts[0][:80],
+                            },
+                        )
+                    )
+                    logger.info(
+                        f"PreToolUse: AskUserQuestion posted to Discord #{discord_channel} for {session_id[:12]}"
+                    )
 
     # Phone notification for AskUserQuestion (non-voice-chat, non-discord-hosted instances)
-    if tool_name == "AskUserQuestion" and session_id and session_id not in VOICE_CHAT_SESSIONS and not _ask_handled_by_discord:
+    if (
+        tool_name == "AskUserQuestion"
+        and session_id
+        and session_id not in VOICE_CHAT_SESSIONS
+        and not _ask_handled_by_discord
+    ):
         questions = tool_input.get("questions", [])
         if questions:
             q_text = questions[0].get("question", "")[:200]
             if q_text:
-                asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
-                    "vibe": 40,
-                    "beep": 30,
-                    "tts_text": f"Claude is asking: {q_text}",
-                    "banner_text": q_text[:80],
-                }))
-                logger.info(f"PreToolUse: AskUserQuestion phone notify for {session_id[:12]}: {q_text[:60]}")
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        _send_to_phone,
+                        "/notify",
+                        {
+                            "vibe": 40,
+                            "beep": 30,
+                            "tts_text": f"Claude is asking: {q_text}",
+                            "banner_text": q_text[:80],
+                        },
+                    )
+                )
+                logger.info(
+                    f"PreToolUse: AskUserQuestion phone notify for {session_id[:12]}: {q_text[:60]}"
+                )
 
     # Only check Bash commands for blocking
     if tool_name != "Bash":
@@ -1598,7 +1760,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 f"'make deploy' is disabled. Use autonomous deployment instead:\n\n"
                 f"  {alt_command}\n\n"
                 f"This provides better error detection and log monitoring."
-            )
+            ),
         }
 
     return {"success": True, "action": "allowed"}
@@ -1615,8 +1777,7 @@ async def handle_notification(payload: dict) -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT notification_sound FROM claude_instances WHERE id = ?",
-                (session_id,)
+                "SELECT notification_sound FROM claude_instances WHERE id = ?", (session_id,)
             )
             row = await cursor.fetchone()
             if row and row["notification_sound"]:
@@ -1668,16 +1829,17 @@ async def handle_stop_validate(payload: dict) -> dict:
             )
             await db.commit()
         logger.info(
-            f"StopValidate: {session_id[:12]} self-eval complete "
-            f"({elapsed:.1f}s) — allowing stop"
+            f"StopValidate: {session_id[:12]} self-eval complete ({elapsed:.1f}s) — allowing stop"
         )
-        await log_event("stop_validate_pass", instance_id=session_id,
-                        details={"reason": "self_eval_complete", "elapsed": elapsed})
+        await log_event(
+            "stop_validate_pass",
+            instance_id=session_id,
+            details={"reason": "self_eval_complete", "elapsed": elapsed},
+        )
         return {}  # no decision — allow stop
 
     # ── Expire stale entries ──
-    stale = [sid for sid, ts in _self_eval_pending.items()
-             if now - ts > SELF_EVAL_TTL_SECONDS]
+    stale = [sid for sid, ts in _self_eval_pending.items() if now - ts > SELF_EVAL_TTL_SECONDS]
     for sid in stale:
         del _self_eval_pending[sid]
 
@@ -1686,7 +1848,7 @@ async def handle_stop_validate(payload: dict) -> dict:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, instance_type, is_subagent, victory_at, workflow_state FROM claude_instances WHERE id = ?",
-            (session_id,)
+            (session_id,),
         )
         instance = await cursor.fetchone()
 
@@ -1712,8 +1874,11 @@ async def handle_stop_validate(payload: dict) -> dict:
     transcript_tail = payload.get("transcript_tail", "")
     if "ScheduleWakeup" in transcript_tail:
         logger.info(f"StopValidate: {session_id[:12]} has active ScheduleWakeup — allowing stop")
-        await log_event("stop_validate_pass", instance_id=session_id,
-                        details={"reason": "schedule_wakeup_active"})
+        await log_event(
+            "stop_validate_pass",
+            instance_id=session_id,
+            details={"reason": "schedule_wakeup_active"},
+        )
         return {}
 
     # ── Block: golden_throne and sync instances get self-eval prompt ──
@@ -1751,15 +1916,18 @@ async def handle_stop_validate(payload: dict) -> dict:
                     workflow_state="blocked",
                     event_type="workflow_state_changed",
                     event_owner="hooks",
-                    details={"old_workflow_state": instance.get("workflow_state"), "new_workflow_state": "blocked"},
+                    details={
+                        "old_workflow_state": instance.get("workflow_state"),
+                        "new_workflow_state": "blocked",
+                    },
                 )
             await db.commit()
         logger.info(
-            f"StopValidate: blocking {session_id[:12]} ({instance_type}) "
-            f"with self-eval prompt"
+            f"StopValidate: blocking {session_id[:12]} ({instance_type}) with self-eval prompt"
         )
-        await log_event("stop_validate_block", instance_id=session_id,
-                        details={"instance_type": instance_type})
+        await log_event(
+            "stop_validate_block", instance_id=session_id, details={"instance_type": instance_type}
+        )
         return {
             "decision": "block",
             "reason": _SELF_EVAL_PROMPT,

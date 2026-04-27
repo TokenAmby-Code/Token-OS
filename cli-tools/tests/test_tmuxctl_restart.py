@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
@@ -91,18 +91,18 @@ def _instance(
 
 
 def _iso_ago(*, hours: int = 0, seconds: int = 0) -> str:
-    return (datetime.now(timezone.utc) - timedelta(hours=hours, seconds=seconds)).isoformat()
+    return (datetime.now(UTC) - timedelta(hours=hours, seconds=seconds)).isoformat()
 
 
 def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
     workspace = _workspace(_pane("%1", "palace:TL"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-            instances=(
+        instances=(
             _instance("old", "palace:TL", last_activity=_iso_ago(hours=30)),
             _instance("new", "palace:TL", last_activity=_iso_ago(hours=1)),
-            ),
-        )
+        ),
+    )
 
     plan = build_restart_plan(workspace, registry)
 
@@ -114,7 +114,7 @@ def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
     workspace = _workspace(_pane("%1", "palace:TL"), _pane("%2", "palace:TR"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-            instances=(
+        instances=(
             _instance("stale", "palace:TL", last_activity=_iso_ago(hours=72)),
             _instance(
                 "recent-stop",

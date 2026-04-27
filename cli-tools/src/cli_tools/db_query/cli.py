@@ -19,10 +19,9 @@ import sys
 from typing import Any
 
 from .query_runner import (
-    BLOCKED_PATTERNS,
     DEFAULT_LIMIT,
-    ENVIRONMENTS,
     ENV_ALIASES,
+    ENVIRONMENTS,
     QueryResult,
     add_limit_if_missing,
     check_proxy_status,
@@ -99,7 +98,7 @@ def cmd_query(args: argparse.Namespace) -> int:
     if is_write_query(args.sql) and not getattr(args, "write", False):
         print("Error: Write operations require the --write flag.")
         print("This is a safety measure to prevent accidental data modifications.")
-        print("\nUsage: db-query --env dev query --write \"INSERT INTO ...\"")
+        print('\nUsage: db-query --env dev query --write "INSERT INTO ..."')
         print("\nNote: Production is always read-only regardless of flags.")
         return 1
 

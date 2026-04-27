@@ -40,9 +40,7 @@ class TmuxAdapter:
         windows: list[dict[str, str]] = []
         for line in lines:
             session, index, name = line.split("\t")
-            windows.append(
-                {"session_name": session, "window_index": index, "window_name": name}
-            )
+            windows.append({"session_name": session, "window_index": index, "window_name": name})
         return windows
 
     def list_panes(self, target: str) -> list[dict[str, str]]:

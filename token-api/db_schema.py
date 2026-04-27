@@ -15,7 +15,6 @@ import aiosqlite
 
 from cron_engine import CronEngine
 
-
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
 
@@ -53,7 +52,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
         columns = {col[1] for col in await cursor.fetchall()}
         instance_migrations = [
             ("working_dir", "ALTER TABLE claude_instances ADD COLUMN working_dir TEXT"),
-            ("is_subagent", "ALTER TABLE claude_instances ADD COLUMN is_subagent INTEGER DEFAULT 0"),
+            (
+                "is_subagent",
+                "ALTER TABLE claude_instances ADD COLUMN is_subagent INTEGER DEFAULT 0",
+            ),
             ("tts_mode", "ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'"),
             ("session_doc_id", "ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER"),
             ("zealotry", "ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4"),
@@ -62,33 +64,72 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("victory_at", "ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP"),
             ("victory_reason", "ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT"),
             ("input_lock", "ALTER TABLE claude_instances ADD COLUMN input_lock TEXT"),
-            ("transplant_target_session", "ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT"),
+            (
+                "transplant_target_session",
+                "ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT",
+            ),
             ("legion", "ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'"),
             ("synced", "ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0"),
-            ("discord_hosted", "ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0"),
+            (
+                "discord_hosted",
+                "ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0",
+            ),
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
-            ("instance_type", "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'"),
+            (
+                "instance_type",
+                "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'",
+            ),
             ("launcher", "ALTER TABLE claude_instances ADD COLUMN launcher TEXT"),
             ("engine", "ALTER TABLE claude_instances ADD COLUMN engine TEXT"),
             ("dispatch_target", "ALTER TABLE claude_instances ADD COLUMN dispatch_target TEXT"),
             ("dispatch_window", "ALTER TABLE claude_instances ADD COLUMN dispatch_window TEXT"),
             ("dispatch_mode", "ALTER TABLE claude_instances ADD COLUMN dispatch_mode TEXT"),
             ("dispatch_slot", "ALTER TABLE claude_instances ADD COLUMN dispatch_slot TEXT"),
-            ("dispatch_session_doc_path", "ALTER TABLE claude_instances ADD COLUMN dispatch_session_doc_path TEXT"),
-            ("target_working_dir", "ALTER TABLE claude_instances ADD COLUMN target_working_dir TEXT"),
+            (
+                "dispatch_session_doc_path",
+                "ALTER TABLE claude_instances ADD COLUMN dispatch_session_doc_path TEXT",
+            ),
+            (
+                "target_working_dir",
+                "ALTER TABLE claude_instances ADD COLUMN target_working_dir TEXT",
+            ),
             ("launch_mode", "ALTER TABLE claude_instances ADD COLUMN launch_mode TEXT"),
-            ("transplant_expected", "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0"),
-            ("session_doc_policy", "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT"),
+            (
+                "transplant_expected",
+                "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0",
+            ),
+            (
+                "session_doc_policy",
+                "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT",
+            ),
             ("wrapper_launch_id", "ALTER TABLE claude_instances ADD COLUMN wrapper_launch_id TEXT"),
-            ("continuity_binding_source", "ALTER TABLE claude_instances ADD COLUMN continuity_binding_source TEXT"),
+            (
+                "continuity_binding_source",
+                "ALTER TABLE claude_instances ADD COLUMN continuity_binding_source TEXT",
+            ),
             ("closure_surface", "ALTER TABLE claude_instances ADD COLUMN closure_surface TEXT"),
-            ("closure_required", "ALTER TABLE claude_instances ADD COLUMN closure_required INTEGER DEFAULT 0"),
+            (
+                "closure_required",
+                "ALTER TABLE claude_instances ADD COLUMN closure_required INTEGER DEFAULT 0",
+            ),
             ("workflow_state", "ALTER TABLE claude_instances ADD COLUMN workflow_state TEXT"),
-            ("workflow_updated_at", "ALTER TABLE claude_instances ADD COLUMN workflow_updated_at TIMESTAMP"),
-            ("workflow_blocked_reason", "ALTER TABLE claude_instances ADD COLUMN workflow_blocked_reason TEXT"),
-            ("stop_allowed", "ALTER TABLE claude_instances ADD COLUMN stop_allowed INTEGER DEFAULT 1"),
-            ("next_required_action", "ALTER TABLE claude_instances ADD COLUMN next_required_action TEXT"),
+            (
+                "workflow_updated_at",
+                "ALTER TABLE claude_instances ADD COLUMN workflow_updated_at TIMESTAMP",
+            ),
+            (
+                "workflow_blocked_reason",
+                "ALTER TABLE claude_instances ADD COLUMN workflow_blocked_reason TEXT",
+            ),
+            (
+                "stop_allowed",
+                "ALTER TABLE claude_instances ADD COLUMN stop_allowed INTEGER DEFAULT 1",
+            ),
+            (
+                "next_required_action",
+                "ALTER TABLE claude_instances ADD COLUMN next_required_action TEXT",
+            ),
             ("next_action_owner", "ALTER TABLE claude_instances ADD COLUMN next_action_owner TEXT"),
         ]
         for column_name, sql in instance_migrations:
@@ -104,15 +145,29 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END""")
 
         # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "is_processing"}
+        dead_columns = {
+            "pane_label",
+            "pre_stop_status",
+            "retrigger_count",
+            "spawner",
+            "is_processing",
+        }
         drop_targets = dead_columns & columns
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
 
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)"
+        )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS devices (
@@ -218,8 +273,12 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
             )
         """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_task_executions_task_id ON task_executions(task_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_task_executions_started_at ON task_executions(started_at)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_executions_task_id ON task_executions(task_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_executions_started_at ON task_executions(started_at)"
+        )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS task_locks (
@@ -412,22 +471,105 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         primarch_seed = [
-            ("vulkan", "Vulkan, The Promethean", '["v"]', "Imperium-ENV", "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.", "vulkan", "Personas/Vulkan.md"),
-            ("fabricator-general", "The Fabricator-General", '["fg", "fabricator"]', "Imperium-ENV", "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.", "fabricator-general", "Personas/Fabricator-General.md"),
-            ("mechanicus", "Adeptus Mechanicus", '["mech", "mars"]', "Imperium-ENV", "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.", "mechanicus", "Personas/Mechanicus.md"),
-            ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
-            ("guilliman", "Guilliman, The Codifier", '["g", "guilliman", "ultramar"]', "Imperium-ENV", "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.", "guilliman", "Personas/Guilliman.md"),
-            ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
-            ("alpharius", "Alpharius, The Unknowable Twin", '["alpharius", "alpha", "hydra"]', "Imperium-ENV", "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. Reports through Mechanicus channels. I am Alpharius.", "alpharius", "Personas/Alpharius.md"),
-            ("dorn", "Dorn, The Imperial Fist", '["dorn", "fortify", "audit"]', "Imperium-ENV", "Security Primarch. Defensive auditor and hardening reviewer. Reviews code, infrastructure, and configurations for vulnerabilities. Does not build — inspects what others build before it ships.", "dorn", "Personas/Dorn.md"),
-            ("corax", "Corax, The Raven Lord", '["corax", "raven", "monitor", "codax"]', "Imperium-ENV", "Observability Primarch. Long-term monitoring, anomaly detection, pattern recognition across the entire system. Independent observer — not part of the Mechanicus command chain. Read-only. Silent by default, speaks when something is wrong.", "corax", "Personas/Corax.md"),
-            ("perturabo", "Perturabo, Lord of Iron", '["pert", "iron-within", "lord-of-iron"]', "Imperium-ENV", "Matters of the flesh. Food supply chain, meal prep logistics, inventory management, health telemetry. On-demand, not cron.", "perturabo", "Personas/Perturabo.md"),
+            (
+                "vulkan",
+                "Vulkan, The Promethean",
+                '["v"]',
+                "Imperium-ENV",
+                "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.",
+                "vulkan",
+                "Personas/Vulkan.md",
+            ),
+            (
+                "fabricator-general",
+                "The Fabricator-General",
+                '["fg", "fabricator"]',
+                "Imperium-ENV",
+                "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.",
+                "fabricator-general",
+                "Personas/Fabricator-General.md",
+            ),
+            (
+                "mechanicus",
+                "Adeptus Mechanicus",
+                '["mech", "mars"]',
+                "Imperium-ENV",
+                "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.",
+                "mechanicus",
+                "Personas/Mechanicus.md",
+            ),
+            (
+                "administratum",
+                "The Administratum",
+                '["admin"]',
+                "Imperium-ENV",
+                "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.",
+                "administratum",
+                "Personas/Administratum.md",
+            ),
+            (
+                "guilliman",
+                "Guilliman, The Codifier",
+                '["g", "guilliman", "ultramar"]',
+                "Imperium-ENV",
+                "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.",
+                "guilliman",
+                "Personas/Guilliman.md",
+            ),
+            (
+                "sanguinius",
+                "Sanguinius, The Angel",
+                '["sang", "sanguinius", "angel"]',
+                "Imperium-ENV",
+                "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.",
+                "sanguinius",
+                "Personas/Sanguinius.md",
+            ),
+            (
+                "alpharius",
+                "Alpharius, The Unknowable Twin",
+                '["alpharius", "alpha", "hydra"]',
+                "Imperium-ENV",
+                "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. Reports through Mechanicus channels. I am Alpharius.",
+                "alpharius",
+                "Personas/Alpharius.md",
+            ),
+            (
+                "dorn",
+                "Dorn, The Imperial Fist",
+                '["dorn", "fortify", "audit"]',
+                "Imperium-ENV",
+                "Security Primarch. Defensive auditor and hardening reviewer. Reviews code, infrastructure, and configurations for vulnerabilities. Does not build — inspects what others build before it ships.",
+                "dorn",
+                "Personas/Dorn.md",
+            ),
+            (
+                "corax",
+                "Corax, The Raven Lord",
+                '["corax", "raven", "monitor", "codax"]',
+                "Imperium-ENV",
+                "Observability Primarch. Long-term monitoring, anomaly detection, pattern recognition across the entire system. Independent observer — not part of the Mechanicus command chain. Read-only. Silent by default, speaks when something is wrong.",
+                "corax",
+                "Personas/Corax.md",
+            ),
+            (
+                "perturabo",
+                "Perturabo, Lord of Iron",
+                '["pert", "iron-within", "lord-of-iron"]',
+                "Imperium-ENV",
+                "Matters of the flesh. Food supply chain, meal prep logistics, inventory management, health telemetry. On-demand, not cron.",
+                "perturabo",
+                "Personas/Perturabo.md",
+            ),
         ]
         for primarch in primarch_seed:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT OR IGNORE INTO primarchs (name, title, aliases, vault, role, instance_name_prefix, vault_note_path)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, primarch)
+            """,
+                primarch,
+            )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS habits (
@@ -562,54 +704,143 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("Mac-Mini", "Mac Mini", "local", "100.95.109.23", "tts_sound", None, "macos_say"),
             ("desktop", "Desktop", "local", "100.66.10.74", "tts_sound", None, "windows_sapi"),
             ("TokenPC", "Token PC", "local", "100.69.198.87", "tts_sound", None, "windows_sapi"),
-            ("Token-S24", "Pixel Phone", "mobile", "100.102.92.24", "webhook", "http://100.102.92.24:7777/notify", None),
+            (
+                "Token-S24",
+                "Pixel Phone",
+                "mobile",
+                "100.102.92.24",
+                "webhook",
+                "http://100.102.92.24:7777/notify",
+                None,
+            ),
         ]
-        for device_id, name, device_type, tailscale_ip, notify_method, webhook_url, tts_engine in device_seed:
-            await db.execute("""
+        for (
+            device_id,
+            name,
+            device_type,
+            tailscale_ip,
+            notify_method,
+            webhook_url,
+            tts_engine,
+        ) in device_seed:
+            await db.execute(
+                """
                 INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, webhook_url, tts_engine)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (device_id, name, device_type, tailscale_ip, notify_method, webhook_url, tts_engine))
+            """,
+                (
+                    device_id,
+                    name,
+                    device_type,
+                    tailscale_ip,
+                    notify_method,
+                    webhook_url,
+                    tts_engine,
+                ),
+            )
 
         scheduled_task_seed = [
-            ("cleanup_stale_instances", "Cleanup Stale Instances", "Mark instances with no activity for 3+ hours as stopped", "interval", "30m", 2),
-            ("purge_old_events", "Purge Old Events", "Delete events older than 30 days", "cron", "0 3 * * *", 1),
+            (
+                "cleanup_stale_instances",
+                "Cleanup Stale Instances",
+                "Mark instances with no activity for 3+ hours as stopped",
+                "interval",
+                "30m",
+                2,
+            ),
+            (
+                "purge_old_events",
+                "Purge Old Events",
+                "Delete events older than 30 days",
+                "cron",
+                "0 3 * * *",
+                1,
+            ),
         ]
         for task_id, name, description, task_type, schedule, max_retries in scheduled_task_seed:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (task_id, name, description, task_type, schedule, max_retries))
+            """,
+                (task_id, name, description, task_type, schedule, max_retries),
+            )
 
         checkin_tasks = [
-            ("checkin_morning_start", "Morning Start Check-in", "Energy, focus, mood, and today's focus", "0 9 * * 1-5"),
-            ("checkin_mid_morning", "Mid-Morning Check-in", "Focus check and on-track status", "30 10 * * 1-5"),
-            ("checkin_decision_point", "Decision Point Check-in", "Gym or power through, energy check", "0 11 * * 1-5"),
-            ("checkin_afternoon", "Afternoon Start Check-in", "Energy and focus after lunch", "0 13 * * 1-5"),
-            ("checkin_afternoon_check", "Afternoon Check", "Energy, focus, and need help assessment", "30 14 * * 1-5"),
+            (
+                "checkin_morning_start",
+                "Morning Start Check-in",
+                "Energy, focus, mood, and today's focus",
+                "0 9 * * 1-5",
+            ),
+            (
+                "checkin_mid_morning",
+                "Mid-Morning Check-in",
+                "Focus check and on-track status",
+                "30 10 * * 1-5",
+            ),
+            (
+                "checkin_decision_point",
+                "Decision Point Check-in",
+                "Gym or power through, energy check",
+                "0 11 * * 1-5",
+            ),
+            (
+                "checkin_afternoon",
+                "Afternoon Start Check-in",
+                "Energy and focus after lunch",
+                "0 13 * * 1-5",
+            ),
+            (
+                "checkin_afternoon_check",
+                "Afternoon Check",
+                "Energy, focus, and need help assessment",
+                "30 14 * * 1-5",
+            ),
         ]
         for task_id, name, description, schedule in checkin_tasks:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
                 VALUES (?, ?, ?, 'cron', ?, 0)
-            """, (task_id, name, description, schedule))
+            """,
+                (task_id, name, description, schedule),
+            )
 
         default_habits = [
             ("morning_teeth", "Brush teeth", "morning", 6, 10, None),
             ("morning_breakfast", "Breakfast", "morning", 6, 11, None),
-            ("morning_movement", "Morning movement", "morning", 6, 11, "Stretch, walk, or exercise"),
+            (
+                "morning_movement",
+                "Morning movement",
+                "morning",
+                6,
+                11,
+                "Stretch, walk, or exercise",
+            ),
             ("work_deep_work", "Deep work session", "work", 9, 14, "At least one focused block"),
             ("work_calendar", "Calendar review", "work", 9, 13, None),
             ("health_gym", "Gym / exercise", "health", 9, 21, None),
             ("health_water", "Hydration", "health", 6, 22, "Drink water throughout the day"),
             ("evening_reflection", "Evening reflection", "evening", 19, 24, None),
             ("evening_reading", "Reading", "evening", 19, 24, None),
-            ("evening_tomorrow", "Tomorrow prep", "evening", 19, 24, "Review tomorrow's calendar and tasks"),
+            (
+                "evening_tomorrow",
+                "Tomorrow prep",
+                "evening",
+                19,
+                24,
+                "Review tomorrow's calendar and tasks",
+            ),
         ]
         for habit in default_habits:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT OR IGNORE INTO habits (id, name, category, window_start_hour, window_end_hour, notes)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, habit)
+            """,
+                habit,
+            )
 
         await db.commit()
         print(f"Database initialized at {db_path}")

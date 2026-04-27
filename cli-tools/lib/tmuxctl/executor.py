@@ -5,12 +5,8 @@ import subprocess
 import time
 from dataclasses import replace
 
-from .enums import AttachmentClass, CoherenceSeverity, RestartPhase
-from .inspect import render_restart_plan, render_restart_result
+from .enums import AttachmentClass, RestartPhase
 from .models import (
-    ClientAttachment,
-    CoherenceIssue,
-    GroupedSessionSnapshot,
     RestartAction,
     RestartExecutionResult,
     RestartPlan,
@@ -57,7 +53,9 @@ class RestartExecutor:
         resume_results: list[ResumeResult] = []
 
         holding_session = "_tmuxctl_restart"
-        self.adapter.run("new-session", "-d", "-s", holding_session, "-x", "80", "-y", "24", allow_failure=True)
+        self.adapter.run(
+            "new-session", "-d", "-s", holding_session, "-x", "80", "-y", "24", allow_failure=True
+        )
         for attachment in plan.client_attachments:
             if attachment.attachment_class in {
                 AttachmentClass.REMOTE_LEADER,
@@ -66,10 +64,19 @@ class RestartExecutor:
                 self.adapter.run("detach-client", "-t", attachment.client_tty, allow_failure=True)
                 detached += 1
             else:
-                self.adapter.run("switch-client", "-c", attachment.client_tty, "-t", holding_session, allow_failure=True)
+                self.adapter.run(
+                    "switch-client",
+                    "-c",
+                    attachment.client_tty,
+                    "-t",
+                    holding_session,
+                    allow_failure=True,
+                )
                 parked += 1
 
-        grouped_sessions = [s for s in plan.grouped_sessions if s.session_name != s.leader_session_name]
+        grouped_sessions = [
+            s for s in plan.grouped_sessions if s.session_name != s.leader_session_name
+        ]
         for grouped in grouped_sessions:
             self.adapter.run("kill-session", "-t", grouped.session_name, allow_failure=True)
         self.adapter.run("kill-session", "-t", plan.session_name, allow_failure=True)
@@ -85,7 +92,9 @@ class RestartExecutor:
                 continue
         time.sleep(0.2)
         rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
-        pane_by_label = {pane.pane_role: pane.pane_id for pane in rebuilt.iter_panes() if pane.pane_role}
+        pane_by_label = {
+            pane.pane_role: pane.pane_id for pane in rebuilt.iter_panes() if pane.pane_role
+        }
 
         for resume in plan.resumes:
             target_pane_id = resume.target_pane_id or pane_by_label.get(resume.pane_label, "")
@@ -182,7 +191,14 @@ class RestartExecutor:
 
         for attachment in plan.client_attachments:
             target_session = attachment.session_name
-            self.adapter.run("switch-client", "-c", attachment.client_tty, "-t", target_session, allow_failure=True)
+            self.adapter.run(
+                "switch-client",
+                "-c",
+                attachment.client_tty,
+                "-t",
+                target_session,
+                allow_failure=True,
+            )
             restored += 1
 
         self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
@@ -234,7 +250,12 @@ class RestartExecutor:
 
     def _planned_actions(self, plan: RestartPlan) -> list[RestartAction]:
         actions: list[RestartAction] = []
-        actions.append(RestartAction(RestartPhase.CAPTURE, "freeze workspace, grouped sessions, clients, and registry inputs"))
+        actions.append(
+            RestartAction(
+                RestartPhase.CAPTURE,
+                "freeze workspace, grouped sessions, clients, and registry inputs",
+            )
+        )
         for attachment in plan.client_attachments:
             verb = "detach" if attachment.is_remote else "park"
             actions.append(
@@ -251,9 +272,13 @@ class RestartExecutor:
                         f"kill grouped session {grouped.session_name}",
                     )
                 )
-        actions.append(RestartAction(RestartPhase.TEARDOWN, f"kill leader session {plan.session_name}"))
+        actions.append(
+            RestartAction(RestartPhase.TEARDOWN, f"kill leader session {plan.session_name}")
+        )
         actions.append(RestartAction(RestartPhase.REBUILD, "recreate workspace via tmux-workspace"))
-        actions.append(RestartAction(RestartPhase.REBUILD, "normalize managed windows before restore"))
+        actions.append(
+            RestartAction(RestartPhase.REBUILD, "normalize managed windows before restore")
+        )
         for resume in plan.resumes:
             target = resume.target_pane_id or f"{resume.pane_label} (resolve post-rebuild)"
             actions.append(

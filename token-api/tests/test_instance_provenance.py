@@ -32,6 +32,7 @@ def _session_start(client, *, tmux_pane=None):
     assert resp.status_code == 200, resp.text
     return instance_id
 
+
 def _mutations_for(app_env, instance_id):
     conn = _db(app_env)
     rows = conn.execute(
@@ -99,7 +100,9 @@ class TestReconciliation:
     def test_direct_sql_write_is_unprovenanced(self, client, app_env):
         instance_id = _session_start(client)
         conn = _db(app_env)
-        conn.execute("UPDATE claude_instances SET legion = 'mechanicus' WHERE id = ?", (instance_id,))
+        conn.execute(
+            "UPDATE claude_instances SET legion = 'mechanicus' WHERE id = ?", (instance_id,)
+        )
         conn.commit()
         conn.close()
 
@@ -109,7 +112,9 @@ class TestReconciliation:
 
     def test_pending_projection_detected_from_queue(self, client):
         instance_id = _session_start(client, tmux_pane="%99")
-        resp = client.post(f"/api/instances/{instance_id}/activity", json={"action": "prompt_submit"})
+        resp = client.post(
+            f"/api/instances/{instance_id}/activity", json={"action": "prompt_submit"}
+        )
         assert resp.status_code == 200, resp.text
 
         resp = client.get(f"/api/instances/{instance_id}/reconciliation")

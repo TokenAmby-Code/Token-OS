@@ -15,13 +15,13 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from nas_mount import ensure_command_mounts
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+
+from nas_mount import ensure_command_mounts
 
 # Timezone handling
 try:
@@ -30,7 +30,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 
-VICTORY_RE = re.compile(r'##IMPERIUM_VICTORIOUS:\s*(.+?)##', re.DOTALL)
+VICTORY_RE = re.compile(r"##IMPERIUM_VICTORIOUS:\s*(.+?)##", re.DOTALL)
 
 # Parse model and prompt_path from legacy monolithic command strings
 _CMD_PARSE_RE = re.compile(
@@ -146,7 +146,9 @@ class CronEngine:
         if "guards_count" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN guards_count INTEGER DEFAULT 0")
         if "followup_delay_seconds" not in cron_jobs_cols:
-            await db.execute("ALTER TABLE cron_jobs ADD COLUMN followup_delay_seconds INTEGER DEFAULT NULL")
+            await db.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN followup_delay_seconds INTEGER DEFAULT NULL"
+            )
         if "notify_discord" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN notify_discord INTEGER DEFAULT 0")
         if "commander" not in cron_jobs_cols:
@@ -158,9 +160,13 @@ class CronEngine:
         if "active_session_id" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN active_session_id TEXT DEFAULT NULL")
         if "session_started_date" not in cron_jobs_cols:
-            await db.execute("ALTER TABLE cron_jobs ADD COLUMN session_started_date TEXT DEFAULT NULL")
+            await db.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN session_started_date TEXT DEFAULT NULL"
+            )
         if "victory_conditions" not in cron_jobs_cols:
-            await db.execute("ALTER TABLE cron_jobs ADD COLUMN victory_conditions TEXT DEFAULT NULL")
+            await db.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN victory_conditions TEXT DEFAULT NULL"
+            )
         if "legion" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN legion TEXT DEFAULT 'mechanicus'")
 
@@ -183,8 +189,7 @@ class CronEngine:
                 prompt = m.group(2).strip()
                 # Rewrite legacy openclaw path to canonical ~/.claude/prompts/
                 prompt = prompt.replace(
-                    "~/.openclaw/workspace/memory/prompts/",
-                    "~/.claude/prompts/"
+                    "~/.openclaw/workspace/memory/prompts/", "~/.claude/prompts/"
                 )
                 await db.execute(
                     "UPDATE cron_jobs SET model = ?, prompt_path = ? WHERE id = ?",
@@ -204,20 +209,23 @@ class CronEngine:
         """
         now = _now_iso()
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM cron_runs WHERE status = 'running'"
-            )
+            cursor = await db.execute("SELECT COUNT(*) FROM cron_runs WHERE status = 'running'")
             count = (await cursor.fetchone())[0]
             if count:
-                await db.execute("""
+                await db.execute(
+                    """
                     UPDATE cron_runs
                     SET status = 'orphaned',
                         finished_at = ?,
                         error_summary = 'Process lost on server restart — run never completed'
                     WHERE status = 'running'
-                """, (now,))
+                """,
+                    (now,),
+                )
                 await db.commit()
-                print(f"CronEngine: Orphaned {count} stale 'running' record(s) from previous session")
+                print(
+                    f"CronEngine: Orphaned {count} stale 'running' record(s) from previous session"
+                )
 
     # ── Load / Sync ────────────────────────────────────────────
 
@@ -249,7 +257,8 @@ class CronEngine:
             for job_def in self._PERMANENT_JOBS:
                 schedule = job_def["schedule"]
                 quiet = job_def.get("quiet_hours")
-                await db.execute("""
+                await db.execute(
+                    """
                     INSERT OR IGNORE INTO cron_jobs (
                         id, name, description, enabled,
                         schedule_type, schedule_value, timezone,
@@ -260,25 +269,30 @@ class CronEngine:
                         model, prompt_path,
                         created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    job_def["id"], job_def["name"],
-                    job_def.get("description", ""),
-                    1 if job_def.get("enabled", True) else 0,
-                    schedule["type"], schedule["value"],
-                    schedule.get("tz", "America/Phoenix"),
-                    job_def.get("command", ""),
-                    job_def.get("timeout_seconds", 120),
-                    quiet[0] if quiet else None,
-                    quiet[1] if quiet else None,
-                    job_def.get("max_runs_per_window"),
-                    job_def.get("run_window_hours", 5),
-                    job_def.get("session_type", "isolated"),
-                    1 if job_def.get("notify_discord") else 0,
-                    job_def.get("commander", "mechanicus"),
-                    job_def.get("model"),
-                    job_def.get("prompt_path"),
-                    now, now,
-                ))
+                """,
+                    (
+                        job_def["id"],
+                        job_def["name"],
+                        job_def.get("description", ""),
+                        1 if job_def.get("enabled", True) else 0,
+                        schedule["type"],
+                        schedule["value"],
+                        schedule.get("tz", "America/Phoenix"),
+                        job_def.get("command", ""),
+                        job_def.get("timeout_seconds", 120),
+                        quiet[0] if quiet else None,
+                        quiet[1] if quiet else None,
+                        job_def.get("max_runs_per_window"),
+                        job_def.get("run_window_hours", 5),
+                        job_def.get("session_type", "isolated"),
+                        1 if job_def.get("notify_discord") else 0,
+                        job_def.get("commander", "mechanicus"),
+                        job_def.get("model"),
+                        job_def.get("prompt_path"),
+                        now,
+                        now,
+                    ),
+                )
             await db.commit()
 
         await self._register_all()
@@ -287,9 +301,7 @@ class CronEngine:
         """Register all enabled jobs with APScheduler."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM cron_jobs WHERE enabled = 1"
-            )
+            cursor = await db.execute("SELECT * FROM cron_jobs WHERE enabled = 1")
             jobs = await cursor.fetchall()
 
         for job in jobs:
@@ -308,7 +320,9 @@ class CronEngine:
                 replace_existing=True,
                 name=job["name"],
             )
-            print(f"CronEngine: Registered '{job['name']}' ({job['schedule_type']}: {job['schedule_value']})")
+            print(
+                f"CronEngine: Registered '{job['name']}' ({job['schedule_type']}: {job['schedule_value']})"
+            )
         except Exception as e:
             print(f"CronEngine: Failed to register '{job['name']}': {e}")
 
@@ -323,9 +337,12 @@ class CronEngine:
             if len(parts) != 5:
                 raise ValueError(f"Invalid cron expression: {job['schedule_value']}")
             return CronTrigger(
-                minute=parts[0], hour=parts[1],
-                day=parts[2], month=parts[3],
-                day_of_week=parts[4], timezone=tz,
+                minute=parts[0],
+                hour=parts[1],
+                day=parts[2],
+                month=parts[3],
+                day_of_week=parts[4],
+                timezone=tz,
             )
         raise ValueError(f"Unknown schedule type: {job['schedule_type']}")
 
@@ -396,10 +413,13 @@ class CronEngine:
         cutoff = (datetime.now() - timedelta(hours=window_hours)).isoformat()
 
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 SELECT COUNT(*) FROM cron_runs
                 WHERE job_id = ? AND started_at > ? AND status IN ('ok', 'error', 'timeout', 'orphaned')
-            """, (job["id"], cutoff))
+            """,
+                (job["id"], cutoff),
+            )
             count = (await cursor.fetchone())[0]
 
         return count < max_runs
@@ -441,8 +461,10 @@ class CronEngine:
                     (new_session_id, today, _now_iso(), job["id"]),
                 )
                 await db.commit()
-            print(f"CronEngine: '{job['name']}' new {session_type} session: {new_session_id[:8]}...")
-            return f'{base} --session-id {new_session_id}'
+            print(
+                f"CronEngine: '{job['name']}' new {session_type} session: {new_session_id[:8]}..."
+            )
+            return f"{base} --session-id {new_session_id}"
         else:
             # Resume existing session — prompt is injected as the -p message
             print(f"CronEngine: '{job['name']}' resuming session: {active_session_id[:8]}...")
@@ -456,10 +478,13 @@ class CronEngine:
 
         # Insert running record
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 INSERT INTO cron_runs (job_id, started_at, status, created_at)
                 VALUES (?, ?, 'running', ?)
-            """, (job_id, started_at, started_at))
+            """,
+                (job_id, started_at, started_at),
+            )
             run_id = cursor.lastrowid
             await db.commit()
 
@@ -468,6 +493,7 @@ class CronEngine:
         output_summary = ""
         error_summary = ""
         import time as _time
+
         start_time = _time.monotonic()
 
         # Discord trigger notification (log on start)
@@ -475,7 +501,8 @@ class CronEngine:
             try:
                 subprocess.run(
                     ["discord", "send", "fleet", f"🔄 **{job['name']}**: started"],
-                    timeout=8, env=_subprocess_env(),
+                    timeout=8,
+                    env=_subprocess_env(),
                 )
             except Exception as e:
                 print(f"CronEngine: Discord trigger notify failed for '{job['name']}': {e}")
@@ -497,9 +524,9 @@ class CronEngine:
             # Alert fleet channel once so the issue is visible
             try:
                 subprocess.run(
-                    ["discord", "send", "fleet",
-                     f"⚠️ **{job['name']}** skipped: {nas_err}"],
-                    timeout=8, env=_subprocess_env(),
+                    ["discord", "send", "fleet", f"⚠️ **{job['name']}** skipped: {nas_err}"],
+                    timeout=8,
+                    env=_subprocess_env(),
                 )
             except Exception:
                 pass
@@ -537,7 +564,7 @@ class CronEngine:
                 output_summary = (stdout or b"").decode("utf-8", errors="replace")[-4000:]
                 error_summary = (stderr or b"").decode("utf-8", errors="replace")[-4000:]
                 status = "ok" if exit_code == 0 else "error"
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -547,14 +574,16 @@ class CronEngine:
                 try:
                     stdout = await asyncio.wait_for(read_stdout, timeout=5)
                     stderr = await asyncio.wait_for(read_stderr, timeout=5)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     read_stdout.cancel()
                     read_stderr.cancel()
                     stdout, stderr = b"", b""
                 output_summary = (stdout or b"").decode("utf-8", errors="replace")[-4000:]
                 error_summary = (stderr or b"").decode("utf-8", errors="replace")[-2000:]
                 status = "timeout"
-                error_summary = f"Killed after {job.get('timeout_seconds', 120)}s timeout\n" + error_summary
+                error_summary = (
+                    f"Killed after {job.get('timeout_seconds', 120)}s timeout\n" + error_summary
+                )
 
         except Exception as e:
             if status != "nas_unavailable":  # don't overwrite NAS-specific status
@@ -571,15 +600,25 @@ class CronEngine:
 
             try:
                 async with aiosqlite.connect(self.db_path) as db:
-                    await db.execute("""
+                    await db.execute(
+                        """
                         UPDATE cron_runs SET
                             finished_at = ?, status = ?, duration_seconds = ?,
                             exit_code = ?, output_summary = ?, error_summary = ?,
                             victory_reason = ?
                         WHERE id = ?
-                    """, (finished_at, status, round(duration, 2),
-                          exit_code, output_summary, error_summary,
-                          victory_reason, run_id))
+                    """,
+                        (
+                            finished_at,
+                            status,
+                            round(duration, 2),
+                            exit_code,
+                            output_summary,
+                            error_summary,
+                            victory_reason,
+                            run_id,
+                        ),
+                    )
                     await db.commit()
             except Exception as db_err:
                 print(f"CronEngine: DB update failed for '{job['name']}': {db_err}")
@@ -598,7 +637,8 @@ class CronEngine:
                 try:
                     subprocess.run(
                         ["discord", "send", "fleet", msg],
-                        timeout=8, env=_subprocess_env(),
+                        timeout=8,
+                        env=_subprocess_env(),
                     )
                 except Exception as e:
                     print(f"CronEngine: Discord notify failed for '{job['name']}': {e}")
@@ -609,9 +649,11 @@ class CronEngine:
                     asyncio.create_task(self._handle_victory(job, run_id, victory_reason))
                 elif job.get("followup_delay_seconds"):
                     delay = job["followup_delay_seconds"]
+
                     async def _delayed_followup(jid=job_id, d=delay):
                         await asyncio.sleep(d)
                         await self._run_wrapper(jid)
+
                     asyncio.create_task(_delayed_followup())
 
             # Post-run graph (guards + victory chain via LangGraph)
@@ -620,17 +662,22 @@ class CronEngine:
             if guards_count or followup_delay:
                 try:
                     from post_run_graph import post_run_graph
-                    asyncio.create_task(post_run_graph.ainvoke({
-                        "job_id": job_id,
-                        "job_name": job["name"],
-                        "cron_run_id": run_id,
-                        "full_output": output_summary,
-                        "guards_count": guards_count or 0,
-                        "followup_delay_seconds": followup_delay,
-                        "victory_reason": victory_reason,
-                        "guard_results": [],
-                        "followup_scheduled": False,
-                    }))
+
+                    asyncio.create_task(
+                        post_run_graph.ainvoke(
+                            {
+                                "job_id": job_id,
+                                "job_name": job["name"],
+                                "cron_run_id": run_id,
+                                "full_output": output_summary,
+                                "guards_count": guards_count or 0,
+                                "followup_delay_seconds": followup_delay,
+                                "victory_reason": victory_reason,
+                                "guard_results": [],
+                                "followup_scheduled": False,
+                            }
+                        )
+                    )
                 except ImportError:
                     pass  # post_run_graph not yet installed
 
@@ -677,10 +724,13 @@ class CronEngine:
         """Record a skipped run."""
         now = _now_iso()
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO cron_runs (job_id, started_at, finished_at, status, skip_reason, duration_seconds, created_at)
                 VALUES (?, ?, ?, 'skipped', ?, 0, ?)
-            """, (job_id, now, now, reason, now))
+            """,
+                (job_id, now, now, reason, now),
+            )
             await db.commit()
         print(f"CronEngine: Job {job_id} skipped ({reason})")
 
@@ -711,7 +761,7 @@ class CronEngine:
 
         return jobs
 
-    async def get_job(self, job_id: str) -> Optional[dict]:
+    async def get_job(self, job_id: str) -> dict | None:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs WHERE id = ?", (job_id,))
@@ -780,7 +830,9 @@ class CronEngine:
         quiet = data.get("quiet_hours")
         commander = data.get("commander", "mechanicus")
         if commander not in self.VALID_COMMANDERS:
-            raise ValueError(f"Invalid commander '{commander}'. Must be one of: {sorted(self.VALID_COMMANDERS)}")
+            raise ValueError(
+                f"Invalid commander '{commander}'. Must be one of: {sorted(self.VALID_COMMANDERS)}"
+            )
 
         model = data.get("model")
         prompt_path = data.get("prompt_path")
@@ -792,7 +844,8 @@ class CronEngine:
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
+                await db.execute(
+                    """
                     INSERT INTO cron_jobs (
                         id, name, description, enabled,
                         schedule_type, schedule_value, timezone,
@@ -804,24 +857,32 @@ class CronEngine:
                         victory_conditions,
                         created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    job_id, data["name"],
-                    data.get("description", ""),
-                    1 if data.get("enabled", True) else 0,
-                    schedule["type"], schedule["value"],
-                    schedule.get("tz", "America/Phoenix"),
-                    command,
-                    data.get("timeout_seconds", 120),
-                    quiet[0] if quiet else None,
-                    quiet[1] if quiet else None,
-                    data.get("max_runs_per_window"),
-                    data.get("run_window_hours", 5),
-                    data.get("session_type", "isolated"),
-                    commander,
-                    model, prompt_path,
-                    json.dumps(data["victory_conditions"]) if data.get("victory_conditions") else None,
-                    now, now,
-                ))
+                """,
+                    (
+                        job_id,
+                        data["name"],
+                        data.get("description", ""),
+                        1 if data.get("enabled", True) else 0,
+                        schedule["type"],
+                        schedule["value"],
+                        schedule.get("tz", "America/Phoenix"),
+                        command,
+                        data.get("timeout_seconds", 120),
+                        quiet[0] if quiet else None,
+                        quiet[1] if quiet else None,
+                        data.get("max_runs_per_window"),
+                        data.get("run_window_hours", 5),
+                        data.get("session_type", "isolated"),
+                        commander,
+                        model,
+                        prompt_path,
+                        json.dumps(data["victory_conditions"])
+                        if data.get("victory_conditions")
+                        else None,
+                        now,
+                        now,
+                    ),
+                )
                 await db.commit()
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed: cron_jobs.name" in str(e):
@@ -833,10 +894,12 @@ class CronEngine:
             self._register_job(job)
         return job
 
-    async def update_job(self, job_id: str, updates: dict) -> Optional[dict]:
+    async def update_job(self, job_id: str, updates: dict) -> dict | None:
         """Update a cron job. Re-registers with scheduler if schedule changed."""
         if "commander" in updates and updates["commander"] not in self.VALID_COMMANDERS:
-            raise ValueError(f"Invalid commander '{updates['commander']}'. Must be one of: {sorted(self.VALID_COMMANDERS)}")
+            raise ValueError(
+                f"Invalid commander '{updates['commander']}'. Must be one of: {sorted(self.VALID_COMMANDERS)}"
+            )
 
         job = await self.get_job(job_id)
         if not job:
@@ -846,8 +909,10 @@ class CronEngine:
         params = []
 
         field_map = {
-            "name": "name", "description": "description",
-            "enabled": "enabled", "command": "command",
+            "name": "name",
+            "description": "description",
+            "enabled": "enabled",
+            "command": "command",
             "timeout_seconds": "timeout_seconds",
             "quiet_hours_start": "quiet_hours_start",
             "quiet_hours_end": "quiet_hours_end",
@@ -937,9 +1002,11 @@ class CronEngine:
             return await self._dry_run(job)
 
         if delay_seconds > 0:
+
             async def _delayed_run():
                 await asyncio.sleep(delay_seconds)
                 await self._run_wrapper(job_id, bypass_enabled=True)
+
             asyncio.create_task(_delayed_run())
             return {"triggered": True, "job": job["name"], "delay_seconds": delay_seconds}
 
@@ -972,10 +1039,14 @@ class CronEngine:
         details.append(f"Current hour ({tz}): {current_hour}")
         quiet_s, quiet_e = job.get("quiet_hours_start"), job.get("quiet_hours_end")
         if quiet_s is not None:
-            details.append(f"Quiet hours: {quiet_s}-{quiet_e} → {'BLOCKED' if not checks['quiet_hours'] else 'clear'}")
+            details.append(
+                f"Quiet hours: {quiet_s}-{quiet_e} → {'BLOCKED' if not checks['quiet_hours'] else 'clear'}"
+            )
         max_runs = job.get("max_runs_per_window")
         if max_runs:
-            details.append(f"Quota: {max_runs}/{job.get('run_window_hours', 5)}h → {'BLOCKED' if not checks['quota'] else 'clear'}")
+            details.append(
+                f"Quota: {max_runs}/{job.get('run_window_hours', 5)}h → {'BLOCKED' if not checks['quota'] else 'clear'}"
+            )
         details.append(f"Enabled: {checks['enabled']}")
         details.append(f"Would run: {'YES' if would_run else 'NO'}")
 
@@ -983,12 +1054,13 @@ class CronEngine:
 
         # Log as a dry_run in the audit trail
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO cron_runs (job_id, started_at, finished_at, status, skip_reason, duration_seconds, output_summary, created_at)
                 VALUES (?, ?, ?, 'dry_run', ?, 0, ?, ?)
-            """, (job_id, now, now,
-                  None if would_run else "would_be_blocked",
-                  output, now))
+            """,
+                (job_id, now, now, None if would_run else "would_be_blocked", output, now),
+            )
             await db.commit()
 
         print(f"CronEngine: '{job['name']}' dry-run: would_run={would_run}")
@@ -1004,12 +1076,15 @@ class CronEngine:
         """Get recent run history for a job."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 SELECT * FROM cron_runs
                 WHERE job_id = ?
                 ORDER BY started_at DESC
                 LIMIT ?
-            """, (job_id, limit))
+            """,
+                (job_id, limit),
+            )
             return [dict(row) for row in await cursor.fetchall()]
 
     async def get_status(self) -> dict:
@@ -1021,7 +1096,7 @@ class CronEngine:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM cron_runs WHERE started_at > ?",
-                ((datetime.now() - timedelta(hours=24)).isoformat(),)
+                ((datetime.now() - timedelta(hours=24)).isoformat(),),
             )
             runs_24h = (await cursor.fetchone())[0]
 
@@ -1053,9 +1128,7 @@ class CronEngine:
                     commanders,
                 )
             else:
-                cursor = await db.execute(
-                    "SELECT id, name FROM cron_jobs WHERE enabled = 1"
-                )
+                cursor = await db.execute("SELECT id, name FROM cron_jobs WHERE enabled = 1")
             enabled_jobs = await cursor.fetchall()
 
             if not enabled_jobs:
@@ -1110,10 +1183,18 @@ class CronEngine:
                 cursor = await db.execute("SELECT job_id FROM fleet_pause_state")
                 paused_ids = [row[0] for row in await cursor.fetchall()]
             except Exception:
-                return {"unpaused": [], "count": 0, "message": "No pause state found — fleet was not paused"}
+                return {
+                    "unpaused": [],
+                    "count": 0,
+                    "message": "No pause state found — fleet was not paused",
+                }
 
             if not paused_ids:
-                return {"unpaused": [], "count": 0, "message": "No pause state found — fleet was not paused"}
+                return {
+                    "unpaused": [],
+                    "count": 0,
+                    "message": "No pause state found — fleet was not paused",
+                }
 
             # Re-enable paused jobs
             placeholders = ",".join("?" for _ in paused_ids)
@@ -1139,5 +1220,7 @@ class CronEngine:
             if job and job["enabled"]:
                 self._register_job(job)
 
-        print(f"CronEngine: Fleet unpaused — {len(paused_ids)} jobs re-enabled: {', '.join(job_names)}")
+        print(
+            f"CronEngine: Fleet unpaused — {len(paused_ids)} jobs re-enabled: {', '.join(job_names)}"
+        )
         return {"unpaused": job_names, "count": len(paused_ids)}

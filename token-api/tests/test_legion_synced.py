@@ -26,6 +26,7 @@ MORNING_ENFORCE_STATE = {}
 _format_discord_injection = None
 _TEST_DB_PATH = None
 
+
 @pytest.fixture
 def client(app_env):
     """Create a test client for the FastAPI app."""
@@ -43,9 +44,17 @@ def _bind_main_globals(app_env):
     _TEST_DB_PATH = str(app_env.db_path)
 
 
-def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
-                     status="idle", tmux_pane=None, working_dir="/tmp",
-                     last_activity=None, db_path=None):
+def _insert_instance(
+    instance_id=None,
+    *,
+    legion="astartes",
+    synced=0,
+    status="idle",
+    tmux_pane=None,
+    working_dir="/tmp",
+    last_activity=None,
+    db_path=None,
+):
     """Insert a minimal test instance directly into DB."""
     iid = instance_id or str(uuid.uuid4())
     now = last_activity or datetime.now().isoformat()
@@ -55,8 +64,18 @@ def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"test-{iid[:8]}", working_dir,
-         status, legion, synced, tmux_pane, now, now)
+        (
+            iid,
+            str(uuid.uuid4()),
+            f"test-{iid[:8]}",
+            working_dir,
+            status,
+            legion,
+            synced,
+            tmux_pane,
+            now,
+            now,
+        ),
     )
     conn.commit()
     conn.close()
@@ -67,9 +86,7 @@ def _get_instance(instance_id):
     """Read an instance row from DB."""
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -114,13 +131,16 @@ class TestSchema:
         cols = conn.execute("PRAGMA table_info(claude_instances)").fetchall()
         conn.close()
         names = {row[1] for row in cols}
-        assert {"continuity_binding_source", "workflow_state", "stop_allowed", "next_required_action"} <= names
+        assert {
+            "continuity_binding_source",
+            "workflow_state",
+            "stop_allowed",
+            "next_required_action",
+        } <= names
 
     def test_workflow_events_table_exists(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
-        tables = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         indices = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='workflow_events'"
         ).fetchall()
@@ -150,7 +170,7 @@ class TestSetLegion:
         assert resp.status_code == 400
 
     def test_set_legion_not_found(self, client):
-        resp = client.patch(f"/api/instances/nonexistent-id/legion", json={"legion": "custodes"})
+        resp = client.patch("/api/instances/nonexistent-id/legion", json={"legion": "custodes"})
         assert resp.status_code == 404
 
 
@@ -203,7 +223,7 @@ class TestSetSynced:
         assert resp.status_code == 200
 
     def test_set_synced_not_found(self, client):
-        resp = client.patch(f"/api/instances/nonexistent/synced", json={"synced": True})
+        resp = client.patch("/api/instances/nonexistent/synced", json={"synced": True})
         assert resp.status_code == 404
 
 
@@ -323,7 +343,9 @@ class TestCivicAutoDetect:
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())
-        self._register_via_hook(client, working_dir="/Volumes/Imperium/Imperium-ENV", session_id=sid)
+        self._register_via_hook(
+            client, working_dir="/Volumes/Imperium/Imperium-ENV", session_id=sid
+        )
         row = _get_instance(sid)
         assert row is not None
         assert row["legion"] == "astartes"
@@ -349,24 +371,29 @@ class TestCivicAutoDetect:
 
 class TestMorningAckViaDiscord:
     def _post_discord_message(self, client, content, channel="chat"):
-        return client.post("/api/discord/message", json={
-            "channel_id": "test-channel-id",
-            "channel_name": channel,
-            "content": content,
-            "author": {"username": "Emperor", "id": "12345"},
-        })
+        return client.post(
+            "/api/discord/message",
+            json={
+                "channel_id": "test-channel-id",
+                "channel_name": channel,
+                "content": content,
+                "author": {"username": "Emperor", "id": "12345"},
+            },
+        )
 
     def test_discord_ack_clears_enforce(self, client):
         """'ack' keyword in Discord should clear pending enforce state."""
         # Set enforce to pending
-        MORNING_ENFORCE_STATE.update({
-            "status": "pending",
-            "session_type": "morning_session",
-            "fired_at": datetime.utcnow().isoformat(),
-            "acknowledged_at": None,
-            "override_reason": None,
-            "escalation_level": 0,
-        })
+        MORNING_ENFORCE_STATE.update(
+            {
+                "status": "pending",
+                "session_type": "morning_session",
+                "fired_at": datetime.utcnow().isoformat(),
+                "acknowledged_at": None,
+                "override_reason": None,
+                "escalation_level": 0,
+            }
+        )
 
         resp = self._post_discord_message(client, "ack")
         assert resp.status_code == 200
@@ -375,13 +402,15 @@ class TestMorningAckViaDiscord:
     def test_discord_ack_keywords(self, client):
         """All ack keywords should work."""
         for keyword in ("ack", "acknowledged", "acknowledge", "here", "awake"):
-            MORNING_ENFORCE_STATE.update({
-                "status": "pending",
-                "session_type": "morning_session",
-                "fired_at": datetime.utcnow().isoformat(),
-                "acknowledged_at": None,
-                "escalation_level": 0,
-            })
+            MORNING_ENFORCE_STATE.update(
+                {
+                    "status": "pending",
+                    "session_type": "morning_session",
+                    "fired_at": datetime.utcnow().isoformat(),
+                    "acknowledged_at": None,
+                    "escalation_level": 0,
+                }
+            )
             self._post_discord_message(client, keyword)
             assert MORNING_ENFORCE_STATE["status"] == "acknowledged", f"Keyword '{keyword}' failed"
 
@@ -393,13 +422,15 @@ class TestMorningAckViaDiscord:
 
     def test_discord_ack_case_insensitive(self, client):
         """Ack keywords should be case-insensitive."""
-        MORNING_ENFORCE_STATE.update({
-            "status": "pending",
-            "session_type": "morning_session",
-            "fired_at": datetime.utcnow().isoformat(),
-            "acknowledged_at": None,
-            "escalation_level": 0,
-        })
+        MORNING_ENFORCE_STATE.update(
+            {
+                "status": "pending",
+                "session_type": "morning_session",
+                "fired_at": datetime.utcnow().isoformat(),
+                "acknowledged_at": None,
+                "escalation_level": 0,
+            }
+        )
         self._post_discord_message(client, "ACK")
         assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
 
@@ -412,31 +443,29 @@ class TestWorkflowState:
         sid = str(uuid.uuid4())
         session_doc = Path(tempfile.mkdtemp()) / "dispatch-note.md"
         session_doc.write_text(
-            "---\n"
-            "title: Dispatch Note\n"
-            "type: session\n"
-            "status: active\n"
-            "---\n\n"
-            "# Dispatch\n",
+            "---\ntitle: Dispatch Note\ntype: session\nstatus: active\n---\n\n# Dispatch\n",
             encoding="utf-8",
         )
 
-        resp = client.post("/api/hooks/SessionStart", json={
-            "session_id": sid,
-            "cwd": "/Volumes/Imperium/Imperium-ENV",
-            "pid": 12345,
-            "env": {
-                "TOKEN_API_ENGINE": "claude",
-                "TOKEN_API_LAUNCHER": "vault-dispatch",
-                "TOKEN_API_DISPATCH_TARGET": "legion:new",
-                "TOKEN_API_DISPATCH_WINDOW": "legion",
-                "TOKEN_API_DISPATCH_MODE": "stack_new",
-                "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
-                "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
-                "TOKEN_API_LAUNCH_MODE": "vault_then_transplant",
-                "TOKEN_API_TRANSPLANT_EXPECTED": "true",
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "pid": 12345,
+                "env": {
+                    "TOKEN_API_ENGINE": "claude",
+                    "TOKEN_API_LAUNCHER": "vault-dispatch",
+                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                    "TOKEN_API_DISPATCH_WINDOW": "legion",
+                    "TOKEN_API_DISPATCH_MODE": "stack_new",
+                    "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
+                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                    "TOKEN_API_LAUNCH_MODE": "vault_then_transplant",
+                    "TOKEN_API_TRANSPLANT_EXPECTED": "true",
+                },
             },
-        })
+        )
         assert resp.status_code == 200, resp.text
 
         row = _get_instance(sid)
@@ -456,32 +485,30 @@ class TestWorkflowState:
         sid = str(uuid.uuid4())
         session_doc = Path(tempfile.mkdtemp()) / "codex-dispatch.md"
         session_doc.write_text(
-            "---\n"
-            "title: Codex Dispatch\n"
-            "type: session\n"
-            "status: active\n"
-            "---\n\n"
-            "# Dispatch\n",
+            "---\ntitle: Codex Dispatch\ntype: session\nstatus: active\n---\n\n# Dispatch\n",
             encoding="utf-8",
         )
 
-        resp = client.post("/api/hooks/SessionStart", json={
-            "session_id": sid,
-            "cwd": "/Volumes/Imperium/Token-OS",
-            "pid": 22222,
-            "env": {
-                "TOKEN_API_ENGINE": "codex",
-                "TOKEN_API_LAUNCHER": "vault-dispatch",
-                "TOKEN_API_DISPATCH_TARGET": "bridge:BL",
-                "TOKEN_API_DISPATCH_WINDOW": "bridge",
-                "TOKEN_API_DISPATCH_MODE": "named_slot",
-                "TOKEN_API_DISPATCH_SLOT": "BL",
-                "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
-                "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
-                "TOKEN_API_LAUNCH_MODE": "direct_target",
-                "TOKEN_API_TRANSPLANT_EXPECTED": "false",
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Token-OS",
+                "pid": 22222,
+                "env": {
+                    "TOKEN_API_ENGINE": "codex",
+                    "TOKEN_API_LAUNCHER": "vault-dispatch",
+                    "TOKEN_API_DISPATCH_TARGET": "bridge:BL",
+                    "TOKEN_API_DISPATCH_WINDOW": "bridge",
+                    "TOKEN_API_DISPATCH_MODE": "named_slot",
+                    "TOKEN_API_DISPATCH_SLOT": "BL",
+                    "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
+                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                    "TOKEN_API_LAUNCH_MODE": "direct_target",
+                    "TOKEN_API_TRANSPLANT_EXPECTED": "false",
+                },
             },
-        })
+        )
         assert resp.status_code == 200, resp.text
 
         row = _get_instance(sid)
@@ -494,7 +521,13 @@ class TestWorkflowState:
         conn.execute(
             """INSERT INTO workflow_events (instance_id, workflow_state, event_type, event_owner, details_json)
                VALUES (?, ?, ?, ?, ?)""",
-            (iid, "worktree", "workflow_state_changed", "test", '{"new_workflow_state":"worktree"}'),
+            (
+                iid,
+                "worktree",
+                "workflow_state_changed",
+                "test",
+                '{"new_workflow_state":"worktree"}',
+            ),
         )
         conn.commit()
         conn.close()
@@ -544,6 +577,7 @@ class TestCronEngineLegion:
     def test_cron_jobs_legion_column(self):
         """cron_jobs table should have a legion column defaulting to 'mechanicus'."""
         import aiosqlite
+
         from cron_engine import CronEngine
 
         async def _check():

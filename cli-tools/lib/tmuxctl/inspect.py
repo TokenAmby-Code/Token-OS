@@ -46,9 +46,7 @@ def render_restart_plan(plan: RestartPlan) -> str:
     ]
     for issue in plan.coherence_issues:
         target = issue.pane_label or issue.pane_id or issue.instance_id or "workspace"
-        lines.append(
-            f"  ! {issue.severity.value} {issue.code} [{target}] {issue.message}"
-        )
+        lines.append(f"  ! {issue.severity.value} {issue.code} [{target}] {issue.message}")
     for attachment in plan.client_attachments:
         scope = attachment.attachment_class.value
         lines.append(

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 _test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _test_db.close()
 os.environ["TOKEN_API_DB"] = _test_db.name
@@ -46,7 +45,18 @@ def _insert_instance(*, legion="custodes", synced=1, status="idle", tmux_pane="%
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), "custodes-test", "/tmp", status, legion, synced, tmux_pane, now, now),
+        (
+            iid,
+            str(uuid.uuid4()),
+            "custodes-test",
+            "/tmp",
+            status,
+            legion,
+            synced,
+            tmux_pane,
+            now,
+            now,
+        ),
     )
     conn.commit()
     conn.close()
@@ -100,7 +110,12 @@ def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
 
     async def fake_inject(prompt, tmux_pane, *, instance_id=None):
         injections.append((prompt, tmux_pane, instance_id))
-        return {"dispatched": True, "reason": "dispatched", "tmux_pane": tmux_pane, "instance_id": instance_id}
+        return {
+            "dispatched": True,
+            "reason": "dispatched",
+            "tmux_pane": tmux_pane,
+            "instance_id": instance_id,
+        }
 
     async def fake_launch(prompt):
         raise AssertionError("should recover pane before launching")

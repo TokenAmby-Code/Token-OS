@@ -142,7 +142,9 @@ def _ensure_somnium_side_slot(adapter: TmuxAdapter, target: str, win_w: int) -> 
     adapter.run("send-keys", "-t", new_right, "exec tui-pane-guard", "Enter")
 
 
-def _reset_side_columns(adapter: TmuxAdapter, side_panes: list[dict[str, str]], win_w: int, layout_origin: str) -> None:
+def _reset_side_columns(
+    adapter: TmuxAdapter, side_panes: list[dict[str, str]], win_w: int, layout_origin: str
+) -> None:
     if not side_panes:
         return
 
@@ -187,7 +189,9 @@ def _rebalance_grid(adapter: TmuxAdapter, target: str) -> None:
         adapter.run("resize-pane", "-t", far_top, "-y", str(even_h))
 
 
-def _restore_expanded_grid(adapter: TmuxAdapter, session_name: str, target: str, grid_expanded: str, grid_stash: str) -> bool:
+def _restore_expanded_grid(
+    adapter: TmuxAdapter, session_name: str, target: str, grid_expanded: str, grid_stash: str
+) -> bool:
     if grid_expanded == "none" or not grid_stash:
         return False
 
@@ -199,7 +203,9 @@ def _restore_expanded_grid(adapter: TmuxAdapter, session_name: str, target: str,
         pane_specs.append((pane_id, col, row))
         seen.add((col, row))
 
-    if not adapter.run("display-message", "-t", grid_expanded, "-p", "#{pane_id}", allow_failure=True).strip():
+    if not adapter.run(
+        "display-message", "-t", grid_expanded, "-p", "#{pane_id}", allow_failure=True
+    ).strip():
         raise ValueError(f"expanded pane no longer exists: {grid_expanded}")
 
     exp_col = exp_row = ""
@@ -213,7 +219,9 @@ def _restore_expanded_grid(adapter: TmuxAdapter, session_name: str, target: str,
 
     v_partner = h_partner = diagonal = ""
     for pane_id, col, row in pane_specs:
-        exists = adapter.run("display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True).strip()
+        exists = adapter.run(
+            "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
+        ).strip()
         if not exists:
             raise ValueError(f"stashed pane no longer exists: {pane_id}")
         if col != exp_col and row == exp_row:
@@ -250,9 +258,20 @@ def _restore_expanded_grid(adapter: TmuxAdapter, session_name: str, target: str,
 
     stash_window = _window_base(_show(adapter, target, "#{window_name}"))
     stash_name = f"_stash_{stash_window}"
-    existing = adapter.run("list-windows", "-t", session_name, "-F", "#{window_name}", allow_failure=True).splitlines()
+    existing = adapter.run(
+        "list-windows", "-t", session_name, "-F", "#{window_name}", allow_failure=True
+    ).splitlines()
     if stash_name in existing:
-        pane_count = len(adapter.run("list-panes", "-t", f"{session_name}:{stash_name}", "-F", "#{pane_id}", allow_failure=True).splitlines())
+        pane_count = len(
+            adapter.run(
+                "list-panes",
+                "-t",
+                f"{session_name}:{stash_name}",
+                "-F",
+                "#{pane_id}",
+                allow_failure=True,
+            ).splitlines()
+        )
         if pane_count <= 1:
             adapter.run("kill-window", "-t", f"{session_name}:{stash_name}", allow_failure=True)
 
@@ -280,9 +299,19 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
             _set_window_option(adapter, target, "@LAYOUT_ORIGIN", layout_origin)
 
     if not focused:
-        if window_base == "palace" and layout_origin == "wsl" and side_expanded == "none" and len(side_panes) < 2:
+        if (
+            window_base == "palace"
+            and layout_origin == "wsl"
+            and side_expanded == "none"
+            and len(side_panes) < 2
+        ):
             _ensure_palace_side_slots(adapter, target, win_w)
-        if window_base in {"somnium", "bridge"} and layout_origin == "mac" and side_expanded == "none" and len(side_panes) < 1:
+        if (
+            window_base in {"somnium", "bridge"}
+            and layout_origin == "mac"
+            and side_expanded == "none"
+            and len(side_panes) < 1
+        ):
             _ensure_somnium_side_slot(adapter, target, win_w)
     else:
         _drop_side_panes(adapter, side_panes)

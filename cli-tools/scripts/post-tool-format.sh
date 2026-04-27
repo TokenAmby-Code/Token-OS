@@ -150,11 +150,11 @@ for file in "${FILES[@]}"; do
 
     rel="${file#$project_root/}"
     log "format ${file}"
-    if ! (cd "$project_root" && uv run --python 3.11 --group dev ruff format "$rel" >> "$LOG_FILE" 2>&1); then
+    if ! (cd "$project_root" && uvx --python 3.11 ruff format "$rel" >> "$LOG_FILE" 2>&1); then
         log "ruff format failed for ${file}"
         continue
     fi
-    if ! (cd "$project_root" && uv run --python 3.11 --group dev ruff check --fix "$rel" >> "$LOG_FILE" 2>&1); then
+    if ! (cd "$project_root" && uvx --python 3.11 ruff check --fix "$rel" >> "$LOG_FILE" 2>&1); then
         log "ruff check --fix failed for ${file}"
         continue
     fi

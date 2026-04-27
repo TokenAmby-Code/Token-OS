@@ -8,115 +8,134 @@ This server provides:
 - Productivity gating
 """
 
+import asyncio
+import json
+import logging
 import os
 import re
-import uuid
-import json
-import time
-import signal
-import random
-import asyncio
-import functools
-import logging
 import shlex
+import signal
+import time
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List
-from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).parent / ".env")
 
 # Canonical Scripts root — derived from this file's location (token-api/ is one level down)
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 
-import aiosqlite
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import tempfile
-import requests
+
+import aiosqlite
 import httpx
+import requests
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+import shared
+from cron_engine import CronEngine
+from custodes_state_policy import (
+    StateEvent,
+    build_dedupe_key,
+    evaluate_state_event,
+    normalize_severity,
+)
+from db_schema import init_database_async
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     get_instance_mutations,
     reconcile_instance,
     sanctioned_update_instance,
-    sanctioned_update_instance_sync,
-)
-from session_doc_helpers import (
-    update_frontmatter, update_victory_frontmatter,
-    create_session_doc_file, _update_doc_agents_list,
-)
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-from cron_engine import CronEngine
-from db_schema import init_database_async
-from schedule import router as schedule_router
-from timer import (
-    TimerEngine, TimerMode, TimerEvent, Activity,
-    format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
-)
-from custodes_state_policy import (
-    StateEvent,
-    evaluate_state_event,
-    build_dedupe_key,
-    normalize_severity,
-)
-import shared
-from shared import (
-    DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR, SERVER_PORT,
-    CRASH_LOG_PATH, STASH_DIR, STASH_MAX_AGE_HOURS,
-    PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
-    get_next_available_profile,
-    DESKTOP_CONFIG, TTS_BACKEND, TTS_GLOBAL_MODE, DESKTOP_STATE,
-    PHONE_CONFIG, PHONE_STATE, PHONE_HEARTBEAT,
-    PAVLOK_CONFIG, PAVLOK_STATE,
-    is_satellite_tts_available,
-    log_event, log_event_sync, append_workflow_event,
-    DISCORD_DAEMON_URL,
-    VOICE_CHAT_SESSIONS, DICTATION_STATE,
-    PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
-    DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device,
-    is_pid_claude, get_parent_pid, is_subagent_pid,
 )
 from phone_service import (
-    push_phone_widget,
-    push_phone_widget_async,
-    _send_to_phone,
-    send_pavlok_stimulus,
-    check_instance_count_pavlok,
-    TWITTER_ZAP_COOLDOWN_FILE,
-    TWITTER_ZAP_COOLDOWN_SECS,
     _persist_twitter_zap_cooldown,
     _restore_twitter_zap_cooldown,
+    _send_to_phone,
+    check_instance_count_pavlok,
+    push_phone_widget_async,
+    send_pavlok_stimulus,
+)
+from routes.hooks import (
+    NUDGE_COOLDOWN_SECONDS,
+    _recently_nudged,
+)
+from routes.hooks import (
+    init_deps as hooks_init_deps,
+)
+from routes.hooks import (
+    router as hooks_router,
+)
+from routes.tts import (
+    _is_quiet_hours,
+    get_tts_queue_status,
+    play_sound,
+    speak_tts,
+    tts_queue_worker,
 )
 from routes.tts import (
     router as tts_router,
-    speak_tts, play_sound, clean_markdown_for_tts,
-    speak_tts_mac, speak_tts_wsl,
-    queue_tts, get_tts_queue_status, skip_tts,
-    tts_queue_worker,
-    send_webhook,
-    _is_quiet_hours,
-    NotifyRequest, TTSRequest, SoundRequest,
-    # Queue state (needed by lifespan)
-    tts_worker_task,
 )
 from routes.voice import router as voice_router
-from routes.hooks import (
-    router as hooks_router,
-    init_deps as hooks_init_deps,
-    HookResponse, PreToolUseResponse,
-    _post_tool_debounce, _pending_background_tasks, _recently_nudged,
-    NUDGE_COOLDOWN_SECONDS,
+from schedule import router as schedule_router
+from session_doc_helpers import (
+    _update_doc_agents_list,
+    create_session_doc_file,
+    update_frontmatter,
+    update_victory_frontmatter,
 )
 from session_doc_helpers import update_frontmatter as _update_session_doc_frontmatter
+from shared import (
+    CRASH_LOG_PATH,
+    DB_PATH,
+    DEFAULT_SESSIONS_DIR,
+    DESKTOP_CONFIG,
+    DESKTOP_STATE,
+    DICTATION_STATE,
+    DISCORD_DAEMON_URL,
+    FALLBACK_VOICES,
+    PAVLOK_CONFIG,
+    PAVLOK_STATE,
+    PEDAL_BUFFER_MS,
+    PEDAL_BYPASS_MS,
+    PEDAL_DOUBLE_TAP_MS,
+    PEDAL_STATE,
+    PHONE_CONFIG,
+    PHONE_HEARTBEAT,
+    PHONE_STATE,
+    PROFILES,
+    SERVER_PORT,
+    STASH_DIR,
+    STASH_MAX_AGE_HOURS,
+    TTS_BACKEND,
+    TTS_GLOBAL_MODE,
+    ULTIMATE_FALLBACK,
+    VOICE_CHAT_SESSIONS,
+    get_next_available_profile,
+    is_local_device,
+    is_pid_claude,
+    log_event,
+    resolve_device_from_ip,
+)
+from timer import (
+    DEFAULT_BREAK_BUFFER_MS,
+    Activity,
+    TimerEngine,
+    TimerEvent,
+    TimerMode,
+    format_timer_time,
+)
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -124,11 +143,9 @@ logger.setLevel(logging.INFO)
 
 # ============ Server-side Log Buffer ============
 from collections import deque
-from urllib.parse import quote
-from typing import Deque
 
 # Circular buffer to store recent log entries (max 500)
-log_buffer: Deque[dict] = deque(maxlen=500)
+log_buffer: deque[dict] = deque(maxlen=500)
 
 
 class LogBufferHandler(logging.Handler):
@@ -140,7 +157,7 @@ class LogBufferHandler(logging.Handler):
             log_entry = {
                 "timestamp": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
                 "level": record.levelname,
-                "message": self.format(record)
+                "message": self.format(record),
             }
             log_buffer.append(log_entry)
         except Exception:
@@ -151,7 +168,7 @@ class LogBufferHandler(logging.Handler):
 # Add buffer handler to logger
 buffer_handler = LogBufferHandler()
 buffer_handler.setLevel(logging.DEBUG)
-buffer_handler.setFormatter(logging.Formatter('%(message)s'))
+buffer_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(buffer_handler)
 
 # Also capture uvicorn and fastapi logs
@@ -166,14 +183,14 @@ fastapi_logger.addHandler(buffer_handler)
 # [MOVED to shared.py / routes/tts.py] — was: DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path
 
 
-
 # ============ Crash Logging ============
 import sys
 import traceback
 
 # Machine identity from centralized config
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
-from imperium_config import cfg, MACHINE
+from imperium_config import cfg
+
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
 
 
@@ -185,9 +202,9 @@ def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
         tb_str = "".join(tb_lines)
 
         with open(CRASH_LOG_PATH, "a") as f:
-            f.write(f"\n{'='*60}\n")
+            f.write(f"\n{'=' * 60}\n")
             f.write(f"CRASH [{context}] at {timestamp}\n")
-            f.write(f"{'='*60}\n")
+            f.write(f"{'=' * 60}\n")
             f.write(tb_str)
             f.write("\n")
 
@@ -214,9 +231,9 @@ def _asyncio_exception_handler(loop, context):
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(CRASH_LOG_PATH, "a") as f:
-                f.write(f"\n{'='*60}\n")
+                f.write(f"\n{'=' * 60}\n")
                 f.write(f"ASYNCIO ERROR at {timestamp}\n")
-                f.write(f"{'='*60}\n")
+                f.write(f"{'=' * 60}\n")
                 f.write(f"{context}\n\n")
         except Exception:
             pass
@@ -235,10 +252,10 @@ sys.excepthook = _global_exception_handler
 # Dark-tinted tmux backgrounds per legion. Subtle but unmistakable.
 # "default" means no custom bg (reset to terminal default).
 LEGION_PANE_COLORS = {
-    "custodes":   "#302800",   # dark gold
-    "mechanicus": "#300808",   # dark red
-    "civic":      "#083010",   # dark green
-    "astartes":   "default",   # no tint (default legion)
+    "custodes": "#302800",  # dark gold
+    "mechanicus": "#300808",  # dark red
+    "civic": "#083010",  # dark green
+    "astartes": "default",  # no tint (default legion)
 }
 
 
@@ -246,7 +263,9 @@ LEGION_PANE_COLORS = {
 #   'default' = in-memory (cron engine jobs with unpicklable bound methods)
 #   'golden_throne' = SQLite-persisted (restart-safe date-trigger follow-ups)
 scheduler = AsyncIOScheduler(
-    jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH.parent / "apscheduler.db"}')}
+    jobstores={
+        "golden_throne": SQLAlchemyJobStore(url=f"sqlite:///{DB_PATH.parent / 'apscheduler.db'}")
+    }
 )
 shared.scheduler = scheduler
 
@@ -258,29 +277,29 @@ cron_engine: CronEngine = None
 class InstanceRegisterRequest(BaseModel):
     instance_id: str
     origin_type: str = "local"  # 'local' or 'ssh'
-    source_ip: Optional[str] = None
-    device_id: Optional[str] = None
-    pid: Optional[int] = None
-    tab_name: Optional[str] = None
-    working_dir: Optional[str] = None
+    source_ip: str | None = None
+    device_id: str | None = None
+    pid: int | None = None
+    tab_name: str | None = None
+    working_dir: str | None = None
 
 
 class InstanceResponse(BaseModel):
     id: str
     session_id: str
-    tab_name: Optional[str]
-    working_dir: Optional[str]
+    tab_name: str | None
+    working_dir: str | None
     origin_type: str
-    source_ip: Optional[str]
+    source_ip: str | None
     device_id: str
     profile_name: str
     tts_voice: str
     notification_sound: str
-    pid: Optional[int]
+    pid: int | None
     status: str
     registered_at: str
     last_activity: str
-    stopped_at: Optional[str]
+    stopped_at: str | None
 
 
 class ActivityRequest(BaseModel):
@@ -293,28 +312,28 @@ class ProfileResponse(BaseModel):
 
 
 class DashboardResponse(BaseModel):
-    instances: List[dict]
+    instances: list[dict]
     productivity_active: bool
-    recent_events: List[dict]
-    tts_queue: Optional[dict] = None  # TTS queue status
+    recent_events: list[dict]
+    tts_queue: dict | None = None  # TTS queue status
 
 
 class TaskResponse(BaseModel):
     id: str
     name: str
-    description: Optional[str]
+    description: str | None
     task_type: str
     schedule: str
     enabled: bool
     max_retries: int
-    last_run: Optional[dict] = None
-    next_run: Optional[str] = None
+    last_run: dict | None = None
+    next_run: str | None = None
 
 
 class TaskUpdateRequest(BaseModel):
-    schedule: Optional[str] = None
-    enabled: Optional[bool] = None
-    max_retries: Optional[int] = None
+    schedule: str | None = None
+    enabled: bool | None = None
+    max_retries: int | None = None
 
 
 class TaskExecutionResponse(BaseModel):
@@ -322,77 +341,86 @@ class TaskExecutionResponse(BaseModel):
     task_id: str
     status: str
     started_at: str
-    completed_at: Optional[str]
-    duration_ms: Optional[int]
-    result: Optional[dict]
+    completed_at: str | None
+    duration_ms: int | None
+    result: dict | None
     retry_count: int
 
 
 class CustodesStateEventRequest(BaseModel):
     event_type: str
     source: str
-    instance_id: Optional[str] = None
-    severity: Optional[int] = None
-    payload: Optional[dict] = None
+    instance_id: str | None = None
+    severity: int | None = None
+    payload: dict | None = None
 
 
 # [MOVED to shared.py / routes/tts.py] — was: class NotifyRequest(BaseModel):
 
+
 class WindowCheckRequest(BaseModel):
     """Request to check if a window should be allowed or closed."""
-    window_title: Optional[str] = None  # e.g., "YouTube - Brave"
-    exe_name: Optional[str] = None  # e.g., "brave.exe"
+
+    window_title: str | None = None  # e.g., "YouTube - Brave"
+    exe_name: str | None = None  # e.g., "brave.exe"
     source: str = "ahk"  # Source of the request
 
 
 # ============ Audio Proxy Models ============
 
+
 class AudioProxyState(BaseModel):
     """Current state of the audio proxy system."""
+
     phone_connected: bool = False
     receiver_running: bool = False
-    receiver_pid: Optional[int] = None
-    last_connect_time: Optional[str] = None
-    last_disconnect_time: Optional[str] = None
+    receiver_pid: int | None = None
+    last_connect_time: str | None = None
+    last_disconnect_time: str | None = None
 
 
 class AudioProxyConnectRequest(BaseModel):
     """Request when phone connects to PC Bluetooth."""
+
     phone_device_id: str = "Token-S24"
-    bluetooth_device_name: Optional[str] = None
+    bluetooth_device_name: str | None = None
     source: str = "macrodroid"
 
 
 class AudioProxyConnectResponse(BaseModel):
     """Response after processing connect request."""
+
     success: bool
     action: str  # "connected", "already_connected", "error"
     receiver_started: bool
-    receiver_pid: Optional[int] = None
+    receiver_pid: int | None = None
     message: str
 
 
 class AudioProxyDisconnectRequest(BaseModel):
     """Request when phone disconnects from PC Bluetooth."""
+
     phone_device_id: str = "Token-S24"
     source: str = "macrodroid"
 
 
 class AudioProxyStatusResponse(BaseModel):
     """Response for status query."""
+
     phone_connected: bool
     receiver_running: bool
-    receiver_pid: Optional[int] = None
-    last_connect_time: Optional[str] = None
-    last_disconnect_time: Optional[str] = None
+    receiver_pid: int | None = None
+    last_connect_time: str | None = None
+    last_disconnect_time: str | None = None
 
 
 class WindowEnforceResponse(BaseModel):
     """Response for window enforcement decision."""
+
     productivity_active: bool
     active_instance_count: int
     should_close_distractions: bool
-    distraction_apps: List[str]  # Apps that should be closed if should_close_distractions is True
+    distraction_apps: list[str]  # Apps that should be closed if should_close_distractions is True
     reason: str
 
 
@@ -402,20 +430,22 @@ class StashContentRequest(BaseModel):
 
 class DesktopDetectionRequest(BaseModel):
     """Request from AHK desktop detection."""
+
     detected_mode: str  # "video" | "music" | "gaming" | "silence"
-    window_title: Optional[str] = None
+    window_title: str | None = None
     source: str = "ahk"
-    steam_app_id: Optional[str] = None
-    steam_app_name: Optional[str] = None
-    steam_exe: Optional[str] = None
+    steam_app_id: str | None = None
+    steam_app_name: str | None = None
+    steam_exe: str | None = None
 
 
 class DesktopDetectionResponse(BaseModel):
     """Response for desktop detection."""
+
     action: str  # "mode_changed" | "blocked" | "none"
     detected_mode: str
-    old_mode: Optional[str] = None
-    new_mode: Optional[str] = None
+    old_mode: str | None = None
+    new_mode: str | None = None
     reason: str
     timer_updated: bool = False
     productivity_active: bool
@@ -424,10 +454,11 @@ class DesktopDetectionResponse(BaseModel):
 
 class GameTurnRequest(BaseModel):
     """Observational turn-end event from game-specific AHK hooks."""
+
     game: str
-    steam_app_id: Optional[str] = None
-    steam_app_name: Optional[str] = None
-    steam_exe: Optional[str] = None
+    steam_app_id: str | None = None
+    steam_app_name: str | None = None
+    steam_exe: str | None = None
     source: str = "ahk"
 
 
@@ -439,19 +470,22 @@ class GameTurnResponse(BaseModel):
 
 # ============ Phone Activity Models ============
 
+
 class PhoneActivityRequest(BaseModel):
     """Request from MacroDroid for phone app activity."""
+
     app: str  # App name: "twitter", "youtube", "game", or app package name
     action: str = "open"  # "open" | "close"
-    package: Optional[str] = None  # Optional package name for games
+    package: str | None = None  # Optional package name for games
 
 
 class PhoneActivityResponse(BaseModel):
     """Response for phone activity detection."""
+
     allowed: bool
     reason: str  # "break_time_available", "productivity_active", "blocked", "closed"
     break_seconds: int = 0
-    message: Optional[str] = None
+    message: str | None = None
 
 
 class PhoneSystemEventRequest(BaseModel):
@@ -461,44 +495,51 @@ class PhoneSystemEventRequest(BaseModel):
       Full:    {"event": "app_open", "app": "Application Launched (X)"}
       Minimal: {"app": "Application Launched (X)"}  (event inferred from trigger name)
     """
-    event: Optional[str] = None  # Optional — inferred from trigger name if absent
-    time: Optional[str] = None
-    server: Optional[str] = None  # heartbeat: server response code
-    shizuku_dead: Optional[str] = None  # heartbeat: current shizuku state
-    app: Optional[str] = None  # trigger name (e.g. "Application Launched (X)")
-    notification: Optional[str] = None  # discord_fallback_received: original notification text
+
+    event: str | None = None  # Optional — inferred from trigger name if absent
+    time: str | None = None
+    server: str | None = None  # heartbeat: server response code
+    shizuku_dead: str | None = None  # heartbeat: current shizuku state
+    app: str | None = None  # trigger name (e.g. "Application Launched (X)")
+    notification: str | None = None  # discord_fallback_received: original notification text
 
 
 # ============ Headless Mode Models ============
 
+
 class HeadlessStatusResponse(BaseModel):
     """Response for headless mode status."""
+
     enabled: bool
-    last_changed: Optional[str] = None
-    hostname: Optional[str] = None
-    error: Optional[str] = None
-    auto_disable_at: Optional[str] = None  # ISO timestamp when headless will auto-disable
+    last_changed: str | None = None
+    hostname: str | None = None
+    error: str | None = None
+    auto_disable_at: str | None = None  # ISO timestamp when headless will auto-disable
 
 
 class HeadlessControlRequest(BaseModel):
     """Request to control headless mode."""
+
     action: str = "toggle"  # "toggle" | "enable" | "disable"
-    duration_hours: Optional[float] = None  # Auto-disable after N hours
+    duration_hours: float | None = None  # Auto-disable after N hours
 
 
 class HeadlessControlResponse(BaseModel):
     """Response after controlling headless mode."""
+
     success: bool
     action: str
     before: HeadlessStatusResponse
-    after: Optional[HeadlessStatusResponse] = None
+    after: HeadlessStatusResponse | None = None
     message: str
 
 
 # ============ System Control Models ============
 
+
 class ShutdownRequest(BaseModel):
     """Request to shutdown/restart the system."""
+
     action: str = "shutdown"  # "shutdown" | "restart"
     delay_seconds: int = 0  # Delay before shutdown (0 = immediate)
     force: bool = False  # Force close applications
@@ -506,6 +547,7 @@ class ShutdownRequest(BaseModel):
 
 class ShutdownResponse(BaseModel):
     """Response after initiating shutdown."""
+
     success: bool
     action: str
     delay_seconds: int
@@ -516,26 +558,29 @@ class ShutdownResponse(BaseModel):
 
 # [MOVED to routes/hooks.py or shared.py] — was: class HookResponse(BaseModel):
 
+
 class DiscordMessageRequest(BaseModel):
     """Forwarded Discord message from the discord-cli daemon."""
-    message_id: Optional[str] = None
+
+    message_id: str | None = None
     channel_id: str
-    channel_name: Optional[str] = None
-    guild_id: Optional[str] = None
-    author: Optional[dict] = None
+    channel_name: str | None = None
+    guild_id: str | None = None
+    author: dict | None = None
     content: str
-    timestamp: Optional[str] = None
+    timestamp: str | None = None
     is_dm: bool = False
     is_reply: bool = False
     is_voice: bool = False
-    bot_name: Optional[str] = None
-    reply_to_message_id: Optional[str] = None
-    attachments: Optional[list] = None
-    embeds: Optional[int] = 0
+    bot_name: str | None = None
+    reply_to_message_id: str | None = None
+    attachments: list | None = None
+    embeds: int | None = 0
 
 
 class InboxNotifyRequest(BaseModel):
     """Gene-seed birth notification for a new inbox note."""
+
     path: str
     title: str
     type: str = "capture"
@@ -544,33 +589,35 @@ class InboxNotifyRequest(BaseModel):
 
 class InboxCreateRequest(BaseModel):
     """Create an aspirant note from external source (Discord, API, hotkey)."""
+
     title: str = ""
     type: str = "capture"
     content: str = ""
     source: str = "discord"
-    author: Optional[str] = None
+    author: str | None = None
 
 
 class SessionDocCreateRequest(BaseModel):
     title: str
-    project: Optional[str] = None
-    file_path: Optional[str] = None
-    primarch_name: Optional[str] = None
+    project: str | None = None
+    file_path: str | None = None
+    primarch_name: str | None = None
 
 
 class SessionDocUpdateRequest(BaseModel):
-    title: Optional[str] = None
-    project: Optional[str] = None
-    status: Optional[str] = None
+    title: str | None = None
+    project: str | None = None
+    status: str | None = None
 
 
 class SessionDocMergeRequest(BaseModel):
     content: str
     source: str = "agent"
-    context: Optional[str] = None
+    context: str | None = None
 
 
 # [MOVED to routes/hooks.py or shared.py] — was: # ============ Hook Handler State ============
+
 
 # Database helper: connect with busy_timeout to prevent indefinite blocking
 async def get_db():
@@ -580,22 +627,23 @@ async def get_db():
     return db
 
 
-# [MOVED to shared.py / routes/tts.py] — was: async def log_event(event_type: str, instance_id: 
+# [MOVED to shared.py / routes/tts.py] — was: async def log_event(event_type: str, instance_id:
 
 # [MOVED to shared.py] — resolve_device_from_ip, LOCAL_DEVICES, is_local_device
 
 # ============ Scheduled Task System ============
 
+
 def parse_interval_schedule(schedule: str) -> dict:
     """Parse interval schedule string like '30m', '1h', '5s' into trigger kwargs."""
-    match = re.match(r'^(\d+)(s|m|h|d)$', schedule.strip().lower())
+    match = re.match(r"^(\d+)(s|m|h|d)$", schedule.strip().lower())
     if not match:
         raise ValueError(f"Invalid interval format: {schedule}. Use format like '30m', '1h', '5s'")
 
     value = int(match.group(1))
     unit = match.group(2)
 
-    unit_map = {'s': 'seconds', 'm': 'minutes', 'h': 'hours', 'd': 'days'}
+    unit_map = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
     return {unit_map[unit]: value}
 
 
@@ -606,15 +654,14 @@ async def acquire_task_lock(task_id: str) -> bool:
         try:
             await db.execute(
                 "INSERT INTO task_locks (task_id, locked_at, locked_by) VALUES (?, ?, ?)",
-                (task_id, now, "main")
+                (task_id, now, "main"),
             )
             await db.commit()
             return True
         except aiosqlite.IntegrityError:
             # Lock already exists - check if it's stale (> 1 hour old)
             cursor = await db.execute(
-                "SELECT locked_at FROM task_locks WHERE task_id = ?",
-                (task_id,)
+                "SELECT locked_at FROM task_locks WHERE task_id = ?", (task_id,)
             )
             row = await cursor.fetchone()
             if row:
@@ -623,7 +670,7 @@ async def acquire_task_lock(task_id: str) -> bool:
                     # Stale lock, force acquire
                     await db.execute(
                         "UPDATE task_locks SET locked_at = ?, locked_by = ? WHERE task_id = ?",
-                        (now, "main", task_id)
+                        (now, "main", task_id),
                     )
                     await db.commit()
                     return True
@@ -644,7 +691,7 @@ async def log_task_start(task_id: str) -> int:
         cursor = await db.execute(
             """INSERT INTO task_executions (task_id, status, started_at)
                VALUES (?, 'running', ?)""",
-            (task_id, now)
+            (task_id, now),
         )
         await db.commit()
         return cursor.lastrowid
@@ -658,7 +705,7 @@ async def log_task_complete(execution_id: int, duration_ms: int, result: dict):
             """UPDATE task_executions
                SET status = 'completed', completed_at = ?, duration_ms = ?, result = ?
                WHERE id = ?""",
-            (now, duration_ms, json.dumps(result), execution_id)
+            (now, duration_ms, json.dumps(result), execution_id),
         )
         await db.commit()
 
@@ -671,12 +718,13 @@ async def log_task_failed(execution_id: int, error: str):
             """UPDATE task_executions
                SET status = 'failed', completed_at = ?, result = ?
                WHERE id = ?""",
-            (now, json.dumps({"error": error}), execution_id)
+            (now, json.dumps({"error": error}), execution_id),
         )
         await db.commit()
 
 
 # ============ Task Implementations ============
+
 
 async def cleanup_stale_instances() -> dict:
     """Mark instances with no activity for 3+ hours as stopped."""
@@ -694,7 +742,11 @@ async def cleanup_stale_instances() -> dict:
             await sanctioned_update_instance(
                 db,
                 instance_id=row[0],
-                updates={"status": "stopped", "synced": 0, "stopped_at": datetime.now().isoformat()},
+                updates={
+                    "status": "stopped",
+                    "synced": 0,
+                    "stopped_at": datetime.now().isoformat(),
+                },
                 mutation_type="instance_stopped",
                 write_source="task",
                 actor="cleanup-stale",
@@ -712,10 +764,7 @@ async def purge_old_events() -> dict:
     """Delete events older than 30 days."""
     cutoff = (datetime.now() - timedelta(days=30)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "DELETE FROM events WHERE created_at < ?",
-            (cutoff,)
-        )
+        cursor = await db.execute("DELETE FROM events WHERE created_at < ?", (cutoff,))
         deleted = cursor.rowcount
         await db.commit()
 
@@ -797,7 +846,7 @@ async def load_tasks_from_db():
                         hour=parts[1],
                         day=parts[2],
                         month=parts[3],
-                        day_of_week=parts[4]
+                        day_of_week=parts[4],
                     )
                 else:
                     raise ValueError(f"Invalid cron expression: {schedule}")
@@ -806,11 +855,7 @@ async def load_tasks_from_db():
                 continue
 
             scheduler.add_job(
-                execute_task,
-                trigger=trigger,
-                args=[task_id],
-                id=task_id,
-                replace_existing=True
+                execute_task, trigger=trigger, args=[task_id], id=task_id, replace_existing=True
             )
             print(f"Registered task: {task_id} ({task_type}: {schedule})")
 
@@ -822,9 +867,9 @@ RESTART_STATE_PATH = Path(__file__).parent / "restart_state.json"
 
 # Keys that must NOT survive a restart — derived from live signals or boot-time config.
 _RESTART_STATE_DENYLIST = {
-    "startup_time",        # reset per boot
+    "startup_time",  # reset per boot
     "startup_grace_secs",  # config, reset per boot
-    "ahk_reachable",       # live heartbeat — unknown until AHK checks in
+    "ahk_reachable",  # live heartbeat — unknown until AHK checks in
     "ahk_last_heartbeat",  # live heartbeat
 }
 
@@ -922,7 +967,7 @@ async def run_overdue_tasks():
             cursor = await db.execute(
                 """SELECT MAX(started_at) as last_run
                    FROM task_executions WHERE task_id = ?""",
-                (task_id,)
+                (task_id,),
             )
             row = await cursor.fetchone()
 
@@ -981,16 +1026,24 @@ async def lifespan(app: FastAPI):
     now_ms = int(time.monotonic() * 1000)
     if desktop_mode in ("video", "scrolling", "gaming"):
         is_sg = desktop_mode in ("scrolling", "gaming")
-        timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
-        print(f"TIMER: Synced activity=DISTRACTION (desktop={desktop_mode}, scrolling_gaming={is_sg})")
+        timer_engine.set_activity(
+            Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
+        )
+        print(
+            f"TIMER: Synced activity=DISTRACTION (desktop={desktop_mode}, scrolling_gaming={is_sg})"
+        )
     else:
         timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
         print(f"TIMER: Synced activity=WORKING (desktop={desktop_mode})")
     # Stash cleanup on startup + hourly
     stash_cleanup()
-    scheduler.add_job(stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True)
+    scheduler.add_job(
+        stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True
+    )
     # 7 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
-    scheduler.add_job(timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True)
+    scheduler.add_job(
+        timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True
+    )
     scheduler.start()
     print("Scheduler started")
     # Initialize cron engine
@@ -1065,7 +1118,7 @@ app = FastAPI(
     title="Token-API",
     description="Local FastAPI server for Claude instance management",
     version="0.1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # CORS Middleware
@@ -1088,7 +1141,9 @@ app.include_router(hooks_router)
 @app.post("/api/instances/register", response_model=ProfileResponse)
 async def register_instance(request: InstanceRegisterRequest):
     """Register a new Claude instance."""
-    logger.info(f"Registering instance: {request.working_dir or request.tab_name or request.instance_id[:8]}")
+    logger.info(
+        f"Registering instance: {request.working_dir or request.tab_name or request.instance_id[:8]}"
+    )
     session_id = str(uuid.uuid4())
 
     # Resolve device_id from source_ip if not provided
@@ -1130,8 +1185,8 @@ async def register_instance(request: InstanceRegisterRequest):
                 profile["notification_sound"],
                 request.pid,
                 now,
-                now
-            )
+                now,
+            ),
         )
         await db.commit()
 
@@ -1143,7 +1198,7 @@ async def register_instance(request: InstanceRegisterRequest):
         "instance_registered",
         instance_id=request.instance_id,
         device_id=device_id,
-        details={"tab_name": request.tab_name, "origin_type": request.origin_type}
+        details={"tab_name": request.tab_name, "origin_type": request.origin_type},
     )
 
     # Push updated instance count to phone widget
@@ -1162,8 +1217,8 @@ async def register_instance(request: InstanceRegisterRequest):
             "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff"),
-            "cc_color": profile.get("cc_color", "default")
-        }
+            "cc_color": profile.get("cc_color", "default"),
+        },
     )
 
 
@@ -1174,39 +1229,34 @@ async def delete_all_instances():
 
     async with aiosqlite.connect(DB_PATH) as db:
         # Get all instances before deleting
-        cursor = await db.execute(
-            "SELECT id, device_id, status FROM claude_instances"
-        )
+        cursor = await db.execute("SELECT id, device_id, status FROM claude_instances")
         all_instances = await cursor.fetchall()
 
         if not all_instances:
             return {"status": "no_instances", "deleted_count": 0}
 
         # Count active instances for enforcement check
-        active_count = sum(1 for _, _, status in all_instances if status in ('processing', 'idle'))
+        active_count = sum(1 for _, _, status in all_instances if status in ("processing", "idle"))
 
         # Delete all instances from the database
         await db.execute("DELETE FROM claude_instances")
         await db.commit()
 
     # Log bulk deletion event
-    await log_event(
-        "bulk_delete_all",
-        details={"count": len(all_instances), "timestamp": now}
-    )
+    await log_event("bulk_delete_all", details={"count": len(all_instances), "timestamp": now})
 
     # Check enforcement if there were active instances
     if active_count > 0 and DESKTOP_STATE.get("current_mode") == "video":
         enforce_result = close_distraction_windows()
         await log_event(
             "enforcement_triggered",
-            details={"trigger": "all_instances_deleted", "result": enforce_result}
+            details={"trigger": "all_instances_deleted", "result": enforce_result},
         )
         return {
             "status": "deleted_all",
             "deleted_count": len(all_instances),
             "enforcement_triggered": True,
-            "enforcement_result": enforce_result
+            "enforcement_result": enforce_result,
         }
 
     return {"status": "deleted_all", "deleted_count": len(all_instances)}
@@ -1221,7 +1271,7 @@ async def stop_instance(instance_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            (instance_id,),
         )
         row = await cursor.fetchone()
 
@@ -1262,11 +1312,7 @@ async def stop_instance(instance_id: str):
         remaining_non_sub = count_row[0] if count_row else 0
 
     # Log event
-    await log_event(
-        "instance_stopped",
-        instance_id=instance_id,
-        device_id=row[1]
-    )
+    await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
 
     # Instance count Pavlok signals (skip subagents)
     if not is_subagent:
@@ -1274,30 +1320,29 @@ async def stop_instance(instance_id: str):
 
     # Push updated instance count to phone widget
     if not is_subagent:
-        asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, remaining_non_sub))
+        asyncio.create_task(
+            push_phone_widget_async(timer_engine.current_mode.value, remaining_non_sub)
+        )
 
     # If no more active instances and video mode was active, enforce
     if remaining_active == 0 and DESKTOP_STATE.get("current_mode") == "video":
-        print(f"ENFORCE: Last instance stopped while in video mode, closing distractions")
+        print("ENFORCE: Last instance stopped while in video mode, closing distractions")
         enforce_result = close_distraction_windows()
         await log_event(
             "enforcement_triggered",
-            details={
-                "trigger": "last_instance_stopped",
-                "result": enforce_result
-            }
+            details={"trigger": "last_instance_stopped", "result": enforce_result},
         )
         return {
             "status": "stopped",
             "instance_id": instance_id,
             "enforcement_triggered": True,
-            "enforcement_result": enforce_result
+            "enforcement_result": enforce_result,
         }
 
     return {"status": "stopped", "instance_id": instance_id}
 
 
-async def find_claude_pid_by_workdir(working_dir: str) -> Optional[int]:
+async def find_claude_pid_by_workdir(working_dir: str) -> int | None:
     """Scan /proc for claude processes matching the working directory.
 
     Returns the PID if exactly one match is found, None otherwise.
@@ -1313,7 +1358,7 @@ async def find_claude_pid_by_workdir(working_dir: str) -> Optional[int]:
             pid = int(entry)
             try:
                 comm_path = f"/proc/{pid}/comm"
-                with open(comm_path, "r") as f:
+                with open(comm_path) as f:
                     comm = f.read().strip()
                 if comm != "claude":
                     continue
@@ -1348,10 +1393,7 @@ async def kill_instance(instance_id: str):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (instance_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
     if not row:
@@ -1381,11 +1423,15 @@ async def kill_instance(instance_id: str):
                         actor="kill-instance",
                     )
                     await db.commit()
-                await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
-                                details={"error": "no_pid", "status": "marked_stopped"})
+                await log_event(
+                    "instance_killed",
+                    instance_id=instance_id,
+                    device_id=device_id,
+                    details={"error": "no_pid", "status": "marked_stopped"},
+                )
                 raise HTTPException(
                     status_code=400,
-                    detail="No PID stored and could not discover process. Instance marked stopped."
+                    detail="No PID stored and could not discover process. Instance marked stopped.",
                 )
         else:
             # Can't scan /proc on remote device
@@ -1399,11 +1445,15 @@ async def kill_instance(instance_id: str):
                     actor="kill-instance",
                 )
                 await db.commit()
-            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
-                            details={"error": "no_pid_remote", "status": "marked_stopped"})
+            await log_event(
+                "instance_killed",
+                instance_id=instance_id,
+                device_id=device_id,
+                details={"error": "no_pid_remote", "status": "marked_stopped"},
+            )
             raise HTTPException(
                 status_code=400,
-                detail=f"No PID stored for remote device '{device_id}'. Instance marked stopped."
+                detail=f"No PID stored for remote device '{device_id}'. Instance marked stopped.",
             )
 
     # Kill sequence based on device type
@@ -1421,8 +1471,12 @@ async def kill_instance(instance_id: str):
                     actor="kill-instance",
                 )
                 await db.commit()
-            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
-                            details={"pid": pid, "status": "already_dead"})
+            await log_event(
+                "instance_killed",
+                instance_id=instance_id,
+                device_id=device_id,
+                details={"pid": pid, "status": "already_dead"},
+            )
             return {"status": "already_dead", "pid": pid, "signal": None}
 
         # SIGINT×2 (mimics double Ctrl+C: first cancels operation, second exits gracefully)
@@ -1442,8 +1496,12 @@ async def kill_instance(instance_id: str):
                     actor="kill-instance",
                 )
                 await db.commit()
-            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
-                            details={"pid": pid, "status": "already_dead"})
+            await log_event(
+                "instance_killed",
+                instance_id=instance_id,
+                device_id=device_id,
+                details={"pid": pid, "status": "already_dead"},
+            )
             return {"status": "already_dead", "pid": pid, "signal": None}
         except PermissionError:
             raise HTTPException(status_code=500, detail=f"Permission denied killing PID {pid}")
@@ -1474,9 +1532,10 @@ async def kill_instance(instance_id: str):
         # Phone/remote device - use sshp with SIGINT×2
         try:
             proc = await asyncio.create_subprocess_exec(
-                "sshp", f"kill -INT {pid}",
+                "sshp",
+                f"kill -INT {pid}",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=10)
             kill_signal = "SIGINT"
@@ -1485,9 +1544,10 @@ async def kill_instance(instance_id: str):
             # Wait 1s then send second SIGINT
             await asyncio.sleep(1)
             proc1b = await asyncio.create_subprocess_exec(
-                "sshp", f"kill -INT {pid}",
+                "sshp",
+                f"kill -INT {pid}",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc1b.communicate(), timeout=10)
             kill_signal = "SIGINT_x2"
@@ -1497,22 +1557,24 @@ async def kill_instance(instance_id: str):
             await asyncio.sleep(3)
 
             proc2 = await asyncio.create_subprocess_exec(
-                "sshp", f"kill -0 {pid}",
+                "sshp",
+                f"kill -0 {pid}",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=10)
             if proc2.returncode == 0:
                 # Still alive, escalate
                 proc3 = await asyncio.create_subprocess_exec(
-                    "sshp", f"kill -9 {pid}",
+                    "sshp",
+                    f"kill -9 {pid}",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc3.communicate(), timeout=10)
                 kill_signal = "SIGKILL"
                 logger.info(f"Kill: escalated to SIGKILL via SSH for PID {pid} on {device_id}")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise HTTPException(status_code=504, detail=f"SSH to {device_id} timed out")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"SSH kill failed: {str(e)}")
@@ -1534,7 +1596,7 @@ async def kill_instance(instance_id: str):
         "instance_killed",
         instance_id=instance_id,
         device_id=device_id,
-        details={"pid": pid, "signal": kill_signal}
+        details={"pid": pid, "signal": kill_signal},
     )
 
     logger.info(f"Kill: instance {instance_id[:12]}... killed (PID {pid}, {kill_signal})")
@@ -1557,10 +1619,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (instance_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
     if not row:
@@ -1578,13 +1637,11 @@ async def unstick_instance(instance_id: str, level: int = 1):
             pid = await find_claude_pid_by_workdir(working_dir)
             if not pid:
                 raise HTTPException(
-                    status_code=400,
-                    detail="No PID stored and could not discover process."
+                    status_code=400, detail="No PID stored and could not discover process."
                 )
         else:
             raise HTTPException(
-                status_code=400,
-                detail=f"No PID stored for remote device '{device_id}'."
+                status_code=400, detail=f"No PID stored for remote device '{device_id}'."
             )
 
     # Choose signal based on level
@@ -1623,11 +1680,16 @@ async def unstick_instance(instance_id: str, level: int = 1):
                     )
                     await db.commit()
             else:
-                raise HTTPException(status_code=400, detail=f"PID {pid} is stale and no Claude process found in {working_dir}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"PID {pid} is stale and no Claude process found in {working_dir}",
+                )
 
         # Capture diagnostics BEFORE sending signal
         diag_before = get_process_diagnostics(pid)
-        logger.info(f"Unstick L{level} BEFORE: PID {pid} state={diag_before.get('state', '?')} wchan={diag_before.get('wchan', '?')} children={len(diag_before.get('children', []))}")
+        logger.info(
+            f"Unstick L{level} BEFORE: PID {pid} state={diag_before.get('state', '?')} wchan={diag_before.get('wchan', '?')} children={len(diag_before.get('children', []))}"
+        )
 
         try:
             os.kill(pid, sig)
@@ -1635,17 +1697,20 @@ async def unstick_instance(instance_id: str, level: int = 1):
         except ProcessLookupError:
             raise HTTPException(status_code=400, detail=f"PID {pid} no longer exists")
         except PermissionError:
-            raise HTTPException(status_code=500, detail=f"Permission denied sending {sig_name} to PID {pid}")
+            raise HTTPException(
+                status_code=500, detail=f"Permission denied sending {sig_name} to PID {pid}"
+            )
     else:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "sshp", f"kill -{ssh_sig} {pid}",
+                "sshp",
+                f"kill -{ssh_sig} {pid}",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=10)
             logger.info(f"Unstick L{level}: sent {sig_name} via SSH to PID {pid} on {device_id}")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise HTTPException(status_code=504, detail=f"SSH to {device_id} timed out")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"SSH unstick failed: {str(e)}")
@@ -1656,8 +1721,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT last_activity FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            "SELECT last_activity FROM claude_instances WHERE id = ?", (instance_id,)
         )
         row = await cursor.fetchone()
 
@@ -1670,7 +1734,9 @@ async def unstick_instance(instance_id: str, level: int = 1):
     diag_after = None
     if is_local_device(device_id) and is_pid_claude(pid):
         diag_after = get_process_diagnostics(pid)
-        logger.info(f"Unstick L{level} AFTER: PID {pid} state={diag_after.get('state', '?')} wchan={diag_after.get('wchan', '?')}")
+        logger.info(
+            f"Unstick L{level} AFTER: PID {pid} state={diag_after.get('state', '?')} wchan={diag_after.get('wchan', '?')}"
+        )
 
     await log_event(
         "instance_unstick",
@@ -1685,12 +1751,20 @@ async def unstick_instance(instance_id: str, level: int = 1):
             "wchan_before": diag_before.get("wchan") if diag_before else None,
             "state_after": diag_after.get("state") if diag_after else None,
             "wchan_after": diag_after.get("wchan") if diag_after else None,
-        }
+        },
     )
 
-    logger.info(f"Unstick L{level}: instance {instance_id[:12]}... {status} (PID {pid}, {sig_name}, activity_changed={activity_changed})")
+    logger.info(
+        f"Unstick L{level}: instance {instance_id[:12]}... {status} (PID {pid}, {sig_name}, activity_changed={activity_changed})"
+    )
 
-    response = {"status": status, "pid": pid, "signal": sig_name, "level": level, "activity_changed": activity_changed}
+    response = {
+        "status": status,
+        "pid": pid,
+        "signal": sig_name,
+        "level": level,
+        "activity_changed": activity_changed,
+    }
     if diag_before:
         response["diagnostics_before"] = {
             "state": diag_before.get("state"),
@@ -1722,15 +1796,15 @@ def get_process_diagnostics(pid: int) -> dict:
 
         # Get comm (process name)
         try:
-            with open(f"{proc_dir}/comm", "r") as f:
+            with open(f"{proc_dir}/comm") as f:
                 diag["comm"] = f.read().strip()
         except Exception as e:
             diag["comm_error"] = str(e)
 
         # Get cmdline
         try:
-            with open(f"{proc_dir}/cmdline", "r") as f:
-                cmdline = f.read().replace('\x00', ' ').strip()
+            with open(f"{proc_dir}/cmdline") as f:
+                cmdline = f.read().replace("\x00", " ").strip()
                 diag["cmdline"] = cmdline[:200] if cmdline else "(empty)"
         except Exception as e:
             diag["cmdline_error"] = str(e)
@@ -1743,7 +1817,7 @@ def get_process_diagnostics(pid: int) -> dict:
 
         # Get process state from stat
         try:
-            with open(f"{proc_dir}/stat", "r") as f:
+            with open(f"{proc_dir}/stat") as f:
                 stat = f.read().split()
                 # State is field 3 (0-indexed 2)
                 state_char = stat[2] if len(stat) > 2 else "?"
@@ -1782,7 +1856,7 @@ def get_process_diagnostics(pid: int) -> dict:
 
         # Get wchan (what syscall it's waiting in)
         try:
-            with open(f"{proc_dir}/wchan", "r") as f:
+            with open(f"{proc_dir}/wchan") as f:
                 wchan = f.read().strip()
                 diag["wchan"] = wchan if wchan and wchan != "0" else "(not waiting)"
         except Exception as e:
@@ -1795,12 +1869,12 @@ def get_process_diagnostics(pid: int) -> dict:
                 if not entry.isdigit():
                     continue
                 try:
-                    with open(f"/proc/{entry}/stat", "r") as f:
+                    with open(f"/proc/{entry}/stat") as f:
                         child_stat = f.read().split()
                         if len(child_stat) > 3 and int(child_stat[3]) == pid:
                             child_comm = "(unknown)"
                             try:
-                                with open(f"/proc/{entry}/comm", "r") as cf:
+                                with open(f"/proc/{entry}/comm") as cf:
                                     child_comm = cf.read().strip()
                             except Exception:
                                 pass
@@ -1827,10 +1901,7 @@ async def diagnose_instance(instance_id: str):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (instance_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
     if not row:
@@ -1856,8 +1927,13 @@ async def diagnose_instance(instance_id: str):
     if last_activity:
         try:
             from datetime import datetime
+
             # Parse the timestamp (assuming it's in local time from SQLite)
-            last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00")) if "T" in last_activity else datetime.strptime(last_activity, "%Y-%m-%d %H:%M:%S")
+            last_dt = (
+                datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
+                if "T" in last_activity
+                else datetime.strptime(last_activity, "%Y-%m-%d %H:%M:%S")
+            )
             age_seconds = (datetime.now() - last_dt).total_seconds()
             result["activity_age_seconds"] = int(age_seconds)
             result["activity_age_human"] = f"{int(age_seconds // 60)}m {int(age_seconds % 60)}s ago"
@@ -1888,7 +1964,7 @@ async def diagnose_instance(instance_id: str):
             if not entry.isdigit():
                 continue
             try:
-                with open(f"/proc/{entry}/comm", "r") as f:
+                with open(f"/proc/{entry}/comm") as f:
                     if f.read().strip() == "claude":
                         pid = int(entry)
                         try:
@@ -1903,7 +1979,9 @@ async def diagnose_instance(instance_id: str):
         result["claude_scan_error"] = str(e)
 
     # Log the diagnosis
-    logger.info(f"Diagnose: instance {instance_id[:12]}... stored_pid={stored_pid}, discovered_pid={discovered_pid}, status={status}")
+    logger.info(
+        f"Diagnose: instance {instance_id[:12]}... stored_pid={stored_pid}, discovered_pid={discovered_pid}, status={status}"
+    )
 
     return result
 
@@ -1914,6 +1992,7 @@ class RenameInstanceRequest(BaseModel):
 
 class LogEntry(BaseModel):
     """Single log entry."""
+
     timestamp: str
     level: str
     message: str
@@ -1921,7 +2000,8 @@ class LogEntry(BaseModel):
 
 class LogsResponse(BaseModel):
     """Response for recent logs."""
-    logs: List[LogEntry]
+
+    logs: list[LogEntry]
     count: int
 
 
@@ -1933,6 +2013,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     hyphens, removes non-alphanumeric chars, truncates to 4 words.
     """
     import re as _re
+
     # Normalize to kebab-case
     clean = (request.tab_name or "").lstrip("✳ ").strip()
     clean = _re.sub(r"[^a-z0-9 -]", "", clean.lower())
@@ -1945,7 +2026,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, tab_name, session_doc_id, session_doc_policy FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            (instance_id,),
         )
         row = await cursor.fetchone()
 
@@ -1965,12 +2046,14 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         )
 
         # Only auto-generated per-instance docs should mirror renames.
-        session_doc_updated = bool(session_doc_id and session_doc_policy in {"interactive_auto", "cron_created"})
+        session_doc_updated = bool(
+            session_doc_id and session_doc_policy in {"interactive_auto", "cron_created"}
+        )
         if session_doc_updated:
             now = datetime.now().isoformat()
             await db.execute(
                 "UPDATE session_documents SET title = ?, updated_at = ? WHERE id = ?",
-                (request.tab_name, now, session_doc_id)
+                (request.tab_name, now, session_doc_id),
             )
 
         await db.commit()
@@ -1979,9 +2062,12 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     await log_event(
         "instance_renamed",
         instance_id=instance_id,
-        details={"old_name": old_name, "new_name": request.tab_name,
-                 "session_doc_updated": session_doc_updated,
-                 "session_doc_policy": session_doc_policy}
+        details={
+            "old_name": old_name,
+            "new_name": request.tab_name,
+            "session_doc_updated": session_doc_updated,
+            "session_doc_policy": session_doc_policy,
+        },
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
@@ -2012,7 +2098,9 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
-    logger.info(f"Transplant pending: {instance_id[:12]}... → target session {target_session[:12]}...")
+    logger.info(
+        f"Transplant pending: {instance_id[:12]}... → target session {target_session[:12]}..."
+    )
     return {"status": "pending", "instance_id": instance_id, "target_session": target_session}
 
 
@@ -2050,7 +2138,9 @@ async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
     """Release input lock for an instance's tmux pane."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -2083,10 +2173,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE id = ?",
-            (instance_id,)
-        )
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
         if not row:
@@ -2106,7 +2193,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         "status": "updated",
         "instance_id": instance_id,
         "action": request.action,
-        "new_status": new_status
+        "new_status": new_status,
     }
 
 
@@ -2146,10 +2233,17 @@ async def get_instance_todos(instance_id: str):
             "progress": progress,
             "completed": completed,
             "total": total,
-            "current_task": current_task
+            "current_task": current_task,
         }
     except Exception as e:
-        return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0, "error": str(e)}
+        return {
+            "todos": [],
+            "progress": 0,
+            "current_task": None,
+            "total": 0,
+            "completed": 0,
+            "error": str(e),
+        }
 
 
 # ============ Golden Throne API ============
@@ -2179,7 +2273,12 @@ async def _get_or_create_backrooms_pane() -> str:
     """
     # Check if backrooms window exists
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}",
+        "tmux",
+        "list-panes",
+        "-t",
+        "main:backrooms",
+        "-F",
+        "#{pane_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -2187,7 +2286,14 @@ async def _get_or_create_backrooms_pane() -> str:
     if proc.returncode == 0 and stdout.decode().strip():
         # Window exists — split a new pane into it
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "split-window", "-t", "main:backrooms", "-d", "-P", "-F", "#{pane_id}",
+            "tmux",
+            "split-window",
+            "-t",
+            "main:backrooms",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -2195,7 +2301,13 @@ async def _get_or_create_backrooms_pane() -> str:
         if proc.returncode == 0 and stdout_split.decode().strip():
             pane_id = stdout_split.decode().strip()
             await asyncio.create_subprocess_exec(
-                "tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms",
+                "tmux",
+                "set-option",
+                "-p",
+                "-t",
+                pane_id,
+                "@PANE_TYPE",
+                "backrooms",
             )
             logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
             return pane_id
@@ -2205,7 +2317,13 @@ async def _get_or_create_backrooms_pane() -> str:
 
     # Create backrooms window (detached so it doesn't steal focus)
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "new-window", "-t", "main", "-n", "backrooms", "-d",
+        "tmux",
+        "new-window",
+        "-t",
+        "main",
+        "-n",
+        "backrooms",
+        "-d",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -2213,7 +2331,12 @@ async def _get_or_create_backrooms_pane() -> str:
 
     # Tag it and get the pane ID
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "list-panes", "-t", "main:backrooms", "-F", "#{pane_id}",
+        "tmux",
+        "list-panes",
+        "-t",
+        "main:backrooms",
+        "-F",
+        "#{pane_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -2222,7 +2345,13 @@ async def _get_or_create_backrooms_pane() -> str:
 
     # Tag pane type
     await asyncio.create_subprocess_exec(
-        "tmux", "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "backrooms",
+        "tmux",
+        "set-option",
+        "-p",
+        "-t",
+        pane_id,
+        "@PANE_TYPE",
+        "backrooms",
     )
     logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
     return pane_id
@@ -2232,9 +2361,7 @@ async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?", (session_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
         instance = await cursor.fetchone()
 
     if not instance:
@@ -2277,11 +2404,15 @@ async def golden_throne_followup(session_id: str):
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
         try:
-            await asyncio.to_thread(_send_to_phone, "/notify", {
-                "vibe": vibe_intensity,
-                "tts_text": "Golden Throne resuming work",
-                "banner_text": f"Resuming: {tab_name}",
-            })
+            await asyncio.to_thread(
+                _send_to_phone,
+                "/notify",
+                {
+                    "vibe": vibe_intensity,
+                    "tts_text": "Golden Throne resuming work",
+                    "banner_text": f"Resuming: {tab_name}",
+                },
+            )
         except Exception as e:
             logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
 
@@ -2293,7 +2424,12 @@ async def golden_throne_followup(session_id: str):
         transport = "unknown"
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_current_command}",
+                "tmux",
+                "display-message",
+                "-t",
+                tmux_pane,
+                "-p",
+                "#{pane_current_command}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2317,19 +2453,28 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                inject_prompt = f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                inject_prompt = (
+                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                )
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "claude-cmd", "--pane", tmux_pane, inject_prompt,
+                    "claude-cmd",
+                    "--pane",
+                    tmux_pane,
+                    inject_prompt,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
                 if proc.returncode == 0:
                     transport = "send-keys"
-                    logger.info(f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys pane={tmux_pane}")
+                    logger.info(
+                        f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys pane={tmux_pane}"
+                    )
                 else:
-                    logger.error(f"Golden Throne: claude-cmd failed for {session_id[:12]}: {stderr.decode()[:200]}")
+                    logger.error(
+                        f"Golden Throne: claude-cmd failed for {session_id[:12]}: {stderr.decode()[:200]}"
+                    )
             except Exception as e:
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
@@ -2341,10 +2486,15 @@ async def golden_throne_followup(session_id: str):
                 Path(sop_file).write_text(sop_prompt)
                 resume_cmd = (
                     f'cd {working_dir} && claude -p "$(cat {sop_file})" '
-                    f'--resume {session_id} --dangerously-skip-permissions'
+                    f"--resume {session_id} --dangerously-skip-permissions"
                 )
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", backrooms_pane, resume_cmd, "Enter",
+                    "tmux",
+                    "send-keys",
+                    "-t",
+                    backrooms_pane,
+                    resume_cmd,
+                    "Enter",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -2377,8 +2527,11 @@ async def golden_throne_followup(session_id: str):
         except Exception as e:
             logger.error(f"Golden Throne: satellite dispatch failed for {session_id[:12]}: {e}")
 
-    await log_event("golden_throne_followup", instance_id=session_id,
-                    details={"zealotry": instance.get("zealotry", 4)})
+    await log_event(
+        "golden_throne_followup",
+        instance_id=session_id,
+        details={"zealotry": instance.get("zealotry", 4)},
+    )
 
 
 async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
@@ -2389,9 +2542,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
         instance = await cursor.fetchone()
 
     if not instance:
@@ -2433,15 +2584,22 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
         # Local delivery via claude-cmd
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude-cmd", "--pane", tmux_pane, prompt,
+                "claude-cmd",
+                "--pane",
+                tmux_pane,
+                prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
-                logger.info(f"Nudge: delivered to {instance_id[:12]} via claude-cmd pane={tmux_pane}")
+                logger.info(
+                    f"Nudge: delivered to {instance_id[:12]} via claude-cmd pane={tmux_pane}"
+                )
             else:
-                logger.error(f"Nudge: claude-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}")
+                logger.error(
+                    f"Nudge: claude-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}"
+                )
                 return {"nudged": False, "reason": f"claude-cmd failed: rc={proc.returncode}"}
         except Exception as e:
             logger.error(f"Nudge: local delivery failed for {instance_id[:12]}: {e}")
@@ -2460,7 +2618,9 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
                     },
                 )
                 result = resp.json()
-                logger.info(f"Nudge: dispatched for {instance_id[:12]} via satellite {result.get('transport', '?')}")
+                logger.info(
+                    f"Nudge: dispatched for {instance_id[:12]} via satellite {result.get('transport', '?')}"
+                )
         except Exception as e:
             logger.error(f"Nudge: satellite dispatch failed for {instance_id[:12]}: {e}")
             return {"nudged": False, "reason": f"dispatch_failed: {e}"}
@@ -2468,8 +2628,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     # Record nudge timestamp for evaluator cooldown
     _recently_nudged[instance_id] = time.time()
 
-    await log_event("nudge_dispatched", instance_id=instance_id,
-                    details={"reason": reason[:200]})
+    await log_event("nudge_dispatched", instance_id=instance_id, details={"reason": reason[:200]})
     return {"nudged": True, "reason": reason[:200]}
 
 
@@ -2539,27 +2698,42 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
     return False, "not_duplicate"
 
 
-async def _inject_custodes_prompt_to_pane(prompt: str, tmux_pane: str, *, instance_id: str | None = None) -> dict:
+async def _inject_custodes_prompt_to_pane(
+    prompt: str, tmux_pane: str, *, instance_id: str | None = None
+) -> dict:
     """Inject a Custodes prompt into a known tmux pane."""
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
-            str(claude_cmd), "--pane", tmux_pane, prompt,
+            str(claude_cmd),
+            "--pane",
+            tmux_pane,
+            prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "PATH": ":".join([
-                str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                str(Path.home() / ".local" / "bin"),
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                os.environ.get("PATH", ""),
-            ])},
+            env={
+                **os.environ,
+                "PATH": ":".join(
+                    [
+                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                        str(Path.home() / ".local" / "bin"),
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        os.environ.get("PATH", ""),
+                    ]
+                ),
+            },
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
             reason = f"claude-cmd failed: rc={proc.returncode}"
             logger.warning(f"Custodes state hook: {reason}: {stderr.decode()[:200]}")
-            return {"dispatched": False, "reason": reason, "instance_id": instance_id, "tmux_pane": tmux_pane}
+            return {
+                "dispatched": False,
+                "reason": reason,
+                "instance_id": instance_id,
+                "tmux_pane": tmux_pane,
+            }
     except Exception as exc:
         logger.warning(f"Custodes state hook: delivery failed: {exc}")
         return {
@@ -2569,8 +2743,15 @@ async def _inject_custodes_prompt_to_pane(prompt: str, tmux_pane: str, *, instan
             "tmux_pane": tmux_pane,
         }
 
-    logger.info(f"Custodes state hook: delivered pane={tmux_pane} instance={instance_id or 'unknown'}")
-    return {"dispatched": True, "reason": "dispatched", "instance_id": instance_id, "tmux_pane": tmux_pane}
+    logger.info(
+        f"Custodes state hook: delivered pane={tmux_pane} instance={instance_id or 'unknown'}"
+    )
+    return {
+        "dispatched": True,
+        "reason": "dispatched",
+        "instance_id": instance_id,
+        "tmux_pane": tmux_pane,
+    }
 
 
 async def _find_custodes_tmux_pane() -> str | None:
@@ -2578,8 +2759,11 @@ async def _find_custodes_tmux_pane() -> str | None:
     custodes_bg = LEGION_PANE_COLORS["custodes"]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "list-panes", "-a",
-            "-F", "#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_bg}",
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_bg}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -2597,9 +2781,8 @@ async def _find_custodes_tmux_pane() -> str | None:
             pane_id, window_name, current_cmd, pane_bg = line.split("\t", 3)
         except ValueError:
             continue
-        cmd_is_claude = (
-            "claude" in current_cmd.lower()
-            or (current_cmd[0:1].isdigit() and "." in current_cmd)
+        cmd_is_claude = "claude" in current_cmd.lower() or (
+            current_cmd[0:1].isdigit() and "." in current_cmd
         )
         if pane_bg == custodes_bg and cmd_is_claude:
             candidates.append(pane_id)
@@ -2613,7 +2796,12 @@ async def _create_custodes_legion_pane() -> str | None:
     """Create or split the local legion window and return a pane id."""
     try:
         exists = await asyncio.create_subprocess_exec(
-            "tmux", "list-windows", "-t", "main", "-F", "#{window_name}",
+            "tmux",
+            "list-windows",
+            "-t",
+            "main",
+            "-F",
+            "#{window_name}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -2622,24 +2810,46 @@ async def _create_custodes_legion_pane() -> str | None:
 
         if "legion" in windows:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "split-window", "-t", "main:legion", "-d", "-P", "-F", "#{pane_id}",
+                "tmux",
+                "split-window",
+                "-t",
+                "main:legion",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "new-window", "-t", "main", "-n", "legion", "-d", "-P", "-F", "#{pane_id}",
+                "tmux",
+                "new-window",
+                "-t",
+                "main",
+                "-n",
+                "legion",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         pane_stdout, pane_stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode != 0:
-            logger.warning(f"Custodes state hook: could not create legion pane: {pane_stderr.decode()[:200]}")
+            logger.warning(
+                f"Custodes state hook: could not create legion pane: {pane_stderr.decode()[:200]}"
+            )
             return None
         pane_id = pane_stdout.decode().strip().splitlines()[0]
 
         await asyncio.create_subprocess_exec(
-            "tmux", "select-layout", "-t", "main:legion", "tiled",
+            "tmux",
+            "select-layout",
+            "-t",
+            "main:legion",
+            "tiled",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -2664,14 +2874,18 @@ async def _launch_custodes_for_intervention(prompt: str) -> dict:
     prompt_file.write_text(launch_prompt)
     launch_cmd = (
         f"cd {shlex.quote('/Volumes/Imperium/Imperium-ENV')} && "
-        f"primarch custodes \"$(cat {shlex.quote(str(prompt_file))})\" ; "
+        f'primarch custodes "$(cat {shlex.quote(str(prompt_file))})" ; '
         f"rm -f {shlex.quote(str(prompt_file))}"
     )
 
     try:
         for keys in (["C-c"], ["C-u"], ["clear", "Enter"], [launch_cmd, "Enter"]):
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", pane_id, *keys,
+                "tmux",
+                "send-keys",
+                "-t",
+                pane_id,
+                *keys,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2679,7 +2893,11 @@ async def _launch_custodes_for_intervention(prompt: str) -> dict:
             await asyncio.sleep(0.1)
     except Exception as exc:
         logger.warning(f"Custodes state hook: launch failed pane={pane_id}: {exc}")
-        return {"dispatched": False, "reason": f"custodes_launch_failed: {exc}", "tmux_pane": pane_id}
+        return {
+            "dispatched": False,
+            "reason": f"custodes_launch_failed: {exc}",
+            "tmux_pane": pane_id,
+        }
 
     logger.warning(f"Custodes state hook: launched new Custodes singleton pane={pane_id}")
     return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": pane_id}
@@ -2703,7 +2921,9 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
     if not row:
         recovered_pane = await _find_custodes_tmux_pane()
         if recovered_pane:
-            logger.warning(f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}")
+            logger.warning(
+                f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}"
+            )
             delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane)
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
@@ -2716,24 +2936,36 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
     if not tmux_pane:
         recovered_pane = await _find_custodes_tmux_pane()
         if recovered_pane:
-            logger.warning(f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}")
-            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            logger.warning(
+                f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}"
+            )
+            delivery = await _inject_custodes_prompt_to_pane(
+                prompt, recovered_pane, instance_id=instance["id"]
+            )
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
             return delivery
-        logger.warning(f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement")
+        logger.warning(
+            f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement"
+        )
         return await _launch_custodes_for_intervention(prompt)
 
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     if device_id != LOCAL_DEVICE_NAME:
         recovered_pane = await _find_custodes_tmux_pane()
         if recovered_pane:
-            logger.warning(f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}")
-            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            logger.warning(
+                f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}"
+            )
+            delivery = await _inject_custodes_prompt_to_pane(
+                prompt, recovered_pane, instance_id=instance["id"]
+            )
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
             return delivery
-        logger.warning(f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement")
+        logger.warning(
+            f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement"
+        )
         return await _launch_custodes_for_intervention(prompt)
 
     return await _inject_custodes_prompt_to_pane(prompt, tmux_pane, instance_id=instance["id"])
@@ -2758,13 +2990,18 @@ async def handle_custodes_state_event(
     dedupe_key = build_dedupe_key(event)
     normalized_severity = normalize_severity(severity)
 
-    await log_event("custodes_state_event", instance_id=instance_id, device_id=source, details={
-        "event_type": event_type,
-        "source": source,
-        "severity": normalized_severity,
-        "dedupe_key": dedupe_key,
-        "payload": payload or {},
-    })
+    await log_event(
+        "custodes_state_event",
+        instance_id=instance_id,
+        device_id=source,
+        details={
+            "event_type": event_type,
+            "source": source,
+            "severity": normalized_severity,
+            "dedupe_key": dedupe_key,
+            "payload": payload or {},
+        },
+    )
 
     intervention = evaluate_state_event(event, _custodes_state_snapshot())
     if intervention is None:
@@ -2794,14 +3031,18 @@ async def handle_custodes_state_event(
             "severity": intervention.severity,
         }
 
-    await log_event("custodes_intervention", instance_id=delivery.get("instance_id") or instance_id,
-                    device_id=source, details={
-                        "event_type": intervention.event_type,
-                        "dedupe_key": intervention.dedupe_key,
-                        "severity": intervention.severity,
-                        "prompt": intervention.prompt,
-                        "delivery": delivery,
-                    })
+    await log_event(
+        "custodes_intervention",
+        instance_id=delivery.get("instance_id") or instance_id,
+        device_id=source,
+        details={
+            "event_type": intervention.event_type,
+            "dedupe_key": intervention.dedupe_key,
+            "severity": intervention.severity,
+            "prompt": intervention.prompt,
+            "delivery": delivery,
+        },
+    )
 
     return {
         "received": True,
@@ -2883,7 +3124,9 @@ async def set_instance_legion(instance_id: str, request: Request):
     body = await request.json()
     legion = body.get("legion")
     if legion not in ALLOWED_LEGIONS:
-        raise HTTPException(status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}")
+        raise HTTPException(
+            status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}"
+        )
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
@@ -2925,13 +3168,13 @@ async def set_instance_synced(instance_id: str, request: Request):
             # Check for existing synced session in this legion
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing') AND id != ?",
-                (legion, instance_id)
+                (legion, instance_id),
             )
             conflict = await cursor.fetchone()
             if conflict:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}"
+                    detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}",
                 )
 
         await sanctioned_update_instance(
@@ -2956,9 +3199,7 @@ async def set_instance_discord(instance_id: str, request: Request):
     discord_channel = body.get("discord_channel")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE id = ?", (instance_id,)
-        )
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
@@ -2971,7 +3212,9 @@ async def set_instance_discord(instance_id: str, request: Request):
             updates["discord_channel"] = discord_channel if discord_channel else None
 
         if not updates:
-            raise HTTPException(status_code=400, detail="Provide discord_hosted and/or discord_channel")
+            raise HTTPException(
+                status_code=400, detail="Provide discord_hosted and/or discord_channel"
+            )
 
         await sanctioned_update_instance(
             db,
@@ -2984,14 +3227,20 @@ async def set_instance_discord(instance_id: str, request: Request):
         await db.commit()
 
     logger.info(f"Discord: {instance_id[:12]} → hosted={discord_hosted}, channel={discord_channel}")
-    return {"instance_id": instance_id, "discord_hosted": discord_hosted, "discord_channel": discord_channel}
+    return {
+        "instance_id": instance_id,
+        "discord_hosted": discord_hosted,
+        "discord_channel": discord_channel,
+    }
 
 
 @app.get("/api/legion/{legion}/synced-session")
 async def get_synced_session(legion: str):
     """Lookup the active synced session for a legion."""
     if legion not in ALLOWED_LEGIONS:
-        raise HTTPException(status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}")
+        raise HTTPException(
+            status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}"
+        )
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -3000,7 +3249,7 @@ async def get_synced_session(legion: str):
                FROM claude_instances
                WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
                LIMIT 1""",
-            (legion,)
+            (legion,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -3018,7 +3267,7 @@ async def get_zealotry(instance_id: str):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT zealotry, victory_at, victory_reason FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -3091,16 +3340,14 @@ async def declare_victory(instance_id: str, request: Request):
         if session_doc_id:
             try:
                 cursor = await db.execute(
-                    "SELECT file_path FROM session_documents WHERE id = ?",
-                    (session_doc_id,)
+                    "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
                 )
                 doc_row = await cursor.fetchone()
                 if doc_row and doc_row["file_path"]:
                     fp = Path(doc_row["file_path"])
                     if fp.exists():
                         await asyncio.to_thread(
-                            update_victory_frontmatter,
-                            fp, reason, now, deliverables
+                            update_victory_frontmatter, fp, reason, now, deliverables
                         )
                         session_doc_updated = True
                         logger.info(f"Victory: Updated session doc {session_doc_id} frontmatter")
@@ -3119,18 +3366,29 @@ async def declare_victory(instance_id: str, request: Request):
     try:
         subprocess.run(
             ["discord", "send", "fleet", f"⚔️ **IMPERIUM VICTORIOUS** — {tab_name}\n> {reason}"],
-            timeout=10, capture_output=True,
+            timeout=10,
+            capture_output=True,
         )
     except Exception as e:
         logger.warning(f"Golden Throne: Victory Discord notify failed: {e}")
 
     logger.info(f"Golden Throne: VICTORY for {instance_id[:12]} — {reason}")
-    await log_event("golden_throne_victory", instance_id=instance_id,
-                    details={"reason": reason, "timer_cancelled": timer_cancelled,
-                             "session_doc_updated": session_doc_updated,
-                             "deliverables": deliverables})
-    return {"instance_id": instance_id, "victory": True, "timer_cancelled": timer_cancelled,
-            "session_doc_updated": session_doc_updated}
+    await log_event(
+        "golden_throne_victory",
+        instance_id=instance_id,
+        details={
+            "reason": reason,
+            "timer_cancelled": timer_cancelled,
+            "session_doc_updated": session_doc_updated,
+            "deliverables": deliverables,
+        },
+    )
+    return {
+        "instance_id": instance_id,
+        "victory": True,
+        "timer_cancelled": timer_cancelled,
+        "session_doc_updated": session_doc_updated,
+    }
 
 
 @app.post("/api/instances/{instance_id}/golden-throne/trigger")
@@ -3151,7 +3409,9 @@ async def set_instance_type(instance_id: str, request: Request):
     body = await request.json()
     new_type = body.get("instance_type")
     if new_type not in VALID_INSTANCE_TYPES:
-        raise HTTPException(status_code=400, detail=f"instance_type must be one of {VALID_INSTANCE_TYPES}")
+        raise HTTPException(
+            status_code=400, detail=f"instance_type must be one of {VALID_INSTANCE_TYPES}"
+        )
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -3164,7 +3424,9 @@ async def set_instance_type(instance_id: str, request: Request):
 
         # Archived instances can only unarchive to one_off
         if old_type == "archived" and new_type != "one_off":
-            raise HTTPException(status_code=400, detail="Archived instances can only be unarchived to one_off")
+            raise HTTPException(
+                status_code=400, detail="Archived instances can only be unarchived to one_off"
+            )
 
         updates = {"instance_type": new_type}
 
@@ -3179,7 +3441,11 @@ async def set_instance_type(instance_id: str, request: Request):
             updates["zealotry"] = zealotry_override
 
         # Auto-set zealotry minimum when promoting to golden_throne
-        if new_type == "golden_throne" and (instance["zealotry"] or 4) < 4 and zealotry_override is None:
+        if (
+            new_type == "golden_throne"
+            and (instance["zealotry"] or 4) < 4
+            and zealotry_override is None
+        ):
             updates["zealotry"] = 4
 
         await sanctioned_update_instance(
@@ -3203,8 +3469,11 @@ async def set_instance_type(instance_id: str, request: Request):
         except Exception:
             pass
 
-    await log_event("instance_type_changed", instance_id=instance_id,
-                    details={"old_type": old_type, "new_type": new_type})
+    await log_event(
+        "instance_type_changed",
+        instance_id=instance_id,
+        details={"old_type": old_type, "new_type": new_type},
+    )
     return {"instance_id": instance_id, "instance_type": new_type, "old_type": old_type}
 
 
@@ -3336,8 +3605,8 @@ async def pedal_left():
         return {"action": "waiting", "reason": "first_tap"}
 
 
-@app.get("/api/instances", response_model=List[dict])
-async def list_instances(status: Optional[str] = None, sort: Optional[str] = None):
+@app.get("/api/instances", response_model=list[dict])
+async def list_instances(status: str | None = None, sort: str | None = None):
     """List all instances, optionally filtered by status and sorted."""
     order_clauses = {
         "status": "status ASC, last_activity DESC",
@@ -3352,13 +3621,10 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
 
         if status:
             cursor = await db.execute(
-                f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by}",
-                (status,)
+                f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by}", (status,)
             )
         else:
-            cursor = await db.execute(
-                f"SELECT * FROM claude_instances ORDER BY {order_by}"
-            )
+            cursor = await db.execute(f"SELECT * FROM claude_instances ORDER BY {order_by}")
 
         rows = await cursor.fetchall()
         instances = []
@@ -3373,7 +3639,7 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
                 if inst["id"] not in VOICE_CHAT_SESSIONS:
                     VOICE_CHAT_SESSIONS[inst["id"]] = {
                         "active": True,
-                        "started_at": datetime.now().isoformat()
+                        "started_at": datetime.now().isoformat(),
                     }
             # Resolve cc_color from profile name
             pn = inst.get("profile_name")
@@ -3385,14 +3651,16 @@ async def list_instances(status: Optional[str] = None, sort: Optional[str] = Non
                         break
             # Golden Throne: enrich with pending timer state
             gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
-            inst["gt_next_fire"] = gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
+            inst["gt_next_fire"] = (
+                gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
+            )
 
             instances.append(inst)
         return instances
 
 
 @app.get("/api/instances/resolve")
-async def resolve_instance(pid: Optional[int] = None, cwd: Optional[str] = None):
+async def resolve_instance(pid: int | None = None, cwd: str | None = None):
     """Resolve the calling agent's instance using PID and/or CWD fallback.
 
     Returns instance + session doc info in a single call.
@@ -3406,7 +3674,7 @@ async def resolve_instance(pid: Optional[int] = None, cwd: Optional[str] = None)
         if pid:
             cursor = await db.execute(
                 "SELECT * FROM claude_instances WHERE pid = ? AND status IN ('processing', 'idle') LIMIT 1",
-                (pid,)
+                (pid,),
             )
             instance = await cursor.fetchone()
 
@@ -3414,13 +3682,13 @@ async def resolve_instance(pid: Optional[int] = None, cwd: Optional[str] = None)
         if not instance and cwd:
             cursor = await db.execute(
                 "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'processing' ORDER BY last_activity DESC LIMIT 1",
-                (cwd,)
+                (cwd,),
             )
             instance = await cursor.fetchone()
             if not instance:
                 cursor = await db.execute(
                     "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'idle' ORDER BY last_activity DESC LIMIT 1",
-                    (cwd,)
+                    (cwd,),
                 )
                 instance = await cursor.fetchone()
 
@@ -3432,8 +3700,7 @@ async def resolve_instance(pid: Optional[int] = None, cwd: Optional[str] = None)
         # Attach session doc if linked
         if result.get("session_doc_id"):
             cursor = await db.execute(
-                "SELECT * FROM session_documents WHERE id = ?",
-                (result["session_doc_id"],)
+                "SELECT * FROM session_documents WHERE id = ?", (result["session_doc_id"],)
             )
             doc = await cursor.fetchone()
             result["session_doc"] = dict(doc) if doc else None
@@ -3448,10 +3715,7 @@ async def get_instance(instance_id: str):
     """Get details of a specific instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
-            (instance_id,)
-        )
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
         if not row:
@@ -3469,7 +3733,7 @@ async def get_instance(instance_id: str):
         return instance
 
 
-@app.get("/api/instances/{instance_id}/workflow-events", response_model=List[dict])
+@app.get("/api/instances/{instance_id}/workflow-events", response_model=list[dict])
 async def get_instance_workflow_events(instance_id: str, limit: int = 20):
     """Return recent workflow events for a specific instance."""
     limit = max(1, min(limit, 100))
@@ -3527,11 +3791,9 @@ async def get_instance_reconciliation(instance_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="Instance not found")
     if result["status"] in RECONCILIATION_SUSPICIOUS:
-        affected_fields = sorted({
-            field
-            for finding in result["findings"]
-            for field in finding.get("fields", [])
-        })
+        affected_fields = sorted(
+            {field for finding in result["findings"] for field in finding.get("fields", [])}
+        )
         await log_event(
             "instance_reconciliation_drift",
             instance_id=instance_id,
@@ -3568,11 +3830,9 @@ async def list_instance_reconciliation(limit: int = 50, suspicious_only: bool = 
                 continue
             results.append(result)
             if result["status"] in RECONCILIATION_SUSPICIOUS:
-                affected_fields = sorted({
-                    field
-                    for finding in result["findings"]
-                    for field in finding.get("fields", [])
-                })
+                affected_fields = sorted(
+                    {field for finding in result["findings"] for field in finding.get("fields", [])}
+                )
                 await log_event(
                     "instance_reconciliation_drift",
                     instance_id=row["id"],
@@ -3600,7 +3860,7 @@ def _derive_vault_and_relative(file_path: str) -> tuple[str, str]:
         marker = f"/{vault}/"
         idx = file_path.find(marker)
         if idx >= 0:
-            return vault, file_path[idx + len(marker):]
+            return vault, file_path[idx + len(marker) :]
     return "Imperium-ENV", file_path
 
 
@@ -3621,7 +3881,7 @@ async def pane_session_doc(tmux_pane: str):
                WHERE ci.tmux_pane = ?
                ORDER BY ci.last_activity DESC
                LIMIT 1""",
-            (tmux_pane,)
+            (tmux_pane,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -3659,9 +3919,7 @@ async def get_dashboard():
         productivity_active = active_count > 0
 
         # Get recent events (last 20)
-        cursor = await db.execute(
-            "SELECT * FROM events ORDER BY created_at DESC LIMIT 20"
-        )
+        cursor = await db.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 20")
         events = []
         for row in await cursor.fetchall():
             event = dict(row)
@@ -3676,14 +3934,14 @@ async def get_dashboard():
             instances=instances,
             productivity_active=productivity_active,
             recent_events=events,
-            tts_queue=get_tts_queue_status()
+            tts_queue=get_tts_queue_status(),
         )
 
 
 class LogEventRequest(BaseModel):
     event_type: str
-    instance_id: Optional[str] = None
-    details: Optional[dict] = None
+    instance_id: str | None = None
+    details: dict | None = None
 
 
 # Distraction apps that require productivity to be allowed
@@ -3706,7 +3964,16 @@ DISTRACTION_PATTERNS = [
 # [MOVED to shared.py] — VOICE_CHAT_SESSIONS, DICTATION_STATE, PEDAL_STATE, pedal constants
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
-VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
+VALID_DETECTION_MODES = [
+    "silence",
+    "music",
+    "video",
+    "scrolling",
+    "gaming",
+    "gym",
+    "work_gym",
+    "meeting",
+]
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
@@ -3717,6 +3984,7 @@ def reset_idle_timer():
     """Signal productivity to the timer engine. Replaces old _last_work_event_ms tracking."""
     now_ms = int(time.monotonic() * 1000)
     timer_engine.set_productivity(True, now_ms)
+
 
 # Paths for Obsidian vault — NAS mount preferred, home fallback
 _imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
@@ -3735,13 +4003,17 @@ def _write_productivity_score(date_str: str, score: int):
             print(f"TIMER: No daily note for {date_str}, skipping score write")
             return
 
-        update_frontmatter(note_path, {
-            "productivity_score": score,
-            "timer_completed": True,
-        })
+        update_frontmatter(
+            note_path,
+            {
+                "productivity_score": score,
+                "timer_completed": True,
+            },
+        )
         print(f"TIMER: Wrote productivity score {score} to {date_str}")
     except Exception as e:
         print(f"TIMER: Failed to write productivity score: {e}")
+
 
 # ============ Productivity Check-In System ============
 DISCORD_CHECKIN_CHANNEL = "1472043387535495323"
@@ -3751,10 +4023,10 @@ DISCORD_CHECKIN_CHANNEL = "1472043387535495323"
 
 MECHANICUS_USER_ID = "1472042705788866611"
 MECHANICUS_ROLE_ID = "1477162726093492308"
-CUSTODES_USER_ID   = "1477159418498912357"
+CUSTODES_USER_ID = "1477159418498912357"
 INQUISITION_USER_ID = "1477164289742864479"
-OPERATOR_USER_ID   = "229461055628115968"
-CUSTODES_CHANNELS  = {"briefing", "chat"}  # Channels where replies route to Custodes
+OPERATOR_USER_ID = "229461055628115968"
+CUSTODES_CHANNELS = {"briefing", "chat"}  # Channels where replies route to Custodes
 
 CHECKIN_SCHEDULE = {
     "morning_start": {
@@ -3828,12 +4100,12 @@ CHECKIN_SCHEDULE = {
 
 class CheckinSubmit(BaseModel):
     type: str  # checkin_type from CHECKIN_SCHEDULE
-    energy: Optional[int] = None
-    focus: Optional[int] = None
-    mood: Optional[str] = None
-    plan: Optional[str] = None
-    notes: Optional[str] = None
-    on_track: Optional[bool] = None
+    energy: int | None = None
+    focus: int | None = None
+    mood: str | None = None
+    plan: str | None = None
+    notes: str | None = None
+    on_track: bool | None = None
 
 
 def send_discord_checkin(message: str):
@@ -3841,10 +4113,15 @@ def send_discord_checkin(message: str):
     try:
         # Use full path to avoid PATH issues when running as service
         cmd = [
-            "/opt/homebrew/bin/openclaw", "message", "send",
-            "--channel", "discord",
-            "--target", DISCORD_CHECKIN_CHANNEL,
-            "--message", message,
+            "/opt/homebrew/bin/openclaw",
+            "message",
+            "send",
+            "--channel",
+            "discord",
+            "--target",
+            DISCORD_CHECKIN_CHANNEL,
+            "--message",
+            message,
         ]
         subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return True
@@ -3882,10 +4159,13 @@ async def trigger_checkin(checkin_type: str) -> dict:
 
     # Log the prompt in the database
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        await db.execute(
+            """
             INSERT OR IGNORE INTO checkins (checkin_type, date, prompted_at)
             VALUES (?, ?, ?)
-        """, (checkin_type, today, prompted_at))
+        """,
+            (checkin_type, today, prompted_at),
+        )
         await db.commit()
 
     # Send Discord message
@@ -3895,10 +4175,13 @@ async def trigger_checkin(checkin_type: str) -> dict:
     speak_checkin_tts(config["tts_prompt"])
 
     logger.info(f"Check-in triggered: {checkin_type} (discord={discord_sent})")
-    await log_event("checkin_prompted", details={
-        "checkin_type": checkin_type,
-        "discord_sent": discord_sent,
-    })
+    await log_event(
+        "checkin_prompted",
+        details={
+            "checkin_type": checkin_type,
+            "discord_sent": discord_sent,
+        },
+    )
 
     return {
         "checkin_type": checkin_type,
@@ -4001,35 +4284,49 @@ async def append_daily_note(request: DailyNoteAppendRequest):
 # Server-driven escalation. Phone executes v3 param-based endpoints.
 # Fallback chain: phone /enforce|/notify → server-side Pavlok API → Discord webhook.
 ENFORCEMENT_CASCADE = {
-    "active": False,          # Is a cascade currently running?
-    "app": None,              # Which app triggered it
-    "current_level": 0,       # Current escalation level (0-5)
-    "started_at": None,       # monotonic time
+    "active": False,  # Is a cascade currently running?
+    "app": None,  # Which app triggered it
+    "current_level": 0,  # Current escalation level (0-5)
+    "started_at": None,  # monotonic time
     "last_escalation": None,  # monotonic time of last level bump
-    "task": None,             # asyncio.Task for the cascade worker
+    "task": None,  # asyncio.Task for the cascade worker
 }
 
 # Level delays (seconds after previous level)
 ENFORCEMENT_LEVEL_DELAYS = {
-    1: 0,    # Vibe — immediate after Discord fallback timeout
-    2: 15,   # Vibe + beep + TTS
-    3: 15,   # Stronger vibe + beep + TTS warning
-    4: 10,   # Spotify redirect
-    5: 30,   # Pavlok zap (repeats every 30s)
+    1: 0,  # Vibe — immediate after Discord fallback timeout
+    2: 15,  # Vibe + beep + TTS
+    3: 15,  # Stronger vibe + beep + TTS warning
+    4: 10,  # Spotify redirect
+    5: 30,  # Pavlok zap (repeats every 30s)
 }
 
 # v3 param mapping per cascade level
 # Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
 ENFORCE_LEVEL_PARAMS = {
     1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "Close {app}"}},
-    2: {"endpoint": "/notify", "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
-    3: {"endpoint": "/notify", "params": {"vibe": 80, "beep": 50, "tts_text": "Final warning. Close {app}", "banner_text": "Final warning"}},
+    2: {
+        "endpoint": "/notify",
+        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+    },
+    3: {
+        "endpoint": "/notify",
+        "params": {
+            "vibe": 80,
+            "beep": 50,
+            "tts_text": "Final warning. Close {app}",
+            "banner_text": "Final warning",
+        },
+    },
     4: {"endpoint": "/enforce", "params": {"banner_text": "Enforcement active"}},
-    5: {"endpoint": "/enforce", "params": {"zap": 50, "tts_text": "Pavlok fired", "banner_text": "Enforcement — Pavlok"}},
+    5: {
+        "endpoint": "/enforce",
+        "params": {"zap": 50, "tts_text": "Pavlok fired", "banner_text": "Enforcement — Pavlok"},
+    },
 }
 
 ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
-DISCORD_FALLBACK_TIMEOUT = 30      # 30s to wait for app_close via Discord
+DISCORD_FALLBACK_TIMEOUT = 30  # 30s to wait for app_close via Discord
 
 
 # [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
@@ -4062,19 +4359,30 @@ async def attempt_shizuku_restart() -> dict:
         last = datetime.fromisoformat(SHIZUKU_STATE["last_restart_attempt"])
         elapsed = (now - last).total_seconds()
         if elapsed < SHIZUKU_CONFIG["restart_cooldown_seconds"]:
-            return {"success": False, "reason": "cooldown", "wait_seconds": round(SHIZUKU_CONFIG["restart_cooldown_seconds"] - elapsed)}
+            return {
+                "success": False,
+                "reason": "cooldown",
+                "wait_seconds": round(SHIZUKU_CONFIG["restart_cooldown_seconds"] - elapsed),
+            }
 
     if SHIZUKU_STATE["consecutive_failures"] >= SHIZUKU_CONFIG["max_consecutive_failures"]:
-        return {"success": False, "reason": "max_failures_reached", "failures": SHIZUKU_STATE["consecutive_failures"]}
+        return {
+            "success": False,
+            "reason": "max_failures_reached",
+            "failures": SHIZUKU_STATE["consecutive_failures"],
+        }
 
     SHIZUKU_STATE["last_restart_attempt"] = now.isoformat()
-    logger.info(f"Shizuku: attempting restart via shizuku-connect (attempt #{SHIZUKU_STATE['restart_count'] + 1})")
+    logger.info(
+        f"Shizuku: attempting restart via shizuku-connect (attempt #{SHIZUKU_STATE['restart_count'] + 1})"
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "shizuku-connect", "start",
+            "shizuku-connect",
+            "start",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
         output = stdout.decode().strip()
@@ -4091,7 +4399,7 @@ async def attempt_shizuku_restart() -> dict:
         logger.info(f"Shizuku: restart successful (total: {SHIZUKU_STATE['restart_count']})")
         return {"success": True, "output": output, "restart_count": SHIZUKU_STATE["restart_count"]}
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         SHIZUKU_STATE["consecutive_failures"] += 1
         logger.warning("Shizuku: restart timed out")
         return {"success": False, "reason": "timeout"}
@@ -4099,6 +4407,7 @@ async def attempt_shizuku_restart() -> dict:
         SHIZUKU_STATE["consecutive_failures"] += 1
         logger.warning(f"Shizuku: restart failed: {e}")
         return {"success": False, "reason": "exception", "error": str(e)}
+
 
 # App categories for phone distraction detection
 PHONE_DISTRACTION_APPS = {
@@ -4160,7 +4469,6 @@ MACRODROID_TRIGGER_APP_MAP = {
 }
 
 
-import re
 _APP_TRIGGER_RE = re.compile(r"Application (?:Launched|Closed) \((.+)\)", re.IGNORECASE)
 _GEO_TRIGGER_RE = re.compile(r"Geofence (Entry|Exit) \((.+)\)", re.IGNORECASE)
 
@@ -4218,7 +4526,7 @@ def parse_macrodroid_trigger_app(raw: str) -> str:
 
 
 # [MOVED to shared.py] — _sync_log_shift, timer_log_shift
-from shared import _sync_log_shift, timer_log_shift
+from shared import timer_log_shift
 
 
 def _sync_generate_daily_analytics(date_str: str):
@@ -4229,8 +4537,8 @@ def _sync_generate_daily_analytics(date_str: str):
     2. Full JSON to Imperium-ENV/Journal/Daily/analytics/ for programmatic access
     Then wipes timer_shifts table.
     """
-    import sqlite3
     import json
+    import sqlite3
     from collections import defaultdict
 
     conn = sqlite3.connect(DB_PATH)
@@ -4282,7 +4590,9 @@ def _sync_generate_daily_analytics(date_str: str):
         "modes_seen": sorted(modes_seen),
         "peak_break_balance_ms": peak_balance,
         "min_break_balance_ms": min_balance if min_balance != float("inf") else 0,
-        "avg_active_instances": round(sum(instance_counts) / len(instance_counts), 1) if instance_counts else 0,
+        "avg_active_instances": round(sum(instance_counts) / len(instance_counts), 1)
+        if instance_counts
+        else 0,
         "max_active_instances": max(instance_counts) if instance_counts else 0,
         "balance_timeline": balance_timeline,
     }
@@ -4297,15 +4607,20 @@ def _sync_generate_daily_analytics(date_str: str):
     # 2. Write summary fields to daily note frontmatter
     note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
     if note_path.exists():
-        update_frontmatter(note_path, {
-            "timer_total_shifts": summary["total_shifts"],
-            "timer_enforcements": enforcement_count,
-            "timer_twitter_shifts": twitter_shifts,
-            "timer_peak_break": format_timer_time(peak_balance),
-            "timer_min_break": format_timer_time(min_balance if min_balance != float("inf") else 0),
-            "timer_avg_instances": summary["avg_active_instances"],
-            "timer_max_instances": summary["max_active_instances"],
-        })
+        update_frontmatter(
+            note_path,
+            {
+                "timer_total_shifts": summary["total_shifts"],
+                "timer_enforcements": enforcement_count,
+                "timer_twitter_shifts": twitter_shifts,
+                "timer_peak_break": format_timer_time(peak_balance),
+                "timer_min_break": format_timer_time(
+                    min_balance if min_balance != float("inf") else 0
+                ),
+                "timer_avg_instances": summary["avg_active_instances"],
+                "timer_max_instances": summary["max_active_instances"],
+            },
+        )
 
     # Wipe timer_shifts table
     conn.execute("DELETE FROM timer_shifts")
@@ -4321,51 +4636,62 @@ async def generate_daily_timer_analytics(date_str: str):
         result = await asyncio.to_thread(_sync_generate_daily_analytics, date_str)
         if result:
             print(f"TIMER: Daily analytics written to {result}")
-            await log_event("timer_daily_analytics_generated", details={"file": result, "date": date_str})
+            await log_event(
+                "timer_daily_analytics_generated", details={"file": result, "date": date_str}
+            )
         else:
             print(f"TIMER: No shift data for {date_str}, skipping analytics")
     except Exception as e:
         print(f"TIMER: Failed to generate daily analytics: {e}")
 
 
-
 def _sync_update_daily_note():
     """Update daily note synchronically (called via asyncio.to_thread)."""
     import sqlite3
+
     today = datetime.now().strftime("%Y-%m-%d")
     note_path = OBSIDIAN_DAILY_PATH / f"{today}.md"
     if not note_path.exists():
         return
-    
+
     # Get session count and mode change count for today
     session_count = 0
     mode_change_count = 0
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("PRAGMA busy_timeout=5000")
-        session_count = conn.execute(
-            "SELECT COUNT(*) FROM timer_sessions WHERE date = ?", (today,)
-        ).fetchone()[0] or 0
-        mode_change_count = conn.execute(
-            "SELECT COUNT(*) FROM timer_mode_changes WHERE timestamp LIKE ?", (f"{today}%",)
-        ).fetchone()[0] or 0
+        session_count = (
+            conn.execute("SELECT COUNT(*) FROM timer_sessions WHERE date = ?", (today,)).fetchone()[
+                0
+            ]
+            or 0
+        )
+        mode_change_count = (
+            conn.execute(
+                "SELECT COUNT(*) FROM timer_mode_changes WHERE timestamp LIKE ?", (f"{today}%",)
+            ).fetchone()[0]
+            or 0
+        )
         conn.close()
     except Exception:
         pass  # Silently skip if DB query fails
-    
-    update_frontmatter(note_path, {
-        "timer_status": timer_engine.current_mode.value,
-        "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
-        "timer_break_earned": format_timer_time(
-            max(0, timer_engine.break_balance_ms) + timer_engine.total_break_time_ms
-        ),
-        "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
-        "timer_break_available": format_timer_time(max(0, timer_engine.break_balance_ms)),
-        "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
-        "timer_sessions": session_count,
-        "timer_mode_changes": mode_change_count,
-        "last_timer_update": datetime.now().strftime("%H:%M:%S"),
-    })
+
+    update_frontmatter(
+        note_path,
+        {
+            "timer_status": timer_engine.current_mode.value,
+            "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
+            "timer_break_earned": format_timer_time(
+                max(0, timer_engine.break_balance_ms) + timer_engine.total_break_time_ms
+            ),
+            "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
+            "timer_break_available": format_timer_time(max(0, timer_engine.break_balance_ms)),
+            "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
+            "timer_sessions": session_count,
+            "timer_mode_changes": mode_change_count,
+            "last_timer_update": datetime.now().strftime("%H:%M:%S"),
+        },
+    )
 
 
 async def timer_update_daily_note():
@@ -4379,13 +4705,14 @@ async def timer_update_daily_note():
 def _sync_save_to_db(state_json: str):
     """Save timer state to SQLite synchronously (called via asyncio.to_thread)."""
     import sqlite3
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """INSERT INTO timer_state (id, state_json, updated_at)
            VALUES (1, ?, CURRENT_TIMESTAMP)
            ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = CURRENT_TIMESTAMP""",
-        (state_json,)
+        (state_json,),
     )
     conn.commit()
     conn.close()
@@ -4405,12 +4732,13 @@ def _sync_log_mode_change(old_mode: str | None, new_mode: str, is_automatic: boo
     """Log a mode change to the database synchronously."""
     import sqlite3
     from datetime import datetime
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """INSERT INTO timer_mode_changes (timestamp, old_mode, new_mode, is_automatic)
            VALUES (?, ?, ?, ?)""",
-        (datetime.now().isoformat(), old_mode, new_mode, 1 if is_automatic else 0)
+        (datetime.now().isoformat(), old_mode, new_mode, 1 if is_automatic else 0),
     )
     conn.commit()
     conn.close()
@@ -4428,12 +4756,13 @@ def _sync_start_session(mode: str, date: str):
     """Start a new timer session."""
     import sqlite3
     from datetime import datetime
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     cursor = conn.execute(
         """INSERT INTO timer_sessions (date, start_time, mode)
            VALUES (?, ?, ?)""",
-        (date, datetime.now().isoformat(), mode)
+        (date, datetime.now().isoformat(), mode),
     )
     conn.commit()
     session_id = cursor.lastrowid
@@ -4450,32 +4779,47 @@ async def timer_start_session(mode: str, date: str) -> int:
         return 0
 
 
-def _sync_end_session(session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0):
+def _sync_end_session(
+    session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0
+):
     """End a timer session."""
     import sqlite3
     from datetime import datetime
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """UPDATE timer_sessions SET end_time = ?, duration_ms = ?, break_earned_ms = ?, break_used_ms = ?
            WHERE id = ?""",
-        (datetime.now().isoformat(), duration_ms, break_earned_ms, break_used_ms, session_id)
+        (datetime.now().isoformat(), duration_ms, break_earned_ms, break_used_ms, session_id),
     )
     conn.commit()
     conn.close()
 
 
-async def timer_end_session(session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0):
+async def timer_end_session(
+    session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0
+):
     """End a timer session asynchronously."""
     try:
-        await asyncio.to_thread(_sync_end_session, session_id, duration_ms, break_earned_ms, break_used_ms)
+        await asyncio.to_thread(
+            _sync_end_session, session_id, duration_ms, break_earned_ms, break_used_ms
+        )
     except Exception as e:
         print(f"TIMER: Failed to end session: {e}")
 
 
-def _sync_save_daily_score(date: str, productivity_score: int, total_work_ms: int, total_break_used_ms: int, session_count: int, mode_change_count: int):
+def _sync_save_daily_score(
+    date: str,
+    productivity_score: int,
+    total_work_ms: int,
+    total_break_used_ms: int,
+    session_count: int,
+    mode_change_count: int,
+):
     """Save daily productivity score."""
     import sqlite3
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
@@ -4488,16 +4832,38 @@ def _sync_save_daily_score(date: str, productivity_score: int, total_work_ms: in
                session_count = excluded.session_count,
                mode_change_count = excluded.mode_change_count,
                updated_at = CURRENT_TIMESTAMP""",
-        (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count)
+        (
+            date,
+            productivity_score,
+            total_work_ms,
+            total_break_used_ms,
+            session_count,
+            mode_change_count,
+        ),
     )
     conn.commit()
     conn.close()
 
 
-async def timer_save_daily_score(date: str, productivity_score: int, total_work_ms: int, total_break_used_ms: int, session_count: int, mode_change_count: int):
+async def timer_save_daily_score(
+    date: str,
+    productivity_score: int,
+    total_work_ms: int,
+    total_break_used_ms: int,
+    session_count: int,
+    mode_change_count: int,
+):
     """Save daily productivity score asynchronously."""
     try:
-        await asyncio.to_thread(_sync_save_daily_score, date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count)
+        await asyncio.to_thread(
+            _sync_save_daily_score,
+            date,
+            productivity_score,
+            total_work_ms,
+            total_break_used_ms,
+            session_count,
+            mode_change_count,
+        )
     except Exception as e:
         print(f"TIMER: Failed to save daily score: {e}")
 
@@ -4505,6 +4871,7 @@ async def timer_save_daily_score(date: str, productivity_score: int, total_work_
 def timer_load_from_db():
     """Load timer state from DB on startup."""
     import sqlite3
+
     now_ms = int(time.monotonic() * 1000)
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -4515,7 +4882,9 @@ def timer_load_from_db():
         if row:
             saved = json.loads(row[0])
             timer_engine.from_dict(saved, now_mono_ms=now_ms)
-            print(f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.break_balance_ms / 1000:.0f}s)")
+            print(
+                f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.break_balance_ms / 1000:.0f}s)"
+            )
             return
     except Exception as e:
         print(f"TIMER: DB load failed: {e}")
@@ -4527,6 +4896,7 @@ def timer_load_from_db():
 async def timer_9am_reset():
     """9 AM daily reset: clear accumulated break, wipe prior-day timer events."""
     import sqlite3
+
     today = datetime.now().strftime("%Y-%m-%d")
     now_ms = int(time.monotonic() * 1000)
 
@@ -4535,6 +4905,7 @@ async def timer_9am_reset():
 
     # Wipe timer_mode_change and break events from previous days
     try:
+
         def _wipe_old_timer_events():
             conn = sqlite3.connect(DB_PATH)
             conn.execute("PRAGMA busy_timeout=5000")
@@ -4550,7 +4921,14 @@ async def timer_9am_reset():
         print(f"TIMER: Failed to wipe old timer events: {e}")
 
     print(f"TIMER: 9 AM daily reset complete (productivity_score={result.productivity_score})")
-    await log_event("timer_daily_reset", details={"source": "9am_scheduler", "productivity_score": result.productivity_score, "date": today})
+    await log_event(
+        "timer_daily_reset",
+        details={
+            "source": "9am_scheduler",
+            "productivity_score": result.productivity_score,
+            "date": today,
+        },
+    )
 
 
 # ============ Audio Proxy State ============
@@ -4566,9 +4944,15 @@ AUDIO_PROXY_STATE = {
 
 # ============ Headless Mode (disabled on macOS) ============
 
+
 def get_headless_state() -> dict:
     """Headless mode is not applicable on macOS."""
-    return {"enabled": False, "last_changed": None, "hostname": None, "error": "not applicable on macOS"}
+    return {
+        "enabled": False,
+        "last_changed": None,
+        "hostname": None,
+        "error": "not applicable on macOS",
+    }
 
 
 async def poll_for_state_change(
@@ -4636,7 +5020,11 @@ def check_audio_receiver_running() -> dict:
 
 
 # [MOVED to enforcement_service.py] — close_distraction_windows, enforce_desktop_app, check_desktop_reachable
-from enforcement_service import close_distraction_windows, enforce_desktop_app, check_desktop_reachable
+from enforcement_service import (
+    check_desktop_reachable,
+    close_distraction_windows,
+    enforce_desktop_app,
+)
 
 
 def trigger_obsidian_command_async(command_id: str, no_focus: bool = False):
@@ -4687,7 +5075,7 @@ def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool 
         return {
             "success": response.status_code == 200,
             "status_code": response.status_code,
-            "response": response.text[:200] if response.text else None
+            "response": response.text[:200] if response.text else None,
         }
     except requests.exceptions.Timeout:
         PHONE_STATE["reachable"] = False
@@ -4711,16 +5099,22 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
     try:
         logger.info(f"PHONE: Auto-restarting Shizuku for {action} {app_name}")
         restart_result = await attempt_shizuku_restart()
-        await log_event("shizuku_auto_restart", device_id="Token-S24",
-                        details={"trigger": f"enforce_{action}_{app_name}", "result": restart_result})
+        await log_event(
+            "shizuku_auto_restart",
+            device_id="Token-S24",
+            details={"trigger": f"enforce_{action}_{app_name}", "result": restart_result},
+        )
         if not restart_result.get("success"):
             logger.warning(f"PHONE: Shizuku restart failed, skipping retry for {action} {app_name}")
             return
         await asyncio.sleep(3)  # Wait for Shizuku init
         retry_result = await asyncio.to_thread(enforce_phone_app, app_name, action, False)
         logger.info(f"PHONE: Enforce retry {action} {app_name} -> {retry_result}")
-        await log_event("enforce_shizuku_retry", device_id="Token-S24",
-                        details={"app": app_name, "action": action, "result": retry_result})
+        await log_event(
+            "enforce_shizuku_retry",
+            device_id="Token-S24",
+            details={"app": app_name, "action": action, "result": retry_result},
+        )
     except Exception as e:
         logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
@@ -4729,11 +5123,14 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
 
 # Wire TTS route dependencies
 from routes.tts import init_deps as tts_init_deps
+
 tts_init_deps(send_to_phone=_send_to_phone)
 
 # Wire voice route dependencies
 from routes.voice import init_deps as voice_init_deps
+
 voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
+
 
 def _send_enforce_to_phone(app_name: str, level: int) -> dict:
     """Send enforcement level to phone using v3 params.
@@ -4743,8 +5140,10 @@ def _send_enforce_to_phone(app_name: str, level: int) -> dict:
     """
     level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
     endpoint = level_config["endpoint"]
-    params = {k: v.format(app=app_name) if isinstance(v, str) else v
-              for k, v in level_config["params"].items()}
+    params = {
+        k: v.format(app=app_name) if isinstance(v, str) else v
+        for k, v in level_config["params"].items()
+    }
     return _send_to_phone(endpoint, params)
 
 
@@ -4761,8 +5160,10 @@ async def _send_discord_fallback(app_name: str, level: int):
     Only /phone/enforce is accepted — no arbitrary code execution.
     """
     level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
-    params = {k: v.format(app=app_name) if isinstance(v, str) else v
-              for k, v in level_config["params"].items()}
+    params = {
+        k: v.format(app=app_name) if isinstance(v, str) else v
+        for k, v in level_config["params"].items()
+    }
     msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
     logger.info(f"DISCORD FALLBACK: {msg}")
     try:
@@ -4771,7 +5172,9 @@ async def _send_discord_fallback(app_name: str, level: int):
             if resp.status_code == 204:
                 logger.info("DISCORD FALLBACK: Webhook sent OK")
             else:
-                logger.warning(f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}")
+                logger.warning(
+                    f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}"
+                )
     except Exception as e:
         logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
 
@@ -4805,7 +5208,7 @@ async def _enforcement_cascade_worker(app_name: str):
     # Wait for Discord fallback to work
     await asyncio.sleep(DISCORD_FALLBACK_TIMEOUT)
     if not cascade["active"]:
-        print(f"CASCADE: app_close received during Discord fallback wait")
+        print("CASCADE: app_close received during Discord fallback wait")
         return
 
     # Escalate through levels 1-5
@@ -4816,14 +5219,19 @@ async def _enforcement_cascade_worker(app_name: str):
 
         elapsed = time.monotonic() - start
         if elapsed > ENFORCEMENT_CASCADE_TIMEOUT:
-            print(f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}")
+            print(
+                f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}"
+            )
             break
 
         cascade["current_level"] = level
         cascade["last_escalation"] = time.monotonic()
         print(f"CASCADE: Escalating to level {level} for {app_name}")
-        await log_event("enforcement_cascade_escalate", device_id="phone",
-                        details={"app": app_name, "level": level, "elapsed_s": round(elapsed)})
+        await log_event(
+            "enforcement_cascade_escalate",
+            device_id="phone",
+            details={"app": app_name, "level": level, "elapsed_s": round(elapsed)},
+        )
 
         # Try phone first, fall back to server-side Pavlok API, then Discord
         result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
@@ -4831,9 +5239,19 @@ async def _enforcement_cascade_worker(app_name: str):
             # Phone unreachable — try server-side Pavlok API for levels with haptics
             level_params = ENFORCE_LEVEL_PARAMS.get(level, {}).get("params", {})
             if "zap" in level_params:
-                send_pavlok_stimulus("zap", level_params["zap"], reason=f"cascade_level_{level}", respect_cooldown=False)
+                send_pavlok_stimulus(
+                    "zap",
+                    level_params["zap"],
+                    reason=f"cascade_level_{level}",
+                    respect_cooldown=False,
+                )
             elif "vibe" in level_params:
-                send_pavlok_stimulus("vibe", level_params["vibe"], reason=f"cascade_level_{level}", respect_cooldown=False)
+                send_pavlok_stimulus(
+                    "vibe",
+                    level_params["vibe"],
+                    reason=f"cascade_level_{level}",
+                    respect_cooldown=False,
+                )
             # Discord as last resort
             await _send_discord_fallback(app_name, level)
 
@@ -4846,7 +5264,9 @@ async def _enforcement_cascade_worker(app_name: str):
                     break
                 result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
                 if not result["success"]:
-                    send_pavlok_stimulus("zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False)
+                    send_pavlok_stimulus(
+                        "zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False
+                    )
                     await _send_discord_fallback(app_name, 5)
         else:
             delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
@@ -4856,10 +5276,19 @@ async def _enforcement_cascade_worker(app_name: str):
     cascade["active"] = False
     cascade["task"] = None
     elapsed = time.monotonic() - start
-    print(f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}")
-    await log_event("enforcement_cascade_end", device_id="phone",
-                    details={"app": app_name, "final_level": cascade["current_level"],
-                             "elapsed_s": round(elapsed), "reason": "timeout_or_exhausted"})
+    print(
+        f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}"
+    )
+    await log_event(
+        "enforcement_cascade_end",
+        device_id="phone",
+        details={
+            "app": app_name,
+            "final_level": cascade["current_level"],
+            "elapsed_s": round(elapsed),
+            "reason": "timeout_or_exhausted",
+        },
+    )
 
 
 def start_enforcement_cascade(app_name: str):
@@ -4896,9 +5325,13 @@ def stop_enforcement_cascade(reason: str = "app_close"):
         cascade["task"].cancel()
     cascade["task"] = None
 
-    asyncio.ensure_future(log_event("enforcement_cascade_stop", device_id="phone",
-                                     details={"app": app, "level": level,
-                                              "elapsed_s": round(elapsed), "reason": reason}))
+    asyncio.ensure_future(
+        log_event(
+            "enforcement_cascade_stop",
+            device_id="phone",
+            details={"app": app, "level": level, "elapsed_s": round(elapsed), "reason": reason},
+        )
+    )
 
 
 def check_phone_reachable() -> dict:
@@ -4962,8 +5395,8 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
             "active_instances": active_count,
             "should_close": should_close,
             "source": request.source if request else "unknown",
-            "window_title": request.window_title if request else None
-        }
+            "window_title": request.window_title if request else None,
+        },
     )
 
     return WindowEnforceResponse(
@@ -4971,7 +5404,7 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
         active_instance_count=active_count,
         should_close_distractions=should_close,
         distraction_apps=DISTRACTION_APPS,
-        reason=reason
+        reason=reason,
     )
 
 
@@ -4989,15 +5422,9 @@ async def trigger_window_close():
     """
     result = close_distraction_windows()
 
-    await log_event(
-        "manual_enforcement",
-        details={"result": result}
-    )
+    await log_event("manual_enforcement", details={"result": result})
 
-    return {
-        "action": "close_distractions",
-        "result": result
-    }
+    return {"action": "close_distractions", "result": result}
 
 
 @app.post("/desktop", response_model=DesktopDetectionResponse)
@@ -5028,11 +5455,13 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     if detected_mode not in VALID_DETECTION_MODES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid detected_mode '{detected_mode}'. Valid: {VALID_DETECTION_MODES}"
+            detail=f"Invalid detected_mode '{detected_mode}'. Valid: {VALID_DETECTION_MODES}",
         )
 
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
-    print(f">>> Desktop detection from {source}: mode={detected_mode} window='{window_title}' work_mode={work_mode}")
+    print(
+        f">>> Desktop detection from {source}: mode={detected_mode} window='{window_title}' work_mode={work_mode}"
+    )
 
     # Get current mode
     current_mode = DESKTOP_STATE["current_mode"]
@@ -5051,7 +5480,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             reason="mode_unchanged",
             productivity_active=True,
             active_instance_count=0,
-            timer_updated=False
+            timer_updated=False,
         )
 
     # Startup grace period: ignore transitions TO silence for N seconds after
@@ -5061,14 +5490,16 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         elapsed = time.time() - DESKTOP_STATE.get("startup_time", 0)
         if elapsed < grace_secs:
             remaining = round(grace_secs - elapsed, 1)
-            print(f"    GRACE PERIOD: Ignoring silence detection ({remaining}s remaining, current={current_mode})")
+            print(
+                f"    GRACE PERIOD: Ignoring silence detection ({remaining}s remaining, current={current_mode})"
+            )
             return DesktopDetectionResponse(
                 action="none",
                 detected_mode=detected_mode,
                 reason=f"startup_grace_period ({remaining}s remaining)",
                 productivity_active=True,
                 active_instance_count=0,
-                timer_updated=False
+                timer_updated=False,
             )
 
     # Check productivity status
@@ -5089,12 +5520,12 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     if work_mode == "clocked_out":
         allowed = True
         reason = "clocked_out"
-        print(f"    Clocked out - all modes allowed")
+        print("    Clocked out - all modes allowed")
     # GYM MODE: All modes allowed (gym has its own timer logic)
     elif work_mode == "gym":
         allowed = True
         reason = "gym_mode"
-        print(f"    Gym mode - all modes allowed")
+        print("    Gym mode - all modes allowed")
     # CLOCKED IN: Video/gaming mode requires either break time OR productivity
     elif detected_mode == "video" or detected_mode == "gaming":
         has_break_time = timer_engine.break_balance_ms > 0
@@ -5119,16 +5550,18 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         DESKTOP_STATE["steam_app_id"] = request.steam_app_id if detected_mode == "gaming" else None
-        DESKTOP_STATE["steam_app_name"] = request.steam_app_name if detected_mode == "gaming" else None
+        DESKTOP_STATE["steam_app_name"] = (
+            request.steam_app_name if detected_mode == "gaming" else None
+        )
         DESKTOP_STATE["steam_exe"] = request.steam_exe if detected_mode == "gaming" else None
 
         # Track meeting state (suppresses TTS)
         was_meeting = DESKTOP_STATE["in_meeting"]
-        DESKTOP_STATE["in_meeting"] = (detected_mode == "meeting")
+        DESKTOP_STATE["in_meeting"] = detected_mode == "meeting"
         if DESKTOP_STATE["in_meeting"] and not was_meeting:
-            print(f"    MEETING STARTED: TTS suppressed")
+            print("    MEETING STARTED: TTS suppressed")
         elif was_meeting and not DESKTOP_STATE["in_meeting"]:
-            print(f"    MEETING ENDED: TTS resumed")
+            print("    MEETING ENDED: TTS resumed")
 
         # Update timer activity layer
         now_ms = int(time.monotonic() * 1000)
@@ -5137,25 +5570,40 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         was_focused = timer_engine.focus_active
         if detected_mode in ("video", "scrolling", "gaming"):
             is_sg = detected_mode in ("scrolling", "gaming")
-            result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
+            result = timer_engine.set_activity(
+                Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
+            )
         else:
-            result = timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+            result = timer_engine.set_activity(
+                Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms
+            )
 
         # Log focus auto-exit on distraction
         if was_focused and not timer_engine.focus_active:
             focus_min = round(timer_engine.total_focus_time_ms / 60000)
-            await log_event("focus_toggle", details={
-                "action": "off", "trigger": "distraction", "detected_mode": detected_mode,
-                "total_focus_time_ms": timer_engine.total_focus_time_ms,
-                "focus_cutoff_time": timer_engine.focus_cutoff_time,
-            })
+            await log_event(
+                "focus_toggle",
+                details={
+                    "action": "off",
+                    "trigger": "distraction",
+                    "detected_mode": detected_mode,
+                    "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                    "focus_cutoff_time": timer_engine.focus_cutoff_time,
+                },
+            )
             loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, speak_tts, f"Focus broken by {detected_mode}. {focus_min} minutes earned.")
+            loop.run_in_executor(
+                None, speak_tts, f"Focus broken by {detected_mode}. {focus_min} minutes earned."
+            )
 
         timer_updated = TimerEvent.MODE_CHANGED in result.events
         if timer_updated:
-            await timer_log_shift(old_timer_mode,
-                                  timer_engine.current_mode.value, trigger="desktop_detection", source="ahk")
+            await timer_log_shift(
+                old_timer_mode,
+                timer_engine.current_mode.value,
+                trigger="desktop_detection",
+                source="ahk",
+            )
 
         await log_event(
             "desktop_mode_change",
@@ -5167,8 +5615,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 **steam_details,
                 "timer_updated": timer_updated,
                 "productivity_active": productivity_active,
-                "active_instances": active_count
-            }
+                "active_instances": active_count,
+            },
         )
 
         print(f"<<< Mode changed: {old_mode} -> {detected_mode} | timer={timer_updated}")
@@ -5181,7 +5629,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             reason="allowed",
             timer_updated=timer_updated,
             productivity_active=productivity_active,
-            active_instance_count=active_count
+            active_instance_count=active_count,
         )
     else:
         # Mode change blocked - immediately enforce by closing distraction windows
@@ -5189,10 +5637,16 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
         enforce_result = close_distraction_windows()
         send_pavlok_stimulus(reason="desktop_distraction_blocked")
-        asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 30,
-            "banner_text": f"Desktop blocked: {detected_mode}",
-        }))
+        asyncio.create_task(
+            asyncio.to_thread(
+                _send_to_phone,
+                "/notify",
+                {
+                    "vibe": 30,
+                    "banner_text": f"Desktop blocked: {detected_mode}",
+                },
+            )
+        )
 
         await log_event(
             "desktop_mode_blocked",
@@ -5204,21 +5658,23 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 **steam_details,
                 "productivity_active": productivity_active,
                 "active_instances": active_count,
-                "enforcement": enforce_result
-            }
-        )
-        asyncio.create_task(handle_custodes_state_event(
-            "desktop_mode_blocked",
-            "desktop",
-            severity=2,
-            payload={
-                "desktop_mode": detected_mode,
-                "reason": reason,
-                "window_title": window_title,
-                **steam_details,
-                "active_instances": active_count,
+                "enforcement": enforce_result,
             },
-        ))
+        )
+        asyncio.create_task(
+            handle_custodes_state_event(
+                "desktop_mode_blocked",
+                "desktop",
+                severity=2,
+                payload={
+                    "desktop_mode": detected_mode,
+                    "reason": reason,
+                    "window_title": window_title,
+                    **steam_details,
+                    "active_instances": active_count,
+                },
+            )
+        )
 
         raise HTTPException(
             status_code=403,
@@ -5228,8 +5684,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 reason=reason,
                 timer_updated=False,
                 productivity_active=productivity_active,
-                active_instance_count=active_count
-            ).model_dump()
+                active_instance_count=active_count,
+            ).model_dump(),
         )
 
 
@@ -5284,8 +5740,7 @@ async def manual_enforce_desktop(app: str = "brave", action: str = "close"):
     result = enforce_desktop_app(app, action)
 
     await log_event(
-        "desktop_manual_enforcement",
-        details={"app": app, "action": action, "result": result}
+        "desktop_manual_enforcement", details={"app": app, "action": action, "result": result}
     )
 
     return result
@@ -5314,6 +5769,7 @@ async def restart_satellite_proxy():
 
 # ============ Phone Heartbeat Endpoints ============
 
+
 @app.post("/api/phone/heartbeat")
 async def phone_heartbeat(request: Request):
     """Record phone heartbeat — resets silence timer and clears alert state."""
@@ -5329,7 +5785,12 @@ async def phone_heartbeat_status():
     """Return last heartbeat time, silence duration, and current alert state."""
     last = PHONE_HEARTBEAT["last_seen"]
     if last is None:
-        return {"last_heartbeat": None, "silence_minutes": None, "alert_state": None, "device_id": None}
+        return {
+            "last_heartbeat": None,
+            "silence_minutes": None,
+            "alert_state": None,
+            "device_id": None,
+        }
     silence_minutes = (datetime.utcnow() - last).total_seconds() / 60
     return {
         "last_heartbeat": last.isoformat(),
@@ -5341,6 +5802,7 @@ async def phone_heartbeat_status():
 
 # ============ Phone Activity Detection ============
 # MacroDroid sends app open/close events from phone
+
 
 @app.post("/phone", response_model=PhoneActivityResponse)
 async def handle_phone_activity(request: PhoneActivityRequest):
@@ -5373,7 +5835,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             PHONE_STATE["twitter_zapped"] = False  # reset zap latch on confirmed close
             # Clear manual mode so close event restores work mode
             timer_engine._clear_manual_mode()
-            print(f"    Twitter closed, manual mode cleared")
+            print("    Twitter closed, manual mode cleared")
 
         # Switch timer activity to working when distraction app closes
         timer_updated = False
@@ -5382,11 +5844,18 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
             now_ms = int(time.monotonic() * 1000)
             old_timer_mode = timer_engine.current_mode.value
-            result = timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+            result = timer_engine.set_activity(
+                Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms
+            )
             timer_updated = TimerEvent.MODE_CHANGED in result.events
             if timer_updated:
-                await timer_log_shift(old_timer_mode, timer_engine.current_mode.value, trigger="phone_app",
-                                      source="macrodroid", phone_app=app_name)
+                await timer_log_shift(
+                    old_timer_mode,
+                    timer_engine.current_mode.value,
+                    trigger="phone_app",
+                    source="macrodroid",
+                    phone_app=app_name,
+                )
             print(f"    Phone close -> working | timer={timer_updated}")
 
         await log_event(
@@ -5395,15 +5864,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "app": app_name,
                 "display_name": display_name,
                 "package": package,
-                "timer_updated": timer_updated
-            }
+                "timer_updated": timer_updated,
+            },
         )
 
-        return PhoneActivityResponse(
-            allowed=True,
-            reason="closed",
-            message="App closed"
-        )
+        return PhoneActivityResponse(allowed=True, reason="closed", message="App closed")
 
     # Determine distraction category
     distraction_mode = PHONE_DISTRACTION_APPS.get(app_name)
@@ -5414,9 +5879,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     if not distraction_mode:
         print(f"    Unknown app, allowing: {app_name}")
         return PhoneActivityResponse(
-            allowed=True,
-            reason="not_tracked",
-            message="App not in distraction list"
+            allowed=True, reason="not_tracked", message="App not in distraction list"
         )
 
     is_twitter = app_name in ("twitter", "x", "com.twitter.android")
@@ -5427,11 +5890,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # switcher, etc. — these phantom opens were resetting current_app and
     # restarting the 7-minute timer, causing repeat zaps.
     if is_twitter and PHONE_STATE.get("twitter_zapped"):
-        print(f"    Phantom Twitter open ignored (already zapped, awaiting confirmed close)")
+        print("    Phantom Twitter open ignored (already zapped, awaiting confirmed close)")
         return PhoneActivityResponse(
             allowed=False,
             reason="phantom_blocked",
-            message="Twitter already enforced, waiting for confirmed close"
+            message="Twitter already enforced, waiting for confirmed close",
         )
 
     # Duplicate open debounce: if we're already tracking this app, don't
@@ -5441,17 +5904,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     if current == app_name or (is_twitter and current in ("twitter", "x", "com.twitter.android")):
         print(f"    Duplicate {app_name} open ignored (already current_app)")
         return PhoneActivityResponse(
-            allowed=True,
-            reason="already_tracked",
-            message="Already tracking this app"
+            allowed=True, reason="already_tracked", message="Already tracking this app"
         )
 
     # Helper to sync timer activity layer for phone distraction
     def _sync_phone_timer():
         # If twitter was already zapped, don't let phantom opens change timer mode
         # (this prevents phantom opens from burning break time → break_exhausted zaps)
-        if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get("twitter_zapped"):
-            print(f"    Skipping timer sync — twitter already zapped")
+        if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get(
+            "twitter_zapped"
+        ):
+            print("    Skipping timer sync — twitter already zapped")
             return False, timer_engine.current_mode.value
         old_timer_mode = timer_engine.current_mode.value
         DESKTOP_STATE["current_mode"] = distraction_mode
@@ -5460,26 +5923,39 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         # Phone distractions → set activity to DISTRACTION
         was_focused = timer_engine.focus_active
         is_sg = distraction_mode in ("scrolling", "gaming")
-        result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
+        result = timer_engine.set_activity(
+            Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
+        )
         updated = TimerEvent.MODE_CHANGED in result.events
-        print(f"    Phone open -> {distraction_mode} (activity=DISTRACTION, sg={is_sg}) | timer={updated}")
+        print(
+            f"    Phone open -> {distraction_mode} (activity=DISTRACTION, sg={is_sg}) | timer={updated}"
+        )
         # Log focus auto-exit on phone distraction
         if was_focused and not timer_engine.focus_active:
             focus_min = round(timer_engine.total_focus_time_ms / 60000)
-            asyncio.ensure_future(log_event("focus_toggle", details={
-                "action": "off", "trigger": "phone_distraction", "app": app_name,
-                "total_focus_time_ms": timer_engine.total_focus_time_ms,
-                "focus_cutoff_time": timer_engine.focus_cutoff_time,
-            }))
+            asyncio.ensure_future(
+                log_event(
+                    "focus_toggle",
+                    details={
+                        "action": "off",
+                        "trigger": "phone_distraction",
+                        "app": app_name,
+                        "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                        "focus_cutoff_time": timer_engine.focus_cutoff_time,
+                    },
+                )
+            )
             loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, speak_tts, f"Focus broken by phone. {focus_min} minutes earned.")
+            loop.run_in_executor(
+                None, speak_tts, f"Focus broken by phone. {focus_min} minutes earned."
+            )
         # Track Twitter open time for 7-minute enforcement
         if app_name in ("twitter", "x", "com.twitter.android"):
             if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
                 PHONE_STATE["twitter_open_since"] = time.monotonic()
-                print(f"    Twitter timer started")
+                print("    Twitter timer started")
             elif PHONE_STATE.get("twitter_zapped"):
-                print(f"    Twitter open (ignoring — already zapped, waiting for confirmed close)")
+                print("    Twitter open (ignoring — already zapped, waiting for confirmed close)")
         else:
             # Different app opened — if twitter timer is running, close event was dropped
             if PHONE_STATE["twitter_open_since"] is not None or PHONE_STATE.get("twitter_zapped"):
@@ -5498,7 +5974,13 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
         if _updated:
-            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
+            await timer_log_shift(
+                _old_mode,
+                "work_" + distraction_mode,
+                trigger="phone_app",
+                source="macrodroid",
+                phone_app=app_name,
+            )
 
         await log_event(
             "phone_distraction_allowed",
@@ -5506,13 +5988,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "app": app_name,
                 "display_name": display_name,
                 "reason": work_mode,
-            }
+            },
         )
 
         return PhoneActivityResponse(
-            allowed=True,
-            reason=work_mode,
-            message=f"Allowed ({work_mode})"
+            allowed=True, reason=work_mode, message=f"Allowed ({work_mode})"
         )
 
     # Clocked in - check break time and productivity
@@ -5531,7 +6011,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # === TEST SHIM - bypasses break/productivity checks ===
     test_force_block = PHONE_CONFIG.get("test_force_block", False)
     if test_force_block:
-        print(f"    TEST MODE: Forcing block (ignoring break={break_secs}s, productivity={productivity_active})")
+        print(
+            f"    TEST MODE: Forcing block (ignoring break={break_secs}s, productivity={productivity_active})"
+        )
         break_secs = 0
         productivity_active = False
     # ======================================================
@@ -5543,7 +6025,13 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
         if _updated:
-            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
+            await timer_log_shift(
+                _old_mode,
+                "work_" + distraction_mode,
+                trigger="phone_app",
+                source="macrodroid",
+                phone_app=app_name,
+            )
 
         await log_event(
             "phone_distraction_allowed",
@@ -5552,7 +6040,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "display_name": display_name,
                 "reason": "break_time",
                 "break_seconds": break_secs,
-            }
+            },
         )
 
         print(f"    Allowed: {break_secs}s break available")
@@ -5560,7 +6048,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             allowed=True,
             reason="break_time_available",
             break_seconds=break_secs,
-            message=f"Break time: {break_secs // 60}m {break_secs % 60}s"
+            message=f"Break time: {break_secs // 60}m {break_secs % 60}s",
         )
 
     elif productivity_active:
@@ -5569,7 +6057,13 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
         if _updated:
-            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
+            await timer_log_shift(
+                _old_mode,
+                "work_" + distraction_mode,
+                trigger="phone_app",
+                source="macrodroid",
+                phone_app=app_name,
+            )
 
         await log_event(
             "phone_distraction_allowed",
@@ -5578,7 +6072,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "display_name": display_name,
                 "reason": "productivity_active",
                 "active_instances": active_count,
-            }
+            },
         )
 
         print(f"    Allowed: productivity active ({active_count} instances)")
@@ -5586,11 +6080,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             allowed=True,
             reason="productivity_active",
             break_seconds=0,
-            message="Productivity active (penalty mode)"
+            message="Productivity active (penalty mode)",
         )
 
     else:
-        print(f"    BLOCKED: no break time, no productivity")
+        print("    BLOCKED: no break time, no productivity")
         # v2: Start enforcement cascade instead of Shizuku disable
         start_enforcement_cascade(app_name)
 
@@ -5600,26 +6094,28 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "app": app_name,
                 "display_name": display_name,
                 "reason": "no_break_no_productivity",
-                "enforcement": "cascade_started"
-            }
-        )
-        asyncio.create_task(handle_custodes_state_event(
-            "phone_distraction_blocked",
-            "phone",
-            severity=2,
-            payload={
-                "app": app_name,
-                "phone_app": app_name,
-                "display_name": display_name,
-                "reason": "no_break_no_productivity",
+                "enforcement": "cascade_started",
             },
-        ))
+        )
+        asyncio.create_task(
+            handle_custodes_state_event(
+                "phone_distraction_blocked",
+                "phone",
+                severity=2,
+                payload={
+                    "app": app_name,
+                    "phone_app": app_name,
+                    "display_name": display_name,
+                    "reason": "no_break_no_productivity",
+                },
+            )
+        )
 
         return PhoneActivityResponse(
             allowed=False,
             reason="blocked",
             break_seconds=0,
-            message="No break time or productivity"
+            message="No break time or productivity",
         )
 
 
@@ -5670,7 +6166,9 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     # Parse trigger name to determine event type and routing
     # Minimal format: {"app": "Application Launched (X)"} or {"app": "Geofence Entry (Home)"}
     raw_trigger = request.app or ""
-    parsed = parse_macrodroid_trigger(raw_trigger) if raw_trigger else {"type": "unknown", "raw": ""}
+    parsed = (
+        parse_macrodroid_trigger(raw_trigger) if raw_trigger else {"type": "unknown", "raw": ""}
+    )
     event = request.event
 
     # Infer event from trigger name if not provided
@@ -5688,12 +6186,16 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     # Log non-app events here; app open/close are logged downstream by handle_phone_activity
     # with richer details (phone_app_closed, phone_distraction_allowed, phone_distraction_blocked)
     if event not in ("app_open", "app_close", "app_telemetry"):
-        await log_event(f"phone_{event}", device_id="phone", details={
-            "time": request.time,
-            "app": request.app,
-            "server": request.server,
-            "shizuku_dead": request.shizuku_dead,
-        })
+        await log_event(
+            f"phone_{event}",
+            device_id="phone",
+            details={
+                "time": request.time,
+                "app": request.app,
+                "server": request.server,
+                "shizuku_dead": request.shizuku_dead,
+            },
+        )
 
     # ---- App telemetry (open/close) ----
     if event in ("app_open", "app_close", "app_telemetry") and parsed["type"] == "app":
@@ -5707,24 +6209,38 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
 
         phone_req = PhoneActivityRequest(app=app_key, action=action, package=app_key)
         result = await handle_phone_activity(phone_req)
-        return {"received": True, "event": event, "app": app_key, "action": action,
-                "raw": raw_trigger, "decision": result.dict()}
+        return {
+            "received": True,
+            "event": event,
+            "app": app_key,
+            "action": action,
+            "raw": raw_trigger,
+            "decision": result.dict(),
+        }
 
     # ---- Geofence (entry/exit) ----
     elif event == "geofence" or parsed["type"] == "geofence":
         location = parsed["location"]
         action = parsed["action"]
 
-        print(f">>> /phone/event geofence: raw={raw_trigger!r} -> location={location!r} action={action!r}")
+        print(
+            f">>> /phone/event geofence: raw={raw_trigger!r} -> location={location!r} action={action!r}"
+        )
 
         loc_req = LocationEventRequest(location=location, action=action, source="macrodroid_v2")
         result = await handle_location_event(loc_req)
-        return {"received": True, "event": "geofence", "location": location, "action": action,
-                "raw": raw_trigger, "result": result}
+        return {
+            "received": True,
+            "event": "geofence",
+            "location": location,
+            "action": action,
+            "raw": raw_trigger,
+            "result": result,
+        }
 
     # ---- v2 Discord fallback acknowledgement ----
     elif event == "discord_fallback_received":
-        logger.info(f"Discord fallback received by phone")
+        logger.info("Discord fallback received by phone")
         PHONE_STATE["reachable"] = True
         PHONE_STATE["last_reachable_check"] = now
         return {"received": True, "event": event}
@@ -5884,6 +6400,7 @@ async def get_timer_shifts():
 
     # Only show shifts since 9 AM today (daily reset time)
     from datetime import time as _time
+
     now = datetime.now()
     reset_today = datetime.combine(now.date(), _time(9, 0))
     if now < reset_today:
@@ -5899,8 +6416,14 @@ async def get_timer_shifts():
         rows = await cursor.fetchall()
 
     if not rows:
-        return {"total_shifts": 0, "balance_series": [], "mode_distribution": {},
-                "shifts_by_trigger": {}, "enforcement_count": 0, "twitter_time_mins": 0}
+        return {
+            "total_shifts": 0,
+            "balance_series": [],
+            "mode_distribution": {},
+            "shifts_by_trigger": {},
+            "enforcement_count": 0,
+            "twitter_time_mins": 0,
+        }
 
     balance_series = []
     balance_timeline = []
@@ -5917,11 +6440,13 @@ async def get_timer_shifts():
         effective = bal_ms - backlog_ms
         bal_min = round(effective / 60000, 1)
         balance_series.append(bal_min)
-        balance_timeline.append({
-            "t": r["timestamp"],
-            "bal": bal_min,
-            "mode": r["new_mode"],
-        })
+        balance_timeline.append(
+            {
+                "t": r["timestamp"],
+                "bal": bal_min,
+                "mode": r["new_mode"],
+            }
+        )
         shifts_by_trigger[r["trigger"] or "unknown"] += 1
         if r["trigger"] == "enforcement":
             enforcement_count += 1
@@ -5931,6 +6456,7 @@ async def get_timer_shifts():
         if prev_time and r["old_mode"]:
             try:
                 from datetime import datetime as _dt
+
                 t1 = _dt.fromisoformat(prev_time)
                 t2 = _dt.fromisoformat(r["timestamp"])
                 delta_s = (t2 - t1).total_seconds()
@@ -5965,11 +6491,19 @@ async def enter_break_mode():
         today = datetime.now().strftime("%Y-%m-%d")
         await timer_log_mode_change(old_mode, "break", is_automatic=False)
         await timer_log_shift(old_mode, "break", trigger="manual", source="api")
-        await timer_end_session(_current_session_id, now_ms - _session_start_ms, break_used_ms=timer_engine.total_break_time_ms)
+        await timer_end_session(
+            _current_session_id,
+            now_ms - _session_start_ms,
+            break_used_ms=timer_engine.total_break_time_ms,
+        )
         _current_session_id = await timer_start_session("break", today)
         _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": "break", "source": "api"})
-    return {"status": "break", "changed": changed, "break_available_seconds": round(max(0, timer_engine.break_balance_ms) / 1000)}
+    return {
+        "status": "break",
+        "changed": changed,
+        "break_available_seconds": round(max(0, timer_engine.break_balance_ms) / 1000),
+    }
 
 
 @app.post("/api/timer/pause")
@@ -6045,11 +6579,14 @@ async def toggle_focus_mode():
 
     if changed:
         action = "on" if focus_on else "off"
-        await log_event("focus_toggle", details={
-            "action": action,
-            "total_focus_time_ms": timer_engine.total_focus_time_ms,
-            "focus_cutoff_time": timer_engine.focus_cutoff_time,
-        })
+        await log_event(
+            "focus_toggle",
+            details={
+                "action": action,
+                "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                "focus_cutoff_time": timer_engine.focus_cutoff_time,
+            },
+        )
         # TTS announcement
         focus_min = round(timer_engine.total_focus_time_ms / 60000)
         if focus_on:
@@ -6100,7 +6637,12 @@ async def reset_timer():
     _session_start_ms = now_ms
 
     await log_event("timer_reset", details={"date": today})
-    return {"status": "reset", "total_work_time": "0h 0m", "accumulated_break": "5m", "current_mode": timer_engine.current_mode.value}
+    return {
+        "status": "reset",
+        "total_work_time": "0h 0m",
+        "accumulated_break": "5m",
+        "current_mode": timer_engine.current_mode.value,
+    }
 
 
 @app.post("/api/work-action")
@@ -6123,10 +6665,15 @@ async def work_action():
         _session_start_ms = now_ms
         print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
 
-    return {"idle_timer_reset": True, "exited_idle": exited_idle, "current_mode": timer_engine.current_mode.value}
+    return {
+        "idle_timer_reset": True,
+        "exited_idle": exited_idle,
+        "current_mode": timer_engine.current_mode.value,
+    }
 
 
 # ============ Pavlok Endpoints ============
+
 
 @app.post("/api/pavlok/zap")
 async def pavlok_zap(
@@ -6161,7 +6708,9 @@ async def pavlok_status():
     """Get current Pavlok state."""
     cooldown_remaining = 0.0
     if PAVLOK_STATE["last_stimulus_at"]:
-        elapsed = (datetime.now() - datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])).total_seconds()
+        elapsed = (
+            datetime.now() - datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
+        ).total_seconds()
         cooldown_remaining = max(0.0, PAVLOK_CONFIG["cooldown_seconds"] - elapsed)
     return {
         "enabled": PAVLOK_CONFIG["enabled"],
@@ -6176,10 +6725,13 @@ async def pavlok_status():
 # ============ Work Mode / Geofence Endpoints ============
 # MacroDroid uses geofence to send work mode changes
 
+
 class WorkModeRequest(BaseModel):
     mode: str = Field(..., description="Work mode: clocked_in, clocked_out, gym")
-    source: str = Field(default="api", description="Source of the request (macrodroid, manual, etc)")
-    token: Optional[str] = Field(default=None, description="Optional auth token for MacroDroid")
+    source: str = Field(
+        default="api", description="Source of the request (macrodroid, manual, etc)"
+    )
+    token: str | None = Field(default=None, description="Optional auth token for MacroDroid")
 
 
 @app.get("/api/work-mode")
@@ -6209,8 +6761,7 @@ async def set_work_mode(request: WorkModeRequest):
     valid_modes = ["clocked_in", "clocked_out", "gym"]
     if request.mode not in valid_modes:
         raise HTTPException(
-            status_code=400,
-            detail=f"Invalid work mode '{request.mode}'. Valid: {valid_modes}"
+            status_code=400, detail=f"Invalid work mode '{request.mode}'. Valid: {valid_modes}"
         )
 
     old_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
@@ -6232,7 +6783,7 @@ async def set_work_mode(request: WorkModeRequest):
             "new_mode": request.mode,
             "source": request.source,
             "timer_updated": timer_updated,
-        }
+        },
     )
 
     return {
@@ -6287,22 +6838,32 @@ async def handle_location_event(request: LocationEventRequest):
     # --- State machine validation ---
     if action == "enter":
         if current_zone == location:
-            await log_event("location_event", details={
-                "location": location, "action": action,
-                "status": "duplicate", "current_zone": current_zone,
-                "source": request.source,
-            })
+            await log_event(
+                "location_event",
+                details={
+                    "location": location,
+                    "action": action,
+                    "status": "duplicate",
+                    "current_zone": current_zone,
+                    "source": request.source,
+                },
+            )
             return {"status": "duplicate", "reason": f"Already in {location}", "zone": current_zone}
 
         if current_zone is not None and current_zone != location:
             # Geofence exit didn't fire — log the implied exit
             notes.append(f"implied_exit:{current_zone}")
             print(f">>> Implied exit from {current_zone} (no exit event received)")
-            await log_event("location_event", details={
-                "location": current_zone, "action": "exit",
-                "implied": True, "reason": f"entered {location} without exiting {current_zone}",
-                "source": "state_machine",
-            })
+            await log_event(
+                "location_event",
+                details={
+                    "location": current_zone,
+                    "action": "exit",
+                    "implied": True,
+                    "reason": f"entered {location} without exiting {current_zone}",
+                    "source": "state_machine",
+                },
+            )
 
         DESKTOP_STATE["location_zone"] = location
 
@@ -6321,13 +6882,12 @@ async def handle_location_event(request: LocationEventRequest):
 
     if new_mode is not None:
         # This branch is now dead code (new_mode is always None) - kept for future flexibility
-        work_mode_req = WorkModeRequest(
-            mode=new_mode,
-            source=f"macrodroid:{location}:{action}"
-        )
+        work_mode_req = WorkModeRequest(mode=new_mode, source=f"macrodroid:{location}:{action}")
         result = await set_work_mode(work_mode_req)
     else:
-        print(f">>> Location tracked: {location}:{action} (work_mode unchanged - manual control only)")
+        print(
+            f">>> Location tracked: {location}:{action} (work_mode unchanged - manual control only)"
+        )
 
     # Gym bounty: +30 min break on gym exit
     if location == "gym" and action == "exit":
@@ -6337,14 +6897,17 @@ async def handle_location_event(request: LocationEventRequest):
         print(f">>> Gym bounty applied: +30min break (total: {bounty_min}min)")
         await log_event("gym_bounty", details={"break_minutes": bounty_min})
 
-    await log_event("location_event", details={
-        "location": location,
-        "action": action,
-        "mapped_mode": new_mode,
-        "prev_zone": current_zone,
-        "notes": notes or None,
-        "source": request.source,
-    })
+    await log_event(
+        "location_event",
+        details={
+            "location": location,
+            "action": action,
+            "mapped_mode": new_mode,
+            "prev_zone": current_zone,
+            "notes": notes or None,
+            "source": request.source,
+        },
+    )
 
     return {
         "status": "ok",
@@ -6377,6 +6940,7 @@ async def clock_in():
 
 # ============ Check-In Endpoints ============
 
+
 @app.post("/api/checkin/submit")
 async def submit_checkin(request: CheckinSubmit):
     """Submit a productivity check-in response. Stores in DB and writes to daily note."""
@@ -6392,32 +6956,50 @@ async def submit_checkin(request: CheckinSubmit):
         # Check if a prompt row exists (created by trigger_checkin)
         cursor = await db.execute(
             "SELECT id, prompted_at FROM checkins WHERE checkin_type = ? AND date = ?",
-            (request.type, today)
+            (request.type, today),
         )
         existing = await cursor.fetchone()
 
         if existing:
-            await db.execute("""
+            await db.execute(
+                """
                 UPDATE checkins SET
                     energy = ?, focus = ?, mood = ?, plan = ?, notes = ?,
                     on_track = ?, responded_at = ?
                 WHERE checkin_type = ? AND date = ?
-            """, (
-                request.energy, request.focus, request.mood, request.plan, request.notes,
-                1 if request.on_track else (0 if request.on_track is not None else None),
-                now, request.type, today,
-            ))
+            """,
+                (
+                    request.energy,
+                    request.focus,
+                    request.mood,
+                    request.plan,
+                    request.notes,
+                    1 if request.on_track else (0 if request.on_track is not None else None),
+                    now,
+                    request.type,
+                    today,
+                ),
+            )
         else:
             # Submit without a prior prompt (manual submission)
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO checkins (checkin_type, date, energy, focus, mood, plan, notes, on_track, prompted_at, responded_at, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'api')
-            """, (
-                request.type, today, request.energy, request.focus, request.mood,
-                request.plan, request.notes,
-                1 if request.on_track else (0 if request.on_track is not None else None),
-                now, now,
-            ))
+            """,
+                (
+                    request.type,
+                    today,
+                    request.energy,
+                    request.focus,
+                    request.mood,
+                    request.plan,
+                    request.notes,
+                    1 if request.on_track else (0 if request.on_track is not None else None),
+                    now,
+                    now,
+                ),
+            )
 
         await db.commit()
 
@@ -6425,12 +7007,15 @@ async def submit_checkin(request: CheckinSubmit):
     data = {k: v for k, v in request.model_dump().items() if k != "type" and v is not None}
     obsidian_updated = update_daily_note_frontmatter(request.type, data)
 
-    await log_event("checkin_submitted", details={
-        "checkin_type": request.type,
-        "energy": request.energy,
-        "focus": request.focus,
-        "obsidian_updated": obsidian_updated,
-    })
+    await log_event(
+        "checkin_submitted",
+        details={
+            "checkin_type": request.type,
+            "energy": request.energy,
+            "focus": request.focus,
+            "obsidian_updated": obsidian_updated,
+        },
+    )
 
     return {"status": "ok", "checkin_type": request.type, "obsidian_updated": obsidian_updated}
 
@@ -6443,8 +7028,7 @@ async def get_today_checkins():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM checkins WHERE date = ? ORDER BY prompted_at",
-            (today,)
+            "SELECT * FROM checkins WHERE date = ? ORDER BY prompted_at", (today,)
         )
         rows = await cursor.fetchall()
 
@@ -6477,8 +7061,7 @@ async def get_checkin_status():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT checkin_type, responded_at FROM checkins WHERE date = ?",
-            (today,)
+            "SELECT checkin_type, responded_at FROM checkins WHERE date = ?", (today,)
         )
         rows = await cursor.fetchall()
 
@@ -6486,9 +7069,20 @@ async def get_checkin_status():
     prompted = [r["checkin_type"] for r in rows]
 
     # Determine next check-in based on current time
-    schedule_order = ["morning_start", "mid_morning", "decision_point", "afternoon", "afternoon_check"]
-    time_map = {"morning_start": "09:00", "mid_morning": "10:30", "decision_point": "11:00",
-                "afternoon": "13:00", "afternoon_check": "14:30"}
+    schedule_order = [
+        "morning_start",
+        "mid_morning",
+        "decision_point",
+        "afternoon",
+        "afternoon_check",
+    ]
+    time_map = {
+        "morning_start": "09:00",
+        "mid_morning": "10:30",
+        "decision_point": "11:00",
+        "afternoon": "13:00",
+        "afternoon_check": "14:30",
+    }
 
     next_checkin = None
     next_at = None
@@ -6522,11 +7116,7 @@ async def manual_trigger_checkin(checkin_type: str):
 @app.post("/api/events/log")
 async def log_debug_event(request: LogEventRequest):
     """Log a custom event (for TUI debugging, etc.)."""
-    await log_event(
-        request.event_type,
-        instance_id=request.instance_id,
-        details=request.details
-    )
+    await log_event(request.event_type, instance_id=request.instance_id, details=request.details)
     return {"status": "logged", "event_type": request.event_type}
 
 
@@ -6536,13 +7126,16 @@ async def get_recent_events(limit: int = 10):
     limit = min(limit, 100)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             SELECT e.*, ci.tab_name as instance_tab_name, ci.working_dir as instance_working_dir
             FROM events e
             LEFT JOIN claude_instances ci ON e.instance_id = ci.id
             ORDER BY e.created_at DESC
             LIMIT ?
-        """, (limit,))
+        """,
+            (limit,),
+        )
         rows = await cursor.fetchall()
 
         events = []
@@ -6571,6 +7164,7 @@ async def list_devices():
 # ============ Audio Proxy Endpoints ============
 # Handles phone audio routing through PC to headphones
 
+
 @app.post("/api/audio-proxy/connect", response_model=AudioProxyConnectResponse)
 async def audio_proxy_connect(request: AudioProxyConnectRequest):
     """
@@ -6588,7 +7182,7 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
             action="already_connected",
             receiver_started=check.get("running", False),
             receiver_pid=check.get("pid"),
-            message="Phone audio proxy already active"
+            message="Phone audio proxy already active",
         )
 
     # Start the audio receiver
@@ -6610,8 +7204,8 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
                 "receiver_pid": result.get("pid"),
                 "receiver_status": result.get("status"),
                 "source": request.source,
-                "port": AUDIO_RECEIVER_PORT
-            }
+                "port": AUDIO_RECEIVER_PORT,
+            },
         )
 
         action = "connected" if result.get("status") == "started" else "reconnected"
@@ -6620,24 +7214,21 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
             action=action,
             receiver_started=True,
             receiver_pid=result.get("pid"),
-            message=f"Audio proxy activated. Receiver listening on port {AUDIO_RECEIVER_PORT}."
+            message=f"Audio proxy activated. Receiver listening on port {AUDIO_RECEIVER_PORT}.",
         )
     else:
         # Failed to start receiver
         await log_event(
             "audio_proxy_connect_failed",
             device_id=request.phone_device_id,
-            details={
-                "error": result.get("error"),
-                "source": request.source
-            }
+            details={"error": result.get("error"), "source": request.source},
         )
 
         return AudioProxyConnectResponse(
             success=False,
             action="error",
             receiver_started=False,
-            message=f"Failed to start audio receiver: {result.get('error')}"
+            message=f"Failed to start audio receiver: {result.get('error')}",
         )
 
 
@@ -6662,17 +7253,14 @@ async def audio_proxy_disconnect(request: AudioProxyDisconnectRequest):
     await log_event(
         "audio_proxy_disconnected",
         device_id=request.phone_device_id,
-        details={
-            "stopped_count": result.get("stopped_count", 0),
-            "source": request.source
-        }
+        details={"stopped_count": result.get("stopped_count", 0), "source": request.source},
     )
 
     return {
         "success": True,
         "action": "disconnected",
         "stopped_count": result.get("stopped_count", 0),
-        "message": "Audio proxy deactivated. Phone can reconnect to headphones."
+        "message": "Audio proxy deactivated. Phone can reconnect to headphones.",
     }
 
 
@@ -6698,11 +7286,12 @@ async def audio_proxy_status():
         receiver_running=actual_running,
         receiver_pid=actual_pid,
         last_connect_time=AUDIO_PROXY_STATE["last_connect_time"],
-        last_disconnect_time=AUDIO_PROXY_STATE["last_disconnect_time"]
+        last_disconnect_time=AUDIO_PROXY_STATE["last_disconnect_time"],
     )
 
 
 # ============ Headless Mode Endpoints (disabled on macOS) ============
+
 
 @app.get("/api/headless", response_model=HeadlessStatusResponse)
 async def headless_status():
@@ -6719,12 +7308,13 @@ async def headless_control(request: HeadlessControlRequest):
         action=request.action,
         before=HeadlessStatusResponse(**state),
         after=HeadlessStatusResponse(**state),
-        message="Headless mode not available on macOS"
+        message="Headless mode not available on macOS",
     )
 
 
 # ============ System Control Endpoints ============
 # Remote shutdown/restart
+
 
 @app.post("/api/system/shutdown", response_model=ShutdownResponse)
 async def system_shutdown(request: ShutdownRequest):
@@ -6758,14 +7348,17 @@ async def system_shutdown(request: ShutdownRequest):
                 success=True,
                 action=action,
                 delay_seconds=request.delay_seconds,
-                message=f"System {action} initiated" + (f" in {delay_minutes} minutes" if delay_minutes > 0 else "")
+                message=f"System {action} initiated"
+                + (f" in {delay_minutes} minutes" if delay_minutes > 0 else ""),
             )
         else:
             error_msg = result.stderr.strip() or result.stdout.strip()
             logger.error(f"SYSTEM: Failed to {action}: {error_msg}")
             return ShutdownResponse(
-                success=False, action=action, delay_seconds=request.delay_seconds,
-                message=f"Failed: {error_msg}"
+                success=False,
+                action=action,
+                delay_seconds=request.delay_seconds,
+                message=f"Failed: {error_msg}",
             )
     except Exception as e:
         logger.error(f"SYSTEM: Error during {action}: {e}")
@@ -6779,28 +7372,28 @@ async def cancel_shutdown():
     """Cancel a pending shutdown/restart."""
     try:
         result = subprocess.run(
-            ["sudo", "killall", "shutdown"],
-            capture_output=True, text=True, timeout=10
+            ["sudo", "killall", "shutdown"], capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
             logger.info("SYSTEM: Cancelled pending shutdown")
             return {"success": True, "message": "Shutdown cancelled"}
         else:
-            return {"success": False, "message": f"No pending shutdown or cancel failed: {result.stderr.strip()}"}
+            return {
+                "success": False,
+                "message": f"No pending shutdown or cancel failed: {result.stderr.strip()}",
+            }
     except Exception as e:
         return {"success": False, "message": str(e)}
 
 
 # ============ KVM (Deskflow) Endpoints ============
 
+
 @app.post("/api/kvm/start")
 async def kvm_start():
     """Start Deskflow client (software KVM) on this Mac."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "Deskflow.app"],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(["pgrep", "-f", "Deskflow.app"], capture_output=True, text=True)
         if result.returncode == 0:
             return {"success": True, "message": "Deskflow already running", "already_running": True}
 
@@ -6816,10 +7409,7 @@ async def kvm_start():
 async def kvm_stop():
     """Stop Deskflow client on this Mac."""
     try:
-        result = subprocess.run(
-            ["pkill", "-f", "Deskflow"],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(["pkill", "-f", "Deskflow"], capture_output=True, text=True)
         if result.returncode == 0:
             logger.info("KVM: Stopped Deskflow")
             return {"success": True, "message": "Deskflow stopped"}
@@ -6833,17 +7423,15 @@ async def kvm_stop():
 @app.get("/api/kvm/status")
 async def kvm_status():
     """Check if Deskflow is running on this Mac."""
-    result = subprocess.run(
-        ["pgrep", "-f", "Deskflow.app"],
-        capture_output=True, text=True
-    )
+    result = subprocess.run(["pgrep", "-f", "Deskflow.app"], capture_output=True, text=True)
     running = result.returncode == 0
     return {"running": running, "pids": result.stdout.strip().split("\n") if running else []}
 
 
 # ============ Task Endpoints ============
 
-@app.get("/api/tasks", response_model=List[TaskResponse])
+
+@app.get("/api/tasks", response_model=list[TaskResponse])
 async def list_tasks():
     """List all scheduled tasks with their status."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -6861,7 +7449,7 @@ async def list_tasks():
                 """SELECT * FROM task_executions
                    WHERE task_id = ?
                    ORDER BY started_at DESC LIMIT 1""",
-                (task_id,)
+                (task_id,),
             )
             last_exec = await cursor.fetchone()
 
@@ -6871,7 +7459,7 @@ async def list_tasks():
                 last_run = {
                     "status": last_exec_dict["status"],
                     "started_at": last_exec_dict["started_at"],
-                    "duration_ms": last_exec_dict["duration_ms"]
+                    "duration_ms": last_exec_dict["duration_ms"],
                 }
 
             # Get next run time from scheduler
@@ -6880,17 +7468,19 @@ async def list_tasks():
             if job and job.next_run_time:
                 next_run = job.next_run_time.isoformat()
 
-            result.append(TaskResponse(
-                id=task_dict["id"],
-                name=task_dict["name"],
-                description=task_dict["description"],
-                task_type=task_dict["task_type"],
-                schedule=task_dict["schedule"],
-                enabled=bool(task_dict["enabled"]),
-                max_retries=task_dict["max_retries"],
-                last_run=last_run,
-                next_run=next_run
-            ))
+            result.append(
+                TaskResponse(
+                    id=task_dict["id"],
+                    name=task_dict["name"],
+                    description=task_dict["description"],
+                    task_type=task_dict["task_type"],
+                    schedule=task_dict["schedule"],
+                    enabled=bool(task_dict["enabled"]),
+                    max_retries=task_dict["max_retries"],
+                    last_run=last_run,
+                    next_run=next_run,
+                )
+            )
 
         return result
 
@@ -6900,10 +7490,7 @@ async def get_task(task_id: str):
     """Get details of a specific task."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM scheduled_tasks WHERE id = ?",
-            (task_id,)
-        )
+        cursor = await db.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,))
         task = await cursor.fetchone()
 
         if not task:
@@ -6916,7 +7503,7 @@ async def get_task(task_id: str):
             """SELECT * FROM task_executions
                WHERE task_id = ?
                ORDER BY started_at DESC LIMIT 1""",
-            (task_id,)
+            (task_id,),
         )
         last_exec = await cursor.fetchone()
 
@@ -6926,7 +7513,7 @@ async def get_task(task_id: str):
             last_run = {
                 "status": last_exec_dict["status"],
                 "started_at": last_exec_dict["started_at"],
-                "duration_ms": last_exec_dict["duration_ms"]
+                "duration_ms": last_exec_dict["duration_ms"],
             }
 
         # Get next run time
@@ -6944,7 +7531,7 @@ async def get_task(task_id: str):
             enabled=bool(task_dict["enabled"]),
             max_retries=task_dict["max_retries"],
             last_run=last_run,
-            next_run=next_run
+            next_run=next_run,
         )
 
 
@@ -6955,10 +7542,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
         db.row_factory = aiosqlite.Row
 
         # Check task exists
-        cursor = await db.execute(
-            "SELECT * FROM scheduled_tasks WHERE id = ?",
-            (task_id,)
-        )
+        cursor = await db.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,))
         task = await cursor.fetchone()
 
         if not task:
@@ -6991,8 +7575,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
             params.append(task_id)
 
             await db.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(updates)} WHERE id = ?",
-                params
+                f"UPDATE scheduled_tasks SET {', '.join(updates)} WHERE id = ?", params
             )
             await db.commit()
 
@@ -7018,7 +7601,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
                                 hour=parts[1],
                                 day=parts[2],
                                 month=parts[3],
-                                day_of_week=parts[4]
+                                day_of_week=parts[4],
                             )
 
                         scheduler.add_job(
@@ -7026,7 +7609,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
                             trigger=trigger,
                             args=[task_id],
                             id=task_id,
-                            replace_existing=True
+                            replace_existing=True,
                         )
                     except Exception as e:
                         raise HTTPException(status_code=400, detail=f"Invalid schedule: {e}")
@@ -7039,10 +7622,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
 async def trigger_task(task_id: str):
     """Manually trigger a task to run immediately."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM scheduled_tasks WHERE id = ?",
-            (task_id,)
-        )
+        cursor = await db.execute("SELECT id FROM scheduled_tasks WHERE id = ?", (task_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -7055,17 +7635,14 @@ async def trigger_task(task_id: str):
     return {"status": "triggered", "task_id": task_id}
 
 
-@app.get("/api/tasks/{task_id}/history", response_model=List[TaskExecutionResponse])
+@app.get("/api/tasks/{task_id}/history", response_model=list[TaskExecutionResponse])
 async def get_task_history(task_id: str, limit: int = 20):
     """Get execution history for a task."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         # Check task exists
-        cursor = await db.execute(
-            "SELECT id FROM scheduled_tasks WHERE id = ?",
-            (task_id,)
-        )
+        cursor = await db.execute("SELECT id FROM scheduled_tasks WHERE id = ?", (task_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -7074,7 +7651,7 @@ async def get_task_history(task_id: str, limit: int = 20):
                WHERE task_id = ?
                ORDER BY started_at DESC
                LIMIT ?""",
-            (task_id, limit)
+            (task_id, limit),
         )
         rows = await cursor.fetchall()
 
@@ -7088,16 +7665,18 @@ async def get_task_history(task_id: str, limit: int = 20):
                 except:
                     result_data = {"raw": row_dict["result"]}
 
-            result.append(TaskExecutionResponse(
-                id=row_dict["id"],
-                task_id=row_dict["task_id"],
-                status=row_dict["status"],
-                started_at=row_dict["started_at"],
-                completed_at=row_dict["completed_at"],
-                duration_ms=row_dict["duration_ms"],
-                result=result_data,
-                retry_count=row_dict["retry_count"]
-            ))
+            result.append(
+                TaskExecutionResponse(
+                    id=row_dict["id"],
+                    task_id=row_dict["task_id"],
+                    status=row_dict["status"],
+                    started_at=row_dict["started_at"],
+                    completed_at=row_dict["completed_at"],
+                    duration_ms=row_dict["duration_ms"],
+                    result=result_data,
+                    retry_count=row_dict["retry_count"],
+                )
+            )
 
         return result
 
@@ -7135,7 +7714,10 @@ async def create_cron_job(request: Request):
     has_command = "command" in data
     has_structured = "model" in data and "prompt_path" in data
     if "name" not in data or "schedule" not in data or not (has_command or has_structured):
-        raise HTTPException(status_code=400, detail="name, schedule, and either command or (model + prompt_path) required")
+        raise HTTPException(
+            status_code=400,
+            detail="name, schedule, and either command or (model + prompt_path) required",
+        )
     try:
         job = await cron_engine.create_job(data)
     except ValueError as e:
@@ -7199,18 +7781,19 @@ async def declare_cron_victory(job_id: str, request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         if run_id:
             await db.execute(
-                "UPDATE cron_runs SET victory_reason = ? WHERE id = ?",
-                (reason, run_id)
+                "UPDATE cron_runs SET victory_reason = ? WHERE id = ?", (reason, run_id)
             )
         else:
             await db.execute(
                 "UPDATE cron_runs SET victory_reason = ? WHERE id = (SELECT id FROM cron_runs WHERE job_id = ? ORDER BY id DESC LIMIT 1)",
-                (reason, job_id)
+                (reason, job_id),
             )
         await db.commit()
 
     await cron_engine.handle_victory(job, run_id or 0, reason)
-    await log_event("cron_victory", details={"job_id": job_id, "job_name": job["name"], "reason": reason})
+    await log_event(
+        "cron_victory", details={"job_id": job_id, "job_name": job["name"], "reason": reason}
+    )
     return {"job_id": job_id, "job_name": job["name"], "victory": True, "reason": reason}
 
 
@@ -7259,7 +7842,7 @@ def _parse_heartbeat_entries(max_entries: int = 20) -> list:
             if bracket_end == -1:
                 continue
             timestamp = line[3:bracket_end]
-            body = line[bracket_end + 1:].strip()
+            body = line[bracket_end + 1 :].strip()
 
             entry_type = "idle"
             detail = body
@@ -7313,7 +7896,7 @@ async def get_heartbeat_status():
             if bracket_end == -1:
                 continue
             watchdog_last_check = line[3:bracket_end]
-            body = line[bracket_end + 1:].strip()
+            body = line[bracket_end + 1 :].strip()
             if "STATUS OK" in body:
                 watchdog_status = "ok"
             elif "TIER 1" in body:
@@ -7338,8 +7921,7 @@ async def get_heartbeat_status():
     openclaw_status = None
     try:
         result = subprocess.run(
-            ["openclaw", "system", "heartbeat", "last"],
-            capture_output=True, text=True, timeout=5
+            ["openclaw", "system", "heartbeat", "last"], capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             openclaw_status = json.loads(result.stdout)
@@ -7400,10 +7982,7 @@ async def get_recent_logs(limit: int = 50):
     # Get the most recent N entries from the buffer
     recent_logs = list(log_buffer)[-limit:]
 
-    return {
-        "logs": recent_logs,
-        "count": len(recent_logs)
-    }
+    return {"logs": recent_logs, "count": len(recent_logs)}
 
 
 # Root endpoint
@@ -7414,7 +7993,7 @@ async def root():
         "name": "Token-API",
         "version": "0.1.0",
         "description": "Local FastAPI server for Claude instance management",
-        "docs": "/docs"
+        "docs": "/docs",
     }
 
 
@@ -7433,7 +8012,7 @@ async def timer_worker():
     last_db_save = 0.0
     last_mode = timer_engine.current_mode.value
     today = datetime.now().strftime("%Y-%m-%d")
-    
+
     # Start initial session
     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
     _session_start_ms = int(time.monotonic() * 1000)
@@ -7456,12 +8035,16 @@ async def timer_worker():
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
-                    await timer_log_shift("idle", "break", trigger="idle_timeout", source="timer_worker")
-                    asyncio.create_task(handle_custodes_state_event(
-                        "idle_timeout",
-                        "timer_worker",
-                        payload={"timer_mode": "break"},
-                    ))
+                    await timer_log_shift(
+                        "idle", "break", trigger="idle_timeout", source="timer_worker"
+                    )
+                    asyncio.create_task(
+                        handle_custodes_state_event(
+                            "idle_timeout",
+                            "timer_worker",
+                            payload={"timer_mode": "break"},
+                        )
+                    )
                     _current_session_id = await timer_start_session("break", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
@@ -7473,67 +8056,120 @@ async def timer_worker():
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
-                    await timer_log_shift("multitasking", "distracted", trigger="distraction_timeout", source="timer_worker")
-                    asyncio.create_task(handle_custodes_state_event(
-                        "distraction_timeout",
-                        "timer_worker",
-                        severity=2,
-                        payload={"timer_mode": "distracted"},
-                    ))
+                    await timer_log_shift(
+                        "multitasking",
+                        "distracted",
+                        trigger="distraction_timeout",
+                        source="timer_worker",
+                    )
+                    asyncio.create_task(
+                        handle_custodes_state_event(
+                            "distraction_timeout",
+                            "timer_worker",
+                            severity=2,
+                            payload={"timer_mode": "distracted"},
+                        )
+                    )
                     _current_session_id = await timer_start_session("distracted", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
                     # Enforce: close distraction windows + Pavlok + phone notify
                     close_distraction_windows()
                     send_pavlok_stimulus(reason="distraction_timeout")
-                    asyncio.create_task(asyncio.to_thread(_send_to_phone, "/notify", {
-                        "vibe": 30,
-                        "banner_text": "Distraction timeout — close distractions",
-                    }))
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            _send_to_phone,
+                            "/notify",
+                            {
+                                "vibe": 30,
+                                "banner_text": "Distraction timeout — close distractions",
+                            },
+                        )
+                    )
                     loop = asyncio.get_event_loop()
-                    loop.run_in_executor(None, speak_tts, "Distraction timeout. Close distractions now.")
+                    loop.run_in_executor(
+                        None, speak_tts, "Distraction timeout. Close distractions now."
+                    )
                     continue
-                elif event == TimerEvent.MODE_CHANGED and (has_idle_timeout or has_distraction_timeout):
+                elif event == TimerEvent.MODE_CHANGED and (
+                    has_idle_timeout or has_distraction_timeout
+                ):
                     continue  # Already handled above
                 elif event == TimerEvent.BREAK_EXHAUSTED:
-                    await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
-                                         trigger="enforcement", source="timer_worker")
-                    asyncio.create_task(handle_custodes_state_event(
+                    await timer_log_shift(
+                        timer_engine.current_mode.value,
                         "break_exhausted",
-                        "timer_worker",
-                        severity=2,
-                        payload={"break_balance_ms": timer_engine.break_balance_ms},
-                    ))
+                        trigger="enforcement",
+                        source="timer_worker",
+                    )
+                    asyncio.create_task(
+                        handle_custodes_state_event(
+                            "break_exhausted",
+                            "timer_worker",
+                            severity=2,
+                            payload={"break_balance_ms": timer_engine.break_balance_ms},
+                        )
+                    )
                     asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
-                    print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
+                    print(
+                        f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}"
+                    )
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
-                        await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
+                        await timer_end_session(
+                            _current_session_id,
+                            duration_ms,
+                            break_earned_ms=timer_engine.total_break_time_ms,
+                        )
                     await timer_save_daily_score(
                         result.reset_date,
                         result.productivity_score or 0,
                         timer_engine.total_work_time_ms,
                         timer_engine.total_break_time_ms,
                         _mode_change_count,
-                        _mode_change_count
+                        _mode_change_count,
                     )
                     await generate_daily_timer_analytics(result.reset_date)
-                    await timer_log_shift(result.old_mode.value if result.old_mode else None,
-                                         timer_engine.current_mode.value, trigger="daily_reset", source="timer_worker")
+                    await timer_log_shift(
+                        result.old_mode.value if result.old_mode else None,
+                        timer_engine.current_mode.value,
+                        trigger="daily_reset",
+                        source="timer_worker",
+                    )
                     _mode_change_count = 0
-                    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+                    _current_session_id = await timer_start_session(
+                        timer_engine.current_mode.value, today
+                    )
                     _session_start_ms = now_ms
                 elif event == TimerEvent.MODE_CHANGED and result.old_mode:
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
-                        if result.old_mode in (TimerMode.WORKING, TimerMode.MULTITASKING, TimerMode.DISTRACTED):
-                            await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
+                        if result.old_mode in (
+                            TimerMode.WORKING,
+                            TimerMode.MULTITASKING,
+                            TimerMode.DISTRACTED,
+                        ):
+                            await timer_end_session(
+                                _current_session_id,
+                                duration_ms,
+                                break_earned_ms=timer_engine.total_break_time_ms,
+                            )
                         else:
-                            await timer_end_session(_current_session_id, duration_ms, break_used_ms=timer_engine.total_break_time_ms)
-                    await timer_log_mode_change(result.old_mode.value if result.old_mode else None, timer_engine.current_mode.value, is_automatic=False)
+                            await timer_end_session(
+                                _current_session_id,
+                                duration_ms,
+                                break_used_ms=timer_engine.total_break_time_ms,
+                            )
+                    await timer_log_mode_change(
+                        result.old_mode.value if result.old_mode else None,
+                        timer_engine.current_mode.value,
+                        is_automatic=False,
+                    )
                     _mode_change_count += 1
-                    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+                    _current_session_id = await timer_start_session(
+                        timer_engine.current_mode.value, today
+                    )
                     _session_start_ms = now_ms
                     async with aiosqlite.connect(DB_PATH) as _wdb:
                         _cur = await _wdb.execute(
@@ -7541,7 +8177,9 @@ async def timer_worker():
                         )
                         _row = await _cur.fetchone()
                         _active = _row[0] if _row else 0
-                    asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, _active))
+                    asyncio.create_task(
+                        push_phone_widget_async(timer_engine.current_mode.value, _active)
+                    )
 
             # Phone current_app staleness check: if last_activity is >3 min old,
             # it's a phantom open (real usage would get refreshed by the debounce
@@ -7550,17 +8188,24 @@ async def timer_worker():
             _phone_app = PHONE_STATE.get("current_app")
             if _phone_app and _phone_last:
                 try:
-                    _phone_age = (datetime.now() - datetime.fromisoformat(_phone_last)).total_seconds()
+                    _phone_age = (
+                        datetime.now() - datetime.fromisoformat(_phone_last)
+                    ).total_seconds()
                     if _phone_age > 180:  # 3 minutes stale
-                        print(f"TIMER: Clearing stale phone_app={_phone_app!r} (last_activity {_phone_age:.0f}s ago)")
+                        print(
+                            f"TIMER: Clearing stale phone_app={_phone_app!r} (last_activity {_phone_age:.0f}s ago)"
+                        )
                         PHONE_STATE["current_app"] = None
                         PHONE_STATE["is_distracted"] = False
                         if _phone_app in ("twitter", "x", "com.twitter.android"):
                             PHONE_STATE["twitter_open_since"] = None
                         # Restore timer activity to working
                         DESKTOP_STATE["current_mode"] = "silence"
-                        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False,
-                                                  now_mono_ms=int(time.monotonic() * 1000))
+                        timer_engine.set_activity(
+                            Activity.WORKING,
+                            is_scrolling_gaming=False,
+                            now_mono_ms=int(time.monotonic() * 1000),
+                        )
                 except Exception:
                     pass
 
@@ -7572,7 +8217,9 @@ async def timer_worker():
                 current_app = (PHONE_STATE.get("current_app") or "").lower()
                 if current_app not in ("twitter", "x", "com.twitter.android"):
                     stale_elapsed = time.monotonic() - twitter_since
-                    print(f"TIMER: Twitter timer stale ({stale_elapsed:.0f}s) — current_app={current_app!r}, clearing (dropped close event)")
+                    print(
+                        f"TIMER: Twitter timer stale ({stale_elapsed:.0f}s) — current_app={current_app!r}, clearing (dropped close event)"
+                    )
                     PHONE_STATE["twitter_open_since"] = None
                     PHONE_STATE["twitter_zapped"] = False
                 else:
@@ -7581,12 +8228,18 @@ async def timer_worker():
                         now_mono = time.monotonic()
                         since_last_zap = now_mono - PHONE_STATE.get("twitter_last_zap_at", 0)
                         if since_last_zap < 1800:  # 30-minute cooldown
-                            print(f"TIMER: Twitter 7-min hit but cooldown active ({since_last_zap:.0f}s < 1800s). Skipping zap.")
+                            print(
+                                f"TIMER: Twitter 7-min hit but cooldown active ({since_last_zap:.0f}s < 1800s). Skipping zap."
+                            )
                             PHONE_STATE["twitter_open_since"] = None
                         else:
-                            print(f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break.")
+                            print(
+                                f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break."
+                            )
                             PHONE_STATE["twitter_open_since"] = None  # one-shot per session
-                            PHONE_STATE["twitter_zapped"] = True  # block re-zap until confirmed close
+                            PHONE_STATE["twitter_zapped"] = (
+                                True  # block re-zap until confirmed close
+                            )
                             PHONE_STATE["twitter_last_zap_at"] = now_mono
                             PHONE_STATE["twitter_last_zap_wall"] = time.time()
                             _persist_twitter_zap_cooldown()
@@ -7598,7 +8251,7 @@ async def timer_worker():
             # NOTE: work_mode is manual-only now (user clocks in/out explicitly).
             # Location-based exemptions still apply (e.g., campus = studying).
             location_zone = DESKTOP_STATE.get("location_zone")
-            timer_engine.idle_timeout_exempt = (location_zone == "campus")
+            timer_engine.idle_timeout_exempt = location_zone == "campus"
 
             # Productivity layer update (every 10s) — poll DB for active instances
             if now - last_db_save >= 10:  # piggyback on DB save interval
@@ -7618,7 +8271,9 @@ async def timer_worker():
                     new_mode = timer_engine.current_mode.value
                     trigger = "productivity_active" if any_processing else "productivity_inactive"
                     print(f"TIMER: Productivity {trigger} — {old_mode} → {new_mode}")
-                    await timer_log_shift(old_mode, new_mode, trigger=trigger, source="timer_worker")
+                    await timer_log_shift(
+                        old_mode, new_mode, trigger=trigger, source="timer_worker"
+                    )
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
@@ -7665,10 +8320,15 @@ async def _async_enforce_twitter_timeout():
         pass
 
     # Phone: v3 enforce with zap, fallback to server-side Pavlok API
-    result = await asyncio.to_thread(_send_to_phone, "/enforce", {
-        "zap": 30, "tts_text": "Twitter 7 minutes. Forcing break.",
-        "banner_text": "Twitter timeout",
-    })
+    result = await asyncio.to_thread(
+        _send_to_phone,
+        "/enforce",
+        {
+            "zap": 30,
+            "tts_text": "Twitter 7 minutes. Forcing break.",
+            "banner_text": "Twitter timeout",
+        },
+    )
     if not result["success"]:
         send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
 
@@ -7679,16 +8339,20 @@ async def _async_enforce_twitter_timeout():
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
         await timer_log_mode_change(old_mode, "break", is_automatic=False)
-        await timer_log_shift(old_mode, "break", trigger="enforcement", source="timer_worker",
-                              phone_app="twitter")
+        await timer_log_shift(
+            old_mode, "break", trigger="enforcement", source="timer_worker", phone_app="twitter"
+        )
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
         _current_session_id = await timer_start_session("break", today)
         _session_start_ms = now_ms
 
-    await log_event("twitter_timeout_enforcement", details={
-        "old_mode": old_mode,
-        "forced_break": changed,
-    })
+    await log_event(
+        "twitter_timeout_enforcement",
+        details={
+            "old_mode": old_mode,
+            "forced_break": changed,
+        },
+    )
 
 
 async def enforce_break_exhausted_impl() -> dict:
@@ -7701,7 +8365,9 @@ async def enforce_break_exhausted_impl() -> dict:
     desktop_result = close_distraction_windows()
     if desktop_result.get("closed_count"):
         enforced_any = True
-        print(f"BREAK-EXHAUSTED: Closed {desktop_result['closed_count']} desktop distraction windows")
+        print(
+            f"BREAK-EXHAUSTED: Closed {desktop_result['closed_count']} desktop distraction windows"
+        )
 
     # Phone enforcement: disable active distraction app
     current_app = PHONE_STATE.get("current_app")
@@ -7709,14 +8375,20 @@ async def enforce_break_exhausted_impl() -> dict:
         enforce_app = current_app
         if current_app in ("x", "twitter", "com.twitter.android"):
             enforce_app = "twitter"
-        elif current_app in ("youtube", "com.google.android.youtube", "app.revanced.android.youtube"):
+        elif current_app in (
+            "youtube",
+            "com.google.android.youtube",
+            "app.revanced.android.youtube",
+        ):
             enforce_app = "youtube"
         elif current_app in PHONE_DISTRACTION_APPS:
             mode = PHONE_DISTRACTION_APPS.get(current_app)
             if mode == "gaming":
                 enforce_app = "game"
 
-        print(f"BREAK-EXHAUSTED: Starting enforcement cascade on {current_app} (mapped to {enforce_app})")
+        print(
+            f"BREAK-EXHAUSTED: Starting enforcement cascade on {current_app} (mapped to {enforce_app})"
+        )
         start_enforcement_cascade(enforce_app)
         phone_result = {"cascade_started": True, "app": enforce_app}
         enforced_any = True
@@ -7732,10 +8404,15 @@ async def enforce_break_exhausted_impl() -> dict:
 
     if enforced_any:
         # Phone: v3 enforce with notification, fallback to server-side Pavlok API
-        phone_notify = await asyncio.to_thread(_send_to_phone, "/enforce", {
-            "zap": 30, "tts_text": "Break time exhausted",
-            "banner_text": "Break exhausted",
-        })
+        phone_notify = await asyncio.to_thread(
+            _send_to_phone,
+            "/enforce",
+            {
+                "zap": 30,
+                "tts_text": "Break time exhausted",
+                "banner_text": "Break exhausted",
+            },
+        )
         if not phone_notify["success"]:
             send_pavlok_stimulus(reason="break_exhausted")
 
@@ -7777,8 +8454,7 @@ async def legion_pane_recolor_worker():
                     # If trigger didn't capture tmux_pane, look it up
                     if not tmux_pane:
                         cur2 = await db.execute(
-                            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
-                            (instance_id,)
+                            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
                         )
                         pane_row = await cur2.fetchone()
                         tmux_pane = pane_row["tmux_pane"] if pane_row else None
@@ -7796,7 +8472,9 @@ async def legion_pane_recolor_worker():
                                 stderr=asyncio.subprocess.DEVNULL,
                             )
                             await proc.wait()
-                            logger.info(f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})")
+                            logger.info(
+                                f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})"
+                            )
                         except Exception as e:
                             logger.warning(f"Legion recolor failed for {tmux_pane}: {e}")
 
@@ -7841,18 +8519,28 @@ async def pane_state_worker():
                     pane = row["tmux_pane"]
                     if not pane:
                         cur2 = await db.execute(
-                            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (row["instance_id"],)
+                            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                            (row["instance_id"],),
                         )
                         r = await cur2.fetchone()
                         pane = r["tmux_pane"] if r else None
                     if pane:
                         try:
                             proc = await asyncio.create_subprocess_exec(
-                                "tmux", "set-option", "-p", "-t", pane, row["variable"], row["value"],
-                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                                "tmux",
+                                "set-option",
+                                "-p",
+                                "-t",
+                                pane,
+                                row["variable"],
+                                row["value"],
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
                             )
                             await proc.wait()
-                            logger.info(f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})")
+                            logger.info(
+                                f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
+                            )
                         except Exception as e:
                             logger.warning(f"Pane state set failed for {pane}: {e}")
                     processed.append(row["id"])
@@ -7901,7 +8589,9 @@ async def session_doc_sync_worker():
 
                 if processed:
                     ph = ",".join("?" * len(processed))
-                    await db.execute(f"DELETE FROM session_doc_sync_queue WHERE id IN ({ph})", processed)
+                    await db.execute(
+                        f"DELETE FROM session_doc_sync_queue WHERE id IN ({ph})", processed
+                    )
                     await db.commit()
         except Exception as e:
             logger.error(f"Session doc sync worker error: {e}")
@@ -7981,7 +8671,9 @@ async def detect_stuck_instances():
                 pid_valid = stored_pid and is_pid_claude(stored_pid)
 
                 # Try to discover actual PID
-                discovered_pid = await find_claude_pid_by_workdir(working_dir) if working_dir else None
+                discovered_pid = (
+                    await find_claude_pid_by_workdir(working_dir) if working_dir else None
+                )
 
                 if not pid_valid and not discovered_pid:
                     # Ghost instance: no process found
@@ -8046,8 +8738,12 @@ async def phone_heartbeat_worker():
                 logger.warning(f"PHONE HB: {msg}")
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "discord", "send", "alerts", msg,
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        "discord",
+                        "send",
+                        "alerts",
+                        msg,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
                     await asyncio.wait_for(proc.communicate(), timeout=15)
                 except Exception as e:
@@ -8055,8 +8751,11 @@ async def phone_heartbeat_worker():
                 await asyncio.to_thread(
                     send_pavlok_stimulus, "zap", None, "phone_heartbeat_silence_60min", True
                 )
-                await log_event("phone_heartbeat_silence", device_id="Token-S24",
-                                details={"silence_min": round(silence_min), "alert": "zap"})
+                await log_event(
+                    "phone_heartbeat_silence",
+                    device_id="Token-S24",
+                    details={"silence_min": round(silence_min), "alert": "zap"},
+                )
 
             elif silence_min > 30 and current_alert is None:
                 PHONE_HEARTBEAT["alert_state"] = "beep"
@@ -8064,8 +8763,12 @@ async def phone_heartbeat_worker():
                 logger.warning(f"PHONE HB: {msg}")
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "discord", "send", "fallback", msg,
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        "discord",
+                        "send",
+                        "fallback",
+                        msg,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
                     await asyncio.wait_for(proc.communicate(), timeout=15)
                 except Exception as e:
@@ -8073,8 +8776,11 @@ async def phone_heartbeat_worker():
                 await asyncio.to_thread(
                     send_pavlok_stimulus, "beep", None, "phone_heartbeat_silence_30min", True
                 )
-                await log_event("phone_heartbeat_silence", device_id="Token-S24",
-                                details={"silence_min": round(silence_min), "alert": "beep"})
+                await log_event(
+                    "phone_heartbeat_silence",
+                    device_id="Token-S24",
+                    details={"silence_min": round(silence_min), "alert": "beep"},
+                )
 
         except Exception as e:
             logger.error(f"phone_heartbeat_worker error: {e}")
@@ -8086,25 +8792,27 @@ async def phone_heartbeat_worker():
 # In-memory state for the current day's morning session enforce loop.
 # Resets each time a new morning session fires.
 MORNING_ENFORCE_STATE: dict = {
-    "status": "idle",           # idle | pending | acknowledged | overridden | blocked
+    "status": "idle",  # idle | pending | acknowledged | overridden | blocked
     "session_type": None,
     "fired_at": None,
     "acknowledged_at": None,
     "override_reason": None,
-    "escalation_level": 0,      # 0 = none, 1 = TTS repeat, 2 = Discord DM, 3 = blocked
+    "escalation_level": 0,  # 0 = none, 1 = TTS repeat, 2 = Discord DM, 3 = blocked
 }
 
 
 def _register_morning_expected_response(session_type: str = "morning_session") -> None:
     """Register an expected response and schedule escalation checks at +5/+10/+15 min."""
-    MORNING_ENFORCE_STATE.update({
-        "status": "pending",
-        "session_type": session_type,
-        "fired_at": datetime.utcnow().isoformat(),
-        "acknowledged_at": None,
-        "override_reason": None,
-        "escalation_level": 0,
-    })
+    MORNING_ENFORCE_STATE.update(
+        {
+            "status": "pending",
+            "session_type": session_type,
+            "fired_at": datetime.utcnow().isoformat(),
+            "acknowledged_at": None,
+            "override_reason": None,
+            "escalation_level": 0,
+        }
+    )
 
     base = datetime.now()
     for level, offset_min in [(1, 5), (2, 10), (3, 15)]:
@@ -8139,7 +8847,9 @@ def _register_morning_expected_response(session_type: str = "morning_session") -
         name="Morning Health Check",
         misfire_grace_time=120,
     )
-    logger.info(f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s")
+    logger.info(
+        f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s"
+    )
 
 
 @app.post("/api/morning/enforce-register")
@@ -8151,13 +8861,25 @@ async def register_morning_enforce():
     """
     _register_morning_expected_response("morning_session")
     await log_event("morning_enforce_registered", device_id="cron")
-    return {"status": "registered", "escalations": ["+90s health-check", "+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
-
+    return {
+        "status": "registered",
+        "escalations": [
+            "+90s health-check",
+            "+5min phone+TTS",
+            "+10min phone+beep+Discord",
+            "+15min zap+blocked+Discord",
+        ],
+    }
 
 
 def _cancel_morning_escalations() -> None:
     """Cancel all pending escalation jobs and health check (called on acknowledge/override)."""
-    for job_id in ["morning-enforce-l1", "morning-enforce-l2", "morning-enforce-l3", "morning-health-check"]:
+    for job_id in [
+        "morning-enforce-l1",
+        "morning-enforce-l2",
+        "morning-enforce-l3",
+        "morning-health-check",
+    ]:
         try:
             scheduler.remove_job(job_id)
         except Exception:
@@ -8203,7 +8925,9 @@ def _morning_health_check() -> None:
         try:
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", pane_id, "-p"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             pane_output = result.stdout
         except Exception as e:
@@ -8211,7 +8935,13 @@ def _morning_health_check() -> None:
             pane_output = f"[pane capture error: {e}]"
 
     # Detect known failure signatures
-    failure_signatures = ["401", "/login", "authentication_error", "Invalid authentication", "ECONNREFUSED"]
+    failure_signatures = [
+        "401",
+        "/login",
+        "authentication_error",
+        "Invalid authentication",
+        "ECONNREFUSED",
+    ]
     for sig in failure_signatures:
         if sig.lower() in pane_output.lower():
             error_signature = sig
@@ -8220,8 +8950,12 @@ def _morning_health_check() -> None:
     if not error_signature and pane_output.strip():
         # Pane has output but no error signature — might just be slow, give benefit of doubt
         # Check if there's any sign of Claude running (prompt indicators)
-        if any(indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]):
-            logger.info("Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain")
+        if any(
+            indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]
+        ):
+            logger.info(
+                "Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain"
+            )
             return
 
     # ── Failure confirmed — alert and self-heal ──
@@ -8236,11 +8970,14 @@ def _morning_health_check() -> None:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             asyncio.run_coroutine_threadsafe(
-                log_event("morning_health_check_failed", details={
-                    "reason": failure_reason,
-                    "pane_id": pane_id,
-                    "pane_snippet": pane_output[-500:] if pane_output else None,
-                }),
+                log_event(
+                    "morning_health_check_failed",
+                    details={
+                        "reason": failure_reason,
+                        "pane_id": pane_id,
+                        "pane_snippet": pane_output[-500:] if pane_output else None,
+                    },
+                ),
                 loop,
             ).result(timeout=5)
     except Exception as e:
@@ -8258,10 +8995,16 @@ def _morning_health_check() -> None:
         )
         subprocess.Popen(
             [
-                "claude", "--print", "--output-format", "text",
-                "--model", "sonnet",
-                "--allowedTools", "Bash,Read,Grep,Glob,Write",
-                "-p", diag_prompt,
+                "claude",
+                "--print",
+                "--output-format",
+                "text",
+                "--model",
+                "sonnet",
+                "--allowedTools",
+                "Bash,Read,Grep,Glob,Write",
+                "-p",
+                diag_prompt,
             ],
             cwd="/Volumes/Imperium/Imperium-ENV",
             stdout=subprocess.PIPE,
@@ -8271,7 +9014,9 @@ def _morning_health_check() -> None:
     except Exception as e:
         logger.error(f"Morning health check: self-heal dispatch failed: {e}")
         # Last resort: just TTS what went wrong
-        speak_checkin_tts(f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent.")
+        speak_checkin_tts(
+            f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent."
+        )
 
 
 def _morning_escalate(level: int) -> None:
@@ -8325,10 +9070,21 @@ def _morning_escalate(level: int) -> None:
 # + phone notifications + TTS. Agents call this, not raw urllib.
 
 _ENFORCE_LEVELS = {
-    "notify": {"phone_endpoint": "/notify", "phone_vibe": 30, "discord_mode": "channel", "emoji": ""},
-    "warn":   {"phone_endpoint": "/notify", "phone_vibe": 50, "phone_beep": 30, "discord_mode": "dm", "emoji": "⚠️"},
+    "notify": {
+        "phone_endpoint": "/notify",
+        "phone_vibe": 30,
+        "discord_mode": "channel",
+        "emoji": "",
+    },
+    "warn": {
+        "phone_endpoint": "/notify",
+        "phone_vibe": 50,
+        "phone_beep": 30,
+        "discord_mode": "dm",
+        "emoji": "⚠️",
+    },
     "enforce": {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "⛔"},
-    "block":  {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "🚫"},
+    "block": {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "🚫"},
 }
 
 
@@ -8370,12 +9126,15 @@ async def unified_enforce(
 
     try:
         import urllib.request as _urllib_req
+
         if discord_mode == "channel" and channel:
-            payload = json.dumps({
-                "channel": channel,
-                "bot": bot,
-                "content": discord_text[:2000],
-            }).encode()
+            payload = json.dumps(
+                {
+                    "channel": channel,
+                    "bot": bot,
+                    "content": discord_text[:2000],
+                }
+            ).encode()
             req = _urllib_req.Request(
                 f"{DISCORD_DAEMON_URL}/send",
                 data=payload,
@@ -8422,8 +9181,11 @@ async def unified_enforce(
     result["phone"] = phone_result
     if not phone_result.get("success") and level in ("enforce", "block"):
         stim = "zap" if level in ("enforce", "block") else "vibe"
-        send_pavlok_stimulus(stim, value=phone_payload.get("zap", phone_payload.get("vibe", 30)),
-                             reason=f"enforce_{level}_{source}")
+        send_pavlok_stimulus(
+            stim,
+            value=phone_payload.get("zap", phone_payload.get("vibe", 30)),
+            reason=f"enforce_{level}_{source}",
+        )
         logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok {stim} fallback fired")
 
     # ── Desktop TTS ──
@@ -8435,20 +9197,28 @@ async def unified_enforce(
     return result
 
 
-def _unified_enforce_sync(level: str, message: str, source: str = "agent",
-                          channel: str | None = None, bot: str = "custodes",
-                          phone_params: dict | None = None, legion_context: str | None = None) -> dict:
+def _unified_enforce_sync(
+    level: str,
+    message: str,
+    source: str = "agent",
+    channel: str | None = None,
+    bot: str = "custodes",
+    phone_params: dict | None = None,
+    legion_context: str | None = None,
+) -> dict:
     """Sync wrapper for unified_enforce — for APScheduler callbacks."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             future = asyncio.run_coroutine_threadsafe(
                 unified_enforce(level, message, source, channel, bot, phone_params, legion_context),
-                loop
+                loop,
             )
             return future.result(timeout=20)
         else:
-            return asyncio.run(unified_enforce(level, message, source, channel, bot, phone_params, legion_context))
+            return asyncio.run(
+                unified_enforce(level, message, source, channel, bot, phone_params, legion_context)
+            )
     except Exception as e:
         logger.warning(f"Enforce sync wrapper failed: {e}")
         return {"success": False, "error": str(e)}
@@ -8468,7 +9238,9 @@ class EnforceRequest(BaseModel):
 async def enforce_endpoint(request: EnforceRequest):
     """Unified enforce endpoint — callable by agents, CLI tools, and cron jobs."""
     if request.level not in _ENFORCE_LEVELS:
-        raise HTTPException(status_code=400, detail=f"level must be one of: {', '.join(_ENFORCE_LEVELS)}")
+        raise HTTPException(
+            status_code=400, detail=f"level must be one of: {', '.join(_ENFORCE_LEVELS)}"
+        )
     return await unified_enforce(
         level=request.level,
         message=request.message,
@@ -8482,6 +9254,7 @@ async def enforce_endpoint(request: EnforceRequest):
 
 # ── Morning Session ────────────────────────────────────────
 
+
 @app.post("/api/morning/start")
 async def start_morning_session():
     """Trigger the Custodes morning session.
@@ -8491,12 +9264,14 @@ async def start_morning_session():
     sends briefing via TTS, and enters a follow-up loop.
     """
     from morning_session import run_morning_session
+
     today = datetime.now().strftime("%Y-%m-%d")
     state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
 
     # Check if already running
     if state_file.exists():
         import json as _json
+
         data = _json.loads(state_file.read_text())
         if data.get("status") == "active":
             return {"status": "already_active", "session_id": data.get("session_id")}
@@ -8519,6 +9294,7 @@ async def get_morning_session_status():
     session_state: dict = {}
     if state_file.exists():
         import json as _json
+
         session_state = _json.loads(state_file.read_text())
     else:
         session_state = {"status": "not_started", "date": today}
@@ -8550,10 +9326,13 @@ async def acknowledge_morning_session():
     state["status"] = "acknowledged"
     logger.info("Morning session acknowledged — enforce escalations cancelled")
 
-    await log_event("morning_acknowledged", details={
-        "escalation_level": state["escalation_level"],
-        "fired_at": state["fired_at"],
-    })
+    await log_event(
+        "morning_acknowledged",
+        details={
+            "escalation_level": state["escalation_level"],
+            "fired_at": state["fired_at"],
+        },
+    )
     return {
         "status": "acknowledged",
         "escalation_level": state["escalation_level"],
@@ -8578,11 +9357,14 @@ async def override_morning_session(request: MorningOverrideRequest):
     MORNING_ENFORCE_STATE["acknowledged_at"] = datetime.utcnow().isoformat()
     logger.info(f"Morning session overridden: {request.reason.strip()}")
 
-    await log_event("morning_overridden", details={
-        "reason": request.reason.strip(),
-        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
-        "fired_at": MORNING_ENFORCE_STATE["fired_at"],
-    })
+    await log_event(
+        "morning_overridden",
+        details={
+            "reason": request.reason.strip(),
+            "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+            "fired_at": MORNING_ENFORCE_STATE["fired_at"],
+        },
+    )
     return {
         "status": "overridden",
         "reason": request.reason.strip(),
@@ -8610,6 +9392,7 @@ async def alarm_dismiss(delay_minutes: int = 0):
 
     async def _fire_morning_start():
         import httpx
+
         try:
             async with httpx.AsyncClient() as client:
                 await client.post("http://localhost:7777/api/morning/start", timeout=10)
@@ -8632,11 +9415,17 @@ async def alarm_dismiss(delay_minutes: int = 0):
         misfire_grace_time=300,
     )
 
-    logger.info(f"alarm-dismiss: morning session scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)")
-    await log_event("morning_alarm_dismiss", device_id="phone", details={
-        "delay_minutes": delay_minutes,
-        "fires_at": fires_at.isoformat(),
-    })
+    logger.info(
+        f"alarm-dismiss: morning session scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)"
+    )
+    await log_event(
+        "morning_alarm_dismiss",
+        device_id="phone",
+        details={
+            "delay_minutes": delay_minutes,
+            "fires_at": fires_at.isoformat(),
+        },
+    )
 
     return {
         "scheduled_at": now.isoformat(),
@@ -8649,12 +9438,12 @@ async def alarm_dismiss(delay_minutes: int = 0):
 # [MOVED to shared.py / routes/tts.py] — was: @app.post("/api/notify")
 
 
-
 # [MOVED to routes/hooks.py or shared.py] — was: # ============ Claude Code Hook Handlers =========
 
 # ============ Stash: Cross-Machine Clipboard & File Sharing ============
 
 import mimetypes
+
 
 def stash_cleanup():
     """Delete stash items older than STASH_MAX_AGE_HOURS."""
@@ -8681,12 +9470,16 @@ async def stash_list():
             continue
         stat = f.stat()
         age_secs = now - stat.st_mtime
-        items.append({
-            "name": f.name,
-            "size": stat.st_size,
-            "age_seconds": int(age_secs),
-            "age_human": f"{int(age_secs // 3600)}h{int((age_secs % 3600) // 60)}m" if age_secs >= 3600 else f"{int(age_secs // 60)}m",
-        })
+        items.append(
+            {
+                "name": f.name,
+                "size": stat.st_size,
+                "age_seconds": int(age_secs),
+                "age_human": f"{int(age_secs // 3600)}h{int((age_secs % 3600) // 60)}m"
+                if age_secs >= 3600
+                else f"{int(age_secs // 60)}m",
+            }
+        )
     return {"items": items, "count": len(items)}
 
 
@@ -8768,7 +9561,7 @@ async def stash_clear_all():
 def _format_discord_injection(channel_name: str, content: str) -> str:
     """Format a Discord message for injection into a synced session."""
     # Strip Discord mention tags for cleaner injection
-    clean = re.sub(r'<@&?\d+>\s*', '', content).strip()
+    clean = re.sub(r"<@&?\d+>\s*", "", content).strip()
     return f"[Emperor via Discord #{channel_name}]: {clean}"
 
 
@@ -8781,7 +9574,7 @@ async def _discord_voice_error(legion: str, transcript: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, status, tmux_pane FROM claude_instances WHERE legion = ? ORDER BY last_activity DESC LIMIT 1",
-            (legion,)
+            (legion,),
         )
         row = await cursor.fetchone()
 
@@ -8798,15 +9591,20 @@ async def _discord_voice_error(legion: str, transcript: str):
     logger.warning(f"Voice error feedback [{legion}]: {error_msg} (transcript: {transcript[:60]})")
 
     try:
-        import requests as _req
         import functools
+
+        import requests as _req
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, functools.partial(
-            _req.post,
-            f"{DISCORD_DAEMON_URL}/voice/tts",
-            json={"message": error_msg, "bot": legion, "voice": "Samantha", "rate": 200},
-            timeout=30,
-        ))
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                _req.post,
+                f"{DISCORD_DAEMON_URL}/voice/tts",
+                json={"message": error_msg, "bot": legion, "voice": "Samantha", "rate": 200},
+                timeout=30,
+            ),
+        )
     except Exception as e:
         logger.error(f"Voice error feedback TTS failed: {e}")
 
@@ -8825,14 +9623,14 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
                 """SELECT id, tmux_pane, device_id FROM claude_instances
                    WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
                    LIMIT 1""",
-                (legion,)
+                (legion,),
             )
         else:
             cursor = await db.execute(
                 """SELECT id, tmux_pane, device_id FROM claude_instances
                    WHERE legion = ? AND status IN ('idle', 'processing')
                    LIMIT 1""",
-                (legion,)
+                (legion,),
             )
         row = await cursor.fetchone()
         if not row:
@@ -8843,33 +9641,42 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
         logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
         return False
 
-    formatted = _format_discord_injection(
-        message.channel_name or "dm",
-        message.content or ""
-    )
+    formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
 
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
-            str(claude_cmd), "--instance", instance_id, formatted,
+            str(claude_cmd),
+            "--instance",
+            instance_id,
+            formatted,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "PATH": ":".join([
-                str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                str(Path.home() / ".local" / "bin"),
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                os.environ.get("PATH", ""),
-            ])},
+            env={
+                **os.environ,
+                "PATH": ":".join(
+                    [
+                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                        str(Path.home() / ".local" / "bin"),
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        os.environ.get("PATH", ""),
+                    ]
+                ),
+            },
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
-            logger.info(f"Discord injection: {legion} → {instance_id[:12]} (#{message.channel_name})")
+            logger.info(
+                f"Discord injection: {legion} → {instance_id[:12]} (#{message.channel_name})"
+            )
             return True
         else:
-            logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+            logger.warning(
+                f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}"
+            )
             return False
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(f"Discord injection timed out for {instance_id[:12]}")
         return False
     except Exception as e:
@@ -8913,6 +9720,7 @@ async def receive_discord_message(request: DiscordMessageRequest):
         content = request.content or ""
         # Extract and replay as /phone/event
         import re
+
         m = re.search(r"phone/event\s+['\"{]", content)
         if m:
             body_start = content.find("{", m.start())
@@ -8921,6 +9729,7 @@ async def receive_discord_message(request: DiscordMessageRequest):
                 raw_body = raw_body.replace("'", '"')
                 try:
                     import json as _json
+
                     body = _json.loads(raw_body)
                     app_raw = body.get("app", "")
                     if app_raw:
@@ -8932,19 +9741,25 @@ async def receive_discord_message(request: DiscordMessageRequest):
         return {"received": True, "message_id": request.message_id, "fallback_processed": True}
 
     # Log non-fallback Discord messages
-    await log_event("discord_message", device_id="discord", details={
-        "channel_id": request.channel_id,
-        "channel_name": request.channel_name,
-        "author_id": author_id,
-        "author_name": author_name,
-        "content": request.content[:500],
-        "message_id": request.message_id,
-        "timestamp": request.timestamp,
-        "is_dm": request.is_dm,
-        "is_reply": request.is_reply,
-    })
+    await log_event(
+        "discord_message",
+        device_id="discord",
+        details={
+            "channel_id": request.channel_id,
+            "channel_name": request.channel_name,
+            "author_id": author_id,
+            "author_name": author_name,
+            "content": request.content[:500],
+            "message_id": request.message_id,
+            "timestamp": request.timestamp,
+            "is_dm": request.is_dm,
+            "is_reply": request.is_reply,
+        },
+    )
 
-    logger.info(f"Discord [{request.channel_name or request.channel_id}] {author_name}: {request.content[:80]}")
+    logger.info(
+        f"Discord [{request.channel_name or request.channel_id}] {author_name}: {request.content[:80]}"
+    )
 
     # --- Discord response routing ---
     # Never respond to bots (loop prevention)
@@ -8965,7 +9780,9 @@ async def receive_discord_message(request: DiscordMessageRequest):
             if not queued:
                 _aspirant_gated_queue.pop(request.channel_id, None)
             asyncio.create_task(_post_to_aspirant_thread(request.channel_id, msg, bot=bot))
-            logger.info(f"Flushed 1 gated message for thread {request.channel_id} ({len(queued)} remaining)")
+            logger.info(
+                f"Flushed 1 gated message for thread {request.channel_id} ({len(queued)} remaining)"
+            )
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
@@ -8977,7 +9794,12 @@ async def receive_discord_message(request: DiscordMessageRequest):
             # No silent failures — TTS the error back through Discord so the operator knows
             logger.warning(f"Voice [{legion}] injection failed — sending voice error feedback")
             asyncio.create_task(_discord_voice_error(legion, request.content))
-        return {"received": True, "message_id": request.message_id, "voice": True, "injected": injected}
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": injected,
+        }
 
     # Trigger 0: bare URL in #forge → auto-clip to vault
     stripped = content.strip()
@@ -9030,18 +9852,21 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
     clip_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "clip"
     env = {
         **os.environ,
-        "PATH": ":".join([
-            str(SCRIPTS_DIR / "cli-tools" / "bin"),
-            str(Path.home() / ".local" / "bin"),
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            os.environ.get("PATH", ""),
-        ]),
+        "PATH": ":".join(
+            [
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ]
+        ),
     }
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            str(clip_bin), url,
+            str(clip_bin),
+            url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -9071,7 +9896,7 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
                 reply_content = f"Clipped: `{url}`"
             logger.info(f"Discord clip saved: {saved_path} ({note_title})")
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(f"Discord clip timed out: {url}")
         reply_content = f"Clip timed out for <{url}>"
     except Exception as e:
@@ -9081,12 +9906,15 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
     # Send reply via daemon
     try:
         import urllib.request as _urllib_req
-        payload = json.dumps({
-            "channel": channel,
-            "bot": "mechanicus",
-            "content": reply_content,
-            "reply_to": reply_to,
-        }).encode()
+
+        payload = json.dumps(
+            {
+                "channel": channel,
+                "bot": "mechanicus",
+                "content": reply_content,
+                "reply_to": reply_to,
+            }
+        ).encode()
         req = _urllib_req.Request(
             f"{DISCORD_DAEMON_URL}/send",
             data=payload,
@@ -9102,6 +9930,7 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
 
 # Per-channel cooldown: max 1 response per 30 seconds per channel
 _discord_respond_cooldowns: dict[str, float] = {}
+
 
 async def _discord_respond(message: DiscordMessageRequest, bot: str):
     """Fetch channel context, build system prompt, spawn responder subprocess."""
@@ -9125,22 +9954,28 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
     # Model selection: Custodes gets Sonnet, others get Haiku
     model = "claude-sonnet-4-6" if bot == "custodes" else "claude-haiku-4-5-20251001"
 
-    author_display = (message.author or {}).get("displayName",
-                      (message.author or {}).get("username", "user"))
+    author_display = (message.author or {}).get(
+        "displayName", (message.author or {}).get("username", "user")
+    )
 
     if bot == "custodes":
         # Custodes: fetch full day's conversation, daily note, and habits
         context_str = ""
         try:
-            today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            today_midnight = (
+                datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            )
+
             def _fetch_custodes_context():
                 import urllib.request as _ur
+
                 req = _ur.Request(
                     f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=100&since={today_midnight}",
                     method="GET",
                 )
                 with _ur.urlopen(req, timeout=5) as resp:
                     return json.loads(resp.read())
+
             data = await asyncio.get_event_loop().run_in_executor(None, _fetch_custodes_context)
             msgs = data.get("messages", [])
             context_str = "\n".join(
@@ -9163,11 +9998,14 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         # Fetch habits from internal API
         habits_str = "(Could not read habit state)"
         try:
+
             def _fetch_habits():
                 import urllib.request as _ur
+
                 req = _ur.Request("http://127.0.0.1:7777/api/habits/today", method="GET")
                 with _ur.urlopen(req, timeout=5) as resp:
                     return resp.read().decode()
+
             habits_str = await asyncio.get_event_loop().run_in_executor(None, _fetch_habits)
         except Exception as e:
             logger.warning(f"Discord responder (custodes): could not fetch habits: {e}")
@@ -9175,11 +10013,14 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         # Fetch timer state
         timer_str = "(Could not read timer state)"
         try:
+
             def _fetch_timer():
                 import urllib.request as _ur
+
                 req = _ur.Request("http://127.0.0.1:7777/api/timer", method="GET")
                 with _ur.urlopen(req, timeout=5) as resp:
                     return resp.read().decode()
+
             timer_str = await asyncio.get_event_loop().run_in_executor(None, _fetch_timer)
         except Exception as e:
             logger.warning(f"Discord responder (custodes): could not fetch timer: {e}")
@@ -9211,7 +10052,7 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
 {timer_str}
 
 ### Conversation in #{channel} (today, oldest to newest)
-{context_str or '(no prior messages today)'}
+{context_str or "(no prior messages today)"}
 
 ### Current Message (replying to)
 [{author_display}]: {message.content}"""
@@ -9220,14 +10061,17 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         # Non-Custodes bots: existing 10-message fetch
         context_str = ""
         try:
+
             def _fetch_context():
                 import urllib.request
+
                 req = urllib.request.Request(
                     f"{DISCORD_DAEMON_URL}/read?channel={channel}&limit=10",
                     method="GET",
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return json.loads(resp.read())
+
             data = await asyncio.get_event_loop().run_in_executor(None, _fetch_context)
             msgs = data.get("messages", [])
             context_str = "\n".join(
@@ -9240,7 +10084,7 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         system_prompt = f"""You are {persona}, responding to a Discord message in #{channel}.
 
 Recent conversation (oldest to newest):
-{context_str or '(no prior context)'}
+{context_str or "(no prior context)"}
 
 You are replying directly to:
 [{author_display}]: {message.content}
@@ -9252,7 +10096,7 @@ Rules:
 - One reply only."""
 
     # Write system prompt to temp file (avoids shell escaping issues)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         f.write(system_prompt)
         prompt_file = f.name
 
@@ -9261,17 +10105,20 @@ Rules:
         **os.environ,
         "CLAUDECODE": "",
         "TOKEN_API_SUBAGENT": f"discord_responder:{bot}",
-        "PATH": ":".join([
-            str(SCRIPTS_DIR / "cli-tools" / "bin"),
-            str(Path.home() / ".local" / "bin"),
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            os.environ.get("PATH", ""),
-        ]),
+        "PATH": ":".join(
+            [
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ]
+        ),
     }
 
     proc = await asyncio.create_subprocess_exec(
-        "python3", str(responder),
+        "python3",
+        str(responder),
         channel,
         message.message_id or "",
         bot,
@@ -9282,13 +10129,16 @@ Rules:
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    logger.info(f"Discord responder spawned: bot={bot} model={model} channel=#{channel} pid={proc.pid}")
+    logger.info(
+        f"Discord responder spawned: bot={bot} model={model} channel=#{channel} pid={proc.pid}"
+    )
 
     # Fire-and-forget but log errors
     async def _wait_and_log():
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             logger.warning(f"Discord responder exited {proc.returncode}: {stderr.decode()[:300]}")
+
     asyncio.create_task(_wait_and_log())
 
 
@@ -9298,28 +10148,39 @@ Rules:
 @app.post("/api/inbox/notify")
 async def inbox_notify(request: InboxNotifyRequest):
     """Gene-seed: receive birth notification for a new inbox note."""
-    await log_event("inbox_notify", device_id="obsidian", details={
-        "path": request.path,
-        "title": request.title,
-        "type": request.type,
-        "source": request.source,
-    })
+    await log_event(
+        "inbox_notify",
+        device_id="obsidian",
+        details={
+            "path": request.path,
+            "title": request.title,
+            "type": request.type,
+            "source": request.source,
+        },
+    )
     logger.info(f"Inbox: new {request.type} note '{request.title}' from {request.source}")
-    asyncio.create_task(run_implantation(
-        note_path=request.path,
-        title=request.title,
-        note_type=request.type,
-        source=request.source,
-    ))
-    return {"received": True, "path": request.path, "type": request.type, "implantation": "dispatched"}
+    asyncio.create_task(
+        run_implantation(
+            note_path=request.path,
+            title=request.title,
+            note_type=request.type,
+            source=request.source,
+        )
+    )
+    return {
+        "received": True,
+        "path": request.path,
+        "type": request.type,
+        "implantation": "dispatched",
+    }
 
 
 @app.post("/api/inbox/create")
 async def inbox_create(request: InboxCreateRequest):
     """Create a new aspirant note in Aspirants/ from an external source."""
     # Sanitize title for filename
-    safe_title = re.sub(r'[^\w\s-]', '', request.title).strip()
-    safe_title = re.sub(r'\s+', ' ', safe_title)
+    safe_title = re.sub(r"[^\w\s-]", "", request.title).strip()
+    safe_title = re.sub(r"\s+", " ", safe_title)
     if not safe_title:
         safe_title = f"Untitled {datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
@@ -9349,7 +10210,9 @@ async def inbox_create(request: InboxCreateRequest):
     frontmatter_lines.append("---")
 
     raw_body = request.content or ""
-    source_line = f"*Captured from {request.author} via {request.source}*\n\n" if request.author else ""
+    source_line = (
+        f"*Captured from {request.author} via {request.source}*\n\n" if request.author else ""
+    )
 
     # Wrap gene-seed content in a callout so pipeline stages can distinguish
     # the Emperor's original intent from pipeline-appended content
@@ -9366,11 +10229,14 @@ async def inbox_create(request: InboxCreateRequest):
     thread_id = None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post("http://127.0.0.1:7779/thread/create", json={
-                "channel": "aspirants",
-                "name": safe_title[:100],
-                "bot": "custodes",
-            })
+            resp = await client.post(
+                "http://127.0.0.1:7779/thread/create",
+                json={
+                    "channel": "aspirants",
+                    "name": safe_title[:100],
+                    "bot": "custodes",
+                },
+            )
             if resp.status_code == 200:
                 thread_data = resp.json()
                 thread_id = thread_data.get("thread_id")
@@ -9382,9 +10248,14 @@ async def inbox_create(request: InboxCreateRequest):
 
                 # Store thread_id in note frontmatter
                 await asyncio.create_subprocess_exec(
-                    OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                    f"path={note_path}", "property=thread_id", f"value={thread_id}",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    OBSIDIAN_CLI,
+                    "vault=Imperium-ENV",
+                    "property:set",
+                    f"path={note_path}",
+                    "property=thread_id",
+                    f"value={thread_id}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
 
                 # Post gene-seed to the thread
@@ -9393,29 +10264,42 @@ async def inbox_create(request: InboxCreateRequest):
                     f"Type: `{request.type}` | Source: `{request.source}`\n\n"
                     f"> {raw_body.strip()[:1500]}"
                 )
-                await client.post("http://127.0.0.1:7779/send", json={
-                    "channel": "aspirants",
-                    "thread_id": thread_id,
-                    "content": gene_seed_msg,
-                    "bot": "custodes",
-                })
+                await client.post(
+                    "http://127.0.0.1:7779/send",
+                    json={
+                        "channel": "aspirants",
+                        "thread_id": thread_id,
+                        "content": gene_seed_msg,
+                        "bot": "custodes",
+                    },
+                )
             else:
-                logger.warning(f"Inbox: thread creation failed for '{safe_title}': {resp.status_code}")
+                logger.warning(
+                    f"Inbox: thread creation failed for '{safe_title}': {resp.status_code}"
+                )
     except Exception as e:
         logger.warning(f"Inbox: thread creation failed for '{safe_title}': {e}")
 
     # Self-notify (same pipeline as Templater-created notes)
-    await inbox_notify(InboxNotifyRequest(
-        path=note_path,
-        title=safe_title,
-        type=request.type,
-        source=request.source,
-    ))
+    await inbox_notify(
+        InboxNotifyRequest(
+            path=note_path,
+            title=safe_title,
+            type=request.type,
+            source=request.source,
+        )
+    )
 
     obsidian_uri = f"obsidian://open?vault=Imperium-ENV&file={note_path.replace(' ', '%20')}"
 
     logger.info(f"Inbox: created '{filename}' from {request.source}")
-    return {"created": True, "path": note_path, "title": safe_title, "obsidian_uri": obsidian_uri, "thread_id": thread_id}
+    return {
+        "created": True,
+        "path": note_path,
+        "title": safe_title,
+        "obsidian_uri": obsidian_uri,
+        "thread_id": thread_id,
+    }
 
 
 # ---- Stage 2: Implantation ----
@@ -9429,9 +10313,13 @@ async def _read_note_property(note_path: str, prop: str) -> str | None:
     """Read a single frontmatter property from a note via obsidian CLI."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            OBSIDIAN_CLI, "vault=Imperium-ENV", "property:read",
-            f"path={note_path}", f"property={prop}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            OBSIDIAN_CLI,
+            "vault=Imperium-ENV",
+            "property:read",
+            f"path={note_path}",
+            f"property={prop}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         val = stdout.decode("utf-8", errors="replace").strip()
@@ -9440,7 +10328,9 @@ async def _read_note_property(note_path: str, prop: str) -> str | None:
         return None
 
 
-async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes", bypass_gate: bool = False) -> None:
+async def _post_to_aspirant_thread(
+    thread_id: str, message: str, bot: str = "custodes", bypass_gate: bool = False
+) -> None:
     """Post a message to an aspirant's thread in #aspirants.
 
     Respects thread gating: if gate is closed, queues the message instead.
@@ -9451,21 +10341,27 @@ async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "cus
     if not bypass_gate and allowed <= 0:
         # Gate closed — queue the message
         _aspirant_gated_queue.setdefault(thread_id, []).append((message, bot))
-        logger.info(f"Aspirant thread {thread_id} gated — queued message ({len(_aspirant_gated_queue[thread_id])} pending)")
+        logger.info(
+            f"Aspirant thread {thread_id} gated — queued message ({len(_aspirant_gated_queue[thread_id])} pending)"
+        )
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(f"{DISCORD_DAEMON_URL}/send", json={
-                "channel": "aspirants",
-                "thread_id": thread_id,
-                "content": message[:2000],
-                "bot": bot,
-            })
+            await client.post(
+                f"{DISCORD_DAEMON_URL}/send",
+                json={
+                    "channel": "aspirants",
+                    "thread_id": thread_id,
+                    "content": message[:2000],
+                    "bot": bot,
+                },
+            )
         # Decrement allowance (0 = gated until Emperor replies)
         if not bypass_gate:
             _aspirant_thread_gates[thread_id] = max(0, allowed - 1)
     except Exception as e:
         logger.warning(f"Failed to post to aspirant thread {thread_id}: {e}")
+
 
 CODEX_CONTEXT = """The Imperium of Claude is an agent orchestration system using Warhammer 40K hierarchy:
 - The Emperor: Token (human) — final authority
@@ -9479,7 +10375,14 @@ MiniMax is for mass, not precision. 300 prompts per 5 hours budget. Notes enter 
 The system uses an Obsidian vault (Imperium-ENV) as its knowledge base. Terra/ is personal domain, Mars/ is mechanicus/agent operations."""
 
 
-async def run_implantation(note_path: str, title: str, note_type: str, source: str, skip_trials: bool = False, emperor_feedback: str = "") -> None:
+async def run_implantation(
+    note_path: str,
+    title: str,
+    note_type: str,
+    source: str,
+    skip_trials: bool = False,
+    emperor_feedback: str = "",
+) -> None:
     """Stage 2: Implantation — async enrichment of an inbox note with vault matches and research swarm."""
     try:
         # Sisyphus guard — track implantation count, cap at 2 re-implantations
@@ -9491,13 +10394,20 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             implant_count = 0
 
         if implant_count >= MAX_IMPLANT_CYCLES:
-            logger.warning(f"Implantation halted for '{title}': max cycles reached ({implant_count}/{MAX_IMPLANT_CYCLES}). Holding for manual intervention.")
+            logger.warning(
+                f"Implantation halted for '{title}': max cycles reached ({implant_count}/{MAX_IMPLANT_CYCLES}). Holding for manual intervention."
+            )
             # Set status to held so it doesn't re-enter the loop
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                    f"path={note_path}", "property=status", "value=held",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    OBSIDIAN_CLI,
+                    "vault=Imperium-ENV",
+                    "property:set",
+                    f"path={note_path}",
+                    "property=status",
+                    "value=held",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=15)
             except Exception:
@@ -9505,17 +10415,24 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             # Notify in thread
             thread_id = await _read_note_property(note_path, "thread_id")
             if thread_id:
-                await _post_to_aspirant_thread(thread_id,
-                    f"**⏸️ Implantation Halted**\nMax cycles reached ({implant_count}). Status set to `held` — needs manual intervention or Emperor direction.")
+                await _post_to_aspirant_thread(
+                    thread_id,
+                    f"**⏸️ Implantation Halted**\nMax cycles reached ({implant_count}). Status set to `held` — needs manual intervention or Emperor direction.",
+                )
             return
 
         # Increment implant count
         implant_count += 1
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f"path={note_path}", "property=implant_count", f"value={implant_count}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=implant_count",
+                f"value={implant_count}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=15)
         except Exception:
@@ -9523,7 +10440,9 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         # Budget check — swarm costs ~14-18 queries per note
         if minimax_limiter.remaining < 25:
-            logger.warning(f"Implantation skipped for '{title}': MiniMax budget low ({minimax_limiter.remaining} remaining)")
+            logger.warning(
+                f"Implantation skipped for '{title}': MiniMax budget low ({minimax_limiter.remaining} remaining)"
+            )
             return
 
         sections = []
@@ -9559,7 +10478,10 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         vault_context_full = ""  # enriched: full content of top matching notes
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "search:context", f'query={title}',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "search:context",
+                f"query={title}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9600,7 +10522,7 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                                 if mcontent.startswith("---"):
                                     end_fm = mcontent.find("---", 3)
                                     if end_fm != -1:
-                                        mcontent = mcontent[end_fm + 3:].strip()
+                                        mcontent = mcontent[end_fm + 3 :].strip()
                                 # Cap per-note at 1500 chars
                                 mcontent = mcontent[:1500]
                                 full_note_contents.append(f"### [[{mpath}]]\n{mcontent}")
@@ -9616,7 +10538,7 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                         user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context_str}",
                         max_tokens=IMPLANTATION_ROLES["vault_relevance"]["max_tokens"],
                     )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"Implantation: vault search timed out for '{title}'")
         except Exception as e:
             logger.warning(f"Implantation: vault search failed for '{title}': {e}")
@@ -9634,9 +10556,17 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                     seen.add(fname)
                     # Strip domain prefix for wikilink (Terra/Ultramar/Foo.md → Foo)
                     note_name = fname.replace(".md", "")
-                    for prefix in ("Terra/Ultramar/", "Terra/Meta/", "Terra/Sessions/", "Mars/Tasks/", "Mars/Sessions/", "Mars/Fleet/", "Aspirants/"):
+                    for prefix in (
+                        "Terra/Ultramar/",
+                        "Terra/Meta/",
+                        "Terra/Sessions/",
+                        "Mars/Tasks/",
+                        "Mars/Sessions/",
+                        "Mars/Fleet/",
+                        "Aspirants/",
+                    ):
                         if note_name.startswith(prefix):
-                            note_name = note_name[len(prefix):]
+                            note_name = note_name[len(prefix) :]
                             break
                     fallback_links.append(f"- [[{note_name}]]")
             if fallback_links:
@@ -9662,7 +10592,9 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 max_tokens=IMPLANTATION_ROLES["query_generator"]["max_tokens"],
             )
             if query_response and query_response.strip():
-                search_queries = [q.strip() for q in query_response.strip().splitlines() if q.strip()]
+                search_queries = [
+                    q.strip() for q in query_response.strip().splitlines() if q.strip()
+                ]
                 search_queries = search_queries[:15]  # cap at 15
         except Exception as e:
             logger.warning(f"Implantation: query generation failed for '{title}': {e}")
@@ -9671,20 +10603,25 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             # Fallback: use title as sole query
             search_queries = [title]
 
-        logger.info(f"Implantation: swarm dispatched ({len(search_queries)} researchers) for '{title}'")
+        logger.info(
+            f"Implantation: swarm dispatched ({len(search_queries)} researchers) for '{title}'"
+        )
 
         # Step 2: Run all web searches in parallel
         async def _web_search(query: str) -> tuple[str, str]:
             """Run a single web search, return (query, results)."""
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    WEB_SEARCH_CLI, "--count", "5", query,
+                    WEB_SEARCH_CLI,
+                    "--count",
+                    "5",
+                    query,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                 return (query, stdout.decode("utf-8", errors="replace").strip())
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return (query, "")
             except Exception:
                 return (query, "")
@@ -9695,7 +10632,15 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         )
 
         # Step 3: Fire MiniMax researcher calls in parallel
-        vault_brief = vault_context_full[:3000] if vault_context_full else (vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic.")
+        vault_brief = (
+            vault_context_full[:3000]
+            if vault_context_full
+            else (
+                vault_context_str[:2000]
+                if vault_context_str
+                else "No existing vault notes found on this topic."
+            )
+        )
 
         async def _research(query: str, web_output: str) -> str:
             """One researcher synthesizes their search results."""
@@ -9727,7 +10672,9 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 if isinstance(out, str) and out.strip():
                     researcher_outputs.append(out.strip())
 
-        logger.info(f"Implantation: {len(researcher_outputs)}/{len(researcher_tasks)} researchers returned content for '{title}'")
+        logger.info(
+            f"Implantation: {len(researcher_outputs)}/{len(researcher_tasks)} researchers returned content for '{title}'"
+        )
 
         # --- Phase 1c: Consolidation ---
         consolidated = None
@@ -9755,7 +10702,7 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 f"You are an Inquisitor reviewing research produced by Imperial Guard (MiniMax) servitors. "
                 f"The Guard is cheap and fast but UNTRUSTED — they hallucinate URLs, produce off-topic content, "
                 f"and fail to ground research in our system's context.\n\n"
-                f"The note being researched is titled: \"{title}\"\n"
+                f'The note being researched is titled: "{title}"\n'
                 f"Note type: {note_type}\n"
                 f"Gene-seed (Emperor's original note content):\n{gene_seed_content[:1000] if gene_seed_content else '(title only — no body content)'}\n\n"
                 f"Existing vault knowledge:\n{vault_context_full[:4000] if vault_context_full else (vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.')}\n\n"
@@ -9769,8 +10716,12 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             )
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "claude", "--model", "claude-sonnet-4-6", "-p",
-                    "--no-session-persistence", "--dangerously-skip-permissions",
+                    "claude",
+                    "--model",
+                    "claude-sonnet-4-6",
+                    "-p",
+                    "--no-session-persistence",
+                    "--dangerously-skip-permissions",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
@@ -9781,8 +10732,10 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 )
                 inquisition_reviewed = stdout.decode("utf-8", errors="replace").strip()
                 logger.info(f"Implantation: Inquisition review complete for '{title}'")
-            except asyncio.TimeoutError:
-                logger.warning(f"Implantation: Inquisition review timed out for '{title}', using raw consolidation")
+            except TimeoutError:
+                logger.warning(
+                    f"Implantation: Inquisition review timed out for '{title}', using raw consolidation"
+                )
             except Exception as e:
                 logger.warning(f"Implantation: Inquisition review failed for '{title}': {e}")
 
@@ -9790,10 +10743,14 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         if inquisition_reviewed and inquisition_reviewed.strip():
             sections.append(f"### Research\n\n{inquisition_reviewed.strip()}")
         elif consolidated and consolidated.strip():
-            sections.append(f"### Research\n\n*\u26a0\ufe0f Inquisition review unavailable — unreviewed Guard output:*\n\n{consolidated.strip()}")
+            sections.append(
+                f"### Research\n\n*\u26a0\ufe0f Inquisition review unavailable — unreviewed Guard output:*\n\n{consolidated.strip()}"
+            )
         elif researcher_outputs:
             fallback_research = "\n\n".join(researcher_outputs[:3])
-            sections.append(f"### Research\n\n*\u26a0\ufe0f Unreviewed Guard output (no consolidation):*\n\n{fallback_research[:3000]}")
+            sections.append(
+                f"### Research\n\n*\u26a0\ufe0f Unreviewed Guard output (no consolidation):*\n\n{fallback_research[:3000]}"
+            )
 
         # --- Append to note ---
         if not sections:
@@ -9815,12 +10772,15 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             except Exception as e:
                 logger.warning(f"Implantation: failed to strip old artifacts from '{title}': {e}")
 
-        implant_content = f"## Implantation\n\n" + "\n\n".join(sections)
+        implant_content = "## Implantation\n\n" + "\n\n".join(sections)
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
-                f'path={note_path}', f'content={implant_content}',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "append",
+                f"path={note_path}",
+                f"content={implant_content}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9835,8 +10795,12 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         # Update status to implanted
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f'path={note_path}', 'property=status', 'value=implanted',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=status",
+                "value=implanted",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9845,15 +10809,19 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             logger.warning(f"Implantation: property:set failed for '{title}': {e}")
 
         try:
-            await log_event("implantation_complete", device_id="minimax", details={
-                "path": note_path,
-                "title": title,
-                "type": note_type,
-                "source": source,
-                "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
-                "has_web_research": bool(consolidated or researcher_outputs),
-                "researcher_count": len(researcher_outputs),
-            })
+            await log_event(
+                "implantation_complete",
+                device_id="minimax",
+                details={
+                    "path": note_path,
+                    "title": title,
+                    "type": note_type,
+                    "source": source,
+                    "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
+                    "has_web_research": bool(consolidated or researcher_outputs),
+                    "researcher_count": len(researcher_outputs),
+                },
+            )
         except Exception as e:
             logger.warning(f"Implantation: log_event failed for '{title}': {e}")
         logger.info(f"Implantation complete for '{title}' ({note_path})")
@@ -9871,7 +10839,9 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         # --- Fire Trials phase ---
         if not skip_trials:
-            asyncio.create_task(run_trials(note_path, title, note_type, vault_context=vault_context_full))
+            asyncio.create_task(
+                run_trials(note_path, title, note_type, vault_context=vault_context_full)
+            )
             logger.info(f"Trials dispatched for '{title}'")
 
     except Exception as e:
@@ -9887,7 +10857,10 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
         note_content = ""
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f'path={note_path}',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "read",
+                f"path={note_path}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9939,8 +10912,12 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
         # Run Claude Sonnet via CLI (pipe prompt via stdin for long content)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--model", "claude-sonnet-4-6", "-p",
-                "--no-session-persistence", "--dangerously-skip-permissions",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "-p",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,
@@ -9950,7 +10927,7 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
                 timeout=120,
             )
             trials_output = stdout.decode("utf-8", errors="replace").strip()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"Trials: Sonnet timed out for '{title}'")
             return
         except Exception as e:
@@ -9968,8 +10945,11 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
         # Append trials to the note
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
-                f'path={note_path}', f'content={trials_output}',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "append",
+                f"path={note_path}",
+                f"content={trials_output}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9984,8 +10964,12 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
         # Update status to trials_active (trials are ongoing until Emperor responds)
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f'path={note_path}', 'property=status', 'value=trials_active',
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=status",
+                "value=trials_active",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -10012,7 +10996,11 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
                 f"Type: `{note_type}` | Respond in #aspirants thread"
             )
             discord_proc = await asyncio.create_subprocess_exec(
-                "discord", "send", "fleet", "--bot", "custodes",
+                "discord",
+                "send",
+                "fleet",
+                "--bot",
+                "custodes",
                 fleet_msg,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -10022,11 +11010,15 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
             logger.warning(f"Trials: Discord notification failed for '{title}': {e}")
 
         try:
-            await log_event("trials_initiated", device_id="sonnet", details={
-                "path": note_path,
-                "title": title,
-                "type": note_type,
-            })
+            await log_event(
+                "trials_initiated",
+                device_id="sonnet",
+                details={
+                    "path": note_path,
+                    "title": title,
+                    "type": note_type,
+                },
+            )
         except Exception as e:
             logger.warning(f"Trials: log_event failed for '{title}': {e}")
 
@@ -10049,7 +11041,9 @@ async def _read_thread_messages(thread_id: str, limit: int = 20) -> list[dict]:
     return []
 
 
-async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor_response: str) -> None:
+async def run_trials_verdict(
+    note_path: str, title: str, note_type: str, emperor_response: str
+) -> None:
     """Process Emperor's response to trials and render a PASS/FAIL verdict via Sonnet."""
     try:
         logger.info(f"Trials verdict: processing for '{title}'")
@@ -10058,8 +11052,12 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
         note_content = ""
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f"path={note_path}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "read",
+                f"path={note_path}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
             note_content = stdout.decode("utf-8", errors="replace").strip()
@@ -10086,9 +11084,14 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--model", "claude-sonnet-4-6", "-p",
-                "--no-session-persistence", "--dangerously-skip-permissions",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "-p",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(
@@ -10096,7 +11099,7 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
                 timeout=60,
             )
             verdict_output = stdout.decode("utf-8", errors="replace").strip()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"Trials verdict: Sonnet timed out for '{title}'")
             return
         except Exception as e:
@@ -10117,9 +11120,14 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
         # Update note status property
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f"path={note_path}", "property=status", f"value={new_status}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=status",
+                f"value={new_status}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=15)
         except Exception as e:
@@ -10134,9 +11142,13 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
         )
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
-                f"path={note_path}", f"content={verdict_section}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "append",
+                f"path={note_path}",
+                f"content={verdict_section}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=15)
         except Exception as e:
@@ -10153,13 +11165,17 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
             await _post_to_aspirant_thread(thread_id, thread_msg)
 
         try:
-            await log_event("trials_verdict", device_id="sonnet", details={
-                "path": note_path,
-                "title": title,
-                "type": note_type,
-                "verdict": "pass" if is_pass else "fail",
-                "status": new_status,
-            })
+            await log_event(
+                "trials_verdict",
+                device_id="sonnet",
+                details={
+                    "path": note_path,
+                    "title": title,
+                    "type": note_type,
+                    "verdict": "pass" if is_pass else "fail",
+                    "status": new_status,
+                },
+            )
         except Exception as e:
             logger.warning(f"Trials verdict: log_event failed for '{title}': {e}")
         logger.info(f"Trials verdict for '{title}': {new_status}")
@@ -10167,7 +11183,9 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
         # On FAIL: do NOT auto-re-implant — wait for Emperor to engage in the thread.
         # The old behavior created infinite implant → trial → fail → re-implant loops.
         if not is_pass:
-            logger.info(f"Trials failed for '{title}': awaiting Emperor feedback in thread (no auto-re-implant)")
+            logger.info(
+                f"Trials failed for '{title}': awaiting Emperor feedback in thread (no auto-re-implant)"
+            )
 
     except Exception as e:
         logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
@@ -10231,7 +11249,9 @@ async def inbox_trials_check():
 
         asyncio.create_task(run_trials_verdict(note_path, title, note_type, emperor_response))
         results["verdicts_triggered"] += 1
-        results["notes"].append({"title": title, "verdict": "dispatched", "replies": len(emperor_replies)})
+        results["notes"].append(
+            {"title": title, "verdict": "dispatched", "replies": len(emperor_replies)}
+        )
 
     return results
 
@@ -10245,8 +11265,12 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
         note_content = ""
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "read", f"path={note_path}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "read",
+                f"path={note_path}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
             note_content = stdout.decode("utf-8", errors="replace").strip()
@@ -10284,9 +11308,14 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
         deployed_content = ""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--model", "claude-sonnet-4-6", "-p",
-                "--no-session-persistence", "--dangerously-skip-permissions",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "-p",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(
@@ -10294,7 +11323,7 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
                 timeout=120,
             )
             deployed_content = stdout.decode("utf-8", errors="replace").strip()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"Deployment: Sonnet timed out for '{title}'")
             return
         except Exception as e:
@@ -10314,9 +11343,13 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
         # Create the note at its final destination via obsidian CLI
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "create",
-                f"path={destination_path}", f"content={deployed_content}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "create",
+                f"path={destination_path}",
+                f"content={deployed_content}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode != 0:
@@ -10335,15 +11368,25 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
         # Update original note status to deployed
         try:
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f"path={note_path}", "property=status", f"value=deployed",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=status",
+                "value=deployed",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=15)
             proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f"path={note_path}", "property=deployed_to", f"value={destination_path}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                OBSIDIAN_CLI,
+                "vault=Imperium-ENV",
+                "property:set",
+                f"path={note_path}",
+                "property=deployed_to",
+                f"value={destination_path}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.wait_for(proc.communicate(), timeout=15)
         except Exception as e:
@@ -10361,12 +11404,16 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
             await _post_to_aspirant_thread(thread_id, deploy_msg)
 
         try:
-            await log_event("deployment", device_id="guilliman", details={
-                "source_path": note_path,
-                "destination_path": destination_path,
-                "title": title,
-                "type": note_type,
-            })
+            await log_event(
+                "deployment",
+                device_id="guilliman",
+                details={
+                    "source_path": note_path,
+                    "destination_path": destination_path,
+                    "title": title,
+                    "type": note_type,
+                },
+            )
         except Exception as e:
             logger.warning(f"Deployment: log_event failed for '{title}': {e}")
         logger.info(f"Deployment complete: '{title}' -> {destination_path}")
@@ -10377,6 +11424,7 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
 
 class InboxDeployRequest(BaseModel):
     """Manual trigger for deployment on a trials_passed note."""
+
     path: str
 
 
@@ -10393,20 +11441,30 @@ async def inbox_deploy(request: InboxDeployRequest):
     note_type = await _read_note_property(request.path, "type") or "descriptive"
     status = await _read_note_property(request.path, "status")
     if status not in ("trials_passed", "trials_complete"):
-        raise HTTPException(status_code=400, detail=f"Note status is '{status}', expected 'trials_passed'")
+        raise HTTPException(
+            status_code=400, detail=f"Note status is '{status}', expected 'trials_passed'"
+        )
 
-    asyncio.create_task(run_deployment(
-        note_path=request.path,
-        title=title,
-        note_type=note_type,
-    ))
+    asyncio.create_task(
+        run_deployment(
+            note_path=request.path,
+            title=title,
+            note_type=note_type,
+        )
+    )
 
     destination_dir = "Mars/Tasks" if note_type in ("prescriptive", "task") else "Terra/Ultramar"
-    return {"dispatched": True, "path": request.path, "title": title, "destination": f"{destination_dir}/{title}.md"}
+    return {
+        "dispatched": True,
+        "path": request.path,
+        "title": title,
+        "destination": f"{destination_dir}/{title}.md",
+    }
 
 
 class InboxImplantRequest(BaseModel):
     """Manual trigger for implantation on an existing inbox note."""
+
     path: str
     skip_trials: bool = False
 
@@ -10423,21 +11481,30 @@ async def inbox_implant(request: InboxImplantRequest):
     if not full_path.exists():
         raise HTTPException(status_code=404, detail=f"Note not found: {request.path}")
 
-    asyncio.create_task(run_implantation(
-        note_path=request.path,
-        title=title,
-        note_type="capture",
-        source="manual",
-        skip_trials=request.skip_trials,
-    ))
+    asyncio.create_task(
+        run_implantation(
+            note_path=request.path,
+            title=title,
+            note_type="capture",
+            source="manual",
+            skip_trials=request.skip_trials,
+        )
+    )
 
-    return {"dispatched": True, "path": request.path, "title": title, "skip_trials": request.skip_trials}
+    return {
+        "dispatched": True,
+        "path": request.path,
+        "title": title,
+        "skip_trials": request.skip_trials,
+    }
 
 
 # ============ Session Document Support ============
 
+
 class MiniMaxRateLimiter:
     """Sliding window rate limiter for MiniMax API calls."""
+
     def __init__(self, max_calls: int = 300, window_seconds: int = 18000):
         self.max_calls = max_calls
         self.window_seconds = window_seconds
@@ -10460,6 +11527,7 @@ class MiniMaxRateLimiter:
         while self.calls and self.calls[0] < now - self.window_seconds:
             self.calls.popleft()
         return max(0, self.max_calls - len(self.calls))
+
 
 minimax_limiter = MiniMaxRateLimiter()
 
@@ -10497,6 +11565,8 @@ IMPLANTATION_ROLES = {
 # ---- Minimax API Client ----
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _MINIMAX_MODEL = "MiniMax-M2.5"
+
+
 def _get_minimax_key() -> str:
     """Read MiniMax API key from MINIMAX_API_KEY env var."""
     key = os.environ.get("MINIMAX_API_KEY")
@@ -10543,23 +11613,23 @@ async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 
         stop_reason = data.get("stop_reason", "?")
 
         # Primary: extract text blocks
-        text = "".join(
-            block["text"] for block in content
-            if block.get("type") == "text"
-        )
+        text = "".join(block["text"] for block in content if block.get("type") == "text")
 
         # Fallback: if no text blocks, extract from thinking blocks
         if not text:
             thinking_text = "".join(
-                block.get("thinking", "") for block in content
-                if block.get("type") == "thinking"
+                block.get("thinking", "") for block in content if block.get("type") == "thinking"
             )
             if thinking_text:
-                logger.info(f"MiniMax: no text blocks, extracting from thinking ({len(thinking_text)} chars)")
+                logger.info(
+                    f"MiniMax: no text blocks, extracting from thinking ({len(thinking_text)} chars)"
+                )
                 text = thinking_text
 
         if not text:
-            logger.warning(f"MiniMax empty response: stop_reason={stop_reason}, content={data.get('content')!r}")
+            logger.warning(
+                f"MiniMax empty response: stop_reason={stop_reason}, content={data.get('content')!r}"
+            )
         return text
 
 
@@ -10618,6 +11688,7 @@ def _parse_verdict_from_tail(text: str) -> tuple[str | None, str]:
     Returns (verdict, finding) where verdict is "block"/"continue"/None.
     """
     import re as _re
+
     lines = text.strip().splitlines()
     for line in reversed(lines):
         line = line.strip()
@@ -10674,7 +11745,11 @@ def _parse_evaluator_result(evaluator_name: str, text: str) -> tuple[bool, str, 
     verdict, finding = _parse_verdict_from_tail(text)
 
     if verdict == "block":
-        return True, finding or f"{evaluator_name.replace('_', ' ').title()} flagged this session", False
+        return (
+            True,
+            finding or f"{evaluator_name.replace('_', ' ').title()} flagged this session",
+            False,
+        )
     if verdict == "continue":
         return False, "", False
 
@@ -10690,7 +11765,9 @@ def _build_evaluator_prompt(evaluator_name: str, ctx: dict) -> str:
             parts.append(f"## Session History (compacted)\n{ctx['compacted_history'][:3000]}")
         parts.append(f"## Recent Agent Activity (raw transcript tail)\n{ctx['recent_tail'][:3000]}")
         parts.append(f"Agent name: {ctx['tab_name']}")
-        parts.append("Analyze the agent's FINAL message. Is it telling the user to do something manually?")
+        parts.append(
+            "Analyze the agent's FINAL message. Is it telling the user to do something manually?"
+        )
         return "\n\n".join(parts)
 
     elif evaluator_name == "plan_auditor":
@@ -10709,7 +11786,7 @@ def _build_evaluator_prompt(evaluator_name: str, ctx: dict) -> str:
 
 async def _gather_evaluator_context(
     instance_id: str,
-    session_doc_id: Optional[int],
+    session_doc_id: int | None,
     transcript_tail: str,
     tab_name: str,
 ) -> dict:
@@ -10731,7 +11808,9 @@ async def _gather_evaluator_context(
         try:
             result = subprocess.run(
                 ["obsidian", "vault=Imperium-ENV", "read", f"path={transcript_rel}"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode == 0 and result.stdout.strip():
                 ctx["compacted_history"] = result.stdout[:6000]
@@ -10743,8 +11822,7 @@ async def _gather_evaluator_context(
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT file_path FROM session_documents WHERE id = ?",
-                    (session_doc_id,)
+                    "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
                 )
                 row = await cursor.fetchone()
                 if row:
@@ -10757,7 +11835,9 @@ async def _gather_evaluator_context(
     return ctx
 
 
-async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_path: str = "") -> None:
+async def _auto_name_instance(
+    instance: dict, transcript_tail: str, transcript_path: str = ""
+) -> None:
     """Generate a session name via MiniMax if instance hasn't been explicitly named.
 
     Called on first stop. If tab_name hasn't been set by our naming pipeline
@@ -10774,8 +11854,9 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
     # Skip if already named by our pipeline (kebab-case = our convention).
     # Auto-name if: default "Claude HH:MM", Claude Code auto-title (has spaces),
     # or fallback "Claude Code" / empty.
-    is_our_name = bool(tab_name and " " not in tab_name
-                       and _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", tab_name))
+    is_our_name = bool(
+        tab_name and " " not in tab_name and _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", tab_name)
+    )
     if is_our_name:
         logger.info(f"AutoName: skipping {instance_id} — already named ({tab_name!r})")
         return
@@ -10797,16 +11878,29 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
                 logger.warning(f"AutoName: failed to read transcript file: {e}")
 
     if not transcript_tail or len(transcript_tail) < 50:
-        logger.info(f"AutoName: skipping {instance_id} — transcript too short ({len(transcript_tail or '')} chars)")
+        logger.info(
+            f"AutoName: skipping {instance_id} — transcript too short ({len(transcript_tail or '')} chars)"
+        )
         return
 
     if minimax_limiter.remaining < 3:
-        logger.warning(f"AutoName: skipping {instance_id} — MiniMax budget low ({minimax_limiter.remaining})")
+        logger.warning(
+            f"AutoName: skipping {instance_id} — MiniMax budget low ({minimax_limiter.remaining})"
+        )
         return
 
     # Blocklist: meta/format names MiniMax parrots from prompt instructions
-    _name_blocklist = {"kebab-case", "example-name", "session-name", "coding-session",
-                       "test-name", "name-here", "your-name", "my-name", "new-name"}
+    _name_blocklist = {
+        "kebab-case",
+        "example-name",
+        "session-name",
+        "coding-session",
+        "test-name",
+        "name-here",
+        "your-name",
+        "my-name",
+        "new-name",
+    }
 
     system_prompt = (
         "Output a single short name for a coding session. "
@@ -10867,7 +11961,10 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
         if device_id == LOCAL_DEVICE_NAME:
             for cmd in cmds:
                 proc = await asyncio.create_subprocess_exec(
-                    "claude-cmd", "--pane", tmux_pane, cmd,
+                    "claude-cmd",
+                    "--pane",
+                    tmux_pane,
+                    cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -10889,7 +11986,7 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
 
 async def _run_stop_evaluators(
     instance_id: str,
-    session_doc_id: Optional[int],
+    session_doc_id: int | None,
     transcript_tail: str,
     tab_name: str,
 ) -> None:
@@ -10902,7 +11999,9 @@ async def _run_stop_evaluators(
     # Loop prevention: skip if recently nudged
     last_nudge = _recently_nudged.get(instance_id, 0)
     if time.time() - last_nudge < NUDGE_COOLDOWN_SECONDS:
-        logger.info(f"StopEval: skipping {instance_id[:12]} — nudged {int(time.time() - last_nudge)}s ago")
+        logger.info(
+            f"StopEval: skipping {instance_id[:12]} — nudged {int(time.time() - last_nudge)}s ago"
+        )
         return
 
     # Rate limit check
@@ -10970,7 +12069,9 @@ async def _run_stop_evaluators(
             if should_nudge and finding:
                 nudge_evaluator = eval_name
                 nudge_finding = finding
-                logger.info(f"StopEval: jury confirmed {eval_name} for {instance_id[:12]}: {finding[:100]}")
+                logger.info(
+                    f"StopEval: jury confirmed {eval_name} for {instance_id[:12]}: {finding[:100]}"
+                )
                 break
             else:
                 logger.info(f"StopEval: jury cleared {eval_name} for {instance_id[:12]}")
@@ -10978,7 +12079,9 @@ async def _run_stop_evaluators(
     if not nudge_finding:
         # All evaluators passed — transition to idle (stop hook left it as processing)
         _recently_nudged.pop(instance_id, None)
-        (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(missing_ok=True)
+        (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(
+            missing_ok=True
+        )
         async with aiosqlite.connect(DB_PATH) as db:
             try:
                 await sanctioned_update_instance(
@@ -11006,9 +12109,16 @@ async def _run_stop_evaluators(
         audit_section = f"\n\n## Evaluator Finding\n\n**{nudge_evaluator}**: {nudge_finding}\n"
         try:
             subprocess.run(
-                ["obsidian", "vault=Imperium-ENV", "append",
-                 f"path={transcript_rel}", f"content={audit_section}"],
-                capture_output=True, text=True, timeout=15,
+                [
+                    "obsidian",
+                    "vault=Imperium-ENV",
+                    "append",
+                    f"path={transcript_rel}",
+                    f"content={audit_section}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
         except Exception:
             pass
@@ -11027,11 +12137,14 @@ async def _run_stop_evaluators(
 async def _find_latest_transcript(instance_id_short: str) -> str | None:
     """Find the most recent transcript file for an instance (by glob on prefix)."""
     import glob as _glob
+
     pattern = f"Mars/Logs/Transcripts/{instance_id_short}-*.md"
     try:
         result = subprocess.run(
             ["obsidian", "vault=Imperium-ENV", "search", f"query=path:{pattern}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         # Fallback: glob on disk
         disk_pattern = str(Path.home() / "Imperium-ENV" / pattern)
@@ -11046,7 +12159,7 @@ async def _find_latest_transcript(instance_id_short: str) -> str | None:
                 parts = Path(m).parts
                 for i, p in enumerate(parts):
                     if p.lower().endswith("-env"):
-                        return str(Path(*parts[i + 1:]))
+                        return str(Path(*parts[i + 1 :]))
         return None
     except Exception:
         return None
@@ -11062,7 +12175,8 @@ VALID_STATUS_TRANSITIONS = {
     "archived": set(),  # terminal
 }
 
-async def get_primarch_from_db(db, name: str) -> Optional[dict]:
+
+async def get_primarch_from_db(db, name: str) -> dict | None:
     """Get a single primarch from the DB by name or alias."""
     db.row_factory = aiosqlite.Row
     cursor = await db.execute("SELECT * FROM primarchs WHERE name = ?", (name,))
@@ -11113,14 +12227,15 @@ async def _handle_orphan_doc(doc_id: int) -> None:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
-            (doc_id,)
+            "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?", (doc_id,)
         )
         count = (await cursor.fetchone())[0]
         if count > 0:
             return
 
-        cursor = await db.execute("SELECT file_path, title, status FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT file_path, title, status FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             return
@@ -11131,14 +12246,16 @@ async def _handle_orphan_doc(doc_id: int) -> None:
 
         # completed / deployment docs are in the pipeline — don't touch them
         if status in ("completed", "deployment"):
-            logger.info(f"Orphan cleanup: doc {doc_id} ({row[1]}) is {status}, leaving for Administratum")
+            logger.info(
+                f"Orphan cleanup: doc {doc_id} ({row[1]}) is {status}, leaving for Administratum"
+            )
             return
 
         # processed docs can be archived
         if status == "processed":
             await db.execute(
                 "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
-                (now, doc_id)
+                (now, doc_id),
             )
             await db.commit()
             logger.info(f"Orphan cleanup: archived processed session doc {doc_id} ({row[1]})")
@@ -11158,13 +12275,16 @@ async def _handle_orphan_doc(doc_id: int) -> None:
             # Has content — transition to completed (enters deployment pipeline)
             await db.execute(
                 "UPDATE session_documents SET status = 'completed', updated_at = ? WHERE id = ?",
-                (now, doc_id)
+                (now, doc_id),
             )
             await db.commit()
-            logger.info(f"Orphan cleanup: completed edited session doc {doc_id} ({row[1]}) — ready for deployment")
+            logger.info(
+                f"Orphan cleanup: completed edited session doc {doc_id} ({row[1]}) — ready for deployment"
+            )
 
 
 # ============ Session Document Endpoints ============
+
 
 @app.post("/api/session-docs")
 async def create_session_doc(request: SessionDocCreateRequest):
@@ -11185,7 +12305,7 @@ async def create_session_doc(request: SessionDocCreateRequest):
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, primarch_name, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, 'active', ?, ?)""",
-            (request.title, str(fp), request.project, request.primarch_name, now, now)
+            (request.title, str(fp), request.project, request.primarch_name, now, now),
         )
         doc_id = cursor.lastrowid
 
@@ -11194,29 +12314,39 @@ async def create_session_doc(request: SessionDocCreateRequest):
             # Unlink any existing active doc for this primarch
             await db.execute(
                 "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
-                (now, request.primarch_name)
+                (now, request.primarch_name),
             )
             await db.execute(
                 "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
-                (request.primarch_name, doc_id, now)
+                (request.primarch_name, doc_id, now),
             )
 
         await db.commit()
 
     create_session_doc_file(fp, request.title, doc_id, request.project, request.primarch_name)
 
-    await log_event("session_doc_created", details={
-        "doc_id": doc_id, "title": request.title, "file_path": str(fp),
-        "primarch_name": request.primarch_name
-    })
+    await log_event(
+        "session_doc_created",
+        details={
+            "doc_id": doc_id,
+            "title": request.title,
+            "file_path": str(fp),
+            "primarch_name": request.primarch_name,
+        },
+    )
     logger.info(f"Created session doc {doc_id}: {request.title} -> {fp}")
 
-    return {"id": doc_id, "title": request.title, "file_path": str(fp), "status": "active",
-            "primarch_name": request.primarch_name}
+    return {
+        "id": doc_id,
+        "title": request.title,
+        "file_path": str(fp),
+        "status": "active",
+        "primarch_name": request.primarch_name,
+    }
 
 
 @app.get("/api/session-docs")
-async def list_session_docs(status: Optional[str] = None, project: Optional[str] = None):
+async def list_session_docs(status: str | None = None, project: str | None = None):
     """List session documents with optional filters."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -11239,8 +12369,7 @@ async def list_session_docs(status: Optional[str] = None, project: Optional[str]
             doc = dict(row)
             # Count linked instances
             cnt_cursor = await db.execute(
-                "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
-                (row["id"],)
+                "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?", (row["id"],)
             )
             doc["linked_instances"] = (await cnt_cursor.fetchone())[0]
             docs.append(doc)
@@ -11275,7 +12404,7 @@ async def get_session_doc(doc_id: int):
         # Get linked instances
         cursor = await db.execute(
             "SELECT id, tab_name, status, working_dir FROM claude_instances WHERE session_doc_id = ?",
-            (doc_id,)
+            (doc_id,),
         )
         instances = [dict(r) for r in await cursor.fetchall()]
         doc["instances"] = instances
@@ -11287,7 +12416,9 @@ async def get_session_doc(doc_id: int):
 async def get_session_doc_content(doc_id: int):
     """Read the actual markdown file content of a session document."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
@@ -11303,7 +12434,9 @@ async def get_session_doc_content(doc_id: int):
 async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
     """Update session document metadata."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, status FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT id, status FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
@@ -11323,7 +12456,7 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
             if request.status != "archived" and request.status not in valid_targets:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid status transition: {current_status} → {request.status}. Valid: {valid_targets | {'archived'}}"
+                    detail=f"Invalid status transition: {current_status} → {request.status}. Valid: {valid_targets | {'archived'}}",
                 )
             updates.append("status = ?")
             params.append(request.status)
@@ -11335,10 +12468,7 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         params.append(datetime.now().isoformat())
         params.append(doc_id)
 
-        await db.execute(
-            f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?",
-            params
-        )
+        await db.execute(f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?", params)
         await db.commit()
 
     logger.info(f"Updated session doc {doc_id}: {updates}")
@@ -11349,7 +12479,9 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
 async def delete_session_doc(doc_id: int, hard: bool = False):
     """Delete a session document. Default is soft delete (archive). Use ?hard=true for hard delete."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
@@ -11382,13 +12514,15 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             if fp.exists():
                 fp.unlink()
 
-            await log_event("session_doc_deleted", details={"doc_id": doc_id, "title": row[1], "hard": True})
+            await log_event(
+                "session_doc_deleted", details={"doc_id": doc_id, "title": row[1], "hard": True}
+            )
             logger.info(f"Hard deleted session doc {doc_id}: {row[1]}")
             return {"id": doc_id, "deleted": True, "hard": True}
         else:
             await db.execute(
                 "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
-                (datetime.now().isoformat(), doc_id)
+                (datetime.now().isoformat(), doc_id),
             )
             await db.commit()
 
@@ -11401,7 +12535,9 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
 async def merge_into_session_doc(doc_id: int, request: SessionDocMergeRequest):
     """Intelligently merge content into a session document using LLM."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, "Session document not found")
@@ -11413,7 +12549,7 @@ async def merge_into_session_doc(doc_id: int, request: SessionDocMergeRequest):
     current_content = fp.read_text()
     context_hint = f"\nContext: {request.context}" if request.context else ""
 
-    system_prompt = f"""You are a document editor for a session planning document. You will receive the current document and new content to merge in.
+    system_prompt = """You are a document editor for a session planning document. You will receive the current document and new content to merge in.
 
 Rules:
 - If the new content is an activity update or progress note, add it to the Activity Log section as a new entry with today's date and time.
@@ -11456,13 +12592,18 @@ Return the complete updated document."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE session_documents SET updated_at = ? WHERE id = ?",
-                (datetime.now().isoformat(), doc_id)
+                (datetime.now().isoformat(), doc_id),
             )
             await db.commit()
 
-        await log_event("session_doc_merged", details={
-            "doc_id": doc_id, "source": request.source, "content_length": len(request.content)
-        })
+        await log_event(
+            "session_doc_merged",
+            details={
+                "doc_id": doc_id,
+                "source": request.source,
+                "content_length": len(request.content),
+            },
+        )
         return {"status": "merged", "doc_id": doc_id, "source": request.source}
 
     except HTTPException:
@@ -11473,6 +12614,7 @@ Return the complete updated document."""
 
 
 # ============ Instance-Doc Linking Endpoints ============
+
 
 @app.post("/api/instances/{instance_id}/assign-doc")
 async def assign_doc_to_instance(instance_id: str, doc_id: int):
@@ -11512,13 +12654,21 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
                     "workflow_state": workflow_state,
                     "event_type": "continuity_binding_changed",
                     "event_owner": "api",
-                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": doc_id, "continuity_binding_source": "manual"},
+                    "details": {
+                        "old_session_doc_id": old_doc_id,
+                        "new_session_doc_id": doc_id,
+                        "continuity_binding_source": "manual",
+                    },
                 },
                 {
                     "workflow_state": workflow_state,
                     "event_type": "session_doc_bound",
                     "event_owner": "api",
-                    "details": {"session_doc_id": doc_id, "session_doc_policy": "manual_assigned", "continuity_binding_source": "manual"},
+                    "details": {
+                        "session_doc_id": doc_id,
+                        "session_doc_policy": "manual_assigned",
+                        "continuity_binding_source": "manual",
+                    },
                 },
             ],
         )
@@ -11566,7 +12716,13 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
                VALUES (?, ?, ?, 'active', ?, ?)""",
-            (request.title, str(fp), request.project, datetime.now().isoformat(), datetime.now().isoformat())
+            (
+                request.title,
+                str(fp),
+                request.project,
+                datetime.now().isoformat(),
+                datetime.now().isoformat(),
+            ),
         )
         doc_id = cursor.lastrowid
 
@@ -11587,13 +12743,21 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
                     "workflow_state": workflow_state,
                     "event_type": "continuity_binding_changed",
                     "event_owner": "api",
-                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": doc_id, "continuity_binding_source": "manual"},
+                    "details": {
+                        "old_session_doc_id": old_doc_id,
+                        "new_session_doc_id": doc_id,
+                        "continuity_binding_source": "manual",
+                    },
                 },
                 {
                     "workflow_state": workflow_state,
                     "event_type": "session_doc_bound",
                     "event_owner": "api",
-                    "details": {"session_doc_id": doc_id, "session_doc_policy": "manual_created", "continuity_binding_source": "manual"},
+                    "details": {
+                        "session_doc_id": doc_id,
+                        "session_doc_policy": "manual_created",
+                        "continuity_binding_source": "manual",
+                    },
                 },
             ],
         )
@@ -11605,12 +12769,25 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     if old_doc_id:
         await _handle_orphan_doc(old_doc_id)
 
-    await log_event("session_doc_created", instance_id=instance_id, details={
-        "doc_id": doc_id, "title": request.title, "file_path": str(fp), "auto_assigned": True
-    })
+    await log_event(
+        "session_doc_created",
+        instance_id=instance_id,
+        details={
+            "doc_id": doc_id,
+            "title": request.title,
+            "file_path": str(fp),
+            "auto_assigned": True,
+        },
+    )
     logger.info(f"Created session doc {doc_id}: {request.title} and assigned to {instance_id}")
 
-    return {"id": doc_id, "title": request.title, "file_path": str(fp), "instance_id": instance_id, "status": "active"}
+    return {
+        "id": doc_id,
+        "title": request.title,
+        "file_path": str(fp),
+        "instance_id": instance_id,
+        "status": "active",
+    }
 
 
 @app.delete("/api/instances/{instance_id}/unassign-doc")
@@ -11628,7 +12805,11 @@ async def unassign_doc_from_instance(instance_id: str):
         old_doc_id = inst_row[1]
         workflow_state = inst_row[2]
         if not old_doc_id:
-            return {"instance_id": instance_id, "unassigned": False, "reason": "No doc was assigned"}
+            return {
+                "instance_id": instance_id,
+                "unassigned": False,
+                "reason": "No doc was assigned",
+            }
 
         await sanctioned_update_instance(
             db,
@@ -11646,7 +12827,11 @@ async def unassign_doc_from_instance(instance_id: str):
                     "workflow_state": workflow_state,
                     "event_type": "continuity_binding_changed",
                     "event_owner": "api",
-                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": None, "continuity_binding_source": None},
+                    "details": {
+                        "old_session_doc_id": old_doc_id,
+                        "new_session_doc_id": None,
+                        "continuity_binding_source": None,
+                    },
                 },
             ],
         )
@@ -11655,7 +12840,9 @@ async def unassign_doc_from_instance(instance_id: str):
     # Handle orphan cleanup
     await _handle_orphan_doc(old_doc_id)
 
-    await log_event("session_doc_unassigned", instance_id=instance_id, details={"doc_id": old_doc_id})
+    await log_event(
+        "session_doc_unassigned", instance_id=instance_id, details={"doc_id": old_doc_id}
+    )
     logger.info(f"Unassigned instance {instance_id} from session doc {old_doc_id}")
 
     return {"instance_id": instance_id, "doc_id": old_doc_id, "unassigned": True}
@@ -11666,8 +12853,7 @@ async def get_instance_session_doc(instance_id: str):
     """Get the session document linked to this instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT session_doc_id FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            "SELECT session_doc_id FROM claude_instances WHERE id = ?", (instance_id,)
         )
         row = await cursor.fetchone()
         if not row:
@@ -11676,10 +12862,7 @@ async def get_instance_session_doc(instance_id: str):
             return {"session_doc_id": None}
 
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM session_documents WHERE id = ?",
-            (row[0],)
-        )
+        cursor = await db.execute("SELECT * FROM session_documents WHERE id = ?", (row[0],))
         doc = await cursor.fetchone()
         if not doc:
             return {"session_doc_id": None}
@@ -11687,6 +12870,7 @@ async def get_instance_session_doc(instance_id: str):
 
 
 # ============ Primarch Endpoints ============
+
 
 @app.get("/api/primarchs")
 async def list_primarchs():
@@ -11698,28 +12882,33 @@ async def list_primarchs():
             # Get active doc link
             cursor = await db.execute(
                 "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-                (p["name"],)
+                (p["name"],),
             )
             link_row = await cursor.fetchone()
             active_doc = None
             if link_row:
                 db.row_factory = aiosqlite.Row
-                cursor = await db.execute("SELECT id, title, file_path, status FROM session_documents WHERE id = ?", (link_row[0],))
+                cursor = await db.execute(
+                    "SELECT id, title, file_path, status FROM session_documents WHERE id = ?",
+                    (link_row[0],),
+                )
                 doc_row = await cursor.fetchone()
                 if doc_row:
                     active_doc = dict(doc_row)
                 db.row_factory = None
 
-            result.append({
-                "name": p["name"],
-                "title": p["title"],
-                "aliases": p["aliases"],
-                "vault": p["vault"],
-                "role": p["role"],
-                "instance_name_prefix": p["instance_name_prefix"],
-                "vault_note_path": p.get("vault_note_path"),
-                "active_doc": active_doc,
-            })
+            result.append(
+                {
+                    "name": p["name"],
+                    "title": p["title"],
+                    "aliases": p["aliases"],
+                    "vault": p["vault"],
+                    "role": p["role"],
+                    "instance_name_prefix": p["instance_name_prefix"],
+                    "vault_note_path": p.get("vault_note_path"),
+                    "active_doc": active_doc,
+                }
+            )
     return {"primarchs": result}
 
 
@@ -11733,13 +12922,16 @@ async def get_primarch(name: str):
         # Get active doc
         cursor = await db.execute(
             "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-            (p["name"],)
+            (p["name"],),
         )
         link_row = await cursor.fetchone()
         active_doc = None
         if link_row:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT id, title, file_path, status FROM session_documents WHERE id = ?", (link_row[0],))
+            cursor = await db.execute(
+                "SELECT id, title, file_path, status FROM session_documents WHERE id = ?",
+                (link_row[0],),
+            )
             doc_row = await cursor.fetchone()
             if doc_row:
                 active_doc = dict(doc_row)
@@ -11757,7 +12949,7 @@ async def get_primarch_active_doc(name: str):
             name = p["name"]
         cursor = await db.execute(
             "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-            (name,)
+            (name,),
         )
         link_row = await cursor.fetchone()
         if not link_row:
@@ -11773,11 +12965,13 @@ async def get_primarch_active_doc(name: str):
 
 
 class PrimarchLinkDocRequest(BaseModel):
-    title: Optional[str] = None
+    title: str | None = None
 
 
 @app.post("/api/primarchs/{name}/link-doc")
-async def link_primarch_doc(name: str, doc_id: Optional[int] = None, request: PrimarchLinkDocRequest = None):
+async def link_primarch_doc(
+    name: str, doc_id: int | None = None, request: PrimarchLinkDocRequest = None
+):
     """Link a primarch to a session doc. If doc_id query param given, link existing. If body has title, create new + link."""
     now = datetime.now().isoformat()
 
@@ -11791,7 +12985,7 @@ async def link_primarch_doc(name: str, doc_id: Optional[int] = None, request: Pr
             # Set primarch_name on the doc
             await db.execute(
                 "UPDATE session_documents SET primarch_name = ?, updated_at = ? WHERE id = ?",
-                (name, now, doc_id)
+                (name, now, doc_id),
             )
         elif request and request.title:
             # Create new doc + link
@@ -11803,7 +12997,7 @@ async def link_primarch_doc(name: str, doc_id: Optional[int] = None, request: Pr
             cursor = await db.execute(
                 """INSERT INTO session_documents (title, file_path, primarch_name, status, created_at, updated_at)
                    VALUES (?, ?, ?, 'active', ?, ?)""",
-                (request.title, str(fp), name, now, now)
+                (request.title, str(fp), name, now, now),
             )
             target_doc_id = cursor.lastrowid
             create_session_doc_file(fp, request.title, target_doc_id, primarch_name=name)
@@ -11813,12 +13007,12 @@ async def link_primarch_doc(name: str, doc_id: Optional[int] = None, request: Pr
         # Unlink previous active doc
         await db.execute(
             "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
-            (now, name)
+            (now, name),
         )
         # Create new link
         await db.execute(
             "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
-            (name, target_doc_id, now)
+            (name, target_doc_id, now),
         )
         await db.commit()
 
@@ -11834,7 +13028,7 @@ async def unlink_primarch_doc(name: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-            (name,)
+            (name,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -11843,11 +13037,11 @@ async def unlink_primarch_doc(name: str):
         doc_id = row[0]
         await db.execute(
             "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
-            (now, name)
+            (now, name),
         )
         await db.execute(
             "UPDATE session_documents SET primarch_name = NULL, updated_at = ? WHERE id = ?",
-            (now, doc_id)
+            (now, doc_id),
         )
         await db.commit()
 
@@ -11858,11 +13052,14 @@ async def unlink_primarch_doc(name: str):
 
 # ============ Deployment Lifecycle Endpoints ============
 
+
 @app.post("/api/session-docs/{doc_id}/deploy")
 async def deploy_session_doc(doc_id: int):
     """Transition a completed session doc to deployment status."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, status, title FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT id, status, title FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, f"Session doc {doc_id} not found")
@@ -11872,7 +13069,7 @@ async def deploy_session_doc(doc_id: int):
         now = datetime.now().isoformat()
         await db.execute(
             "UPDATE session_documents SET status = 'deployment', updated_at = ? WHERE id = ?",
-            (now, doc_id)
+            (now, doc_id),
         )
         await db.commit()
 
@@ -11885,24 +13082,28 @@ async def deploy_session_doc(doc_id: int):
 async def mark_session_doc_processed(doc_id: int):
     """Mark a deployment doc as processed by Administratum. Unlinks primarch if linked."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, status, title, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute(
+            "SELECT id, status, title, primarch_name FROM session_documents WHERE id = ?", (doc_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, f"Session doc {doc_id} not found")
         if row[1] != "deployment":
-            raise HTTPException(400, f"Can only mark deployment docs as processed, current status: {row[1]}")
+            raise HTTPException(
+                400, f"Can only mark deployment docs as processed, current status: {row[1]}"
+            )
 
         now = datetime.now().isoformat()
         await db.execute(
             "UPDATE session_documents SET status = 'processed', primarch_name = NULL, updated_at = ? WHERE id = ?",
-            (now, doc_id)
+            (now, doc_id),
         )
 
         # Unlink primarch if this was linked
         if row[3]:
             await db.execute(
                 "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND session_doc_id = ? AND unlinked_at IS NULL",
-                (now, row[3], doc_id)
+                (now, row[3], doc_id),
             )
 
         await db.commit()
@@ -11913,6 +13114,7 @@ async def mark_session_doc_processed(doc_id: int):
 
 
 # ============ MiniMax Status Endpoint ============
+
 
 @app.get("/api/minimax/status")
 async def get_minimax_status():
@@ -11937,7 +13139,7 @@ _FLEET_STATE_DEFAULTS = {
 _LEGACY_STATE_PATH = Path.home() / ".openclaw" / "workspace" / "memory" / "fabricator-state.json"
 
 
-async def _get_fleet_state_row(db: aiosqlite.Connection) -> Optional[dict]:
+async def _get_fleet_state_row(db: aiosqlite.Connection) -> dict | None:
     cursor = await db.execute("SELECT state_json FROM agent_state WHERE id = 'fabricator'")
     row = await cursor.fetchone()
     if row:
@@ -12031,6 +13233,7 @@ async def reset_fleet_state():
 
 # ============ Habit Tracker Endpoints ============
 
+
 @app.get("/api/habits/definitions")
 async def get_habit_definitions():
     """Return all active habit definitions with their windows."""
@@ -12049,14 +13252,17 @@ async def get_habits_today():
     today = datetime.now().strftime("%Y-%m-%d")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             SELECT h.id, h.name, h.category, h.window_start_hour, h.window_end_hour, h.notes,
                    hc.completed_at, hc.notes AS completion_notes
             FROM habits h
             LEFT JOIN habit_completions hc ON hc.habit_id = h.id AND hc.date = ?
             WHERE h.active = 1
             ORDER BY h.window_start_hour, h.category, h.id
-        """, (today,))
+        """,
+            (today,),
+        )
         rows = await cursor.fetchall()
 
     habits = []
@@ -12069,7 +13275,11 @@ async def get_habits_today():
     return {
         "date": today,
         "habits": habits,
-        "summary": {"total": len(habits), "completed": completed_count, "pending": len(habits) - completed_count},
+        "summary": {
+            "total": len(habits),
+            "completed": completed_count,
+            "pending": len(habits) - completed_count,
+        },
     }
 
 
@@ -12090,21 +13300,25 @@ async def mark_habit_today(habit_id: str, body: dict = None):
 
     async with aiosqlite.connect(DB_PATH) as db:
         # Verify habit exists
-        cursor = await db.execute("SELECT id, name FROM habits WHERE id = ? AND active = 1", (habit_id,))
+        cursor = await db.execute(
+            "SELECT id, name FROM habits WHERE id = ? AND active = 1", (habit_id,)
+        )
         habit = await cursor.fetchone()
         if not habit:
             raise HTTPException(status_code=404, detail=f"Habit '{habit_id}' not found")
 
         if completed:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO habit_completions (habit_id, date, notes)
                 VALUES (?, ?, ?)
                 ON CONFLICT(habit_id, date) DO UPDATE SET completed_at = CURRENT_TIMESTAMP, notes = excluded.notes
-            """, (habit_id, today, notes))
+            """,
+                (habit_id, today, notes),
+            )
         else:
             await db.execute(
-                "DELETE FROM habit_completions WHERE habit_id = ? AND date = ?",
-                (habit_id, today)
+                "DELETE FROM habit_completions WHERE habit_id = ? AND date = ?", (habit_id, today)
             )
         await db.commit()
 
@@ -12149,13 +13363,16 @@ async def get_state():
         processing_count = row[0] if row else 0
 
         # Habits
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             SELECT h.window_start_hour, h.window_end_hour,
                    hc.completed_at
             FROM habits h
             LEFT JOIN habit_completions hc ON hc.habit_id = h.id AND hc.date = ?
             WHERE h.active = 1
-        """, (today,))
+        """,
+            (today,),
+        )
         habit_rows = await cursor.fetchall()
 
     total_habits = len(habit_rows)
@@ -12204,4 +13421,5 @@ hooks_init_deps(
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)

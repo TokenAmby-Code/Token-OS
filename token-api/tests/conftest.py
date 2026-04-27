@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 _MODULES_TO_RELOAD = [
     "shared",
     "routes.voice",

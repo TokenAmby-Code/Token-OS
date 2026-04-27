@@ -7,13 +7,12 @@ State dicts live here; both main.py and routes/* import from this module.
 Phase 2 will convert these raw dicts into TypedDicts/dataclasses.
 """
 
-import os
 import json
-import time
-import random
 import logging
+import os
+import random
+import time
 from pathlib import Path
-from typing import Optional
 
 import aiosqlite
 
@@ -36,21 +35,101 @@ STASH_MAX_AGE_HOURS = 24
 # ============ Voice Profiles ============
 
 PROFILES = [
-    {"name": "profile_1", "wsl_voice": "Microsoft George",    "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#66cccc", "cc_color": "cyan"},     # UK M
-    {"name": "profile_2", "wsl_voice": "Microsoft Susan",     "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "notify.wav", "color": "#ff66cc", "cc_color": "pink"},     # UK F
-    {"name": "profile_3", "wsl_voice": "Microsoft Catherine",  "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "ding.wav",   "color": "#ffcc00", "cc_color": "yellow"},   # AU F
-    {"name": "profile_5", "wsl_voice": "Microsoft Sean",      "wsl_rate": 0, "mac_voice": "Moira",  "notification_sound": "chord.wav",  "color": "#ff9900", "cc_color": "orange"},   # IE M
-    {"name": "profile_7", "wsl_voice": "Microsoft Heera",     "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "chimes.wav", "color": "#cc66ff", "cc_color": "purple"},   # IN F
-    {"name": "profile_8", "wsl_voice": "Microsoft Ravi",      "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "notify.wav", "color": "#ff6666", "cc_color": "red"},      # IN M
+    {
+        "name": "profile_1",
+        "wsl_voice": "Microsoft George",
+        "wsl_rate": 2,
+        "mac_voice": "Daniel",
+        "notification_sound": "chimes.wav",
+        "color": "#66cccc",
+        "cc_color": "cyan",
+    },  # UK M
+    {
+        "name": "profile_2",
+        "wsl_voice": "Microsoft Susan",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "notify.wav",
+        "color": "#ff66cc",
+        "cc_color": "pink",
+    },  # UK F
+    {
+        "name": "profile_3",
+        "wsl_voice": "Microsoft Catherine",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "ding.wav",
+        "color": "#ffcc00",
+        "cc_color": "yellow",
+    },  # AU F
+    {
+        "name": "profile_5",
+        "wsl_voice": "Microsoft Sean",
+        "wsl_rate": 0,
+        "mac_voice": "Moira",
+        "notification_sound": "chord.wav",
+        "color": "#ff9900",
+        "cc_color": "orange",
+    },  # IE M
+    {
+        "name": "profile_7",
+        "wsl_voice": "Microsoft Heera",
+        "wsl_rate": 1,
+        "mac_voice": "Rishi",
+        "notification_sound": "chimes.wav",
+        "color": "#cc66ff",
+        "cc_color": "purple",
+    },  # IN F
+    {
+        "name": "profile_8",
+        "wsl_voice": "Microsoft Ravi",
+        "wsl_rate": 1,
+        "mac_voice": "Rishi",
+        "notification_sound": "notify.wav",
+        "color": "#ff6666",
+        "cc_color": "red",
+    },  # IN M
 ]
 
 FALLBACK_VOICES = [
-    {"name": "fallback_1", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#888888", "cc_color": "default"},
-    {"name": "fallback_2", "wsl_voice": "Microsoft Zira",  "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "chord.wav",  "color": "#999999", "cc_color": "default"},
-    {"name": "fallback_3", "wsl_voice": "Microsoft Mark",  "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "recycle.wav","color": "#aaaaaa", "cc_color": "default"},
+    {
+        "name": "fallback_1",
+        "wsl_voice": "Microsoft David",
+        "wsl_rate": 1,
+        "mac_voice": "Daniel",
+        "notification_sound": "tada.wav",
+        "color": "#888888",
+        "cc_color": "default",
+    },
+    {
+        "name": "fallback_2",
+        "wsl_voice": "Microsoft Zira",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "chord.wav",
+        "color": "#999999",
+        "cc_color": "default",
+    },
+    {
+        "name": "fallback_3",
+        "wsl_voice": "Microsoft Mark",
+        "wsl_rate": 1,
+        "mac_voice": "Daniel",
+        "notification_sound": "recycle.wav",
+        "color": "#aaaaaa",
+        "cc_color": "default",
+    },
 ]
 
-ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#666666", "cc_color": "default"}
+ULTIMATE_FALLBACK = {
+    "name": "fallback_david",
+    "wsl_voice": "Microsoft David",
+    "wsl_rate": 1,
+    "mac_voice": "Daniel",
+    "notification_sound": "chimes.wav",
+    "color": "#666666",
+    "cc_color": "default",
+}
 
 
 def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:
@@ -91,10 +170,10 @@ DESKTOP_CONFIG = {
 
 # TTS backend routing state (WSL-first with Mac fallback)
 TTS_BACKEND = {
-    "current": None,          # "wsl" | "mac" | None — what's currently speaking
+    "current": None,  # "wsl" | "mac" | None — what's currently speaking
     "satellite_available": None,  # True/False/None (unknown)
     "last_health_check": 0,
-    "health_check_ttl": 30,   # Re-probe satellite every 30s
+    "health_check_ttl": 30,  # Re-probe satellite every 30s
 }
 
 # Global TTS mute state (in-memory, resets to "verbose" on server restart)
@@ -108,8 +187,10 @@ def is_satellite_tts_available() -> bool:
     import requests
 
     now = time.time()
-    if (TTS_BACKEND["satellite_available"] is not None
-            and now - TTS_BACKEND["last_health_check"] < TTS_BACKEND["health_check_ttl"]):
+    if (
+        TTS_BACKEND["satellite_available"] is not None
+        and now - TTS_BACKEND["last_health_check"] < TTS_BACKEND["health_check_ttl"]
+    ):
         return TTS_BACKEND["satellite_available"]
 
     host = DESKTOP_CONFIG["host"]
@@ -132,9 +213,9 @@ PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
     "port": 7777,
     "timeout": 2,
-    "reachable": None,          # True/False/None (unknown)
+    "reachable": None,  # True/False/None (unknown)
     "last_health_check": 0,
-    "health_check_ttl": 30,     # Re-probe phone every 30s
+    "health_check_ttl": 30,  # Re-probe phone every 30s
 }
 
 
@@ -143,8 +224,10 @@ def is_phone_reachable() -> bool:
     import requests
 
     now = time.time()
-    if (PHONE_TTS_CONFIG["reachable"] is not None
-            and now - PHONE_TTS_CONFIG["last_health_check"] < PHONE_TTS_CONFIG["health_check_ttl"]):
+    if (
+        PHONE_TTS_CONFIG["reachable"] is not None
+        and now - PHONE_TTS_CONFIG["last_health_check"] < PHONE_TTS_CONFIG["health_check_ttl"]
+    ):
         return PHONE_TTS_CONFIG["reachable"]
 
     host = PHONE_TTS_CONFIG["host"]
@@ -189,9 +272,9 @@ PHONE_STATE = {
 }
 
 PHONE_HEARTBEAT = {
-    "last_seen": None,      # datetime (UTC) or None
+    "last_seen": None,  # datetime (UTC) or None
     "device_id": None,
-    "alert_state": None,    # None, "beep", "zap"
+    "alert_state": None,  # None, "beep", "zap"
 }
 
 PAVLOK_CONFIG = {
@@ -246,25 +329,25 @@ DICTATION_STATE = {"active": False, "updated_at": None}
 
 # Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
 PEDAL_STATE = {
-    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
-    "enter_queued": False,          # enter waiting for dictation buffer to expire
-    "queued_task": None,            # asyncio.Task for delayed enter send
-    "bypass_active": False,         # single-tap bypass window after buffered enter
-    "bypass_start": 0.0,           # when bypass window started
+    "last_tap_time": 0.0,  # monotonic time of last left-pedal tap
+    "enter_queued": False,  # enter waiting for dictation buffer to expire
+    "queued_task": None,  # asyncio.Task for delayed enter send
+    "bypass_active": False,  # single-tap bypass window after buffered enter
+    "bypass_start": 0.0,  # when bypass window started
 }
-PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
-PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
-PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
+PEDAL_DOUBLE_TAP_MS = 500  # double-tap window
+PEDAL_BUFFER_MS = 1.0  # seconds to wait after dictation ends before sending queued enter
+PEDAL_BYPASS_MS = 10.0  # seconds of single-tap bypass after buffered enter
 
 
 # ============ Device Resolution ============
 
 DEVICE_IPS = {
-    "100.102.92.24": "Token-S24",    # Phone
-    "100.69.198.87": "TokenPC",      # Windows PC
-    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
-    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
-    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
+    "100.102.92.24": "Token-S24",  # Phone
+    "100.69.198.87": "TokenPC",  # Windows PC
+    "100.66.10.74": "TokenPC",  # WSL (same physical machine)
+    "100.95.109.23": "Mac-Mini",  # Mac Mini (Tailscale)
+    "127.0.0.1": "Mac-Mini",  # Mac Mini (localhost)
 }
 
 LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
@@ -282,6 +365,7 @@ def is_local_device(device_id: str) -> bool:
 
 # ============ Process Utilities ============
 
+
 def is_pid_claude(pid: int) -> bool:
     """Check if the given PID belongs to a claude process."""
     try:
@@ -291,7 +375,7 @@ def is_pid_claude(pid: int) -> bool:
         return False
 
 
-def get_parent_pid(pid: int) -> Optional[int]:
+def get_parent_pid(pid: int) -> int | None:
     """Get the parent PID of a process from /proc/<pid>/stat."""
     try:
         with open(f"/proc/{pid}/stat") as f:
@@ -314,24 +398,29 @@ DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 
 # ============ Event Logging ============
 
-async def log_event(event_type: str, instance_id: str = None, device_id: str = None, details: dict = None):
+
+async def log_event(
+    event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
+):
     """Log an event to the events table."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO events (event_type, instance_id, device_id, details)
                VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None)
+            (event_type, instance_id, device_id, json.dumps(details) if details else None),
         )
         await db.commit()
 
 
-async def log_event_sync(event_type: str, instance_id: str = None, device_id: str = None, details: dict = None):
+async def log_event_sync(
+    event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
+):
     """Synchronous wrapper for logging events (for use in sync functions)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO events (event_type, instance_id, device_id, details)
                VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None)
+            (event_type, instance_id, device_id, json.dumps(details) if details else None),
         )
         await db.commit()
 
@@ -363,17 +452,20 @@ async def append_workflow_event(
 # Set by main.py after module-level initialization.
 # hooks.py and other route modules import via `import shared; shared.timer_engine.xxx`
 # instead of reaching back through the _main() lazy import.
-timer_engine = None   # token_api.timer.TimerEngine
-scheduler = None      # apscheduler.schedulers.asyncio.AsyncIOScheduler
+timer_engine = None  # token_api.timer.TimerEngine
+scheduler = None  # apscheduler.schedulers.asyncio.AsyncIOScheduler
 
 
 # ============ Timer Analytics ============
 
-def _sync_log_shift(old_mode, new_mode: str, trigger: str, source: str,
-                    phone_app=None, details=None):
+
+def _sync_log_shift(
+    old_mode, new_mode: str, trigger: str, source: str, phone_app=None, details=None
+):
     """Log a timer mode shift to the analytics table (sync, for thread offload)."""
     import sqlite3
     from datetime import datetime as _dt
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
 
@@ -386,19 +478,33 @@ def _sync_log_shift(old_mode, new_mode: str, trigger: str, source: str,
         """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
            break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
-         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
-         timer_engine.total_work_time_ms, active_instances, phone_app, details)
+        (
+            _dt.now().isoformat(),
+            old_mode,
+            new_mode,
+            trigger,
+            source,
+            timer_engine.break_balance_ms,
+            abs(min(0, timer_engine.break_balance_ms)),
+            timer_engine.total_work_time_ms,
+            active_instances,
+            phone_app,
+            details,
+        ),
     )
     conn.commit()
     conn.close()
 
 
-async def timer_log_shift(old_mode, new_mode: str, trigger: str, source: str,
-                          phone_app=None, details=None):
+async def timer_log_shift(
+    old_mode, new_mode: str, trigger: str, source: str, phone_app=None, details=None
+):
     """Log a timer mode shift to the analytics table (async wrapper)."""
     import asyncio
+
     try:
-        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
+        await asyncio.to_thread(
+            _sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details
+        )
     except Exception as e:
         print(f"TIMER: Failed to log shift: {e}")

@@ -9,9 +9,9 @@ from .inspect import (
     render_window,
     render_workspace,
 )
-from .planner import build_restart_plan
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
+from .planner import build_restart_plan
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
 

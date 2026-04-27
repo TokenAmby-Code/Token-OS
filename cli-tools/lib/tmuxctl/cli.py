@@ -14,9 +14,7 @@ def _parse_window_ref(value: str, control: TmuxControlPlane) -> tuple[str, int]:
         raw = control.adapter.run("display-message", "-p", "#{window_index}").strip()
         return session, int(raw)
     if ":" not in value:
-        raise argparse.ArgumentTypeError(
-            "window must look like session:index or use 'current'"
-        )
+        raise argparse.ArgumentTypeError("window must look like session:index or use 'current'")
     session_name, raw_index = value.split(":", 1)
     try:
         return session_name, int(raw_index)

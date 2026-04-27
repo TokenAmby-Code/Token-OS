@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 V1_TRIGGERS = {
     "idle_timeout",
     "distraction_timeout",

@@ -5,8 +5,9 @@ instead of reaching back through the _main() lazy import.
 """
 
 import logging
-import requests
 from datetime import datetime
+
+import requests
 
 from shared import DESKTOP_CONFIG, DESKTOP_STATE
 

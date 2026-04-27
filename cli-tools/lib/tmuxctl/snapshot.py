@@ -99,7 +99,9 @@ def _window_warnings(
         if focused:
             focused_sides = sorted({"palace:SL", "palace:SR"} & set(role_counts))
             if focused_sides:
-                warnings.append(f"focused palace should not expose side roles: {', '.join(focused_sides)}")
+                warnings.append(
+                    f"focused palace should not expose side roles: {', '.join(focused_sides)}"
+                )
 
         if not focused and side_expanded == "none":
             side_required = {"palace:SL", "palace:SR"}
@@ -140,7 +142,9 @@ def _window_warnings(
     return tuple(warnings)
 
 
-def build_window_snapshot(adapter: TmuxAdapter, session_name: str, window_index: int) -> WindowSnapshot:
+def build_window_snapshot(
+    adapter: TmuxAdapter, session_name: str, window_index: int
+) -> WindowSnapshot:
     target = f"{session_name}:{window_index}"
     pane_records = adapter.list_panes(target)
     if not pane_records:
@@ -211,7 +215,9 @@ def build_workspace_snapshot(adapter: TmuxAdapter, session_name: str) -> Workspa
     windows = []
     for record in adapter.list_windows(session_name):
         try:
-            windows.append(build_window_snapshot(adapter, session_name, int(record["window_index"])))
+            windows.append(
+                build_window_snapshot(adapter, session_name, int(record["window_index"]))
+            )
         except (TmuxError, ValueError):
             # Stash windows can disappear mid-scan after a retract/normalize.
             continue

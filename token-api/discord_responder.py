@@ -5,12 +5,13 @@ discord_responder.py <channel> <reply_to_message_id> <bot> <prompt_file> [model]
 Invoked by token-api to respond to Discord messages.
 Reads system prompt from file, calls claude CLI, posts response to daemon.
 """
-import sys
-import os
-import subprocess
+
 import json
-import urllib.request
+import os
 import pathlib
+import subprocess
+import sys
+import urllib.request
 
 channel, reply_to, bot, prompt_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 model = sys.argv[5] if len(sys.argv) > 5 else "claude-haiku-4-5-20251001"
@@ -28,9 +29,12 @@ claude_bin = pathlib.Path.home() / ".local" / "bin" / "claude"
 result = subprocess.run(
     [
         str(claude_bin),
-        "--model", model,
-        "--system-prompt", system_prompt,
-        "-p", f"Reply to the Discord message above as the {bot} bot.",
+        "--model",
+        model,
+        "--system-prompt",
+        system_prompt,
+        "-p",
+        f"Reply to the Discord message above as the {bot} bot.",
         "--dangerously-skip-permissions",
     ],
     capture_output=True,
@@ -41,8 +45,12 @@ result = subprocess.run(
 
 response = result.stdout.strip()
 if not response:
-    print(f"discord_responder: no response from claude (rc={result.returncode}, stderr: {result.stderr[:200]})", file=sys.stderr)
+    print(
+        f"discord_responder: no response from claude (rc={result.returncode}, stderr: {result.stderr[:200]})",
+        file=sys.stderr,
+    )
     sys.exit(1)
+
 
 def _send_to_daemon(channel, bot, content, reply_to=None):
     body = {"channel": channel, "bot": bot, "content": content}
@@ -57,6 +65,7 @@ def _send_to_daemon(channel, bot, content, reply_to=None):
     )
     urllib.request.urlopen(req, timeout=10)
 
+
 # Post to daemon
 try:
     _send_to_daemon(channel, bot, response, reply_to)
@@ -65,10 +74,17 @@ except urllib.error.HTTPError as e:
     body = e.read().decode("utf-8", errors="replace")[:200]
     print(f"[discord_responder] HTTP {e.code} from daemon: {body}", file=sys.stderr, flush=True)
     if reply_to and e.code in (400, 404, 500):
-        print("[discord_responder] Retrying without reply_to reference...", file=sys.stderr, flush=True)
+        print(
+            "[discord_responder] Retrying without reply_to reference...",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             _send_to_daemon(channel, bot, response, reply_to=None)
-            print(f"discord_responder: sent {len(response)} chars as {bot} in #{channel} (no reply_to)", file=sys.stderr)
+            print(
+                f"discord_responder: sent {len(response)} chars as {bot} in #{channel} (no reply_to)",
+                file=sys.stderr,
+            )
         except Exception as e2:
             print(f"[discord_responder] Retry also failed: {e2}", file=sys.stderr, flush=True)
             sys.exit(1)

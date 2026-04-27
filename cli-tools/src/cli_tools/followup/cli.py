@@ -37,7 +37,10 @@ def cmd_create(args: argparse.Namespace) -> int:
         )
     else:
         if not args.at:
-            print("Error: one-shot jobs require --at (e.g. --at +4h or --at '2026-02-17 09:00')", file=sys.stderr)
+            print(
+                "Error: one-shot jobs require --at (e.g. --at +4h or --at '2026-02-17 09:00')",
+                file=sys.stderr,
+            )
             return 1
         return create_oneshot(
             prompt=args.prompt,

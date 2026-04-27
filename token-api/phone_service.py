@@ -13,10 +13,10 @@ import requests
 
 from shared import (
     DB_PATH,
-    PHONE_CONFIG,
-    PHONE_STATE,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
+    PHONE_CONFIG,
+    PHONE_STATE,
     log_event,
 )
 
@@ -46,7 +46,9 @@ def _restore_twitter_zap_cooldown():
             if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
                 PHONE_STATE["twitter_zapped"] = True
                 PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
-                print(f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked.")
+                print(
+                    f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked."
+                )
             else:
                 print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
                 TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
@@ -159,10 +161,14 @@ async def check_instance_count_pavlok(remaining_active: int, was_active: int):
     """Send Pavlok signals when Claude instance count drops critically."""
     if remaining_active == 1 and was_active >= 2:
         print(f"INSTANCE COUNT: Dropped to 1 (from {was_active}), double vibe")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 50,
-            "banner_text": f"1 Claude remaining (was {was_active})",
-        })
+        result = await asyncio.to_thread(
+            _send_to_phone,
+            "/notify",
+            {
+                "vibe": 50,
+                "banner_text": f"1 Claude remaining (was {was_active})",
+            },
+        )
         if not result["success"]:
             send_pavlok_stimulus(
                 stimulus_type="vibe",
@@ -182,12 +188,16 @@ async def check_instance_count_pavlok(remaining_active: int, was_active: int):
         await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
     elif remaining_active == 0 and was_active >= 1:
         print("INSTANCE COUNT: All Claude instances stopped, zap")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 80,
-            "beep": 50,
-            "tts_text": "All Claude instances stopped",
-            "banner_text": "All Claudes stopped",
-        })
+        result = await asyncio.to_thread(
+            _send_to_phone,
+            "/notify",
+            {
+                "vibe": 80,
+                "beep": 50,
+                "tts_text": "All Claude instances stopped",
+                "banner_text": "All Claudes stopped",
+            },
+        )
         if not result["success"]:
             send_pavlok_stimulus(
                 stimulus_type="zap",

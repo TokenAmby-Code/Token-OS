@@ -8,7 +8,6 @@ from pathlib import Path
 
 import aiosqlite
 
-
 logger = logging.getLogger("token_api")
 
 SERVICE_VERSION_FALLBACK = "0.1.0"
@@ -494,38 +493,51 @@ def _read_tmux_projection(tmux_pane: str | None) -> dict:
 def _collect_state_findings(row: dict) -> list[dict]:
     findings = []
     if row.get("workflow_state") == "closed" and row.get("status") != "stopped":
-        findings.append({
-            "category": "state_drift",
-            "message": "workflow_state=closed but status is not stopped",
-            "fields": ["workflow_state", "status"],
-        })
+        findings.append(
+            {
+                "category": "state_drift",
+                "message": "workflow_state=closed but status is not stopped",
+                "fields": ["workflow_state", "status"],
+            }
+        )
     if row.get("continuity_binding_source") == "dispatch" and not row.get("session_doc_id"):
-        findings.append({
-            "category": "state_drift",
-            "message": "dispatch continuity binding has no session_doc_id",
-            "fields": ["continuity_binding_source", "session_doc_id"],
-        })
+        findings.append(
+            {
+                "category": "state_drift",
+                "message": "dispatch continuity binding has no session_doc_id",
+                "fields": ["continuity_binding_source", "session_doc_id"],
+            }
+        )
     if row.get("session_doc_policy") == "dispatch_explicit" and not row.get("dispatch_target"):
-        findings.append({
-            "category": "state_drift",
-            "message": "dispatch_explicit policy has no dispatch_target",
-            "fields": ["session_doc_policy", "dispatch_target"],
-        })
+        findings.append(
+            {
+                "category": "state_drift",
+                "message": "dispatch_explicit policy has no dispatch_target",
+                "fields": ["session_doc_policy", "dispatch_target"],
+            }
+        )
     return findings
 
 
-def _current_row_matches_sanctioned_fields(row: dict, mutations: list[dict]) -> tuple[bool, list[str], dict]:
+def _current_row_matches_sanctioned_fields(
+    row: dict, mutations: list[dict]
+) -> tuple[bool, list[str], dict]:
     if not mutations:
         return False, [], {}
     latest_by_field = {}
     for mutation in mutations:
         after = mutation.get("after") or {}
         for field, expected in after.items():
-            latest_by_field.setdefault(field, {
-                "expected": expected,
-                "write_txn_id": mutation.get("write_txn_id"),
-            })
-    mismatches = [field for field, meta in latest_by_field.items() if row.get(field) != meta["expected"]]
+            latest_by_field.setdefault(
+                field,
+                {
+                    "expected": expected,
+                    "write_txn_id": mutation.get("write_txn_id"),
+                },
+            )
+    mismatches = [
+        field for field, meta in latest_by_field.items() if row.get(field) != meta["expected"]
+    ]
     return not mismatches, mismatches, latest_by_field
 
 
@@ -536,21 +548,26 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
 
     mutations = await get_instance_mutations(db, instance_id, limit=10)
     latest = mutations[0] if mutations else None
-    matches_latest, provenance_mismatches, latest_by_field = _current_row_matches_sanctioned_fields(row, mutations)
+    matches_latest, provenance_mismatches, latest_by_field = _current_row_matches_sanctioned_fields(
+        row, mutations
+    )
     findings = []
 
     if latest is None or not matches_latest:
         fields = provenance_mismatches or sorted((latest or {}).get("after", {}).keys())
-        findings.append({
-            "category": "unprovenanced_write",
-            "message": "current instance row diverges from the latest sanctioned mutation" if latest else "instance has no sanctioned mutation history",
-            "fields": fields,
-            "write_txn_id": latest.get("write_txn_id") if latest else None,
-            "field_write_txn_ids": {
-                field: latest_by_field.get(field, {}).get("write_txn_id")
-                for field in fields
-            },
-        })
+        findings.append(
+            {
+                "category": "unprovenanced_write",
+                "message": "current instance row diverges from the latest sanctioned mutation"
+                if latest
+                else "instance has no sanctioned mutation history",
+                "fields": fields,
+                "write_txn_id": latest.get("write_txn_id") if latest else None,
+                "field_write_txn_ids": {
+                    field: latest_by_field.get(field, {}).get("write_txn_id") for field in fields
+                },
+            }
+        )
 
     findings.extend(_collect_state_findings(row))
 
@@ -562,32 +579,40 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
 
     if row.get("tmux_pane"):
         if not observed_projection["pane_exists"]:
-            projection_findings.append({
-                "category": "projection_drift",
-                "message": "instance tmux pane is missing",
-                "fields": ["tmux_pane"],
-            })
+            projection_findings.append(
+                {
+                    "category": "projection_drift",
+                    "message": "instance tmux pane is missing",
+                    "fields": ["tmux_pane"],
+                }
+            )
         else:
             current_cc_state = observed_projection.get("cc_state")
             if current_cc_state != expected_cc_state:
-                projection_findings.append({
-                    "category": "projection_drift",
-                    "message": "pane @CC_STATE does not match instance status",
-                    "fields": ["status"],
-                    "expected": expected_cc_state,
-                    "observed": current_cc_state,
-                })
+                projection_findings.append(
+                    {
+                        "category": "projection_drift",
+                        "message": "pane @CC_STATE does not match instance status",
+                        "fields": ["status"],
+                        "expected": expected_cc_state,
+                        "observed": current_cc_state,
+                    }
+                )
             current_bg = observed_projection.get("pane_bg")
             if current_bg not in {expected_pane_bg, None}:
-                projection_findings.append({
-                    "category": "projection_drift",
-                    "message": "pane legion tint does not match instance legion",
-                    "fields": ["legion"],
-                    "expected": expected_pane_bg,
-                    "observed": current_bg,
-                })
+                projection_findings.append(
+                    {
+                        "category": "projection_drift",
+                        "message": "pane legion tint does not match instance legion",
+                        "fields": ["legion"],
+                        "expected": expected_pane_bg,
+                        "observed": current_bg,
+                    }
+                )
 
-    pending = bool(projection_findings) and (pending_projection["cc_state"] or pending_projection["legion_tint"])
+    pending = bool(projection_findings) and (
+        pending_projection["cc_state"] or pending_projection["legion_tint"]
+    )
     if pending:
         findings.extend(
             {
@@ -614,7 +639,9 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
     return {
         "instance_id": instance_id,
         "status": status,
-        "current_row": {field: row.get(field) for field in sorted(INSTANCE_MUTATION_FIELDS | {"id"})},
+        "current_row": {
+            field: row.get(field) for field in sorted(INSTANCE_MUTATION_FIELDS | {"id"})
+        },
         "latest_sanctioned_mutation": latest,
         "findings": findings,
         "pending_projection": pending_projection,

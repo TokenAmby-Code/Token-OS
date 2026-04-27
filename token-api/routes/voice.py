@@ -13,25 +13,25 @@ Does NOT own:
 - Pedal endpoints (main.py — tightly coupled to pedal state machine)
 """
 
-import random
 import logging
+import random
 from datetime import datetime
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from instance_mutation import sanctioned_update_instance
 
+from instance_mutation import sanctioned_update_instance
 from shared import (
     DB_PATH,
-    log_event,
-    PROFILES,
-    FALLBACK_VOICES,
-    get_next_available_profile,
-    VOICE_CHAT_SESSIONS,
     DICTATION_STATE,
-    PEDAL_STATE,
+    FALLBACK_VOICES,
     PEDAL_BUFFER_MS,
+    PEDAL_STATE,
+    PROFILES,
+    VOICE_CHAT_SESSIONS,
+    get_next_available_profile,
+    log_event,
 )
 
 logger = logging.getLogger("token_api")
@@ -58,11 +58,13 @@ def init_deps(*, schedule_pedal_enter=None):
 
 # ============ Pydantic Models ============
 
+
 class VoiceChangeRequest(BaseModel):
     voice: str
 
 
 # ============ Voice Profile Helpers ============
+
 
 def find_voice_linear_probe(used_voices: set) -> str | None:
     """Find an available WSL voice using random offset + linear probe.
@@ -90,6 +92,7 @@ def find_voice_linear_probe(used_voices: set) -> str | None:
 
 # ============ Voice Management Endpoints ============
 
+
 @router.get("/api/voices")
 async def list_voices():
     """List all available TTS voices from the profile pool."""
@@ -99,13 +102,15 @@ async def list_voices():
         wsl_voice = profile["wsl_voice"]
         short_name = wsl_voice.replace("Microsoft ", "")
         is_fallback = profile in FALLBACK_VOICES
-        voices.append({
-            "voice": wsl_voice,
-            "mac_voice": profile["mac_voice"],
-            "short_name": short_name,
-            "profile_name": profile["name"],
-            "fallback": is_fallback,
-        })
+        voices.append(
+            {
+                "voice": wsl_voice,
+                "mac_voice": profile["mac_voice"],
+                "short_name": short_name,
+                "profile_name": profile["name"],
+                "fallback": is_fallback,
+            }
+        )
     return {"voices": voices}
 
 
@@ -120,8 +125,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     all_voices = {p["wsl_voice"] for p in PROFILES + FALLBACK_VOICES}
     if request.voice not in all_voices:
         raise HTTPException(
-            status_code=400,
-            detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
+            status_code=400, detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
         )
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -181,7 +185,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
         await log_event(
             "instance_voice_changed",
             instance_id=iid,
-            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id}
+            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id},
         )
 
     # Build response
@@ -194,11 +198,12 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
         "status": "voice_changed",
         "instance_id": instance_id,
         "voice": request.voice,
-        "changes": bumps
+        "changes": bumps,
     }
 
 
 # ============ TTS Mode Endpoints ============
+
 
 @router.patch("/api/instances/{instance_id}/tts-mode")
 async def set_instance_tts_mode(instance_id: str, request: Request):
@@ -206,11 +211,17 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
     body = await request.json()
     mode = body.get("mode", "verbose")
     if mode not in ("verbose", "muted", "silent", "voice-chat"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat",
+        )
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -264,7 +275,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
     if mode == "voice-chat":
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
-            "started_at": datetime.now().isoformat()
+            "started_at": datetime.now().isoformat(),
         }
         logger.info(f"Voice chat STARTED for {instance_id[:12]} (via tts_mode)")
     elif old_mode == "voice-chat" and mode != "voice-chat":
@@ -276,6 +287,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
 
 
 # ============ Voice Chat Session Endpoints ============
+
 
 @router.post("/api/instances/{instance_id}/voice-chat")
 async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: str = ""):
@@ -322,11 +334,14 @@ async def toggle_listening(instance_id: str, active: bool = True):
     """Toggle listening (dictation/mic) state. Delegates to global dictation state."""
     DICTATION_STATE["active"] = active
     DICTATION_STATE["updated_at"] = datetime.now().isoformat()
-    logger.info(f"Dictation {'ON' if active else 'OFF'} (via voice-chat/listening for {instance_id[:12]})")
+    logger.info(
+        f"Dictation {'ON' if active else 'OFF'} (via voice-chat/listening for {instance_id[:12]})"
+    )
     return {"instance_id": instance_id, "listening": active}
 
 
 # ============ Dictation Endpoints ============
+
 
 @router.post("/api/dictation")
 async def set_dictation_state(active: bool):

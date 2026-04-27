@@ -31,10 +31,13 @@ def test_v1_triggers_emit_interventions():
 
 
 def test_routine_events_are_noop():
-    assert evaluate_state_event(
-        StateEvent(event_type="timer_tick", source="timer_worker"),
-        _snapshot(),
-    ) is None
+    assert (
+        evaluate_state_event(
+            StateEvent(event_type="timer_tick", source="timer_worker"),
+            _snapshot(),
+        )
+        is None
+    )
 
 
 def test_prompt_includes_relevant_snapshot_fields():

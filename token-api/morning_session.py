@@ -10,6 +10,7 @@ self-registers as legion=custodes, instance_type=sync via the SessionStart hook.
 
 The launcher exits after launch — the Claude session is autonomous from there.
 """
+
 import json
 import os
 import subprocess
@@ -29,6 +30,7 @@ SESSION_DIR = Path("/tmp/custodes_morning_sessions")
 def _get(path: str) -> dict | list | str:
     """GET from Token-API."""
     import urllib.request
+
     try:
         with urllib.request.urlopen(f"{BASE}{path}", timeout=10) as resp:
             return json.loads(resp.read())
@@ -39,9 +41,11 @@ def _get(path: str) -> dict | list | str:
 def _post(path: str, data: dict = None) -> dict:
     """POST to Token-API."""
     import urllib.request
+
     body = json.dumps(data or {}).encode()
     req = urllib.request.Request(
-        f"{BASE}{path}", data=body,
+        f"{BASE}{path}",
+        data=body,
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -61,9 +65,13 @@ def _obsidian_read_vault(vault: str, path: str) -> str:
     try:
         result = subprocess.run(
             ["obsidian", f"vault={vault}", "read", f"path={path}"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
-        return result.stdout.strip() if result.returncode == 0 else f"(could not read {vault}/{path})"
+        return (
+            result.stdout.strip() if result.returncode == 0 else f"(could not read {vault}/{path})"
+        )
     except Exception as e:
         return f"(error reading {vault}/{path}: {e})"
 
@@ -72,7 +80,11 @@ def _run_shell(cmd: str, timeout: int = 10) -> str:
     """Run a shell command and return output."""
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         return result.stdout.strip() or result.stderr.strip() or "(no output)"
     except Exception as e:
@@ -291,14 +303,17 @@ def send_tts(message: str):
 def get_daily_thread_id(today: str) -> str | None:
     """Read thread_id from today's daily note frontmatter (set by Aspirants pipeline)."""
     import re
+
     try:
         result = subprocess.run(
             ["obsidian", "vault=Imperium-ENV", "read", f"path=Terra/Journal/Daily/{today}.md"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
-        m = re.search(r'^thread_id:\s*(.+)$', result.stdout, re.MULTILINE)
+        m = re.search(r"^thread_id:\s*(.+)$", result.stdout, re.MULTILINE)
         if m:
-            tid = m.group(1).strip().strip('"\'')
+            tid = m.group(1).strip().strip("\"'")
             return tid if tid and tid != "null" else None
     except Exception:
         pass
@@ -308,8 +323,11 @@ def get_daily_thread_id(today: str) -> str | None:
 def _discord_post(channel: str, content: str, bot: str = "custodes") -> dict:
     """Send a message to a Discord channel via the daemon. Returns message data."""
     import urllib.request as ureq
+
     body = json.dumps({"channel": channel, "content": content, "bot": bot}).encode()
-    req = ureq.Request(f"{DISCORD_DAEMON}/send", data=body, headers={"Content-Type": "application/json"})
+    req = ureq.Request(
+        f"{DISCORD_DAEMON}/send", data=body, headers={"Content-Type": "application/json"}
+    )
     try:
         with ureq.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read())
@@ -320,8 +338,11 @@ def _discord_post(channel: str, content: str, bot: str = "custodes") -> dict:
 def _discord_create_thread(channel: str, name: str, bot: str = "custodes") -> str | None:
     """Create a thread in a channel. Returns thread_id or None on failure."""
     import urllib.request as ureq
+
     body = json.dumps({"channel": channel, "name": name, "bot": bot}).encode()
-    req = ureq.Request(f"{DISCORD_DAEMON}/thread/create", data=body, headers={"Content-Type": "application/json"})
+    req = ureq.Request(
+        f"{DISCORD_DAEMON}/thread/create", data=body, headers={"Content-Type": "application/json"}
+    )
     try:
         with ureq.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
@@ -338,13 +359,17 @@ def create_daily_thread(today: str) -> str | None:
     if thread_id:
         # Post a brief launch message — Claude will post the full briefing
         import urllib.request as ureq
-        body = json.dumps({
-            "thread_id": thread_id,
-            "content": f"Morning session launching — {today}",
-            "bot": "custodes",
-        }).encode()
+
+        body = json.dumps(
+            {
+                "thread_id": thread_id,
+                "content": f"Morning session launching — {today}",
+                "bot": "custodes",
+            }
+        ).encode()
         req = ureq.Request(
-            f"{DISCORD_DAEMON}/thread/send", data=body,
+            f"{DISCORD_DAEMON}/thread/send",
+            data=body,
             headers={"Content-Type": "application/json"},
         )
         try:
@@ -355,10 +380,17 @@ def create_daily_thread(today: str) -> str | None:
         # Write thread_id into daily note frontmatter
         try:
             subprocess.run(
-                ["obsidian", "vault=Imperium-ENV", "property:set",
-                 f"path=Terra/Journal/Daily/{today}.md",
-                 "property=thread_id", f"value={thread_id}"],
-                capture_output=True, text=True, timeout=15,
+                [
+                    "obsidian",
+                    "vault=Imperium-ENV",
+                    "property:set",
+                    f"path=Terra/Journal/Daily/{today}.md",
+                    "property=thread_id",
+                    f"value={thread_id}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             print(f"Daily thread created: {thread_id}")
         except Exception as e:
@@ -372,7 +404,9 @@ def ensure_daily_notes():
         try:
             result = subprocess.run(
                 ["obsidian", f"vault={vault}", "daily"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if "Opened:" in result.stdout or "Opened:" in result.stderr:
                 print(f"Daily note created/opened in {vault}")
@@ -392,20 +426,36 @@ def create_legion_pane() -> str | None:
     # Check if legion window exists
     result = subprocess.run(
         ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
 
     if result.returncode != 0:
         # Create legion window
         subprocess.run(
-            ["tmux", "new-window", "-t", TMUX_SESSION, "-n", "legion", "-d",
-             "-P", "-F", "#{pane_id}"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "tmux",
+                "new-window",
+                "-t",
+                TMUX_SESSION,
+                "-n",
+                "legion",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         # The new-window itself created a pane — get it
         result = subprocess.run(
             ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0:
             print("Error: could not create legion window")
@@ -414,16 +464,19 @@ def create_legion_pane() -> str | None:
         # Check if this pane is idle (it should be — just created)
         cmd_result = subprocess.run(
             ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_command}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if cmd_result.stdout.strip() in ("bash", "zsh", "sh"):
             return pane_id
 
     # Legion window exists — split a new pane into it
     result = subprocess.run(
-        ["tmux", "split-window", "-t", f"{TMUX_SESSION}:legion", "-d",
-         "-P", "-F", "#{pane_id}"],
-        capture_output=True, text=True, timeout=5,
+        ["tmux", "split-window", "-t", f"{TMUX_SESSION}:legion", "-d", "-P", "-F", "#{pane_id}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
     if result.returncode != 0:
         print(f"Error: could not split pane in legion: {result.stderr}")
@@ -434,7 +487,8 @@ def create_legion_pane() -> str | None:
     # Re-tile legion
     subprocess.run(
         ["tmux", "select-layout", "-t", f"{TMUX_SESSION}:legion", "tiled"],
-        capture_output=True, timeout=5,
+        capture_output=True,
+        timeout=5,
     )
 
     return pane_id
@@ -448,31 +502,33 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
     # primarch custodes sets TOKEN_API_PRIMARCH=custodes, which triggers
     # auto-registration as legion=custodes, instance_type=sync in SessionStart hook
     launch_cmd = (
-        f"cd '{VAULT_DIR}' && "
-        f"primarch custodes \"$(cat {PROMPT_FILE})\" ; "
-        f"rm -f {PROMPT_FILE}"
+        f"cd '{VAULT_DIR}' && primarch custodes \"$(cat {PROMPT_FILE})\" ; rm -f {PROMPT_FILE}"
     )
 
     try:
         # Clear pane and send launch command
         subprocess.run(
             ["tmux", "send-keys", "-t", pane_id, "C-c"],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            timeout=5,
         )
         time.sleep(0.2)
         subprocess.run(
             ["tmux", "send-keys", "-t", pane_id, "C-u"],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            timeout=5,
         )
         time.sleep(0.1)
         subprocess.run(
             ["tmux", "send-keys", "-t", pane_id, "clear", "Enter"],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            timeout=5,
         )
         time.sleep(0.3)
         subprocess.run(
             ["tmux", "send-keys", "-t", pane_id, launch_cmd, "Enter"],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            timeout=5,
         )
         return True
     except Exception as e:
@@ -498,15 +554,20 @@ def run_morning_session() -> dict:
     # Phase 0: Ensure NAS is mounted
     try:
         from nas_mount import ensure_mounted
+
         for share in ["/Volumes/Imperium"]:
             ok, msg = ensure_mounted(share)
             if not ok:
                 send_tts(f"Morning session could not start: {msg}")
-                state_file.write_text(json.dumps({
-                    "started_at": datetime.now().isoformat(),
-                    "status": "nas_unavailable",
-                    "error": msg,
-                }))
+                state_file.write_text(
+                    json.dumps(
+                        {
+                            "started_at": datetime.now().isoformat(),
+                            "status": "nas_unavailable",
+                            "error": msg,
+                        }
+                    )
+                )
                 return {"status": "nas_unavailable", "error": msg}
     except ImportError:
         pass  # nas_mount not available, proceed
@@ -529,29 +590,41 @@ def run_morning_session() -> dict:
     pane_id = create_legion_pane()
     if not pane_id:
         send_tts("Morning session failed: could not create legion pane")
-        state_file.write_text(json.dumps({
-            "started_at": datetime.now().isoformat(),
-            "status": "no_pane",
-        }))
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": datetime.now().isoformat(),
+                    "status": "no_pane",
+                }
+            )
+        )
         return {"status": "no_pane"}
 
     launched = launch_in_legion(prompt, pane_id)
     if not launched:
         send_tts("Morning session failed: could not launch in legion pane")
-        state_file.write_text(json.dumps({
-            "started_at": datetime.now().isoformat(),
-            "status": "launch_failed",
-            "pane_id": pane_id,
-        }))
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": datetime.now().isoformat(),
+                    "status": "launch_failed",
+                    "pane_id": pane_id,
+                }
+            )
+        )
         return {"status": "launch_failed"}
 
     # Save state — the session is now autonomous
-    state_file.write_text(json.dumps({
-        "started_at": datetime.now().isoformat(),
-        "status": "launched",
-        "pane_id": pane_id,
-        "daily_thread_id": daily_thread_id,
-    }))
+    state_file.write_text(
+        json.dumps(
+            {
+                "started_at": datetime.now().isoformat(),
+                "status": "launched",
+                "pane_id": pane_id,
+                "daily_thread_id": daily_thread_id,
+            }
+        )
+    )
 
     # Register enforce escalation (idempotent — also done by /api/morning/start endpoint)
     _post("/api/morning/enforce-register", {})
@@ -563,6 +636,7 @@ def run_morning_session() -> dict:
 def start_morning_session_background():
     """Entry point for Token-API to start the morning session in background."""
     import threading
+
     thread = threading.Thread(target=run_morning_session, daemon=True)
     thread.start()
 

@@ -25,9 +25,9 @@ Endpoints:
 
 import glob
 import json
+import logging
 import os
 import subprocess
-import logging
 import threading
 import time
 import uuid
@@ -37,7 +37,6 @@ from pathlib import Path
 import requests as http_requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger("token_satellite")
@@ -151,17 +150,17 @@ class TTSEngine:
     """
 
     def __init__(self):
-        self._process: Optional[subprocess.Popen] = None
+        self._process: subprocess.Popen | None = None
         self._io_lock = threading.Lock()
         self._speaking = False
         self._was_skipped = False
         # Managed playback state (synth-and-speak path)
         self._playing = False
         self._play_paused = False
-        self._current_file: Optional[str] = None
+        self._current_file: str | None = None
         # Track current message for restart
-        self._current_message: Optional[str] = None
-        self._current_voice: Optional[str] = None
+        self._current_message: str | None = None
+        self._current_voice: str | None = None
         self._current_rate: int = 0
 
     def _write_script(self):
@@ -174,8 +173,14 @@ class TTSEngine:
         """Start the persistent PowerShell process."""
         self._write_script()
         self._process = subprocess.Popen(
-            [POWERSHELL_EXE, "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", TTS_SCRIPT_WIN_PATH],
+            [
+                POWERSHELL_EXE,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                TTS_SCRIPT_WIN_PATH,
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -193,6 +198,7 @@ class TTSEngine:
     def _readline_raw(self, timeout=5):
         """Read one line from stdout with timeout. No lock needed (called during init)."""
         import select
+
         fileno = self._process.stdout.fileno()
         ready, _, _ = select.select([fileno], [], [], timeout)
         if ready:
@@ -311,22 +317,29 @@ class TTSEngine:
             file_id = str(uuid.uuid4())
 
         with self._io_lock:
-            self._send({
-                "action": "synthesize",
-                "voice": voice,
-                "rate": rate,
-                "message": message,
-                "file_id": file_id,
-            })
+            self._send(
+                {
+                    "action": "synthesize",
+                    "voice": voice,
+                    "rate": rate,
+                    "message": message,
+                    "file_id": file_id,
+                }
+            )
             resp = self._readline()
 
         if resp == "SYNTH_OK":
             wav_path_win = f"{self.TTS_DIR_WIN}\\{file_id}.wav"
             wav_path_wsl = f"{self.TTS_DIR_WSL}/{file_id}.wav"
             logger.info(f"TTS synthesize: {len(message)} chars -> {file_id}.wav")
-            return {"success": True, "file_id": file_id, "wav_path_win": wav_path_win, "wav_path_wsl": wav_path_wsl}
+            return {
+                "success": True,
+                "file_id": file_id,
+                "wav_path_win": wav_path_win,
+                "wav_path_wsl": wav_path_wsl,
+            }
         elif resp and resp.startswith("SYNTH_ERR:"):
-            error = resp[len("SYNTH_ERR:"):]
+            error = resp[len("SYNTH_ERR:") :]
             logger.warning(f"TTS synthesize failed: {error}")
             return {"success": False, "error": error}
         else:
@@ -383,8 +396,14 @@ class TTSEngine:
             self._play_paused = False
             # Re-speak the same message (non-blocking — speak polls in its own thread)
             with self._io_lock:
-                self._send({"action": "speak", "voice": self._current_voice,
-                            "rate": self._current_rate, "message": self._current_message})
+                self._send(
+                    {
+                        "action": "speak",
+                        "voice": self._current_voice,
+                        "rate": self._current_rate,
+                        "message": self._current_message,
+                    }
+                )
                 resp = self._readline()
             if resp != "OK":
                 return {"success": False, "error": f"Restart speak failed: {resp}"}
@@ -434,10 +453,10 @@ tts_engine = TTSEngine()
 MAC_API_BASE = "http://100.95.109.23:7777"
 MAC_TAILSCALE_IP = "100.95.109.23"
 DESKFLOW_EXE = r"C:\Tools\Deskflow\deskflow.exe"
-DESKFLOW_POLL_INTERVAL = 30          # seconds between checks
-DESKFLOW_CONFIRM_CHECKS = 2          # consecutive checks before state transition
-DESKFLOW_STABLE_TIMEOUT = 900        # 15 min: stop polling after this long in RUNNING
-DESKFLOW_PROCESS_CHECK_INTERVAL = 300 # verify DeskFlow process every 5 min
+DESKFLOW_POLL_INTERVAL = 30  # seconds between checks
+DESKFLOW_CONFIRM_CHECKS = 2  # consecutive checks before state transition
+DESKFLOW_STABLE_TIMEOUT = 900  # 15 min: stop polling after this long in RUNNING
+DESKFLOW_PROCESS_CHECK_INTERVAL = 300  # verify DeskFlow process every 5 min
 
 
 class DeskFlowWatchdog:
@@ -460,16 +479,14 @@ class DeskFlowWatchdog:
         self.consecutive_up = 0
         self.consecutive_down = 0
         self.last_process_check = 0.0
-        self.hold_until: Optional[float] = None
-        self.last_mac_status: Optional[bool] = None
+        self.hold_until: float | None = None
+        self.last_mac_status: bool | None = None
         self.last_state_change = time.time()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
     def start(self):
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="deskflow-watchdog"
-        )
+        self._thread = threading.Thread(target=self._run, daemon=True, name="deskflow-watchdog")
         self._thread.start()
         logger.info("KVM watchdog: Started")
 
@@ -489,7 +506,9 @@ class DeskFlowWatchdog:
             try:
                 result = subprocess.run(
                     ["tailscale", "status", "--json"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 if result.returncode == 0:
                     data = json.loads(result.stdout)
@@ -591,9 +610,7 @@ class DeskFlowWatchdog:
             # Stable — check if we can reduce polling
             elapsed = time.time() - self.last_state_change
             if elapsed >= DESKFLOW_STABLE_TIMEOUT:
-                logger.info(
-                    f"KVM watchdog: Stable for {int(elapsed)}s → IDLE"
-                )
+                logger.info(f"KVM watchdog: Stable for {int(elapsed)}s → IDLE")
                 self.state = "idle"
                 self.last_state_change = time.time()
 
@@ -635,11 +652,17 @@ class DeskFlowWatchdog:
         try:
             # Check for ESTABLISHED connections on port 24800
             result = subprocess.run(
-                [POWERSHELL_EXE, "-NoProfile", "-Command",
-                 "Get-NetTCPConnection -LocalPort 24800 "
-                 "-State Established -ErrorAction SilentlyContinue | "
-                 "Select-Object -First 1 RemoteAddress"],
-                capture_output=True, text=True, timeout=10,
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    "Get-NetTCPConnection -LocalPort 24800 "
+                    "-State Established -ErrorAction SilentlyContinue | "
+                    "Select-Object -First 1 RemoteAddress",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             return bool(result.stdout.strip())
         except Exception:
@@ -650,9 +673,15 @@ class DeskFlowWatchdog:
     def _check_deskflow_running(self) -> bool:
         try:
             result = subprocess.run(
-                [POWERSHELL_EXE, "-NoProfile", "-Command",
-                 "Get-Process deskflow-core -ErrorAction SilentlyContinue"],
-                capture_output=True, text=True, timeout=10,
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Process deskflow-core -ErrorAction SilentlyContinue",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             return bool(result.stdout.strip())
         except Exception:
@@ -665,9 +694,15 @@ class DeskFlowWatchdog:
         logger.info("KVM watchdog: Starting DeskFlow server")
         try:
             subprocess.run(
-                [POWERSHELL_EXE, "-NoProfile", "-Command",
-                 f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized"],
-                capture_output=True, text=True, timeout=15,
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
@@ -676,10 +711,16 @@ class DeskFlowWatchdog:
         logger.info("KVM watchdog: Stopping DeskFlow server")
         try:
             subprocess.run(
-                [POWERSHELL_EXE, "-NoProfile", "-Command",
-                 "Stop-Process -Name deskflow, deskflow-core "
-                 "-Force -ErrorAction SilentlyContinue"],
-                capture_output=True, text=True, timeout=10,
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    "Stop-Process -Name deskflow, deskflow-core "
+                    "-Force -ErrorAction SilentlyContinue",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to stop DeskFlow: {e}")
@@ -689,9 +730,18 @@ class DeskFlowWatchdog:
     def _wake_mac_display(self) -> bool:
         try:
             result = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                 "mini", "caffeinate -u -t 5"],
-                capture_output=True, text=True, timeout=12,
+                [
+                    "ssh",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "BatchMode=yes",
+                    "mini",
+                    "caffeinate -u -t 5",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=12,
             )
             return result.returncode == 0
         except Exception as e:
@@ -708,11 +758,19 @@ class DeskFlowWatchdog:
         logger.info("KVM watchdog: Restarting Mac client via SSH (kill → wake → open)")
         try:
             result = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                 "mini",
-                 "killall -9 Deskflow deskflow-core 2>/dev/null; "
-                 "sleep 2; caffeinate -u -t 5 & open -a Deskflow"],
-                capture_output=True, text=True, timeout=20,
+                [
+                    "ssh",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "BatchMode=yes",
+                    "mini",
+                    "killall -9 Deskflow deskflow-core 2>/dev/null; "
+                    "sleep 2; caffeinate -u -t 5 & open -a Deskflow",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
             )
             if result.returncode == 0:
                 logger.info("KVM watchdog: Mac client restarted via SSH")
@@ -745,9 +803,7 @@ class DeskFlowWatchdog:
         self._wake_mac_display()
         time.sleep(2)
         try:
-            resp = http_requests.post(
-                f"{MAC_API_BASE}/api/kvm/start", timeout=10
-            )
+            resp = http_requests.post(f"{MAC_API_BASE}/api/kvm/start", timeout=10)
             data = resp.json()
             logger.info(f"KVM watchdog: Mac client → {data.get('message', 'unknown')}")
         except Exception as e:
@@ -776,12 +832,9 @@ class DeskFlowWatchdog:
             "deskflow_connected": connected,
             "consecutive_up": self.consecutive_up,
             "consecutive_down": self.consecutive_down,
-            "last_state_change": datetime.fromtimestamp(
-                self.last_state_change
-            ).isoformat(),
+            "last_state_change": datetime.fromtimestamp(self.last_state_change).isoformat(),
             "hold_until": (
-                datetime.fromtimestamp(self.hold_until).isoformat()
-                if self.hold_until else None
+                datetime.fromtimestamp(self.hold_until).isoformat() if self.hold_until else None
             ),
         }
 
@@ -839,15 +892,16 @@ class AhkRequest(BaseModel):
     script: str  # Script filename (e.g., "voice-select-other.ahk")
     args: list[str] = []  # Optional arguments
 
+
 class TmuxSendKeysRequest(BaseModel):
-    pane: str       # tmux pane ID (e.g., "%5")
-    command: str    # slash command or text to send (e.g., "/color cyan")
+    pane: str  # tmux pane ID (e.g., "%5")
+    command: str  # slash command or text to send (e.g., "/color cyan")
     no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
 
 
 class GoldenThroneFollowupRequest(BaseModel):
     session_id: str
-    tmux_pane: Optional[str] = None
+    tmux_pane: str | None = None
     working_dir: str = "~"
     prompt: str
 
@@ -855,6 +909,7 @@ class GoldenThroneFollowupRequest(BaseModel):
 def _announce_to_mac():
     """Background thread: announce satellite startup to Mac Token-API."""
     import socket
+
     time.sleep(3)  # Let the server finish binding
     hostname = socket.gethostname()
     payload = {"hostname": hostname, "port": 7777}
@@ -895,7 +950,9 @@ async def health():
         "status": "ok",
         "service": "token-satellite",
         "timestamp": datetime.now().isoformat(),
-        "tts_engine": "running" if tts_engine._process and tts_engine._process.poll() is None else "stopped",
+        "tts_engine": "running"
+        if tts_engine._process and tts_engine._process.poll() is None
+        else "stopped",
         "kvm_watchdog": deskflow_watchdog.state,
     }
 
@@ -931,7 +988,9 @@ async def enforce(request: EnforceRequest):
             timeout=10,
         )
         success = result.returncode == 0
-        logger.info(f"ENFORCE: taskkill {exe} -> rc={result.returncode} stdout={result.stdout.strip()}")
+        logger.info(
+            f"ENFORCE: taskkill {exe} -> rc={result.returncode} stdout={result.stdout.strip()}"
+        )
         return {
             "success": success,
             "app": app_name,
@@ -987,7 +1046,9 @@ def tts_speak(request: TTSSpeakRequest):
     if tts_engine.is_speaking:
         raise HTTPException(status_code=409, detail="Already speaking")
 
-    logger.info(f"TTS: Speaking {len(request.message)} chars with {request.voice} (rate={request.rate})")
+    logger.info(
+        f"TTS: Speaking {len(request.message)} chars with {request.voice} (rate={request.rate})"
+    )
     result = tts_engine.speak(request.message, request.voice, request.rate)
 
     if result.get("skipped"):
@@ -1010,13 +1071,16 @@ async def tts_skip():
 
 # ── File-based TTS: synthesize to WAV + controlled playback ──
 
+
 class TTSSynthesizeRequest(BaseModel):
     message: str
     voice: str = "Microsoft David"
     rate: int = 0
 
+
 class TTSControlRequest(BaseModel):
-    command: str   # pause, resume, stop, toggle, restart
+    command: str  # pause, resume, stop, toggle, restart
+
 
 class TTSSynthAndPlayRequest(BaseModel):
     message: str
@@ -1080,7 +1144,11 @@ async def execute_ahk(req: AhkRequest):
         cmd = [AHK_EXE, str(script_path)] + req.args
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         logger.info(f"AHK: Executed {req.script} (exit={result.returncode})")
-        return {"ok": True, "exit_code": result.returncode, "stderr": result.stderr[:200] if result.stderr else None}
+        return {
+            "ok": True,
+            "exit_code": result.returncode,
+            "stderr": result.stderr[:200] if result.stderr else None,
+        }
     except subprocess.TimeoutExpired:
         logger.warning(f"AHK: Timeout executing {req.script}")
         return {"ok": False, "error": "timeout"}
@@ -1107,8 +1175,10 @@ async def kvm_control(request: KvmControlRequest):
     elif action == "hold":
         deskflow_watchdog.hold(request.hold_minutes)
         return {
-            "success": True, "action": "hold",
-            "minutes": request.hold_minutes, "state": deskflow_watchdog.state,
+            "success": True,
+            "action": "hold",
+            "minutes": request.hold_minutes,
+            "state": deskflow_watchdog.state,
         }
     else:
         raise HTTPException(
@@ -1152,7 +1222,9 @@ async def tmux_send_keys(req: TmuxSendKeysRequest):
     try:
         verify = subprocess.run(
             ["tmux", "display-message", "-t", pane, "-p", "#{pane_id}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if verify.returncode != 0 or not verify.stdout.strip():
             raise HTTPException(status_code=404, detail=f"Pane {pane} not found")
@@ -1186,13 +1258,17 @@ def _get_or_create_kreig_pane() -> str:
     # Check if kreig window exists
     result = subprocess.run(
         ["tmux", "list-panes", "-t", "main:kreig", "-F", "#{pane_id}"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
     if result.returncode == 0 and result.stdout.strip():
         # Window exists — split a new pane into it
         split = subprocess.run(
             ["tmux", "split-window", "-t", "main:kreig", "-d", "-P", "-F", "#{pane_id}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if split.returncode == 0 and split.stdout.strip():
             pane_id = split.stdout.strip()
@@ -1215,7 +1291,9 @@ def _get_or_create_kreig_pane() -> str:
     # Get pane ID and tag it
     result = subprocess.run(
         ["tmux", "list-panes", "-t", "main:kreig", "-F", "#{pane_id}"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
     pane_id = result.stdout.strip().split("\n")[0]
     subprocess.run(
@@ -1242,7 +1320,9 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
         try:
             verify = subprocess.run(
                 ["tmux", "display-message", "-t", pane, "-p", "#{pane_current_command}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             current_cmd = verify.stdout.strip() if verify.returncode == 0 else ""
         except Exception:
@@ -1260,7 +1340,9 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 time.sleep(0.3)
                 subprocess.run(["tmux", "send-keys", "-t", pane, req.prompt, "Enter"], timeout=5)
                 transport = "send-keys"
-                logger.info(f"Golden Throne: sent SOP to {pane} via send-keys (session {req.session_id[:12]})")
+                logger.info(
+                    f"Golden Throne: sent SOP to {pane} via send-keys (session {req.session_id[:12]})"
+                )
             except Exception as e:
                 logger.error(f"Golden Throne: send-keys failed for {pane}: {e}")
                 raise HTTPException(status_code=500, detail=f"send-keys failed: {e}")
@@ -1274,7 +1356,7 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 Path(sop_file).write_text(req.prompt)
                 resume_cmd = (
                     f'cd {working_dir} && claude -p "$(cat {sop_file})" '
-                    f'--resume {req.session_id} --dangerously-skip-permissions'
+                    f"--resume {req.session_id} --dangerously-skip-permissions"
                 )
                 subprocess.run(
                     ["tmux", "send-keys", "-t", kreig_pane, resume_cmd, "Enter"],
@@ -1341,4 +1423,5 @@ async def restart_satellite(pull: bool = True):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=7777)

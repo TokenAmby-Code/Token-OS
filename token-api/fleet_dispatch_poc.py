@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Fleet Dispatch POC — Phase 7: fix guardsman PATH in subprocess dispatch."""
 
-import subprocess, time, json, datetime, os, sys, urllib.request
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://localhost:7777"
@@ -16,7 +22,10 @@ FALLBACK_TASKS = [
     ("ls /mnt/imperium/Token-OS/token-api/ | fleet_dispatch_poc.py is listed", "fallback"),
     ("curl -s localhost:7777/health | response contains a status field", "fallback"),
     ("date | output contains a valid year between 2020 and 2030", "fallback"),
-    ("head -3 /mnt/imperium/Token-OS/token-api/CLAUDE.md | first lines describe Token-API or port 7777", "fallback"),
+    (
+        "head -3 /mnt/imperium/Token-OS/token-api/CLAUDE.md | first lines describe Token-API or port 7777",
+        "fallback",
+    ),
 ]
 
 
@@ -54,6 +63,7 @@ def pull_tasks():
 def _scan_mars_tasks(limit: int) -> list:
     """Scan Mars/Tasks for autonomy: researchable files, fabricate guardsman tasks."""
     import glob as _glob
+
     tasks_dir = "/Volumes/Imperium/Imperium-ENV/Mars/Tasks"
     assertions = [
         "task file has a title and autonomy frontmatter",
@@ -90,9 +100,12 @@ def dispatch_one(task: str, category: str) -> dict:
     t0 = time.time()
     r = subprocess.run([GUARDSMAN_BIN, task], capture_output=True, text=True, timeout=120)
     return {
-        "task": task, "category": category,
-        "output": r.stdout.strip(), "stderr": r.stderr.strip(),
-        "returncode": r.returncode, "elapsed_sec": round(time.time() - t0, 2),
+        "task": task,
+        "category": category,
+        "output": r.stdout.strip(),
+        "stderr": r.stderr.strip(),
+        "returncode": r.returncode,
+        "elapsed_sec": round(time.time() - t0, 2),
     }
 
 
@@ -132,19 +145,20 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
 def write_results_to_state(results: list, wall_clock: float) -> None:
     """Write dispatch_results to fleet state + append summary note."""
     ok = sum(1 for r in results if r["returncode"] == 0)
-    summary = (
-        f"Phase 5 dispatch: {len(results)} tasks, {ok} OK, "
-        f"wall-clock {wall_clock:.1f}s"
-    )
+    summary = f"Phase 5 dispatch: {len(results)} tasks, {ok} OK, wall-clock {wall_clock:.1f}s"
     dispatch_results = {
         "last_run": datetime.datetime.utcnow().isoformat() + "Z",
         "count": len(results),
         "ok": ok,
         "wall_clock_sec": wall_clock,
         "results": [
-            {"task": r["task"][:120], "category": r["category"],
-             "returncode": r["returncode"], "elapsed_sec": r["elapsed_sec"],
-             "output": (r["output"] or r["stderr"])[:200]}
+            {
+                "task": r["task"][:120],
+                "category": r["category"],
+                "returncode": r["returncode"],
+                "elapsed_sec": r["elapsed_sec"],
+                "output": (r["output"] or r["stderr"])[:200],
+            }
             for r in results[:10]
         ],
     }
@@ -155,8 +169,10 @@ def write_results_to_state(results: list, wall_clock: float) -> None:
         notes.append(summary)
         payload = json.dumps({"notes": notes, "dispatch_results": dispatch_results}).encode()
         req = urllib.request.Request(
-            f"{BASE}/api/fleet/state", data=payload,
-            headers={"Content-Type": "application/json"}, method="PATCH",
+            f"{BASE}/api/fleet/state",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
         )
         urllib.request.urlopen(req)
         print(f"Written to fleet state: {summary}")
@@ -173,6 +189,7 @@ def get_daily_spend() -> float:
     except Exception:
         return 0.0
 
+
 def update_daily_spend(delta_usd: float) -> float:
     """Add delta to today's spend in fleet state. Returns new total."""
     current = get_daily_spend()
@@ -180,8 +197,10 @@ def update_daily_spend(delta_usd: float) -> float:
     try:
         payload = json.dumps({"daily_dispatch_spend_usd": new_total}).encode()
         req = urllib.request.Request(
-            f"{BASE}/api/fleet/state", data=payload,
-            headers={"Content-Type": "application/json"}, method="PATCH",
+            f"{BASE}/api/fleet/state",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
         )
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
@@ -224,8 +243,10 @@ def write_retry_queue(failed: list) -> None:
     try:
         payload = json.dumps({"dispatch_retry_queue": failed}).encode()
         req = urllib.request.Request(
-            f"{BASE}/api/fleet/state", data=payload,
-            headers={"Content-Type": "application/json"}, method="PATCH",
+            f"{BASE}/api/fleet/state",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
         )
         urllib.request.urlopen(req, timeout=5)
         print(f"[retry] {len(failed)} failed tasks queued for retry")
@@ -261,8 +282,10 @@ def clear_retry_queue() -> None:
     try:
         payload = json.dumps({"retry_queue": []}).encode()
         req = urllib.request.Request(
-            f"{BASE}/api/fleet/state", data=payload,
-            headers={"Content-Type": "application/json"}, method="PATCH",
+            f"{BASE}/api/fleet/state",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
         )
         urllib.request.urlopen(req, timeout=5)
         print("[retry_queue] Cleared.")
@@ -270,8 +293,9 @@ def clear_retry_queue() -> None:
         print(f"Warning: could not clear retry queue: {e}")
 
 
-def write_fleet_report(results: list, wall_clock: float, retry_mode: bool,
-                       daily_spend: float) -> None:
+def write_fleet_report(
+    results: list, wall_clock: float, retry_mode: bool, daily_spend: float
+) -> None:
     """Overwrite Mars/Fleet/fleet_status.md with current dispatch summary."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M MST")
     total = len(results)
@@ -279,7 +303,8 @@ def write_fleet_report(results: list, wall_clock: float, retry_mode: bool,
     failed_count = total - success
     avg_elapsed = round(sum(r["elapsed_sec"] for r in results) / max(total, 1), 1)
     lines = [
-        "# Fleet Status", "",
+        "# Fleet Status",
+        "",
         f"**Last updated**: {now}",
         f"**Mode**: {'Retry queue' if retry_mode else 'Autonomy queue'}",
         "",
@@ -350,7 +375,9 @@ def run_parallel():
     new_total = update_daily_spend(0.0)  # guardsman is free
     write_fleet_report(results, wall_clock, retry_mode, new_total)
     print(f"[cost] Daily spend: ${new_total:.2f} / ${DAILY_BUDGET_USD:.2f}")
-    print(f"\nWall-clock: {wall_clock}s | Sequential estimate: {seq_estimate}s | Speedup: {speedup}x")
+    print(
+        f"\nWall-clock: {wall_clock}s | Sequential estimate: {seq_estimate}s | Speedup: {speedup}x"
+    )
     print(f"SUMMARY: wall={wall_clock}s seq={seq_estimate}s speedup={speedup}x")
 
 

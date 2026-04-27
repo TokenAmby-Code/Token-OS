@@ -21,22 +21,22 @@ Designed to run every 5-15 minutes via cron.
 import json
 import subprocess
 import sys
-import urllib.request
 import urllib.error
-from datetime import datetime, date
+import urllib.request
+from datetime import date, datetime
 from pathlib import Path
 
 BASE = "http://localhost:7777"
 STATE_FILE = Path("/tmp/custodes-watchtower-state.json")
 
-WORK_HOURS_START = 9   # 9 AM
-WORK_HOURS_END = 17    # 5 PM (exclusive)
+WORK_HOURS_START = 9  # 9 AM
+WORK_HOURS_END = 17  # 5 PM (exclusive)
 
 # work_mode values that mean the Emperor is legitimately away
 EXEMPT_MODES = {"clocked_out", "gym", "campus"}
 
 ESCALATION_THRESHOLDS = {
-    1: 30,   # minutes
+    1: 30,  # minutes
     2: 60,
     3: 90,
     4: 120,
@@ -46,6 +46,7 @@ ESCALATION_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+
 
 def _load_state() -> dict:
     try:
@@ -61,8 +62,8 @@ def _load_state() -> dict:
 def _fresh_state() -> dict:
     return {
         "date": date.today().isoformat(),
-        "offline_since": None,   # ISO timestamp string or None
-        "escalation_level": 0,   # highest level fired this period
+        "offline_since": None,  # ISO timestamp string or None
+        "escalation_level": 0,  # highest level fired this period
     }
 
 
@@ -76,6 +77,7 @@ def _save_state(state: dict):
 # ---------------------------------------------------------------------------
 # Token-API queries (defensive — return None on failure)
 # ---------------------------------------------------------------------------
+
 
 def _get(path: str) -> dict | list | None:
     try:
@@ -91,6 +93,7 @@ def _post(path: str, params: dict | None = None) -> dict | None:
     url = f"{BASE}{path}"
     if params:
         from urllib.parse import urlencode
+
         url += "?" + urlencode(params)
     try:
         req = urllib.request.Request(url, data=b"", method="POST")
@@ -116,9 +119,9 @@ def get_manual_instance_count() -> int | None:
         return None
     instances = data if isinstance(data, list) else data.get("instances", [])
     manual = [
-        i for i in instances
-        if i.get("status") in ("active", "processing", "idle")
-        and not i.get("is_subagent")
+        i
+        for i in instances
+        if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")
     ]
     return len(manual)
 
@@ -127,10 +130,13 @@ def get_manual_instance_count() -> int | None:
 # Escalation actions
 # ---------------------------------------------------------------------------
 
+
 def _discord_dm(message: str):
     result = subprocess.run(
         ["discord", "dm", message],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     if result.returncode != 0:
         print(f"  discord dm failed: {result.stderr.strip()}", file=sys.stderr)
@@ -141,7 +147,9 @@ def _discord_dm(message: str):
 def _discord_send(channel: str, message: str):
     result = subprocess.run(
         ["discord", "send", channel, message],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     if result.returncode != 0:
         print(f"  discord send failed ({channel}): {result.stderr.strip()}", file=sys.stderr)
@@ -158,9 +166,11 @@ def _sound(sound_name: str = "Glass"):
 
 
 def _pavlok_beep(value: int = 50):
-    result = _post("/api/pavlok/zap", {"type": "beep", "value": value, "reason": "offline_work_hours"})
+    result = _post(
+        "/api/pavlok/zap", {"type": "beep", "value": value, "reason": "offline_work_hours"}
+    )
     if result is None:
-        print(f"  Pavlok beep failed — token-api unreachable", file=sys.stderr)
+        print("  Pavlok beep failed — token-api unreachable", file=sys.stderr)
     else:
         print(f"  Pavlok beep: value={value}")
 
@@ -192,6 +202,7 @@ def fire_escalation(level: int, elapsed_min: int):
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
+
 
 def is_work_hours(now: datetime) -> bool:
     """True if now is a weekday between 9 AM and 5 PM."""
