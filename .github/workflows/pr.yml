@@ -44,12 +44,12 @@ jobs:
       - name: Sync Python deps (cli-tools)
         if: hashFiles('cli-tools/pyproject.toml') != ''
         working-directory: cli-tools
-        run: uv sync --all-groups
+        run: uv sync --python 3.11 --all-groups
 
       - name: Sync Python deps (token-api)
         if: hashFiles('token-api/pyproject.toml') != ''
         working-directory: token-api
-        run: uv sync --all-groups
+        run: uv sync --python 3.11 --all-groups
 
       - name: Format check (ruff)
         run: |
