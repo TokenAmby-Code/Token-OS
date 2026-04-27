@@ -86,29 +86,29 @@ for proj in "${PROJECTS[@]}"; do
     [[ -f "$proj/pyproject.toml" ]] || { warn "Skipping $proj (no pyproject.toml)"; continue; }
 
     if [[ "$FIX" == "true" ]]; then
-        run_step "ruff format (write)" "$proj" uv run --group dev ruff format .
-        run_step "ruff check --fix"     "$proj" uv run --group dev ruff check --fix .
+        run_step "ruff format (write)" "$proj" uv run --python 3.11 --group dev ruff format .
+        run_step "ruff check --fix"     "$proj" uv run --python 3.11 --group dev ruff check --fix .
         continue
     fi
 
     case "$TARGET" in
         format)
-            run_step "ruff format --check" "$proj" uv run --group dev ruff format --check .
+            run_step "ruff format --check" "$proj" uv run --python 3.11 --group dev ruff format --check .
             ;;
         lint)
-            run_step "ruff check" "$proj" uv run --group dev ruff check .
+            run_step "ruff check" "$proj" uv run --python 3.11 --group dev ruff check .
             ;;
         types)
-            run_step "mypy" "$proj" uv run --group dev mypy --ignore-missing-imports .
+            run_step "mypy" "$proj" uv run --python 3.11 --group dev mypy --ignore-missing-imports .
             ;;
         unit)
-            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --group dev pytest --tb=short
+            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --python 3.11 --group dev pytest --tb=short
             ;;
         all|cli-tools|token-api)
-            run_step "ruff format --check" "$proj" uv run --group dev ruff format --check .
-            run_step "ruff check"          "$proj" uv run --group dev ruff check .
-            run_step "mypy"                "$proj" uv run --group dev mypy --ignore-missing-imports .
-            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --group dev pytest --tb=short
+            run_step "ruff format --check" "$proj" uv run --python 3.11 --group dev ruff format --check .
+            run_step "ruff check"          "$proj" uv run --python 3.11 --group dev ruff check .
+            run_step "mypy"                "$proj" uv run --python 3.11 --group dev mypy --ignore-missing-imports .
+            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --python 3.11 --group dev pytest --tb=short
             ;;
     esac
 done
