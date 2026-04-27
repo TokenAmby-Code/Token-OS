@@ -578,6 +578,17 @@ apply_side_expansion() {
     side_exp=$(tmux show-options -wv -t "$TARGET" @SIDE_EXPANDED 2>/dev/null || echo "none")
     local origin
     origin=$(get_layout_origin)
+    local focused
+    focused=$(tmux show-options -wv -t "$TARGET" @FOCUSED 2>/dev/null || echo "false")
+
+    if [[ "$focused" == "true" ]]; then
+        while IFS=$'\t' read -r pid _pleft _ptop _pwidth _pheight; do
+            tmux kill-pane -t "$pid" 2>/dev/null || true
+        done < <(get_side_panes)
+        tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
+        rebalance_grid_even
+        return 0
+    fi
 
     # Validate target still exists
     if [[ "$side_exp" != "none" ]] && ! tmux display-message -t "$side_exp" -p '' 2>/dev/null; then
