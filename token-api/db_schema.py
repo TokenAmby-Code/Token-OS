@@ -80,6 +80,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("launch_mode", "ALTER TABLE claude_instances ADD COLUMN launch_mode TEXT"),
             ("transplant_expected", "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0"),
             ("session_doc_policy", "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT"),
+            ("wrapper_launch_id", "ALTER TABLE claude_instances ADD COLUMN wrapper_launch_id TEXT"),
+            ("continuity_binding_source", "ALTER TABLE claude_instances ADD COLUMN continuity_binding_source TEXT"),
+            ("closure_surface", "ALTER TABLE claude_instances ADD COLUMN closure_surface TEXT"),
+            ("closure_required", "ALTER TABLE claude_instances ADD COLUMN closure_required INTEGER DEFAULT 0"),
+            ("workflow_state", "ALTER TABLE claude_instances ADD COLUMN workflow_state TEXT"),
+            ("workflow_updated_at", "ALTER TABLE claude_instances ADD COLUMN workflow_updated_at TIMESTAMP"),
+            ("workflow_blocked_reason", "ALTER TABLE claude_instances ADD COLUMN workflow_blocked_reason TEXT"),
+            ("stop_allowed", "ALTER TABLE claude_instances ADD COLUMN stop_allowed INTEGER DEFAULT 1"),
+            ("next_required_action", "ALTER TABLE claude_instances ADD COLUMN next_required_action TEXT"),
+            ("next_action_owner", "ALTER TABLE claude_instances ADD COLUMN next_action_owner TEXT"),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -128,6 +138,57 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at DESC)")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                workflow_state TEXT,
+                event_type TEXT NOT NULL,
+                event_owner TEXT,
+                details_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_workflow_events_instance_time
+            ON workflow_events(instance_id, created_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_workflow_events_type_time
+            ON workflow_events(event_type, created_at DESC)
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS instance_mutations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                mutation_type TEXT NOT NULL,
+                write_source TEXT NOT NULL,
+                write_txn_id TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                service_version TEXT,
+                wrapper_launch_id TEXT,
+                field_names_json TEXT,
+                before_json TEXT,
+                after_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_instance_mutations_instance_time
+            ON instance_mutations(instance_id, created_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_instance_mutations_write_txn
+            ON instance_mutations(write_txn_id)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_instance_mutations_type_time
+            ON instance_mutations(mutation_type, created_at DESC)
+        """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_tasks (

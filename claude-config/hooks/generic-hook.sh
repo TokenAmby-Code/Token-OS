@@ -42,7 +42,7 @@ fi
 
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
-if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" ]]; then
+if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" ]]; then
   JQ_FILTER=".env //= {} | .env"
   [[ -n "$SSH_CLIENT" ]] && JQ_FILTER="$JQ_FILTER + {SSH_CLIENT: \$ssh}"
   [[ -n "$TMUX" ]] && JQ_FILTER="$JQ_FILTER + {TMUX: \$tmux}"
@@ -59,6 +59,7 @@ if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMAR
   [[ -n "${TOKEN_API_LAUNCH_MODE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_LAUNCH_MODE: \$launch_mode}"
   [[ -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_TRANSPLANT_EXPECTED: \$transplant_expected}"
   [[ -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_DISPATCH_RESOLVED_PANE: \$dispatch_resolved_pane}"
+  [[ -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_WRAPPER_LAUNCH_ID: \$wrapper_launch_id}"
   JQ_FILTER=".env = ($JQ_FILTER)"
   HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c \
     --arg ssh "${SSH_CLIENT:-}" \
@@ -76,6 +77,7 @@ if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMAR
     --arg launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \
     --arg transplant_expected "${TOKEN_API_TRANSPLANT_EXPECTED:-}" \
     --arg dispatch_resolved_pane "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" \
+    --arg wrapper_launch_id "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" \
     "$JQ_FILTER" 2>/dev/null) || true
 fi
 

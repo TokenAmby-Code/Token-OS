@@ -13,7 +13,6 @@ Uses a temporary SQLite database via TOKEN_API_DB env var.
 """
 
 import asyncio
-import os
 import sqlite3
 import tempfile
 import uuid
@@ -22,49 +21,35 @@ from pathlib import Path
 
 import pytest
 
-# Set test DB before importing main (DB_PATH is read at import time)
-_test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_test_db.close()
-os.environ["TOKEN_API_DB"] = _test_db.name
+ALLOWED_LEGIONS = set()
+MORNING_ENFORCE_STATE = {}
+_format_discord_injection = None
+_TEST_DB_PATH = None
 
-from main import (
-    ALLOWED_LEGIONS,
-    DB_PATH,
-    MORNING_ENFORCE_STATE,
-    _format_discord_injection,
-)
-from init_db import init_database
+@pytest.fixture
+def client(app_env):
+    """Create a test client for the FastAPI app."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(app_env.main.app)
 
 
 @pytest.fixture(autouse=True)
-def _init_db():
-    """Initialize a fresh test database for each test.
-
-    Uses the canonical sync wrapper, which now covers the full schema.
-    """
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
-    init_database()
-    yield
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
-
-
-@pytest.fixture
-def client():
-    """Create a test client for the FastAPI app."""
-    from main import app
-    from fastapi.testclient import TestClient
-    return TestClient(app)
+def _bind_main_globals(app_env):
+    global ALLOWED_LEGIONS, MORNING_ENFORCE_STATE, _format_discord_injection, _TEST_DB_PATH
+    ALLOWED_LEGIONS = app_env.main.ALLOWED_LEGIONS
+    MORNING_ENFORCE_STATE = app_env.main.MORNING_ENFORCE_STATE
+    _format_discord_injection = app_env.main._format_discord_injection
+    _TEST_DB_PATH = str(app_env.db_path)
 
 
 def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
                      status="idle", tmux_pane=None, working_dir="/tmp",
-                     last_activity=None):
+                     last_activity=None, db_path=None):
     """Insert a minimal test instance directly into DB."""
     iid = instance_id or str(uuid.uuid4())
     now = last_activity or datetime.now().isoformat()
-    conn = sqlite3.connect(_test_db.name)
+    conn = sqlite3.connect(db_path or _TEST_DB_PATH)
     conn.execute(
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
@@ -80,13 +65,25 @@ def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
 
 def _get_instance(instance_id):
     """Read an instance row from DB."""
-    conn = sqlite3.connect(_test_db.name)
+    conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _get_workflow_events(instance_id):
+    """Read workflow events for an instance directly from DB."""
+    conn = sqlite3.connect(_TEST_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM workflow_events WHERE instance_id = ? ORDER BY id ASC",
+        (instance_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 # ── 1. Schema Tests ──────────────────────────────────────────
@@ -104,13 +101,35 @@ class TestSchema:
         assert row["synced"] == 0
 
     def test_legion_synced_index_exists(self):
-        conn = sqlite3.connect(_test_db.name)
+        conn = sqlite3.connect(_TEST_DB_PATH)
         indices = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='claude_instances'"
         ).fetchall()
         conn.close()
         index_names = {row[0] for row in indices}
         assert "idx_instances_legion_synced" in index_names
+
+    def test_workflow_columns_exist(self):
+        conn = sqlite3.connect(_TEST_DB_PATH)
+        cols = conn.execute("PRAGMA table_info(claude_instances)").fetchall()
+        conn.close()
+        names = {row[1] for row in cols}
+        assert {"continuity_binding_source", "workflow_state", "stop_allowed", "next_required_action"} <= names
+
+    def test_workflow_events_table_exists(self):
+        conn = sqlite3.connect(_TEST_DB_PATH)
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        indices = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='workflow_events'"
+        ).fetchall()
+        conn.close()
+        table_names = {row[0] for row in tables}
+        index_names = {row[0] for row in indices}
+        assert "workflow_events" in table_names
+        assert "idx_workflow_events_instance_time" in index_names
+        assert "idx_workflow_events_type_time" in index_names
 
 
 # ── 2. PATCH /api/instances/{id}/legion ──────────────────────
@@ -256,15 +275,13 @@ class TestSyncedCleanupOnStop:
 
     def test_stale_cleanup_clears_synced(self):
         """Stale instance cleanup should set synced=0."""
-        from main import cleanup_stale_instances
-
         # Insert instance with old last_activity (4 hours ago)
         old_time = (datetime.now() - timedelta(hours=4)).isoformat()
         iid = _insert_instance(legion="mechanicus", synced=1, last_activity=old_time)
 
         # Run cleanup
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(cleanup_stale_instances())
+        result = loop.run_until_complete(__import__("main").cleanup_stale_instances())
         loop.close()
 
         assert result["cleaned_up"] >= 1
@@ -387,6 +404,139 @@ class TestMorningAckViaDiscord:
         assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
 
 
+# ── 9. Workflow / continuity state ───────────────────────────
+
+
+class TestWorkflowState:
+    def test_dispatch_start_persists_binding_and_events(self, client):
+        sid = str(uuid.uuid4())
+        session_doc = Path(tempfile.mkdtemp()) / "dispatch-note.md"
+        session_doc.write_text(
+            "---\n"
+            "title: Dispatch Note\n"
+            "type: session\n"
+            "status: active\n"
+            "---\n\n"
+            "# Dispatch\n",
+            encoding="utf-8",
+        )
+
+        resp = client.post("/api/hooks/SessionStart", json={
+            "session_id": sid,
+            "cwd": "/Volumes/Imperium/Imperium-ENV",
+            "pid": 12345,
+            "env": {
+                "TOKEN_API_ENGINE": "claude",
+                "TOKEN_API_LAUNCHER": "vault-dispatch",
+                "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                "TOKEN_API_DISPATCH_WINDOW": "legion",
+                "TOKEN_API_DISPATCH_MODE": "stack_new",
+                "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
+                "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                "TOKEN_API_LAUNCH_MODE": "vault_then_transplant",
+                "TOKEN_API_TRANSPLANT_EXPECTED": "true",
+            },
+        })
+        assert resp.status_code == 200, resp.text
+
+        row = _get_instance(sid)
+        assert row["session_doc_id"] is not None
+        assert row["session_doc_policy"] == "dispatch_explicit"
+        assert row["continuity_binding_source"] == "dispatch"
+        assert row["workflow_state"] == "dispatching"
+        assert row["stop_allowed"] == 1
+
+        events = _get_workflow_events(sid)
+        event_types = [event["event_type"] for event in events]
+        assert "session_doc_bound" in event_types
+        assert "continuity_binding_changed" in event_types
+        assert "workflow_state_changed" in event_types
+
+    def test_codex_direct_target_starts_in_worktree(self, client):
+        sid = str(uuid.uuid4())
+        session_doc = Path(tempfile.mkdtemp()) / "codex-dispatch.md"
+        session_doc.write_text(
+            "---\n"
+            "title: Codex Dispatch\n"
+            "type: session\n"
+            "status: active\n"
+            "---\n\n"
+            "# Dispatch\n",
+            encoding="utf-8",
+        )
+
+        resp = client.post("/api/hooks/SessionStart", json={
+            "session_id": sid,
+            "cwd": "/Volumes/Imperium/Token-OS",
+            "pid": 22222,
+            "env": {
+                "TOKEN_API_ENGINE": "codex",
+                "TOKEN_API_LAUNCHER": "vault-dispatch",
+                "TOKEN_API_DISPATCH_TARGET": "bridge:BL",
+                "TOKEN_API_DISPATCH_WINDOW": "bridge",
+                "TOKEN_API_DISPATCH_MODE": "named_slot",
+                "TOKEN_API_DISPATCH_SLOT": "BL",
+                "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
+                "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                "TOKEN_API_LAUNCH_MODE": "direct_target",
+                "TOKEN_API_TRANSPLANT_EXPECTED": "false",
+            },
+        })
+        assert resp.status_code == 200, resp.text
+
+        row = _get_instance(sid)
+        assert row["workflow_state"] == "worktree"
+        assert row["continuity_binding_source"] == "dispatch"
+
+    def test_workflow_events_endpoint_returns_recent_events(self, client):
+        iid = _insert_instance()
+        conn = sqlite3.connect(_TEST_DB_PATH)
+        conn.execute(
+            """INSERT INTO workflow_events (instance_id, workflow_state, event_type, event_owner, details_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (iid, "worktree", "workflow_state_changed", "test", '{"new_workflow_state":"worktree"}'),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.get(f"/api/instances/{iid}/workflow-events")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["event_type"] == "workflow_state_changed"
+        assert data[0]["details"]["new_workflow_state"] == "worktree"
+
+    def test_stop_validate_blocks_and_sets_workflow(self, client):
+        sid = _insert_instance(status="idle")
+        conn = sqlite3.connect(_TEST_DB_PATH)
+        conn.execute(
+            """UPDATE claude_instances
+               SET instance_type = 'golden_throne',
+                   workflow_state = 'worktree',
+                   stop_allowed = 1
+               WHERE id = ?""",
+            (sid,),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.post("/api/hooks/StopValidate", json={"session_id": sid})
+        assert resp.status_code == 200
+        assert resp.json()["decision"] == "block"
+
+        row = _get_instance(sid)
+        assert row["workflow_state"] == "blocked"
+        assert row["workflow_blocked_reason"] == "self_eval_required"
+        assert row["stop_allowed"] == 0
+        assert row["next_required_action"] == "self_eval"
+        assert row["next_action_owner"] == "agent"
+
+        events = _get_workflow_events(sid)
+        event_types = [event["event_type"] for event in events]
+        assert "stop_blocked" in event_types
+        assert "workflow_state_changed" in event_types
+
+
 # ── 9. Cron engine legion column ──────────────────────────────
 
 
@@ -397,7 +547,7 @@ class TestCronEngineLegion:
         from cron_engine import CronEngine
 
         async def _check():
-            async with aiosqlite.connect(_test_db.name) as db:
+            async with aiosqlite.connect(_TEST_DB_PATH) as db:
                 await CronEngine.init_tables(db)
                 await db.commit()
                 cursor = await db.execute("PRAGMA table_info(cron_jobs)")

@@ -31,12 +31,14 @@ import aiosqlite
 import requests
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from instance_mutation import sanctioned_update_instance
 
 from shared import (
     DB_PATH,
     log_event,
     PROFILES,
     FALLBACK_VOICES,
+    ULTIMATE_FALLBACK,
     get_next_available_profile,
     DESKTOP_CONFIG,
     TTS_BACKEND,
@@ -375,8 +377,12 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
         # Phone unreachable while away — Mac as last resort (shouldn't happen often)
         return {"device": "mac", "reason": f"geofence: {location_zone}, phone unreachable", "discord_bot": None}
 
-    # 3. WSL satellite — best audio quality when at home
-    if wsl_voice and is_satellite_tts_available():
+    # 3. WSL satellite — best audio quality when at home.
+    # Route to WSL whenever the satellite is healthy; speak_tts() will
+    # substitute a default voice if the caller didn't provide one. Gating
+    # on wsl_voice here used to silently demote every voice-less call
+    # (e.g. /api/notify/tts) to phone, contradicting the "WSL first" doctrine.
+    if is_satellite_tts_available():
         return {"device": "wsl", "reason": "satellite healthy", "discord_bot": None}
 
     # 4. Phone — reachable as secondary home device
@@ -414,6 +420,13 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
     device = routing["device"]
     logger.info(f"TTS: Routing to {device} ({routing['reason']})")
 
+    # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
+    # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
+    if device == "wsl" and not wsl_voice:
+        wsl_voice = ULTIMATE_FALLBACK["wsl_voice"]
+        if wsl_rate is None:
+            wsl_rate = ULTIMATE_FALLBACK.get("wsl_rate", 0)
+
     # Dispatch with fallthrough on failure
     if device == "discord":
         result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
@@ -421,8 +434,10 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
             return result
         logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
         # Re-resolve skipping discord — try WSL/phone/mac
-        if wsl_voice and is_satellite_tts_available():
-            result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0,
+        if is_satellite_tts_available():
+            fallthrough_voice = wsl_voice or ULTIMATE_FALLBACK["wsl_voice"]
+            fallthrough_rate = wsl_rate if wsl_rate is not None else ULTIMATE_FALLBACK.get("wsl_rate", 0)
+            result = speak_tts_wsl(message, fallthrough_voice, fallthrough_rate,
                                    use_file_playback=use_file_playback)
             if result.get("success"):
                 return result
@@ -1164,11 +1179,19 @@ async def set_global_tts_mode(request: Request):
     # Update all active instances to match
     async with aiosqlite.connect(DB_PATH) as db:
         if mode == "silent":
-            # Release all voice slots for non-subagent active instances
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE status IN ('processing', 'idle') AND is_subagent = 0",
-                (mode,)
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
             )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={"tts_mode": mode, "tts_voice": None, "notification_sound": None},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
+                )
         elif mode == "verbose" and old_mode == "silent":
             # Re-assign voices to all active instances that lost theirs
             cursor = await db.execute(
@@ -1178,17 +1201,33 @@ async def set_global_tts_mode(request: Request):
             used_voices = set()
             for row in rows:
                 profile, _ = get_next_available_profile(used_voices)
-                await db.execute(
-                    "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
-                    (mode, profile["wsl_voice"], profile["notification_sound"], row[0])
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={
+                        "tts_mode": mode,
+                        "tts_voice": profile["wsl_voice"],
+                        "notification_sound": profile["notification_sound"],
+                    },
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
                 )
                 used_voices.add(profile["wsl_voice"])
         else:
-            # muted or verbose (voices already assigned)
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ? WHERE status IN ('processing', 'idle') AND is_subagent = 0",
-                (mode,)
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
             )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={"tts_mode": mode},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
+                )
         await db.commit()
 
     await log_event("tts_global_mode_changed", details={"mode": mode, "old_mode": old_mode})

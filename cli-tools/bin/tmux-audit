@@ -8,7 +8,7 @@
 # fallback. Each assertion is a self-contained function.
 #
 # Assertions:
-#   backburner  — No idle shells in legion/kreig; backstop placeholder management
+#   backburner  — No idle shells in legion/mechanicus; backstop placeholder management
 #   grid        — Palace power grid has expected pane count
 #   tui         — TUI monitor panes are alive, not dead/stuck
 #   layout      — Pane proportions haven't drifted
@@ -66,7 +66,7 @@ fi
 
 # ============================================================
 # ASSERTION: backburner
-# No idle shells in legion/kreig. Backstop placeholder management.
+# No idle shells in legion/mechanicus. Backstop placeholder management.
 # ============================================================
 assert_backburner() {
     local IDLE_SHELLS="bash zsh sh fish"
@@ -79,7 +79,7 @@ assert_backburner() {
         return 1
     }
 
-    for win in legion kreig; do
+    for win in legion mechanicus mars kreig; do
         local pane_data
         pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
             -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}' 2>/dev/null) || continue

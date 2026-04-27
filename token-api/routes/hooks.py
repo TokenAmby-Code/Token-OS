@@ -25,12 +25,18 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import shared
+from instance_mutation import (
+    _fetch_instance_row,
+    sanctioned_delete_instance,
+    sanctioned_insert_instance,
+    sanctioned_update_instance,
+)
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR,
     PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
     get_next_available_profile,
     DESKTOP_STATE, DISCORD_DAEMON_URL,
-    log_event,
+    log_event, append_workflow_event,
     VOICE_CHAT_SESSIONS,
     resolve_device_from_ip,
     is_subagent_pid,
@@ -137,6 +143,149 @@ def _normalize_text(value: Any) -> str | None:
     return text or None
 
 
+def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | None:
+    """Collapse session-doc policy variants into the higher-level ownership classes."""
+    if not session_doc_policy:
+        return None
+    if session_doc_policy == "dispatch_explicit":
+        return "dispatch"
+    if session_doc_policy == "daily_note_custodes":
+        return "daily_note"
+    if session_doc_policy in {"manual_assigned", "manual_created"}:
+        return "manual"
+    return "auto_created"
+
+
+def _derive_launch_workflow_state(
+    *,
+    dispatch_target: str | None,
+    engine: str | None,
+    launch_mode: str | None,
+    working_dir: str | None,
+    target_working_dir: str | None,
+) -> str | None:
+    """Return the coarse workflow state for a fresh launch registration."""
+    if not dispatch_target:
+        return None
+    if launch_mode == "direct_target" or engine == "codex":
+        return "worktree"
+    if working_dir and target_working_dir and Path(working_dir) == Path(target_working_dir):
+        return "worktree"
+    return "dispatching"
+
+
+async def _apply_instance_workflow_state(
+    db,
+    *,
+    instance_id: str,
+    session_doc_id: int | None,
+    session_doc_policy: str | None,
+    workflow_state: str | None,
+    previous_session_doc_id: int | None = None,
+    previous_workflow_state: str | None = None,
+    event_owner: str = "hooks",
+):
+    """Persist coarse continuity/workflow fields and emit workflow events."""
+    continuity_binding_source = _derive_continuity_binding_source(session_doc_policy)
+    now = datetime.now().isoformat()
+    workflow_events = []
+    if session_doc_id:
+        workflow_events.append({
+            "workflow_state": workflow_state,
+            "event_type": "session_doc_bound",
+            "event_owner": event_owner,
+            "details": {
+                "session_doc_id": session_doc_id,
+                "session_doc_policy": session_doc_policy,
+                "continuity_binding_source": continuity_binding_source,
+            },
+        })
+    if previous_session_doc_id != session_doc_id:
+        workflow_events.append({
+            "workflow_state": workflow_state,
+            "event_type": "continuity_binding_changed",
+            "event_owner": event_owner,
+            "details": {
+                "old_session_doc_id": previous_session_doc_id,
+                "new_session_doc_id": session_doc_id,
+                "continuity_binding_source": continuity_binding_source,
+                "session_doc_policy": session_doc_policy,
+            },
+        })
+    if workflow_state and previous_workflow_state != workflow_state:
+        workflow_events.append({
+            "workflow_state": workflow_state,
+            "event_type": "workflow_state_changed",
+            "event_owner": event_owner,
+            "details": {
+                "old_workflow_state": previous_workflow_state,
+                "new_workflow_state": workflow_state,
+            },
+        })
+
+    updates = {
+        "session_doc_id": session_doc_id,
+        "session_doc_policy": session_doc_policy,
+        "continuity_binding_source": continuity_binding_source,
+        "workflow_state": workflow_state,
+        "workflow_blocked_reason": None,
+        "stop_allowed": 1,
+        "next_required_action": None,
+        "next_action_owner": None,
+    }
+    if workflow_state is not None:
+        updates["workflow_updated_at"] = now
+
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates=updates,
+        mutation_type="continuity_binding_changed" if previous_session_doc_id != session_doc_id else "instance_updated",
+        write_source="hooks",
+        actor=event_owner,
+        workflow_events=workflow_events,
+    )
+
+
+async def handle_wrapper_start(payload: dict) -> dict:
+    """Handle wrapper-level launch telemetry without creating an instance row."""
+    wrapper_launch_id = _normalize_text(
+        payload.get("wrapper_launch_id")
+        or payload.get("env", {}).get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
+    )
+    details = {
+        "wrapper_launch_id": wrapper_launch_id,
+        "launcher": _normalize_text(payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")),
+        "engine": _normalize_text(payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")),
+        "cwd": _normalize_text(payload.get("cwd")),
+        "tmux_pane": _normalize_text(payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")),
+        "pid": payload.get("pid"),
+        "source": "wrapper",
+    }
+    await log_event("wrapper_start", details=details)
+    return {"success": True, "action": "wrapper_start_logged", "wrapper_launch_id": wrapper_launch_id}
+
+
+async def handle_wrapper_end(payload: dict) -> dict:
+    """Handle wrapper-level exit telemetry without stopping an instance row."""
+    wrapper_launch_id = _normalize_text(
+        payload.get("wrapper_launch_id")
+        or payload.get("env", {}).get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
+    )
+    details = {
+        "wrapper_launch_id": wrapper_launch_id,
+        "launcher": _normalize_text(payload.get("launcher") or payload.get("env", {}).get("TOKEN_API_LAUNCHER", "")),
+        "engine": _normalize_text(payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")),
+        "cwd": _normalize_text(payload.get("cwd")),
+        "tmux_pane": _normalize_text(payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")),
+        "pid": payload.get("pid"),
+        "exit_code": payload.get("exit_code"),
+        "source": "wrapper",
+    }
+    await log_event("wrapper_end", details=details)
+    return {"success": True, "action": "wrapper_end_logged", "wrapper_launch_id": wrapper_launch_id}
+
+
 # ============ Session Doc Pool Derivation ============
 
 def _derive_pool(working_dir: str | None) -> str:
@@ -208,11 +357,13 @@ async def handle_session_start(payload: dict) -> dict:
     dispatch_session_doc_path = _normalize_text(payload.get("dispatch_session_doc_path") or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", ""))
     target_working_dir = _normalize_text(payload.get("target_working_dir") or env.get("TOKEN_API_TARGET_WORKING_DIR", ""))
     launch_mode = _normalize_text(payload.get("launch_mode") or env.get("TOKEN_API_LAUNCH_MODE", ""))
+    wrapper_launch_id = _normalize_text(payload.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", ""))
     transplant_expected_raw = payload.get("transplant_expected")
     if transplant_expected_raw is None:
         transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
     transplant_expected = str(transplant_expected_raw).lower() in {"1", "true", "yes"}
-    dispatch_field_values = (
+    launch_field_values = (
+        wrapper_launch_id,
         launcher,
         engine,
         dispatch_target,
@@ -225,6 +376,7 @@ async def handle_session_start(payload: dict) -> dict:
         1 if transplant_expected else 0,
     )
     session_doc_policy = None
+    dispatch_bound_doc = False
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -249,9 +401,13 @@ async def handle_session_start(payload: dict) -> dict:
         if db_transplant_row:
             supplant_id = db_transplant_row["id"]
             # Clear the marker
-            await db.execute(
-                "UPDATE claude_instances SET transplant_target_session = NULL WHERE id = ?",
-                (supplant_id,)
+            await sanctioned_update_instance(
+                db,
+                instance_id=supplant_id,
+                updates={"transplant_target_session": None},
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="SessionStart",
             )
 
         # 2. File-based handoff (local transplant — injected by generic-hook.sh)
@@ -289,42 +445,59 @@ async def handle_session_start(payload: dict) -> dict:
                         is_subagent=bool(is_subagent),
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
+                workflow_state = _derive_launch_workflow_state(
+                    dispatch_target=dispatch_target,
+                    engine=engine,
+                    launch_mode=launch_mode,
+                    working_dir=working_dir,
+                    target_working_dir=target_working_dir,
+                )
 
                 # Same-ID transplant (--continue): update the existing row in-place
                 now = datetime.now().isoformat()
-                await db.execute(
-                    """UPDATE claude_instances
-                       SET working_dir = ?, pid = ?, device_id = ?,
-                           status = 'idle', tmux_pane = ?,
-                           last_activity = ?,
-                           stopped_at = NULL, victory_at = NULL, victory_reason = NULL,
-                           input_lock = NULL, transplant_target_session = NULL,
-                           primarch = ?,
-                           session_doc_id = COALESCE(?, session_doc_id),
-                           launcher = COALESCE(?, launcher),
-                           engine = COALESCE(?, engine),
-                           dispatch_target = COALESCE(?, dispatch_target),
-                           dispatch_window = COALESCE(?, dispatch_window),
-                           dispatch_mode = COALESCE(?, dispatch_mode),
-                           dispatch_slot = COALESCE(?, dispatch_slot),
-                           dispatch_session_doc_path = COALESCE(?, dispatch_session_doc_path),
-                           target_working_dir = COALESCE(?, target_working_dir),
-                           launch_mode = COALESCE(?, launch_mode),
-                           transplant_expected = ?,
-                           session_doc_policy = COALESCE(?, session_doc_policy)
-                       WHERE id = ?""",
-                    (
-                        working_dir,
-                        payload.get("pid"),
-                        device_id,
-                        tmux_pane,
-                        now,
-                        primarch_name or existing_row["primarch"] if hasattr(existing_row, '__getitem__') else primarch_name,
-                        resolved_session_doc_id,
-                        *dispatch_field_values,
-                        session_doc_policy,
-                        session_id
-                    )
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=session_id,
+                    updates={
+                        "working_dir": working_dir,
+                        "pid": payload.get("pid"),
+                        "device_id": device_id,
+                        "status": "idle",
+                        "tmux_pane": tmux_pane,
+                        "last_activity": now,
+                        "stopped_at": None,
+                        "victory_at": None,
+                        "victory_reason": None,
+                        "input_lock": None,
+                        "transplant_target_session": None,
+                        "primarch": primarch_name or existing_row["primarch"] if hasattr(existing_row, '__getitem__') else primarch_name,
+                        "session_doc_id": resolved_session_doc_id or existing_row["session_doc_id"],
+                        "wrapper_launch_id": wrapper_launch_id or existing_row["wrapper_launch_id"],
+                        "launcher": launcher or existing_row["launcher"],
+                        "engine": engine or existing_row["engine"],
+                        "dispatch_target": dispatch_target or existing_row["dispatch_target"],
+                        "dispatch_window": dispatch_window or existing_row["dispatch_window"],
+                        "dispatch_mode": dispatch_mode or existing_row["dispatch_mode"],
+                        "dispatch_slot": dispatch_slot or existing_row["dispatch_slot"],
+                        "dispatch_session_doc_path": dispatch_session_doc_path or existing_row["dispatch_session_doc_path"],
+                        "target_working_dir": target_working_dir or existing_row["target_working_dir"],
+                        "launch_mode": launch_mode or existing_row["launch_mode"],
+                        "transplant_expected": 1 if transplant_expected else 0,
+                        "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
+                    },
+                    mutation_type="instance_updated",
+                    write_source="hooks",
+                    actor="SessionStart",
+                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                )
+                await _apply_instance_workflow_state(
+                    db,
+                    instance_id=session_id,
+                    session_doc_id=resolved_session_doc_id or existing_row["session_doc_id"],
+                    session_doc_policy=session_doc_policy or existing_row["session_doc_policy"],
+                    workflow_state=workflow_state,
+                    previous_session_doc_id=existing_row["session_doc_id"],
+                    previous_workflow_state=existing_row["workflow_state"],
                 )
                 await db.commit()
 
@@ -388,43 +561,53 @@ async def handle_session_start(payload: dict) -> dict:
                         is_subagent=bool(is_subagent),
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
+                workflow_state = _derive_launch_workflow_state(
+                    dispatch_target=dispatch_target,
+                    engine=engine,
+                    launch_mode=launch_mode,
+                    working_dir=working_dir,
+                    target_working_dir=target_working_dir,
+                )
 
                 # Update the old row with new session identity, preserve config
-                await db.execute(
-                    """UPDATE claude_instances
-                       SET id = ?, session_id = ?, working_dir = ?, pid = ?,
-                           status = 'idle', tmux_pane = ?, device_id = ?,
-                           registered_at = ?, last_activity = ?,
-                           stopped_at = NULL, victory_at = NULL, victory_reason = NULL,
-                           input_lock = NULL, primarch = ?,
-                           session_doc_id = COALESCE(?, session_doc_id),
-                           launcher = COALESCE(?, launcher),
-                           engine = COALESCE(?, engine),
-                           dispatch_target = COALESCE(?, dispatch_target),
-                           dispatch_window = COALESCE(?, dispatch_window),
-                           dispatch_mode = COALESCE(?, dispatch_mode),
-                           dispatch_slot = COALESCE(?, dispatch_slot),
-                           dispatch_session_doc_path = COALESCE(?, dispatch_session_doc_path),
-                           target_working_dir = COALESCE(?, target_working_dir),
-                           launch_mode = COALESCE(?, launch_mode),
-                           transplant_expected = ?,
-                           session_doc_policy = COALESCE(?, session_doc_policy)
-                       WHERE id = ?""",
-                    (
-                        session_id,
-                        internal_session_id,
-                        working_dir,
-                        payload.get("pid"),
-                        tmux_pane,
-                        device_id,
-                        now,
-                        now,
-                        primarch_name or old_inst["primarch"],
-                        resolved_session_doc_id,
-                        *dispatch_field_values,
-                        session_doc_policy,
-                        supplant_id
-                    )
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=supplant_id,
+                    updates={
+                        "id": session_id,
+                        "session_id": internal_session_id,
+                        "working_dir": working_dir,
+                        "pid": payload.get("pid"),
+                        "status": "idle",
+                        "tmux_pane": tmux_pane,
+                        "device_id": device_id,
+                        "registered_at": now,
+                        "last_activity": now,
+                        "stopped_at": None,
+                        "victory_at": None,
+                        "victory_reason": None,
+                        "input_lock": None,
+                        "primarch": primarch_name or old_inst["primarch"],
+                        "session_doc_id": resolved_session_doc_id or old_inst["session_doc_id"],
+                        "wrapper_launch_id": wrapper_launch_id or old_inst["wrapper_launch_id"],
+                        "launcher": launcher or old_inst["launcher"],
+                        "engine": engine or old_inst["engine"],
+                        "dispatch_target": dispatch_target or old_inst["dispatch_target"],
+                        "dispatch_window": dispatch_window or old_inst["dispatch_window"],
+                        "dispatch_mode": dispatch_mode or old_inst["dispatch_mode"],
+                        "dispatch_slot": dispatch_slot or old_inst["dispatch_slot"],
+                        "dispatch_session_doc_path": dispatch_session_doc_path or old_inst["dispatch_session_doc_path"],
+                        "target_working_dir": target_working_dir or old_inst["target_working_dir"],
+                        "launch_mode": launch_mode or old_inst["launch_mode"],
+                        "transplant_expected": 1 if transplant_expected else 0,
+                        "session_doc_policy": session_doc_policy or old_inst["session_doc_policy"],
+                    },
+                    mutation_type="instance_updated",
+                    write_source="hooks",
+                    actor="SessionStart",
+                    wrapper_launch_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
+                    where_clause="id = ?",
+                    where_params=(supplant_id,),
                 )
 
                 # Auto-link primarch session doc if applicable
@@ -437,10 +620,28 @@ async def handle_session_start(payload: dict) -> dict:
                     link_row = await cursor.fetchone()
                     if link_row and link_row[0]:
                         session_doc_id = link_row[0]
-                        await db.execute(
-                            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
-                            (session_doc_id, session_id)
+                        await sanctioned_update_instance(
+                            db,
+                            instance_id=session_id,
+                            updates={
+                                "session_doc_id": session_doc_id,
+                                "continuity_binding_source": "primarch",
+                            },
+                            mutation_type="continuity_binding_changed",
+                            write_source="hooks",
+                            actor="SessionStart",
                         )
+
+                await _apply_instance_workflow_state(
+                    db,
+                    instance_id=session_id,
+                    session_doc_id=session_doc_id,
+                    session_doc_policy=session_doc_policy or old_inst["session_doc_policy"],
+                    workflow_state=workflow_state,
+                    previous_session_doc_id=old_inst["session_doc_id"],
+                    previous_workflow_state=old_inst["workflow_state"],
+                )
+                dispatch_bound_doc = (session_doc_policy or old_inst["session_doc_policy"]) == "dispatch_explicit"
 
                 await db.commit()
 
@@ -502,14 +703,18 @@ async def handle_session_start(payload: dict) -> dict:
         _prior_discord_hosted = 0
         _prior_discord_channel = None
         _prior_legion = None
+        _prior_wrapper_launch_id = None
         _prior_session_doc_policy = None
+        _prior_session_doc_id = None
+        _prior_workflow_state = None
         _prior_dispatch = {}
         cursor = await db.execute(
             """SELECT discord_hosted, discord_channel, legion,
+                      wrapper_launch_id,
                       launcher, engine, dispatch_target, dispatch_window,
                       dispatch_mode, dispatch_slot, dispatch_session_doc_path,
                       target_working_dir, launch_mode, transplant_expected,
-                      session_doc_policy
+                      session_doc_policy, session_doc_id, workflow_state
                FROM claude_instances WHERE id = ?""",
             (session_id,)
         )
@@ -518,22 +723,33 @@ async def handle_session_start(payload: dict) -> dict:
             _prior_discord_hosted = _prior_row[0] or 0
             _prior_discord_channel = _prior_row[1]
             _prior_legion = _prior_row[2]
+            _prior_wrapper_launch_id = _prior_row[3]
             _prior_dispatch = {
-                "launcher": _prior_row[3],
-                "engine": _prior_row[4],
-                "dispatch_target": _prior_row[5],
-                "dispatch_window": _prior_row[6],
-                "dispatch_mode": _prior_row[7],
-                "dispatch_slot": _prior_row[8],
-                "dispatch_session_doc_path": _prior_row[9],
-                "target_working_dir": _prior_row[10],
-                "launch_mode": _prior_row[11],
-                "transplant_expected": _prior_row[12] or 0,
+                "launcher": _prior_row[4],
+                "engine": _prior_row[5],
+                "dispatch_target": _prior_row[6],
+                "dispatch_window": _prior_row[7],
+                "dispatch_mode": _prior_row[8],
+                "dispatch_slot": _prior_row[9],
+                "dispatch_session_doc_path": _prior_row[10],
+                "target_working_dir": _prior_row[11],
+                "launch_mode": _prior_row[12],
+                "transplant_expected": _prior_row[13] or 0,
             }
-            _prior_session_doc_policy = _prior_row[13]
+            _prior_session_doc_policy = _prior_row[14]
+            _prior_session_doc_id = _prior_row[15]
+            _prior_workflow_state = _prior_row[16]
             # Delete old row so INSERT succeeds (id is PRIMARY KEY)
-            await db.execute("DELETE FROM claude_instances WHERE id = ?", (session_id,))
+            await sanctioned_delete_instance(
+                db,
+                instance_id=session_id,
+                mutation_type="instance_replaced",
+                write_source="hooks",
+                actor="SessionStart",
+                wrapper_launch_id=_prior_wrapper_launch_id,
+            )
 
+        wrapper_launch_id = wrapper_launch_id or _prior_wrapper_launch_id
         launcher = launcher or _prior_dispatch.get("launcher")
         engine = engine or _prior_dispatch.get("engine")
         dispatch_target = dispatch_target or _prior_dispatch.get("dispatch_target")
@@ -550,49 +766,48 @@ async def handle_session_start(payload: dict) -> dict:
         # Insert instance
         now = datetime.now().isoformat()
         internal_session_id = str(uuid.uuid4())
-        await db.execute(
-            """INSERT INTO claude_instances
-               (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
-                profile_name, tts_voice, notification_sound, pid, status,
-                is_subagent, tmux_pane, primarch,
-                launcher, engine, dispatch_target, dispatch_window,
-                dispatch_mode, dispatch_slot, dispatch_session_doc_path,
-                target_working_dir, launch_mode, transplant_expected,
-                session_doc_policy,
-                discord_hosted, discord_channel,
-                registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                session_id,
-                internal_session_id,
-                tab_name,
-                working_dir,
-                origin_type,
-                source_ip,
-                device_id,
-                profile["name"],
-                profile["wsl_voice"],
-                profile["notification_sound"],
-                payload.get("pid"),
-                is_subagent,
-                tmux_pane,
-                primarch_name or None,
-                launcher,
-                engine,
-                dispatch_target,
-                dispatch_window,
-                dispatch_mode,
-                dispatch_slot,
-                dispatch_session_doc_path,
-                target_working_dir,
-                launch_mode,
-                1 if transplant_expected else 0,
-                session_doc_policy,
-                _prior_discord_hosted,
-                _prior_discord_channel,
-                now,
-                now
-            )
+        await sanctioned_insert_instance(
+            db,
+            values={
+                "id": session_id,
+                "session_id": internal_session_id,
+                "tab_name": tab_name,
+                "working_dir": working_dir,
+                "origin_type": origin_type,
+                "source_ip": source_ip,
+                "device_id": device_id,
+                "profile_name": profile["name"],
+                "tts_voice": profile["wsl_voice"],
+                "notification_sound": profile["notification_sound"],
+                "pid": payload.get("pid"),
+                "status": "idle",
+                "legion": _prior_legion or "astartes",
+                "synced": 0,
+                "input_lock": None,
+                "is_subagent": is_subagent,
+                "tmux_pane": tmux_pane,
+                "primarch": primarch_name or None,
+                "wrapper_launch_id": wrapper_launch_id,
+                "launcher": launcher,
+                "engine": engine,
+                "dispatch_target": dispatch_target,
+                "dispatch_window": dispatch_window,
+                "dispatch_mode": dispatch_mode,
+                "dispatch_slot": dispatch_slot,
+                "dispatch_session_doc_path": dispatch_session_doc_path,
+                "target_working_dir": target_working_dir,
+                "launch_mode": launch_mode,
+                "transplant_expected": 1 if transplant_expected else 0,
+                "session_doc_policy": session_doc_policy,
+                "discord_hosted": _prior_discord_hosted,
+                "discord_channel": _prior_discord_channel,
+                "registered_at": now,
+                "last_activity": now,
+            },
+            mutation_type="instance_registered",
+            write_source="hooks",
+            actor="SessionStart",
+            wrapper_launch_id=wrapper_launch_id,
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
@@ -606,12 +821,23 @@ async def handle_session_start(payload: dict) -> dict:
             is_subagent=bool(is_subagent),
         )
         session_doc_policy = resolved_session_doc_policy or session_doc_policy
+        workflow_state = _derive_launch_workflow_state(
+            dispatch_target=dispatch_target,
+            engine=engine,
+            launch_mode=launch_mode,
+            working_dir=working_dir,
+            target_working_dir=target_working_dir,
+        )
         dispatch_bound_doc = session_doc_policy == "dispatch_explicit"
-        if session_doc_id:
-            await db.execute(
-                "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = ? WHERE id = ?",
-                (session_doc_id, session_doc_policy, session_id)
-            )
+        await _apply_instance_workflow_state(
+            db,
+            instance_id=session_id,
+            session_doc_id=session_doc_id,
+            session_doc_policy=session_doc_policy,
+            workflow_state=workflow_state,
+            previous_session_doc_id=_prior_session_doc_id,
+            previous_workflow_state=_prior_workflow_state,
+        )
 
         # Auto-detect legion from context
         auto_legion = None
@@ -631,14 +857,24 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:
-            await db.execute(
-                "UPDATE claude_instances SET legion = ? WHERE id = ?",
-                (auto_legion, session_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={"legion": auto_legion},
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="SessionStart",
+                wrapper_launch_id=wrapper_launch_id,
             )
         elif _prior_legion and _prior_legion != "astartes":
-            await db.execute(
-                "UPDATE claude_instances SET legion = ? WHERE id = ?",
-                (_prior_legion, session_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={"legion": _prior_legion},
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="SessionStart",
+                wrapper_launch_id=wrapper_launch_id,
             )
 
         await db.commit()
@@ -677,6 +913,7 @@ async def handle_session_start(payload: dict) -> dict:
                              "is_subagent": is_subagent, "subagent_env": subagent_env or None,
                              "primarch": primarch_name or None,
                              "launcher": launcher or None,
+                             "wrapper_launch_id": wrapper_launch_id or None,
                              "engine": engine or None,
                              "dispatch_target": dispatch_target or None,
                              "dispatch_window": dispatch_window or None,
@@ -712,7 +949,9 @@ async def handle_session_end(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id, tmux_pane, legion FROM claude_instances WHERE id = ?",
+            """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
+                      tmux_pane, legion, workflow_state
+               FROM claude_instances WHERE id = ?""",
             (session_id,)
         )
         row = await cursor.fetchone()
@@ -724,6 +963,7 @@ async def handle_session_end(payload: dict) -> dict:
         session_doc_id = row[3]
         _stop_pane = row[4]
         _stop_legion = row[5] or "astartes"
+        _prior_workflow_state = row[6]
 
         # Populate end_time and duration_minutes in session doc frontmatter
         if session_doc_id and not is_subagent:
@@ -755,9 +995,38 @@ async def handle_session_end(payload: dict) -> dict:
         count_row = await cursor.fetchone()
         was_active = count_row[0] if count_row else 0
 
-        await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-            (now, session_id)
+        workflow_events = [{
+            "workflow_state": "closed",
+            "event_type": "workflow_closed",
+            "event_owner": "hooks",
+            "details": {"source": "session_end"},
+        }]
+        if _prior_workflow_state != "closed":
+            workflow_events.append({
+                "workflow_state": "closed",
+                "event_type": "workflow_state_changed",
+                "event_owner": "hooks",
+                "details": {"old_workflow_state": _prior_workflow_state, "new_workflow_state": "closed"},
+            })
+        await sanctioned_update_instance(
+            db,
+            instance_id=session_id,
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "stopped_at": now,
+                "workflow_state": "closed",
+                "workflow_updated_at": now,
+                "workflow_blocked_reason": None,
+                "stop_allowed": 1,
+                "next_required_action": None,
+                "next_action_owner": None,
+            },
+            mutation_type="instance_stopped",
+            write_source="hooks",
+            actor="SessionEnd",
+            wrapper_launch_id=payload.get("wrapper_launch_id"),
+            workflow_events=workflow_events,
         )
 
         # Reset pane background on stop (clear legion tint so stale colors don't linger)
@@ -839,21 +1108,29 @@ async def handle_prompt_submit(payload: dict) -> dict:
     now = datetime.now().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE id = ?",
+            "SELECT * FROM claude_instances WHERE id = ?",
             (session_id,)
         )
-        if not await cursor.fetchone():
+        existing = await cursor.fetchone()
+        if not existing:
             return {"success": False, "action": "not_found"}
 
         # Also resurrect stopped instances - activity means they're active
         # Backfill PID if payload contains one and DB value is NULL
-        await db.execute(
-            """UPDATE claude_instances
-               SET status = 'processing', last_activity = ?, stopped_at = NULL,
-                   pid = COALESCE(pid, ?)
-               WHERE id = ?""",
-            (now, payload.get("pid"), session_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=session_id,
+            updates={
+                "status": "processing",
+                "last_activity": now,
+                "stopped_at": None,
+                "pid": existing["pid"] or payload.get("pid"),
+            },
+            mutation_type="status_changed",
+            write_source="hooks",
+            actor="PromptSubmit",
         )
         await db.commit()
 
@@ -898,12 +1175,21 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # Backfill PID if payload contains one and DB value is NULL
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """UPDATE claude_instances
-               SET status = 'processing', last_activity = ?, stopped_at = NULL,
-                   pid = COALESCE(pid, ?)
-               WHERE id = ?""",
-            (now, payload.get("pid"), session_id)
+        existing = await _fetch_instance_row(db, session_id)
+        if not existing:
+            return {"success": False, "action": "not_found", "instance_id": session_id}
+        await sanctioned_update_instance(
+            db,
+            instance_id=session_id,
+            updates={
+                "status": "processing",
+                "last_activity": now,
+                "stopped_at": None,
+                "pid": existing.get("pid") or payload.get("pid"),
+            },
+            mutation_type="status_changed",
+            write_source="hooks",
+            actor="PostToolUse",
         )
         await db.commit()
 
@@ -992,16 +1278,22 @@ async def handle_stop(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         if will_evaluate or is_sync_instance:
-            # Evaluators (or sync retrigger) will handle status — just update timestamp
-            await db.execute(
-                "UPDATE claude_instances SET last_activity = ? WHERE id = ?",
-                (now, session_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={"last_activity": now},
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="Stop",
             )
         else:
-            # Subagents, intermediate stops, no evaluators — go idle immediately
-            await db.execute(
-                "UPDATE claude_instances SET status = 'idle', last_activity = ? WHERE id = ?",
-                (now, session_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={"status": "idle", "last_activity": now},
+                mutation_type="status_changed",
+                write_source="hooks",
+                actor="Stop",
             )
         await db.commit()
 
@@ -1189,11 +1481,13 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     if session_id:
         now = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """UPDATE claude_instances
-                   SET status = 'processing', last_activity = ?, stopped_at = NULL
-                   WHERE id = ?""",
-                (now, session_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={"status": "processing", "last_activity": now, "stopped_at": None},
+                mutation_type="status_changed",
+                write_source="hooks",
+                actor="PreToolUse",
             )
             await db.commit()
 
@@ -1358,6 +1652,21 @@ async def handle_stop_validate(payload: dict) -> dict:
     if session_id in _self_eval_pending:
         issued_at = _self_eval_pending.pop(session_id)
         elapsed = now - issued_at
+        async with aiosqlite.connect(DB_PATH) as db:
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={
+                    "stop_allowed": 1,
+                    "workflow_blocked_reason": None,
+                    "next_required_action": None,
+                    "next_action_owner": None,
+                },
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="StopValidate",
+            )
+            await db.commit()
         logger.info(
             f"StopValidate: {session_id[:12]} self-eval complete "
             f"({elapsed:.1f}s) — allowing stop"
@@ -1376,7 +1685,7 @@ async def handle_stop_validate(payload: dict) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, instance_type, is_subagent, victory_at FROM claude_instances WHERE id = ?",
+            "SELECT id, instance_type, is_subagent, victory_at, workflow_state FROM claude_instances WHERE id = ?",
             (session_id,)
         )
         instance = await cursor.fetchone()
@@ -1410,6 +1719,41 @@ async def handle_stop_validate(payload: dict) -> dict:
     # ── Block: golden_throne and sync instances get self-eval prompt ──
     if instance_type in ("golden_throne", "sync"):
         _self_eval_pending[session_id] = now
+        blocked_at = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates={
+                    "workflow_state": "blocked",
+                    "workflow_updated_at": blocked_at,
+                    "workflow_blocked_reason": "self_eval_required",
+                    "stop_allowed": 0,
+                    "next_required_action": "self_eval",
+                    "next_action_owner": "agent",
+                },
+                mutation_type="status_changed",
+                write_source="hooks",
+                actor="StopValidate",
+            )
+            await append_workflow_event(
+                db,
+                instance_id=session_id,
+                workflow_state="blocked",
+                event_type="stop_blocked",
+                event_owner="hooks",
+                details={"instance_type": instance_type, "reason": "self_eval_required"},
+            )
+            if instance.get("workflow_state") != "blocked":
+                await append_workflow_event(
+                    db,
+                    instance_id=session_id,
+                    workflow_state="blocked",
+                    event_type="workflow_state_changed",
+                    event_owner="hooks",
+                    details={"old_workflow_state": instance.get("workflow_state"), "new_workflow_state": "blocked"},
+                )
+            await db.commit()
         logger.info(
             f"StopValidate: blocking {session_id[:12]} ({instance_type}) "
             f"with self-eval prompt"
@@ -1428,12 +1772,22 @@ async def handle_stop_validate(payload: dict) -> dict:
 @router.post("/api/hooks/{action_type}")
 async def dispatch_hook(action_type: str, payload: dict, request: Request) -> dict:
     """
-    Unified hook dispatcher for Claude Code hooks.
+    Unified hook dispatcher for Claude Code and Codex hooks.
 
-    Receives hook events from generic-hook.sh and routes to appropriate handler.
+    Receives hook events from shell bridges and routes to appropriate handler.
     Always returns a response - errors are logged but don't cause failures.
     """
+    action_aliases = {
+        "PromptSubmit": "UserPromptSubmit",
+        "InferenceStop": "Stop",
+        "InferenceStopValidate": "StopValidate",
+    }
+
+    normalized_action_type = action_aliases.get(action_type, action_type)
+
     handlers = {
+        "WrapperStart": handle_wrapper_start,
+        "WrapperEnd": handle_wrapper_end,
         "SessionStart": handle_session_start,
         "SessionEnd": handle_session_end,
         "UserPromptSubmit": handle_prompt_submit,
@@ -1444,7 +1798,7 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         "Notification": handle_notification,
     }
 
-    handler = handlers.get(action_type)
+    handler = handlers.get(normalized_action_type)
     if not handler:
         logger.warning(f"Hook: Unknown action type: {action_type}")
         return {"success": False, "action": "unknown_hook_type", "type": action_type}
@@ -1452,11 +1806,20 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     # Inject HTTP client IP into payload for device detection fallback
     if request.client:
         payload["_client_ip"] = request.client.host
+    payload["_hook_action_type"] = normalized_action_type
+    payload["_hook_action_type_raw"] = action_type
 
     try:
         result = await handler(payload)
         return result
     except Exception as e:
-        logger.error(f"Hook handler error ({action_type}): {e}")
-        await log_event("hook_error", details={"action_type": action_type, "error": str(e)})
+        logger.error(f"Hook handler error ({normalized_action_type}): {e}")
+        await log_event(
+            "hook_error",
+            details={
+                "action_type": normalized_action_type,
+                "raw_action_type": action_type,
+                "error": str(e),
+            },
+        )
         return {"success": False, "action": "handler_error", "error": str(e)}

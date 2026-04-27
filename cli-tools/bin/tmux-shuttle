@@ -5,7 +5,7 @@
 #
 # Window-aware behavior:
 #   palace/warp   → demote current pane to legion (fresh shell replaces it)
-#   legion/kreig  → popup selector to promote (swap) into palace/warp slot
+#   legion/mechanicus  → popup selector to promote (swap) into palace/warp slot
 #
 # Selector layout:
 #   1-4  Palace grid (TL TR BL BR)
@@ -58,7 +58,7 @@ if [[ "${1:-}" == "--do-swap" ]]; then
     # After swap: src content is at dst's position, dst content is at src's position.
     # Pane IDs (%N) follow content, so:
     #   $src (now in palace/warp position) gets the palace/warp tag
-    #   $dst (now in legion/kreig position) gets demoted tag
+    #   $dst (now in legion/mechanicus position) gets demoted tag
     pane_tag "$src" "$dst_tag" || true
     pane_tag "$dst" "${src_window}:bumped" || true
     tmux set-option -p -t "$dst" @PANE_TYPE "legion" 2>/dev/null || true
@@ -123,7 +123,7 @@ demote() {
     tmux display-message "Shipped to legion"
 }
 
-# --- PROMOTE: legion/kreig → palace/warp (selector) ---
+# --- PROMOTE: legion/mechanicus → palace/warp (selector) ---
 promote() {
     # Collect pane data into flat parallel arrays (no associative arrays — compat)
     local pd_tags="" pd_pids="" pd_cmds="" pd_states=""
@@ -213,10 +213,10 @@ case "$current_window" in
     palace|warp)
         demote
         ;;
-    legion|kreig)
+    legion|mechanicus|mars|kreig)
         promote
         ;;
     *)
-        tmux display-message "Shuttle: only works on palace/warp/legion/kreig"
+        tmux display-message "Shuttle: only works on palace/warp/legion/mechanicus"
         ;;
 esac

@@ -23,6 +23,7 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+CLAUDE_WRAPPER_BIN="$(dirname "$(readlink -f "$0")")/../scripts/claude-wrapper.sh"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -174,13 +175,13 @@ if [[ -n "$TARGET_PANE" ]]; then
         if [[ -n "$PRIMARCH" ]]; then
             CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | primarch ${PRIMARCH}"
         else
-            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | claude --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
         fi
     else
         if [[ -n "$PRIMARCH" ]]; then
             CMD="cd '${WORK_DIR}' && primarch ${PRIMARCH}"
         else
-            CMD="cd '${WORK_DIR}' && claude --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
         fi
     fi
 
@@ -198,9 +199,13 @@ else
         if [[ -n "$PRIMARCH" ]]; then
             echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
         else
-            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+            TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}" <<< "$FULL_PROMPT"
         fi
     else
-        exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        if [[ -n "$PRIMARCH" ]]; then
+            exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        else
+            TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}"
+        fi
     fi
 fi

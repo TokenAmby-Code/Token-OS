@@ -11,8 +11,8 @@
 #   tx                    # Show session status (or start if not in tmux)
 #   tx start              # Create/attach to main workspace session
 #   tx restart [-r]       # Kill session and recreate workspace
-#   tx restart --pane     # Reset active pane to default state
-#   tx restart --page     # Reset current window/page to default layout
+#   tx restart-pane       # Reset active pane to default state
+#   tx restart-page       # Reset current window/page to default layout
 #   tx exit               # Detach from tmux
 #   tx status             # Show session/pane overview
 #   tx workspace [...]    # Forward to tmux-workspace
@@ -21,10 +21,12 @@
 #   tx focus              # Drop side columns, keep 2×2 grid only
 #   tx unfocus            # Restore side columns
 #   tx resume [...]       # Inject prompt into Claude pane
+#   tx inspect [...]      # Inspect typed workspace state
+#   tx normalize [...]    # Reserved Python normalize path
 #   tx refresh            # Reset panes to canonical proportions
 #   tx list               # List all tmux sessions
 #   tx kill [session]     # Kill a session (default: main)
-#   tx kreig "prompt"     # Dispatch background task (alias: tx kr)
+#   tx mechanicus "prompt" # Dispatch background task (aliases: tx mech, tx mars)
 #   tx legion bump        # Bump current pane to legion window
 #   tx legion recall      # Recall pane from legion to palace
 #   tx help               # Show this help
@@ -70,6 +72,10 @@ is_workspace_flag() {
 # --- Check if inside tmux ---
 in_tmux() { [[ -n "${TMUX:-}" ]]; }
 
+run_tmuxctl() {
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli "$@"
+}
+
 # --- Help ---
 show_help() {
     # Detect terminal width, default to 80
@@ -87,8 +93,8 @@ SESSION
   tx start --mac  mac palace layout
   tx portable     attach portable mon
   tx restart (-r) kill + recreate
-  tx restart --pane  reset pane
-  tx restart --page  reset page
+  tx restart-pane   reset pane
+  tx restart-page   reset page
   tx exit         detach
   tx status       overview
   tx list         all sessions
@@ -98,6 +104,9 @@ LAYOUT
   tx focus     drop side columns
   tx unfocus   restore sides
   tx expand    toggle pane size
+  tx inspect   inspect typed state
+    restart-plan   inspect restart registry/restore plan
+  tx normalize reserved Python path
   tx refresh   reset proportions
   tx reset     reset menu
 
@@ -107,10 +116,10 @@ AGENTS
   tx resume --find-claude "..."
     auto-find Claude pane
 
-KREIG
-  tx kr "prompt"  dispatch task
-  tx kr status    list panes
-  tx kr cleanup   kill dead
+MECHANICUS
+  tx mech "prompt"   dispatch task
+  tx mech status     list panes
+  tx mech cleanup    kill dead
 
 LEGION
   tx legion bump    move pane out
@@ -137,11 +146,11 @@ tx — Imperium tmux wrapper
 Session:
   tx                  status, or start if no tmux
   tx start            create + attach workspace
-  tx start --mac      mac palace layout
+  tx start --mac      mac somnium layout
   tx portable         attach with portable monitor status bar
   tx restart, tx -r   kill + recreate session
-  tx restart --pane   reset active pane to default state
-  tx restart --page   reset current window/page to default layout
+  tx restart-pane     reset active pane to default state
+  tx restart-page     reset current window/page to default layout
   tx exit             detach (session stays alive)
   tx status           session/pane overview
   tx list             list all sessions
@@ -151,6 +160,9 @@ Layout:
   tx focus            drop side columns
   tx unfocus          restore side columns
   tx expand           toggle pane expand/retract
+  tx inspect          inspect typed workspace state
+    restart-plan      inspect restart registry/restore plan
+  tx normalize        reserved Python normalize path
   tx refresh          reset canonical proportions
   tx reset            interactive reset menu
 
@@ -158,12 +170,12 @@ Agents:
   tx resume "prompt"  inject into Claude pane
     --find-claude     auto-detect Claude pane
 
-Kreig:
-  tx kreig "prompt"         dispatch task to new pane (alias: tx kr)
+Mechanicus:
+  tx mechanicus "prompt"    dispatch task to new pane (aliases: tx mech, tx mars)
     --label name            custom label (auto-derived if omitted)
     --dir path              working directory (default: Imperium-ENV)
-  tx kreig status           list all kreig panes
-  tx kreig cleanup          kill dead panes, re-tile survivors
+  tx mechanicus status      list all mechanicus panes
+  tx mechanicus cleanup     kill dead panes, re-tile survivors
     --all                   kill ALL panes (including running)
 
 Legion:
@@ -247,7 +259,7 @@ cmd_restart_page() {
 
     # Detect window type and rebuild
     if [[ -n "$layout_origin" ]]; then
-        # Palace (grid or bridge layout) — delegate to tmux-reset hard wipe
+        # Palace or somnium layout — delegate to tmux-reset hard wipe
         tmux-reset --do-hard
         log_success "Page '${window_name}' reset (${layout_origin} layout)"
     elif [[ "$window_name" == "warp" || "$window_name" == warp* ]]; then
@@ -495,14 +507,14 @@ cmd_list() {
     fi
 }
 
-cmd_kreig() {
+cmd_mechanicus() {
     local subcmd="${1:-status}"
     shift 2>/dev/null || true
 
     local TOKEN_API="${TOKEN_API_URL:-http://localhost:7777}"
 
     case "$subcmd" in
-        # tx kreig "prompt text" — dispatch a single task
+        # tx mechanicus "prompt text" — dispatch a single task
         status|cleanup)
             # handled below
             ;;
@@ -510,7 +522,7 @@ cmd_kreig() {
             # Anything else is a prompt — dispatch it
             local prompt="$subcmd${*:+ $*}"
             if [[ -z "$prompt" ]]; then
-                log_error "Usage: tx kreig \"prompt text\" [--label name] [--dir path]"
+                log_error "Usage: tx mechanicus \"prompt text\" [--label name] [--dir path]"
                 return 1
             fi
 
@@ -529,7 +541,7 @@ cmd_kreig() {
                 label=$(echo "$prompt" | tr -d '"'"'" | cut -c1-40 | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
             fi
 
-            log_info "Dispatching to kreig: ${label}"
+            log_info "Dispatching to mechanicus: ${label}"
 
             local payload
             payload=$(python3 -c "
@@ -539,7 +551,7 @@ print(json.dumps({
         'label': sys.argv[1],
         'prompt': sys.argv[2],
         'working_dir': sys.argv[3],
-        'source': 'tx-kreig'
+        'source': 'tx-mechanicus'
     }]
 }))
 " "$label" "$prompt" "$working_dir")
@@ -560,8 +572,8 @@ print(json.dumps({
 
             if [[ "$status_val" == "launched" ]]; then
                 log_success "Launched in pane ${pane_id}"
-                # Rebalance the kreig window
-                tmux select-layout -t "main:kreig" tiled 2>/dev/null || true
+                # Rebalance the mechanicus window
+                tmux select-layout -t "main:mechanicus" tiled 2>/dev/null || true
             else
                 local err
                 err=$(echo "$result" | python3 -c "import sys,json; r=json.load(sys.stdin)['results'][0]; print(r.get('error','unknown'))" 2>/dev/null)
@@ -585,11 +597,11 @@ print(json.dumps({
             total=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
 
             if [[ "$total" == "0" ]]; then
-                log_info "No kreig panes active."
+                log_info "No mechanicus panes active."
                 return 0
             fi
 
-            echo -e "${BOLD}Kreig${RESET} (${total} panes):"
+            echo -e "${BOLD}Mechanicus${RESET} (${total} panes):"
             echo ""
             echo "$result" | python3 -c "
 import sys, json
@@ -843,10 +855,21 @@ case "$CMD" in
         ;;
     restart|-r)
         case "${1:-}" in
-            --pane) cmd_restart_pane ;;
-            --page) cmd_restart_page ;;
-            *)      cmd_restart "$@" ;;
+            --pane|--page)
+                log_error "restart is reserved for full session rebuilds"
+                echo -e "  Use: ${BOLD}tx restart-pane${RESET} or ${BOLD}tx restart-page${RESET}"
+                exit 1
+                ;;
+            *)
+                cmd_restart "$@"
+                ;;
         esac
+        ;;
+    restart-pane)
+        cmd_restart_pane
+        ;;
+    restart-page)
+        cmd_restart_page
         ;;
     exit|detach)
         cmd_exit
@@ -889,17 +912,27 @@ case "$CMD" in
     resume)
         exec tmux-resume "$@"
         ;;
+    inspect)
+        run_tmuxctl inspect "$@"
+        ;;
+    normalize)
+        run_tmuxctl normalize "$@"
+        ;;
     resurrect)
         exec tmux-resurrect "$@"
         ;;
-    kreig|kr|backrooms|br)
-        cmd_kreig "$@"
+    mechanicus|mech|mars|kreig|kr|backrooms|br)
+        cmd_mechanicus "$@"
         ;;
     legion)
         cmd_legion "$@"
         ;;
     refresh)
-        exec tmux-refresh-layout "$@"
+        if [[ $# -gt 0 ]]; then
+            run_tmuxctl normalize --window "$1"
+        else
+            run_tmuxctl normalize --window current
+        fi
         ;;
     help|-h|--help)
         show_help

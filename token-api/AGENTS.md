@@ -52,18 +52,48 @@ agents-db --json instances       # JSON output
 ## Key Tables
 
 ### claude_instances
-Core instance registry. Key columns:
+Core instance registry. This remains the source of truth for live instance state,
+but sanctioned writes now flow through the `instance_mutation.py` helper so
+provenance and reconciliation can reason about drift. Key columns:
 - `id` - Instance UUID
 - `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
 - `working_dir` - Instance working directory
-- `status` - 'active' or 'stopped'
-- `is_processing` - 1 when actively processing a prompt
-- `device_id` - 'desktop', 'Token-S24', etc.
-- `is_subagent` - 1 if spawned by `subagent` CLI or headless `claude -p` (0 for interactive)
-- `spawner` - Origin tag, e.g. `"subagent:claude"`, `"cron:task-worker"` (NULL for interactive)
+- `status` - typically `idle`, `processing`, or `stopped`
+- `last_activity` - heartbeat timestamp used for stale detection and reconciliation ordering
+- `device_id` - runtime host identity, e.g. `Mac-Mini`, `Token-S24`
+- `is_subagent` - 1 if spawned headlessly or as a background worker
+- `tmux_pane` - pane projection target for `@CC_STATE` and legion tint
+- `legion` / `synced` / `input_lock` - high-frequency control-plane fields now covered by provenance
+- `tts_mode` / `tts_voice` / `notification_sound` - per-instance voice and mute state
+- `session_doc_id` / `session_doc_policy` / `continuity_binding_source` - active continuity binding
+- `workflow_state` / `workflow_updated_at` / `stop_allowed` / `next_required_action` - coarse workflow state
+- `dispatch_target` / `dispatch_window` / `dispatch_mode` / `dispatch_slot` - dispatch identity
+- `instance_type` / `follow_up_sop` / `zealotry` / `victory_at` / `victory_reason` - lifecycle + follow-up controls
+- `discord_hosted` / `discord_channel` / `transplant_target_session` - operator linkage and transplant handoff state
+- `wrapper_launch_id` - wrapper ingress correlation key when present
 
 ### events
 Event log for instance lifecycle, renames, TTS, notifications.
+
+### workflow_events
+Append-only workflow/continuity event stream for machine-readable state transitions.
+Examples: `session_doc_bound`, `continuity_binding_changed`, `workflow_state_changed`, `workflow_closed`.
+
+### instance_mutations
+Append-only provenance log for sanctioned `claude_instances` row mutations.
+Key fields:
+- `mutation_type` - coarse mutation class such as `instance_registered`, `status_changed`, `continuity_binding_changed`, `instance_stopped`
+- `write_source` - sanctioned writer identity: `hooks`, `api`, `system_worker`, `migration`, `exceptional_direct`
+- `write_txn_id` - per-write correlation UUID
+- `actor` - request or subsystem actor, e.g. `SessionStart`, `SessionEnd`, `assign-doc`
+- `service_version` - git SHA or fallback app version captured at process boot
+- `wrapper_launch_id` - launcher correlation when the mutation is tied to wrapper ingress
+- `field_names_json`, `before_json`, `after_json` - concise changed-field snapshot, not full row dumps
+
+Sanction policy:
+- Direct reads are fine.
+- New instance-row writes should prefer `sanctioned_update_instance()` / `sanctioned_insert_instance()`.
+- Remaining direct SQL writes to `claude_instances` should be treated as explicit debt and will show up as suspicious in reconciliation until migrated.
 
 ## Core API Endpoints
 
@@ -77,6 +107,10 @@ POST   /api/instances/{id}/unstick     # Nudge stuck instance (?level=1 SIGWINCH
 GET    /api/instances/{id}/diagnose    # Get detailed process diagnostics
 GET    /api/instances                   # List all instances
 GET    /api/instances/{id}/todos        # Get instance task list
+GET    /api/instances/{id}/workflow-events  # Recent workflow event log
+GET    /api/instances/{id}/provenance       # Recent sanctioned instance mutations
+GET    /api/instances/{id}/reconciliation   # Drift classification for one instance
+GET    /api/reconciliation/instances        # Fleet reconciliation read model
 ```
 
 ### Notifications
@@ -306,6 +340,12 @@ agents-db events --limit 20
 # Verify rename worked
 agents-db query "SELECT id, tab_name FROM claude_instances WHERE id='...'"
 
+# Inspect sanctioned instance writes
+agents-db query "SELECT mutation_type, write_source, actor, write_txn_id, created_at FROM instance_mutations ORDER BY id DESC LIMIT 20"
+
+# Inspect workflow event stream
+agents-db query "SELECT event_type, workflow_state, event_owner, created_at FROM workflow_events ORDER BY id DESC LIMIT 20"
+
 # Watch server logs (if running via systemd)
 journalctl -u token-api -f
 
@@ -338,6 +378,38 @@ Voices assigned via **random-start linear probe** (open addressing): one random 
 
 **Fallback pool** (US English, used when primary is exhausted):
 - David, Zira, Mark → less distinct, but functional
+
+## Provenance And Reconciliation
+
+### Sanctioned Write Layer
+
+`instance_mutation.py` is the sanctioned bridge layer for `claude_instances` row writes.
+It is not the final service extraction, but it now covers most runtime control-plane mutations.
+
+Current sanctioned coverage:
+- hook-driven registration, supplant refresh, and session end flows already migrated in `main.py`
+- manual session-doc bind / create / unbind and hard-delete unlink side effects
+- API writes for rename, activity/status, stop, kill fallback stop-marking, unstick PID refresh, legion, synced, input_lock
+- API writes for transplant pending, zealotry, discord linkage, instance type, archive / unarchive, and victory metadata
+- per-instance voice reassignment, per-instance `tts_mode`, voice-chat mode sync, and global TTS mode fanout
+- background/system writes for stale cleanup, stale processing clear, stop-evaluator idle transition, auto-name rename
+- sync stop-hook stop marking via `sanctioned_update_instance_sync()`
+
+Remaining direct-write debt worth tracking:
+- bootstrap / migration / full-table admin operations still use direct SQL where provenance is not the goal
+- the main runtime exception is full-table admin deletion in `DELETE /api/instances/all`
+- reconciliation still treats any future unmigrated runtime writes as suspicious rather than fatal
+
+### Reconciliation Statuses
+
+`GET /api/instances/{id}/reconciliation` classifies:
+- `clean` - current row and pane projection align with sanctioned writes
+- `pending_projection` - pane queue entries exist, so tmux projection is expected to catch up
+- `unprovenanced_write` - current row diverges from latest sanctioned value for one or more tracked fields
+- `state_drift` - workflow / continuity fields are internally incoherent
+- `projection_drift` - tmux pane state is stale or missing with no pending queue
+
+Suspicious statuses emit `instance_reconciliation_drift` into the normal `events` log.
 
 **Ultimate fallback**: Microsoft David (if 12+ concurrent instances somehow)
 

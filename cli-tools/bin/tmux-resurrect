@@ -224,7 +224,7 @@ for inst in json.loads(sys.stdin.read()):
         fi
 
         if [[ -z "$target" ]]; then
-            echo "  skip: ${pane_label} — pane not found (kreig/expendable)" >&2
+            echo "  skip: ${pane_label} — pane not found (mechanicus/expendable)" >&2
             continue
         fi
 

@@ -24,8 +24,10 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from instance_mutation import sanctioned_update_instance_sync
 
-DB_PATH = Path.home() / ".claude" / "agents.db"
+
+DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 # Device → satellite URL mapping for cross-machine file access
@@ -44,10 +46,19 @@ def mark_cron_instance_stopped(instance_id: str):
     """
     try:
         con = sqlite3.connect(str(DB_PATH))
-        con.execute(
-            "UPDATE claude_instances SET status = 'stopped' WHERE id = ? AND status != 'stopped'",
-            (instance_id,),
-        )
+        try:
+            sanctioned_update_instance_sync(
+                con,
+                instance_id=instance_id,
+                updates={"status": "stopped", "synced": 0, "stopped_at": datetime.now().isoformat()},
+                mutation_type="instance_stopped",
+                write_source="stop_hook",
+                actor="stop-hook",
+                where_clause="id = ? AND status != 'stopped'",
+                where_params=(instance_id,),
+            )
+        except LookupError:
+            pass
         rows = con.total_changes
         con.commit()
         con.close()

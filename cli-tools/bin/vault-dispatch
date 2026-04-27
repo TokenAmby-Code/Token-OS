@@ -9,14 +9,14 @@
 #   vault-dispatch --list-free                    # Show free tmux panes
 #
 # The dispatch pattern:
-#   1. Resolve a human target (legion:new, mars:new, etc.) to a tmux pane
+#   1. Resolve a human target (legion:new, mechanicus:new, etc.) to a tmux pane
 #   2. Launch Claude or Codex with structured dispatch metadata
 #   3. Bind the launched instance to the intended session doc at registration time
 #
 # Examples:
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --engine codex
-#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --target mars:new
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --target mechanicus:new
 #   vault-dispatch --list-free
 #   vault-dispatch --dry-run Mars/Sessions/my-session.md /home/token/project
 
@@ -80,7 +80,7 @@ release_claim() {
 }
 
 # --- Stack windows vs reuse windows ---
-STACK_WINDOWS=("legion" "mars" "kreig")
+STACK_WINDOWS=("legion" "mechanicus" "mars" "kreig")
 
 is_stack_window() {
     local win="$1"
@@ -193,7 +193,7 @@ create_stack_pane() {
 
 # --- Free pane detection (for palace/warp reuse) ---
 # Returns pane IDs that are running plain bash/zsh (no Claude, no TUI, no special process)
-# Only scans reuse windows (palace, warp). Stack windows (legion, kreig) always split.
+# Only scans reuse windows (palace, warp). Stack windows (legion, mechanicus) always split.
 find_free_panes() {
     local grid_panes=()
     local other_panes=()
@@ -338,7 +338,7 @@ Arguments:
 Options:
   --engine <name>     Launch engine: claude (default) or codex
   --target <name>     Human dispatch target (default: legion:new)
-  --window, -w <name> Legacy target window. Stack windows (legion, mars, kreig)
+  --window, -w <name> Legacy target window. Stack windows (legion, mechanicus)
                       create a new pane. Reuse windows (palace, warp) scan for free panes.
   --pane <id>         Target a specific pane (overrides --window). In stack windows,
                       still creates a new pane rather than reusing.
@@ -351,7 +351,7 @@ Options:
 
 Examples:
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp
-  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w kreig
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w mechanicus
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --primarch vulkan
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w palace
   vault-dispatch --list-free
@@ -471,10 +471,11 @@ fi
 # --- Resolve human dispatch target into pane behavior ---
 # Current pass supports:
 #   legion:new
+#   mechanicus:new
 #   mars:new
 #   kreig:new
 #   palace:<slot>
-#   bridge:<slot>
+#   somnium:<slot>
 if [[ -n "$TARGET_WINDOW" && "$DISPATCH_TARGET" == "legion:new" ]]; then
     DISPATCH_TARGET="${TARGET_WINDOW}:new"
 fi
@@ -483,11 +484,11 @@ DISPATCH_MODE=""
 DISPATCH_SLOT=""
 
 case "$DISPATCH_TARGET" in
-    legion:new|mars:new|kreig:new)
+    legion:new|mechanicus:new|mars:new|kreig:new)
         TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
         DISPATCH_MODE="stack_new"
         ;;
-    palace:*|bridge:*)
+    palace:*|somnium:*|bridge:*)
         TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
         DISPATCH_SLOT="$(dispatch_slot_of_target "$DISPATCH_TARGET")"
         DISPATCH_MODE="named_slot"

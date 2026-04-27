@@ -20,6 +20,7 @@ from datetime import datetime
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from instance_mutation import sanctioned_update_instance
 
 from shared import (
     DB_PATH,
@@ -164,9 +165,13 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         # Apply all changes to database
         for iid, _, new_voice in changes:
-            await db.execute(
-                "UPDATE claude_instances SET tts_voice = ? WHERE id = ?",
-                (new_voice, iid)
+            await sanctioned_update_instance(
+                db,
+                instance_id=iid,
+                updates={"tts_voice": new_voice},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="voice-assignment",
             )
         await db.commit()
 
@@ -216,9 +221,13 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
 
         if mode == "silent":
             # Release voice slot
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE id = ?",
-                (mode, instance_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"tts_mode": mode, "tts_voice": None, "notification_sound": None},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="tts-mode",
             )
         elif mode in ("verbose", "voice-chat") and not old_voice:
             # Re-assign voice from pool
@@ -228,14 +237,26 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
             rows = await cursor2.fetchall()
             used_voices = {r[0] for r in rows}
             profile, _ = get_next_available_profile(used_voices)
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
-                (mode, profile["wsl_voice"], profile["notification_sound"], instance_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "tts_mode": mode,
+                    "tts_voice": profile["wsl_voice"],
+                    "notification_sound": profile["notification_sound"],
+                },
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="tts-mode",
             )
         else:
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-                (mode, instance_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"tts_mode": mode},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="tts-mode",
             )
         await db.commit()
 
@@ -277,9 +298,13 @@ async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: st
     # Keep tts_mode column in sync
     new_mode = "voice-chat" if active else "verbose"
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-            (new_mode, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"tts_mode": new_mode},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="voice-chat",
         )
         await db.commit()
     return {"instance_id": instance_id, "voice_chat": active, "tmux_pane": tmux_pane}

@@ -150,7 +150,9 @@ def is_phone_reachable() -> bool:
     host = PHONE_TTS_CONFIG["host"]
     port = PHONE_TTS_CONFIG["port"]
     try:
-        resp = requests.get(f"http://{host}:{port}/notify", params={"ping": "1"}, timeout=2)
+        # Use /heartbeat — hitting /notify fires the Notify macro (vibrate + TTS)
+        # which produced spurious vibrations on every health probe.
+        resp = requests.get(f"http://{host}:{port}/heartbeat", timeout=2)
         available = resp.status_code == 200
     except Exception:
         available = False
@@ -222,6 +224,10 @@ DESKTOP_STATE = {
     # AHK heartbeat tracking
     "ahk_reachable": None,
     "ahk_last_heartbeat": None,
+    # Steam game metadata for the current desktop gaming mode
+    "steam_app_id": None,
+    "steam_app_name": None,
+    "steam_exe": None,
     # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
     "in_meeting": False,
 }
@@ -328,6 +334,29 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
             (event_type, instance_id, device_id, json.dumps(details) if details else None)
         )
         await db.commit()
+
+
+async def append_workflow_event(
+    db,
+    *,
+    instance_id: str,
+    event_type: str,
+    workflow_state: str | None = None,
+    event_owner: str | None = None,
+    details: dict | None = None,
+):
+    """Append a machine-readable workflow event using an existing DB connection."""
+    await db.execute(
+        """INSERT INTO workflow_events (instance_id, workflow_state, event_type, event_owner, details_json)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            instance_id,
+            workflow_state,
+            event_type,
+            event_owner,
+            json.dumps(details) if details else None,
+        ),
+    )
 
 
 # ============ App Singletons ============

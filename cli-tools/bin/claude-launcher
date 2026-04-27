@@ -12,6 +12,9 @@
 #
 # Usage:
 #   claude-launcher              Interactive mode (full menu)
+#   claude-launcher --prompt "..."       Interactive mode with initial prompt
+#   claude-launcher --prompt-file <path> Interactive mode with initial prompt from file
+#   claude-launcher --dry-run --prompt-file <path>
 
 set -euo pipefail
 
@@ -23,6 +26,33 @@ CODEX_DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/codex-dispatch"
 IMPERIUM_ROOT="${IMPERIUM:-/Volumes/Imperium}"
 CIVIC_ROOT="${CIVIC:-/Volumes/Civic}"
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
+INITIAL_PROMPT=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prompt)
+            INITIAL_PROMPT="$2"
+            shift 2
+            ;;
+        --prompt-file)
+            if [[ ! -f "$2" ]]; then
+                echo "Prompt file not found: $2" >&2
+                exit 1
+            fi
+            INITIAL_PROMPT="$(<"$2")"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # --- Colors ---
 CYAN='\033[0;36m'
@@ -43,6 +73,10 @@ fi
 # =============================================================================
 select_target() {
     local options=()
+
+    if [[ "$PWD" != "$HOME" ]]; then
+        options+=("$PWD (current)")
+    fi
 
     # Vault-only options (no transplant — stay in vault)
     options+=("Imperium-ENV")
@@ -293,15 +327,27 @@ fi
 if [[ "$ENGINE" == "codex" ]]; then
     # Codex path — no persona/mode, dispatch directly to target dir
     CODEX_DIR="${TRANSPLANT_DIR:-$LAUNCH_VAULT}"
+    CODEX_PROMPT="${INITIAL_PROMPT}"
 
     echo ""
     echo -e "${DIM}Launching:${NC}"
     echo -e "  ${DIM}engine:${NC}    codex"
     echo -e "  ${DIM}dir:${NC}       $CODEX_DIR"
+    [[ -n "$CODEX_PROMPT" ]] && echo -e "  ${DIM}prompt:${NC}    yes"
     echo ""
 
     clear
-    exec "$CODEX_DISPATCH_BIN" --launcher "claude-launcher" "$CODEX_DIR" ""
+    if $DRY_RUN; then
+        echo -e "${CYAN}${BOLD}codex-dispatch (dry run)${NC}"
+        echo -e "  ${DIM}dir:${NC}         $CODEX_DIR"
+        echo -e "  ${DIM}launcher:${NC}    claude-launcher"
+        if [[ -n "$CODEX_PROMPT" ]]; then
+            echo -e "  ${DIM}prompt:${NC}"
+            echo "$CODEX_PROMPT" | sed 's/^/    /'
+        fi
+        exit 0
+    fi
+    exec "$CODEX_DISPATCH_BIN" --launcher "claude-launcher" "$CODEX_DIR" "$CODEX_PROMPT"
 fi
 
 # Claude path — continue with persona + mode selectors
@@ -322,7 +368,15 @@ fi
 DISPATCH_ARGS=("--dir" "$LAUNCH_VAULT")
 
 if [[ -n "$TRANSPLANT_DIR" ]]; then
-    DISPATCH_ARGS+=("--prompt" "Transplant to ${TRANSPLANT_DIR} and begin work.")
+    TRANSPLANT_PROMPT="Transplant to ${TRANSPLANT_DIR} and begin work."
+    if [[ -n "$INITIAL_PROMPT" ]]; then
+        TRANSPLANT_PROMPT="${TRANSPLANT_PROMPT}
+
+${INITIAL_PROMPT}"
+    fi
+    DISPATCH_ARGS+=("--prompt" "$TRANSPLANT_PROMPT")
+elif [[ -n "$INITIAL_PROMPT" ]]; then
+    DISPATCH_ARGS+=("--prompt" "$INITIAL_PROMPT")
 fi
 
 if [[ -n "$PERSONA" ]]; then
@@ -342,7 +396,11 @@ echo -e "  ${DIM}vault:${NC}     $LAUNCH_VAULT"
 [[ -n "$TRANSPLANT_DIR" ]] && echo -e "  ${DIM}target:${NC}    $TRANSPLANT_DIR"
 [[ -n "$PERSONA" ]]        && echo -e "  ${DIM}persona:${NC}   $PERSONA"
 echo -e "  ${DIM}mode:${NC}      $MODE"
+[[ -n "$INITIAL_PROMPT" ]] && echo -e "  ${DIM}prompt:${NC}    yes"
 echo ""
 
 # Dispatch
+if $DRY_RUN; then
+    DISPATCH_ARGS+=("--dry-run")
+fi
 exec "$DISPATCH_BIN" "${DISPATCH_ARGS[@]}"

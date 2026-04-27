@@ -39,6 +39,13 @@ import tempfile
 import requests
 import httpx
 from pydantic import BaseModel, Field
+from instance_mutation import (
+    RECONCILIATION_SUSPICIOUS,
+    get_instance_mutations,
+    reconcile_instance,
+    sanctioned_update_instance,
+    sanctioned_update_instance_sync,
+)
 from session_doc_helpers import (
     update_frontmatter, update_victory_frontmatter,
     create_session_doc_file, _update_doc_agents_list,
@@ -71,7 +78,7 @@ from shared import (
     PHONE_CONFIG, PHONE_STATE, PHONE_HEARTBEAT,
     PAVLOK_CONFIG, PAVLOK_STATE,
     is_satellite_tts_available,
-    log_event, log_event_sync,
+    log_event, log_event_sync, append_workflow_event,
     DISCORD_DAEMON_URL,
     VOICE_CHAT_SESSIONS, DICTATION_STATE,
     PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
@@ -398,6 +405,9 @@ class DesktopDetectionRequest(BaseModel):
     detected_mode: str  # "video" | "music" | "gaming" | "silence"
     window_title: Optional[str] = None
     source: str = "ahk"
+    steam_app_id: Optional[str] = None
+    steam_app_name: Optional[str] = None
+    steam_exe: Optional[str] = None
 
 
 class DesktopDetectionResponse(BaseModel):
@@ -410,6 +420,21 @@ class DesktopDetectionResponse(BaseModel):
     timer_updated: bool = False
     productivity_active: bool
     active_instance_count: int
+
+
+class GameTurnRequest(BaseModel):
+    """Observational turn-end event from game-specific AHK hooks."""
+    game: str
+    steam_app_id: Optional[str] = None
+    steam_app_name: Optional[str] = None
+    steam_exe: Optional[str] = None
+    source: str = "ahk"
+
+
+class GameTurnResponse(BaseModel):
+    recorded: bool
+    block: bool = False
+    reason: str = "observational_only"
 
 
 # ============ Phone Activity Models ============
@@ -657,14 +682,25 @@ async def cleanup_stale_instances() -> dict:
     """Mark instances with no activity for 3+ hours as stopped."""
     cutoff = (datetime.now() - timedelta(hours=3)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            UPDATE claude_instances
-            SET status = 'stopped', synced = 0, stopped_at = CURRENT_TIMESTAMP
-            WHERE status IN ('processing', 'idle')
-              AND last_activity < ?
-        """, (cutoff,))
-        affected = cursor.rowcount
+        cursor = await db.execute(
+            """SELECT id
+               FROM claude_instances
+               WHERE status IN ('processing', 'idle')
+                 AND last_activity < ?""",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        for row in rows:
+            await sanctioned_update_instance(
+                db,
+                instance_id=row[0],
+                updates={"status": "stopped", "synced": 0, "stopped_at": datetime.now().isoformat()},
+                mutation_type="instance_stopped",
+                write_source="task",
+                actor="cleanup-stale",
+            )
         await db.commit()
+        affected = len(rows)
 
     if affected > 0:
         await log_event("task_cleanup", details={"cleaned_up": affected})
@@ -1201,11 +1237,13 @@ async def stop_instance(instance_id: str):
         count_row = await cursor.fetchone()
         was_active = count_row[0] if count_row else 0
 
-        await db.execute(
-            """UPDATE claude_instances
-               SET status = 'stopped', synced = 0, stopped_at = ?
-               WHERE id = ?""",
-            (now, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            mutation_type="instance_stopped",
+            write_source="api",
+            actor="stop-instance",
         )
         await db.commit()
 
@@ -1334,9 +1372,13 @@ async def kill_instance(instance_id: str):
             else:
                 # Mark stopped in DB anyway (cleanup)
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-                        (now, instance_id)
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=instance_id,
+                        updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                        mutation_type="instance_stopped",
+                        write_source="api",
+                        actor="kill-instance",
                     )
                     await db.commit()
                 await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
@@ -1348,9 +1390,13 @@ async def kill_instance(instance_id: str):
         else:
             # Can't scan /proc on remote device
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-                    (now, instance_id)
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    mutation_type="instance_stopped",
+                    write_source="api",
+                    actor="kill-instance",
                 )
                 await db.commit()
             await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
@@ -1366,9 +1412,13 @@ async def kill_instance(instance_id: str):
         if not is_pid_claude(pid):
             # Process already exited or PID reused by another process
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-                    (now, instance_id)
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    mutation_type="instance_stopped",
+                    write_source="api",
+                    actor="kill-instance",
                 )
                 await db.commit()
             await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
@@ -1383,9 +1433,13 @@ async def kill_instance(instance_id: str):
         except ProcessLookupError:
             # Already dead
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-                    (now, instance_id)
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    mutation_type="instance_stopped",
+                    write_source="api",
+                    actor="kill-instance",
                 )
                 await db.commit()
             await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
@@ -1465,9 +1519,13 @@ async def kill_instance(instance_id: str):
 
     # Mark stopped in DB
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET status = 'stopped', synced = 0, stopped_at = ? WHERE id = ?",
-            (now, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            mutation_type="instance_stopped",
+            write_source="api",
+            actor="kill-instance",
         )
         await db.commit()
 
@@ -1555,7 +1613,14 @@ async def unstick_instance(instance_id: str, level: int = 1):
                 logger.info(f"Unstick: rediscovered PID {pid} for {working_dir}")
                 # Update the stored PID
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE claude_instances SET pid = ? WHERE id = ?", (pid, instance_id))
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=instance_id,
+                        updates={"pid": pid},
+                        mutation_type="instance_updated",
+                        write_source="api",
+                        actor="unstick-instance",
+                    )
                     await db.commit()
             else:
                 raise HTTPException(status_code=400, detail=f"PID {pid} is stale and no Claude process found in {working_dir}")
@@ -1890,9 +1955,13 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         old_name = row[1]
         session_doc_id = row[2]
         session_doc_policy = row[3]
-        await db.execute(
-            "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
-            (request.tab_name, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"tab_name": request.tab_name},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="rename-instance",
         )
 
         # Only auto-generated per-instance docs should mirror renames.
@@ -1927,12 +1996,20 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
     enabling cross-device transplants where file-based handoff doesn't work.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "UPDATE claude_instances SET transplant_target_session = ? WHERE id = ?",
-            (target_session, instance_id)
+        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"transplant_target_session": target_session},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="transplant-pending",
         )
         await db.commit()
-        if cursor.rowcount == 0:
+        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
     logger.info(f"Transplant pending: {instance_id[:12]}... → target session {target_session[:12]}...")
@@ -1947,18 +2024,24 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
     Uses atomic UPDATE with WHERE to ensure only one caller wins.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "UPDATE claude_instances SET input_lock = ? WHERE id = ? AND input_lock IS NULL",
-            (locker, instance_id)
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        if row["input_lock"] is not None:
+            return {"acquired": False, "held_by": row["input_lock"]}
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"input_lock": locker},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="input-lock-acquire",
+            where_clause="id = ? AND input_lock IS NULL",
+            where_params=(instance_id,),
         )
         await db.commit()
-        if cursor.rowcount == 0:
-            # Check if instance exists vs lock held
-            cursor = await db.execute("SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,))
-            row = await cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Instance not found")
-            return {"acquired": False, "held_by": row[0]}
         return {"acquired": True, "locker": locker}
 
 
@@ -1966,10 +2049,22 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
 async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
     """Release input lock for an instance's tmux pane."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET input_lock = NULL WHERE id = ? AND input_lock = ?",
-            (instance_id, locker)
-        )
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        if row["input_lock"] == locker:
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"input_lock": None},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="input-lock-release",
+                where_clause="id = ? AND input_lock = ?",
+                where_params=(instance_id, locker),
+            )
         await db.commit()
     return {"released": True}
 
@@ -1997,9 +2092,13 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        await db.execute(
-            "UPDATE claude_instances SET status = ?, last_activity = ? WHERE id = ?",
-            (new_status, now, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"status": new_status, "last_activity": now},
+            mutation_type="status_changed",
+            write_source="api",
+            actor=f"activity-{request.action}",
         )
         await db.commit()
 
@@ -2374,7 +2473,6 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     return {"nudged": True, "reason": reason[:200]}
 
 
-
 _CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
 _custodes_state_debounce: dict[str, dict] = {}
 
@@ -2396,6 +2494,9 @@ def _custodes_state_snapshot() -> dict:
             "current_mode": DESKTOP_STATE.get("current_mode", "silence"),
             "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
             "location_zone": DESKTOP_STATE.get("location_zone"),
+            "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
+            "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+            "steam_exe": DESKTOP_STATE.get("steam_exe"),
         },
     }
 
@@ -2747,9 +2848,13 @@ async def set_zealotry(instance_id: str, request: Request):
         cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await db.execute(
-            "UPDATE claude_instances SET zealotry = ? WHERE id = ?",
-            (zealotry, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"zealotry": zealotry},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="zealotry",
         )
         await db.commit()
 
@@ -2784,9 +2889,13 @@ async def set_instance_legion(instance_id: str, request: Request):
         cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await db.execute(
-            "UPDATE claude_instances SET legion = ? WHERE id = ?",
-            (legion, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"legion": legion},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="set-legion",
         )
         await db.commit()
 
@@ -2825,9 +2934,13 @@ async def set_instance_synced(instance_id: str, request: Request):
                     detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}"
                 )
 
-        await db.execute(
-            "UPDATE claude_instances SET synced = ? WHERE id = ?",
-            (synced_int, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"synced": synced_int},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="set-synced",
         )
         await db.commit()
 
@@ -2849,24 +2962,24 @@ async def set_instance_discord(instance_id: str, request: Request):
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        updates = []
-        params = []
+        updates = {}
         if discord_hosted is not None:
             if discord_hosted not in (True, False, 0, 1):
                 raise HTTPException(status_code=400, detail="discord_hosted must be true or false")
-            updates.append("discord_hosted = ?")
-            params.append(1 if discord_hosted else 0)
+            updates["discord_hosted"] = 1 if discord_hosted else 0
         if discord_channel is not None:
-            updates.append("discord_channel = ?")
-            params.append(discord_channel if discord_channel else None)
+            updates["discord_channel"] = discord_channel if discord_channel else None
 
         if not updates:
             raise HTTPException(status_code=400, detail="Provide discord_hosted and/or discord_channel")
 
-        params.append(instance_id)
-        await db.execute(
-            f"UPDATE claude_instances SET {', '.join(updates)} WHERE id = ?",
-            tuple(params)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="discord-linkage",
         )
         await db.commit()
 
@@ -2948,9 +3061,13 @@ async def declare_victory(instance_id: str, request: Request):
         session_doc_id = row["session_doc_id"]
 
         # DB write (existing behavior)
-        await db.execute(
-            "UPDATE claude_instances SET victory_at = ?, victory_reason = ?, instance_type = 'one_off' WHERE id = ?",
-            (now, reason, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"victory_at": now, "victory_reason": reason, "instance_type": "one_off"},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="victory",
         )
 
         # Write victory data to session doc frontmatter
@@ -3049,27 +3166,30 @@ async def set_instance_type(instance_id: str, request: Request):
         if old_type == "archived" and new_type != "one_off":
             raise HTTPException(status_code=400, detail="Archived instances can only be unarchived to one_off")
 
-        updates = ["instance_type = ?"]
-        params = [new_type]
+        updates = {"instance_type": new_type}
 
         # Optional follow_up_sop — persist custom SOP path for GT follow-ups
         follow_up_sop = body.get("follow_up_sop")
         if follow_up_sop is not None:
-            updates.append("follow_up_sop = ?")
-            params.append(follow_up_sop if follow_up_sop else None)
+            updates["follow_up_sop"] = follow_up_sop if follow_up_sop else None
 
         # Optional zealotry override in same call
         zealotry_override = body.get("zealotry")
         if isinstance(zealotry_override, int) and 1 <= zealotry_override <= 10:
-            updates.append("zealotry = ?")
-            params.append(zealotry_override)
+            updates["zealotry"] = zealotry_override
 
         # Auto-set zealotry minimum when promoting to golden_throne
         if new_type == "golden_throne" and (instance["zealotry"] or 4) < 4 and zealotry_override is None:
-            updates.append("zealotry = 4")
+            updates["zealotry"] = 4
 
-        params.append(instance_id)
-        await db.execute(f"UPDATE claude_instances SET {', '.join(updates)} WHERE id = ?", params)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="instance-type",
+        )
         await db.commit()
 
     # Cancel timers when leaving golden_throne or sync
@@ -3095,9 +3215,13 @@ async def archive_instance(instance_id: str):
         cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await db.execute(
-            "UPDATE claude_instances SET instance_type = 'archived', status = 'stopped' WHERE id = ?",
-            (instance_id,)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"instance_type": "archived", "status": "stopped"},
+            mutation_type="instance_archived",
+            write_source="api",
+            actor="archive-instance",
         )
         await db.commit()
 
@@ -3118,9 +3242,13 @@ async def unarchive_instance(instance_id: str):
         cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await db.execute(
-            "UPDATE claude_instances SET instance_type = 'one_off' WHERE id = ?",
-            (instance_id,)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"instance_type": "one_off"},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="unarchive-instance",
         )
         await db.commit()
 
@@ -3339,6 +3467,123 @@ async def get_instance(instance_id: str):
                     instance["cc_color"] = p.get("cc_color", "default")
                     break
         return instance
+
+
+@app.get("/api/instances/{instance_id}/workflow-events", response_model=List[dict])
+async def get_instance_workflow_events(instance_id: str, limit: int = 20):
+    """Return recent workflow events for a specific instance."""
+    limit = max(1, min(limit, 100))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT 1 FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+        cursor = await db.execute(
+            """SELECT id, instance_id, workflow_state, event_type, event_owner, details_json, created_at
+               FROM workflow_events
+               WHERE instance_id = ?
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?""",
+            (instance_id, limit),
+        )
+        rows = await cursor.fetchall()
+
+    events = []
+    for row in rows:
+        event = dict(row)
+        details_json = event.pop("details_json", None)
+        event["details"] = json.loads(details_json) if details_json else None
+        events.append(event)
+    return events
+
+
+@app.get("/api/instances/{instance_id}/provenance", response_model=dict)
+async def get_instance_provenance(instance_id: str, limit: int = 20):
+    """Return recent sanctioned mutation history for a specific instance."""
+    limit = max(1, min(limit, 100))
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        mutations = await get_instance_mutations(db, instance_id, limit=limit)
+    return {
+        "instance_id": instance_id,
+        "latest_sanctioned_mutation": mutations[0] if mutations else None,
+        "recent_mutations": mutations,
+        "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
+    }
+
+
+@app.get("/api/instances/{instance_id}/reconciliation", response_model=dict)
+async def get_instance_reconciliation(instance_id: str):
+    """Return reconciliation status for one instance against sanctioned writes and pane projection."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        result = await reconcile_instance(db, instance_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if result["status"] in RECONCILIATION_SUSPICIOUS:
+        affected_fields = sorted({
+            field
+            for finding in result["findings"]
+            for field in finding.get("fields", [])
+        })
+        await log_event(
+            "instance_reconciliation_drift",
+            instance_id=instance_id,
+            details={
+                "reconciliation_status": result["status"],
+                "affected_fields": affected_fields,
+                "write_txn_id": result.get("last_write_txn_id"),
+                "pending_projection": result["status"] == "pending_projection",
+            },
+        )
+    return result
+
+
+@app.get("/api/reconciliation/instances", response_model=dict)
+async def list_instance_reconciliation(limit: int = 50, suspicious_only: bool = True):
+    """Return recent reconciliation findings across instances."""
+    limit = max(1, min(limit, 200))
+    results = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id
+               FROM claude_instances
+               ORDER BY datetime(last_activity) DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        for row in rows:
+            result = await reconcile_instance(db, row["id"])
+            if result is None:
+                continue
+            if suspicious_only and result["status"] == "clean":
+                continue
+            results.append(result)
+            if result["status"] in RECONCILIATION_SUSPICIOUS:
+                affected_fields = sorted({
+                    field
+                    for finding in result["findings"]
+                    for field in finding.get("fields", [])
+                })
+                await log_event(
+                    "instance_reconciliation_drift",
+                    instance_id=row["id"],
+                    details={
+                        "reconciliation_status": result["status"],
+                        "affected_fields": affected_fields,
+                        "write_txn_id": result.get("last_write_txn_id"),
+                        "pending_projection": result["status"] == "pending_projection",
+                    },
+                )
+    return {"instances": results}
 
 
 _KNOWN_VAULTS = ("Imperium-ENV", "Pax-ENV", "Civic-ENV")
@@ -4773,6 +5018,11 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     detected_mode = request.detected_mode.lower()
     window_title = request.window_title or ""
     source = request.source
+    steam_details = {
+        "steam_app_id": request.steam_app_id,
+        "steam_app_name": request.steam_app_name,
+        "steam_exe": request.steam_exe,
+    }
 
     # Validate detected mode
     if detected_mode not in VALID_DETECTION_MODES:
@@ -4789,6 +5039,11 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
     # Check if mode change is needed
     if detected_mode == current_mode:
+        if detected_mode == "gaming":
+            DESKTOP_STATE["steam_app_id"] = request.steam_app_id
+            DESKTOP_STATE["steam_app_name"] = request.steam_app_name
+            DESKTOP_STATE["steam_exe"] = request.steam_exe
+            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         print(f"    Mode unchanged ({detected_mode}), skipping")
         return DesktopDetectionResponse(
             action="none",
@@ -4863,6 +5118,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         old_mode = DESKTOP_STATE["current_mode"]
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        DESKTOP_STATE["steam_app_id"] = request.steam_app_id if detected_mode == "gaming" else None
+        DESKTOP_STATE["steam_app_name"] = request.steam_app_name if detected_mode == "gaming" else None
+        DESKTOP_STATE["steam_exe"] = request.steam_exe if detected_mode == "gaming" else None
 
         # Track meeting state (suppresses TTS)
         was_meeting = DESKTOP_STATE["in_meeting"]
@@ -4906,6 +5164,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "new_mode": detected_mode,
                 "window_title": window_title,
                 "source": source,
+                **steam_details,
                 "timer_updated": timer_updated,
                 "productivity_active": productivity_active,
                 "active_instances": active_count
@@ -4942,6 +5201,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "reason": reason,
                 "window_title": window_title,
                 "source": source,
+                **steam_details,
                 "productivity_active": productivity_active,
                 "active_instances": active_count,
                 "enforcement": enforce_result
@@ -4955,6 +5215,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "desktop_mode": detected_mode,
                 "reason": reason,
                 "window_title": window_title,
+                **steam_details,
                 "active_instances": active_count,
             },
         ))
@@ -4970,6 +5231,31 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 active_instance_count=active_count
             ).model_dump()
         )
+
+
+@app.post("/games/turn", response_model=GameTurnResponse)
+async def handle_game_turn(request: GameTurnRequest):
+    """
+    Record a game-specific turn-end event.
+
+    Layer 1 is observational only. Enforcement decisions for turn events are
+    intentionally deferred until the policy choices in the task note are locked.
+    """
+    game = request.game.strip().lower()
+    if not game:
+        raise HTTPException(status_code=400, detail="game is required")
+
+    details = {
+        "game": game,
+        "steam_app_id": request.steam_app_id,
+        "steam_app_name": request.steam_app_name,
+        "steam_exe": request.steam_exe,
+        "source": request.source,
+    }
+    await log_event("game_turn_end", device_id="desktop", details=details)
+    logger.info(f"Game turn-end recorded: game={game} appid={request.steam_app_id}")
+
+    return GameTurnResponse(recorded=True)
 
 
 # ============ Desktop Satellite Endpoints ============
@@ -5583,6 +5869,9 @@ async def get_timer_state():
         "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
         "location_zone": DESKTOP_STATE.get("location_zone"),
+        "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
+        "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+        "steam_exe": DESKTOP_STATE.get("steam_exe"),
         "phone_app": PHONE_STATE.get("current_app"),
         "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
     }
@@ -7624,16 +7913,29 @@ async def clear_stale_processing_flags():
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute("""
-                    UPDATE claude_instances
-                    SET status = 'idle'
-                    WHERE status = 'processing'
-                      AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')
-                """)
+                cursor = await db.execute(
+                    """SELECT id
+                       FROM claude_instances
+                       WHERE status = 'processing'
+                         AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')"""
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    try:
+                        await sanctioned_update_instance(
+                            db,
+                            instance_id=row[0],
+                            updates={"status": "idle"},
+                            mutation_type="status_changed",
+                            write_source="system",
+                            actor="clear-stale-processing",
+                        )
+                    except LookupError:
+                        continue
                 await db.commit()
 
-                if cursor.rowcount > 0:
-                    logger.warning(f"Auto-cleared {cursor.rowcount} stale processing flags")
+                if rows:
+                    logger.warning(f"Auto-cleared {len(rows)} stale processing flags")
 
             await asyncio.sleep(60)  # Run every minute
 
@@ -10537,9 +10839,13 @@ async def _auto_name_instance(instance: dict, transcript_tail: str, transcript_p
         # Rename via Token-API directly (faster than claude-cmd for the API side)
         instance_id = instance["id"]
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
-                (name, instance_id)
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"tab_name": name},
+                mutation_type="instance_updated",
+                write_source="system",
+                actor="rename-instance",
             )
             await db.commit()
 
@@ -10674,10 +10980,19 @@ async def _run_stop_evaluators(
         _recently_nudged.pop(instance_id, None)
         (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(missing_ok=True)
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE claude_instances SET status = 'idle' WHERE id = ? AND status = 'processing'",
-                (instance_id,)
-            )
+            try:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"status": "idle"},
+                    mutation_type="status_changed",
+                    write_source="system",
+                    actor="stop-evaluator",
+                    where_clause="id = ? AND status = 'processing'",
+                    where_params=(instance_id,),
+                )
+            except LookupError:
+                pass
             await db.commit()
         logger.info(f"StopEval: all passed for {instance_id[:12]} — status → idle")
         return
@@ -11040,11 +11355,24 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
         if hard:
-            # NULL out session_doc_id on linked instances
-            await db.execute(
-                "UPDATE claude_instances SET session_doc_id = NULL WHERE session_doc_id = ?",
-                (doc_id,)
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE session_doc_id = ?",
+                (doc_id,),
             )
+            linked_rows = await cursor.fetchall()
+            for linked_row in linked_rows:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=linked_row[0],
+                    updates={
+                        "session_doc_id": None,
+                        "session_doc_policy": None,
+                        "continuity_binding_source": None,
+                    },
+                    mutation_type="continuity_binding_changed",
+                    write_source="api",
+                    actor="delete-session-doc",
+                )
             # Delete from DB
             await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
@@ -11151,12 +11479,16 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
     """Assign an existing session document to an instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         # Verify instance exists
-        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
         inst_row = await cursor.fetchone()
         if not inst_row:
             raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
 
         old_doc_id = inst_row[1]
+        workflow_state = inst_row[2]
 
         # Verify doc exists
         cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
@@ -11164,9 +11496,31 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
         # Assign
-        await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_assigned' WHERE id = ?",
-            (doc_id, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "session_doc_id": doc_id,
+                "session_doc_policy": "manual_assigned",
+                "continuity_binding_source": "manual",
+            },
+            mutation_type="continuity_binding_changed",
+            write_source="api",
+            actor="assign-doc",
+            workflow_events=[
+                {
+                    "workflow_state": workflow_state,
+                    "event_type": "continuity_binding_changed",
+                    "event_owner": "api",
+                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": doc_id, "continuity_binding_source": "manual"},
+                },
+                {
+                    "workflow_state": workflow_state,
+                    "event_type": "session_doc_bound",
+                    "event_owner": "api",
+                    "details": {"session_doc_id": doc_id, "session_doc_policy": "manual_assigned", "continuity_binding_source": "manual"},
+                },
+            ],
         )
         await db.commit()
 
@@ -11185,12 +11539,16 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     """Create a new session document and assign it to the instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         # Verify instance exists
-        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
         inst_row = await cursor.fetchone()
         if not inst_row:
             raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
 
         old_doc_id = inst_row[1]
+        workflow_state = inst_row[2]
 
     # Create the doc by reusing the create endpoint logic
     today = datetime.now().strftime("%Y-%m-%d")
@@ -11213,9 +11571,31 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
         doc_id = cursor.lastrowid
 
         # Assign to instance
-        await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_created' WHERE id = ?",
-            (doc_id, instance_id)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "session_doc_id": doc_id,
+                "session_doc_policy": "manual_created",
+                "continuity_binding_source": "manual",
+            },
+            mutation_type="continuity_binding_changed",
+            write_source="api",
+            actor="create-doc",
+            workflow_events=[
+                {
+                    "workflow_state": workflow_state,
+                    "event_type": "continuity_binding_changed",
+                    "event_owner": "api",
+                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": doc_id, "continuity_binding_source": "manual"},
+                },
+                {
+                    "workflow_state": workflow_state,
+                    "event_type": "session_doc_bound",
+                    "event_owner": "api",
+                    "details": {"session_doc_id": doc_id, "session_doc_policy": "manual_created", "continuity_binding_source": "manual"},
+                },
+            ],
         )
         await db.commit()
 
@@ -11237,18 +11617,38 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
 async def unassign_doc_from_instance(instance_id: str):
     """Unlink a session document from an instance."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
         inst_row = await cursor.fetchone()
         if not inst_row:
             raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
 
         old_doc_id = inst_row[1]
+        workflow_state = inst_row[2]
         if not old_doc_id:
             return {"instance_id": instance_id, "unassigned": False, "reason": "No doc was assigned"}
 
-        await db.execute(
-            "UPDATE claude_instances SET session_doc_id = NULL, session_doc_policy = NULL WHERE id = ?",
-            (instance_id,)
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "session_doc_id": None,
+                "session_doc_policy": None,
+                "continuity_binding_source": None,
+            },
+            mutation_type="continuity_binding_changed",
+            write_source="api",
+            actor="unassign-doc",
+            workflow_events=[
+                {
+                    "workflow_state": workflow_state,
+                    "event_type": "continuity_binding_changed",
+                    "event_owner": "api",
+                    "details": {"old_session_doc_id": old_doc_id, "new_session_doc_id": None, "continuity_binding_source": None},
+                },
+            ],
         )
         await db.commit()
 
