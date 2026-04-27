@@ -50,14 +50,24 @@ This is the standard flow for getting code reviewed:
    )"
    ```
 
-3. **Wait for automated reviews** (Greptile, Bugbot, GitHub Actions):
-   - `pr-create` automatically polls for up to 15 minutes
-   - When reviews arrive, output the comments for the user
+3. **Wait for CodeRabbit + GitHub Actions:**
+   - `pr-create` polls for up to 8 minutes (CodeRabbit assertive on large diffs runs 1–5 min; 8 min gives headroom)
+   - Stop signals (any one ends the wait):
+     - A new comment from `coderabbitai[bot]` whose body matches `^## Summary by CodeRabbit`
+     - The `coderabbit` commit status reaches `success` or `failure` on the PR head
+     - A `coderabbitai[bot]` PR review with state `APPROVED` or `CHANGES_REQUESTED`
+   - When reviews arrive, output the summary + any inline comments
 
-4. **Report results:**
-   - Show the PR URL
-   - Show any review comments that need addressing
-   - If reviews found issues, suggest using `/pr review` after fixing
+4. **Address feedback in a loop (if `CHANGES_REQUESTED`):**
+   - Read the inline comments and the summary
+   - Fix the issues in the worktree
+   - Run `/pr review --message "..."` to push + re-poll
+   - Loop until review is `APPROVED` or no blockers remain
+
+5. **Merge when clean:**
+   - All required checks green (PR Gate workflow + `coderabbit` status)
+   - No open `CHANGES_REQUESTED` reviews
+   - Run `/pr merge -y` (or `/pr merge` to confirm first)
 
 ### `/pr review`
 
@@ -70,15 +80,15 @@ pr-review-loop [PR_NUMBER] [--message "description of fixes"]
 
 The tool will:
 1. Push the current branch
-2. Post a comment requesting re-review from @greptileai
-3. Poll for new review comments (distinguishes new vs baseline)
-4. Output only the NEW comments from this review cycle
+2. Post a comment requesting re-review from @coderabbitai (`@coderabbitai full review`)
+3. Poll for new review comments + commit status (distinguishes new vs baseline)
+4. Output only the NEW comments from this review cycle and the current review state
 
 Options:
 - `--message "..."` — describe what was fixed (included in re-review request)
 - `--no-push` — skip the git push (if already pushed)
 - `--read` — just poll for existing comments, don't push or request re-review
-- `--timeout <mins>` — override the 15-minute default
+- `--timeout <mins>` — override the 8-minute default
 
 ### `/pr merge`
 
@@ -125,8 +135,23 @@ fi
 Before creating a PR, verify:
 
 1. **Not on main/master** — never create PRs from the default branch
-2. **Tests pass** — run `pytest tests/unit/ -k <relevant>` if changes touch Python
+2. **Local checks pass** — run `test` (the unified CI-mirror runner) so you catch
+   format/lint/type/test failures before pushing. CI runs the same commands;
+   "passes locally" means the same thing as "passes CI."
 3. **No secrets staged** — check for `.env`, credentials, API keys in `git diff --cached`
+
+## What the PR Gate Enforces
+
+Branch protection on `main` requires:
+
+- The `PR Gate (blocking) / quality` workflow run to be green (format, lint,
+  typecheck, tests — see `.github/workflows/pr.yml`)
+- The `coderabbit` commit status to be `success`
+- Zero open `CHANGES_REQUESTED` reviews
+
+The push-side workflow (`.github/workflows/push.yml`) is **advisory only** —
+it surfaces issues as annotations on every push to a feature branch, but does
+not block. PRs are for shipping, not for fishing for an AI review.
 
 ## GitHub Authentication
 
@@ -169,3 +194,6 @@ Commits, creates PR, waits for reviews, reports results.
 - If reviews time out: use `/pr status` to check manually, or `pr-review-loop --read`
 - If merge fails: check for merge conflicts, required status checks, or branch protection rules
 - If merge conflicts exist: resolve locally, commit, then `/pr review` before merging
+- If CodeRabbit never posts a summary: verify the CodeRabbit GitHub App is
+  installed for the repo and `CODERABBIT_API_KEY` is set in repo Actions
+  secrets (see vault: `Terra/Meta/coderabbit-template.yaml`)

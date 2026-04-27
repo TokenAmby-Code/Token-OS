@@ -3,7 +3,7 @@
 # TAGS: git, pr, workflow
 # AUDIENCE: human, agent
 #
-# Creates a pull request and waits for Greptile/Bugbot reviews to complete,
+# Creates a pull request and waits for CodeRabbit reviews to complete,
 # then outputs the review comments for the caller to address.
 #
 # Usage: pr-create [gh pr create options]
@@ -14,7 +14,7 @@
 #
 # The tool will:
 #   1. Create the PR using gh pr create
-#   2. Poll for Greptile/Bugbot review comments (up to 15 minutes)
+#   2. Poll for CodeRabbit review comments (up to 15 minutes)
 #   3. Output the review comments for you to address
 
 set -euo pipefail
@@ -25,7 +25,7 @@ source "$SCRIPT_DIR/../lib/git-remote.sh"
 
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=900       # 15 minutes max wait
-REVIEWERS=("greptile-apps" "github-actions" "bugbot")
+REVIEWERS=("coderabbitai[bot]" "coderabbitai" "coderabbit")
 
 # Colors for output
 RED='\033[0;31m'
@@ -63,7 +63,7 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
 PR Create with Review Polling
 
-Creates a pull request and waits for automated reviews (Greptile, Bugbot)
+Creates a pull request and waits for automated reviews (CodeRabbit)
 to complete, then outputs the review comments.
 
 Usage: pr-create [gh pr create options]
@@ -91,7 +91,7 @@ Examples:
 
 Output:
   Returns the automated review comments formatted for easy reading.
-  Reviews from: Greptile, Bugbot, GitHub Actions
+  Reviews from: CodeRabbit
 EOF
     exit 0
 fi
@@ -297,7 +297,7 @@ if [[ "$NO_WAIT" == "true" ]]; then
     exit 0
 fi
 
-log "Waiting for automated reviews (Greptile, Bugbot)..."
+log "Waiting for automated reviews (CodeRabbit)..."
 log "Polling every ${POLL_INTERVAL}s for up to ${TIMEOUT_MINS} minutes..."
 
 # Poll for reviews
