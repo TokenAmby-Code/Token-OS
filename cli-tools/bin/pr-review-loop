@@ -29,9 +29,11 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
 
 POLL_INTERVAL=30        # seconds between checks
-MAX_WAIT_TIME=900       # 15 minutes default
-GREPTILE_BOT="greptile-apps[bot]"
-GREPTILE_USER="greptile-apps"
+MAX_WAIT_TIME=480       # 8 minutes default — CodeRabbit assertive on large diffs runs 1–5 min
+REVIEWER_BOT="coderabbitai[bot]"
+REVIEWER_USER="coderabbitai"
+SUMMARY_MARKER="^## Summary by CodeRabbit"
+COMMIT_STATUS_CONTEXT="coderabbit"
 
 # Colors for output
 RED='\033[0;31m'
@@ -74,10 +76,10 @@ Examples:
 
 Workflow:
   1. Push current branch to remote (unless --no-push)
-  2. Post PR comment requesting re-review from @greptileai
-  3. Poll for new Greptile review comments (every 30s)
-  4. Output new comments and confidence score
-  5. Exit 0 if score >= 4, exit 1 otherwise
+  2. Post PR comment requesting re-review from @coderabbitai
+  3. Poll for new CodeRabbit summary or commit status (every 30s)
+  4. Output new comments and current review state
+  5. Exit 0 if review approved + no CHANGES_REQUESTED, exit 1 otherwise
 EOF
     exit 0
 fi
@@ -87,7 +89,7 @@ PR_NUMBER=""
 MESSAGE=""
 NO_PUSH=false
 READ_ONLY=false
-TIMEOUT_MINS=15
+TIMEOUT_MINS=8
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,13 +165,16 @@ fi
 
 # Get baseline comment counts and timestamps before posting
 BASELINE_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg bot "$GREPTILE_BOT" '[.[] | select(.user.login == $bot)] | length')
+    jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
 BASELINE_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg user "$GREPTILE_USER" '[.[] | select(.user.login == $user)] | length')
+    jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
 
-# Get the updated_at timestamp of the latest Greptile overview comment (if any)
+# Get the updated_at timestamp of the latest CodeRabbit summary comment (if any)
 BASELINE_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg user "$GREPTILE_USER" -r '[.[] | select(.user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
+    jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
+
+# Capture the head SHA so we can check the coderabbit commit status against it.
+HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
 
 # Step 2: Post re-review request comment (skip in --read mode)
 if [[ "$READ_ONLY" == "false" ]]; then
@@ -182,7 +187,7 @@ if [[ "$READ_ONLY" == "false" ]]; then
     else
         COMMENT_BODY="${COMMENT_BODY}\n\nAddressed review feedback."
     fi
-    COMMENT_BODY="${COMMENT_BODY}\n\n@greptileai please re-review"
+    COMMENT_BODY="${COMMENT_BODY}\n\n@coderabbitai full review"
 
     gh pr comment "$PR_NUMBER" --body "$(echo -e "$COMMENT_BODY")" || {
         error "Failed to post PR comment"
@@ -194,7 +199,7 @@ else
 fi
 
 # Step 3: Poll for new review comments
-log "⏳ Waiting for Greptile re-review (timeout: ${TIMEOUT_MINS}m)..."
+log "⏳ Waiting for CodeRabbit re-review (timeout: ${TIMEOUT_MINS}m)..."
 
 START_TIME=$(date +%s)
 NEW_INLINE_COUNT=0
@@ -212,39 +217,47 @@ while true; do
 
     # Fetch current comments
     CURRENT_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg bot "$GREPTILE_BOT" '[.[] | select(.user.login == $bot)] | length')
+        jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
     CURRENT_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg user "$GREPTILE_USER" '[.[] | select(.user.login == $user)] | length')
+        jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
 
     NEW_INLINE_COUNT=$((CURRENT_REVIEW_COMMENTS - BASELINE_REVIEW_COMMENTS))
     NEW_OVERVIEW_COUNT=$((CURRENT_ISSUE_COMMENTS - BASELINE_ISSUE_COMMENTS))
 
-    # Check for new overview comment OR updated existing overview comment
+    # Check for new summary comment OR updated existing one
     CURRENT_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg user "$GREPTILE_USER" -r '[.[] | select(.user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
+        jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
-    # Check if we have a new overview comment (the summary with Confidence Score)
     if [[ $NEW_OVERVIEW_COUNT -gt 0 ]]; then
-        # Verify it actually has a confidence score
         LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-            jq --arg user "$GREPTILE_USER" -r '.[] | select(.user.login == $user) | .body' | tail -1)
+            jq --arg bot "$REVIEWER_BOT" -r '.[] | select(.user.login == $bot) | .body' | tail -1)
 
-        if echo "$LATEST_ISSUE_COMMENT" | grep -q "Confidence Score:"; then
+        if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
             FOUND_OVERVIEW=true
-            log "Found new overview comment with confidence score!"
+            log "Found new CodeRabbit summary comment."
             break
         fi
-    # Check if existing overview comment was updated
     elif [[ -n "$BASELINE_OVERVIEW_TIMESTAMP" ]] && [[ -n "$CURRENT_OVERVIEW_TIMESTAMP" ]] && \
          [[ "$CURRENT_OVERVIEW_TIMESTAMP" != "$BASELINE_OVERVIEW_TIMESTAMP" ]]; then
-        # Verify the updated comment has a confidence score
         LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-            jq --arg user "$GREPTILE_USER" -r '[.[] | select(.user.login == $user)] | sort_by(.updated_at) | .[-1].body')
+            jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].body')
 
-        if echo "$LATEST_ISSUE_COMMENT" | grep -q "Confidence Score:"; then
+        if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
             FOUND_OVERVIEW=true
             OVERVIEW_UPDATED=true
-            log "Existing overview comment was updated with new confidence score!"
+            log "Existing CodeRabbit summary was updated."
+            break
+        fi
+    fi
+
+    # Also accept terminal coderabbit commit status (success/failure) as a stop signal.
+    if [[ -n "$HEAD_SHA" ]]; then
+        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+            jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
+            '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
+        if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
+            FOUND_OVERVIEW=true
+            log "CodeRabbit commit status reached terminal state: $CR_STATE"
             break
         fi
     fi
@@ -254,7 +267,7 @@ while true; do
     if [[ "$OVERVIEW_UPDATED" == "true" ]]; then
         STATUS=" (updated)"
     fi
-    printf "\r  Polling... (%d new inline, %d new overview%s) [%ds]   " \
+    printf "\r  Polling... (%d new inline, %d new summary%s) [%ds]   " \
         "$NEW_INLINE_COUNT" "$NEW_OVERVIEW_COUNT" "$STATUS" "$ELAPSED_SECS"
     sleep "$POLL_INTERVAL"
 done
@@ -266,9 +279,9 @@ if [[ "$FOUND_OVERVIEW" == "false" ]] && [[ $NEW_INLINE_COUNT -eq 0 ]] && [[ $NE
     warn "No new review comments found within timeout period."
     echo ""
     echo "Possible reasons:"
-    echo "  - Greptile is still processing"
+    echo "  - CodeRabbit is still processing"
     echo "  - No new issues found"
-    echo "  - Greptile not configured for this repo"
+    echo "  - CodeRabbit App not installed for this repo"
     echo ""
     echo "Check manually: https://github.com/${REPO}/pull/${PR_NUMBER}"
     exit 1
@@ -281,44 +294,48 @@ ALL_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/
 ALL_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
 
 # Get new inline comments (after baseline)
-NEW_INLINE_COMMENTS=$(echo "$ALL_REVIEW_COMMENTS" | jq --arg bot "$GREPTILE_BOT" \
+NEW_INLINE_COMMENTS=$(echo "$ALL_REVIEW_COMMENTS" | jq --arg bot "$REVIEWER_BOT" \
     --argjson baseline "$BASELINE_REVIEW_COMMENTS" '
     [.[] | select(.user.login == $bot)] |
     if length > ($baseline | tonumber) then .[$baseline:] else [] end
 ')
 
-# Get new overview comments (after baseline) OR the updated one
+# Get new summary comments (after baseline) OR the updated one
 if [[ "$OVERVIEW_UPDATED" == "true" ]]; then
-    # If overview was updated (not new), get the latest one
-    NEW_OVERVIEW_COMMENTS=$(echo "$ALL_ISSUE_COMMENTS" | jq --arg user "$GREPTILE_USER" \
-        '[.[] | select(.user.login == $user)] | sort_by(.updated_at) | [.[-1]]')
+    NEW_OVERVIEW_COMMENTS=$(echo "$ALL_ISSUE_COMMENTS" | jq --arg bot "$REVIEWER_BOT" \
+        '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | [.[-1]]')
 else
-    # Otherwise get new comments after baseline
-    NEW_OVERVIEW_COMMENTS=$(echo "$ALL_ISSUE_COMMENTS" | jq --arg user "$GREPTILE_USER" \
+    NEW_OVERVIEW_COMMENTS=$(echo "$ALL_ISSUE_COMMENTS" | jq --arg bot "$REVIEWER_BOT" \
         --argjson baseline "$BASELINE_ISSUE_COMMENTS" '
-        [.[] | select(.user.login == $user)] |
+        [.[] | select(.user.login == $bot)] |
         if length > ($baseline | tonumber) then .[$baseline:] else [] end
     ')
 fi
 
-# Extract confidence score from overview
-CONFIDENCE_SCORE=""
-CONFIDENCE_STATUS=""
-if [[ $NEW_OVERVIEW_COUNT -gt 0 ]] || [[ "$OVERVIEW_UPDATED" == "true" ]]; then
-    OVERVIEW_BODY=$(echo "$NEW_OVERVIEW_COMMENTS" | jq -r '.[0].body // ""')
+# Determine review state from PR reviews + commit status.
+REVIEW_STATE=""
+REVIEW_STATUS_ICON=""
+LATEST_REVIEW_STATE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
+    jq --arg bot "$REVIEWER_BOT" -r \
+    '[.[] | select(.user.login == $bot)] | sort_by(.submitted_at) | .[-1].state // ""')
+CR_COMMIT_STATE=""
+if [[ -n "$HEAD_SHA" ]]; then
+    CR_COMMIT_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+        jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
+        '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
+fi
 
-    if [[ -n "$OVERVIEW_BODY" ]]; then
-        # Try to extract confidence score (format: "Confidence Score: 4/5" or similar)
-        if SCORE=$(echo "$OVERVIEW_BODY" | grep -oE 'Confidence Score: ([0-9])/5' | head -1); then
-            CONFIDENCE_SCORE=$(echo "$SCORE" | grep -oE '[0-9]' | head -1)
-
-            if [[ $CONFIDENCE_SCORE -ge 4 ]]; then
-                CONFIDENCE_STATUS="✅"
-            else
-                CONFIDENCE_STATUS="❌"
-            fi
-        fi
-    fi
+if [[ "$LATEST_REVIEW_STATE" == "CHANGES_REQUESTED" ]]; then
+    REVIEW_STATE="CHANGES_REQUESTED"
+    REVIEW_STATUS_ICON="❌"
+elif [[ "$LATEST_REVIEW_STATE" == "APPROVED" ]] || [[ "$CR_COMMIT_STATE" == "success" ]]; then
+    REVIEW_STATE="APPROVED"
+    REVIEW_STATUS_ICON="✅"
+elif [[ "$CR_COMMIT_STATE" == "failure" ]]; then
+    REVIEW_STATE="FAILURE"
+    REVIEW_STATUS_ICON="❌"
+elif [[ -n "$LATEST_REVIEW_STATE" ]]; then
+    REVIEW_STATE="$LATEST_REVIEW_STATE"
 fi
 
 # Output formatted results
@@ -328,10 +345,13 @@ echo "PR #${PR_NUMBER} Re-Review Results"
 echo "=============================================="
 echo ""
 
-if [[ -n "$CONFIDENCE_SCORE" ]]; then
-    echo "Confidence Score: ${CONFIDENCE_SCORE}/5 ${CONFIDENCE_STATUS}"
-    echo ""
+if [[ -n "$REVIEW_STATE" ]]; then
+    echo "Review State:    ${REVIEW_STATE} ${REVIEW_STATUS_ICON}"
 fi
+if [[ -n "$CR_COMMIT_STATE" ]]; then
+    echo "CodeRabbit CI:   ${CR_COMMIT_STATE}"
+fi
+echo ""
 
 if [[ $NEW_INLINE_COUNT -gt 0 ]]; then
     echo "### New Inline Comments (${NEW_INLINE_COUNT}):"
@@ -359,16 +379,22 @@ echo "PR URL: https://github.com/${REPO}/pull/${PR_NUMBER}"
 echo "=============================================="
 echo ""
 
-# Exit based on confidence score
-if [[ -n "$CONFIDENCE_SCORE" ]]; then
-    if [[ $CONFIDENCE_SCORE -ge 4 ]]; then
-        success "Confidence score >= 4, review passed!"
+# Exit based on review state.
+case "$REVIEW_STATE" in
+    APPROVED)
+        success "CodeRabbit approved (or commit status success)."
         exit 0
-    else
-        warn "Confidence score < 4, further fixes needed."
+        ;;
+    CHANGES_REQUESTED)
+        warn "CodeRabbit requested changes — fix and re-run."
         exit 1
-    fi
-else
-    warn "Could not determine confidence score."
-    exit 1
-fi
+        ;;
+    FAILURE)
+        warn "CodeRabbit commit status: failure — review needed."
+        exit 1
+        ;;
+    *)
+        warn "Inconclusive review state: '${REVIEW_STATE:-(none)}'. Inspect manually."
+        exit 1
+        ;;
+esac

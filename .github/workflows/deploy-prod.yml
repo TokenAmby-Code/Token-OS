@@ -1,0 +1,50 @@
+name: Deploy (prod)
+
+# Triggers ONLY on merge to main. Per-worktree local dev URLs are
+# untouched — there is no "merge to deploy dev" path. Merge means ship.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write  # for OIDC-based cloud auth, if used
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ─── Replace this block with the actual prod deploy command ───
+      # Examples:
+      #   - gcloud run deploy ... (Cloud Run)
+      #   - fly deploy
+      #   - rsync over SSH to a VPS
+      #   - kubectl rollout
+      #
+      # Until wired up, this is a no-op so merges to main don't fail.
+      - name: Deploy
+        run: |
+          echo "TODO: wire prod deploy command here."
+          echo "Commit: $GITHUB_SHA"
+          echo "Ref:    $GITHUB_REF"
