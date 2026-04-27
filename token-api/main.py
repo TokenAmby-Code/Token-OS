@@ -18,6 +18,7 @@ import random
 import asyncio
 import functools
 import logging
+import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -38,7 +39,10 @@ import tempfile
 import requests
 import httpx
 from pydantic import BaseModel, Field
-from session_doc_helpers import update_frontmatter, update_victory_frontmatter
+from session_doc_helpers import (
+    update_frontmatter, update_victory_frontmatter,
+    create_session_doc_file, _update_doc_agents_list,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.interval import IntervalTrigger
@@ -51,15 +55,39 @@ from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
     format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
 )
+from custodes_state_policy import (
+    StateEvent,
+    evaluate_state_event,
+    build_dedupe_key,
+    normalize_severity,
+)
+import shared
 from shared import (
     DB_PATH, DEFAULT_SESSIONS_DIR, MARS_SESSIONS_DIR, SERVER_PORT,
     CRASH_LOG_PATH, STASH_DIR, STASH_MAX_AGE_HOURS,
     PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK,
     get_next_available_profile,
     DESKTOP_CONFIG, TTS_BACKEND, TTS_GLOBAL_MODE, DESKTOP_STATE,
+    PHONE_CONFIG, PHONE_STATE, PHONE_HEARTBEAT,
+    PAVLOK_CONFIG, PAVLOK_STATE,
     is_satellite_tts_available,
     log_event, log_event_sync,
     DISCORD_DAEMON_URL,
+    VOICE_CHAT_SESSIONS, DICTATION_STATE,
+    PEDAL_STATE, PEDAL_DOUBLE_TAP_MS, PEDAL_BUFFER_MS, PEDAL_BYPASS_MS,
+    DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device,
+    is_pid_claude, get_parent_pid, is_subagent_pid,
+)
+from phone_service import (
+    push_phone_widget,
+    push_phone_widget_async,
+    _send_to_phone,
+    send_pavlok_stimulus,
+    check_instance_count_pavlok,
+    TWITTER_ZAP_COOLDOWN_FILE,
+    TWITTER_ZAP_COOLDOWN_SECS,
+    _persist_twitter_zap_cooldown,
+    _restore_twitter_zap_cooldown,
 )
 from routes.tts import (
     router as tts_router,
@@ -73,8 +101,10 @@ from routes.tts import (
     # Queue state (needed by lifespan)
     tts_worker_task,
 )
+from routes.voice import router as voice_router
 from routes.hooks import (
     router as hooks_router,
+    init_deps as hooks_init_deps,
     HookResponse, PreToolUseResponse,
     _post_tool_debounce, _pending_background_tasks, _recently_nudged,
     NUDGE_COOLDOWN_SECONDS,
@@ -191,16 +221,7 @@ def _asyncio_exception_handler(loop, context):
 # Install global exception handlers
 sys.excepthook = _global_exception_handler
 
-# Device IP mapping for SSH detection
-DEVICE_IPS = {
-    "100.102.92.24": "Token-S24",    # Phone
-    "100.69.198.87": "TokenPC",      # Windows PC
-    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
-    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
-    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
-}
-
-# [MOVED to shared.py / routes/tts.py] — was: # Voice pool: foreign-accent voices are the primar
+# [MOVED to shared.py] — DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device
 
 
 # ── Legion Pane Recolor ──────────────────────────────────────
@@ -220,6 +241,7 @@ LEGION_PANE_COLORS = {
 scheduler = AsyncIOScheduler(
     jobstores={'golden_throne': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH.parent / "apscheduler.db"}')}
 )
+shared.scheduler = scheduler
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
@@ -297,6 +319,14 @@ class TaskExecutionResponse(BaseModel):
     duration_ms: Optional[int]
     result: Optional[dict]
     retry_count: int
+
+
+class CustodesStateEventRequest(BaseModel):
+    event_type: str
+    source: str
+    instance_id: Optional[str] = None
+    severity: Optional[int] = None
+    payload: Optional[dict] = None
 
 
 # [MOVED to shared.py / routes/tts.py] — was: class NotifyRequest(BaseModel):
@@ -525,472 +555,9 @@ async def get_db():
     return db
 
 
-# Database initialization
-async def init_db():
-    """Initialize SQLite database with required tables."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Set busy_timeout to prevent blocking on lock contention
-        await db.execute("PRAGMA busy_timeout=5000")
-        # Create claude_instances table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS claude_instances (
-                id TEXT PRIMARY KEY,
-                session_id TEXT UNIQUE NOT NULL,
-                tab_name TEXT,
-                working_dir TEXT,
-                origin_type TEXT NOT NULL,
-                source_ip TEXT,
-                device_id TEXT NOT NULL,
-                profile_name TEXT,
-                tts_voice TEXT,
-                notification_sound TEXT,
-                pid INTEGER,
-                status TEXT DEFAULT 'idle',
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                stopped_at TIMESTAMP
-            )
-        """)
-
-        cursor = await db.execute("PRAGMA table_info(claude_instances)")
-        columns = [col[1] for col in await cursor.fetchall()]
-        if 'working_dir' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN working_dir TEXT")
-        if 'tts_mode' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
-        if 'session_doc_id' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER")
-        if 'zealotry' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4")
-        if 'tmux_pane' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT")
-        if 'victory_at' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP")
-        if 'victory_reason' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT")
-        if 'input_lock' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN input_lock TEXT")
-        if 'transplant_target_session' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT")
-        if 'legion' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'")
-        if 'synced' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0")
-        if 'discord_hosted' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0")
-        if 'discord_channel' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT")
-        if 'follow_up_sop' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT")
-        if 'instance_type' not in columns:
-            await db.execute("ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'")
-            await db.execute("""UPDATE claude_instances SET instance_type = CASE
-                WHEN synced = 1 AND status IN ('processing', 'idle') THEN 'sync'
-                WHEN victory_at IS NOT NULL THEN 'one_off'
-                WHEN zealotry >= 4 AND COALESCE(is_subagent, 0) = 0 THEN 'golden_throne'
-                ELSE 'one_off'
-            END""")
-
-        # Migration: add primarch_name and cron_job_id to session_documents
-        cursor = await db.execute("PRAGMA table_info(session_documents)")
-        sd_columns = [col[1] for col in await cursor.fetchall()]
-        if 'primarch_name' not in sd_columns:
-            await db.execute("ALTER TABLE session_documents ADD COLUMN primarch_name TEXT")
-        if 'cron_job_id' not in sd_columns:
-            await db.execute("ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT")
-
-        # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
-        drop_targets = dead_columns & set(columns)
-        for col in drop_targets:
-            await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
-
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)")
-
-        # Create devices table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                tailscale_ip TEXT UNIQUE,
-                notification_method TEXT,
-                webhook_url TEXT,
-                tts_engine TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create events table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                instance_id TEXT,
-                device_id TEXT,
-                details TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at DESC)")
-
-        # Create scheduled_tasks table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled_tasks (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                task_type TEXT NOT NULL,
-                schedule TEXT NOT NULL,
-                enabled INTEGER DEFAULT 1,
-                max_retries INTEGER DEFAULT 0,
-                retry_delay_seconds INTEGER DEFAULT 60,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create task_executions table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS task_executions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at TIMESTAMP NOT NULL,
-                completed_at TIMESTAMP,
-                duration_ms INTEGER,
-                result TEXT,
-                retry_count INTEGER DEFAULT 0,
-                FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
-            )
-        """)
-
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_task_executions_task_id ON task_executions(task_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_task_executions_started_at ON task_executions(started_at)")
-
-        # Create task_locks table
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS task_locks (
-                task_id TEXT PRIMARY KEY,
-                locked_at TIMESTAMP NOT NULL,
-                locked_by TEXT,
-                FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
-            )
-        """)
-
-        # Create audio_proxy_state table (for phone audio routing through PC)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS audio_proxy_state (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                phone_connected INTEGER DEFAULT 0,
-                receiver_running INTEGER DEFAULT 0,
-                receiver_pid INTEGER,
-                last_connect_time TEXT,
-                last_disconnect_time TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CHECK (id = 1)
-            )
-        """)
-
-        # Create timer_state table (single-row, stores timer engine state as JSON)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                state_json TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Timer session logging - track work/break sessions
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                start_time TIMESTAMP NOT NULL,
-                end_time TIMESTAMP,
-                mode TEXT NOT NULL,
-                duration_ms INTEGER DEFAULT 0,
-                break_earned_ms INTEGER DEFAULT 0,
-                break_used_ms INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Timer mode changes - track when mode changed
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_mode_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP NOT NULL,
-                old_mode TEXT,
-                new_mode TEXT NOT NULL,
-                is_automatic INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Timer daily scores - track productivity over time
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_daily_scores (
-                date TEXT PRIMARY KEY,
-                productivity_score INTEGER,
-                total_work_ms INTEGER DEFAULT 0,
-                total_break_used_ms INTEGER DEFAULT 0,
-                session_count INTEGER DEFAULT 0,
-                mode_change_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create checkins table (productivity check-in responses)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS checkins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                checkin_type TEXT NOT NULL,
-                date TEXT NOT NULL,
-                energy INTEGER,
-                focus INTEGER,
-                mood TEXT,
-                plan TEXT,
-                notes TEXT,
-                on_track INTEGER,
-                source TEXT DEFAULT 'discord',
-                prompted_at TIMESTAMP NOT NULL,
-                responded_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(checkin_type, date)
-            )
-        """)
-
-        # Create nudges table (Phase 2 - idle detection nudges)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS nudges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nudge_type TEXT NOT NULL,
-                message TEXT NOT NULL,
-                idle_minutes REAL,
-                acknowledged INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Timer shifts analytics table (daily-wiped, rich metadata)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_shifts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                old_mode TEXT,
-                new_mode TEXT NOT NULL,
-                trigger TEXT,
-                source TEXT,
-                break_balance_ms INTEGER,
-                break_backlog_ms INTEGER,
-                work_time_ms INTEGER,
-                active_instances INTEGER,
-                phone_app TEXT,
-                details TEXT
-            )
-        """)
-
-        # Seed devices if not exist
-        await db.execute("""
-            INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)
-            VALUES ('desktop', 'Desktop', 'local', '100.66.10.74', 'tts_sound', 'windows_sapi')
-        """)
-
-        await db.execute("""
-            INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, webhook_url)
-            VALUES ('Token-S24', 'Pixel Phone', 'mobile', '100.102.92.24', 'webhook', 'http://100.102.92.24:7777/notify')
-        """)
-
-        # Seed scheduled tasks
-        await db.execute("""
-            INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
-            VALUES ('cleanup_stale_instances', 'Cleanup Stale Instances',
-                    'Mark instances with no activity for 3+ hours as stopped',
-                    'interval', '30m', 2)
-        """)
-
-        await db.execute("""
-            INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
-            VALUES ('purge_old_events', 'Purge Old Events',
-                    'Delete events older than 30 days',
-                    'cron', '0 3 * * *', 1)
-        """)
-
-        # Seed check-in scheduled tasks (weekdays only)
-        checkin_tasks = [
-            ("checkin_morning_start", "Morning Start Check-in", "Energy, focus, mood, and today's focus", "0 9 * * 1-5"),
-            ("checkin_mid_morning", "Mid-Morning Check-in", "Focus check and on-track status", "30 10 * * 1-5"),
-            ("checkin_decision_point", "Decision Point Check-in", "Gym or power through, energy check", "0 11 * * 1-5"),
-            ("checkin_afternoon", "Afternoon Start Check-in", "Energy and focus after lunch", "0 13 * * 1-5"),
-            ("checkin_afternoon_check", "Afternoon Check", "Energy, focus, and need help assessment", "30 14 * * 1-5"),
-        ]
-        for task_id, name, desc, schedule in checkin_tasks:
-            await db.execute("""
-                INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
-                VALUES (?, ?, ?, 'cron', ?, 0)
-            """, (task_id, name, desc, schedule))
-
-        # Cron engine tables
-        await CronEngine.init_tables(db)
-
-        # Agent state + guard runs tables
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS agent_state (
-                id       TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS guard_runs (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                cron_run_id INTEGER NOT NULL,
-                job_id      TEXT NOT NULL,
-                guard_index INTEGER NOT NULL,
-                verdict     TEXT NOT NULL,
-                findings    TEXT,
-                model       TEXT DEFAULT 'MiniMax-M2.5',
-                duration_ms INTEGER,
-                created_at  TEXT NOT NULL
-            )
-        """)
-
-        # Create session_documents table (persistent Obsidian notes linked to instances)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS session_documents (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path   TEXT NOT NULL UNIQUE,
-                title       TEXT,
-                project     TEXT,
-                primarch_name TEXT,
-                cron_job_id TEXT,
-                status      TEXT DEFAULT 'active',
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create primarch_session_docs table (tracks primarch ↔ session doc links over time)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS primarch_session_docs (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                primarch_name TEXT NOT NULL,
-                session_doc_id INTEGER NOT NULL,
-                linked_at     TEXT NOT NULL DEFAULT (datetime('now')),
-                unlinked_at   TEXT,
-                FOREIGN KEY (session_doc_id) REFERENCES session_documents(id)
-            )
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_primarch_active
-              ON primarch_session_docs(primarch_name) WHERE unlinked_at IS NULL
-        """)
-
-        # Create primarchs table (registry of primarch identities)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS primarchs (
-                name            TEXT PRIMARY KEY,
-                title           TEXT NOT NULL,
-                aliases         TEXT NOT NULL DEFAULT '[]',
-                vault           TEXT NOT NULL,
-                role            TEXT NOT NULL,
-                instance_name_prefix TEXT NOT NULL,
-                vault_note_path TEXT,
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Seed primarchs (INSERT OR IGNORE so existing data isn't overwritten)
-        primarch_seed = [
-            ("vulkan", "Vulkan, The Promethean", '["v"]', "Imperium-ENV", "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.", "vulkan", "Personas/Vulkan.md"),
-            ("fabricator-general", "The Fabricator-General", '["fg", "fabricator"]', "Imperium-ENV", "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.", "fabricator-general", "Personas/Fabricator-General.md"),
-            ("mechanicus", "Adeptus Mechanicus", '["mech", "mars"]', "Imperium-ENV", "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.", "mechanicus", "Personas/Mechanicus.md"),
-            ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
-            ("guilliman", "Guilliman, The Codifier", '["g", "guilliman", "ultramar"]', "Imperium-ENV", "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.", "guilliman", "Personas/Guilliman.md"),
-            ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
-            ("alpharius", "Alpharius, The Unknowable Twin", '["alpharius", "alpha", "hydra"]', "Imperium-ENV", "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. Reports through Mechanicus channels. I am Alpharius.", "alpharius", "Personas/Alpharius.md"),
-            ("dorn", "Dorn, The Imperial Fist", '["dorn", "fortify", "audit"]', "Imperium-ENV", "Security Primarch. Defensive auditor and hardening reviewer. Reviews code, infrastructure, and configurations for vulnerabilities. Does not build — inspects what others build before it ships.", "dorn", "Personas/Dorn.md"),
-            ("corax", "Corax, The Raven Lord", '["corax", "raven", "monitor", "codax"]', "Imperium-ENV", "Observability Primarch. Long-term monitoring, anomaly detection, pattern recognition across the entire system. Independent observer — not part of the Mechanicus command chain. Read-only. Silent by default, speaks when something is wrong.", "corax", "Personas/Corax.md"),
-            ("perturabo", "Perturabo, Lord of Iron", '["pert", "iron-within", "lord-of-iron"]', "Imperium-ENV", "Matters of the flesh. Food supply chain, meal prep logistics, inventory management, health telemetry. On-demand, not cron.", "perturabo", "Personas/Perturabo.md"),
-        ]
-        for p in primarch_seed:
-            await db.execute("""
-                INSERT OR IGNORE INTO primarchs (name, title, aliases, vault, role, instance_name_prefix, vault_note_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, p)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS habits (
-                id                  TEXT PRIMARY KEY,
-                name                TEXT NOT NULL,
-                category            TEXT NOT NULL,
-                window_start_hour   INTEGER NOT NULL,
-                window_end_hour     INTEGER NOT NULL,
-                notes               TEXT,
-                active              INTEGER NOT NULL DEFAULT 1,
-                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS habit_completions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                habit_id    TEXT NOT NULL REFERENCES habits(id),
-                date        TEXT NOT NULL,
-                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                notes       TEXT,
-                UNIQUE(habit_id, date)
-            )
-        """)
-
-        # Seed default habit definitions (INSERT OR IGNORE so existing data isn't overwritten)
-        default_habits = [
-            ("morning_teeth",      "Brush teeth",           "morning", 6,  10, None),
-            ("morning_breakfast",  "Breakfast",             "morning", 6,  11, None),
-            ("morning_movement",   "Morning movement",      "morning", 6,  11, "Stretch, walk, or exercise"),
-            ("work_deep_work",     "Deep work session",     "work",    9,  14, "At least one focused block"),
-            ("work_calendar",      "Calendar review",       "work",    9,  13, None),
-            ("health_gym",         "Gym / exercise",        "health",  9,  21, None),
-            ("health_water",       "Hydration",             "health",  6,  22, "Drink water throughout the day"),
-            ("evening_reflection", "Evening reflection",    "evening", 19, 24, None),
-            ("evening_reading",    "Reading",               "evening", 19, 24, None),
-            ("evening_tomorrow",   "Tomorrow prep",         "evening", 19, 24, "Review tomorrow's calendar and tasks"),
-        ]
-        for h in default_habits:
-            await db.execute("""
-                INSERT OR IGNORE INTO habits (id, name, category, window_start_hour, window_end_hour, notes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, h)
-
-        await db.commit()
-        print(f"Database initialized at {DB_PATH}")
-
-
 # [MOVED to shared.py / routes/tts.py] — was: async def log_event(event_type: str, instance_id: 
 
-def resolve_device_from_ip(ip: str) -> str:
-    """Map Tailscale IPs to known devices."""
-    return DEVICE_IPS.get(ip, "unknown")
-
-
-# Devices where we can inspect local PIDs, send signals, etc.
-LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
-
-
-def is_local_device(device_id: str) -> bool:
-    """Check if device_id refers to a machine where we can manage processes locally."""
-    return device_id in LOCAL_DEVICES
-
-
-# [MOVED to shared.py / routes/tts.py] — was: def get_next_available_profile(used_wsl_voices: se
+# [MOVED to shared.py] — resolve_device_from_ip, LOCAL_DEVICES, is_local_device
 
 # ============ Scheduled Task System ============
 
@@ -1215,35 +782,64 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
-async def restore_desktop_state():
-    """Restore DESKTOP_STATE from last known event on startup.
+RESTART_STATE_PATH = Path(__file__).parent / "restart_state.json"
 
-    Prevents state desync when the server restarts while AHK is still running.
-    AHK tracks its own internal mode and only sends changes, so if the server
-    resets to 'silence' but AHK thinks it's in 'video', no detection is sent
-    until the next mode *transition* on the AHK side.
+# Keys that must NOT survive a restart — derived from live signals or boot-time config.
+_RESTART_STATE_DENYLIST = {
+    "startup_time",        # reset per boot
+    "startup_grace_secs",  # config, reset per boot
+    "ahk_reachable",       # live heartbeat — unknown until AHK checks in
+    "ahk_last_heartbeat",  # live heartbeat
+}
 
-    Timer state is restored separately via timer_load_from_db() before this.
+
+def save_restart_state() -> None:
+    """Dump DESKTOP_STATE to disk for pragma-once consumption on next startup.
+
+    Called during graceful shutdown. Only surviveable keys are persisted
+    (see _RESTART_STATE_DENYLIST). Failure is non-fatal — next boot just
+    starts fresh.
     """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Restore current_mode from the last desktop_mode_change event
-            cursor = await db.execute(
-                "SELECT details FROM events WHERE event_type = 'desktop_mode_change' ORDER BY id DESC LIMIT 1"
-            )
-            row = await cursor.fetchone()
-            if row:
-                details = json.loads(row[0])
-                restored_mode = details.get("new_mode")
-                if restored_mode and restored_mode in VALID_DETECTION_MODES:
-                    DESKTOP_STATE["current_mode"] = restored_mode
-                    DESKTOP_STATE["in_meeting"] = (restored_mode == "meeting")
-                    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-                    print(f"Restored desktop mode: {restored_mode} (from last event)")
-                    return
-        print("No previous desktop mode found, defaulting to silence")
+        persistable = {k: v for k, v in DESKTOP_STATE.items() if k not in _RESTART_STATE_DENYLIST}
+        payload = {
+            "saved_at": datetime.now().isoformat(),
+            "desktop_state": persistable,
+        }
+        RESTART_STATE_PATH.write_text(json.dumps(payload, indent=2))
+        print(f"Restart state saved: {sorted(persistable.keys())}")
     except Exception as e:
-        print(f"Failed to restore desktop state: {e}")
+        print(f"Failed to save restart state: {e}")
+
+
+def restore_restart_state() -> None:
+    """Read restart_state.json, apply to DESKTOP_STATE, then delete it.
+
+    Pragma-once: the file is consumed and removed so a subsequent crash-reboot
+    (which didn't go through graceful shutdown) boots fresh rather than
+    restoring potentially-stale state. If no file exists, this is a no-op.
+    """
+    if not RESTART_STATE_PATH.exists():
+        print("No restart state found, starting fresh")
+        return
+    try:
+        payload = json.loads(RESTART_STATE_PATH.read_text())
+        persisted = payload.get("desktop_state", {})
+        saved_at = payload.get("saved_at", "unknown")
+        applied = []
+        for key, value in persisted.items():
+            if key in _RESTART_STATE_DENYLIST:
+                continue
+            DESKTOP_STATE[key] = value
+            applied.append(key)
+        print(f"Restored restart state (saved {saved_at}): {sorted(applied)}")
+    except Exception as e:
+        print(f"Failed to restore restart state: {e}")
+    finally:
+        try:
+            RESTART_STATE_PATH.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"Failed to delete restart state: {e}")
 
 
 async def run_overdue_tasks():
@@ -1343,7 +939,7 @@ async def lifespan(app: FastAPI):
     await init_database_async(DB_PATH)
     await load_tasks_from_db()
     timer_load_from_db()
-    await restore_desktop_state()
+    restore_restart_state()
     # Sync timer activity layer with restored desktop mode
     desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
     now_ms = int(time.monotonic() * 1000)
@@ -1402,6 +998,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Persist ephemeral state for next startup (pragma-once consumption).
+    save_restart_state()
+
     # Shutdown
     if _tts_mod.tts_worker_task:
         _tts_mod.tts_worker_task.cancel()
@@ -1445,6 +1044,7 @@ app.add_middleware(
 # Slaanesh scheduling routes (Black Ships booking portal)
 app.include_router(schedule_router)
 app.include_router(tts_router)
+app.include_router(voice_router)
 app.include_router(hooks_router)
 
 
@@ -1693,29 +1293,7 @@ async def find_claude_pid_by_workdir(working_dir: str) -> Optional[int]:
     return None
 
 
-def is_pid_claude(pid: int) -> bool:
-    """Check if the given PID belongs to a claude process."""
-    try:
-        with open(f"/proc/{pid}/comm", "r") as f:
-            return f.read().strip() == "claude"
-    except (OSError, PermissionError):
-        return False
-
-
-def get_parent_pid(pid: int) -> Optional[int]:
-    """Get the parent PID of a process from /proc/<pid>/stat."""
-    try:
-        with open(f"/proc/{pid}/stat", "r") as f:
-            fields = f.read().split()
-            return int(fields[3])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def is_subagent_pid(pid: int) -> bool:
-    """Return True if this claude process was spawned by another claude process."""
-    parent = get_parent_pid(pid)
-    return bool(parent and parent != 1 and is_pid_claude(parent))
+# [MOVED to shared.py] — is_pid_claude, get_parent_pid, is_subagent_pid
 
 
 @app.post("/api/instances/{instance_id}/kill")
@@ -2284,7 +1862,7 @@ class LogsResponse(BaseModel):
 
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
-    """Rename an instance's tab_name. Also updates linked session doc title.
+    """Rename an instance's tab_name. Auto-generated docs may mirror the title.
 
     Enforces kebab-case: strips ✳ artifacts, lowercases, converts spaces to
     hyphens, removes non-alphanumeric chars, truncates to 4 words.
@@ -2301,7 +1879,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
+            "SELECT id, tab_name, session_doc_id, session_doc_policy FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
@@ -2311,13 +1889,15 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
 
         old_name = row[1]
         session_doc_id = row[2]
+        session_doc_policy = row[3]
         await db.execute(
             "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
             (request.tab_name, instance_id)
         )
 
-        # Also update session doc title if linked
-        if session_doc_id:
+        # Only auto-generated per-instance docs should mirror renames.
+        session_doc_updated = bool(session_doc_id and session_doc_policy in {"interactive_auto", "cron_created"})
+        if session_doc_updated:
             now = datetime.now().isoformat()
             await db.execute(
                 "UPDATE session_documents SET title = ?, updated_at = ? WHERE id = ?",
@@ -2331,7 +1911,8 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         "instance_renamed",
         instance_id=instance_id,
         details={"old_name": old_name, "new_name": request.tab_name,
-                 "session_doc_updated": bool(session_doc_id)}
+                 "session_doc_updated": session_doc_updated,
+                 "session_doc_policy": session_doc_policy}
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
@@ -2391,197 +1972,6 @@ async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
         )
         await db.commit()
     return {"released": True}
-
-
-class VoiceChangeRequest(BaseModel):
-    voice: str
-
-
-@app.get("/api/voices")
-async def list_voices():
-    """List all available TTS voices from the profile pool."""
-    all_profiles = PROFILES + FALLBACK_VOICES
-    voices = []
-    for profile in all_profiles:
-        wsl_voice = profile["wsl_voice"]
-        short_name = wsl_voice.replace("Microsoft ", "")
-        is_fallback = profile in FALLBACK_VOICES
-        voices.append({
-            "voice": wsl_voice,
-            "mac_voice": profile["mac_voice"],
-            "short_name": short_name,
-            "profile_name": profile["name"],
-            "fallback": is_fallback,
-        })
-    return {"voices": voices}
-
-
-def find_voice_linear_probe(used_voices: set) -> str | None:
-    """Find an available WSL voice using random offset + linear probe.
-
-    Picks a random starting index in PROFILES (foreign accents), then iterates
-    circularly until finding a voice not in used_voices. Falls back to
-    FALLBACK_VOICES, then returns None if everything is taken.
-    """
-    n = len(PROFILES)
-    if n > 0:
-        start = random.randint(0, n - 1)
-        for i in range(n):
-            idx = (start + i) % n
-            voice = PROFILES[idx]["wsl_voice"]
-            if voice not in used_voices:
-                return voice
-
-    # Try fallback voices
-    for fb in FALLBACK_VOICES:
-        if fb["wsl_voice"] not in used_voices:
-            return fb["wsl_voice"]
-
-    return None
-
-
-@app.patch("/api/instances/{instance_id}/voice")
-async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
-    """Change an instance's TTS voice with collision handling.
-
-    If the target voice is already in use by another instance, that instance
-    gets bumped using random offset + linear probe to find an open slot.
-    No cascade - bumped instance just finds the next available voice.
-    """
-    all_voices = {p["wsl_voice"] for p in PROFILES + FALLBACK_VOICES}
-    if request.voice not in all_voices:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
-        )
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Get all instances and their voices
-        cursor = await db.execute("SELECT id, tts_voice, tab_name FROM claude_instances")
-        rows = await cursor.fetchall()
-
-        instance_to_voice = {row[0]: row[1] for row in rows}
-        instance_to_name = {row[0]: row[2] for row in rows}
-        voice_to_instance = {row[1]: row[0] for row in rows if row[1]}
-
-        if instance_id not in instance_to_voice:
-            raise HTTPException(status_code=404, detail="Instance not found")
-
-        original_voice = instance_to_voice[instance_id]
-        if original_voice == request.voice:
-            return {"status": "no_change", "instance_id": instance_id, "voice": request.voice}
-
-        # Changes to apply: [(instance_id, old_voice, new_voice), ...]
-        changes = [(instance_id, original_voice, request.voice)]
-
-        # Check for collision
-        holder = voice_to_instance.get(request.voice)
-        if holder and holder != instance_id:
-            # Collision! Bump the holder to a new voice
-            holder_old_voice = instance_to_voice[holder]
-
-            # Build set of voices that will be in use after our change
-            # (exclude original_voice since we're freeing it, include request.voice since we're taking it)
-            used_after = set(voice_to_instance.keys())
-            used_after.discard(original_voice)  # We're freeing this
-            used_after.add(request.voice)  # We're taking this
-
-            # Find new voice for bumped instance via linear probe
-            new_voice_for_holder = find_voice_linear_probe(used_after)
-            if not new_voice_for_holder:
-                # All voices in use, give them the voice we just freed
-                new_voice_for_holder = original_voice
-
-            changes.append((holder, holder_old_voice, new_voice_for_holder))
-
-        # Apply all changes to database
-        for iid, _, new_voice in changes:
-            await db.execute(
-                "UPDATE claude_instances SET tts_voice = ? WHERE id = ?",
-                (new_voice, iid)
-            )
-        await db.commit()
-
-    # Log events for each change
-    for iid, old_v, new_v in changes:
-        name = instance_to_name.get(iid, iid[:8])
-        await log_event(
-            "instance_voice_changed",
-            instance_id=iid,
-            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id}
-        )
-
-    # Build response
-    bumps = [
-        {"instance_id": iid, "name": instance_to_name.get(iid, iid[:8]), "old": old_v, "new": new_v}
-        for iid, old_v, new_v in changes
-    ]
-
-    return {
-        "status": "voice_changed",
-        "instance_id": instance_id,
-        "voice": request.voice,
-        "changes": bumps
-    }
-
-
-@app.patch("/api/instances/{instance_id}/tts-mode")
-async def set_instance_tts_mode(instance_id: str, request: Request):
-    """Set TTS mode for an instance: verbose, muted, or silent."""
-    body = await request.json()
-    mode = body.get("mode", "verbose")
-    if mode not in ("verbose", "muted", "silent", "voice-chat"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?", (instance_id,))
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-
-        old_mode = row["tts_mode"] or "verbose"
-        old_voice = row["tts_voice"]
-        old_sound = row["notification_sound"]
-
-        if mode == "silent":
-            # Release voice slot
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE id = ?",
-                (mode, instance_id)
-            )
-        elif mode in ("verbose", "voice-chat") and not old_voice:
-            # Re-assign voice from pool
-            cursor2 = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
-            )
-            rows = await cursor2.fetchall()
-            used_voices = {r[0] for r in rows}
-            profile, _ = get_next_available_profile(used_voices)
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
-                (mode, profile["wsl_voice"], profile["notification_sound"], instance_id)
-            )
-        else:
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-                (mode, instance_id)
-            )
-        await db.commit()
-
-    # Manage voice chat session based on mode transition
-    if mode == "voice-chat":
-        VOICE_CHAT_SESSIONS[instance_id] = {
-            "active": True,
-            "started_at": datetime.now().isoformat()
-        }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]} (via tts_mode)")
-    elif old_mode == "voice-chat" and mode != "voice-chat":
-        VOICE_CHAT_SESSIONS.pop(instance_id, None)
-        logger.info(f"Voice chat ENDED for {instance_id[:12]} (via tts_mode)")
-
-    await log_event("tts_mode_changed", instance_id=instance_id, details={"mode": mode})
-    return {"status": "ok", "instance_id": instance_id, "mode": mode}
 
 
 @app.post("/api/instances/{instance_id}/activity")
@@ -2661,81 +2051,6 @@ async def get_instance_todos(instance_id: str):
         }
     except Exception as e:
         return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0, "error": str(e)}
-
-
-@app.post("/api/instances/{instance_id}/voice-chat")
-async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: str = ""):
-    """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'.
-
-    Args:
-        tmux_pane: Target tmux pane for send-keys (e.g., 'main:grid.2').
-                   If empty, AHK script will use default.
-    """
-    if active:
-        VOICE_CHAT_SESSIONS[instance_id] = {
-            "active": True,
-            "started_at": datetime.now().isoformat(),
-            "tmux_pane": tmux_pane or "",
-        }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]} (pane: {tmux_pane or 'default'})")
-    else:
-        VOICE_CHAT_SESSIONS.pop(instance_id, None)
-        logger.info(f"Voice chat ENDED for {instance_id[:12]}")
-    # Keep tts_mode column in sync
-    new_mode = "voice-chat" if active else "verbose"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
-            (new_mode, instance_id)
-        )
-        await db.commit()
-    return {"instance_id": instance_id, "voice_chat": active, "tmux_pane": tmux_pane}
-
-
-@app.get("/api/instances/{instance_id}/voice-chat")
-async def get_voice_chat_status(instance_id: str):
-    """Check if instance is in voice chat mode."""
-    session = VOICE_CHAT_SESSIONS.get(instance_id)
-    return {"active": session is not None, "session": session}
-
-
-@app.post("/api/instances/{instance_id}/voice-chat/listening")
-async def toggle_listening(instance_id: str, active: bool = True):
-    """Toggle listening (dictation/mic) state. Delegates to global dictation state."""
-    DICTATION_STATE["active"] = active
-    DICTATION_STATE["updated_at"] = datetime.now().isoformat()
-    logger.info(f"Dictation {'ON' if active else 'OFF'} (via voice-chat/listening for {instance_id[:12]})")
-    return {"instance_id": instance_id, "listening": active}
-
-
-@app.post("/api/dictation")
-async def set_dictation_state(active: bool):
-    """Set global dictation (Wispr Flow) state. Called by AHK on every toggle."""
-    DICTATION_STATE["active"] = active
-    DICTATION_STATE["updated_at"] = datetime.now().isoformat()
-    logger.info(f"Dictation {'ON' if active else 'OFF'}")
-
-    # When dictation ends, flush any queued pedal enter after buffer delay
-    if not active and PEDAL_STATE["enter_queued"]:
-        _schedule_pedal_enter(PEDAL_BUFFER_MS)
-
-    return {"active": active}
-
-
-@app.get("/api/dictation")
-async def get_dictation_state():
-    """Get current dictation state. Used by AHK for explicit on/off decisions."""
-    # Also report if any voice chat session is active
-    voice_chat_instance = None
-    for instance_id, session in VOICE_CHAT_SESSIONS.items():
-        if session.get("active"):
-            voice_chat_instance = instance_id
-            break
-    return {
-        "active": DICTATION_STATE["active"],
-        "updated_at": DICTATION_STATE["updated_at"],
-        "voice_chat_instance": voice_chat_instance,
-    }
 
 
 # ============ Golden Throne API ============
@@ -3059,6 +2374,354 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     return {"nudged": True, "reason": reason[:200]}
 
 
+
+_CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
+_custodes_state_debounce: dict[str, dict] = {}
+
+
+def _custodes_state_snapshot() -> dict:
+    """Small /api/state-style snapshot for Custodes policy prompts."""
+    return {
+        "timer": {
+            "current_mode": timer_engine.current_mode.value,
+            "break_balance_ms": timer_engine.break_balance_ms,
+            "total_work_time_ms": timer_engine.total_work_time_ms,
+        },
+        "phone": {
+            "current_app": PHONE_STATE.get("current_app"),
+            "is_distracted": PHONE_STATE.get("is_distracted", False),
+            "last_activity": PHONE_STATE.get("last_activity"),
+        },
+        "desktop": {
+            "current_mode": DESKTOP_STATE.get("current_mode", "silence"),
+            "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+            "location_zone": DESKTOP_STATE.get("location_zone"),
+        },
+    }
+
+
+async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tuple[bool, str]:
+    """Return (suppressed, reason) using memory plus recent event-log history."""
+    now = time.time()
+    cached = _custodes_state_debounce.get(dedupe_key)
+    if cached and now - cached["at"] < _CUSTODES_STATE_DEBOUNCE_SECONDS:
+        if severity <= cached.get("severity", 1):
+            return True, "memory_debounce"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT details
+               FROM events
+               WHERE event_type = 'custodes_intervention'
+                 AND created_at > datetime('now', '-20 minutes')
+               ORDER BY created_at DESC
+               LIMIT 100"""
+        )
+        rows = await cursor.fetchall()
+
+    for (details_json,) in rows:
+        if not details_json:
+            continue
+        try:
+            details = json.loads(details_json)
+        except Exception:
+            continue
+        if details.get("dedupe_key") != dedupe_key:
+            continue
+        if not (details.get("delivery") or {}).get("dispatched"):
+            continue
+        previous_severity = normalize_severity(details.get("severity"))
+        if severity <= previous_severity:
+            _custodes_state_debounce[dedupe_key] = {"at": now, "severity": previous_severity}
+            return True, "event_log_debounce"
+
+    return False, "not_duplicate"
+
+
+async def _inject_custodes_prompt_to_pane(prompt: str, tmux_pane: str, *, instance_id: str | None = None) -> dict:
+    """Inject a Custodes prompt into a known tmux pane."""
+    try:
+        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        proc = await asyncio.create_subprocess_exec(
+            str(claude_cmd), "--pane", tmux_pane, prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": ":".join([
+                str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.environ.get("PATH", ""),
+            ])},
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            reason = f"claude-cmd failed: rc={proc.returncode}"
+            logger.warning(f"Custodes state hook: {reason}: {stderr.decode()[:200]}")
+            return {"dispatched": False, "reason": reason, "instance_id": instance_id, "tmux_pane": tmux_pane}
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: delivery failed: {exc}")
+        return {
+            "dispatched": False,
+            "reason": f"delivery_failed: {exc}",
+            "instance_id": instance_id,
+            "tmux_pane": tmux_pane,
+        }
+
+    logger.info(f"Custodes state hook: delivered pane={tmux_pane} instance={instance_id or 'unknown'}")
+    return {"dispatched": True, "reason": "dispatched", "instance_id": instance_id, "tmux_pane": tmux_pane}
+
+
+async def _find_custodes_tmux_pane() -> str | None:
+    """Recover a live Custodes pane from tmux when DB singleton tracking is stale."""
+    custodes_bg = LEGION_PANE_COLORS["custodes"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-a",
+            "-F", "#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_bg}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: tmux pane recovery failed: {exc}")
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    candidates: list[str] = []
+    for line in stdout.decode().splitlines():
+        try:
+            pane_id, window_name, current_cmd, pane_bg = line.split("\t", 3)
+        except ValueError:
+            continue
+        cmd_is_claude = (
+            "claude" in current_cmd.lower()
+            or (current_cmd[0:1].isdigit() and "." in current_cmd)
+        )
+        if pane_bg == custodes_bg and cmd_is_claude:
+            candidates.append(pane_id)
+        elif window_name == "legion" and pane_bg == custodes_bg:
+            candidates.append(pane_id)
+
+    return candidates[0] if candidates else None
+
+
+async def _create_custodes_legion_pane() -> str | None:
+    """Create or split the local legion window and return a pane id."""
+    try:
+        exists = await asyncio.create_subprocess_exec(
+            "tmux", "list-windows", "-t", "main", "-F", "#{window_name}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(exists.communicate(), timeout=5)
+        windows = stdout.decode().splitlines() if exists.returncode == 0 else []
+
+        if "legion" in windows:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "split-window", "-t", "main:legion", "-d", "-P", "-F", "#{pane_id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "new-window", "-t", "main", "-n", "legion", "-d", "-P", "-F", "#{pane_id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        pane_stdout, pane_stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            logger.warning(f"Custodes state hook: could not create legion pane: {pane_stderr.decode()[:200]}")
+            return None
+        pane_id = pane_stdout.decode().strip().splitlines()[0]
+
+        await asyncio.create_subprocess_exec(
+            "tmux", "select-layout", "-t", "main:legion", "tiled",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return pane_id
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: legion pane creation failed: {exc}")
+        return None
+
+
+async def _launch_custodes_for_intervention(prompt: str) -> dict:
+    """Launch a new Custodes singleton carrying the missed state-hook prompt."""
+    pane_id = await _create_custodes_legion_pane()
+    if not pane_id:
+        return {"dispatched": False, "reason": "custodes_launch_no_pane"}
+
+    prompt_file = Path(tempfile.gettempdir()) / f"custodes-state-hook-{uuid.uuid4().hex}.md"
+    launch_prompt = (
+        "Custodes state hook fired while no live synced Custodes singleton was registered. "
+        "Register yourself as legion=custodes, instance_type=sync, synced=true, then handle this intervention.\n\n"
+        f"{prompt}"
+    )
+    prompt_file.write_text(launch_prompt)
+    launch_cmd = (
+        f"cd {shlex.quote('/Volumes/Imperium/Imperium-ENV')} && "
+        f"primarch custodes \"$(cat {shlex.quote(str(prompt_file))})\" ; "
+        f"rm -f {shlex.quote(str(prompt_file))}"
+    )
+
+    try:
+        for keys in (["C-c"], ["C-u"], ["clear", "Enter"], [launch_cmd, "Enter"]):
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", pane_id, *keys,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.sleep(0.1)
+    except Exception as exc:
+        logger.warning(f"Custodes state hook: launch failed pane={pane_id}: {exc}")
+        return {"dispatched": False, "reason": f"custodes_launch_failed: {exc}", "tmux_pane": pane_id}
+
+    logger.warning(f"Custodes state hook: launched new Custodes singleton pane={pane_id}")
+    return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": pane_id}
+
+
+async def _dispatch_custodes_intervention(prompt: str) -> dict:
+    """Inject into Custodes, recovering or launching the singleton if needed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = 'custodes'
+                 AND synced = 1
+                 AND status IN ('idle', 'processing')
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane)
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning("Custodes state hook: no live singleton found; launching new Custodes")
+        return await _launch_custodes_for_intervention(prompt)
+
+    instance = dict(row)
+    tmux_pane = instance.get("tmux_pane")
+    if not tmux_pane:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning(f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement")
+        return await _launch_custodes_for_intervention(prompt)
+
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    if device_id != LOCAL_DEVICE_NAME:
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane:
+            logger.warning(f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}")
+            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane, instance_id=instance["id"])
+            if delivery.get("dispatched"):
+                delivery["reason"] = "recovered_tmux_pane"
+            return delivery
+        logger.warning(f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement")
+        return await _launch_custodes_for_intervention(prompt)
+
+    return await _inject_custodes_prompt_to_pane(prompt, tmux_pane, instance_id=instance["id"])
+
+
+async def handle_custodes_state_event(
+    event_type: str,
+    source: str,
+    *,
+    instance_id: str | None = None,
+    severity: int | None = None,
+    payload: dict | None = None,
+) -> dict:
+    """Internal router for state events that may wake Custodes."""
+    event = StateEvent(
+        event_type=event_type,
+        source=source,
+        instance_id=instance_id,
+        severity=severity,
+        payload=payload or {},
+    )
+    dedupe_key = build_dedupe_key(event)
+    normalized_severity = normalize_severity(severity)
+
+    await log_event("custodes_state_event", instance_id=instance_id, device_id=source, details={
+        "event_type": event_type,
+        "source": source,
+        "severity": normalized_severity,
+        "dedupe_key": dedupe_key,
+        "payload": payload or {},
+    })
+
+    intervention = evaluate_state_event(event, _custodes_state_snapshot())
+    if intervention is None:
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": dedupe_key,
+            "reason": "no_policy_match",
+        }
+
+    suppressed, dedupe_reason = await _custodes_state_dedupe_decision(
+        intervention.dedupe_key,
+        intervention.severity,
+    )
+    if suppressed:
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": intervention.dedupe_key,
+            "reason": dedupe_reason,
+        }
+
+    delivery = await _dispatch_custodes_intervention(intervention.prompt)
+    if delivery.get("dispatched"):
+        _custodes_state_debounce[intervention.dedupe_key] = {
+            "at": time.time(),
+            "severity": intervention.severity,
+        }
+
+    await log_event("custodes_intervention", instance_id=delivery.get("instance_id") or instance_id,
+                    device_id=source, details={
+                        "event_type": intervention.event_type,
+                        "dedupe_key": intervention.dedupe_key,
+                        "severity": intervention.severity,
+                        "prompt": intervention.prompt,
+                        "delivery": delivery,
+                    })
+
+    return {
+        "received": True,
+        "intervention_dispatched": bool(delivery.get("dispatched")),
+        "dedupe_key": intervention.dedupe_key,
+        "reason": delivery.get("reason", intervention.reason),
+    }
+
+
+@app.post("/api/custodes/state-event")
+async def custodes_state_event_endpoint(request: CustodesStateEventRequest):
+    """Internal state-hook ingestion point for immediate Custodes interventions."""
+    return await handle_custodes_state_event(
+        request.event_type,
+        request.source,
+        instance_id=request.instance_id,
+        severity=request.severity,
+        payload=request.payload,
+    )
+
+
 @app.post("/api/instances/{instance_id}/nudge")
 async def nudge_instance_endpoint(instance_id: str, request: Request):
     """Immediate followup — MiniMax escalation path.
@@ -3105,7 +2768,8 @@ async def set_zealotry(instance_id: str, request: Request):
 
 # ── Legion / Synced Session Endpoints ─────────────────────────
 
-ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic"}
+ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic", "fabricator"}
+SINGLETON_LEGIONS = {"custodes", "fabricator"}
 
 
 @app.patch("/api/instances/{instance_id}/legion")
@@ -3677,6 +3341,61 @@ async def get_instance(instance_id: str):
         return instance
 
 
+_KNOWN_VAULTS = ("Imperium-ENV", "Pax-ENV", "Civic-ENV")
+
+
+def _derive_vault_and_relative(file_path: str) -> tuple[str, str]:
+    """Split an absolute session-doc path into (vault_name, vault_relative_path).
+
+    file_path may be stored as absolute (/Volumes/Imperium/Imperium-ENV/Terra/…)
+    or as vault-relative (Terra/Sessions/…). Writers vary by machine; readers
+    need a normalized form for the obsidian:// URI and the obsidian CLI.
+    """
+    for vault in _KNOWN_VAULTS:
+        marker = f"/{vault}/"
+        idx = file_path.find(marker)
+        if idx >= 0:
+            return vault, file_path[idx + len(marker):]
+    return "Imperium-ENV", file_path
+
+
+@app.get("/api/panes/{tmux_pane}/session-doc")
+async def pane_session_doc(tmux_pane: str):
+    """Resolve the session doc linked to a tmux pane.
+
+    Returns {vault, file_path (vault-relative), absolute_path, title, doc_id,
+    instance_id}. 404 if no instance for the pane, or no linked session doc.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT ci.id AS instance_id, sd.id AS doc_id, sd.file_path,
+                      sd.title, sd.project
+               FROM claude_instances ci
+               LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+               WHERE ci.tmux_pane = ?
+               ORDER BY ci.last_activity DESC
+               LIMIT 1""",
+            (tmux_pane,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"No instance for pane {tmux_pane}")
+        if not row["doc_id"]:
+            raise HTTPException(404, f"Instance {row['instance_id']} has no session doc")
+
+        vault, rel = _derive_vault_and_relative(row["file_path"])
+        return {
+            "instance_id": row["instance_id"],
+            "doc_id": row["doc_id"],
+            "vault": vault,
+            "file_path": rel,
+            "absolute_path": row["file_path"],
+            "title": row["title"],
+            "project": row["project"],
+        }
+
+
 # Dashboard Endpoint
 @app.get("/api/dashboard", response_model=DashboardResponse)
 async def get_dashboard():
@@ -3739,31 +3458,14 @@ DISTRACTION_PATTERNS = [
 
 # [MOVED to shared.py / routes/tts.py] — was: # Windows satellite server config (token-satellite
 
-# Voice chat state — tracks which instances are in voice conversation mode
-VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
-
-# Global dictation state — tracks whether Wispr Flow is currently active
-# Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
-#             voice-select-other (explicit on/off during voice chat)
-DICTATION_STATE = {"active": False, "updated_at": None}
-
-# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
-PEDAL_STATE = {
-    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
-    "enter_queued": False,          # enter waiting for dictation buffer to expire
-    "queued_task": None,            # asyncio.Task for delayed enter send
-    "bypass_active": False,         # single-tap bypass window after buffered enter
-    "bypass_start": 0.0,           # when bypass window started
-}
-PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
-PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
-PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
+# [MOVED to shared.py] — VOICE_CHAT_SESSIONS, DICTATION_STATE, PEDAL_STATE, pedal constants
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
 VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym", "meeting"]
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
+shared.timer_engine = timer_engine
 
 
 def reset_idle_timer():
@@ -4050,72 +3752,6 @@ async def append_daily_note(request: DailyNoteAppendRequest):
     return {"ok": True, "date": today, "appended_chars": len(block)}
 
 
-# Phone HTTP server config (MacroDroid on phone via Tailscale)
-PHONE_CONFIG = {
-    "host": "100.102.92.24",
-    "port": 7777,
-    "timeout": 5,
-    # === TEST SHIM - REMOVE AFTER TESTING ===
-    # Set to True to bypass break time check and force blocking
-    "test_force_block": False,
-    # =========================================
-}
-
-# Last widget state pushed to phone (dedup)
-_last_widget_push = {"mode": None, "active": None}
-
-
-def push_phone_widget(mode: str, active_count: int):
-    """Push timer mode + active instance count to phone MacroDroid widget endpoint.
-
-    Only pushes if the state actually changed (deduped via _last_widget_push).
-    Runs synchronously via requests (fire-and-forget from async via create_task + to_thread).
-    """
-    if _last_widget_push["mode"] == mode and _last_widget_push["active"] == active_count:
-        return  # no change
-
-    host = PHONE_CONFIG["host"]
-    port = PHONE_CONFIG["port"]
-    timeout = PHONE_CONFIG["timeout"]
-    url = f"http://{host}:{port}/widget-update?mode={mode}&instances={active_count}"
-
-    try:
-        response = requests.get(url, timeout=timeout)
-        _last_widget_push["mode"] = mode
-        _last_widget_push["active"] = active_count
-        print(f"WIDGET: Pushed mode={mode} instances={active_count} -> {response.status_code}")
-    except Exception as e:
-        print(f"WIDGET: Push failed: {e}")
-
-
-async def push_phone_widget_async(mode: str, active_count: int):
-    """Async wrapper for push_phone_widget."""
-    await asyncio.to_thread(push_phone_widget, mode, active_count)
-
-
-# Phone activity state (tracks current app from MacroDroid)
-PHONE_STATE = {
-    "current_app": None,  # Current distraction app or None
-    "last_activity": None,
-    "is_distracted": False,
-    "reachable": None,  # Last known reachability status
-    "last_reachable_check": None,
-    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
-    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
-    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
-    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
-}
-
-# Phone heartbeat state (absence-of-signal detection)
-PHONE_HEARTBEAT = {
-    "last_seen": None,      # datetime (UTC) or None
-    "device_id": None,
-    "alert_state": None,    # None, "beep", "zap"
-}
-
-TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
-TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
-
 # ============ Enforcement Cascade v3 ============
 # Server-driven escalation. Phone executes v3 param-based endpoints.
 # Fallback chain: phone /enforce|/notify → server-side Pavlok API → Discord webhook.
@@ -4151,31 +3787,7 @@ ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
 DISCORD_FALLBACK_TIMEOUT = 30      # 30s to wait for app_close via Discord
 
 
-def _persist_twitter_zap_cooldown():
-    """Write twitter zap wall-clock time to file so it survives restarts."""
-    try:
-        TWITTER_ZAP_COOLDOWN_FILE.write_text(str(time.time()))
-    except Exception as e:
-        print(f"WARN: Failed to persist twitter zap cooldown: {e}")
-
-
-def _restore_twitter_zap_cooldown():
-    """On startup, restore twitter zap cooldown from file.
-    If a zap happened less than 30 min ago, set twitter_zapped=True to block phantom opens."""
-    try:
-        if TWITTER_ZAP_COOLDOWN_FILE.exists():
-            last_zap_wall = float(TWITTER_ZAP_COOLDOWN_FILE.read_text().strip())
-            elapsed = time.time() - last_zap_wall
-            if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
-                PHONE_STATE["twitter_zapped"] = True
-                PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
-                print(f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked.")
-            else:
-                print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
-                TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
-    except Exception as e:
-        print(f"WARN: Failed to restore twitter zap cooldown: {e}")
-
+# [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
 
 # Shizuku restart state
 SHIZUKU_STATE = {
@@ -4357,136 +3969,11 @@ def parse_macrodroid_trigger_app(raw: str) -> str:
     return parsed.get("app", parsed.get("raw", ""))
 
 
-# ============ Pavlok Shock Watch ============
-PAVLOK_CONFIG = {
-    "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
-    "token": os.getenv("PAVLOK_API_TOKEN"),
-    "enabled": True,
-    "cooldown_seconds": 30,
-    "default_zap_value": 50,
-}
-
-PAVLOK_STATE = {
-    "last_stimulus_at": None,
-}
-
-
-def send_pavlok_stimulus(
-    stimulus_type: str = "zap",
-    value: int | None = None,
-    reason: str = "manual",
-    respect_cooldown: bool = True,
-) -> dict:
-    """Send a stimulus (zap/beep/vibe) to the Pavlok watch."""
-    if not PAVLOK_CONFIG["token"]:
-        return {"skipped": True, "reason": "no_token", "hint": "Set PAVLOK_API_TOKEN in .env"}
-    if not PAVLOK_CONFIG["enabled"]:
-        return {"skipped": True, "reason": "disabled"}
-
-    now = datetime.now()
-    if respect_cooldown and PAVLOK_STATE["last_stimulus_at"]:
-        last = datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
-        elapsed = (now - last).total_seconds()
-        if elapsed < PAVLOK_CONFIG["cooldown_seconds"]:
-            return {"skipped": True, "reason": "cooldown", "remaining": round(PAVLOK_CONFIG["cooldown_seconds"] - elapsed)}
-
-    if value is None:
-        value = PAVLOK_CONFIG["default_zap_value"]
-
-    try:
-        response = requests.post(
-            PAVLOK_CONFIG["api_url"],
-            headers={"Authorization": PAVLOK_CONFIG["token"]},
-            json={"stimulus": {"stimulusType": stimulus_type, "stimulusValue": value}},
-            timeout=10,
-        )
-        PAVLOK_STATE["last_stimulus_at"] = now.isoformat()
-        print(f"PAVLOK: {stimulus_type} value={value} reason={reason} -> {response.status_code}")
-        return {
-            "success": response.status_code == 200,
-            "type": stimulus_type,
-            "value": value,
-            "reason": reason,
-            "status_code": response.status_code,
-        }
-    except requests.exceptions.Timeout:
-        print(f"PAVLOK: Timeout sending {stimulus_type}")
-        return {"success": False, "error": "timeout", "reason": reason}
-    except requests.exceptions.ConnectionError:
-        print(f"PAVLOK: Connection error sending {stimulus_type}")
-        return {"success": False, "error": "connection_error", "reason": reason}
-    except Exception as e:
-        print(f"PAVLOK: Error sending {stimulus_type}: {e}")
-        return {"success": False, "error": str(e), "reason": reason}
-
-
-async def check_instance_count_pavlok(remaining_active: int, was_active: int):
-    """Send Pavlok signals when Claude instance count drops critically.
-
-    - Drops to 1 (from 2+): double vibe as warning
-    - Drops to 0: zap as penalty
-    Skips if was_active was already at or below threshold (no regression).
-    Phone-first, server-side Pavlok API fallback.
-    """
-    if remaining_active == 1 and was_active >= 2:
-        print(f"INSTANCE COUNT: Dropped to 1 (from {was_active}), double vibe")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 50, "banner_text": f"1 Claude remaining (was {was_active})",
-        })
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
-        await asyncio.sleep(3)
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {"vibe": 50})
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
-        await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
-    elif remaining_active == 0 and was_active >= 1:
-        print(f"INSTANCE COUNT: All Claude instances stopped, zap")
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {
-            "vibe": 80, "beep": 50, "tts_text": "All Claude instances stopped",
-            "banner_text": "All Claudes stopped",
-        })
-        if not result["success"]:
-            send_pavlok_stimulus(stimulus_type="zap", value=50, reason="all_claudes_stopped", respect_cooldown=False)
-        await log_event("instance_count_zero", details={"was": was_active})
-
-
 # ============ Timer I/O Functions ============
 
 
-def _sync_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
-                    phone_app: str | None = None, details: str | None = None):
-    """Log a timer mode shift to the analytics table (sync, for thread offload)."""
-    import sqlite3
-    from datetime import datetime as _dt
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    # Get active non-subagent instance count
-    cursor = conn.execute(
-        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
-    )
-    active_instances = cursor.fetchone()[0]
-
-    conn.execute(
-        """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
-           break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
-         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
-         timer_engine.total_work_time_ms, active_instances, phone_app, details)
-    )
-    conn.commit()
-    conn.close()
-
-
-async def timer_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
-                          phone_app: str | None = None, details: str | None = None):
-    """Log a timer mode shift to the analytics table (async wrapper)."""
-    try:
-        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
-    except Exception as e:
-        print(f"TIMER: Failed to log shift: {e}")
+# [MOVED to shared.py] — _sync_log_shift, timer_log_shift
+from shared import _sync_log_shift, timer_log_shift
 
 
 def _sync_generate_daily_analytics(date_str: str):
@@ -4903,80 +4390,8 @@ def check_audio_receiver_running() -> dict:
     return {"running": False, "pid": None}
 
 
-def close_distraction_windows() -> dict:
-    """
-    Close distraction windows on Windows via token-satellite.
-
-    Mode-aware enforcement:
-    - video mode → close brave (YouTube in browser)
-    - gaming mode → close minecraft
-    """
-    current_mode = DESKTOP_STATE.get("current_mode", "silence")
-
-    # Map modes to apps to close
-    mode_targets = {
-        "video": ["brave"],
-        "gaming": ["minecraft"],
-    }
-
-    targets = mode_targets.get(current_mode, [])
-    if not targets:
-        logger.info(f"ENFORCE: No targets for mode '{current_mode}'")
-        return {"success": True, "closed_count": 0, "mode": current_mode}
-
-    results = []
-    for app in targets:
-        result = enforce_desktop_app(app, "close")
-        results.append(result)
-
-    closed = sum(1 for r in results if r.get("success"))
-    logger.info(f"ENFORCE: Closed {closed}/{len(targets)} targets for mode '{current_mode}'")
-    return {"success": closed > 0 or not targets, "closed_count": closed, "results": results}
-
-
-def enforce_desktop_app(app_name: str, action: str = "close") -> dict:
-    """Send enforcement command to Windows via token-satellite."""
-    host = DESKTOP_CONFIG["host"]
-    port = DESKTOP_CONFIG["port"]
-    timeout = DESKTOP_CONFIG["timeout"]
-
-    url = f"http://{host}:{port}/enforce"
-
-    try:
-        response = requests.post(
-            url,
-            json={"app": app_name, "action": action},
-            timeout=timeout,
-        )
-        logger.info(f"DESKTOP: Enforce {action} {app_name} -> {response.status_code}")
-        return {
-            "success": response.status_code == 200,
-            "app": app_name,
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code == 200 else response.text,
-        }
-    except Exception as e:
-        logger.error(f"DESKTOP: Error enforcing {action} {app_name}: {e}")
-        DESKTOP_STATE["ahk_reachable"] = False
-        return {"success": False, "app": app_name, "error": str(e)}
-
-
-def check_desktop_reachable() -> dict:
-    """Check if Windows satellite server is reachable."""
-    host = DESKTOP_CONFIG["host"]
-    port = DESKTOP_CONFIG["port"]
-    timeout = DESKTOP_CONFIG["timeout"]
-
-    url = f"http://{host}:{port}/health"
-
-    try:
-        response = requests.get(url, timeout=timeout)
-        DESKTOP_STATE["ahk_reachable"] = True
-        DESKTOP_STATE["ahk_last_heartbeat"] = datetime.now().isoformat()
-        return {"reachable": True, "status_code": response.status_code}
-    except Exception:
-        DESKTOP_STATE["ahk_reachable"] = False
-        return {"reachable": False}
+# [MOVED to enforcement_service.py] — close_distraction_windows, enforce_desktop_app, check_desktop_reachable
+from enforcement_service import close_distraction_windows, enforce_desktop_app, check_desktop_reachable
 
 
 def trigger_obsidian_command_async(command_id: str, no_focus: bool = False):
@@ -5065,44 +4480,15 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
         logger.error(f"PHONE: Shizuku retry failed for {action} {app_name}: {e}")
 
 
-# ============ Phone v3 Endpoints ============
-
-def _send_to_phone(endpoint: str, params: dict) -> dict:
-    """Send v3 params to phone's MacroDroid HTTP endpoint.
-
-    Args:
-        endpoint: "/notify", "/enforce", or "/zap"
-        params: v3 query params (vibe, beep, zap, tts_text, banner_text, etc.)
-
-    Returns dict with success status. On failure, caller should fall back to
-    server-side Pavlok API or Discord webhook.
-    """
-    host = PHONE_CONFIG["host"]
-    port = PHONE_CONFIG["port"]
-    timeout = PHONE_CONFIG["timeout"]
-    url = f"http://{host}:{port}{endpoint}"
-
-    try:
-        response = requests.get(url, params=params, timeout=timeout)
-        PHONE_STATE["reachable"] = True
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE v3: {endpoint} params={params} -> {response.status_code}")
-        return {"success": response.status_code == 200, "status_code": response.status_code}
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-        PHONE_STATE["reachable"] = False
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        print(f"PHONE v3: {endpoint} UNREACHABLE: {e}")
-        return {"success": False, "error": type(e).__name__}
-    except Exception as e:
-        PHONE_STATE["reachable"] = False
-        print(f"PHONE v3: {endpoint} ERROR: {e}")
-        return {"success": False, "error": str(e)}
-
-
+# [MOVED to phone_service.py] — _send_to_phone
 
 # Wire TTS route dependencies
 from routes.tts import init_deps as tts_init_deps
 tts_init_deps(send_to_phone=_send_to_phone)
+
+# Wire voice route dependencies
+from routes.voice import init_deps as voice_init_deps
+voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
 
 def _send_enforce_to_phone(app_name: str, level: int) -> dict:
     """Send enforcement level to phone using v3 params.
@@ -5161,6 +4547,12 @@ async def _enforcement_cascade_worker(app_name: str):
 
     print(f"CASCADE START: app={app_name}")
     await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
+    await handle_custodes_state_event(
+        "enforcement_cascade_started",
+        "phone",
+        severity=2,
+        payload={"app": app_name},
+    )
 
     # Level 0: Discord fallback (soft close)
     await _send_discord_fallback(app_name, 1)
@@ -5555,6 +4947,17 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "enforcement": enforce_result
             }
         )
+        asyncio.create_task(handle_custodes_state_event(
+            "desktop_mode_blocked",
+            "desktop",
+            severity=2,
+            payload={
+                "desktop_mode": detected_mode,
+                "reason": reason,
+                "window_title": window_title,
+                "active_instances": active_count,
+            },
+        ))
 
         raise HTTPException(
             status_code=403,
@@ -5914,6 +5317,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "enforcement": "cascade_started"
             }
         )
+        asyncio.create_task(handle_custodes_state_event(
+            "phone_distraction_blocked",
+            "phone",
+            severity=2,
+            payload={
+                "app": app_name,
+                "phone_app": app_name,
+                "display_name": display_name,
+                "reason": "no_break_no_productivity",
+            },
+        ))
 
         return PhoneActivityResponse(
             allowed=False,
@@ -6092,6 +5506,12 @@ async def handle_break_exhausted():
     """
     result = await enforce_break_exhausted_impl()
     await log_event("break_exhausted_enforcement", details=result)
+    await handle_custodes_state_event(
+        "break_exhausted",
+        "api",
+        severity=2,
+        payload={"break_balance_ms": timer_engine.break_balance_ms, "result": result},
+    )
 
     if not result.get("enforced"):
         return {"enforced": False, "reason": "no_active_distractions"}
@@ -7748,6 +7168,11 @@ async def timer_worker():
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
                     await timer_log_shift("idle", "break", trigger="idle_timeout", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "idle_timeout",
+                        "timer_worker",
+                        payload={"timer_mode": "break"},
+                    ))
                     _current_session_id = await timer_start_session("break", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
@@ -7760,6 +7185,12 @@ async def timer_worker():
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
                     await timer_log_shift("multitasking", "distracted", trigger="distraction_timeout", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "distraction_timeout",
+                        "timer_worker",
+                        severity=2,
+                        payload={"timer_mode": "distracted"},
+                    ))
                     _current_session_id = await timer_start_session("distracted", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
@@ -7778,6 +7209,12 @@ async def timer_worker():
                 elif event == TimerEvent.BREAK_EXHAUSTED:
                     await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
                                          trigger="enforcement", source="timer_worker")
+                    asyncio.create_task(handle_custodes_state_event(
+                        "break_exhausted",
+                        "timer_worker",
+                        severity=2,
+                        payload={"break_balance_ms": timer_engine.break_balance_ms},
+                    ))
                     asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
                     print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
@@ -8384,7 +7821,23 @@ def _register_morning_expected_response(session_type: str = "morning_session") -
             name=f"Morning Enforce L{level}",
             misfire_grace_time=120,
         )
-    logger.info(f"Morning enforce registered: {session_type}, escalations scheduled at +5/+10/+15 min")
+
+    # Schedule instance health check at +90s — detects 401, crash, dead pane
+    health_fire_at = base + timedelta(seconds=90)
+    health_job_id = "morning-health-check"
+    try:
+        scheduler.remove_job(health_job_id)
+    except Exception:
+        pass
+    scheduler.add_job(
+        _morning_health_check,
+        DateTrigger(run_date=health_fire_at),
+        id=health_job_id,
+        replace_existing=True,
+        name="Morning Health Check",
+        misfire_grace_time=120,
+    )
+    logger.info(f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s")
 
 
 @app.post("/api/morning/enforce-register")
@@ -8396,17 +7849,127 @@ async def register_morning_enforce():
     """
     _register_morning_expected_response("morning_session")
     await log_event("morning_enforce_registered", device_id="cron")
-    return {"status": "registered", "escalations": ["+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
+    return {"status": "registered", "escalations": ["+90s health-check", "+5min phone+TTS", "+10min phone+beep+Discord", "+15min zap+blocked+Discord"]}
 
 
 
 def _cancel_morning_escalations() -> None:
-    """Cancel all pending escalation jobs (called on acknowledge/override)."""
-    for level in [1, 2, 3]:
+    """Cancel all pending escalation jobs and health check (called on acknowledge/override)."""
+    for job_id in ["morning-enforce-l1", "morning-enforce-l2", "morning-enforce-l3", "morning-health-check"]:
         try:
-            scheduler.remove_job(f"morning-enforce-l{level}")
+            scheduler.remove_job(job_id)
         except Exception:
             pass
+
+
+def _morning_health_check() -> None:
+    """APScheduler callback at +90s: verify the morning Claude instance is alive.
+
+    Checks if the instance acknowledged (meaning it booted, authenticated, and
+    ran its first tool). If not, captures the tmux pane to detect 401/crash,
+    sends TTS alert, and dispatches a self-heal investigation agent.
+    """
+    state = MORNING_ENFORCE_STATE
+    if state["status"] not in ("pending",):
+        logger.info(f"Morning health check: status={state['status']}, no action needed")
+        return
+
+    # Check if acknowledged_at was set by Emperor-origin Discord/API acknowledgement.
+    if state.get("acknowledged_at"):
+        logger.info("Morning health check: already acknowledged, healthy")
+        return
+
+    # Not acknowledged after 90s — check the pane for signs of life
+    logger.warning("Morning health check: no acknowledgement after 90s, inspecting pane")
+
+    pane_id = None
+    error_signature = None
+    pane_output = ""
+
+    # Read pane_id from state file
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        state_file = Path("/tmp/custodes_morning_sessions") / f"morning_{today}.json"
+        if state_file.exists():
+            state_data = json.loads(state_file.read_text())
+            pane_id = state_data.get("pane_id")
+    except Exception as e:
+        logger.warning(f"Morning health check: could not read state file: {e}")
+
+    # Capture pane output to detect failure signatures
+    if pane_id:
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", pane_id, "-p"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pane_output = result.stdout
+        except Exception as e:
+            logger.warning(f"Morning health check: pane capture failed: {e}")
+            pane_output = f"[pane capture error: {e}]"
+
+    # Detect known failure signatures
+    failure_signatures = ["401", "/login", "authentication_error", "Invalid authentication", "ECONNREFUSED"]
+    for sig in failure_signatures:
+        if sig.lower() in pane_output.lower():
+            error_signature = sig
+            break
+
+    if not error_signature and pane_output.strip():
+        # Pane has output but no error signature — might just be slow, give benefit of doubt
+        # Check if there's any sign of Claude running (prompt indicators)
+        if any(indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]):
+            logger.info("Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain")
+            return
+
+    # ── Failure confirmed — alert and self-heal ──
+    failure_reason = error_signature or "no response and no Claude activity detected"
+    logger.error(f"Morning health check FAILED: {failure_reason}")
+
+    # 1. TTS alert
+    speak_checkin_tts("Morning session launch failed. Dispatching investigation.")
+
+    # 2. Log event
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                log_event("morning_health_check_failed", details={
+                    "reason": failure_reason,
+                    "pane_id": pane_id,
+                    "pane_snippet": pane_output[-500:] if pane_output else None,
+                }),
+                loop,
+            ).result(timeout=5)
+    except Exception as e:
+        logger.warning(f"Morning health check: event log failed: {e}")
+
+    # 3. Dispatch self-heal investigation agent
+    try:
+        diag_prompt = (
+            f"Morning session health check failed at +90s. Failure reason: {failure_reason}. "
+            f"Pane {pane_id or 'unknown'} output snippet: {pane_output[-300:] if pane_output else 'empty'}. "
+            "Investigate the root cause (auth expiry, CLI crash, network issue, etc.), "
+            "attempt to fix it if possible (e.g. kill dead pane, re-auth), "
+            "and report findings to Discord #briefing channel. "
+            "If the fix requires user interaction (like /login), send TTS instructions."
+        )
+        subprocess.Popen(
+            [
+                "claude", "--print", "--output-format", "text",
+                "--model", "sonnet",
+                "--allowedTools", "Bash,Read,Grep,Glob,Write",
+                "-p", diag_prompt,
+            ],
+            cwd="/Volumes/Imperium/Imperium-ENV",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        logger.info("Morning health check: self-heal agent dispatched")
+    except Exception as e:
+        logger.error(f"Morning health check: self-heal dispatch failed: {e}")
+        # Last resort: just TTS what went wrong
+        speak_checkin_tts(f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent.")
 
 
 def _morning_escalate(level: int) -> None:
@@ -9016,6 +8579,15 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
 _discord_seen_ids: set = set()
 _DISCORD_DEDUP_MAX = 200
 
+# Aspirant thread gating — prevents bot message spam without Emperor engagement.
+# Key = thread_id, Value = number of allowed posts before gate closes.
+# 0 = gated (no bot posts allowed). >0 = that many posts allowed.
+# New threads start at 2 (implantation + trials initial posts; gene-seed goes direct).
+# Emperor reply sets to 1 (one response per Emperor message).
+_aspirant_thread_gates: dict[str, int] = {}
+# Queued messages for gated threads — posted when gate opens.
+_aspirant_gated_queue: dict[str, list[tuple[str, str]]] = {}  # thread_id -> [(message, bot)]
+
 
 @app.post("/api/discord/message")
 async def receive_discord_message(request: DiscordMessageRequest):
@@ -9078,6 +8650,20 @@ async def receive_discord_message(request: DiscordMessageRequest):
         return {"received": True, "message_id": request.message_id}
 
     content = request.content or ""
+
+    # --- Aspirant thread gating: Emperor replied → open gate + flush queued messages ---
+    # Thread messages arrive with channel_id = thread snowflake ID
+    if request.channel_id in _aspirant_thread_gates:
+        _aspirant_thread_gates[request.channel_id] = 1  # Allow one bot response
+        logger.info(f"Aspirant gate opened for thread {request.channel_id} (Emperor replied)")
+        # Flush one queued message (gate will close again after posting)
+        queued = _aspirant_gated_queue.get(request.channel_id, [])
+        if queued:
+            msg, bot = queued.pop(0)
+            if not queued:
+                _aspirant_gated_queue.pop(request.channel_id, None)
+            asyncio.create_task(_post_to_aspirant_thread(request.channel_id, msg, bot=bot))
+            logger.info(f"Flushed 1 gated message for thread {request.channel_id} ({len(queued)} remaining)")
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
@@ -9486,6 +9072,10 @@ async def inbox_create(request: InboxCreateRequest):
             if resp.status_code == 200:
                 thread_data = resp.json()
                 thread_id = thread_data.get("thread_id")
+                # Register thread in gating registry — initial pipeline gets a free pass
+                # Allow 2 posts: implantation summary + trials initiation
+                # (gene-seed post goes direct, not through _post_to_aspirant_thread)
+                _aspirant_thread_gates[thread_id] = 2
                 logger.info(f"Inbox: created aspirant thread '{safe_title}' -> {thread_id}")
 
                 # Store thread_id in note frontmatter
@@ -9548,8 +9138,19 @@ async def _read_note_property(note_path: str, prop: str) -> str | None:
         return None
 
 
-async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes") -> None:
-    """Post a message to an aspirant's thread in #aspirants."""
+async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "custodes", bypass_gate: bool = False) -> None:
+    """Post a message to an aspirant's thread in #aspirants.
+
+    Respects thread gating: if gate is closed, queues the message instead.
+    Gate closes after each successful post (prevents consecutive bot messages).
+    Use bypass_gate=True for initial pipeline messages (gene-seed notification).
+    """
+    allowed = _aspirant_thread_gates.get(thread_id, 0)
+    if not bypass_gate and allowed <= 0:
+        # Gate closed — queue the message
+        _aspirant_gated_queue.setdefault(thread_id, []).append((message, bot))
+        logger.info(f"Aspirant thread {thread_id} gated — queued message ({len(_aspirant_gated_queue[thread_id])} pending)")
+        return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(f"{DISCORD_DAEMON_URL}/send", json={
@@ -9558,6 +9159,9 @@ async def _post_to_aspirant_thread(thread_id: str, message: str, bot: str = "cus
                 "content": message[:2000],
                 "bot": bot,
             })
+        # Decrement allowance (0 = gated until Emperor replies)
+        if not bypass_gate:
+            _aspirant_thread_gates[thread_id] = max(0, allowed - 1)
     except Exception as e:
         logger.warning(f"Failed to post to aspirant thread {thread_id}: {e}")
 
@@ -9622,10 +9226,35 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         sections = []
 
-        # --- Phase 1a: Similar note search (vault) ---
+        # --- Phase 0: Read gene-seed content from the aspirant note ---
+        gene_seed_content = ""
+        try:
+            note_file = OBSIDIAN_VAULT_PATH / note_path
+            if note_file.exists():
+                raw = note_file.read_text(encoding="utf-8")
+                # Extract gene-seed from the callout block
+                in_geneseed = False
+                gs_lines = []
+                for line in raw.splitlines():
+                    if "> [!dna]" in line:
+                        in_geneseed = True
+                        continue
+                    if in_geneseed:
+                        if line.startswith("> "):
+                            gs_lines.append(line[2:])
+                        elif line.strip() == ">":
+                            gs_lines.append("")
+                        else:
+                            break
+                gene_seed_content = "\n".join(gs_lines).strip()
+        except Exception as e:
+            logger.warning(f"Implantation: could not read gene-seed from '{title}': {e}")
+
+        # --- Phase 1a: Similar note search (vault) — enriched with full note reads ---
         vault_synthesis = None
         raw_vault_lines = []
         vault_context_str = ""
+        vault_context_full = ""  # enriched: full content of top matching notes
         try:
             proc = await asyncio.create_subprocess_exec(
                 OBSIDIAN_CLI, "vault=Imperium-ENV", "search:context", f'query={title}',
@@ -9644,6 +9273,42 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
                 if raw_vault_lines:
                     vault_context_str = "\n".join(raw_vault_lines[:50])  # cap context size
+
+                    # Enrichment: read full content of top matching notes
+                    matched_paths = []
+                    seen_paths = set()
+                    for line in raw_vault_lines:
+                        fpath = line.split(":")[0] if ":" in line else line.strip()
+                        if fpath and fpath not in seen_paths and fpath.endswith(".md"):
+                            seen_paths.add(fpath)
+                            matched_paths.append(fpath)
+                    matched_paths = matched_paths[:5]  # top 5 matches
+
+                    full_note_contents = []
+                    total_chars = 0
+                    MAX_VAULT_CONTEXT = 6000  # char budget for full note reads
+                    for mpath in matched_paths:
+                        if total_chars >= MAX_VAULT_CONTEXT:
+                            break
+                        try:
+                            mfile = OBSIDIAN_VAULT_PATH / mpath
+                            if mfile.exists():
+                                mcontent = mfile.read_text(encoding="utf-8")
+                                # Strip frontmatter for context
+                                if mcontent.startswith("---"):
+                                    end_fm = mcontent.find("---", 3)
+                                    if end_fm != -1:
+                                        mcontent = mcontent[end_fm + 3:].strip()
+                                # Cap per-note at 1500 chars
+                                mcontent = mcontent[:1500]
+                                full_note_contents.append(f"### [[{mpath}]]\n{mcontent}")
+                                total_chars += len(mcontent)
+                        except Exception:
+                            pass
+
+                    if full_note_contents:
+                        vault_context_full = "\n\n---\n\n".join(full_note_contents)
+
                     vault_synthesis = await minimax_chat(
                         system_prompt=IMPLANTATION_ROLES["vault_relevance"]["system"],
                         user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context_str}",
@@ -9679,9 +9344,13 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         # Step 1: Generate diverse search queries via MiniMax
         search_queries = []
         try:
-            # Build query generator input with vault context + Emperor feedback if available
+            # Build query generator input with gene-seed + vault context + Emperor feedback
             query_input = f"Note title: {title}\nNote type: {note_type}"
-            if vault_context_str:
+            if gene_seed_content:
+                query_input += f"\n\nGene-seed (the Emperor's original note content):\n{gene_seed_content[:1500]}"
+            if vault_context_full:
+                query_input += f"\n\nExisting vault knowledge (full content of related notes):\n{vault_context_full[:3000]}"
+            elif vault_context_str:
                 query_input += f"\n\nExisting vault context (related notes found in the Obsidian vault):\n{vault_context_str[:1000]}"
             if emperor_feedback:
                 query_input += f"\n\nIMPORTANT — Emperor's feedback from a previous failed cycle (research the RIGHT domain this time):\n{emperor_feedback[:1000]}"
@@ -9724,7 +9393,7 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         )
 
         # Step 3: Fire MiniMax researcher calls in parallel
-        vault_brief = vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic."
+        vault_brief = vault_context_full[:3000] if vault_context_full else (vault_context_str[:2000] if vault_context_str else "No existing vault notes found on this topic.")
 
         async def _research(query: str, web_output: str) -> str:
             """One researcher synthesizes their search results."""
@@ -9786,8 +9455,8 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
                 f"and fail to ground research in our system's context.\n\n"
                 f"The note being researched is titled: \"{title}\"\n"
                 f"Note type: {note_type}\n"
-                f"Original note content: a note about this topic in our Imperium system.\n\n"
-                f"Existing vault knowledge:\n{vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.'}\n\n"
+                f"Gene-seed (Emperor's original note content):\n{gene_seed_content[:1000] if gene_seed_content else '(title only — no body content)'}\n\n"
+                f"Existing vault knowledge:\n{vault_context_full[:4000] if vault_context_full else (vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.')}\n\n"
                 f"Here is the Guard's consolidated research output:\n\n---\n{review_input}\n---\n\n"
                 f"Your task:\n"
                 f"1. REMOVE any fabricated/hallucinated URLs (fake protocols like imperium://, made-up domains). Keep only real, verifiable URLs.\n"
@@ -9828,6 +9497,21 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
         if not sections:
             logger.info(f"Implantation: no enrichment content for '{title}', skipping append")
             return
+
+        # Strip old pipeline artifacts on re-implantation (prevents snowball accumulation)
+        if implant_count > 0:
+            try:
+                note_file = OBSIDIAN_VAULT_PATH / note_path
+                if note_file.exists():
+                    raw = note_file.read_text(encoding="utf-8")
+                    # Find first ## Implantation and truncate everything after it
+                    marker_idx = raw.find("\n## Implantation")
+                    if marker_idx != -1:
+                        cleaned = raw[:marker_idx].rstrip() + "\n\n"
+                        note_file.write_text(cleaned, encoding="utf-8")
+                        logger.info(f"Implantation: stripped old pipeline artifacts from '{title}'")
+            except Exception as e:
+                logger.warning(f"Implantation: failed to strip old artifacts from '{title}': {e}")
 
         implant_content = f"## Implantation\n\n" + "\n\n".join(sections)
 
@@ -9885,14 +9569,14 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
 
         # --- Fire Trials phase ---
         if not skip_trials:
-            asyncio.create_task(run_trials(note_path, title, note_type))
+            asyncio.create_task(run_trials(note_path, title, note_type, vault_context=vault_context_full))
             logger.info(f"Trials dispatched for '{title}'")
 
     except Exception as e:
         logger.error(f"Implantation failed for '{title}': {e}", exc_info=True)
 
 
-async def run_trials(note_path: str, title: str, note_type: str) -> None:
+async def run_trials(note_path: str, title: str, note_type: str, vault_context: str = "") -> None:
     """Stage 3: Trials — Custodes Sonnet challenge of an implanted note."""
     try:
         logger.info(f"Trials: starting for '{title}' ({note_path})")
@@ -9935,6 +9619,7 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
             f"the Inquisition review. If the research failed, note that the idea needs better research — don't conflate "
             f"research failure with idea failure.\n\n"
             f"The note's declared type is: {note_type}\n\n"
+            f"{'## Existing Vault Knowledge' + chr(10) + chr(10) + 'Use this to ground your challenges in how the system actually works:' + chr(10) + chr(10) + vault_context[:4000] + chr(10) + chr(10) if vault_context else ''}"
             f"Here is the full note content:\n\n---\n{note_content}\n---\n\n"
             f"Produce exactly THREE sections in this format (use Obsidian callout syntax):\n\n"
             f"## Trials\n\n"
@@ -10177,18 +9862,10 @@ async def run_trials_verdict(note_path: str, title: str, note_type: str, emperor
             logger.warning(f"Trials verdict: log_event failed for '{title}': {e}")
         logger.info(f"Trials verdict for '{title}': {new_status}")
 
-        # On FAIL, re-dispatch to implantation with Emperor's feedback so next cycle knows what went wrong
+        # On FAIL: do NOT auto-re-implant — wait for Emperor to engage in the thread.
+        # The old behavior created infinite implant → trial → fail → re-implant loops.
         if not is_pass:
-            source = await _read_note_property(note_path, "source") or "re-implant"
-            logger.info(f"Trials failed for '{title}': re-dispatching to implantation with Emperor feedback")
-            asyncio.create_task(run_implantation(
-                note_path=note_path,
-                title=title,
-                note_type=note_type,
-                source=source,
-                skip_trials=False,
-                emperor_feedback=emperor_response,
-            ))
+            logger.info(f"Trials failed for '{title}': awaiting Emperor feedback in thread (no auto-re-implant)")
 
     except Exception as e:
         logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
@@ -10495,7 +10172,18 @@ IMPLANTATION_ROLES = {
         "max_tokens": 512,
     },
     "query_generator": {
-        "system": "You are a research strategist. Given a note title and content, generate 12 diverse web search queries that would help research this topic thoroughly. Include: direct queries, related concepts, opposing viewpoints, practical applications, recent news, and technical deep-dives. Return ONLY the queries, one per line, no numbering or bullets.",
+        "system": (
+            "You are a research strategist for the Imperium of Claude — an agent orchestration system "
+            "built with Claude Code, Obsidian vaults, Discord bots, tmux, and Python/FastAPI. "
+            "Given a note title, its gene-seed content, and existing vault context, generate 12 diverse "
+            "web search queries that would help research this topic thoroughly. "
+            "CRITICAL: Ground your queries in the ACTUAL domain of the note. If the title contains words "
+            "that have multiple meanings (e.g., 'aspirant', 'pipeline', 'vault', 'fleet', 'guard'), use "
+            "the gene-seed content and vault context to determine the correct domain. DO NOT generate "
+            "queries about unrelated domains (industrial pipelines, military aspirants, bank vaults, etc.). "
+            "Include: direct queries, related technical concepts, implementation patterns, recent developments, "
+            "and deep-dives. Return ONLY the queries, one per line, no numbering or bullets."
+        ),
         "max_tokens": 512,
     },
     "consolidator": {
@@ -11096,75 +10784,7 @@ async def get_all_primarchs_from_db(db) -> list:
     return result
 
 
-def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None) -> None:
-    """Create the markdown file for a session document."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
-    project_line = f"\nproject: {project}" if project else ""
-    primarch_line = f"\nprimarch: {primarch_name}" if primarch_name else ""
-    content = f"""---
-session_doc_id: {doc_id}
-created: {today}{project_line}
-agents: []
-instance_ids: []{primarch_line}
-status: active
-type: session
-start_time: null
-end_time: null
-duration_minutes: null
-pool: null
-legion: null
-faction: null
-victory_conditions: []
-victory: pending
-victory_reason: null
-deliverables: []
-instance_type: one_off
-zealotry: 4
----
-
-# Session: {title}
-
-## Plan
-
-_No plan defined yet._
-
-## Activity Log
-
-"""
-    file_path.write_text(content)
-
-
-async def _update_doc_agents_list(db, doc_id: int) -> None:
-    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
-    cursor = await db.execute(
-        "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
-        (doc_id,)
-    )
-    rows = await cursor.fetchall()
-    agents = [r[1] for r in rows if r[1]]
-    instance_ids = [r[0] for r in rows if r[0]]
-
-    cursor = await db.execute("SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
-    doc_row = await cursor.fetchone()
-    if not doc_row:
-        return
-
-    fp = Path(doc_row[0])
-    if not fp.exists():
-        return
-
-    primarch_name = doc_row[1]
-
-    updates = {
-        "agents": agents,
-        "instance_ids": instance_ids,
-    }
-    if primarch_name:
-        updates["primarch"] = primarch_name
-    delete_keys = ["primarch"] if not primarch_name else None
-
-    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
+# [MOVED to session_doc_helpers.py] — create_session_doc_file, _update_doc_agents_list
 
 
 async def _handle_orphan_doc(doc_id: int) -> None:
@@ -11545,7 +11165,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
 
         # Assign
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_assigned' WHERE id = ?",
             (doc_id, instance_id)
         )
         await db.commit()
@@ -11594,7 +11214,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
 
         # Assign to instance
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = ?, session_doc_policy = 'manual_created' WHERE id = ?",
             (doc_id, instance_id)
         )
         await db.commit()
@@ -11627,7 +11247,7 @@ async def unassign_doc_from_instance(instance_id: str):
             return {"instance_id": instance_id, "unassigned": False, "reason": "No doc was assigned"}
 
         await db.execute(
-            "UPDATE claude_instances SET session_doc_id = NULL WHERE id = ?",
+            "UPDATE claude_instances SET session_doc_id = NULL, session_doc_policy = NULL WHERE id = ?",
             (instance_id,)
         )
         await db.commit()
@@ -12170,6 +11790,16 @@ async def get_state():
             "pending_window": sorted(pending_windows),
         },
     }
+
+
+# Wire hook-route dependencies after hook-owned callbacks are defined.
+hooks_init_deps(
+    scheduler=scheduler,
+    timer_engine=shared.timer_engine,
+    timer_log_shift=shared.timer_log_shift,
+    run_stop_evaluators=_run_stop_evaluators,
+    auto_name_instance=_auto_name_instance,
+)
 
 
 if __name__ == "__main__":

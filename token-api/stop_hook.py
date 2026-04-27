@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import glob
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -645,6 +646,55 @@ def _parse_jsonl_string(content):
 
 
 # ---------------------------------------------------------------------------
+# TTS queue notification on stop
+# ---------------------------------------------------------------------------
+
+def _notify_tts_queue(session_id, tab_name):
+    """Check if stopping instance has queued TTS items; send AHK notification if so.
+
+    Runs in a background thread so it doesn't slow down the stop hook.
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{TOKEN_API_URL}/api/notify/queue/status")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+
+        # Count queued items for this instance
+        count = sum(
+            1 for item in data.get("queue", [])
+            if item.get("instance_id") == session_id
+        )
+        # Also count if currently playing item belongs to this instance
+        current = data.get("current")
+        if current and current.get("instance_id") == session_id:
+            count += 1
+
+        if count == 0:
+            return
+
+        msg = f"{tab_name} has {count} TTS item{'s' if count != 1 else ''} queued"
+        print(f"[info] TTS queue alert: {msg}", file=sys.stderr)
+
+        # Fire AHK notification to WSL satellite
+        satellite_url = SATELLITE_URLS.get("TokenPC")
+        if not satellite_url:
+            return
+
+        payload = json.dumps({"script": "notify.ahk", "args": ["TTS Queue", msg]}).encode()
+        notify_req = urllib.request.Request(
+            f"{satellite_url}/ahk/execute",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(notify_req, timeout=5)
+        print(f"[ok] AHK notification sent to satellite", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[warn] TTS queue notification failed (non-fatal): {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -700,10 +750,15 @@ def main():
     print(f"[info] Transcript ~{tokens_est} tokens ({len(transcript)} chars)", file=sys.stderr)
 
     # Mutex: cron instances must be explicitly marked stopped
-    if instance and str(instance.get("spawner", "")).startswith("cron:"):
+    if instance and instance.get("origin_type") == "cron":
         mark_cron_instance_stopped(session_id)
 
     tab_name = instance.get("tab_name", session_id[:8]) if instance else session_id[:8]
+
+    # Fire-and-forget: check TTS queue and notify satellite if items remain
+    threading.Thread(
+        target=_notify_tts_queue, args=(session_id, tab_name), daemon=True
+    ).start()
 
     # Skip trivial sessions (< 3 events = no real work)
     if len(events) < 3:

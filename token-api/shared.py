@@ -127,6 +127,84 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+# Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
+PHONE_TTS_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 2,
+    "reachable": None,          # True/False/None (unknown)
+    "last_health_check": 0,
+    "health_check_ttl": 30,     # Re-probe phone every 30s
+}
+
+
+def is_phone_reachable() -> bool:
+    """Check if the phone's MacroDroid HTTP server is reachable. Cached with 30s TTL."""
+    import requests
+
+    now = time.time()
+    if (PHONE_TTS_CONFIG["reachable"] is not None
+            and now - PHONE_TTS_CONFIG["last_health_check"] < PHONE_TTS_CONFIG["health_check_ttl"]):
+        return PHONE_TTS_CONFIG["reachable"]
+
+    host = PHONE_TTS_CONFIG["host"]
+    port = PHONE_TTS_CONFIG["port"]
+    try:
+        resp = requests.get(f"http://{host}:{port}/notify", params={"ping": "1"}, timeout=2)
+        available = resp.status_code == 200
+    except Exception:
+        available = False
+
+    PHONE_TTS_CONFIG["reachable"] = available
+    PHONE_TTS_CONFIG["last_health_check"] = now
+    if available:
+        logger.info("TTS: Phone reachable for TTS routing")
+    return available
+
+
+# ============ Phone / Pavlok State ============
+
+PHONE_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 5,
+    # === TEST SHIM - REMOVE AFTER TESTING ===
+    # Set to True to bypass break time check and force blocking
+    "test_force_block": False,
+    # =========================================
+}
+
+PHONE_STATE = {
+    "current_app": None,  # Current distraction app or None
+    "last_activity": None,
+    "is_distracted": False,
+    "reachable": None,  # Last known reachability status
+    "last_reachable_check": None,
+    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
+    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
+    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
+    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
+}
+
+PHONE_HEARTBEAT = {
+    "last_seen": None,      # datetime (UTC) or None
+    "device_id": None,
+    "alert_state": None,    # None, "beep", "zap"
+}
+
+PAVLOK_CONFIG = {
+    "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
+    "token": os.getenv("PAVLOK_API_TOKEN"),
+    "enabled": True,
+    "cooldown_seconds": 30,
+    "default_zap_value": 50,
+}
+
+PAVLOK_STATE = {
+    "last_stimulus_at": None,
+}
+
+
 # ============ Desktop State ============
 
 DESKTOP_STATE = {
@@ -147,6 +225,80 @@ DESKTOP_STATE = {
     # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
     "in_meeting": False,
 }
+
+
+# ============ Voice Chat & Dictation State ============
+# These live in shared.py so both main.py and routes/voice.py can access them.
+
+# Voice chat state — tracks which instances are in voice conversation mode
+VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
+
+# Global dictation state — tracks whether Wispr Flow is currently active
+# Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
+#             voice-select-other (explicit on/off during voice chat)
+DICTATION_STATE = {"active": False, "updated_at": None}
+
+# Pedal state — tracks enter queue and double-tap timing for Stream Deck Pedal
+PEDAL_STATE = {
+    "last_tap_time": 0.0,          # monotonic time of last left-pedal tap
+    "enter_queued": False,          # enter waiting for dictation buffer to expire
+    "queued_task": None,            # asyncio.Task for delayed enter send
+    "bypass_active": False,         # single-tap bypass window after buffered enter
+    "bypass_start": 0.0,           # when bypass window started
+}
+PEDAL_DOUBLE_TAP_MS = 500          # double-tap window
+PEDAL_BUFFER_MS = 1.0              # seconds to wait after dictation ends before sending queued enter
+PEDAL_BYPASS_MS = 10.0             # seconds of single-tap bypass after buffered enter
+
+
+# ============ Device Resolution ============
+
+DEVICE_IPS = {
+    "100.102.92.24": "Token-S24",    # Phone
+    "100.69.198.87": "TokenPC",      # Windows PC
+    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
+    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
+    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
+}
+
+LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
+
+
+def resolve_device_from_ip(ip: str) -> str:
+    """Map Tailscale IPs to known devices."""
+    return DEVICE_IPS.get(ip, "unknown")
+
+
+def is_local_device(device_id: str) -> bool:
+    """Check if device_id refers to a machine where we can manage processes locally."""
+    return device_id in LOCAL_DEVICES
+
+
+# ============ Process Utilities ============
+
+def is_pid_claude(pid: int) -> bool:
+    """Check if the given PID belongs to a claude process."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() == "claude"
+    except (OSError, PermissionError):
+        return False
+
+
+def get_parent_pid(pid: int) -> Optional[int]:
+    """Get the parent PID of a process from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+            return int(fields[3])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_subagent_pid(pid: int) -> bool:
+    """Return True if this claude process was spawned by another claude process."""
+    parent = get_parent_pid(pid)
+    return bool(parent and parent != 1 and is_pid_claude(parent))
 
 
 # ============ Discord ============
@@ -176,3 +328,48 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
             (event_type, instance_id, device_id, json.dumps(details) if details else None)
         )
         await db.commit()
+
+
+# ============ App Singletons ============
+# Set by main.py after module-level initialization.
+# hooks.py and other route modules import via `import shared; shared.timer_engine.xxx`
+# instead of reaching back through the _main() lazy import.
+timer_engine = None   # token_api.timer.TimerEngine
+scheduler = None      # apscheduler.schedulers.asyncio.AsyncIOScheduler
+
+
+# ============ Timer Analytics ============
+
+def _sync_log_shift(old_mode, new_mode: str, trigger: str, source: str,
+                    phone_app=None, details=None):
+    """Log a timer mode shift to the analytics table (sync, for thread offload)."""
+    import sqlite3
+    from datetime import datetime as _dt
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+    )
+    active_instances = cursor.fetchone()[0]
+
+    conn.execute(
+        """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
+           break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
+         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
+         timer_engine.total_work_time_ms, active_instances, phone_app, details)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_log_shift(old_mode, new_mode: str, trigger: str, source: str,
+                          phone_app=None, details=None):
+    """Log a timer mode shift to the analytics table (async wrapper)."""
+    import asyncio
+    try:
+        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
+    except Exception as e:
+        print(f"TIMER: Failed to log shift: {e}")

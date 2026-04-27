@@ -40,6 +40,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 profile_name TEXT,
                 tts_voice TEXT,
                 notification_sound TEXT,
+                primarch TEXT,
                 pid INTEGER,
                 status TEXT DEFAULT 'idle',
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -57,6 +58,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("session_doc_id", "ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER"),
             ("zealotry", "ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4"),
             ("tmux_pane", "ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT"),
+            ("primarch", "ALTER TABLE claude_instances ADD COLUMN primarch TEXT"),
             ("victory_at", "ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP"),
             ("victory_reason", "ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT"),
             ("input_lock", "ALTER TABLE claude_instances ADD COLUMN input_lock TEXT"),
@@ -67,6 +69,17 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
             ("instance_type", "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'"),
+            ("launcher", "ALTER TABLE claude_instances ADD COLUMN launcher TEXT"),
+            ("engine", "ALTER TABLE claude_instances ADD COLUMN engine TEXT"),
+            ("dispatch_target", "ALTER TABLE claude_instances ADD COLUMN dispatch_target TEXT"),
+            ("dispatch_window", "ALTER TABLE claude_instances ADD COLUMN dispatch_window TEXT"),
+            ("dispatch_mode", "ALTER TABLE claude_instances ADD COLUMN dispatch_mode TEXT"),
+            ("dispatch_slot", "ALTER TABLE claude_instances ADD COLUMN dispatch_slot TEXT"),
+            ("dispatch_session_doc_path", "ALTER TABLE claude_instances ADD COLUMN dispatch_session_doc_path TEXT"),
+            ("target_working_dir", "ALTER TABLE claude_instances ADD COLUMN target_working_dir TEXT"),
+            ("launch_mode", "ALTER TABLE claude_instances ADD COLUMN launch_mode TEXT"),
+            ("transplant_expected", "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0"),
+            ("session_doc_policy", "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT"),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -81,7 +94,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END""")
 
         # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "primarch", "is_processing"}
+        dead_columns = {"pane_label", "pre_stop_status", "retrigger_count", "spawner", "is_processing"}
         drop_targets = dead_columns & columns
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")

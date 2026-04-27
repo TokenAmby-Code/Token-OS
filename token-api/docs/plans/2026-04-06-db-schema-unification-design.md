@@ -221,6 +221,62 @@ Residual issue:
 - its API integration section hangs in the registration flow under test harness execution
 - this appears separate from schema parity and should be checked independently
 
+## 2026-04-23 Follow-On: Session-Doc Ownership and Dispatch Metadata
+
+Schema unification by itself did not solve the larger ownership seam around
+launch metadata and session-doc linkage. A bounded follow-on patch extended the
+canonical `claude_instances` schema to persist dispatch/session ownership fields:
+
+- `launcher`
+- `engine`
+- `dispatch_target`
+- `dispatch_window`
+- `dispatch_mode`
+- `dispatch_slot`
+- `dispatch_session_doc_path`
+- `target_working_dir`
+- `launch_mode`
+- `transplant_expected`
+- `session_doc_policy`
+
+This was done for one reason: launch-time routing and archive/session-doc policy
+should not live only in transient hook payloads or event logs.
+
+### What this follow-on patch changes
+
+- `routes/hooks.py` now normalizes and persists dispatch metadata during registration
+- session-doc resolution for launch paths moved further out of inline route code and into `session_doc_helpers.py`
+- session-doc linkage now records policy, not just `session_doc_id`
+- rename behavior now distinguishes auto-generated docs from manually assigned/created docs:
+  only auto-generated docs mirror instance rename operations
+
+### Why this matters
+
+Before this patch, the system knew *that* a doc was linked, but not *why* that
+link existed. That made it too easy for later behavior to overwrite manual doc
+assignments as if they were disposable auto-generated projections.
+
+The useful distinction is now explicit:
+
+- `dispatch_explicit`
+- `daily_note_custodes`
+- `primarch_active`
+- `cron_active`
+- `cron_created`
+- `interactive_auto`
+- `manual_assigned`
+- `manual_created`
+
+This is still not the final architecture, but it is a materially cleaner
+ownership model than "one nullable FK and route-local assumptions."
+
+### Remaining work after this patch
+
+- live Mac DB migration/startup verification still needs an operator step
+- route-to-main coupling in `routes/hooks.py` is reduced, not eliminated
+- more session-doc/archive reconciliation logic should move behind helpers/services
+- network/service-boundary work should still wait until DB/state ownership is cleaner
+
 ## Risk Notes
 
 The danger is not just schema mismatch. It is hidden data assumptions in lifecycle code.
