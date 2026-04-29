@@ -245,11 +245,11 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
         if window.archetype.value == "palace":
             legal.update(
                 {
-                    "palace:TL",
-                    "palace:TR",
-                    "palace:BL",
-                    "palace:BR",
                     "palace:SL",
+                    "palace:TL",
+                    "palace:BL",
+                    "palace:TR",
+                    "palace:BR",
                     "palace:SR",
                 }
             )
@@ -263,11 +263,7 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
                     "somnium:SR",
                 }
             )
-        elif window.archetype.value == "legion_stack":
-            legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
-        elif window.archetype.value == "mechanicus_stack":
-            legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
-        elif window.archetype.value == "tui_single":
+        elif window.archetype.value in {"legion_stack", "mechanicus_stack", "tui_single"}:
             legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
     return legal
 

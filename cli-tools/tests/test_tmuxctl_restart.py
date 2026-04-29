@@ -8,12 +8,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.api import build_client_attachments
+from tmuxctl.builder import build_workspace
 from tmuxctl.enums import (
     AttachmentClass,
     CoherenceSeverity,
     GridState,
     InstanceStatus,
-    LayoutOrigin,
     PaneKind,
     ResumeDisposition,
     WindowArchetype,
@@ -30,12 +30,12 @@ from tmuxctl.models import (
 from tmuxctl.planner import build_restart_plan
 
 
-def _pane(pane_id: str, role: str, *, command: str = "zsh") -> PaneSnapshot:
+def _pane(pane_id: str, role: str, *, command: str = "zsh", window: str = "somnium") -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
         session_name="main",
         window_index=1,
-        window_name="palace",
+        window_name=window,
         pane_index=0,
         width=100,
         height=40,
@@ -49,20 +49,23 @@ def _pane(pane_id: str, role: str, *, command: str = "zsh") -> PaneSnapshot:
     )
 
 
-def _workspace(*panes: PaneSnapshot) -> WorkspaceSnapshot:
-    window = WindowSnapshot(
+def _workspace(
+    *panes: PaneSnapshot,
+    window: str = "somnium",
+    archetype: WindowArchetype = WindowArchetype.SOMNIUM,
+) -> WorkspaceSnapshot:
+    window_snapshot = WindowSnapshot(
         session_name="main",
         window_index=1,
-        window_name="palace",
-        archetype=WindowArchetype.PALACE,
-        layout_origin=LayoutOrigin.WSL,
+        window_name=window,
+        archetype=archetype,
         focused=False,
         grid_expanded="none",
         grid_stash="",
         side_expanded="none",
         panes=tuple(panes),
     )
-    return WorkspaceSnapshot(session_name="main", windows=(window,))
+    return WorkspaceSnapshot(session_name="main", windows=(window_snapshot,))
 
 
 def _instance(
@@ -71,7 +74,7 @@ def _instance(
     *,
     status: InstanceStatus = InstanceStatus.IDLE,
     pre_stop_status: InstanceStatus = InstanceStatus.IDLE,
-    last_activity: str = "2026-04-25T16:00:00+00:00",
+    last_activity: str | None = None,
     stopped_at: str = "",
     tmux_pane: str = "%1",
     is_subagent: bool = False,
@@ -81,11 +84,11 @@ def _instance(
         device_id="Mac-Mini",
         pane_label=pane_label,
         tmux_pane=tmux_pane,
-        working_dir="/mnt/imperium/Imperium-ENV",
+        working_dir="/Volumes/Imperium/Imperium-ENV",
         status=status,
         pre_stop_status=pre_stop_status,
         is_subagent=is_subagent,
-        last_activity=last_activity,
+        last_activity=last_activity if last_activity is not None else _iso_ago(hours=1),
         stopped_at=stopped_at,
     )
 
@@ -95,12 +98,12 @@ def _iso_ago(*, hours: int = 0, seconds: int = 0) -> str:
 
 
 def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
-    workspace = _workspace(_pane("%1", "palace:TL"))
+    workspace = _workspace(_pane("%1", "somnium:TL"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("old", "palace:TL", last_activity=_iso_ago(hours=30)),
-            _instance("new", "palace:TL", last_activity=_iso_ago(hours=1)),
+            _instance("old", "somnium:TL", last_activity=_iso_ago(hours=30)),
+            _instance("new", "somnium:TL", last_activity=_iso_ago(hours=1)),
         ),
     )
 
@@ -111,14 +114,14 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
 
 
 def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
-    workspace = _workspace(_pane("%1", "palace:TL"), _pane("%2", "palace:TR"))
+    workspace = _workspace(_pane("%1", "somnium:TL"), _pane("%2", "somnium:TR"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("stale", "palace:TL", last_activity=_iso_ago(hours=72)),
+            _instance("stale", "somnium:TL", last_activity=_iso_ago(hours=72)),
             _instance(
                 "recent-stop",
-                "palace:TR",
+                "somnium:TR",
                 status=InstanceStatus.STOPPED,
                 pre_stop_status=InstanceStatus.PROCESSING,
                 stopped_at=_iso_ago(seconds=30),
@@ -134,10 +137,10 @@ def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
 
 
 def test_restart_plan_flags_busy_targets_and_pane_id_drift():
-    workspace = _workspace(_pane("%2", "palace:TL", command="claude"))
+    workspace = _workspace(_pane("%2", "somnium:TL", command="claude"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc", "palace:TL", tmux_pane="%1"),),
+        instances=(_instance("abc", "somnium:TL", tmux_pane="%1"),),
     )
 
     plan = build_restart_plan(workspace, registry)
@@ -149,10 +152,12 @@ def test_restart_plan_flags_busy_targets_and_pane_id_drift():
 
 def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
     workspace = _workspace(
-        _pane("%1", "palace:TL"),
-        _pane("%2", "palace:TR"),
-        _pane("%3", "palace:BL"),
-        _pane("%4", "palace:BR"),
+        _pane("%1", "palace:TL", window="palace"),
+        _pane("%2", "palace:TR", window="palace"),
+        _pane("%3", "palace:BL", window="palace"),
+        _pane("%4", "palace:BR", window="palace"),
+        window="palace",
+        archetype=WindowArchetype.PALACE,
     )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
@@ -166,10 +171,36 @@ def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
     assert not any(issue.code == "missing_target_pane" for issue in plan.coherence_issues)
 
 
+def test_palace_happy_path_resumes_grid_and_side_labels():
+    workspace = _workspace(
+        _pane("%1", "palace:SL", window="palace"),
+        _pane("%2", "palace:TL", window="palace"),
+        _pane("%3", "palace:BL", window="palace"),
+        _pane("%4", "palace:TR", window="palace"),
+        _pane("%5", "palace:BR", window="palace"),
+        _pane("%6", "palace:SR", window="palace"),
+        window="palace",
+        archetype=WindowArchetype.PALACE,
+    )
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(
+            _instance("alpha", "palace:TL", tmux_pane="%2"),
+            _instance("beta", "palace:SR", tmux_pane="%6"),
+        ),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    resumed = {resume.instance_id: resume.target_pane_id for resume in plan.resumes}
+    assert resumed == {"alpha": "%2", "beta": "%6"}
+    assert all(not resume.target_hidden_until_rebuild for resume in plan.resumes)
+
+
 def test_build_client_attachments_classifies_local_remote_and_grouped():
     managed = (
-        GroupedSessionSnapshot("main", "main", 0, "palace"),
-        GroupedSessionSnapshot("phone", "main", 2, "warp"),
+        GroupedSessionSnapshot("main", "main", 0, "somnium"),
+        GroupedSessionSnapshot("phone", "main", 2, "somnium"),
     )
     attachments = build_client_attachments(
         [
@@ -178,14 +209,14 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
                 "session_name": "main",
                 "client_name": "local",
                 "window_index": "0",
-                "window_name": "palace",
+                "window_name": "somnium",
             },
             {
                 "client_tty": "/dev/pts/4",
                 "session_name": "phone",
                 "client_name": "remote",
                 "window_index": "2",
-                "window_name": "warp",
+                "window_name": "somnium",
             },
         ],
         managed_sessions=managed,
@@ -196,14 +227,14 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
 
 
 def test_dry_run_emits_deterministic_action_order():
-    workspace = _workspace(_pane("%1", "palace:TL"))
+    workspace = _workspace(_pane("%1", "somnium:TL"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc12345", "palace:TL"),),
+        instances=(_instance("abc12345", "somnium:TL"),),
     )
     grouped = (
-        GroupedSessionSnapshot("main", "main", 0, "palace"),
-        GroupedSessionSnapshot("phone", "main", 2, "warp"),
+        GroupedSessionSnapshot("main", "main", 0, "somnium"),
+        GroupedSessionSnapshot("phone", "main", 2, "somnium"),
     )
     attachments = build_client_attachments(
         [
@@ -212,14 +243,14 @@ def test_dry_run_emits_deterministic_action_order():
                 "session_name": "main",
                 "client_name": "local",
                 "window_index": "0",
-                "window_name": "palace",
+                "window_name": "somnium",
             },
             {
                 "client_tty": "/dev/pts/4",
                 "session_name": "phone",
                 "client_name": "remote",
                 "window_index": "2",
-                "window_name": "warp",
+                "window_name": "somnium",
             },
         ],
         managed_sessions=grouped,
@@ -240,9 +271,103 @@ def test_dry_run_emits_deterministic_action_order():
         "detach client /dev/pts/4 (remote_grouped)",
         "kill grouped session phone",
         "kill leader session main",
-        "recreate workspace via tmux-workspace",
+        "recreate workspace via builder.build_workspace",
         "normalize managed windows before restore",
+        "clear transient stash windows",
         "resume abc12345 into %1 with resume",
-        "recreate grouped session phone on warp",
+        "recreate grouped session phone on somnium",
         "verify pane labels and resume outcomes",
     ]
+
+
+class FakeBuilderAdapter:
+    def __init__(self) -> None:
+        self.sessions: set[str] = set()
+        self.windows: dict[str, list[str]] = {}
+        self.panes: dict[str, list[str]] = {}
+        self.pane_options: dict[str, dict[str, str]] = {}
+        self.window_options: dict[str, dict[str, str]] = {}
+
+    def has_session(self, session_name: str) -> bool:
+        return session_name in self.sessions
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        cmd = args[0]
+        if cmd == "new-session":
+            session = args[args.index("-s") + 1]
+            window = args[args.index("-n") + 1]
+            self.sessions.add(session)
+            self.windows[session] = [window]
+            self.panes[f"{session}:{window}"] = [f"{session}:{window}.1"]
+            return ""
+        if cmd == "new-window":
+            session = args[args.index("-t") + 1]
+            window = args[args.index("-n") + 1]
+            self.windows.setdefault(session, []).append(window)
+            self.panes[f"{session}:{window}"] = [f"{session}:{window}.1"]
+            return ""
+        if cmd == "display-message":
+            target = args[args.index("-t") + 1]
+            fmt = args[-1]
+            if fmt == "#{window_width}":
+                return "240\n"
+            if fmt == "#{window_height}":
+                return "60\n"
+            if fmt == "#{pane_id}":
+                return f"{target}\n"
+            return "\n"
+        if cmd == "split-window":
+            target = args[args.index("-t") + 1]
+            window_target = target.rsplit(".", 1)[0]
+            pane_list = self.panes.setdefault(window_target, [f"{window_target}.1"])
+            new_pane = f"{window_target}.{len(pane_list) + 1}"
+            pane_list.append(new_pane)
+            if "-P" in args:
+                return f"{new_pane}\n"
+            return ""
+        if cmd == "set-option":
+            option = args[-2]
+            value = args[-1]
+            target = args[args.index("-t") + 1]
+            if "-p" in args:
+                self.pane_options.setdefault(target, {})[option] = value
+            elif "-w" in args:
+                self.window_options.setdefault(target, {})[option] = value
+            return ""
+        if cmd in {"send-keys", "select-pane", "select-window"}:
+            return ""
+        raise AssertionError(f"unhandled tmux command in fake adapter: {args}")
+
+
+def test_builder_creates_canonical_workspace_roles():
+    adapter = FakeBuilderAdapter()
+
+    build_workspace(adapter, "main")  # type: ignore[arg-type]
+
+    assert adapter.windows["main"] == ["palace", "somnium", "legion", "mechanicus", "tui"]
+    roles = {
+        target: options.get("@PANE_ID")
+        for target, options in adapter.pane_options.items()
+        if "@PANE_ID" in options
+    }
+    assert {
+        "palace:SL",
+        "palace:TL",
+        "palace:BL",
+        "palace:TR",
+        "palace:BR",
+        "palace:SR",
+    } <= set(roles.values())
+    assert {
+        "somnium:TL",
+        "somnium:BL",
+        "somnium:TR",
+        "somnium:BR",
+        "somnium:SR",
+    } <= set(roles.values())
+    assert roles["main:legion.1"] == "legion:empty"
+    assert roles["main:mechanicus.1"] == "mechanicus:backstop"
+    assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
+    assert roles["main:tui.1"] == "tui:1"
+    assert adapter.pane_options["main:somnium.5"]["@PANE_TYPE"] == "tui"
+    assert adapter.pane_options["main:tui.1"]["@PANE_TYPE"] == "tui"

@@ -9,6 +9,9 @@ from .models import (
 )
 
 
+CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus", "tui"}
+
+
 def render_workspace(snapshot: WorkspaceSnapshot) -> str:
     lines = [f"session {snapshot.session_name}"]
     for window in snapshot.windows:
@@ -97,12 +100,41 @@ def render_restart_result(result: RestartExecutionResult) -> str:
     return "\n".join(lines)
 
 
+def render_doctor(snapshot: WorkspaceSnapshot) -> str:
+    issues: list[str] = []
+    window_bases = {window.window_name.split("(", 1)[0] for window in snapshot.windows}
+
+    missing_windows = sorted(CANONICAL_WINDOWS - window_bases)
+    if missing_windows:
+        issues.append(f"missing canonical windows: {', '.join(missing_windows)}")
+
+    for window in snapshot.windows:
+        base = window.window_name.split("(", 1)[0]
+        if base.startswith("_stash_") or base.startswith("_fstash_"):
+            issues.append(f"orphan transient window: {window.window_name}")
+        if window.grid_expanded != "none":
+            issues.append(f"{window.target} has transient @GRID_EXPANDED={window.grid_expanded}")
+        if window.grid_stash:
+            issues.append(f"{window.target} has transient @GRID_STASH set")
+        if window.side_expanded != "none":
+            issues.append(f"{window.target} has transient @SIDE_EXPANDED={window.side_expanded}")
+        for warning in window.warnings:
+            issues.append(f"{window.target}: {warning}")
+
+    lines = [f"doctor session={snapshot.session_name}"]
+    if not issues:
+        lines.append("  ok")
+    else:
+        for issue in issues:
+            lines.append(f"  ! {issue}")
+    return "\n".join(lines)
+
+
 def render_window_lines(snapshot: WindowSnapshot) -> list[str]:
     lines = [
         (
             f"- {snapshot.target} {snapshot.window_name} "
             f"[{snapshot.archetype.value}] "
-            f"origin={snapshot.layout_origin.value} "
             f"focused={'true' if snapshot.focused else 'false'} "
             f"grid={snapshot.grid_expanded} "
             f"stash={'set' if snapshot.grid_stash else 'none'} "

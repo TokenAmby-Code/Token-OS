@@ -29,12 +29,6 @@ class PaneKind(str, Enum):
     BACKSTOP = "backstop"
 
 
-class LayoutOrigin(str, Enum):
-    UNKNOWN = "unknown"
-    WSL = "wsl"
-    MAC = "mac"
-
-
 class InstanceStatus(str, Enum):
     UNKNOWN = "unknown"
     IDLE = "idle"

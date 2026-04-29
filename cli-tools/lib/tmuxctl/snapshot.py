@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from .enums import GridState, LayoutOrigin, PaneKind, WindowArchetype
+from .enums import GridState, PaneKind, WindowArchetype
 from .models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
 from .tmux_adapter import TmuxAdapter, TmuxError
 
@@ -21,13 +21,6 @@ def _parse_pane_kind(value: str) -> PaneKind:
         return PaneKind.UNKNOWN
 
 
-def _parse_layout_origin(value: str) -> LayoutOrigin:
-    try:
-        return LayoutOrigin(value)
-    except ValueError:
-        return LayoutOrigin.UNKNOWN
-
-
 def _parse_grid_stash(value: str) -> list[str]:
     if not value:
         return []
@@ -39,23 +32,23 @@ def _parse_grid_stash(value: str) -> list[str]:
     return pane_ids
 
 
-def _infer_archetype(window_name: str, _layout_origin: LayoutOrigin) -> WindowArchetype:
-    if window_name == "palace":
+def _infer_archetype(window_name: str) -> WindowArchetype:
+    base = window_name.split("(", 1)[0]
+    if base == "palace":
         return WindowArchetype.PALACE
-    if window_name in {"somnium", "bridge"}:
+    if base == "somnium":
         return WindowArchetype.SOMNIUM
-    if window_name == "legion":
+    if base == "legion":
         return WindowArchetype.LEGION_STACK
-    if window_name in {"mechanicus", "mars", "kreig"}:
+    if base in {"mechanicus", "mars", "kreig"}:
         return WindowArchetype.MECHANICUS_STACK
-    if window_name == "tui":
+    if base == "tui":
         return WindowArchetype.TUI_SINGLE
     return WindowArchetype.UNKNOWN
 
 
 def _window_warnings(
     window_name: str,
-    layout_origin: LayoutOrigin,
     pane_roles: list[str],
     pane_ids: list[str],
     focused: bool,
@@ -67,9 +60,6 @@ def _window_warnings(
     role_counts = Counter(role for role in pane_roles if role)
     visible_panes = set(pane_ids)
     stash_panes = set(_parse_grid_stash(grid_stash))
-
-    if window_name in {"palace", "somnium", "bridge"} and layout_origin == LayoutOrigin.UNKNOWN:
-        warnings.append("missing @LAYOUT_ORIGIN on managed window")
 
     duplicated = [role for role, count in role_counts.items() if count > 1]
     if duplicated:
@@ -85,7 +75,9 @@ def _window_warnings(
         else:
             warnings.append(f"@GRID_EXPANDED points to missing pane '{grid_expanded}'")
 
-    if window_name == "palace":
+    window_base = window_name.split("(", 1)[0]
+
+    if window_base == "palace":
         grid_required = {"palace:TL", "palace:TR", "palace:BL", "palace:BR"}
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
@@ -96,20 +88,16 @@ def _window_warnings(
         elif missing_grid:
             warnings.append(f"missing palace grid roles: {', '.join(missing_grid)}")
 
-        if focused:
-            focused_sides = sorted({"palace:SL", "palace:SR"} & set(role_counts))
-            if focused_sides:
-                warnings.append(
-                    f"focused palace should not expose side roles: {', '.join(focused_sides)}"
-                )
+        if focused and ("palace:SL" in role_counts or "palace:SR" in role_counts):
+            warnings.append("focused palace should not expose palace:SL or palace:SR")
 
-        if not focused and side_expanded == "none":
+        if not focused:
             side_required = {"palace:SL", "palace:SR"}
-            missing_sides = sorted(side_required - set(role_counts))
-            if missing_sides:
-                warnings.append(f"missing palace side roles: {', '.join(missing_sides)}")
+            missing_side = sorted(side_required - set(role_counts))
+            if missing_side:
+                warnings.append(f"missing palace side roles: {', '.join(missing_side)}")
 
-    if window_name in {"somnium", "bridge"}:
+    if window_base == "somnium":
         grid_required = {"somnium:TL", "somnium:TR", "somnium:BL", "somnium:BR"}
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
@@ -151,7 +139,6 @@ def build_window_snapshot(
         raise ValueError(f"window has no panes: {target}")
 
     window_name = pane_records[0]["window_name"]
-    layout_origin = _parse_layout_origin(adapter.show_window_option(target, "@LAYOUT_ORIGIN"))
     focused = adapter.show_window_option(target, "@FOCUSED") == "true"
     grid_expanded = adapter.show_window_option(target, "@GRID_EXPANDED") or "none"
     grid_stash = adapter.show_window_option(target, "@GRID_STASH")
@@ -184,10 +171,9 @@ def build_window_snapshot(
             )
         )
 
-    archetype = _infer_archetype(window_name, layout_origin)
+    archetype = _infer_archetype(window_name)
     warnings = _window_warnings(
         window_name=window_name,
-        layout_origin=layout_origin,
         pane_roles=pane_roles,
         pane_ids=pane_ids,
         focused=focused,
@@ -201,7 +187,6 @@ def build_window_snapshot(
         window_index=window_index,
         window_name=window_name,
         archetype=archetype,
-        layout_origin=layout_origin,
         focused=focused,
         grid_expanded=grid_expanded,
         grid_stash=grid_stash,
@@ -219,6 +204,5 @@ def build_workspace_snapshot(adapter: TmuxAdapter, session_name: str) -> Workspa
                 build_window_snapshot(adapter, session_name, int(record["window_index"]))
             )
         except (TmuxError, ValueError):
-            # Stash windows can disappear mid-scan after a retract/normalize.
             continue
     return WorkspaceSnapshot(session_name=session_name, windows=tuple(windows))

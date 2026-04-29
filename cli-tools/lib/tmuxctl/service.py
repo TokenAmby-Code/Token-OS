@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 from .api import build_client_attachments, fetch_instance_registry
+from .builder import (
+    PALACE_WINDOW,
+    SESSION_NAME,
+    SOMNIUM_WINDOW,
+    build_palace_window,
+    build_somnium_window,
+    build_workspace,
+)
 from .executor import RestartExecutor
 from .inspect import (
+    render_doctor,
     render_pane,
     render_restart_plan,
     render_restart_result,
@@ -47,6 +56,9 @@ class TmuxControlPlane:
         plan = self.build_restart_plan(session_name)
         return render_restart_plan(plan)
 
+    def doctor(self, session_name: str) -> str:
+        return render_doctor(build_workspace_snapshot(self.adapter, session_name))
+
     def build_restart_plan(self, session_name: str):
         workspace = build_workspace_snapshot(self.adapter, session_name)
         registry = fetch_instance_registry()
@@ -74,6 +86,40 @@ class TmuxControlPlane:
 
     def normalize(self, session_name: str, window_index: int) -> str:
         return normalize_window(self.adapter, session_name, window_index)
+
+    def create_workspace(self, session_name: str = SESSION_NAME) -> str:
+        if self.adapter.has_session(session_name):
+            return f"session '{session_name}' already exists"
+        build_workspace(self.adapter, session_name)
+        return f"created workspace '{session_name}'"
+
+    def rebuild_window(self, session_name: str, window_index: int) -> str:
+        target = f"{session_name}:{window_index}"
+        panes = self.adapter.list_panes(target)
+        if not panes:
+            raise ValueError(f"window has no panes: {target}")
+
+        window_name_raw = panes[0]["window_name"]
+        window_base = window_name_raw.split("(", 1)[0]
+        if window_base == PALACE_WINDOW:
+            builder = build_palace_window
+        elif window_base == SOMNIUM_WINDOW:
+            builder = build_somnium_window
+        else:
+            raise ValueError(
+                f"rebuild-window supports palace and somnium archetypes (got '{window_base}')"
+            )
+
+        survivor = panes[0]["pane_id"]
+        for record in panes[1:]:
+            self.adapter.run("kill-pane", "-t", record["pane_id"], allow_failure=True)
+
+        self.adapter.run("respawn-pane", "-k", "-t", survivor, allow_failure=True)
+        for opt in ("@PANE_ID", "@GRID_STATE", "@PANE_TYPE", "@GRID_RESERVED"):
+            self.adapter.run("set-option", "-pu", "-t", survivor, opt, allow_failure=True)
+
+        builder(self.adapter, session_name, window_name_raw)
+        return f"rebuilt {target}"
 
     def _grouped_sessions(self, leader_session_name: str) -> tuple[GroupedSessionSnapshot, ...]:
         sessions = []

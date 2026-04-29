@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # pane-id.sh — Human-readable tmux pane ID system
-# Sourced by tmux-workspace, tx, and other tmux tools.
+# Sourced by tx, vault-dispatch, tmuxctl, and other tmux tools.
 #
-# Pane IDs use the format window:position (e.g., palace:TR, warp:MON, mechanicus:1).
+# Pane IDs use the format window:position (e.g., palace:TR, mechanicus:1).
 # Stored as @PANE_ID tmux pane option. Resolves to tmux pane target (%N).
 #
-# Palace positions:
-#   Bridge (Mac):  TL TR BL BR SR
-#   Grid (WSL):    SL TL BL TR BR SR
-# Warp positions:  MON T B
+# Palace positions:  SL TL BL TR BR SR  (6-pane: side columns flank a 2x2 grid)
+# Somnium positions: TL TR BL BR SR     (5-pane: 2x2 grid + right TUI column)
 # Mechanicus/Legion: incrementing integers (1, 2, 3...)
-# TUI:             1
+# TUI:               1
 
 _TMUX_STATE_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=./tmux-state.sh
@@ -39,7 +37,7 @@ pane_tag() {
             tmux set-option -p -t "$target" @PANE_TYPE "$pane_type"
             ;;
     esac
-    # warp:MON and palace:SR (mac-palace) get @PANE_TYPE "tui" — set by caller
+    # somnium:SR gets @PANE_TYPE "tui" — set by caller
 }
 
 # Resolve a pane ID to a tmux pane target (e.g., palace:TR → %17).

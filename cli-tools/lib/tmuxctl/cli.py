@@ -50,6 +50,16 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
 
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--session", default="main")
+
+    create_parser = subparsers.add_parser("create")
+    create_parser.add_argument("--session", default="main")
+    create_parser.add_argument("--attach", action="store_true")
+
+    rebuild_parser = subparsers.add_parser("rebuild-window")
+    rebuild_parser.add_argument("--window", default="current")
+
     return parser
 
 
@@ -87,6 +97,22 @@ def main(argv: list[str] | None = None) -> int:
                 output, ok = control.execute_restart(args.session)
                 print(output)
                 return 0 if ok else 1
+
+        if args.command == "doctor":
+            print(control.doctor(args.session))
+            return 0
+
+        if args.command == "create":
+            print(control.create_workspace(args.session))
+            if args.attach:
+                from .builder import attach_workspace
+                attach_workspace(args.session)
+            return 0
+
+        if args.command == "rebuild-window":
+            session_name, window_index = _parse_window_ref(args.window, control)
+            print(control.rebuild_window(session_name=session_name, window_index=window_index))
+            return 0
 
         parser.error(f"unhandled command: {args.command}")
     except (

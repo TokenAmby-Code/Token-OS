@@ -4,13 +4,12 @@
 # AUDIENCE: human (keybind: prefix + d)
 #
 # Window-aware behavior:
-#   palace/warp   → demote current pane to legion (fresh shell replaces it)
-#   legion/mechanicus  → popup selector to promote (swap) into palace/warp slot
+#   palace/somnium      → demote current pane to legion (fresh shell replaces it)
+#   legion/mechanicus   → popup selector to promote (swap) into a palace or somnium slot
 #
 # Selector layout:
-#   1-4  Palace grid (TL TR BL BR)
-#   5-6  Warp terminals (Top Bot)
-#   7-8  WSL side columns (SL SR) — only shown on WSL layout
+#   1-6  Palace slots  (SL TL BL TR BR SR)
+#   7-a  Somnium grid  (TL TR BL BR SR)
 #
 # Dirty panes (Claude processing) are dimmed in the selector.
 
@@ -57,7 +56,7 @@ if [[ "${1:-}" == "--do-swap" ]]; then
 
     # After swap: src content is at dst's position, dst content is at src's position.
     # Pane IDs (%N) follow content, so:
-    #   $src (now in palace/warp position) gets the palace/warp tag
+    #   $src (now in somnium position) gets the somnium tag
     #   $dst (now in legion/mechanicus position) gets demoted tag
     pane_tag "$src" "$dst_tag" || true
     pane_tag "$dst" "${src_window}:bumped" || true
@@ -79,7 +78,7 @@ current_window="${current_window%%(*}"  # Strip instance count suffix
 current_pane=$(tmux display-message -p '#{pane_id}')
 current_tag=$(pane_id_of "$current_pane")
 
-# --- DEMOTE: palace/warp → legion ---
+# --- DEMOTE: somnium → legion ---
 demote() {
     # Ensure legion window exists; resolve actual name (may have instance count suffix)
     local legion_win
@@ -114,7 +113,7 @@ demote() {
     # Update Token-API DB so orchestration sees the new location
     relocate_pane "$current_pane" "legion:demoted"
 
-    # Refresh palace/warp layout so the replacement pane fills the correct geometry
+    # Refresh somnium layout so the replacement pane fills the correct geometry
     tmux-refresh-layout 2>/dev/null || true
 
     # Trigger workspace audit (backburner cleanup, etc.) — fire and forget
@@ -123,7 +122,7 @@ demote() {
     tmux display-message "Shipped to legion"
 }
 
-# --- PROMOTE: legion/mechanicus → palace/warp (selector) ---
+# --- PROMOTE: legion/mechanicus → somnium (selector) ---
 promote() {
     # Collect pane data into flat parallel arrays (no associative arrays — compat)
     local pd_tags="" pd_pids="" pd_cmds="" pd_states=""
@@ -140,7 +139,7 @@ promote() {
             -F '#{pane_id}	#{@PANE_ID}	#{pane_current_command}	#{@CC_STATE}' 2>/dev/null || true)
     }
     collect_panes palace
-    collect_panes warp
+    collect_panes somnium
 
     # Lookup helper: find pid/cmd/state for a given tag
     lookup_tag() {
@@ -160,10 +159,6 @@ promote() {
         done
     }
 
-    # Detect WSL layout
-    local layout_origin
-    layout_origin=$(tmux show-options -wv -t "${SESSION}:palace" @LAYOUT_ORIGIN 2>/dev/null || echo "")
-
     # Build display-menu arguments in order
     local menu_args=()
 
@@ -180,25 +175,19 @@ promote() {
         fi
     }
 
-    # Palace grid (1-4)
-    add_slot 1 "palace:TL" "Palace TL"
-    add_slot 2 "palace:TR" "Palace TR"
+    # Palace slots (1-6)
+    add_slot 1 "palace:SL" "Palace SL"
+    add_slot 2 "palace:TL" "Palace TL"
     add_slot 3 "palace:BL" "Palace BL"
-    add_slot 4 "palace:BR" "Palace BR"
+    add_slot 4 "palace:TR" "Palace TR"
+    add_slot 5 "palace:BR" "Palace BR"
+    add_slot 6 "palace:SR" "Palace SR"
 
-    # Separator
-    menu_args+=("" "" "")
-
-    # Warp terminals (5-6)
-    add_slot 5 "warp:T" "Warp Top"
-    add_slot 6 "warp:B" "Warp Bot"
-
-    # WSL side columns (7-8)
-    if [[ "$layout_origin" == "wsl" ]]; then
-        menu_args+=("" "" "")
-        add_slot 7 "palace:SL" "WSL Side-L"
-        add_slot 8 "palace:SR" "WSL Side-R"
-    fi
+    # Somnium grid (7-a)
+    add_slot 7 "somnium:TL" "Somnium TL"
+    add_slot 8 "somnium:TR" "Somnium TR"
+    add_slot 9 "somnium:BL" "Somnium BL"
+    add_slot 0 "somnium:BR" "Somnium BR"
 
     if [[ ${#menu_args[@]} -eq 0 ]]; then
         tmux display-message "No target panes found"
@@ -210,13 +199,13 @@ promote() {
 
 # --- Route based on current window ---
 case "$current_window" in
-    palace|warp)
+    palace|somnium)
         demote
         ;;
     legion|mechanicus|mars|kreig)
         promote
         ;;
     *)
-        tmux display-message "Shuttle: only works on palace/warp/legion/mechanicus"
+        tmux display-message "Shuttle: only works on palace/somnium/legion/mechanicus"
         ;;
 esac

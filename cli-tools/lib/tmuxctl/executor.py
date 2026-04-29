@@ -5,6 +5,7 @@ import subprocess
 import time
 from dataclasses import replace
 
+from .builder import build_workspace
 from .enums import AttachmentClass, RestartPhase
 from .models import (
     RestartAction,
@@ -81,7 +82,7 @@ class RestartExecutor:
             self.adapter.run("kill-session", "-t", grouped.session_name, allow_failure=True)
         self.adapter.run("kill-session", "-t", plan.session_name, allow_failure=True)
 
-        subprocess.run(["tmux-workspace"], check=False, capture_output=True, text=True)
+        build_workspace(self.adapter, plan.session_name)
         time.sleep(0.5)
 
         rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
@@ -90,6 +91,7 @@ class RestartExecutor:
                 normalize_window(self.adapter, plan.session_name, window.window_index)
             except Exception:
                 continue
+        self._clear_transient_windows(plan.session_name)
         time.sleep(0.2)
         rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
         pane_by_label = {
@@ -246,7 +248,26 @@ class RestartExecutor:
         for result in resume_results:
             if not result.success:
                 violations.append(f"resume failed for {result.pane_label}: {result.message}")
+        for window in rebuilt.windows:
+            base = window.window_name.split("(", 1)[0]
+            if base.startswith("_stash_") or base.startswith("_fstash_"):
+                violations.append(f"transient stash window survived rebuild: {window.window_name}")
+            for warning in window.warnings:
+                if "missing" in warning or "duplicate" in warning:
+                    violations.append(f"{window.target}: {warning}")
         return violations
+
+    def _clear_transient_windows(self, session_name: str) -> None:
+        for record in self.adapter.list_windows(session_name):
+            window_name = record["window_name"]
+            base = window_name.split("(", 1)[0]
+            if base.startswith("_stash_") or base.startswith("_fstash_"):
+                self.adapter.run(
+                    "kill-window",
+                    "-t",
+                    f"{session_name}:{window_name}",
+                    allow_failure=True,
+                )
 
     def _planned_actions(self, plan: RestartPlan) -> list[RestartAction]:
         actions: list[RestartAction] = []
@@ -275,10 +296,11 @@ class RestartExecutor:
         actions.append(
             RestartAction(RestartPhase.TEARDOWN, f"kill leader session {plan.session_name}")
         )
-        actions.append(RestartAction(RestartPhase.REBUILD, "recreate workspace via tmux-workspace"))
+        actions.append(RestartAction(RestartPhase.REBUILD, "recreate workspace via builder.build_workspace"))
         actions.append(
             RestartAction(RestartPhase.REBUILD, "normalize managed windows before restore")
         )
+        actions.append(RestartAction(RestartPhase.REBUILD, "clear transient stash windows"))
         for resume in plan.resumes:
             target = resume.target_pane_id or f"{resume.pane_label} (resolve post-rebuild)"
             actions.append(

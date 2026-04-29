@@ -3,7 +3,7 @@
 # TAGS: tmux, windows, focus
 # AUDIENCE: human
 #
-# Called by tmux-workspace --focus/--unfocus on WSL.
+# Called by focus/unfocus flows on WSL.
 #   wt-focus on   — store HWND to file, hide tab bar, snap to right 50%, re-apply layout
 #   wt-focus off  — maximize terminal, re-apply layout, show tab bar, remove HWND file
 #
@@ -119,7 +119,7 @@ case "$MODE" in
         toggle_tab_bar "False"
         snap_right
         sleep 0.5
-        # No layout re-apply here — the caller (tmux-workspace focus_mode)
+        # No layout re-apply here — the caller
         # runs tmux-refresh-layout afterward for canonical reset at new dimensions.
         ;;
     off)

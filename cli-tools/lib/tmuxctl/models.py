@@ -8,7 +8,6 @@ from .enums import (
     CoherenceSeverity,
     GridState,
     InstanceStatus,
-    LayoutOrigin,
     PaneKind,
     RestartPhase,
     ResumeDisposition,
@@ -40,7 +39,6 @@ class WindowSnapshot:
     window_index: int
     window_name: str
     archetype: WindowArchetype
-    layout_origin: LayoutOrigin
     focused: bool
     grid_expanded: str
     grid_stash: str

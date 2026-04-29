@@ -11,9 +11,7 @@
 #     running). Retract brings them back and restores the 2x2 layout.
 #
 #   Side expansion (@SIDE_EXPANDED):
-#     WSL: close the other side panel, shift the grid, expand this terminal
-#          into the freed space. Grid panes stay the same size.
-#     Mac: compress the grid proportionally to give the monitor more room.
+#     Compress the grid proportionally to give the monitor more room.
 #
 # Both can be active simultaneously. Side panes are never touched by grid
 # expansion — only grid panes are stashed/restored.
@@ -24,10 +22,9 @@
 
 set -euo pipefail
 
-WSL_SIDE_CANONICAL_RATIO=20
-WSL_SIDE_EXPAND_RATIO=40
-MAC_SIDE_CANONICAL_RATIO=33
-MAC_SIDE_EXPAND_RATIO=40
+PALACE_SIDE_CANONICAL_RATIO=20
+SOMNIUM_SIDE_CANONICAL_RATIO=33
+SOMNIUM_SIDE_EXPAND_RATIO=40
 
 ACTIVE_PANE=$(tmux display-message -p '#{pane_id}')
 if [[ "${1:-}" == "--pane" && -n "${2:-}" ]]; then
@@ -40,7 +37,7 @@ WINDOW=$(tmux display-message -t "$ACTIVE_PANE" -p '#{window_index}')
 TARGET="${SESSION}:${WINDOW}"
 
 # Per-window stash prevents races when multiple windows expand simultaneously.
-# Strip parenthetical suffix from window name (e.g. "palace(3)" → "palace").
+# Strip parenthetical suffix from window name (e.g. "somnium(3)" → "somnium").
 WINDOW_NAME_RAW=$(tmux display-message -p '#{window_name}')
 WINDOW_BASE="${WINDOW_NAME_RAW%%(*}"
 STASH_WINDOW="_stash_${WINDOW_BASE}"
@@ -72,10 +69,6 @@ acquire_lock() {
 resolve_window() {
     local base="$1"
     tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -m1 "^${base}" || echo "$base"
-}
-
-get_layout_origin() {
-    tmux_require_layout_origin "$TARGET" "$WINDOW_BASE" 2>/dev/null || true
 }
 
 get_all_panes() {
@@ -182,43 +175,48 @@ rebalance_grid_even() {
     [[ -n "$FAR_COL" ]] && tmux resize-pane -t "$FAR_COL" -y "$even_h" 2>/dev/null || true
 }
 
-ensure_wsl_side_slots() {
-    local side_w
-    side_w=$(($(tmux display-message -t "$TARGET" -p '#{window_width}') - 5))
-    side_w=$((side_w * WSL_SIDE_CANONICAL_RATIO / 100))
+ensure_palace_side_slots() {
+    [[ "$WINDOW_BASE" == "palace" ]] || return 0
+
+    local existing_tags=()
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] && existing_tags+=("$tag")
+    done < <(tmux list-panes -t "$TARGET" -F '#{@PANE_ID}' 2>/dev/null)
 
     local has_sl=false has_sr=false
-    while IFS=$'\t' read -r pid _pleft _ptop _pwidth _pheight; do
-        case "$(tmux show-options -pv -t "$pid" @PANE_ID 2>/dev/null || echo "")" in
-            palace:SL) has_sl=true ;;
-            palace:SR) has_sr=true ;;
-        esac
-    done < <(get_side_panes)
+    local t
+    for t in "${existing_tags[@]+"${existing_tags[@]}"}"; do
+        [[ "$t" == "palace:SL" ]] && has_sl=true
+        [[ "$t" == "palace:SR" ]] && has_sr=true
+    done
 
-    local wdir
-    wdir=$(tmux display-message -t "$ACTIVE_PANE" -p '#{pane_current_path}' 2>/dev/null || echo "$HOME")
+    [[ "$has_sl" == true && "$has_sr" == true ]] && return 0
+
+    local win_w side_w
+    win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
+    side_w=$(( (win_w - 5) * PALACE_SIDE_CANONICAL_RATIO / 100 ))
+
+    local first_pane last_pane
+    first_pane=$(tmux list-panes -t "$TARGET" -F '#{pane_id}' | head -1)
+    last_pane=$(tmux list-panes -t "$TARGET" -F '#{pane_id}' | tail -1)
 
     if [[ "$has_sl" != true ]]; then
-        local first_pane new_left
-        first_pane=$(tmux list-panes -t "$TARGET" -F '#{pane_id}' | head -1)
-        new_left=$(tmux split-window -fhb -t "$first_pane" -l "${side_w}" -c "${wdir:-$HOME}" -P -F '#{pane_id}')
+        local new_left
+        new_left=$(tmux split-window -fh -b -t "$first_pane" -l "$side_w" -P -F '#{pane_id}' -c "$HOME")
         pane_tag "$new_left" "palace:SL"
         tmux set-option -p -t "$new_left" @GRID_RESERVED "false" 2>/dev/null || true
     fi
 
     if [[ "$has_sr" != true ]]; then
-        local last_pane new_right
         last_pane=$(tmux list-panes -t "$TARGET" -F '#{pane_id}' | tail -1)
-        new_right=$(tmux split-window -fh -t "$last_pane" -l "${side_w}" -c "${wdir:-$HOME}" -P -F '#{pane_id}')
+        local new_right
+        new_right=$(tmux split-window -fh -t "$last_pane" -l "$side_w" -P -F '#{pane_id}' -c "$HOME")
         pane_tag "$new_right" "palace:SR"
         tmux set-option -p -t "$new_right" @GRID_RESERVED "false" 2>/dev/null || true
     fi
 }
 
 reset_side_to_canonical() {
-    local origin
-    origin=$(get_layout_origin)
-
     local side_ids=()
     while IFS=$'\t' read -r pid _pleft _ptop _pwidth _pheight; do
         side_ids+=("$pid")
@@ -228,18 +226,11 @@ reset_side_to_canonical() {
 
     local win_w desired
     win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
-
-    case "$origin" in
-        wsl)
-            desired=$(( (win_w - 5) * WSL_SIDE_CANONICAL_RATIO / 100 ))
-            ;;
-        mac)
-            desired=$(( (win_w - 2) * MAC_SIDE_CANONICAL_RATIO / 100 ))
-            ;;
-        *)
-            return 0
-            ;;
-    esac
+    if [[ "$WINDOW_BASE" == "palace" ]]; then
+        desired=$(( (win_w - 5) * PALACE_SIDE_CANONICAL_RATIO / 100 ))
+    else
+        desired=$(( (win_w - 2) * SOMNIUM_SIDE_CANONICAL_RATIO / 100 ))
+    fi
 
     local pid
     for pid in "${side_ids[@]}"; do
@@ -267,49 +258,31 @@ soft_bump_pane_to_legion() {
 
 do_side_expand() {
     local target_side="$1"
-    local origin
-    origin=$(get_layout_origin)
 
-    if [[ "$origin" == "wsl" ]]; then
-        do_side_expand_wsl "$target_side"
-    elif [[ "$origin" == "mac" ]]; then
-        do_side_expand_mac "$target_side"
-    fi
-}
+    if [[ "$WINDOW_BASE" == "palace" ]]; then
+        # Palace: kill the OTHER side column. Freed width is absorbed by the
+        # active side, so grid panes stay the same size.
+        local target_w other_w
+        target_w=$(tmux display-message -t "$target_side" -p '#{pane_width}')
+        local other_pid=""
+        while IFS=$'\t' read -r pid _pleft _ptop pwidth _pheight; do
+            if [[ "$pid" != "$target_side" ]]; then
+                other_pid="$pid"
+                other_w="$pwidth"
+            fi
+        done < <(get_side_panes)
 
-do_side_expand_wsl() {
-    local target_side="$1"
-
-    local other_side="" target_w=0 other_w=0 target_left=0 other_left=0
-    while IFS=$'\t' read -r pid pleft ptop pwidth pheight; do
-        if [[ "$pid" == "$target_side" ]]; then
-            target_w=$pwidth; target_left=$pleft
-        else
-            other_side="$pid"; other_w=$pwidth; other_left=$pleft
+        if [[ -n "$other_pid" ]]; then
+            tmux kill-pane -t "$other_pid" 2>/dev/null || true
+            tmux resize-pane -t "$target_side" -x "$((target_w + other_w + 1))" 2>/dev/null || true
         fi
-    done < <(get_side_panes)
-
-    [[ -z "$other_side" ]] && return
-
-    local win_w desired
-    win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
-    desired=$(( (win_w - 5) * WSL_SIDE_EXPAND_RATIO / 100 ))
-
-    if [[ -n "$other_side" ]]; then
-        soft_bump_pane_to_legion "$other_side"
+        return 0
     fi
 
-    tmux resize-pane -t "$target_side" -x "$desired"
-    rebalance_grid_even
-    tmux select-pane -t "$target_side" 2>/dev/null || true
-}
-
-do_side_expand_mac() {
-    local target_side="$1"
     local win_w
     win_w=$(tmux display-message -t "$TARGET" -p '#{window_width}')
 
-    local new_monitor_w=$((win_w * MAC_SIDE_EXPAND_RATIO / 100))
+    local new_monitor_w=$((win_w * SOMNIUM_SIDE_EXPAND_RATIO / 100))
 
     find_grid_cols
     compute_grid_bounds
@@ -576,8 +549,6 @@ do_grid_retract() {
 apply_side_expansion() {
     local side_exp
     side_exp=$(tmux show-options -wv -t "$TARGET" @SIDE_EXPANDED 2>/dev/null || echo "none")
-    local origin
-    origin=$(get_layout_origin)
     local focused
     focused=$(tmux show-options -wv -t "$TARGET" @FOCUSED 2>/dev/null || echo "false")
 
@@ -596,8 +567,8 @@ apply_side_expansion() {
         tmux set-option -w -t "$TARGET" @SIDE_EXPANDED "none" 2>/dev/null || true
     fi
 
-    if [[ "$side_exp" == "none" && "$origin" == "wsl" ]]; then
-        ensure_wsl_side_slots
+    if [[ "$side_exp" == "none" ]]; then
+        ensure_palace_side_slots
     fi
 
     reset_side_to_canonical
@@ -630,10 +601,10 @@ clear_stale_prompts() {
     done <<< "$all_panes"
 }
 
-# ─── Generic Expansion (non-palace windows) ─────────────────────────
+# ─── Generic Expansion (non-somnium windows) ─────────────────────────
 
 # Expand the active pane by stashing all non-reserved sibling panes.
-# Reserved panes (@GRID_RESERVED == "true") stay in place (e.g. TUI monitor on warp).
+# Reserved panes (@GRID_RESERVED == "true") stay in place.
 do_generic_expand() {
     local target_pane="$1"
 
@@ -810,16 +781,16 @@ case "${1:-}" in
             fi
 
         elif [[ "$active_state" == "small" ]]; then
-            # No active grid expansion — check if we have a proper 2x2 for palace expand
+            # No active grid expansion — check if we have a proper 2x2 for somnium expand
             grid_pane_count=$(get_grid_panes | wc -l | tr -d ' ')
 
             if [[ "$grid_pane_count" -eq 4 ]]; then
-                # Palace 2x2 grid pane: expand to true fullscreen
+                # Somnium 2x2 grid pane: expand to true fullscreen
                 tmux set-option -w -t "$TARGET" @GRID_EXPANDED "$ACTIVE_PANE"
                 do_grid_expand "$ACTIVE_PANE"
                 apply_side_expansion
             else
-                # Non-palace window with "small" panes (warp, etc.) → generic expand
+                # Non-grid window with "small" panes → generic expand
                 active_reserved=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_RESERVED 2>/dev/null || echo "false")
                 if [[ "$active_reserved" == "true" ]]; then
                     tmux display-message "Cannot expand reserved pane"
@@ -851,7 +822,7 @@ case "${1:-}" in
             clear_stale_prompts
 
         else
-            # Generic expand: works on any window (warp, mechanicus, legion, etc.)
+            # Generic expand: works on any window (mechanicus, legion, etc.)
             # Stashes non-reserved sibling panes, preserves reserved ones (TUI monitor).
             # Skip if active pane is reserved (e.g. TUI monitor — nothing useful to expand into).
             active_reserved=$(tmux show-options -pv -t "$ACTIVE_PANE" @GRID_RESERVED 2>/dev/null || echo "false")

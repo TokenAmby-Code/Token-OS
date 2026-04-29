@@ -5,6 +5,9 @@ from .tmux_adapter import TmuxAdapter
 GRID_STATE_SMALL = "small"
 GRID_STATE_SIDE = "side"
 
+PALACE_SIDE_RATIO = 20
+SOMNIUM_SIDE_RATIO = 33
+
 
 def _window_base(window_name: str) -> str:
     return window_name.split("(", 1)[0]
@@ -63,26 +66,11 @@ def _side_panes(adapter: TmuxAdapter, target: str) -> list[dict[str, str]]:
     return [row for row in _pane_rows(adapter, target) if row["grid_state"] == GRID_STATE_SIDE]
 
 
-def _infer_layout_origin(window_base: str, side_count: int) -> str:
-    if window_base in {"somnium", "bridge"}:
-        return "mac"
-    if window_base == "palace":
-        if side_count >= 2:
-            return "wsl"
-        if side_count == 1:
-            return "mac"
-    return ""
-
-
 def _current_path(adapter: TmuxAdapter, target: str) -> str:
     try:
         return _show(adapter, target, "#{pane_current_path}") or "~"
     except Exception:
         return "~"
-
-
-def _first_pane_id(adapter: TmuxAdapter, target: str) -> str:
-    return adapter.run("list-panes", "-t", target, "-F", "#{pane_id}").splitlines()[0]
 
 
 def _last_pane_id(adapter: TmuxAdapter, target: str) -> str:
@@ -109,17 +97,17 @@ def _split_window(
 
 
 def _ensure_palace_side_slots(adapter: TmuxAdapter, target: str, win_w: int) -> None:
-    side_w = ((win_w - 5) * 20) // 100
     pane_tags = set(_pane_tags(adapter, target))
+    side_w = ((win_w - 5) * PALACE_SIDE_RATIO) // 100
     path = _current_path(adapter, target)
 
     if "palace:SL" not in pane_tags:
-        new_left = _split_window(adapter, _first_pane_id(adapter, target), True, side_w, path)
+        first_pane = adapter.run("list-panes", "-t", target, "-F", "#{pane_id}").splitlines()[0]
+        new_left = _split_window(adapter, first_pane, True, side_w, path)
         _set_pane_option(adapter, new_left, "@PANE_ID", "palace:SL")
         _set_pane_option(adapter, new_left, "@GRID_STATE", GRID_STATE_SIDE)
         _set_pane_option(adapter, new_left, "@GRID_RESERVED", "false")
 
-    pane_tags = set(_pane_tags(adapter, target))
     if "palace:SR" not in pane_tags:
         new_right = _split_window(adapter, _last_pane_id(adapter, target), False, side_w, path)
         _set_pane_option(adapter, new_right, "@PANE_ID", "palace:SR")
@@ -132,7 +120,7 @@ def _ensure_somnium_side_slot(adapter: TmuxAdapter, target: str, win_w: int) -> 
     if "somnium:SR" in pane_tags:
         return
 
-    side_w = ((win_w - 2) * 33) // 100
+    side_w = ((win_w - 2) * SOMNIUM_SIDE_RATIO) // 100
     path = _current_path(adapter, target)
     new_right = _split_window(adapter, _last_pane_id(adapter, target), False, side_w, path)
     _set_pane_option(adapter, new_right, "@PANE_ID", "somnium:SR")
@@ -143,18 +131,16 @@ def _ensure_somnium_side_slot(adapter: TmuxAdapter, target: str, win_w: int) -> 
 
 
 def _reset_side_columns(
-    adapter: TmuxAdapter, side_panes: list[dict[str, str]], win_w: int, layout_origin: str
+    adapter: TmuxAdapter,
+    side_panes: list[dict[str, str]],
+    win_w: int,
+    *,
+    ratio: int = SOMNIUM_SIDE_RATIO,
+    border_count: int = 2,
 ) -> None:
     if not side_panes:
         return
-
-    if layout_origin == "wsl":
-        desired = ((win_w - 5) * 20) // 100
-    elif layout_origin == "mac":
-        desired = ((win_w - 2) * 33) // 100
-    else:
-        return
-
+    desired = ((win_w - border_count) * ratio) // 100
     for pane in side_panes:
         adapter.run("resize-pane", "-t", pane["pane_id"], "-x", str(desired))
 
@@ -292,33 +278,30 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
     win_w = int(_show(adapter, target, "#{window_width}"))
 
     side_panes = _side_panes(adapter, target)
-    layout_origin = _window_option(adapter, target, "@LAYOUT_ORIGIN")
-    if not layout_origin:
-        layout_origin = _infer_layout_origin(window_base, len(side_panes))
-        if layout_origin:
-            _set_window_option(adapter, target, "@LAYOUT_ORIGIN", layout_origin)
 
-    if not focused:
-        if (
-            window_base == "palace"
-            and layout_origin == "wsl"
-            and side_expanded == "none"
-            and len(side_panes) < 2
-        ):
-            _ensure_palace_side_slots(adapter, target, win_w)
-        if (
-            window_base in {"somnium", "bridge"}
-            and layout_origin == "mac"
-            and side_expanded == "none"
-            and len(side_panes) < 1
-        ):
-            _ensure_somnium_side_slot(adapter, target, win_w)
-    else:
-        _drop_side_panes(adapter, side_panes)
+    if window_base == "palace":
+        if not focused:
+            if side_expanded == "none" and len(side_panes) < 2:
+                _ensure_palace_side_slots(adapter, target, win_w)
+        else:
+            _drop_side_panes(adapter, side_panes)
 
-    side_panes = _side_panes(adapter, target)
-    _reset_side_columns(adapter, side_panes, win_w, layout_origin)
-    _rebalance_grid(adapter, target)
+        side_panes = _side_panes(adapter, target)
+        _reset_side_columns(
+            adapter, side_panes, win_w, ratio=PALACE_SIDE_RATIO, border_count=5
+        )
+        _rebalance_grid(adapter, target)
+
+    elif window_base == "somnium":
+        if not focused:
+            if side_expanded == "none" and len(side_panes) < 1:
+                _ensure_somnium_side_slot(adapter, target, win_w)
+        else:
+            _drop_side_panes(adapter, side_panes)
+
+        side_panes = _side_panes(adapter, target)
+        _reset_side_columns(adapter, side_panes, win_w)
+        _rebalance_grid(adapter, target)
 
     _set_window_option(adapter, target, "@GRID_EXPANDED", "none")
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")

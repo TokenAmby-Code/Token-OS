@@ -191,9 +191,9 @@ create_stack_pane() {
     echo "$new_pane"
 }
 
-# --- Free pane detection (for palace/warp reuse) ---
+# --- Free pane detection (for palace + somnium reuse) ---
 # Returns pane IDs that are running plain bash/zsh (no Claude, no TUI, no special process)
-# Only scans reuse windows (palace, warp). Stack windows (legion, mechanicus) always split.
+# Only scans the palace + somnium reuse windows. Stack windows always split.
 find_free_panes() {
     local grid_panes=()
     local other_panes=()
@@ -227,8 +227,8 @@ find_free_panes() {
             # Stale claim — reap it
             rm -f "$claim_file"
         fi
-        # Prioritize palace panes over mobile/other
-        if [[ "$window_name" == "palace" ]]; then
+        # Prioritize palace + somnium grid panes over other windows
+        if [[ "$window_name" == "palace" || "$window_name" == "somnium" ]]; then
             grid_panes+=("$pane_id")
         else
             other_panes+=("$pane_id")
@@ -339,7 +339,7 @@ Options:
   --engine <name>     Launch engine: claude (default) or codex
   --target <name>     Human dispatch target (default: legion:new)
   --window, -w <name> Legacy target window. Stack windows (legion, mechanicus)
-                      create a new pane. Reuse windows (palace, warp) scan for free panes.
+                      create a new pane. The somnium reuse window scans for free panes.
   --pane <id>         Target a specific pane (overrides --window). In stack windows,
                       still creates a new pane rather than reusing.
   --primarch <name>   Launch as a primarch persona
@@ -353,7 +353,7 @@ Examples:
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w mechanicus
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --primarch vulkan
-  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w palace
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w somnium
   vault-dispatch --list-free
 EOF
     exit 0
@@ -488,7 +488,7 @@ case "$DISPATCH_TARGET" in
         TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
         DISPATCH_MODE="stack_new"
         ;;
-    palace:*|somnium:*|bridge:*)
+    palace:*|somnium:*)
         TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
         DISPATCH_SLOT="$(dispatch_slot_of_target "$DISPATCH_TARGET")"
         DISPATCH_MODE="named_slot"
@@ -579,7 +579,7 @@ else
             fi
         done < <(find_free_panes)
         if [[ -z "$TARGET_PANE" ]]; then
-            log_error "No free panes in reuse windows (palace/warp)"
+            log_error "No free panes in the palace/somnium reuse windows"
             echo ""
             echo "  Options:"
             echo "  1. Use --window legion (default) to create a stack pane"
