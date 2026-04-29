@@ -209,7 +209,7 @@ case "$TARGET_MODE" in
     instance)
         INSTANCE_ID="$TARGET_VALUE"
         INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$TARGET_VALUE" 2>/dev/null || true)
-        if [[ -z "$INSTANCE_DATA" ]] || ! echo "$INSTANCE_DATA" | jq -e '.pid' >/dev/null 2>&1; then
+        if [[ -z "$INSTANCE_DATA" ]] || ! echo "$INSTANCE_DATA" | jq -e '(.pid // .tmux_pane // empty)' >/dev/null 2>&1; then
             echo "Error: Could not find instance '$TARGET_VALUE'." >&2
             exit 1
         fi
