@@ -93,6 +93,10 @@ TIMEOUT_MINS=8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --message)
+            if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+                error "--message requires a value"
+                exit 1
+            fi
             MESSAGE="$2"
             shift 2
             ;;
@@ -106,6 +110,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --timeout)
+            if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+                error "--timeout requires a positive integer value"
+                exit 1
+            fi
             TIMEOUT_MINS="$2"
             if ! [[ "$TIMEOUT_MINS" =~ ^[1-9][0-9]*$ ]]; then
                 error "Invalid --timeout value: must be a positive integer"
@@ -167,14 +175,14 @@ else
 fi
 
 # Get baseline comment counts and timestamps before posting
-BASELINE_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
-BASELINE_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
+BASELINE_REVIEW_COMMENTS=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
+    jq -s --arg bot "$REVIEWER_BOT" 'add | [.[] | select(.user.login == $bot)] | length')
+BASELINE_ISSUE_COMMENTS=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+    jq -s --arg bot "$REVIEWER_BOT" 'add | [.[] | select(.user.login == $bot)] | length')
 
 # Get the updated_at timestamp of the latest CodeRabbit summary comment (if any)
-BASELINE_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-    jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
+BASELINE_OVERVIEW_TIMESTAMP=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+    jq -s --arg bot "$REVIEWER_BOT" -r 'add | [.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
 # Capture the head SHA so we can check the coderabbit commit status against it.
 HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
@@ -219,21 +227,21 @@ while true; do
     fi
 
     # Fetch current comments
-    CURRENT_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
-    CURRENT_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg bot "$REVIEWER_BOT" '[.[] | select(.user.login == $bot)] | length')
+    CURRENT_REVIEW_COMMENTS=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
+        jq -s --arg bot "$REVIEWER_BOT" 'add | [.[] | select(.user.login == $bot)] | length')
+    CURRENT_ISSUE_COMMENTS=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+        jq -s --arg bot "$REVIEWER_BOT" 'add | [.[] | select(.user.login == $bot)] | length')
 
     NEW_INLINE_COUNT=$((CURRENT_REVIEW_COMMENTS - BASELINE_REVIEW_COMMENTS))
     NEW_OVERVIEW_COUNT=$((CURRENT_ISSUE_COMMENTS - BASELINE_ISSUE_COMMENTS))
 
     # Check for new summary comment OR updated existing one
-    CURRENT_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-        jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
+    CURRENT_OVERVIEW_TIMESTAMP=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+        jq -s --arg bot "$REVIEWER_BOT" -r 'add | [.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
     if [[ $NEW_OVERVIEW_COUNT -gt 0 ]]; then
-        LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-            jq --arg bot "$REVIEWER_BOT" -r '.[] | select(.user.login == $bot) | .body' | tail -1)
+        LATEST_ISSUE_COMMENT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+            jq -s --arg bot "$REVIEWER_BOT" -r 'add | .[] | select(.user.login == $bot) | .body' | tail -1)
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
             FOUND_OVERVIEW=true
@@ -242,8 +250,8 @@ while true; do
         fi
     elif [[ -n "$BASELINE_OVERVIEW_TIMESTAMP" ]] && [[ -n "$CURRENT_OVERVIEW_TIMESTAMP" ]] && \
          [[ "$CURRENT_OVERVIEW_TIMESTAMP" != "$BASELINE_OVERVIEW_TIMESTAMP" ]]; then
-        LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-            jq --arg bot "$REVIEWER_BOT" -r '[.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].body')
+        LATEST_ISSUE_COMMENT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+            jq -s --arg bot "$REVIEWER_BOT" -r 'add | [.[] | select(.user.login == $bot)] | sort_by(.updated_at) | .[-1].body')
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
             FOUND_OVERVIEW=true
@@ -255,9 +263,9 @@ while true; do
 
     # Also accept terminal coderabbit commit status (success/failure) as a stop signal.
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
-            jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
-            '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
+        CR_STATE=$(gh api --paginate "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+            jq -s --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
+            'add | [.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
             FOUND_OVERVIEW=true
             log "CodeRabbit commit status reached terminal state: $CR_STATE"
@@ -293,8 +301,8 @@ fi
 log "Fetching review results..."
 
 # Fetch all comments
-ALL_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
-ALL_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
+ALL_REVIEW_COMMENTS=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | jq -s 'add' || echo "[]")
+ALL_ISSUE_COMMENTS=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | jq -s 'add' || echo "[]")
 
 # Get new inline comments (after baseline)
 NEW_INLINE_COMMENTS=$(echo "$ALL_REVIEW_COMMENTS" | jq --arg bot "$REVIEWER_BOT" \
@@ -318,25 +326,25 @@ fi
 # Determine review state from PR reviews + commit status.
 REVIEW_STATE=""
 REVIEW_STATUS_ICON=""
-LATEST_REVIEW_STATE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
-    jq --arg bot "$REVIEWER_BOT" -r \
-    '[.[] | select(.user.login == $bot)] | sort_by(.submitted_at) | .[-1].state // ""')
+LATEST_REVIEW_STATE=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
+    jq -s --arg bot "$REVIEWER_BOT" -r \
+    'add | [.[] | select(.user.login == $bot)] | sort_by(.submitted_at) | .[-1].state // ""')
 CR_COMMIT_STATE=""
 if [[ -n "$HEAD_SHA" ]]; then
-    CR_COMMIT_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
-        jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
-        '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
+    CR_COMMIT_STATE=$(gh api --paginate "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+        jq -s --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
+        'add | [.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
 fi
 
 if [[ "$LATEST_REVIEW_STATE" == "CHANGES_REQUESTED" ]]; then
     REVIEW_STATE="CHANGES_REQUESTED"
     REVIEW_STATUS_ICON="❌"
-elif [[ "$LATEST_REVIEW_STATE" == "APPROVED" ]] || [[ "$CR_COMMIT_STATE" == "success" ]]; then
-    REVIEW_STATE="APPROVED"
-    REVIEW_STATUS_ICON="✅"
 elif [[ "$CR_COMMIT_STATE" == "failure" ]]; then
     REVIEW_STATE="FAILURE"
     REVIEW_STATUS_ICON="❌"
+elif [[ "$LATEST_REVIEW_STATE" == "APPROVED" ]] || [[ "$CR_COMMIT_STATE" == "success" ]]; then
+    REVIEW_STATE="APPROVED"
+    REVIEW_STATUS_ICON="✅"
 elif [[ -n "$LATEST_REVIEW_STATE" ]]; then
     REVIEW_STATE="$LATEST_REVIEW_STATE"
 fi
