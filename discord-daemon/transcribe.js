@@ -8,6 +8,7 @@ import { execFile } from 'child_process';
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { promisify } from 'util';
+import { createRealtimeTranscriber } from './realtime-transcriber.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -137,6 +138,7 @@ export function createTranscriber(config, logger) {
 
   // Transcription result callbacks
   const resultHandlers = [];
+  let realtime = null;
 
   // Short-utterance debounce: buffer 1-2 word transcriptions and prepend to next chunk.
   // Known false positives are dropped entirely. Keep this list small (<10) — the word-count
@@ -148,26 +150,8 @@ export function createTranscriber(config, logger) {
 
   function getBufferKey(botName, userId) { return `${botName || 'unknown'}:${userId}`; }
 
-  async function handleAudio(userId, pcmBuffer, pcmPath, botName) {
-    const timestamp = Date.now();
-
+  async function emitTranscript({ userId, text, timestamp = Date.now(), pcmPath = null, botName = null, realtime = false, ...extra }) {
     try {
-      let text;
-
-      if (provider === 'wispr') {
-        // Wispr Flow uses the raw PCM file directly — Hammerspoon handles playback
-        text = await transcribeWispr(pcmPath, logger);
-      } else if (provider === 'openai') {
-        if (!apiKey) {
-          logger.warn('Transcriber: skipping — no API key');
-          return;
-        }
-        const wavPath = join(audioDir, `${userId}-${timestamp}.wav`);
-        await pcmToWav(pcmBuffer, wavPath);
-        text = await transcribeWhisperAPI(wavPath, apiKey);
-        if (!config.keep_audio) { try { unlinkSync(wavPath); } catch {} }
-      }
-
       if (!text || text.trim().length === 0) {
         logger.debug('Transcriber: empty transcription, skipping');
         return;
@@ -215,7 +199,7 @@ export function createTranscriber(config, logger) {
       logger.info(`Transcriber [${botName || 'unknown'}]: [${userId}] "${text}"`);
 
       // Notify handlers
-      const result = { userId, text, timestamp, pcmPath, botName };
+      const result = { userId, text, timestamp, pcmPath, botName, realtime, ...extra };
       for (const handler of resultHandlers) {
         try {
           await handler(result);
@@ -231,8 +215,58 @@ export function createTranscriber(config, logger) {
     }
   }
 
+  if (provider === 'realtime-demo') {
+    realtime = createRealtimeTranscriber(config, logger, emitTranscript);
+  }
+
+  async function handleAudio(userId, pcmBuffer, pcmPath, botName) {
+    const timestamp = Date.now();
+
+    if (provider === 'realtime-demo') {
+      // Realtime mode consumes live PCM frames through handleAudioFrame().
+      // The chunk callback remains wired as a production fallback seam.
+      return null;
+    }
+
+    try {
+      let text;
+
+      if (provider === 'wispr') {
+        // Wispr Flow uses the raw PCM file directly — Hammerspoon handles playback
+        text = await transcribeWispr(pcmPath, logger);
+      } else if (provider === 'openai') {
+        if (!apiKey) {
+          logger.warn('Transcriber: skipping — no API key');
+          return;
+        }
+        const wavPath = join(audioDir, `${userId}-${timestamp}.wav`);
+        await pcmToWav(pcmBuffer, wavPath);
+        text = await transcribeWhisperAPI(wavPath, apiKey);
+        if (!config.keep_audio) { try { unlinkSync(wavPath); } catch {} }
+      }
+
+      return emitTranscript({ userId, text, timestamp, pcmPath, botName });
+    } catch (err) {
+      logger.error(`Transcriber: failed for ${userId}: ${err.message}`);
+      return null;
+    }
+  }
+
   return {
     handleAudio,
+    handleAudioFrame(userId, pcmChunk, botName) {
+      if (provider !== 'realtime-demo' || !realtime) return;
+      realtime.appendPCM(userId, pcmChunk, botName);
+    },
+    closeUser(userId, botName) {
+      if (realtime) realtime.closeUser(userId, botName);
+    },
+    closeAll() {
+      if (realtime) realtime.closeAll();
+    },
+    getRealtimeStatus() {
+      return realtime ? realtime.getStatus() : {};
+    },
     onTranscription(handler) { resultHandlers.push(handler); },
   };
 }
