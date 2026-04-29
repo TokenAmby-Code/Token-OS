@@ -20,3 +20,29 @@ source() {
 _reset_c_cleared() { [[ "$1" != "c" ]] && _c_cleared=false; }
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec _reset_c_cleared
+
+# Agent exit cleanup: hooks stage /tmp/agent-resume-${TMUX_PANE}; the next shell
+# prompt clears the terminal and records the resume command in zsh history.
+_agent_resume_precmd() {
+    local pane="${TMUX_PANE:-}"
+    [[ -z "$pane" ]] && return
+
+    local f="/tmp/agent-resume-${pane}"
+    local legacy="/tmp/claude-resume-${pane}"
+    local cmd=""
+
+    if [[ -f "$f" ]]; then
+        cmd="$(sed -n '2p' "$f" 2>/dev/null)"
+        rm -f "$f"
+    elif [[ -f "$legacy" ]]; then
+        cmd="$(cat "$legacy" 2>/dev/null)"
+        rm -f "$legacy"
+    else
+        return
+    fi
+
+    clear
+    [[ -z "$cmd" ]] && return
+    print -s "$cmd"
+}
+add-zsh-hook precmd _agent_resume_precmd

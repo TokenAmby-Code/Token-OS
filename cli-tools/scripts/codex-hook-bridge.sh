@@ -11,6 +11,8 @@ ACTION_TYPE="${1:-Unknown}"
 API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
+RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/scripts/agent-session-end-resume.sh"
+[[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="/Volumes/Imperium/Token-OS/cli-tools/scripts/agent-session-end-resume.sh"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 HOOK_INPUT="$(cat 2>/dev/null || true)"
@@ -24,13 +26,30 @@ if command -v jq >/dev/null 2>&1; then
             --arg tmux "${TMUX:-}" \
             --arg tmux_pane "${TMUX_PANE:-}" \
             --arg ssh_client "${SSH_CLIENT:-}" \
+            --arg token_session "${TOKEN_API_SESSION_ID:-}" \
+            --arg bridge_id "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
             '.action = $action
              | .cwd //= $cwd
              | .env //= {}
              | .env.TMUX = $tmux
              | .env.TMUX_PANE = $tmux_pane
-             | .env.SSH_CLIENT = $ssh_client' 2>/dev/null || printf '%s' "$HOOK_INPUT"
+             | .env.SSH_CLIENT = $ssh_client
+             | .env.TOKEN_API_SESSION_ID = $token_session
+             | .env.TOKEN_API_CODEX_BRIDGE_ID = $bridge_id' 2>/dev/null || printf '%s' "$HOOK_INPUT"
     )"
+fi
+
+if command -v jq >/dev/null 2>&1 && [[ -n "${TOKEN_API_CODEX_BRIDGE_ID:-}" ]]; then
+    CODEX_SESSION_ID="$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // .conversation_id // empty' 2>/dev/null || true)"
+    if [[ -n "$CODEX_SESSION_ID" && "$CODEX_SESSION_ID" != "${TOKEN_API_SESSION_ID:-}" ]]; then
+        BRIDGE_DIR="${HOME}/.codex/session-bridges"
+        mkdir -p "$BRIDGE_DIR" 2>/dev/null || true
+        printf '%s' "$CODEX_SESSION_ID" > "${BRIDGE_DIR}/${TOKEN_API_CODEX_BRIDGE_ID}.session_id" 2>/dev/null || true
+    fi
+fi
+
+if [[ "$ACTION_TYPE" == "Stop" ]]; then
+    printf '%s' "$HOOK_INPUT" | bash "$RESUME_SCRIPT" codex 2>/dev/null || true
 fi
 
 if [[ "${HOOK_DEBUG:-0}" == "1" ]]; then
