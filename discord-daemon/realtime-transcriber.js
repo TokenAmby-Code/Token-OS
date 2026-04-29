@@ -46,6 +46,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       lastDeltaAt: null,
       resampleRemainder: Buffer.alloc(0),
       pendingAudio: [],
+      cleanupTimer: null,
     };
 
     ws.on('open', () => {
@@ -101,6 +102,24 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         return;
       }
 
+      if (event.type === 'input_audio_buffer.committed') {
+        logger.info(
+          `Realtime demo [${botName}]: input committed item=${event.item_id || '?'} ` +
+          `previous=${event.previous_item_id || 'none'}`
+        );
+        return;
+      }
+
+      if (event.type === 'input_audio_buffer.speech_started') {
+        logger.debug(`Realtime demo [${botName}]: server VAD speech started`);
+        return;
+      }
+
+      if (event.type === 'input_audio_buffer.speech_stopped') {
+        logger.debug(`Realtime demo [${botName}]: server VAD speech stopped`);
+        return;
+      }
+
       if (event.type === 'conversation.item.input_audio_transcription.delta') {
         session.lastDeltaAt = Date.now();
         const firstAudioLatency = session.firstAudioAt ? session.lastDeltaAt - session.firstAudioAt : null;
@@ -132,6 +151,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           startedAt: session.startedAt,
           firstDeltaAt: session.lastDeltaAt,
         });
+        scheduleCleanup(session, 1000, 'completed');
       }
     });
 
@@ -218,15 +238,38 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     appendAudio(session, audio);
   }
 
+  function commitUser(userId, botName, meta = {}) {
+    const session = sessions.get(keyFor(botName, userId));
+    if (!session || session.closed || !session.ready) return false;
+    if (session.appendedFrames === 0) return false;
+    logger.info(
+      `Realtime demo [${botName}]: committing audio for user ${userId} ` +
+      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'})`
+    );
+    return send(session, { type: 'input_audio_buffer.commit' });
+  }
+
+  function scheduleCleanup(session, delayMs, reason) {
+    if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+    session.cleanupTimer = setTimeout(() => {
+      logger.info(`Realtime demo [${session.botName}]: cleanup after ${reason} for user ${session.userId}`);
+      cleanupSession(session.key);
+    }, delayMs);
+  }
+
   function cleanupSession(key) {
     const session = sessions.get(key);
     if (!session) return;
     sessions.delete(key);
+    if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     try { session.ws.close(); } catch {}
   }
 
   function closeUser(userId, botName) {
-    cleanupSession(keyFor(botName, userId));
+    const session = sessions.get(keyFor(botName, userId));
+    if (!session) return;
+    commitUser(userId, botName, { reason: 'stream-end' });
+    scheduleCleanup(session, 20_000, 'stream-end');
   }
 
   function closeAll() {
@@ -235,6 +278,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
   return {
     appendPCM,
+    commitUser,
     closeUser,
     closeAll,
     getStatus() {

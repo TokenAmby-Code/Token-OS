@@ -97,6 +97,9 @@ async function main() {
   voiceManager.setAudioEndCallback((userId, botName) => {
     return transcriber.closeUser?.(userId, botName);
   });
+  voiceManager.setAudioCommitCallback((userId, botName, meta) => {
+    return transcriber.commitUser?.(userId, botName, meta);
+  });
 
   // Forward transcription results to Token API
   transcriber.onTranscription(async (result) => {

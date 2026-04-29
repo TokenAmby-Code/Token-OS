@@ -49,6 +49,7 @@ export function createVoiceManager(botClients, config, logger) {
   let onTranscription = null;
   let onAudioFrame = null;
   let onAudioEnd = null;
+  let onAudioCommit = null;
   const SILENCE_PCM_20MS = Buffer.alloc(48000 / 50 * 2);
 
   function getBotState(botName) {
@@ -193,6 +194,9 @@ export function createVoiceManager(botClients, config, logger) {
         if (totalBytes > 0) {
           logger.info(`Voice [${botName}]: silence detected (${SILENCE_FLUSH_MS}ms), flushing chunk`);
           flushChunk();
+          if (onAudioCommit) {
+            try { onAudioCommit(userId, botName, { reason: 'silence', silenceMs: SILENCE_FLUSH_MS }); } catch {}
+          }
         }
       }, SILENCE_FLUSH_MS);
     }
@@ -290,6 +294,9 @@ export function createVoiceManager(botClients, config, logger) {
       if (sub.flush) {
         try { sub.flush(); } catch {}
       }
+      if (onAudioCommit) {
+        try { onAudioCommit(userId, botName, { reason: 'leave' }); } catch {}
+      }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
     }
@@ -320,6 +327,9 @@ export function createVoiceManager(botClients, config, logger) {
     for (const [userId, sub] of state.activeSubscriptions) {
       if (sub.flush) {
         try { sub.flush(); } catch {}
+      }
+      if (onAudioCommit) {
+        try { onAudioCommit(userId, botName, { reason: 'stop' }); } catch {}
       }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
@@ -626,6 +636,7 @@ export function createVoiceManager(botClients, config, logger) {
     setTranscriptionCallback(cb) { onTranscription = cb; },
     setAudioFrameCallback(cb) { onAudioFrame = cb; },
     setAudioEndCallback(cb) { onAudioEnd = cb; },
+    setAudioCommitCallback(cb) { onAudioCommit = cb; },
     reconcileOperatorVoiceState,
   };
 }
