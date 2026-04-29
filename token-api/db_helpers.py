@@ -23,6 +23,7 @@ async def get_instance(
     db_path: Path = DB_PATH,
 ) -> Optional[dict]:
     """Fetch a claude_instances row by id. Returns dict or None."""
+
     async def _query(conn: aiosqlite.Connection) -> Optional[dict]:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
@@ -72,6 +73,7 @@ async def count_instances_for_doc(
     db_path: Path = DB_PATH,
 ) -> int:
     """Count instances linked to a specific session document."""
+
     async def _query(conn: aiosqlite.Connection) -> int:
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",

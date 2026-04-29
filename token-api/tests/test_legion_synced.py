@@ -55,12 +55,20 @@ def client():
     """Create a test client for the FastAPI app."""
     from main import app
     from fastapi.testclient import TestClient
+
     return TestClient(app)
 
 
-def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
-                     status="idle", tmux_pane=None, working_dir="/tmp",
-                     last_activity=None):
+def _insert_instance(
+    instance_id=None,
+    *,
+    legion="astartes",
+    synced=0,
+    status="idle",
+    tmux_pane=None,
+    working_dir="/tmp",
+    last_activity=None,
+):
     """Insert a minimal test instance directly into DB."""
     iid = instance_id or str(uuid.uuid4())
     now = last_activity or datetime.now().isoformat()
@@ -70,8 +78,18 @@ def _insert_instance(instance_id=None, *, legion="astartes", synced=0,
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"test-{iid[:8]}", working_dir,
-         status, legion, synced, tmux_pane, now, now)
+        (
+            iid,
+            str(uuid.uuid4()),
+            f"test-{iid[:8]}",
+            working_dir,
+            status,
+            legion,
+            synced,
+            tmux_pane,
+            now,
+            now,
+        ),
     )
     conn.commit()
     conn.close()
@@ -82,9 +100,7 @@ def _get_instance(instance_id):
     """Read an instance row from DB."""
     conn = sqlite3.connect(_test_db.name)
     conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -306,7 +322,9 @@ class TestCivicAutoDetect:
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())
-        self._register_via_hook(client, working_dir="/Volumes/Imperium/Imperium-ENV", session_id=sid)
+        self._register_via_hook(
+            client, working_dir="/Volumes/Imperium/Imperium-ENV", session_id=sid
+        )
         row = _get_instance(sid)
         assert row is not None
         assert row["legion"] == "astartes"
@@ -332,24 +350,29 @@ class TestCivicAutoDetect:
 
 class TestMorningAckViaDiscord:
     def _post_discord_message(self, client, content, channel="chat"):
-        return client.post("/api/discord/message", json={
-            "channel_id": "test-channel-id",
-            "channel_name": channel,
-            "content": content,
-            "author": {"username": "Emperor", "id": "12345"},
-        })
+        return client.post(
+            "/api/discord/message",
+            json={
+                "channel_id": "test-channel-id",
+                "channel_name": channel,
+                "content": content,
+                "author": {"username": "Emperor", "id": "12345"},
+            },
+        )
 
     def test_discord_ack_clears_enforce(self, client):
         """'ack' keyword in Discord should clear pending enforce state."""
         # Set enforce to pending
-        MORNING_ENFORCE_STATE.update({
-            "status": "pending",
-            "session_type": "morning_session",
-            "fired_at": datetime.utcnow().isoformat(),
-            "acknowledged_at": None,
-            "override_reason": None,
-            "escalation_level": 0,
-        })
+        MORNING_ENFORCE_STATE.update(
+            {
+                "status": "pending",
+                "session_type": "morning_session",
+                "fired_at": datetime.utcnow().isoformat(),
+                "acknowledged_at": None,
+                "override_reason": None,
+                "escalation_level": 0,
+            }
+        )
 
         resp = self._post_discord_message(client, "ack")
         assert resp.status_code == 200
@@ -358,13 +381,15 @@ class TestMorningAckViaDiscord:
     def test_discord_ack_keywords(self, client):
         """All ack keywords should work."""
         for keyword in ("ack", "acknowledged", "acknowledge", "here", "awake"):
-            MORNING_ENFORCE_STATE.update({
-                "status": "pending",
-                "session_type": "morning_session",
-                "fired_at": datetime.utcnow().isoformat(),
-                "acknowledged_at": None,
-                "escalation_level": 0,
-            })
+            MORNING_ENFORCE_STATE.update(
+                {
+                    "status": "pending",
+                    "session_type": "morning_session",
+                    "fired_at": datetime.utcnow().isoformat(),
+                    "acknowledged_at": None,
+                    "escalation_level": 0,
+                }
+            )
             self._post_discord_message(client, keyword)
             assert MORNING_ENFORCE_STATE["status"] == "acknowledged", f"Keyword '{keyword}' failed"
 
@@ -376,13 +401,15 @@ class TestMorningAckViaDiscord:
 
     def test_discord_ack_case_insensitive(self, client):
         """Ack keywords should be case-insensitive."""
-        MORNING_ENFORCE_STATE.update({
-            "status": "pending",
-            "session_type": "morning_session",
-            "fired_at": datetime.utcnow().isoformat(),
-            "acknowledged_at": None,
-            "escalation_level": 0,
-        })
+        MORNING_ENFORCE_STATE.update(
+            {
+                "status": "pending",
+                "session_type": "morning_session",
+                "fired_at": datetime.utcnow().isoformat(),
+                "acknowledged_at": None,
+                "escalation_level": 0,
+            }
+        )
         self._post_discord_message(client, "ACK")
         assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
 

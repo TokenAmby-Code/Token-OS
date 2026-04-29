@@ -22,19 +22,20 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.11"
 
       - name: Install uv
+        env:
+          UV_VERSION: "0.8.15"
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python -m pip install "uv==${UV_VERSION}"
 
       - name: Sync Python deps (cli-tools)
         if: hashFiles('cli-tools/pyproject.toml') != ''
@@ -52,46 +53,63 @@ jobs:
         id: fmt
         continue-on-error: true
         run: |
-          set -o pipefail
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff format --check .) || echo "::warning::ruff format check failed (cli-tools)"
+          rc=0
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run ruff format --check .) || rc=1
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff format --check .) || echo "::warning::ruff format check failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run ruff format --check .) || rc=1
           fi
+          exit "$rc"
 
       - name: Lint (ruff)
         id: lint
         continue-on-error: true
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run ruff check .) || echo "::warning::ruff check failed (cli-tools)"
+          rc=0
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run ruff check .) || rc=1
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run ruff check .) || echo "::warning::ruff check failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run ruff check .) || rc=1
           fi
+          exit "$rc"
 
       - name: Typecheck (mypy)
         id: types
         continue-on-error: true
         run: |
-          if [ -d cli-tools ]; then
-            (cd cli-tools && uv run mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (cli-tools)"
+          rc=0
+          if [ -f cli-tools/pyproject.toml ]; then
+            set +e
+            output=$(cd cli-tools && uv run mypy --ignore-missing-imports . 2>&1)
+            project_rc=$?
+            set -e
+            printf '%s\n' "$output" | tail -100
+            [[ $project_rc -eq 0 ]] || rc=1
           fi
-          if [ -d token-api ]; then
-            (cd token-api && uv run mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (token-api)"
+          if [ -f token-api/pyproject.toml ]; then
+            set +e
+            output=$(cd token-api && uv run mypy --ignore-missing-imports . 2>&1)
+            project_rc=$?
+            set -e
+            printf '%s\n' "$output" | tail -100
+            [[ $project_rc -eq 0 ]] || rc=1
           fi
+          exit "$rc"
 
       - name: Test (pytest)
         id: test
         continue-on-error: true
         run: |
-          if [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run pytest -x --tb=short) || echo "::warning::pytest failed (cli-tools)"
+          rc=0
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run pytest -x --tb=short) || rc=1
           fi
-          if [ -d token-api/tests ]; then
-            (cd token-api && uv run pytest -x --tb=short) || echo "::warning::pytest failed (token-api)"
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run pytest -x --tb=short) || rc=1
           fi
+          exit "$rc"
 
       - name: CodeRabbit chill review
         id: cr
@@ -99,25 +117,25 @@ jobs:
         env:
           CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
         run: |
+          set -euo pipefail
           if [ -z "${CODERABBIT_API_KEY:-}" ]; then
             echo "::notice::CODERABBIT_API_KEY not set — skipping push-side cr CLI review"
             exit 0
           fi
           curl -fsSL https://cli.coderabbit.ai/install.sh | sh
-          # Try profile override flag first (assumed CLI support);
-          # fall back to a sibling .coderabbit-cli.yaml via --config if it exists.
+          export PATH="$HOME/.local/bin:$PATH"
+          review_args=(--api-key "$CODERABBIT_API_KEY" --base origin/main --plain)
           if [ -f .coderabbit-cli.yaml ]; then
-            cr review --config .coderabbit-cli.yaml --base "$GITHUB_REF_NAME" --output review.json || true
-          else
-            cr review --review-profile chill --base "$GITHUB_REF_NAME" --output review.json || true
+            review_args+=(--config .coderabbit-cli.yaml)
           fi
+          coderabbit review "${review_args[@]}" | tee coderabbit-review.txt
 
       - name: Upload review artifact
-        if: always() && hashFiles('review.json') != ''
-        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('coderabbit-review.txt') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coderabbit-chill-review
-          path: review.json
+          path: coderabbit-review.txt
           retention-days: 7
 
       - name: Summary

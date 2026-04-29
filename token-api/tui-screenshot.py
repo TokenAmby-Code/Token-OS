@@ -22,11 +22,13 @@ from pathlib import Path
 # Import the TUI module (hyphenated filename requires importlib)
 TUI_PATH = Path(__file__).parent / "token-api-tui.py"
 
+
 def load_tui():
     spec = importlib.util.spec_from_file_location("tui", str(TUI_PATH))
     tui = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tui)
     return tui
+
 
 def main():
     parser = argparse.ArgumentParser(description="Render TUI panels to SVG/text")
@@ -35,7 +37,12 @@ def main():
         choices=["timer-stats", "monitor", "dashboard", "info"],
         help="Which panel to render",
     )
-    parser.add_argument("--width", type=int, default=None, help="Terminal width to simulate (default: current terminal width)")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Terminal width to simulate (default: current terminal width)",
+    )
     parser.add_argument("--height", type=int, default=20, help="max_lines for panel (default: 20)")
     parser.add_argument("--svg", default="/tmp/tui-screenshot.svg", help="SVG output path")
     parser.add_argument("--txt", default="/tmp/tui-screenshot.txt", help="Text output path")
@@ -79,6 +86,7 @@ def main():
     except Exception as e:
         print(f"Error rendering panel '{args.panel}': {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

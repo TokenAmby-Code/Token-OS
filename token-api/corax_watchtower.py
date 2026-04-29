@@ -63,7 +63,9 @@ def _get(path: str):
     try:
         result = subprocess.run(
             ["curl", "-s", f"{API}{path}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return json.loads(result.stdout)
     except Exception:
@@ -74,7 +76,8 @@ def _alert(message: str):
     """Post to Discord #fleet. Corax speaks through Mechanicus channels (for now)."""
     subprocess.run(
         ["discord", "send", FLEET_CHANNEL, "--bot", "mechanicus", message],
-        capture_output=True, timeout=15,
+        capture_output=True,
+        timeout=15,
     )
     print(f"  ALERT: {message}")
 
@@ -108,7 +111,9 @@ def check_infrastructure_integrity(prev_state: dict) -> list[str]:
         if h is None:
             alerts.append(f"MISSING: `{name}` ({path}) — critical infrastructure file absent")
         elif name in prev_hashes and prev_hashes[name] != h and prev_hashes[name] is not None:
-            alerts.append(f"MODIFIED: `{name}` changed since last scan (was {prev_hashes[name]}, now {h})")
+            alerts.append(
+                f"MODIFIED: `{name}` changed since last scan (was {prev_hashes[name]}, now {h})"
+            )
 
     return alerts, current_hashes
 
@@ -129,7 +134,9 @@ def check_vault_anomalies(prev_state: dict) -> list[str]:
             delta = count - prev_counts[name]
             # Large swings are suspicious
             if abs(delta) > 20:
-                alerts.append(f"VAULT ANOMALY: `{name}` changed by {delta:+d} files ({prev_counts[name]} → {count})")
+                alerts.append(
+                    f"VAULT ANOMALY: `{name}` changed by {delta:+d} files ({prev_counts[name]} → {count})"
+                )
 
     return alerts, current_counts
 
@@ -192,7 +199,9 @@ def check_env_files() -> list[str]:
             try:
                 result = subprocess.run(
                     ["git", "check-ignore", str(p)],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                     cwd=p.parent,
                 )
                 if result.returncode != 0:
@@ -212,10 +221,17 @@ def check_prompt_directory() -> list[str]:
 
     # Patterns that indicate exfiltration or destruction — NOT internal API calls
     DANGEROUS_PATTERNS = [
-        "/etc/passwd", "/etc/shadow",
-        "rm -rf /", "mkfifo", "reverse shell",
-        "wget ", "\nnc ", "netcat ",
-        "base64 -d", "eval(", "exec(",
+        "/etc/passwd",
+        "/etc/shadow",
+        "rm -rf /",
+        "mkfifo",
+        "reverse shell",
+        "wget ",
+        "\nnc ",
+        "netcat ",
+        "base64 -d",
+        "eval(",
+        "exec(",
     ]
 
     try:
@@ -224,9 +240,7 @@ def check_prompt_directory() -> list[str]:
             lower = content.lower()
             found = [p for p in DANGEROUS_PATTERNS if p in lower]
             if found:
-                alerts.append(
-                    f"SUSPICIOUS PROMPT: `{f.name}` contains: {', '.join(found)}"
-                )
+                alerts.append(f"SUSPICIOUS PROMPT: `{f.name}` contains: {', '.join(found)}")
     except (FileNotFoundError, PermissionError):
         pass
 
@@ -262,11 +276,13 @@ def main():
     all_alerts.extend(check_prompt_directory())
 
     # Save state for next cycle
-    _save_state({
-        "timestamp": datetime.now().isoformat(),
-        "file_hashes": current_hashes,
-        "vault_counts": current_counts,
-    })
+    _save_state(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "file_hashes": current_hashes,
+            "vault_counts": current_counts,
+        }
+    )
 
     # Report or stay silent
     if all_alerts:

@@ -90,7 +90,9 @@ def build_source_datetime(parsed: ParsedTime, tz_name: str, anchor: date) -> dat
     except ZoneInfoNotFoundError as exc:  # pragma: no cover - depends on system data
         raise click.BadParameter(f"Unknown timezone: {tz_name}", param_hint="timezone") from exc
 
-    return datetime(anchor.year, anchor.month, anchor.day, parsed.hour, parsed.minute, tzinfo=source_tz)
+    return datetime(
+        anchor.year, anchor.month, anchor.day, parsed.hour, parsed.minute, tzinfo=source_tz
+    )
 
 
 def format_timezone(tzinfo) -> str:
@@ -124,7 +126,9 @@ def format_timezone(tzinfo) -> str:
     show_default=True,
     help="Quiet prints just the converted time; verbose shows extra context.",
 )
-def main(time: str, timezone: str, anchor_date: datetime | None, output_format: str, quiet: bool) -> None:
+def main(
+    time: str, timezone: str, anchor_date: datetime | None, output_format: str, quiet: bool
+) -> None:
     """Convert TIME in SOURCE_TZ to the system's local timezone."""
 
     parsed = parse_time(time)

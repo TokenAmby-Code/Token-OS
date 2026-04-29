@@ -15,6 +15,11 @@
 #   lookup_port <worktree-dir>    → echoes assigned port or empty
 #   list_ports                     → dumps the registry as text
 
+_wp_run_strict() (
+    set -euo pipefail
+    "$@"
+)
+
 WORKTREE_PORT_POOL_START=7100
 WORKTREE_PORT_POOL_END=7199
 WORKTREE_PORT_REGISTRY="${HOME}/.local/state/imperium/worktree-ports.json"
@@ -91,9 +96,9 @@ _wp_free_inner() {
         local pids
         pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
-            kill -INT $pids 2>/dev/null || true
+            printf '%s\n' "$pids" | xargs -n1 kill -INT 2>/dev/null || true
             sleep 1
-            kill -KILL $pids 2>/dev/null || true
+            printf '%s\n' "$pids" | xargs -n1 kill -KILL 2>/dev/null || true
         fi
     fi
 
@@ -106,21 +111,29 @@ _wp_free_inner() {
 
 assign_port() {
     [[ $# -eq 1 ]] || { echo "assign_port <worktree-dir>" >&2; return 1; }
-    _wp_with_lock _wp_assign_inner "$1"
+    _wp_run_strict _wp_with_lock _wp_assign_inner "$1"
 }
 
 free_port() {
     [[ $# -eq 1 ]] || { echo "free_port <worktree-dir>" >&2; return 1; }
-    _wp_with_lock _wp_free_inner "$1"
+    _wp_run_strict _wp_with_lock _wp_free_inner "$1"
 }
 
 lookup_port() {
     [[ $# -eq 1 ]] || { echo "lookup_port <worktree-dir>" >&2; return 1; }
+    _wp_run_strict _wp_lookup_inner "$1"
+}
+
+list_ports() {
+    _wp_run_strict _wp_list_inner
+}
+
+_wp_lookup_inner() {
     _wp_ensure_registry
     jq -r --arg k "$1" '.[$k] // empty' "$WORKTREE_PORT_REGISTRY"
 }
 
-list_ports() {
+_wp_list_inner() {
     _wp_ensure_registry
     jq -r 'to_entries | sort_by(.value) | .[] | "\(.value)\t\(.key)"' "$WORKTREE_PORT_REGISTRY"
 }

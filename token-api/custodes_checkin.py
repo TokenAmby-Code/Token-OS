@@ -3,6 +3,7 @@
 Reads Emperor state, synthesizes an observation, posts to Discord #briefing,
 and appends to the daily note.
 """
+
 import json
 import re
 import subprocess
@@ -29,9 +30,9 @@ def get_instances():
 
 def active_instances(instances):
     return [
-        i for i in instances
-        if i.get("status") in ("active", "processing", "idle")
-        and not i.get("is_subagent")
+        i
+        for i in instances
+        if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")
     ]
 
 
@@ -43,7 +44,9 @@ def get_session_doc(instance):
     try:
         result = subprocess.run(
             ["obsidian", "vault=Imperium-ENV", "read", f'path="Terra/Sessions/{doc_id}.md"'],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
             # Return first non-empty, non-frontmatter lines as summary
@@ -59,7 +62,9 @@ def get_daily_thread_id(today: str) -> str | None:
     try:
         result = subprocess.run(
             ["obsidian", "vault=Imperium-ENV", "read", f'path="Terra/Journal/Daily/{today}.md"'],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
             # Look for pattern: "Thread: ... (ID <snowflake>)"
@@ -89,7 +94,7 @@ def build_observation(state: dict, active: list, session_summary: str | None) ->
         instance_line = f"1 active instance: **{name}**."
     else:
         names = ", ".join(f"**{i['tab_name']}**" for i in active[:4])
-        suffix = f" (+{n-4} more)" if n > 4 else ""
+        suffix = f" (+{n - 4} more)" if n > 4 else ""
         instance_line = f"{n} active instances: {names}{suffix}."
 
     lines = [
@@ -107,7 +112,9 @@ def post_to_discord(observation: str, thread_id: str | None, today: str):
     if thread_id:
         result = subprocess.run(
             ["discord", "thread", "send", thread_id, observation],
-            capture_output=True, text=True, timeout=15
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if result.returncode == 0:
             print(f"  Posted to thread {thread_id}")
@@ -116,8 +123,12 @@ def post_to_discord(observation: str, thread_id: str | None, today: str):
 
     # No thread or thread failed — post header + observation to #briefing
     header = f"**Custodes — {today}**"
-    subprocess.run(["discord", "send", "briefing", f"{header}\n{observation}"],
-                   capture_output=True, text=True, timeout=15)
+    subprocess.run(
+        ["discord", "send", "briefing", f"{header}\n{observation}"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
     print("  Posted to #briefing")
 
 
@@ -126,7 +137,9 @@ def append_to_daily_note(observation: str, today: str, timestamp: str):
     entry = f"\n## Custodes — {timestamp}\n\n{observation}\n"
     result = subprocess.run(
         ["obsidian", "vault=Imperium-ENV", "append", f'path="{note_path}"', f'content="{entry}"'],
-        capture_output=True, text=True, timeout=10
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     if result.returncode == 0:
         print(f"  Appended to {note_path}")

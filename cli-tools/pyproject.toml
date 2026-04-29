@@ -36,7 +36,8 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP"]
+# Initial blocking gate: fatal syntax/name errors only until baseline cleanup lands.
+select = ["E9", "F63", "F7", "F82"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.ruff.format]

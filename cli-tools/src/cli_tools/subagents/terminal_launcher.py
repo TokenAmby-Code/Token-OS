@@ -155,7 +155,9 @@ def _build_shell_command(command: Sequence[str], working_dir: Path) -> str:
     return f"cd {quoted_cwd} && {shlex.join(list(command))}; exec bash"
 
 
-def _build_wsl_shell_command(command: Sequence[str], working_dir: Path, keep_open: bool = True) -> str:
+def _build_wsl_shell_command(
+    command: Sequence[str], working_dir: Path, keep_open: bool = True
+) -> str:
     wsl_path = _normalize_wsl_unc_path(str(working_dir))
 
     quoted_cwd = shlex.quote(wsl_path)

@@ -4,6 +4,7 @@ Used by the cron engine and any script that depends on /Volumes/Imperium or
 /Volumes/Civic being available. Attempts to remount via AppleScript (uses
 macOS keychain credentials) before giving up.
 """
+
 import os
 import subprocess
 import time
@@ -11,18 +12,18 @@ import time
 # Share definitions: (mount_point, smb_uri)
 NAS_SHARES = {
     "/Volumes/Imperium": "smb://TokenClaw@Token-NAS._smb._tcp.local/Imperium",
-    "/Volumes/Civic":    "smb://TokenClaw@Token-NAS._smb._tcp.local/Civic",
+    "/Volumes/Civic": "smb://TokenClaw@Token-NAS._smb._tcp.local/Civic",
 }
 
 # Probe file that must exist and be readable to confirm the mount is live
 # (not just a stale ghost directory)
 _PROBE_FILES = {
     "/Volumes/Imperium": "/Volumes/Imperium/Imperium-ENV",
-    "/Volumes/Civic":    "/Volumes/Civic/Pax-ENV",
+    "/Volumes/Civic": "/Volumes/Civic/Pax-ENV",
 }
 
-MOUNT_TIMEOUT_SECONDS = 15   # Max wait after triggering a mount attempt
-MOUNT_POLL_INTERVAL  = 1.0   # How often to re-check during wait
+MOUNT_TIMEOUT_SECONDS = 15  # Max wait after triggering a mount attempt
+MOUNT_POLL_INTERVAL = 1.0  # How often to re-check during wait
 
 
 def is_mounted(mount_point: str) -> bool:
@@ -42,7 +43,9 @@ def _trigger_mount(smb_uri: str) -> bool:
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         return result.returncode == 0
     except Exception:

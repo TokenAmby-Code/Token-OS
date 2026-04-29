@@ -23,9 +23,12 @@ from langgraph.graph import END, StateGraph
 
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _MINIMAX_MODEL = "MiniMax-M2.5"
+
+
 def _get_minimax_key() -> str:
     """Read MiniMax API key from MINIMAX_API_KEY env var."""
     import os
+
     key = os.environ.get("MINIMAX_API_KEY")
     if not key:
         raise RuntimeError("MINIMAX_API_KEY environment variable not set")
@@ -159,20 +162,27 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
     # Store in DB
     try:
         import aiosqlite
+
         db_path = Path(_HOME) / ".claude" / "agents.db"
         async with aiosqlite.connect(db_path) as db:
             for r in results:
-                await db.execute("""
+                await db.execute(
+                    """
                     INSERT INTO guard_runs
                         (cron_run_id, job_id, guard_index, verdict, findings, model, duration_ms, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    cron_run_id, job_id, r["guard_index"],
-                    r["verdict"], r["findings"],
-                    _MINIMAX_MODEL,
-                    r["duration_ms"],
-                    datetime.now().isoformat(),
-                ))
+                """,
+                    (
+                        cron_run_id,
+                        job_id,
+                        r["guard_index"],
+                        r["verdict"],
+                        r["findings"],
+                        _MINIMAX_MODEL,
+                        r["duration_ms"],
+                        datetime.now().isoformat(),
+                    ),
+                )
             await db.commit()
     except Exception as e:
         print(f"PostRunGraph: Failed to store guard_runs: {e}")
@@ -183,7 +193,8 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
 
     concern_lines = [
-        f"  • {r['findings']}" for r in results
+        f"  • {r['findings']}"
+        for r in results
         if r["verdict"] in ("concern", "invalid") and r["findings"]
     ]
 
@@ -192,7 +203,9 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
         "concern": "⚠️",
         "invalid": "❌",
     }
-    overall = "invalid" if counts["invalid"] > 0 else ("concern" if counts["concern"] > 0 else "valid")
+    overall = (
+        "invalid" if counts["invalid"] > 0 else ("concern" if counts["concern"] > 0 else "valid")
+    )
     icon = verdict_icons[overall]
 
     lines = [
@@ -247,6 +260,7 @@ async def followup_decision_node(state: PostRunState) -> PostRunState:
 
 def _subprocess_env() -> dict:
     import os
+
     env = dict(os.environ)
     extra = [
         f"{_HOME}/Token-OS/cli-tools/bin",

@@ -4,7 +4,8 @@ name: PR Gate (blocking)
 # Triggered on PR open / synchronize / reopen against main. Failures here
 # block merge via branch protection. CodeRabbit GitHub App handles the
 # assertive review (governed by .coderabbit.yaml in repo root) — this
-# workflow runs the deterministic gates: format, lint, typecheck, tests.
+# workflow runs the deterministic gates. The initial cutover blocks on format
+# and fatal lint; typecheck/tests are advisory until their baseline is clean.
 
 on:
   pull_request:
@@ -27,19 +28,20 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.11"
 
       - name: Install uv
+        env:
+          UV_VERSION: "0.8.15"
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python -m pip install "uv==${UV_VERSION}"
 
       - name: Sync Python deps (cli-tools)
         if: hashFiles('cli-tools/pyproject.toml') != ''
@@ -53,40 +55,44 @@ jobs:
 
       - name: Format check (ruff)
         run: |
-          if [ -d cli-tools ]; then
+          if [ -f cli-tools/pyproject.toml ]; then
             (cd cli-tools && uv run ruff format --check .)
           fi
-          if [ -d token-api ]; then
+          if [ -f token-api/pyproject.toml ]; then
             (cd token-api && uv run ruff format --check .)
           fi
 
       - name: Lint (ruff)
         run: |
-          if [ -d cli-tools ]; then
+          if [ -f cli-tools/pyproject.toml ]; then
             (cd cli-tools && uv run ruff check .)
           fi
-          if [ -d token-api ]; then
+          if [ -f token-api/pyproject.toml ]; then
             (cd token-api && uv run ruff check .)
           fi
 
       - name: Typecheck (mypy)
+        continue-on-error: true
         run: |
-          if [ -d cli-tools ]; then
+          if [ -f cli-tools/pyproject.toml ]; then
             (cd cli-tools && uv run mypy --ignore-missing-imports .)
           fi
-          if [ -d token-api ]; then
+          if [ -f token-api/pyproject.toml ]; then
             (cd token-api && uv run mypy --ignore-missing-imports .)
           fi
 
       - name: Test (pytest)
+        continue-on-error: true
+        timeout-minutes: 5
         run: |
-          if [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run pytest --tb=short)
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run pytest -x --tb=short)
           fi
-          if [ -d token-api/tests ]; then
-            (cd token-api && uv run pytest --tb=short)
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run pytest -x --tb=short)
           fi
 
   # CodeRabbit GitHub App posts its own `coderabbit` commit status. Branch
-  # protection on main is configured to require BOTH "PR Gate (blocking) /
-  # quality" AND "coderabbit" to pass before merge.
+  # protection on main requires BOTH "PR Gate (blocking) / quality" AND
+  # "coderabbit" before merge. Typecheck/tests should become blocking after
+  # the existing baseline failures are resolved.

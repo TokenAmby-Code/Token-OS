@@ -27,7 +27,9 @@ def _get(path: str):
     try:
         result = subprocess.run(
             ["curl", "-s", f"{API}{path}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return json.loads(result.stdout)
     except Exception:
@@ -38,7 +40,8 @@ def _alert(message: str):
     """Post to Discord #fleet via Mechanicus account. Alpharius wears the cog."""
     subprocess.run(
         ["discord", "send", FLEET_CHANNEL, "--bot", "mechanicus", message],
-        capture_output=True, timeout=15,
+        capture_output=True,
+        timeout=15,
     )
     print(f"  ALERT: {message}")
 

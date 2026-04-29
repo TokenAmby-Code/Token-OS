@@ -140,15 +140,19 @@ class TestVoiceAssignmentAPI:
         """Create a test client for the FastAPI app."""
         from main import app
         from fastapi.testclient import TestClient
+
         return TestClient(app)
 
     def _register(self, client, name: str) -> dict:
         """Helper to register an instance and return the response."""
-        resp = client.post("/api/instances/register", json={
-            "instance_id": str(uuid.uuid4()),
-            "tab_name": name,
-            "working_dir": f"/tmp/test-{name}",
-        })
+        resp = client.post(
+            "/api/instances/register",
+            json={
+                "instance_id": str(uuid.uuid4()),
+                "tab_name": name,
+                "working_dir": f"/tmp/test-{name}",
+            },
+        )
         assert resp.status_code == 200, f"Registration failed: {resp.text}"
         return resp.json()
 

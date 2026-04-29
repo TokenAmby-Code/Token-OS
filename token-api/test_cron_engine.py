@@ -69,10 +69,12 @@ def engine(db_path):
     scheduler.remove_job = MagicMock()
     scheduler.get_job = MagicMock(return_value=None)
     eng = CronEngine(scheduler, db_path)
+
     async def _init():
         async with aiosqlite.connect(db_path) as db:
             await CronEngine.init_tables(db)
             await db.commit()
+
     run(_init())
     return eng
 
@@ -156,6 +158,7 @@ class TestQuietHours:
         job = {"quiet_hours_start": 22, "quiet_hours_end": 8, "timezone": "America/Phoenix"}
         with patch("cron_engine.datetime") as mock_dt:
             from zoneinfo import ZoneInfo
+
             mock_now = MagicMock()
             mock_now.hour = 14  # 2 PM
             mock_dt.now.return_value = mock_now
@@ -217,6 +220,7 @@ class TestQuota:
 
     def test_under_quota_allowed(self, engine, db_path):
         job = {"id": "j1", "max_runs_per_window": 3, "run_window_hours": 1}
+
         # Insert 2 runs
         async def setup():
             async with aiosqlite.connect(db_path) as db:
@@ -226,11 +230,13 @@ class TestQuota:
                         ("j1", datetime.now().isoformat(), datetime.now().isoformat()),
                     )
                 await db.commit()
+
         run(setup())
         assert run(engine._check_quota(job)) is True
 
     def test_at_quota_blocked(self, engine, db_path):
         job = {"id": "j1", "max_runs_per_window": 3, "run_window_hours": 1}
+
         async def setup():
             async with aiosqlite.connect(db_path) as db:
                 for _ in range(3):
@@ -239,12 +245,14 @@ class TestQuota:
                         ("j1", datetime.now().isoformat(), datetime.now().isoformat()),
                     )
                 await db.commit()
+
         run(setup())
         assert run(engine._check_quota(job)) is False
 
     def test_old_runs_dont_count(self, engine, db_path):
         """Runs outside the window shouldn't count against quota."""
         job = {"id": "j1", "max_runs_per_window": 2, "run_window_hours": 1}
+
         async def setup():
             old_time = (datetime.now() - timedelta(hours=2)).isoformat()
             async with aiosqlite.connect(db_path) as db:
@@ -254,12 +262,14 @@ class TestQuota:
                         ("j1", old_time, old_time),
                     )
                 await db.commit()
+
         run(setup())
         assert run(engine._check_quota(job)) is True
 
     def test_skipped_runs_dont_count(self, engine, db_path):
         """Skipped runs should not count against quota."""
         job = {"id": "j1", "max_runs_per_window": 2, "run_window_hours": 1}
+
         async def setup():
             now = datetime.now().isoformat()
             async with aiosqlite.connect(db_path) as db:
@@ -269,6 +279,7 @@ class TestQuota:
                         ("j1", now, now),
                     )
                 await db.commit()
+
         run(setup())
         assert run(engine._check_quota(job)) is True
 
@@ -323,6 +334,7 @@ class TestCRUD:
     def test_delete_cascades_runs(self, engine, db_path):
         created = run(engine.create_job(create_job_dict(name="crud-cascade")))
         job_id = created["id"]
+
         # Insert a run
         async def add_run():
             async with aiosqlite.connect(db_path) as db:
@@ -331,6 +343,7 @@ class TestCRUD:
                     (job_id, datetime.now().isoformat(), datetime.now().isoformat()),
                 )
                 await db.commit()
+
         run(add_run())
         run(engine.delete_job(job_id))
         runs = run(engine.get_runs(job_id))
@@ -395,10 +408,14 @@ class TestDelayedTrigger:
 
 class TestExecution:
     def test_simple_echo(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-echo",
-            command="echo hello_from_test",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-echo",
+                    command="echo hello_from_test",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert len(runs) == 1
@@ -407,21 +424,29 @@ class TestExecution:
         assert runs[0]["exit_code"] == 0
 
     def test_failing_command(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-fail",
-            command="exit 42",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-fail",
+                    command="exit 42",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "error"
         assert runs[0]["exit_code"] == 42
 
     def test_timeout(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-timeout",
-            command="sleep 30",
-            timeout_seconds=2,
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-timeout",
+                    command="sleep 30",
+                    timeout_seconds=2,
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "timeout"
@@ -430,40 +455,56 @@ class TestExecution:
 
     def test_timeout_stderr_collected(self, engine):
         """Stderr buffered before kill should survive in error_summary."""
-        created = run(engine.create_job(create_job_dict(
-            name="exec-timeout-stderr",
-            command="echo pre_kill_stderr >&2; sleep 30",
-            timeout_seconds=2,
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-timeout-stderr",
+                    command="echo pre_kill_stderr >&2; sleep 30",
+                    timeout_seconds=2,
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "timeout"
         assert "pre_kill_stderr" in runs[0]["error_summary"]
 
     def test_stderr_captured(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-stderr",
-            command="echo err_msg >&2; exit 1",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-stderr",
+                    command="echo err_msg >&2; exit 1",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert "err_msg" in runs[0]["error_summary"]
 
     def test_env_vars_injected(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-env",
-            command="echo $CRON_JOB_NAME",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-env",
+                    command="echo $CRON_JOB_NAME",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert "exec-env" in runs[0]["output_summary"]
 
     def test_duration_recorded(self, engine):
-        created = run(engine.create_job(create_job_dict(
-            name="exec-duration",
-            command="sleep 1 && echo done",
-            timeout_seconds=10,
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="exec-duration",
+                    command="sleep 1 && echo done",
+                    timeout_seconds=10,
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["duration_seconds"] >= 1.0
@@ -526,7 +567,13 @@ class TestConfigLoad:
 
     def test_upsert_on_reload(self, engine, tmp_path):
         """Reloading config should update, not duplicate."""
-        config = [{"name": "upsert-test", "schedule": {"type": "interval", "value": "5m"}, "command": "echo v1"}]
+        config = [
+            {
+                "name": "upsert-test",
+                "schedule": {"type": "interval", "value": "5m"},
+                "command": "echo v1",
+            }
+        ]
         config_path = tmp_path / "test.json"
         config_path.write_text(json.dumps(config))
         run(engine.load_from_config(config_path))
@@ -574,14 +621,18 @@ def api_get(path):
 
 def api_post(path, data=None):
     body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(f"{API}{path}", data=body, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(
+        f"{API}{path}", data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
 
 
 def api_patch(path, data):
     body = json.dumps(data).encode()
-    req = urllib.request.Request(f"{API}{path}", data=body, headers={"Content-Type": "application/json"}, method="PATCH")
+    req = urllib.request.Request(
+        f"{API}{path}", data=body, headers={"Content-Type": "application/json"}, method="PATCH"
+    )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
 
@@ -628,11 +679,14 @@ class TestIntegrationCRUD:
             pass
 
     def test_create_and_get(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-crud",
-            "command": "echo integration",
-            "schedule": {"type": "interval", "value": "1h"},
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-crud",
+                "command": "echo integration",
+                "schedule": {"type": "interval", "value": "1h"},
+            },
+        )
         try:
             assert job["name"] == "int-test-crud"
             assert job["id"]
@@ -642,11 +696,14 @@ class TestIntegrationCRUD:
             self._cleanup_job(job["id"])
 
     def test_update(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-update",
-            "command": "echo update",
-            "schedule": {"type": "interval", "value": "1h"},
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-update",
+                "command": "echo update",
+                "schedule": {"type": "interval", "value": "1h"},
+            },
+        )
         try:
             updated = api_patch(f"/api/cron/jobs/{job['id']}", {"enabled": 0})
             assert updated["enabled"] == 0
@@ -654,11 +711,14 @@ class TestIntegrationCRUD:
             self._cleanup_job(job["id"])
 
     def test_delete(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-delete",
-            "command": "echo delete",
-            "schedule": {"type": "interval", "value": "1h"},
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-delete",
+                "command": "echo delete",
+                "schedule": {"type": "interval", "value": "1h"},
+            },
+        )
         result = api_delete(f"/api/cron/jobs/{job['id']}")
         assert result["deleted"] is True
 
@@ -673,12 +733,15 @@ class TestIntegrationTrigger:
     """Test trigger and dry-run against live API."""
 
     def test_trigger_echo(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-trigger",
-            "command": "echo triggered_ok",
-            "schedule": {"type": "interval", "value": "1h"},
-            "enabled": False,
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-trigger",
+                "command": "echo triggered_ok",
+                "schedule": {"type": "interval", "value": "1h"},
+                "enabled": False,
+            },
+        )
         try:
             result = api_post(f"/api/cron/jobs/{job['id']}/trigger")
             assert result["triggered"] is True
@@ -691,12 +754,15 @@ class TestIntegrationTrigger:
             api_delete(f"/api/cron/jobs/{job['id']}")
 
     def test_dry_run(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-dryrun",
-            "command": "echo should_not_run",
-            "schedule": {"type": "interval", "value": "1h"},
-            "enabled": False,
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-dryrun",
+                "command": "echo should_not_run",
+                "schedule": {"type": "interval", "value": "1h"},
+                "enabled": False,
+            },
+        )
         try:
             result = api_post(f"/api/cron/jobs/{job['id']}/trigger?dry_run=true")
             assert result["dry_run"] is True
@@ -707,12 +773,15 @@ class TestIntegrationTrigger:
 
     def test_dry_run_with_quiet_hours(self):
         # Quiet 0-24 means always blocked
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-dryrun-quiet",
-            "command": "echo blocked",
-            "schedule": {"type": "interval", "value": "1h"},
-            "quiet_hours": [0, 24],
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-dryrun-quiet",
+                "command": "echo blocked",
+                "schedule": {"type": "interval", "value": "1h"},
+                "quiet_hours": [0, 24],
+            },
+        )
         try:
             result = api_post(f"/api/cron/jobs/{job['id']}/trigger?dry_run=true")
             assert result["would_run"] is False
@@ -725,12 +794,15 @@ class TestIntegrationPATH:
     """Verify that claude is in the subprocess PATH."""
 
     def test_claude_in_path(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-path-claude",
-            "command": "which claude",
-            "schedule": {"type": "interval", "value": "1h"},
-            "enabled": False,
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-path-claude",
+                "command": "which claude",
+                "schedule": {"type": "interval", "value": "1h"},
+                "enabled": False,
+            },
+        )
         try:
             api_post(f"/api/cron/jobs/{job['id']}/trigger")
             time.sleep(3)
@@ -741,7 +813,6 @@ class TestIntegrationPATH:
             api_delete(f"/api/cron/jobs/{job['id']}")
 
 
-
 @skip_no_server
 class TestIntegrationQuietHours:
     """Test quiet hours enforcement via live firing."""
@@ -749,12 +820,15 @@ class TestIntegrationQuietHours:
     def test_nighttime_blocked_during_day(self):
         """Job with quiet 8-22 should be skipped during daytime."""
         cleanup_job_by_name("int-test-quiet-night")
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-quiet-night",
-            "command": "echo should_not_fire",
-            "schedule": {"type": "interval", "value": "10s"},
-            "quiet_hours": [8, 22],
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-quiet-night",
+                "command": "echo should_not_fire",
+                "schedule": {"type": "interval", "value": "10s"},
+                "quiet_hours": [8, 22],
+            },
+        )
         try:
             time.sleep(15)
             runs = api_get(f"/api/cron/jobs/{job['id']}/runs?limit=5")
@@ -772,18 +846,25 @@ class TestIntegrationQuota:
     """Test quota enforcement via live firing."""
 
     def test_quota_caps_runs(self):
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-quota",
-            "command": "echo quota_run",
-            "schedule": {"type": "interval", "value": "5s"},
-            "max_runs_per_window": 2,
-            "run_window_hours": 1,
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-quota",
+                "command": "echo quota_run",
+                "schedule": {"type": "interval", "value": "5s"},
+                "max_runs_per_window": 2,
+                "run_window_hours": 1,
+            },
+        )
         try:
             time.sleep(20)
             runs = api_get(f"/api/cron/jobs/{job['id']}/runs?limit=10")
             ok_runs = [r for r in runs["runs"] if r["status"] == "ok"]
-            skipped_runs = [r for r in runs["runs"] if r["status"] == "skipped" and r["skip_reason"] == "quota_exceeded"]
+            skipped_runs = [
+                r
+                for r in runs["runs"]
+                if r["status"] == "skipped" and r["skip_reason"] == "quota_exceeded"
+            ]
             assert len(ok_runs) == 2
             assert len(skipped_runs) >= 1
         finally:
@@ -803,13 +884,16 @@ class TestIntegrationAgentLaunch:
         if proof_file.exists():
             proof_file.unlink()
 
-        job = api_post("/api/cron/jobs", {
-            "name": "int-test-agent",
-            "command": "claude -p \"Write exactly this to /tmp/test_suite_agent_proof.md using the Write tool: TEST_SUITE_AGENT_VERIFIED\" --dangerously-skip-permissions",
-            "schedule": {"type": "interval", "value": "1h"},
-            "timeout_seconds": 120,
-            "enabled": False,
-        })
+        job = api_post(
+            "/api/cron/jobs",
+            {
+                "name": "int-test-agent",
+                "command": 'claude -p "Write exactly this to /tmp/test_suite_agent_proof.md using the Write tool: TEST_SUITE_AGENT_VERIFIED" --dangerously-skip-permissions',
+                "schedule": {"type": "interval", "value": "1h"},
+                "timeout_seconds": 120,
+                "enabled": False,
+            },
+        )
         try:
             api_post(f"/api/cron/jobs/{job['id']}/trigger")
             # Wait up to 90s for agent to complete
@@ -820,7 +904,9 @@ class TestIntegrationAgentLaunch:
                     break
 
             runs = api_get(f"/api/cron/jobs/{job['id']}/runs?limit=1")
-            assert runs["runs"][0]["status"] == "ok", f"Agent failed: {runs['runs'][0].get('error_summary', '')}"
+            assert runs["runs"][0]["status"] == "ok", (
+                f"Agent failed: {runs['runs'][0].get('error_summary', '')}"
+            )
             assert runs["runs"][0]["exit_code"] == 0
             assert proof_file.exists(), "Agent did not create proof file"
             content = proof_file.read_text()
@@ -837,10 +923,14 @@ class TestIntegrationAgentLaunch:
 class TestVictoryDetection:
     def test_victory_stored_in_run(self, engine):
         """Victory signal in stdout is captured and stored in victory_reason."""
-        created = run(engine.create_job(create_job_dict(
-            name="victory-test",
-            command="echo '##IMPERIUM_VICTORIOUS: All tests pass, docs updated##'",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="victory-test",
+                    command="echo '##IMPERIUM_VICTORIOUS: All tests pass, docs updated##'",
+                )
+            )
+        )
         with patch("cron_engine.CronEngine._handle_victory"):
             run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
@@ -849,10 +939,14 @@ class TestVictoryDetection:
 
     def test_no_victory_when_absent(self, engine):
         """No victory_reason stored when signal is absent."""
-        created = run(engine.create_job(create_job_dict(
-            name="no-victory-test",
-            command="echo 'Task complete but no victory declared'",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="no-victory-test",
+                    command="echo 'Task complete but no victory declared'",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "ok"
@@ -860,10 +954,14 @@ class TestVictoryDetection:
 
     def test_victory_multiline_reason(self, engine):
         """Victory reason is trimmed from multi-word output."""
-        created = run(engine.create_job(create_job_dict(
-            name="victory-multiword",
-            command="echo 'done'; echo '##IMPERIUM_VICTORIOUS: rebuilt 47 links, all green##'",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="victory-multiword",
+                    command="echo 'done'; echo '##IMPERIUM_VICTORIOUS: rebuilt 47 links, all green##'",
+                )
+            )
+        )
         with patch("cron_engine.CronEngine._handle_victory"):
             run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
@@ -871,10 +969,14 @@ class TestVictoryDetection:
 
     def test_victory_on_error_not_stored(self, engine):
         """Victory in output is not stored if exit code is non-zero (status=error)."""
-        created = run(engine.create_job(create_job_dict(
-            name="victory-on-error",
-            command="echo '##IMPERIUM_VICTORIOUS: claimed##'; exit 1",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="victory-on-error",
+                    command="echo '##IMPERIUM_VICTORIOUS: claimed##'; exit 1",
+                )
+            )
+        )
         with patch("cron_engine.CronEngine._handle_victory"):
             run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
@@ -913,10 +1015,14 @@ class TestNewSchemaColumns:
     def test_output_summary_captures_4000_chars(self, engine):
         """Output is captured up to 4000 chars (expanded from 500)."""
         # Generate 3000 chars of output — all should be captured
-        created = run(engine.create_job(create_job_dict(
-            name="output-expand",
-            command="python3 -c \"print('X' * 3000)\"",
-        )))
+        created = run(
+            engine.create_job(
+                create_job_dict(
+                    name="output-expand",
+                    command="python3 -c \"print('X' * 3000)\"",
+                )
+            )
+        )
         run(engine._execute(created))
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "ok"
@@ -929,16 +1035,19 @@ class TestNewSchemaColumns:
 class TestVictoryRegex:
     def test_basic_match(self):
         from cron_engine import VICTORY_RE
+
         m = VICTORY_RE.search("##IMPERIUM_VICTORIOUS: done##")
         assert m is not None
         assert m.group(1).strip() == "done"
 
     def test_no_match(self):
         from cron_engine import VICTORY_RE
+
         assert VICTORY_RE.search("just some output") is None
 
     def test_match_with_surrounding_text(self):
         from cron_engine import VICTORY_RE
+
         text = "Task completed.\n##IMPERIUM_VICTORIOUS: 42 files processed##\nClean exit."
         m = VICTORY_RE.search(text)
         assert m is not None
@@ -946,6 +1055,7 @@ class TestVictoryRegex:
 
     def test_whitespace_trimmed(self):
         from cron_engine import VICTORY_RE
+
         m = VICTORY_RE.search("##IMPERIUM_VICTORIOUS:   spaces around   ##")
         assert m.group(1).strip() == "spaces around"
 
@@ -959,6 +1069,7 @@ class TestInstanceMutex:
     def _seed_instance(self, db_path, job_name: str, status: str, instance_id: str = None):
         """Insert a claude_instance row directly into the test DB."""
         import sqlite3
+
         instance_id = instance_id or f"inst-{time.monotonic_ns()}"
         con = sqlite3.connect(str(db_path))
         con.execute("""
@@ -973,7 +1084,13 @@ class TestInstanceMutex:
         """)
         con.execute(
             "INSERT INTO claude_instances (id, tab_name, status, spawner, is_subagent, created_at) VALUES (?,?,?,?,1,?)",
-            (instance_id, f"sub: cron:{job_name}", status, f"cron:{job_name}", "2026-01-01T00:00:00"),
+            (
+                instance_id,
+                f"sub: cron:{job_name}",
+                status,
+                f"cron:{job_name}",
+                "2026-01-01T00:00:00",
+            ),
         )
         con.commit()
         con.close()
@@ -984,6 +1101,7 @@ class TestInstanceMutex:
         job = {"id": "j1", "name": "my-task", "enabled": 1}
         # Ensure claude_instances table exists (empty)
         import sqlite3
+
         con = sqlite3.connect(str(db_path))
         con.execute("""
             CREATE TABLE IF NOT EXISTS claude_instances (
@@ -1027,4 +1145,6 @@ class TestInstanceMutex:
         run(engine._log_skip(job_id, "instance_mutex"))
 
         runs = run(engine.get_runs(job_id))
-        assert any(r["status"] == "skipped" and r.get("skip_reason") == "instance_mutex" for r in runs)
+        assert any(
+            r["status"] == "skipped" and r.get("skip_reason") == "instance_mutex" for r in runs
+        )

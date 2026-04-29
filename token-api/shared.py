@@ -36,21 +36,101 @@ STASH_MAX_AGE_HOURS = 24
 # ============ Voice Profiles ============
 
 PROFILES = [
-    {"name": "profile_1", "wsl_voice": "Microsoft George",    "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#66cccc", "cc_color": "cyan"},     # UK M
-    {"name": "profile_2", "wsl_voice": "Microsoft Susan",     "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "notify.wav", "color": "#ff66cc", "cc_color": "pink"},     # UK F
-    {"name": "profile_3", "wsl_voice": "Microsoft Catherine",  "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "ding.wav",   "color": "#ffcc00", "cc_color": "yellow"},   # AU F
-    {"name": "profile_5", "wsl_voice": "Microsoft Sean",      "wsl_rate": 0, "mac_voice": "Moira",  "notification_sound": "chord.wav",  "color": "#ff9900", "cc_color": "orange"},   # IE M
-    {"name": "profile_7", "wsl_voice": "Microsoft Heera",     "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "chimes.wav", "color": "#cc66ff", "cc_color": "purple"},   # IN F
-    {"name": "profile_8", "wsl_voice": "Microsoft Ravi",      "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "notify.wav", "color": "#ff6666", "cc_color": "red"},      # IN M
+    {
+        "name": "profile_1",
+        "wsl_voice": "Microsoft George",
+        "wsl_rate": 2,
+        "mac_voice": "Daniel",
+        "notification_sound": "chimes.wav",
+        "color": "#66cccc",
+        "cc_color": "cyan",
+    },  # UK M
+    {
+        "name": "profile_2",
+        "wsl_voice": "Microsoft Susan",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "notify.wav",
+        "color": "#ff66cc",
+        "cc_color": "pink",
+    },  # UK F
+    {
+        "name": "profile_3",
+        "wsl_voice": "Microsoft Catherine",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "ding.wav",
+        "color": "#ffcc00",
+        "cc_color": "yellow",
+    },  # AU F
+    {
+        "name": "profile_5",
+        "wsl_voice": "Microsoft Sean",
+        "wsl_rate": 0,
+        "mac_voice": "Moira",
+        "notification_sound": "chord.wav",
+        "color": "#ff9900",
+        "cc_color": "orange",
+    },  # IE M
+    {
+        "name": "profile_7",
+        "wsl_voice": "Microsoft Heera",
+        "wsl_rate": 1,
+        "mac_voice": "Rishi",
+        "notification_sound": "chimes.wav",
+        "color": "#cc66ff",
+        "cc_color": "purple",
+    },  # IN F
+    {
+        "name": "profile_8",
+        "wsl_voice": "Microsoft Ravi",
+        "wsl_rate": 1,
+        "mac_voice": "Rishi",
+        "notification_sound": "notify.wav",
+        "color": "#ff6666",
+        "cc_color": "red",
+    },  # IN M
 ]
 
 FALLBACK_VOICES = [
-    {"name": "fallback_1", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#888888", "cc_color": "default"},
-    {"name": "fallback_2", "wsl_voice": "Microsoft Zira",  "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "chord.wav",  "color": "#999999", "cc_color": "default"},
-    {"name": "fallback_3", "wsl_voice": "Microsoft Mark",  "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "recycle.wav","color": "#aaaaaa", "cc_color": "default"},
+    {
+        "name": "fallback_1",
+        "wsl_voice": "Microsoft David",
+        "wsl_rate": 1,
+        "mac_voice": "Daniel",
+        "notification_sound": "tada.wav",
+        "color": "#888888",
+        "cc_color": "default",
+    },
+    {
+        "name": "fallback_2",
+        "wsl_voice": "Microsoft Zira",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "chord.wav",
+        "color": "#999999",
+        "cc_color": "default",
+    },
+    {
+        "name": "fallback_3",
+        "wsl_voice": "Microsoft Mark",
+        "wsl_rate": 1,
+        "mac_voice": "Daniel",
+        "notification_sound": "recycle.wav",
+        "color": "#aaaaaa",
+        "cc_color": "default",
+    },
 ]
 
-ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#666666", "cc_color": "default"}
+ULTIMATE_FALLBACK = {
+    "name": "fallback_david",
+    "wsl_voice": "Microsoft David",
+    "wsl_rate": 1,
+    "mac_voice": "Daniel",
+    "notification_sound": "chimes.wav",
+    "color": "#666666",
+    "cc_color": "default",
+}
 
 
 def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:
@@ -91,10 +171,10 @@ DESKTOP_CONFIG = {
 
 # TTS backend routing state (WSL-first with Mac fallback)
 TTS_BACKEND = {
-    "current": None,          # "wsl" | "mac" | None — what's currently speaking
+    "current": None,  # "wsl" | "mac" | None — what's currently speaking
     "satellite_available": None,  # True/False/None (unknown)
     "last_health_check": 0,
-    "health_check_ttl": 30,   # Re-probe satellite every 30s
+    "health_check_ttl": 30,  # Re-probe satellite every 30s
 }
 
 # Global TTS mute state (in-memory, resets to "verbose" on server restart)
@@ -108,8 +188,10 @@ def is_satellite_tts_available() -> bool:
     import requests
 
     now = time.time()
-    if (TTS_BACKEND["satellite_available"] is not None
-            and now - TTS_BACKEND["last_health_check"] < TTS_BACKEND["health_check_ttl"]):
+    if (
+        TTS_BACKEND["satellite_available"] is not None
+        and now - TTS_BACKEND["last_health_check"] < TTS_BACKEND["health_check_ttl"]
+    ):
         return TTS_BACKEND["satellite_available"]
 
     host = DESKTOP_CONFIG["host"]
@@ -156,23 +238,28 @@ DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 
 # ============ Event Logging ============
 
-async def log_event(event_type: str, instance_id: str = None, device_id: str = None, details: dict = None):
+
+async def log_event(
+    event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
+):
     """Log an event to the events table."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO events (event_type, instance_id, device_id, details)
                VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None)
+            (event_type, instance_id, device_id, json.dumps(details) if details else None),
         )
         await db.commit()
 
 
-async def log_event_sync(event_type: str, instance_id: str = None, device_id: str = None, details: dict = None):
+async def log_event_sync(
+    event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
+):
     """Synchronous wrapper for logging events (for use in sync functions)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO events (event_type, instance_id, device_id, details)
                VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None)
+            (event_type, instance_id, device_id, json.dumps(details) if details else None),
         )
         await db.commit()

@@ -74,9 +74,11 @@ def _generate_mock_token(audience: str) -> str:
     """
     import base64
 
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
-    ).decode().rstrip("=")
+    header = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+        .decode()
+        .rstrip("=")
+    )
 
     now = int(datetime.now(timezone.utc).timestamp())
     payload_data = {
@@ -89,9 +91,7 @@ def _generate_mock_token(audience: str) -> str:
         "iss": "https://accounts.google.com",
         "sub": "113421852997393319348",
     }
-    payload = base64.urlsafe_b64encode(
-        json.dumps(payload_data).encode()
-    ).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
 
     # Mock signature - base64url encoded placeholder (256 bytes = RS256 signature size)
     # This is NOT cryptographically valid but passes base64 validation

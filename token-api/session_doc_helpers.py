@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class _ObsidianDumper(yaml.SafeDumper):
     """YAML dumper that doesn't quote Obsidian wikilinks or colons in strings."""
+
     pass
 
 
@@ -185,7 +186,7 @@ def _obsidian_cmd(vault: str, command: str, **kwargs) -> list[str]:
     """Build an obsidian CLI command list."""
     cmd = ["obsidian", f"vault={vault}", command]
     for key, value in kwargs.items():
-        cmd.append(f'{key}={value}')
+        cmd.append(f"{key}={value}")
     return cmd
 
 
@@ -194,7 +195,9 @@ def obsidian_property_set(vault: str, path: str, prop: str, value: str) -> bool:
     try:
         result = subprocess.run(
             _obsidian_cmd(vault, "property:set", path=path, property=prop, value=value),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception as e:
@@ -207,7 +210,9 @@ def obsidian_property_read(vault: str, path: str, prop: str) -> Optional[str]:
     try:
         result = subprocess.run(
             _obsidian_cmd(vault, "property:read", path=path, property=prop),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -222,7 +227,9 @@ def obsidian_read(vault: str, path: str) -> Optional[str]:
     try:
         result = subprocess.run(
             _obsidian_cmd(vault, "read", path=path),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
             return result.stdout
@@ -237,7 +244,9 @@ def obsidian_append(vault: str, path: str, content: str) -> bool:
     try:
         result = subprocess.run(
             _obsidian_cmd(vault, "append", path=path, content=content),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception as e:
@@ -250,7 +259,9 @@ def obsidian_create(vault: str, path: str, content: str) -> bool:
     try:
         result = subprocess.run(
             _obsidian_cmd(vault, "create", path=path, content=content),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception as e:
@@ -259,6 +270,7 @@ def obsidian_create(vault: str, path: str, content: str) -> bool:
 
 
 # Async variants — run CLI calls off the event loop
+
 
 async def async_obsidian_property_set(vault: str, path: str, prop: str, value: str) -> bool:
     """Set a single frontmatter property via obsidian CLI (async)."""

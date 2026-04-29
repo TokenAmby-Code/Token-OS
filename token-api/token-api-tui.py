@@ -125,14 +125,12 @@ TUI_SLOTS = ("desktop",)  # Signal file slots
 console = Console()
 
 
-
-
-ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 def strip_ansi(text: str) -> str:
     """Strip ANSI escape codes from text."""
-    return ANSI_ESCAPE_RE.sub('', text)
+    return ANSI_ESCAPE_RE.sub("", text)
 
 
 def check_deploy_status() -> tuple[bool, Path | None, dict]:
@@ -190,9 +188,13 @@ def check_api_health() -> tuple[bool, str | None]:
 def format_duration(start_time_str: str, end_time_str: str = None) -> str:
     """Format duration from start time to now or end time."""
     try:
-        start = datetime.fromisoformat(start_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0])
+        start = datetime.fromisoformat(
+            start_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]
+        )
         if end_time_str:
-            end = datetime.fromisoformat(end_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0])
+            end = datetime.fromisoformat(
+                end_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]
+            )
         else:
             end = datetime.now()
 
@@ -217,8 +219,16 @@ def format_duration_colored(start_time_str: str, end_time_str: str = None) -> st
     """Format duration with color based on age: green <30m, yellow 30m-2h, dim >2h."""
     duration = format_duration(start_time_str, end_time_str)
     try:
-        start = datetime.fromisoformat(start_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0])
-        end = datetime.fromisoformat(end_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]) if end_time_str else datetime.now()
+        start = datetime.fromisoformat(
+            start_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]
+        )
+        end = (
+            datetime.fromisoformat(
+                end_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]
+            )
+            if end_time_str
+            else datetime.now()
+        )
         total_minutes = int((end - start).total_seconds()) // 60
     except Exception:
         return duration
@@ -330,10 +340,11 @@ def filter_instances(instances: list) -> list:
 def is_custom_tab_name(tab_name: str) -> bool:
     """Check if tab_name is a custom name (not auto-generated like 'Claude HH:MM')."""
     import re
+
     if not tab_name:
         return False
     # Auto-generated names match "Claude HH:MM" pattern
-    if re.match(r'^Claude \d{2}:\d{2}$', tab_name):
+    if re.match(r"^Claude \d{2}:\d{2}$", tab_name):
         return False
     return True
 
@@ -345,7 +356,7 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
     # If user has set a custom name, always use it
     if is_custom_tab_name(tab_name):
         if len(tab_name) > max_len:
-            return tab_name[:max_len - 3] + "..."
+            return tab_name[: max_len - 3] + "..."
         return tab_name
 
     # Otherwise derive from working_dir
@@ -362,7 +373,7 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
         else:
             name = working_dir
         if len(name) > max_len:
-            name = "..." + name[-(max_len - 3):]
+            name = "..." + name[-(max_len - 3) :]
         return name
     # Fallback to tab_name or id
     return tab_name or instance.get("id", "?")[:max_len]
@@ -409,7 +420,7 @@ def rename_instance(instance_id: str, new_name: str) -> bool:
             f"{API_URL}/api/instances/{instance_id}/rename",
             data=data,
             headers={"Content-Type": "application/json"},
-            method="PATCH"
+            method="PATCH",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode())
@@ -421,10 +432,7 @@ def rename_instance(instance_id: str, new_name: str) -> bool:
 def delete_instance(instance_id: str) -> bool:
     """Delete/stop an instance via the API."""
     try:
-        req = urllib.request.Request(
-            f"{API_URL}/api/instances/{instance_id}",
-            method="DELETE"
-        )
+        req = urllib.request.Request(f"{API_URL}/api/instances/{instance_id}", method="DELETE")
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode())
             return result.get("status") == "stopped"
@@ -439,7 +447,7 @@ def kill_instance(instance_id: str) -> dict:
             f"{API_URL}/api/instances/{instance_id}/kill",
             method="POST",
             headers={"Content-Type": "application/json"},
-            data=b"{}"
+            data=b"{}",
         )
         resp = urllib.request.urlopen(req, timeout=20)  # longer timeout for SIGINT×2 sequence
         return json.loads(resp.read())
@@ -460,7 +468,7 @@ def unstick_instance(instance_id: str, level: int = 1) -> dict:
             f"{API_URL}/api/instances/{instance_id}/unstick?level={level}",
             method="POST",
             headers={"Content-Type": "application/json"},
-            data=b"{}"
+            data=b"{}",
         )
         resp = urllib.request.urlopen(req, timeout=10)  # 4s server wait + margin
         return json.loads(resp.read())
@@ -487,7 +495,9 @@ def copy_to_clipboard(text: str) -> tuple[bool, str]:
 
     # Try xclip
     try:
-        subprocess.run(["xclip", "-selection", "clipboard"], input=text, text=True, check=True, timeout=2)
+        subprocess.run(
+            ["xclip", "-selection", "clipboard"], input=text, text=True, check=True, timeout=2
+        )
         return (True, "Copied to clipboard")
     except FileNotFoundError:
         pass
@@ -496,7 +506,9 @@ def copy_to_clipboard(text: str) -> tuple[bool, str]:
 
     # Try xsel
     try:
-        subprocess.run(["xsel", "--clipboard", "--input"], input=text, text=True, check=True, timeout=2)
+        subprocess.run(
+            ["xsel", "--clipboard", "--input"], input=text, text=True, check=True, timeout=2
+        )
         return (True, "Copied to clipboard")
     except FileNotFoundError:
         pass
@@ -528,7 +540,7 @@ def change_instance_voice(instance_id: str, voice: str) -> dict:
             f"{API_URL}/api/instances/{instance_id}/voice",
             data=data,
             headers={"Content-Type": "application/json"},
-            method="PATCH"
+            method="PATCH",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode())
@@ -536,7 +548,7 @@ def change_instance_voice(instance_id: str, voice: str) -> dict:
                 return {
                     "success": True,
                     "changes": result.get("changes", []),
-                    "status": result.get("status")
+                    "status": result.get("status"),
                 }
             return {"success": False}
     except Exception:
@@ -545,7 +557,12 @@ def change_instance_voice(instance_id: str, voice: str) -> dict:
 
 def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
     """Cycle TTS mode: verbose -> muted -> silent -> voice-chat -> verbose."""
-    mode_cycle = {"verbose": "muted", "muted": "silent", "silent": "voice-chat", "voice-chat": "verbose"}
+    mode_cycle = {
+        "verbose": "muted",
+        "muted": "silent",
+        "silent": "voice-chat",
+        "voice-chat": "verbose",
+    }
     new_mode = mode_cycle.get(current_mode, "muted")
     try:
         data = json.dumps({"mode": new_mode}).encode()
@@ -553,7 +570,7 @@ def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
             f"{API_URL}/api/instances/{instance_id}/tts-mode",
             data=data,
             headers={"Content-Type": "application/json"},
-            method="PATCH"
+            method="PATCH",
         )
         with urllib.request.urlopen(req, timeout=3) as response:
             result = json.loads(response.read().decode())
@@ -570,7 +587,7 @@ def set_instance_zealotry(instance_id: str, zealotry: int) -> dict | None:
             f"{API_URL}/api/instances/{instance_id}/zealotry",
             data=data,
             headers={"Content-Type": "application/json"},
-            method="PATCH"
+            method="PATCH",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             return json.loads(response.read().decode())
@@ -601,7 +618,7 @@ def cycle_global_tts_mode() -> dict | None:
             f"{API_URL}/api/tts/global-mode",
             data=data,
             headers={"Content-Type": "application/json"},
-            method="POST"
+            method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode())
@@ -614,10 +631,7 @@ def cycle_global_tts_mode() -> dict | None:
 def delete_all_instances() -> tuple[bool, int]:
     """Delete all instances via the API. Returns (success, count)."""
     try:
-        req = urllib.request.Request(
-            f"{API_URL}/api/instances/all",
-            method="DELETE"
-        )
+        req = urllib.request.Request(f"{API_URL}/api/instances/all", method="DELETE")
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode())
             if result.get("status") in ("deleted_all", "no_instances"):
@@ -649,14 +663,14 @@ def format_event_instance_name(event: dict, max_len: int = 15) -> str:
     # If instance still exists and has a custom name, use it
     if is_custom_tab_name(tab_name):
         if len(tab_name) > max_len:
-            return tab_name[:max_len - 2] + ".."
+            return tab_name[: max_len - 2] + ".."
         return tab_name
 
     # Check details for name (some events store it there)
     details_name = details.get("tab_name") or details.get("new_name")
     if is_custom_tab_name(details_name):
         if len(details_name) > max_len:
-            return details_name[:max_len - 2] + ".."
+            return details_name[: max_len - 2] + ".."
         return details_name
 
     # Derive from working_dir if available
@@ -666,7 +680,7 @@ def format_event_instance_name(event: dict, max_len: int = 15) -> str:
         if parts:
             name = parts[-1]
             if len(name) > max_len:
-                name = name[:max_len - 2] + ".."
+                name = name[: max_len - 2] + ".."
             return name
 
     # Fallback to truncated ID
@@ -692,7 +706,10 @@ def _read_timer() -> dict:
         req = urllib.request.Request(f"{API_URL}/api/timer")
         with urllib.request.urlopen(req, timeout=1) as resp:
             data = json.loads(resp.read().decode())
-        bal_ms = data.get("break_balance_ms", data.get("accumulated_break_ms", 0) - data.get("break_backlog_ms", 0))
+        bal_ms = data.get(
+            "break_balance_ms",
+            data.get("accumulated_break_ms", 0) - data.get("break_backlog_ms", 0),
+        )
         _timer_cache = {
             "break_secs": round(max(0, bal_ms) / 1000),
             "backlog_secs": round(abs(min(0, bal_ms)) / 1000),
@@ -877,7 +894,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
             header_style="bold cyan",
             border_style="blue",
             expand=True,
-            padding=(0, 0)
+            padding=(0, 0),
         )
         table.add_column("S", width=1, justify="center")
         table.add_column("Name", style="white", no_wrap=True, max_width=20)
@@ -885,12 +902,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
         table.add_column("ssh", width=3, justify="center")
         num_cols = 4
     else:
-        table = Table(
-            show_header=True,
-            header_style="bold cyan",
-            border_style="blue",
-            expand=True
-        )
+        table = Table(show_header=True, header_style="bold cyan", border_style="blue", expand=True)
         table.add_column("S", width=1, justify="center")
         table.add_column("Name", style="white")
         table.add_column("Tags", width=5, justify="center")
@@ -918,11 +930,18 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
         first_group = False
 
         # Within each lifecycle group, sort: processing first, then by last_activity desc
-        members.sort(key=lambda m: (
-            0 if m[1].get("status") == "processing" else 1,
-            -(datetime.fromisoformat(m[1].get("last_activity", "2000-01-01T00:00:00")).timestamp()
-              if m[1].get("last_activity") else 0)
-        ))
+        members.sort(
+            key=lambda m: (
+                0 if m[1].get("status") == "processing" else 1,
+                -(
+                    datetime.fromisoformat(
+                        m[1].get("last_activity", "2000-01-01T00:00:00")
+                    ).timestamp()
+                    if m[1].get("last_activity")
+                    else 0
+                ),
+            )
+        )
 
         for orig_idx, instance in members:
             icon = format_status_icon(instance)
@@ -952,19 +971,14 @@ def create_archived_table(instances: list, selected_idx: int) -> Table:
             header_style="bold cyan",
             border_style="dim",
             expand=True,
-            padding=(0, 0)
+            padding=(0, 0),
         )
         table.add_column("Name", style="white", no_wrap=True, max_width=20)
         table.add_column("Tags", width=3, justify="center")
         table.add_column("ssh", width=3, justify="center")
         num_cols = 3
     else:
-        table = Table(
-            show_header=True,
-            header_style="bold cyan",
-            border_style="dim",
-            expand=True
-        )
+        table = Table(show_header=True, header_style="bold cyan", border_style="dim", expand=True)
         table.add_column("Name", style="white")
         table.add_column("Tags", width=5, justify="center")
         table.add_column("Type", width=8, justify="center")
@@ -1109,18 +1123,13 @@ def create_cron_table(jobs: list, selected_idx: int) -> Table:
             header_style="bold cyan",
             border_style="blue",
             expand=True,
-            padding=(0, 0)
+            padding=(0, 0),
         )
         table.add_column("", width=1, justify="center")
         table.add_column("Name", style="white", no_wrap=True, max_width=20)
         table.add_column("Next", width=8, justify="right")
     else:
-        table = Table(
-            show_header=True,
-            header_style="bold cyan",
-            border_style="blue",
-            expand=True
-        )
+        table = Table(show_header=True, header_style="bold cyan", border_style="blue", expand=True)
         table.add_column("", width=2, justify="center")
         table.add_column("Name", style="white")
         table.add_column("Next", width=10, justify="right")
@@ -1201,7 +1210,9 @@ def _wrap_summary_lines(text: str, width: int = 70) -> list[str]:
 def create_cron_details_panel(job: dict) -> Panel:
     """Create a compact single-line cron details panel."""
     if not job:
-        return Panel("[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta")
+        return Panel(
+            "[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta"
+        )
 
     name = job.get("name", job.get("id", "?"))
     job_id = job.get("id", "")
@@ -1242,6 +1253,7 @@ def create_cron_details_panel(job: dict) -> Panel:
         if isinstance(vc_raw, str):
             try:
                 import json
+
                 vcs = json.loads(vc_raw)
             except Exception:
                 vcs = []
@@ -1299,19 +1311,26 @@ def create_events_panel(events: list) -> Panel:
             elif event_type == "instance_renamed":
                 old_name = details.get("old_name", "?")
                 new_name = details.get("new_name", "?")
-                msg = f"[{color}]{icon}[/{color}] [bold]{old_name}[/bold] -> [bold]{new_name}[/bold]"
+                msg = (
+                    f"[{color}]{icon}[/{color}] [bold]{old_name}[/bold] -> [bold]{new_name}[/bold]"
+                )
             elif event_type in ("tts_queued", "tts_playing", "tts_completed"):
                 voice = details.get("voice", "").replace("Microsoft ", "").replace(" Desktop", "")
                 msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
                 if voice and event_type == "tts_playing":
                     msg += f" [dim]({voice})[/dim]"
-            elif event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked",
-                                "phone_app_open", "phone_app_close"):
+            elif event_type in (
+                "phone_app_closed",
+                "phone_distraction_allowed",
+                "phone_distraction_blocked",
+                "phone_app_open",
+                "phone_app_close",
+            ):
                 app_display = details.get("display_name") or details.get("app", "?")
                 # Strip raw trigger prefix for cleaner display
                 for prefix in ("Application Launched (", "Application Closed ("):
                     if app_display.startswith(prefix) and app_display.endswith(")"):
-                        app_display = app_display[len(prefix):-1]
+                        app_display = app_display[len(prefix) : -1]
                 reason = details.get("reason", "")
                 msg = f"[{color}]{icon}[/{color}] [bold]{app_display}[/bold]: [{color}]{action}[/{color}]"
                 if reason and event_type not in ("phone_app_closed", "phone_app_close"):
@@ -1324,7 +1343,7 @@ def create_events_panel(events: list) -> Panel:
                 if not location:
                     for prefix in ("Geofence Entry (", "Geofence Exit ("):
                         if raw.startswith(prefix) and raw.endswith(")"):
-                            location = raw[len(prefix):-1]
+                            location = raw[len(prefix) : -1]
                             geo_action = "enter" if "Entry" in prefix else "exit"
                 geo_color = "green" if geo_action == "enter" else "red"
                 msg = f"[{color}]{icon}[/{color}] [bold]{location or '?'}[/bold]: [{geo_color}]{geo_action}[/{geo_color}]"
@@ -1363,7 +1382,7 @@ def create_server_logs_panel(max_lines: int = 8) -> Panel:
                     "WARN": "yellow",
                     "ERRO": "red",
                     "DEBU": "dim",
-                    "CRIT": "red bold"
+                    "CRIT": "red bold",
                 }
 
                 for i, log in enumerate(logs):
@@ -1380,7 +1399,7 @@ def create_server_logs_panel(max_lines: int = 8) -> Panel:
                     content.append(f"{level} ", style=level_color)
 
                     # Apply JSON highlighting to message if it might contain JSON
-                    if '{' in message or '[' in message:
+                    if "{" in message or "[" in message:
                         message_text = json_highlighter(Text(message))
                         content.append_text(message_text)
                     else:
@@ -1484,7 +1503,11 @@ def create_tmux_log_panel(max_lines: int = 8) -> Panel:
                 content.append(line, style="red")
             elif "skip" in line.lower() or "warn" in line.lower():
                 content.append(line, style="yellow")
-            elif "success" in line.lower() or "complete" in line.lower() or "restored" in line.lower():
+            elif (
+                "success" in line.lower()
+                or "complete" in line.lower()
+                or "restored" in line.lower()
+            ):
                 content.append(line, style="green")
             else:
                 content.append(line)
@@ -1503,7 +1526,9 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     lines = []
 
     if not instance:
-        return Panel("[dim]No instance selected[/dim]", title="Instance Details", border_style="magenta")
+        return Panel(
+            "[dim]No instance selected[/dim]", title="Instance Details", border_style="magenta"
+        )
 
     name = format_instance_name(instance, max_len=25)
     status = instance.get("status", "unknown")
@@ -1572,12 +1597,18 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]({device})[/dim]")
     tts_mode = instance.get("tts_mode", "verbose") or "verbose"
     if tts_mode == "voice-chat":
-        dictation_state = "[green]dictating[/green]" if instance.get("listening", False) else "[dim]idle[/dim]"
-        lines.append(f"[cyan]Voice:[/cyan] [magenta]voice-chat[/magenta]  {dictation_state}  [dim]({voice_short})[/dim]")
+        dictation_state = (
+            "[green]dictating[/green]" if instance.get("listening", False) else "[dim]idle[/dim]"
+        )
+        lines.append(
+            f"[cyan]Voice:[/cyan] [magenta]voice-chat[/magenta]  {dictation_state}  [dim]({voice_short})[/dim]"
+        )
     elif tts_mode == "verbose":
         lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
     elif tts_mode == "muted":
-        lines.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]  [dim]({voice_short} reserved)[/dim]")
+        lines.append(
+            f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]  [dim]({voice_short} reserved)[/dim]"
+        )
     else:  # silent
         lines.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
     lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
@@ -1588,8 +1619,7 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         try:
             with sqlite3.connect(DB_PATH) as doc_conn:
                 doc_cursor = doc_conn.execute(
-                    "SELECT title, file_path FROM session_documents WHERE id = ?",
-                    (session_doc_id,)
+                    "SELECT title, file_path FROM session_documents WHERE id = ?", (session_doc_id,)
                 )
                 doc_row = doc_cursor.fetchone()
             if doc_row:
@@ -1598,7 +1628,9 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
                 short_path = doc_path.replace(str(Path.home()), "~")
                 if len(short_path) > 50:
                     short_path = "..." + short_path[-47:]
-                lines.append(f"[cyan]Session:[/cyan] [bold]{doc_title}[/bold]  [dim]{short_path}[/dim]")
+                lines.append(
+                    f"[cyan]Session:[/cyan] [bold]{doc_title}[/bold]  [dim]{short_path}[/dim]"
+                )
         except Exception:
             lines.append(f"[cyan]Session:[/cyan] [dim]doc #{session_doc_id}[/dim]")
 
@@ -1608,7 +1640,11 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     victory_reason = instance.get("victory_reason")
     gt_next_fire = instance.get("gt_next_fire")
     if victory_at:
-        reason_short = (victory_reason[:40] + "...") if victory_reason and len(victory_reason) > 40 else (victory_reason or "")
+        reason_short = (
+            (victory_reason[:40] + "...")
+            if victory_reason and len(victory_reason) > 40
+            else (victory_reason or "")
+        )
         lines.append(f"[cyan]Throne:[/cyan] [green]VICTORIOUS[/green] — {reason_short}")
     elif gt_next_fire:
         try:
@@ -1624,7 +1660,9 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         except Exception:
             lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]timer pending[/dim]")
     elif zealotry >= 4:
-        lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]idle (schedules on stop)[/dim]")
+        lines.append(
+            f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]idle (schedules on stop)[/dim]"
+        )
     else:
         lines.append(f"[cyan]Throne:[/cyan] zealotry={zealotry}  [dim]no follow-up[/dim]")
 
@@ -1667,10 +1705,16 @@ HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 def get_heartbeat_status() -> dict:
     """Fetch combined heartbeat status from the API."""
     default = {
-        "entries": [], "consecutive_idle": 0, "action_count": 0,
-        "total_recent": 0, "last_hb_time": None, "last_hb_epoch": None,
-        "watchdog_status": "unknown", "watchdog_last_check": None,
-        "last_task": None, "openclaw_status": None,
+        "entries": [],
+        "consecutive_idle": 0,
+        "action_count": 0,
+        "total_recent": 0,
+        "last_hb_time": None,
+        "last_hb_epoch": None,
+        "watchdog_status": "unknown",
+        "watchdog_last_check": None,
+        "last_task": None,
+        "openclaw_status": None,
     }
     try:
         req = urllib.request.Request(f"{API_URL}/api/system/heartbeat")
@@ -1701,7 +1745,11 @@ def _get_instance_counts() -> tuple[int, int]:
         with urllib.request.urlopen(req, timeout=3) as response:
             data = json.loads(response.read().decode())
             instances = data if isinstance(data, list) else data.get("instances", [])
-            alive = [i for i in instances if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")]
+            alive = [
+                i
+                for i in instances
+                if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")
+            ]
             cron = sum(1 for i in alive if i.get("origin_type") == "cron")
             return len(alive) - cron, cron
     except Exception:
@@ -1747,20 +1795,27 @@ def create_monitor_panel(max_lines: int = 8) -> Panel:
         content.append("?", style="dim")
 
     wdog = status["watchdog_status"]
-    wdog_styles = {"ok": ("green", "OK"), "nudge": ("yellow", "NUDGE"), "escalation": ("red", "ESCALATED"), "unknown": ("dim", "?")}
+    wdog_styles = {
+        "ok": ("green", "OK"),
+        "nudge": ("yellow", "NUDGE"),
+        "escalation": ("red", "ESCALATED"),
+        "unknown": ("dim", "?"),
+    }
     wdog_style, wdog_label = wdog_styles.get(wdog, ("dim", wdog))
     content.append("  Wdog:", style="white")
     content.append(wdog_label, style=wdog_style)
 
     enabled_count = sum(1 for j in jobs if j.get("enabled", True))
-    content.append(f"  {enabled_count}/{len(jobs)} active", style="green" if enabled_count > 0 else "red")
+    content.append(
+        f"  {enabled_count}/{len(jobs)} active", style="green" if enabled_count > 0 else "red"
+    )
     content.append("\n")
 
     # Per-job rows
     if not jobs:
         content.append("No cron jobs found", style="dim")
     else:
-        for job in jobs[:(max_lines - 1)]:
+        for job in jobs[: (max_lines - 1)]:
             name = job.get("name", job.get("id", "?")[:8])
             enabled = job.get("enabled", True)
             state = job.get("state", {})
@@ -1870,6 +1925,7 @@ def get_cached_cron_jobs() -> list:
 _timer_shifts_cache = {}
 _timer_shifts_cache_time = 0.0
 
+
 def _fetch_timer_shifts() -> dict:
     """Fetch timer shift analytics from API (cached 5s)."""
     global _timer_shifts_cache, _timer_shifts_cache_time
@@ -1886,8 +1942,7 @@ def _fetch_timer_shifts() -> dict:
     return _timer_shifts_cache
 
 
-def _line_graph(values: list, width: int = 42, height: int = 3,
-                modes: list | None = None) -> list:
+def _line_graph(values: list, width: int = 42, height: int = 3, modes: list | None = None) -> list:
     """Render a braille line graph with optional per-column background colors.
 
     Each braille char is a 2-wide x 4-tall dot grid, giving
@@ -1901,25 +1956,31 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Mode → background color mapping
     # Working=dark blue, Multi=dark green, Idle=dark orange, Break=dark red
     MODE_BG = {
-        "working":         "#143030",   # teal
-        "work_silence":    "#143030",
-        "work_music":      "#143030",
-        "work_video":      "#141430",   # indigo
-        "work_scrolling":  "#301414",   # red
-        "work_gaming":     "#301414",
-        "break":           "#301414",   # red
-        "break_exhausted": "#301414",   # red
-        "idle":            "#4F4F4F",   # dark gray
-        "multitasking":    "#141430",   # indigo
-        "distracted":      "#301414",   # red
-        "sleeping":        "#4F4F4F",   # dark gray
+        "working": "#143030",  # teal
+        "work_silence": "#143030",
+        "work_music": "#143030",
+        "work_video": "#141430",  # indigo
+        "work_scrolling": "#301414",  # red
+        "work_gaming": "#301414",
+        "break": "#301414",  # red
+        "break_exhausted": "#301414",  # red
+        "idle": "#4F4F4F",  # dark gray
+        "multitasking": "#141430",  # indigo
+        "distracted": "#301414",  # red
+        "sleeping": "#4F4F4F",  # dark gray
     }
 
     # Braille dot bit positions: (col, row) -> bit
     # col 0: rows 0-3 = bits 0,1,2,6   col 1: rows 0-3 = bits 3,4,5,7
     DOT_BITS = {
-        (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
-        (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+        (0, 0): 0x01,
+        (0, 1): 0x02,
+        (0, 2): 0x04,
+        (0, 3): 0x40,
+        (1, 0): 0x08,
+        (1, 1): 0x10,
+        (1, 2): 0x20,
+        (1, 3): 0x80,
     }
     BRAILLE_BASE = 0x2800
 
@@ -2122,7 +2183,9 @@ def _format_context_section() -> list:
     if phone_app:
         doing += f" + phone: {phone_app}"
     doing_color = "green" if activity == "working" else "yellow"
-    lines.append(Text.from_markup(f"  [bold]Activity[/bold]  [{doing_color}]{doing}[/{doing_color}]"))
+    lines.append(
+        Text.from_markup(f"  [bold]Activity[/bold]  [{doing_color}]{doing}[/{doing_color}]")
+    )
 
     # Location inference
     location = timer.get("location_zone")
@@ -2132,7 +2195,9 @@ def _format_context_section() -> list:
     # Productivity state
     prod_style = "green" if productivity else "red"
     prod_label = "Active" if productivity else "Inactive"
-    lines.append(Text.from_markup(f"  [bold]Prod[/bold]     [{prod_style}]{prod_label}[/{prod_style}]"))
+    lines.append(
+        Text.from_markup(f"  [bold]Prod[/bold]     [{prod_style}]{prod_label}[/{prod_style}]")
+    )
 
     # AHK reachable?
     ahk = timer.get("ahk_reachable")
@@ -2320,8 +2385,12 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         # Timer state (condensed)
         state = _read_timer()
         mode_icons = {
-            "working": "\U0001f4bb", "multitasking": "\U0001f4fa", "idle": "\U0001f4a4",
-            "break": "\u2615", "distracted": "\u26a0\ufe0f", "sleeping": "\U0001f319",
+            "working": "\U0001f4bb",
+            "multitasking": "\U0001f4fa",
+            "idle": "\U0001f4a4",
+            "break": "\u2615",
+            "distracted": "\u26a0\ufe0f",
+            "sleeping": "\U0001f319",
         }
         icon = mode_icons.get(state["mode"], "\u2753")
         is_backlog = state["backlog_secs"] > 0
@@ -2431,8 +2500,12 @@ def generate_mobile_widget(instances: list) -> Layout:
     """
     state = _read_timer()
     mode_icons = {
-        "working": "\U0001f4bb", "multitasking": "\U0001f4fa", "idle": "\U0001f4a4",
-        "break": "\u2615", "distracted": "\u26a0\ufe0f", "sleeping": "\U0001f319",
+        "working": "\U0001f4bb",
+        "multitasking": "\U0001f4fa",
+        "idle": "\U0001f4a4",
+        "break": "\u2615",
+        "distracted": "\u26a0\ufe0f",
+        "sleeping": "\U0001f319",
     }
     icon = mode_icons.get(state["mode"], "\u2753")
     mode_name = state["mode"].replace("_", " ").title()
@@ -2441,7 +2514,11 @@ def generate_mobile_widget(instances: list) -> Layout:
     break_str = format_break_time(state["backlog_secs"] if is_backlog else state["break_secs"])
 
     # Filter to active instances only
-    active = [i for i in instances if i.get("status") in ("processing", "idle") and not i.get("is_subagent")]
+    active = [
+        i
+        for i in instances
+        if i.get("status") in ("processing", "idle") and not i.get("is_subagent")
+    ]
 
     # Build timer header line
     header = Text()
@@ -2495,7 +2572,10 @@ def generate_mobile_widget(instances: list) -> Layout:
 
         row = Text()
         # Status icon
-        row.append("> " if status == "processing" else "* ", style="green" if status == "processing" else "cyan")
+        row.append(
+            "> " if status == "processing" else "* ",
+            style="green" if status == "processing" else "cyan",
+        )
         # Name
         row.append(name, style="bold white")
         # Device
@@ -2519,7 +2599,7 @@ def generate_mobile_widget(instances: list) -> Layout:
             remaining = max(0, width - len(row.plain) - 3)
             if remaining > 5:
                 if len(current_task) > remaining:
-                    current_task = current_task[:remaining - 3] + "..."
+                    current_task = current_task[: remaining - 3] + "..."
                 row.append(f"  {current_task}", style="dim italic")
 
         # Second line: dir name + session doc title if we have room
@@ -2536,8 +2616,7 @@ def generate_mobile_widget(instances: list) -> Layout:
                 try:
                     with sqlite3.connect(DB_PATH) as doc_conn:
                         doc_row = doc_conn.execute(
-                            "SELECT title FROM session_documents WHERE id = ?",
-                            (session_doc_id,)
+                            "SELECT title FROM session_documents WHERE id = ?", (session_doc_id,)
                         ).fetchone()
                     if doc_row and doc_row[0]:
                         detail_line.append(f"  {doc_row[0]}", style="cyan")
@@ -2608,7 +2687,7 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
                 Layout(name="instances"),
                 Layout(name="details", size=5),
                 Layout(name="info_panel", size=info_size),
-                Layout(name="footer", size=footer_size)
+                Layout(name="footer", size=footer_size),
             )
             error_text = Text()
             error_text.append("! API down", style="bold red")
@@ -2618,7 +2697,7 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
                 Layout(name="instances"),
                 Layout(name="details", size=5),
                 Layout(name="info_panel", size=info_size),
-                Layout(name="footer", size=footer_size)
+                Layout(name="footer", size=footer_size),
             )
         info_lines = max(1, info_size - 2)
     else:
@@ -2645,7 +2724,7 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
             Layout(name="instances", size=instance_size),
             Layout(name="info_panel"),
             Layout(name="details", size=details_size),
-            Layout(name="footer", size=footer_size)
+            Layout(name="footer", size=footer_size),
         )
 
         # Header with health dot
@@ -2654,26 +2733,33 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
         dot.append_text(timer_text)
         timer_text = dot
         timer_text.justify = "center"
-        layout["header"].update(Panel(
-            timer_text,
-            border_style="cyan" if api_healthy else "red"
-        ))
+        layout["header"].update(Panel(timer_text, border_style="cyan" if api_healthy else "red"))
         info_lines = max(1, events_size - 2)
 
     # Populate shared panels
     if table_mode == "cron":
         cron_jobs = get_cached_cron_jobs()
-        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
+        selected_job = (
+            cron_jobs[cron_selected_index]
+            if cron_jobs and 0 <= cron_selected_index < len(cron_jobs)
+            else None
+        )
         layout["instances"].update(create_cron_table(cron_jobs, cron_selected_index))
         layout["details"].update(create_cron_details_panel(selected_job))
     elif table_mode == "archived":
         archived = [i for i in instances_cache if i.get("instance_type") == "archived"]
         layout["instances"].update(create_archived_table(instances_cache, archived_selected_index))
-        selected_archived = archived[archived_selected_index] if archived and 0 <= archived_selected_index < len(archived) else None
+        selected_archived = (
+            archived[archived_selected_index]
+            if archived and 0 <= archived_selected_index < len(archived)
+            else None
+        )
         layout["details"].update(create_instance_details_panel(selected_archived, {}, compact=True))
     else:
         layout["instances"].update(create_instances_table(instances, selected_idx))
-        layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
+        layout["details"].update(
+            create_instance_details_panel(selected_instance, selected_todos, compact=True)
+        )
     layout["info_panel"].update(create_info_panel(max_lines=info_lines))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
@@ -2685,45 +2771,60 @@ def generate_help_screen() -> Layout:
     layout = Layout()
 
     keybindings = [
-        ("Navigation", [
-            ("↑ / k", "Move selection up"),
-            ("↓ / j", "Move selection down"),
-            ("g", "Jump to first item"),
-            ("G", "Jump to last item"),
-            ("[ / ]", "Switch table (Instances / Cron / Archived)"),
-            ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer/tmux)"),
-            ("f", "Cycle filter (all / active / stopped)"),
-            ("o", "Change sort order"),
-            ("a", "Toggle subagent visibility"),
-        ]),
-        ("Instance Actions", [
-            ("Enter", "Open selected instance in new terminal tab"),
-            ("r", "Rename selected instance"),
-            ("y", "Copy resume command to clipboard (yank)"),
-            ("v", "Change voice for instance"),
-            ("s", "Stop selected instance"),
-            ("d", "Delete selected instance"),
-            ("c", "Clear all stopped instances"),
-            ("n", "Set session note for instance"),
-            ("z", "Set zealotry (follow-up frequency 1-10)"),
-            ("A", "Archive / Unarchive instance"),
-            ("t", "Set instance type (sync/golden_throne/one_off)"),
-        ]),
-        ("Recovery", [
-            ("U", "Unstick frozen instance (SIGWINCH, gentle nudge)"),
-            ("I", "Interrupt frozen instance (SIGINT, cancel op)"),
-            ("K", "Kill deadlocked instance (SIGKILL, preserves /resume)"),
-        ]),
-        ("TTS / Audio", [
-            ("m", "Cycle instance TTS mode (verbose/muted/silent/voice-chat)"),
-            ("M", "Cycle global TTS mode"),
-        ]),
-        ("System", [
-            ("R", "Restart Token-API server"),
-            ("Ctrl+R", "Full refresh (restart server + reload TUI)"),
-            ("?", "Toggle this help screen"),
-            ("q", "Quit"),
-        ]),
+        (
+            "Navigation",
+            [
+                ("↑ / k", "Move selection up"),
+                ("↓ / j", "Move selection down"),
+                ("g", "Jump to first item"),
+                ("G", "Jump to last item"),
+                ("[ / ]", "Switch table (Instances / Cron / Archived)"),
+                ("h / l", "Switch info panel (Events/Logs/Deploy/Monitor/Timer/tmux)"),
+                ("f", "Cycle filter (all / active / stopped)"),
+                ("o", "Change sort order"),
+                ("a", "Toggle subagent visibility"),
+            ],
+        ),
+        (
+            "Instance Actions",
+            [
+                ("Enter", "Open selected instance in new terminal tab"),
+                ("r", "Rename selected instance"),
+                ("y", "Copy resume command to clipboard (yank)"),
+                ("v", "Change voice for instance"),
+                ("s", "Stop selected instance"),
+                ("d", "Delete selected instance"),
+                ("c", "Clear all stopped instances"),
+                ("n", "Set session note for instance"),
+                ("z", "Set zealotry (follow-up frequency 1-10)"),
+                ("A", "Archive / Unarchive instance"),
+                ("t", "Set instance type (sync/golden_throne/one_off)"),
+            ],
+        ),
+        (
+            "Recovery",
+            [
+                ("U", "Unstick frozen instance (SIGWINCH, gentle nudge)"),
+                ("I", "Interrupt frozen instance (SIGINT, cancel op)"),
+                ("K", "Kill deadlocked instance (SIGKILL, preserves /resume)"),
+            ],
+        ),
+        (
+            "TTS / Audio",
+            [
+                ("m", "Cycle instance TTS mode (verbose/muted/silent/voice-chat)"),
+                ("M", "Cycle global TTS mode"),
+            ],
+        ),
+        (
+            "System",
+            [
+                ("R", "Restart Token-API server"),
+                ("Ctrl+R", "Full refresh (restart server + reload TUI)"),
+                ("?", "Toggle this help screen"),
+                ("q", "Quit"),
+            ],
+        ),
     ]
 
     lines = []
@@ -2757,16 +2858,37 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, sort_mode, filter_mode, show_subagents, panel_page, show_help
-    global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
-    global table_mode, cron_selected_index, archived_selected_index, unstick_feedback, global_tts_mode
+    global \
+        selected_index, \
+        instances_cache, \
+        api_healthy, \
+        api_error_message, \
+        sort_mode, \
+        filter_mode, \
+        show_subagents, \
+        panel_page, \
+        show_help
+    global \
+        deploy_active, \
+        deploy_log_path, \
+        deploy_metadata, \
+        deploy_previous_page, \
+        deploy_auto_switched
+    global \
+        table_mode, \
+        cron_selected_index, \
+        archived_selected_index, \
+        unstick_feedback, \
+        global_tts_mode
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.parse_args()
 
     # TUI must run inside tmux for lifecycle management (auto-restart, dirty bit)
     if not os.environ.get("TMUX"):
-        console.print("[red]Error:[/red] TUI must run inside tmux. Use [bold]monitor[/bold] to launch.")
+        console.print(
+            "[red]Error:[/red] TUI must run inside tmux. Use [bold]monitor[/bold] to launch."
+        )
         raise SystemExit(1)
 
     h, w = console.size.height, console.size.width
@@ -2777,9 +2899,13 @@ def main():
     api_healthy, api_error_message = check_api_health()
     if not api_healthy:
         console.print(f"[yellow]Warning:[/yellow] {api_error_message}")
-        console.print("[dim]TUI will retry API calls — data panels may be empty until server is reachable.[/dim]")
+        console.print(
+            "[dim]TUI will retry API calls — data panels may be empty until server is reachable.[/dim]"
+        )
 
-    console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, n=note, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
+    console.print(
+        "[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, n=note, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n"
+    )
 
     # Record startup time for smart restart detection; clean stale signals
     tui_slot = "desktop"
@@ -2802,6 +2928,7 @@ def main():
     # Store terminal settings at main scope for cleanup on Ctrl+C
     import tty
     import termios
+
     # Open /dev/tty directly — sys.stdin may be a socket/pipe in tmux or
     # when launched from non-interactive shells (e.g. Claude Code).
     try:
@@ -2830,141 +2957,141 @@ def main():
                     # When help is showing, any key dismisses it
                     if show_help:
                         with action_lock:
-                            action_queue.append('toggle_help')
+                            action_queue.append("toggle_help")
                         update_flag.set()
                         continue
 
-                    if key.lower() == 'q':
+                    if key.lower() == "q":
                         quit_flag.set()
                         break
-                    elif key == '\x1b':
+                    elif key == "\x1b":
                         if sel.select([tty_fd], [], [], 0.05)[0]:
                             seq = tty_fd.read(2)
                             with action_lock:
-                                if seq == '[A':
-                                    action_queue.append('up')
-                                elif seq == '[B':
-                                    action_queue.append('down')
+                                if seq == "[A":
+                                    action_queue.append("up")
+                                elif seq == "[B":
+                                    action_queue.append("down")
                             update_flag.set()
-                    elif key == '\x12':  # Ctrl+R: full refresh (restart server + re-exec TUI)
+                    elif key == "\x12":  # Ctrl+R: full refresh (restart server + re-exec TUI)
                         with action_lock:
-                            action_queue.append('full_refresh')
+                            action_queue.append("full_refresh")
                         update_flag.set()
-                    elif key == 'r':
+                    elif key == "r":
                         with action_lock:
-                            action_queue.append('rename')
+                            action_queue.append("rename")
                         update_flag.set()
-                    elif key.lower() == 'd':
+                    elif key.lower() == "d":
                         with action_lock:
-                            action_queue.append('delete')
+                            action_queue.append("delete")
                         update_flag.set()
-                    elif key.lower() == 'c':
+                    elif key.lower() == "c":
                         with action_lock:
-                            action_queue.append('delete_all')
+                            action_queue.append("delete_all")
                         update_flag.set()
-                    elif key.lower() == 's':
+                    elif key.lower() == "s":
                         with action_lock:
-                            action_queue.append('stop')
+                            action_queue.append("stop")
                         update_flag.set()
-                    elif key.lower() == 'o':
+                    elif key.lower() == "o":
                         with action_lock:
-                            action_queue.append('sort')
+                            action_queue.append("sort")
                         update_flag.set()
-                    elif key == 'j':
+                    elif key == "j":
                         with action_lock:
-                            action_queue.append('down')
+                            action_queue.append("down")
                         update_flag.set()
-                    elif key == 'k':
+                    elif key == "k":
                         with action_lock:
-                            action_queue.append('up')
+                            action_queue.append("up")
                         update_flag.set()
-                    elif key == 'h':
+                    elif key == "h":
                         with action_lock:
-                            action_queue.append('page_prev')
+                            action_queue.append("page_prev")
                         update_flag.set()
-                    elif key == 'l':
+                    elif key == "l":
                         with action_lock:
-                            action_queue.append('page_next')
+                            action_queue.append("page_next")
                         update_flag.set()
-                    elif key == 'y':
+                    elif key == "y":
                         with action_lock:
-                            action_queue.append('resume')
+                            action_queue.append("resume")
                         update_flag.set()
-                    elif key == 'v':
+                    elif key == "v":
                         with action_lock:
-                            action_queue.append('voice')
+                            action_queue.append("voice")
                         update_flag.set()
-                    elif key == 'U':
+                    elif key == "U":
                         with action_lock:
-                            action_queue.append('unstick')
+                            action_queue.append("unstick")
                         update_flag.set()
-                    elif key == 'I':
+                    elif key == "I":
                         with action_lock:
-                            action_queue.append('unstick2')
+                            action_queue.append("unstick2")
                         update_flag.set()
-                    elif key == 'K':
+                    elif key == "K":
                         with action_lock:
-                            action_queue.append('kill')
+                            action_queue.append("kill")
                         update_flag.set()
-                    elif key == 'A':
+                    elif key == "A":
                         with action_lock:
-                            action_queue.append('archive_toggle')
+                            action_queue.append("archive_toggle")
                         update_flag.set()
-                    elif key == 't':
+                    elif key == "t":
                         with action_lock:
-                            action_queue.append('set_type')
+                            action_queue.append("set_type")
                         update_flag.set()
-                    elif key == 'a':
+                    elif key == "a":
                         with action_lock:
-                            action_queue.append('toggle_subagents')
+                            action_queue.append("toggle_subagents")
                         update_flag.set()
-                    elif key == 'm':
+                    elif key == "m":
                         with action_lock:
-                            action_queue.append('mute_toggle')
+                            action_queue.append("mute_toggle")
                         update_flag.set()
-                    elif key == 'z':
+                    elif key == "z":
                         with action_lock:
-                            action_queue.append('set_zealotry')
+                            action_queue.append("set_zealotry")
                         update_flag.set()
-                    elif key == 'n':
+                    elif key == "n":
                         with action_lock:
-                            action_queue.append('session_note')
+                            action_queue.append("session_note")
                         update_flag.set()
-                    elif key == 'M':
+                    elif key == "M":
                         with action_lock:
-                            action_queue.append('global_mute_toggle')
+                            action_queue.append("global_mute_toggle")
                         update_flag.set()
-                    elif key == 'f':
+                    elif key == "f":
                         with action_lock:
-                            action_queue.append('filter')
+                            action_queue.append("filter")
                         update_flag.set()
-                    elif key == 'R':
+                    elif key == "R":
                         with action_lock:
-                            action_queue.append('restart')
+                            action_queue.append("restart")
                         update_flag.set()
-                    elif key == '\r' or key == '\n':
+                    elif key == "\r" or key == "\n":
                         with action_lock:
-                            action_queue.append('open_terminal')
+                            action_queue.append("open_terminal")
                         update_flag.set()
-                    elif key == 'g':
+                    elif key == "g":
                         with action_lock:
-                            action_queue.append('go_top')
+                            action_queue.append("go_top")
                         update_flag.set()
-                    elif key == 'G':
+                    elif key == "G":
                         with action_lock:
-                            action_queue.append('go_bottom')
+                            action_queue.append("go_bottom")
                         update_flag.set()
-                    elif key == '[':
+                    elif key == "[":
                         with action_lock:
-                            action_queue.append('table_prev')
+                            action_queue.append("table_prev")
                         update_flag.set()
-                    elif key == ']':
+                    elif key == "]":
                         with action_lock:
-                            action_queue.append('table_next')
+                            action_queue.append("table_next")
                         update_flag.set()
-                    elif key == '?':
+                    elif key == "?":
                         with action_lock:
-                            action_queue.append('toggle_help')
+                            action_queue.append("toggle_help")
                         update_flag.set()
         except Exception:
             pass
@@ -2995,10 +3122,11 @@ def main():
         _throbber_tick += 1
         # Scan for evaluator signal files
         signal_dir = Path.home() / ".claude" / "tui-signals"
-        _evaluating_instances = {
-            f.name.removeprefix("evaluating-")
-            for f in signal_dir.glob("evaluating-*")
-        } if signal_dir.exists() else set()
+        _evaluating_instances = (
+            {f.name.removeprefix("evaluating-") for f in signal_dir.glob("evaluating-*")}
+            if signal_dir.exists()
+            else set()
+        )
         displayed = _get_displayed()
         live_ref.update(get_dashboard(displayed, selected_index))
         live_ref.refresh()
@@ -3030,7 +3158,12 @@ def main():
         # We suppress cursor throughout the TUI lifecycle and only restore it
         # temporarily during input prompts (live.stop() restores normal terminal).
         console.show_cursor(False)
-        with Live(get_dashboard(_get_displayed(), selected_index), console=console, refresh_per_second=10, screen=True) as live:
+        with Live(
+            get_dashboard(_get_displayed(), selected_index),
+            console=console,
+            refresh_per_second=10,
+            screen=True,
+        ) as live:
             last_refresh = time.time()
             last_timer_refresh = last_refresh
 
@@ -3044,26 +3177,26 @@ def main():
                 displayed = _get_displayed()
 
                 for action in actions_to_process:
-                    if action == 'toggle_help':
+                    if action == "toggle_help":
                         show_help = not show_help
                         _refresh(live)
                         continue
 
-                    if action == 'table_prev':
+                    if action == "table_prev":
                         idx = TABLE_MODES.index(table_mode)
                         table_mode = TABLE_MODES[(idx - 1) % len(TABLE_MODES)]
                         _clamp_selection()
                         _refresh(live)
                         continue
 
-                    elif action == 'table_next':
+                    elif action == "table_next":
                         idx = TABLE_MODES.index(table_mode)
                         table_mode = TABLE_MODES[(idx + 1) % len(TABLE_MODES)]
                         _clamp_selection()
                         _refresh(live)
                         continue
 
-                    if action == 'up':
+                    if action == "up":
                         if table_mode == "cron":
                             cron_selected_index = max(0, cron_selected_index - 1)
                         elif table_mode == "archived":
@@ -3072,18 +3205,24 @@ def main():
                             selected_index = max(0, selected_index - 1)
                         _refresh(live)
 
-                    elif action == 'down':
+                    elif action == "down":
                         if table_mode == "cron":
                             cron_jobs = get_cached_cron_jobs()
-                            cron_selected_index = min(len(cron_jobs) - 1, cron_selected_index + 1) if cron_jobs else 0
+                            cron_selected_index = (
+                                min(len(cron_jobs) - 1, cron_selected_index + 1) if cron_jobs else 0
+                            )
                         elif table_mode == "archived":
                             archived = _get_archived()
-                            archived_selected_index = min(len(archived) - 1, archived_selected_index + 1) if archived else 0
+                            archived_selected_index = (
+                                min(len(archived) - 1, archived_selected_index + 1)
+                                if archived
+                                else 0
+                            )
                         elif displayed:
                             selected_index = min(len(displayed) - 1, selected_index + 1)
                         _refresh(live)
 
-                    elif action == 'go_top':
+                    elif action == "go_top":
                         if table_mode == "cron":
                             cron_selected_index = 0
                         elif table_mode == "archived":
@@ -3092,7 +3231,7 @@ def main():
                             selected_index = 0
                         _refresh(live)
 
-                    elif action == 'go_bottom':
+                    elif action == "go_bottom":
                         if table_mode == "cron":
                             cron_jobs = get_cached_cron_jobs()
                             cron_selected_index = len(cron_jobs) - 1 if cron_jobs else 0
@@ -3103,7 +3242,7 @@ def main():
                             selected_index = len(displayed) - 1
                         _refresh(live)
 
-                    if action == 'rename' and displayed and table_mode == "instances":
+                    if action == "rename" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3136,7 +3275,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'session_note' and displayed and table_mode == "instances":
+                    elif action == "session_note" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3146,7 +3285,9 @@ def main():
                                 input_mode.set()
                                 time.sleep(0.1)
                                 live.stop()
-                                console.print("[yellow]No session doc linked. Use instance-name --session to create one.[/yellow]")
+                                console.print(
+                                    "[yellow]No session doc linked. Use instance-name --session to create one.[/yellow]"
+                                )
                                 time.sleep(1.5)
                                 live.start()
                                 input_mode.clear()
@@ -3159,24 +3300,36 @@ def main():
 
                             termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
-                            console.print(f"\n[yellow]Session note for:[/yellow] {format_instance_name(instance)}")
+                            console.print(
+                                f"\n[yellow]Session note for:[/yellow] {format_instance_name(instance)}"
+                            )
                             try:
                                 note = Prompt.ask("Note")
                                 if note and note.strip():
                                     try:
-                                        merge_body = json.dumps({"content": note.strip(), "source": "tui", "context": "Quick note from TUI"}).encode("utf-8")
+                                        merge_body = json.dumps(
+                                            {
+                                                "content": note.strip(),
+                                                "source": "tui",
+                                                "context": "Quick note from TUI",
+                                            }
+                                        ).encode("utf-8")
                                         req = urllib.request.Request(
                                             f"{API_URL}/api/session-docs/{session_doc_id}/merge",
                                             data=merge_body,
                                             headers={"Content-Type": "application/json"},
-                                            method="POST"
+                                            method="POST",
                                         )
                                         with urllib.request.urlopen(req, timeout=30) as resp:
                                             result = json.loads(resp.read().decode())
                                         if result.get("status") == "merged":
-                                            console.print("[green]v[/green] Note merged into session doc")
+                                            console.print(
+                                                "[green]v[/green] Note merged into session doc"
+                                            )
                                         else:
-                                            console.print(f"[red]x[/red] Unexpected response: {result}")
+                                            console.print(
+                                                f"[red]x[/red] Unexpected response: {result}"
+                                            )
                                     except Exception as e:
                                         console.print(f"[red]x[/red] Merge request failed: {e}")
                                 else:
@@ -3192,7 +3345,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'delete' and displayed and table_mode == "instances":
+                    elif action == "delete" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3207,7 +3360,7 @@ def main():
                             console.print(f"\n[red]Delete instance:[/red] {instance_name}")
                             try:
                                 confirm = Prompt.ask("Type 'yes' to confirm delete", default="no")
-                                if confirm.lower() == 'yes':
+                                if confirm.lower() == "yes":
                                     if delete_instance(instance_id):
                                         console.print(f"[green]v[/green] Deleted: {instance_name}")
                                     else:
@@ -3225,7 +3378,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'voice' and displayed and table_mode == "instances":
+                    elif action == "voice" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3247,7 +3400,9 @@ def main():
 
                                 # Display numbered list
                                 for i, v in enumerate(voices, 1):
-                                    marker = "[green]*[/green]" if v["voice"] == current_voice else " "
+                                    marker = (
+                                        "[green]*[/green]" if v["voice"] == current_voice else " "
+                                    )
                                     console.print(f"  {marker} {i}. {v['short_name']}")
 
                                 console.print()
@@ -3260,17 +3415,31 @@ def main():
                                             result = change_instance_voice(instance_id, new_voice)
                                             if result.get("success"):
                                                 if result.get("status") == "no_change":
-                                                    console.print("[dim]Already using that voice[/dim]")
+                                                    console.print(
+                                                        "[dim]Already using that voice[/dim]"
+                                                    )
                                                 else:
                                                     changes = result.get("changes", [])
-                                                    console.print(f"[green]v[/green] Voice changed to: {voices[idx]['short_name']}")
+                                                    console.print(
+                                                        f"[green]v[/green] Voice changed to: {voices[idx]['short_name']}"
+                                                    )
                                                     # Show bump chain if any
                                                     if len(changes) > 1:
-                                                        console.print("[yellow]Bump chain:[/yellow]")
+                                                        console.print(
+                                                            "[yellow]Bump chain:[/yellow]"
+                                                        )
                                                         for c in changes:
-                                                            old_short = c['old'].replace('Microsoft ', '') if c['old'] else '?'
-                                                            new_short = c['new'].replace('Microsoft ', '')
-                                                            console.print(f"  {c['name']}: {old_short} -> {new_short}")
+                                                            old_short = (
+                                                                c["old"].replace("Microsoft ", "")
+                                                                if c["old"]
+                                                                else "?"
+                                                            )
+                                                            new_short = c["new"].replace(
+                                                                "Microsoft ", ""
+                                                            )
+                                                            console.print(
+                                                                f"  {c['name']}: {old_short} -> {new_short}"
+                                                            )
                                             else:
                                                 console.print("[red]x[/red] Voice change failed")
                                         else:
@@ -3287,7 +3456,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'mute_toggle' and displayed and table_mode == "instances":
+                    elif action == "mute_toggle" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3295,12 +3464,20 @@ def main():
                             result = cycle_instance_tts_mode(instance_id, current_mode)
                             if result:
                                 new_mode = result.get("mode", "?")
-                                mode_display = {"verbose": "Verbose (TTS+Sound)", "muted": "Muted (Sound only)", "silent": "Silent", "voice-chat": "Voice Chat"}
-                                unstick_feedback = (time.time(), f"TTS: {mode_display.get(new_mode, new_mode)}")
+                                mode_display = {
+                                    "verbose": "Verbose (TTS+Sound)",
+                                    "muted": "Muted (Sound only)",
+                                    "silent": "Silent",
+                                    "voice-chat": "Voice Chat",
+                                }
+                                unstick_feedback = (
+                                    time.time(),
+                                    f"TTS: {mode_display.get(new_mode, new_mode)}",
+                                )
                                 instances_cache = get_instances()
                                 refresh_global_tts_mode()
 
-                    elif action == 'set_zealotry' and displayed and table_mode == "instances":
+                    elif action == "set_zealotry" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3312,8 +3489,12 @@ def main():
                             live.stop()
                             termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
-                            console.print(f"\n[yellow]Set zealotry for:[/yellow] {current_name} (current: {current_zealotry})")
-                            console.print("[dim]1-3: dies quietly  4-6: standard  7-8: frequent  9-10: near-realtime[/dim]")
+                            console.print(
+                                f"\n[yellow]Set zealotry for:[/yellow] {current_name} (current: {current_zealotry})"
+                            )
+                            console.print(
+                                "[dim]1-3: dies quietly  4-6: standard  7-8: frequent  9-10: near-realtime[/dim]"
+                            )
                             try:
                                 value = Prompt.ask("Zealotry (1-10)", default=str(current_zealotry))
                                 if value.isdigit() and 1 <= int(value) <= 10:
@@ -3335,15 +3516,22 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'global_mute_toggle':
+                    elif action == "global_mute_toggle":
                         result = cycle_global_tts_mode()
                         if result:
                             new_mode = result.get("mode", "?")
-                            mode_display = {"verbose": "Verbose", "muted": "Muted", "silent": "Silent"}
-                            unstick_feedback = (time.time(), f"Global TTS: {mode_display.get(new_mode, new_mode)}")
+                            mode_display = {
+                                "verbose": "Verbose",
+                                "muted": "Muted",
+                                "silent": "Silent",
+                            }
+                            unstick_feedback = (
+                                time.time(),
+                                f"Global TTS: {mode_display.get(new_mode, new_mode)}",
+                            )
                             instances_cache = get_instances()
 
-                    elif action == 'delete_all':
+                    elif action == "delete_all":
                         total_count = len(instances_cache) if instances_cache else 0
 
                         if total_count == 0:
@@ -3363,11 +3551,15 @@ def main():
 
                         termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
 
-                        console.print(f"\n[red bold]Clear all {total_count} instance(s)?[/red bold]")
-                        console.print("[dim]This will remove all instances from the database.[/dim]")
+                        console.print(
+                            f"\n[red bold]Clear all {total_count} instance(s)?[/red bold]"
+                        )
+                        console.print(
+                            "[dim]This will remove all instances from the database.[/dim]"
+                        )
                         try:
                             confirm = Prompt.ask("Type 'yes' to confirm", default="no")
-                            if confirm.lower() == 'yes':
+                            if confirm.lower() == "yes":
                                 success, count = delete_all_instances()
                                 if success:
                                     console.print(f"[green]v[/green] Cleared {count} instance(s)")
@@ -3387,7 +3579,7 @@ def main():
                         live.start()
                         _refresh(live)
 
-                    elif action == 'stop' and displayed and table_mode == "instances":
+                    elif action == "stop" and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -3398,12 +3590,16 @@ def main():
                                 _clamp_selection()
                                 _refresh(live)
 
-                    elif action in ('unstick', 'unstick2') and displayed and table_mode == "instances":
+                    elif (
+                        action in ("unstick", "unstick2")
+                        and displayed
+                        and table_mode == "instances"
+                    ):
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
                             instance_name = format_instance_name(instance)
-                            level = 2 if action == 'unstick2' else 1
+                            level = 2 if action == "unstick2" else 1
                             level_desc = "Interrupting" if level == 2 else "Nudging"
 
                             # Non-destructive: no confirmation needed, run in background
@@ -3415,18 +3611,28 @@ def main():
                                 result = unstick_instance(iid, level=lvl)
                                 sig = result.get("signal", "?") if result else "?"
                                 if result and result.get("status") == "nudged":
-                                    unstick_feedback = (time.time(), f"{sig}: {iname} - activity detected")
+                                    unstick_feedback = (
+                                        time.time(),
+                                        f"{sig}: {iname} - activity detected",
+                                    )
                                 elif result and result.get("status") == "no_change":
                                     unstick_feedback = (time.time(), f"{sig}: {iname} - no change")
                                 elif result and result.get("detail"):
-                                    unstick_feedback = (time.time(), f"Failed: {result['detail'][:30]}")
+                                    unstick_feedback = (
+                                        time.time(),
+                                        f"Failed: {result['detail'][:30]}",
+                                    )
                                 else:
                                     unstick_feedback = (time.time(), f"Unstick failed for {iname}")
                                 update_flag.set()
 
-                            threading.Thread(target=_do_unstick, args=(instance_id, instance_name, level), daemon=True).start()
+                            threading.Thread(
+                                target=_do_unstick,
+                                args=(instance_id, instance_name, level),
+                                daemon=True,
+                            ).start()
 
-                    elif action == 'kill' and displayed and table_mode == "instances":
+                    elif action == "kill" and displayed and table_mode == "instances":
                         # Kill uses unstick level 3 (SIGKILL) - no confirmation needed
                         # since terminal is preserved and instance can be resumed
                         if 0 <= selected_index < len(displayed):
@@ -3449,32 +3655,45 @@ def main():
                                         resume_cmd = f"cd {wdir} && claude --resume {iid}"
                                         copied, _ = copy_to_clipboard(resume_cmd)
                                         if copied:
-                                            unstick_feedback = (time.time(), f"Killed {iname} - resume cmd copied!")
+                                            unstick_feedback = (
+                                                time.time(),
+                                                f"Killed {iname} - resume cmd copied!",
+                                            )
                                         else:
-                                            unstick_feedback = (time.time(), f"Killed {iname} (use y to copy resume)")
+                                            unstick_feedback = (
+                                                time.time(),
+                                                f"Killed {iname} (use y to copy resume)",
+                                            )
                                     else:
                                         unstick_feedback = (time.time(), f"Killed {iname}")
                                 elif result and result.get("detail"):
-                                    unstick_feedback = (time.time(), f"Kill failed: {result['detail'][:30]}")
+                                    unstick_feedback = (
+                                        time.time(),
+                                        f"Kill failed: {result['detail'][:30]}",
+                                    )
                                 else:
                                     unstick_feedback = (time.time(), f"Kill failed for {iname}")
                                 update_flag.set()
 
-                            threading.Thread(target=_do_kill, args=(instance_id, instance_name, working_dir), daemon=True).start()
+                            threading.Thread(
+                                target=_do_kill,
+                                args=(instance_id, instance_name, working_dir),
+                                daemon=True,
+                            ).start()
 
-                    elif action == 'toggle_subagents':
+                    elif action == "toggle_subagents":
                         show_subagents = not show_subagents
                         _clamp_selection()
                         _refresh(live)
 
-                    elif action == 'filter':
+                    elif action == "filter":
                         # Cycle filter: all -> active -> stopped -> all
                         filter_cycle = {"all": "active", "active": "stopped", "stopped": "all"}
                         filter_mode = filter_cycle.get(filter_mode, "all")
                         _clamp_selection()
                         _refresh(live)
 
-                    elif action == 'restart':
+                    elif action == "restart":
                         # Restart the Token-API server
                         global restart_feedback
                         restart_feedback = (time.time(), "Restarting server...")
@@ -3484,8 +3703,7 @@ def main():
                             global restart_feedback, api_healthy, api_error_message
                             try:
                                 result = subprocess.run(
-                                    ["token-restart"],
-                                    capture_output=True, text=True, timeout=15
+                                    ["token-restart"], capture_output=True, text=True, timeout=15
                                 )
                                 if result.returncode == 0:
                                     restart_feedback = (time.time(), "Restarted server!")
@@ -3493,7 +3711,10 @@ def main():
                                     time.sleep(2)
                                     api_healthy, api_error_message = check_api_health()
                                 else:
-                                    restart_feedback = (time.time(), f"Restart failed: {result.stderr[:30]}")
+                                    restart_feedback = (
+                                        time.time(),
+                                        f"Restart failed: {result.stderr[:30]}",
+                                    )
                             except FileNotFoundError:
                                 restart_feedback = (time.time(), "token-restart not found")
                             except subprocess.TimeoutExpired:
@@ -3504,24 +3725,30 @@ def main():
 
                         threading.Thread(target=_do_restart, daemon=True).start()
 
-                    elif action == 'full_refresh':
+                    elif action == "full_refresh":
                         # Ctrl+R: restart server + re-exec TUI to pick up code changes
                         live.stop()
                         termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
-                        console.print("\n[cyan bold]Full refresh: restarting server and TUI...[/cyan bold]")
+                        console.print(
+                            "\n[cyan bold]Full refresh: restarting server and TUI...[/cyan bold]"
+                        )
                         try:
-                            subprocess.run(["token-restart"], capture_output=True, text=True, timeout=15)
+                            subprocess.run(
+                                ["token-restart"], capture_output=True, text=True, timeout=15
+                            )
                             console.print("[green]Server restarted.[/green] Re-launching TUI...")
                             time.sleep(1)
                         except Exception as e:
-                            console.print(f"[yellow]Server restart issue: {e}[/yellow] Re-launching TUI anyway...")
+                            console.print(
+                                f"[yellow]Server restart issue: {e}[/yellow] Re-launching TUI anyway..."
+                            )
                             time.sleep(0.5)
                         # Re-exec this process to pick up code changes
                         quit_flag.set()
                         listener_thread.join(timeout=0.5)
                         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-                    elif action == 'open_terminal' and displayed and table_mode == "instances":
+                    elif action == "open_terminal" and displayed and table_mode == "instances":
                         # Open a new terminal tab with resume command for selected instance
                         global resume_feedback
                         if 0 <= selected_index < len(displayed):
@@ -3537,23 +3764,42 @@ def main():
                                 # Try to open in a new Windows Terminal tab
                                 try:
                                     subprocess.Popen(
-                                        ["cmd.exe", "/c", "start", "wt.exe", "-w", "0", "nt",
-                                         "wsl.exe", "-e", "bash", "-ic", resume_cmd],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                                        [
+                                            "cmd.exe",
+                                            "/c",
+                                            "start",
+                                            "wt.exe",
+                                            "-w",
+                                            "0",
+                                            "nt",
+                                            "wsl.exe",
+                                            "-e",
+                                            "bash",
+                                            "-ic",
+                                            resume_cmd,
+                                        ],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
                                     )
-                                    resume_feedback = (time.time(), f"Opened terminal for {instance_name}")
+                                    resume_feedback = (
+                                        time.time(),
+                                        f"Opened terminal for {instance_name}",
+                                    )
                                 except FileNotFoundError:
                                     # Fallback: copy to clipboard
                                     copied, msg = copy_to_clipboard(resume_cmd)
                                     if copied:
-                                        resume_feedback = (time.time(), f"Copied resume cmd (no wt.exe)")
+                                        resume_feedback = (
+                                            time.time(),
+                                            f"Copied resume cmd (no wt.exe)",
+                                        )
                                     else:
                                         resume_feedback = (time.time(), msg)
                                 except Exception as e:
                                     resume_feedback = (time.time(), f"Open failed: {str(e)[:25]}")
                         _refresh(live)
 
-                    elif action == 'sort':
+                    elif action == "sort":
                         input_mode.set()
                         time.sleep(0.1)
                         live.stop()
@@ -3571,10 +3817,12 @@ def main():
                                 "1": "status",
                                 "2": "recent_activity",
                                 "3": "recent_stopped",
-                                "4": "created"
+                                "4": "created",
                             }
                             sort_mode = sort_options.get(choice, "status")
-                            console.print(f"[green]v[/green] Sorting by: {sort_mode.replace('_', ' ')}")
+                            console.print(
+                                f"[green]v[/green] Sorting by: {sort_mode.replace('_', ' ')}"
+                            )
                         except (KeyboardInterrupt, EOFError):
                             console.print("[dim]Cancelled[/dim]")
 
@@ -3585,22 +3833,26 @@ def main():
                         live.start()
                         _refresh(live)
 
-                    elif action == 'page_prev':
+                    elif action == "page_prev":
                         panel_page = max(0, panel_page - 1)
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
                         _refresh(live)
 
-                    elif action == 'page_next':
+                    elif action == "page_next":
                         panel_page = min(PANEL_PAGE_MAX, panel_page + 1)
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
                         _refresh(live)
 
-                    elif action == 'archive_toggle':
-                        if table_mode == "instances" and displayed and 0 <= selected_index < len(displayed):
+                    elif action == "archive_toggle":
+                        if (
+                            table_mode == "instances"
+                            and displayed
+                            and 0 <= selected_index < len(displayed)
+                        ):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id", "")
                             try:
@@ -3608,10 +3860,13 @@ def main():
                                     f"{API_URL}/api/instances/{instance_id}/archive",
                                     method="PATCH",
                                     headers={"Content-Type": "application/json"},
-                                    data=b"{}"
+                                    data=b"{}",
                                 )
                                 urllib.request.urlopen(req, timeout=5)
-                                resume_feedback = (time.time(), f"Archived {format_instance_name(instance)}")
+                                resume_feedback = (
+                                    time.time(),
+                                    f"Archived {format_instance_name(instance)}",
+                                )
                             except Exception as e:
                                 resume_feedback = (time.time(), f"Archive failed: {e}")
                         elif table_mode == "archived":
@@ -3624,20 +3879,25 @@ def main():
                                         f"{API_URL}/api/instances/{instance_id}/unarchive",
                                         method="PATCH",
                                         headers={"Content-Type": "application/json"},
-                                        data=b"{}"
+                                        data=b"{}",
                                     )
                                     urllib.request.urlopen(req, timeout=5)
-                                    resume_feedback = (time.time(), f"Unarchived {format_instance_name(instance)}")
+                                    resume_feedback = (
+                                        time.time(),
+                                        f"Unarchived {format_instance_name(instance)}",
+                                    )
                                 except Exception as e:
                                     resume_feedback = (time.time(), f"Unarchive failed: {e}")
                         _refresh(live)
 
-                    elif action == 'set_type' and table_mode == "instances" and displayed:
+                    elif action == "set_type" and table_mode == "instances" and displayed:
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id", "")
                             current_type = instance.get("instance_type", "one_off")
-                            valid_types = [t for t in ("sync", "golden_throne", "one_off") if t != current_type]
+                            valid_types = [
+                                t for t in ("sync", "golden_throne", "one_off") if t != current_type
+                            ]
 
                             input_mode.set()
                             time.sleep(0.1)
@@ -3645,13 +3905,15 @@ def main():
                             try:
                                 console.print(f"\n[cyan]Current type:[/cyan] {current_type}")
                                 console.print(f"[cyan]Options:[/cyan] {', '.join(valid_types)}")
-                                new_type = Prompt.ask("Set type", choices=valid_types, default=valid_types[0])
+                                new_type = Prompt.ask(
+                                    "Set type", choices=valid_types, default=valid_types[0]
+                                )
                                 body = json.dumps({"instance_type": new_type}).encode()
                                 req = urllib.request.Request(
                                     f"{API_URL}/api/instances/{instance_id}/type",
                                     method="PATCH",
                                     headers={"Content-Type": "application/json"},
-                                    data=body
+                                    data=body,
                                 )
                                 urllib.request.urlopen(req, timeout=5)
                                 resume_feedback = (time.time(), f"Type → {new_type}")
@@ -3664,7 +3926,7 @@ def main():
                                 live.start()
                         _refresh(live)
 
-                    elif action == 'resume' and table_mode == "instances":
+                    elif action == "resume" and table_mode == "instances":
                         # Copy resume command to clipboard (y key)
                         if not displayed:
                             resume_feedback = (time.time(), "No instances")
@@ -3682,7 +3944,10 @@ def main():
                                 resume_cmd = f"cd {working_dir} && claude --resume {instance_id}"
                                 copied, msg = copy_to_clipboard(resume_cmd)
                                 if copied:
-                                    resume_feedback = (time.time(), f"Copied resume cmd for {instance_name}")
+                                    resume_feedback = (
+                                        time.time(),
+                                        f"Copied resume cmd for {instance_name}",
+                                    )
                                 else:
                                     resume_feedback = (time.time(), msg)
                         _refresh(live)
@@ -3699,7 +3964,9 @@ def main():
                         live.stop()
                         termios.tcsetattr(tty_fd, termios.TCSADRAIN, original_terminal_settings)
                         reason = tui_signal.get("reason", "unknown")
-                        console.print(f"\n[cyan bold]Remote restart signal received ({reason}). Re-launching TUI...[/cyan bold]")
+                        console.print(
+                            f"\n[cyan bold]Remote restart signal received ({reason}). Re-launching TUI...[/cyan bold]"
+                        )
                         time.sleep(0.5)
                         quit_flag.set()
                         listener_thread.join(timeout=0.5)

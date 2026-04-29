@@ -61,14 +61,21 @@ def create_oneshot(
 
     cmd = [
         "add",
-        "--name", job_name,
-        "--description", description,
-        "--at", _normalize_duration(at),
+        "--name",
+        job_name,
+        "--description",
+        description,
+        "--at",
+        _normalize_duration(at),
         "--delete-after-run",
-        "--session", "isolated",
-        "--message", agent_prompt,
-        "--thinking", "low",
-        "--timeout-seconds", "240",
+        "--session",
+        "isolated",
+        "--message",
+        agent_prompt,
+        "--thinking",
+        "low",
+        "--timeout-seconds",
+        "240",
     ]
 
     if not announce:
@@ -97,19 +104,23 @@ def create_recurring(
 ) -> int:
     """Create a recurring followup on a schedule."""
     job_name = name or _generate_name(prompt)
-    agent_prompt = build_prompt(
-        task=prompt, name=job_name, route=route, expires=expires
-    )
+    agent_prompt = build_prompt(task=prompt, name=job_name, route=route, expires=expires)
     description = _build_description(prompt)
 
     cmd = [
         "add",
-        "--name", job_name,
-        "--description", description,
-        "--session", "isolated",
-        "--message", agent_prompt,
-        "--thinking", "low",
-        "--timeout-seconds", "240",
+        "--name",
+        job_name,
+        "--description",
+        description,
+        "--session",
+        "isolated",
+        "--message",
+        agent_prompt,
+        "--thinking",
+        "low",
+        "--timeout-seconds",
+        "240",
     ]
 
     if every:
@@ -150,10 +161,7 @@ def list_followups() -> int:
         print("Error: could not parse cron list output", file=sys.stderr)
         return 1
 
-    jobs = [
-        j for j in data.get("jobs", [])
-        if j.get("description", "").startswith(FOLLOWUP_TAG)
-    ]
+    jobs = [j for j in data.get("jobs", []) if j.get("description", "").startswith(FOLLOWUP_TAG)]
 
     if not jobs:
         print("No active follow-ups.")

@@ -25,7 +25,7 @@ source "$SCRIPT_DIR/../lib/git-remote.sh"
 
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=900       # 15 minutes max wait
-REVIEWERS=("coderabbitai[bot]" "coderabbitai" "coderabbit")
+REVIEWERS=("coderabbitai[bot]" "coderabbitai")
 
 # Colors for output
 RED='\033[0;31m'
@@ -326,7 +326,7 @@ while true; do
             [ .[] | select(
                 (.user.type == "Bot") or
                 (try ((.user.login | ascii_downcase) as $login |
-                    any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false)
+                    any($reviewers[]; . as $r | $login == ($r | ascii_downcase))) catch false)
             ) ] | length
         end
     ')
@@ -339,7 +339,7 @@ while true; do
             [ .[] | select(
                 (.user.type == "Bot") or
                 (try ((.user.login | ascii_downcase) as $login |
-                    any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false)
+                    any($reviewers[]; . as $r | $login == ($r | ascii_downcase))) catch false)
             ) ] | length
         end
     ')
@@ -385,7 +385,7 @@ REVIEWER_COMMENTS=$(printf "%s" "$ALL_COMMENTS" | jq -r --argjson reviewers "$RE
         def is_bot:
             (.user.type == "Bot") or
             (try ((.user.login | ascii_downcase) as $login |
-                any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false);
+                any($reviewers[]; . as $r | $login == ($r | ascii_downcase))) catch false);
         def format_comment:
             if (.comment_type // "") == "inline" then
                 "### \(.user.login) - \(.path // "General"):\(.line // .original_line // "N/A")\n\((.body // "") | gsub("\r\n"; "\n"))\n"
@@ -409,7 +409,7 @@ REVIEWER_REVIEWS=$(printf "%s" "$REVIEWS" | jq -r --argjson reviewers "$REVIEWER
         | select(
             (.user.type == "Bot") or
             (try ((.user.login | ascii_downcase) as $login |
-                any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false))
+                any($reviewers[]; . as $r | $login == ($r | ascii_downcase))) catch false))
         | select(.body != null and .body != "")
         | "### \(.user.login) - Review (\(.state))\n\((.body // "") | gsub("\r\n"; "\n"))\n"
     end

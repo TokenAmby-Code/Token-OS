@@ -50,9 +50,7 @@ def _get_gcloud_credentials() -> Any:
     )
     token = result.stdout.strip()
     if not token or result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to get gcloud access token: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to get gcloud access token: {result.stderr.strip()}")
     return google.oauth2.credentials.Credentials(token=token)
 
 
@@ -211,8 +209,7 @@ def get_env_config(env: str) -> dict[str, Any]:
     env_name = normalize_env(env)
     if env_name not in ENVIRONMENTS:
         raise ValueError(
-            f"Unknown environment '{env}'. "
-            f"Valid environments: {', '.join(ENVIRONMENTS.keys())}"
+            f"Unknown environment '{env}'. Valid environments: {', '.join(ENVIRONMENTS.keys())}"
         )
     return ENVIRONMENTS[env_name].copy()
 
@@ -280,9 +277,7 @@ def format_results_table(columns: list[str], rows: list[tuple[Any, ...]]) -> str
     lines = []
 
     # Header
-    header = " | ".join(
-        col.ljust(widths[i])[: widths[i]] for i, col in enumerate(columns)
-    )
+    header = " | ".join(col.ljust(widths[i])[: widths[i]] for i, col in enumerate(columns))
     separator = "-+-".join("-" * w for w in widths)
     lines.append(header)
     lines.append(separator)

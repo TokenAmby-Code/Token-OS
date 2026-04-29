@@ -47,15 +47,16 @@ _last_polled: Optional[str] = None  # ISO timestamp
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+
 class CalendlyEvent(BaseModel):
-    name: str                          # Invitee name
-    email: Optional[str] = None        # Invitee email
-    start_time: str                    # ISO 8601
-    end_time: str                      # ISO 8601
-    status: str                        # "active" or "canceled"
-    event_type: Optional[str] = None   # Event type name from Calendly
+    name: str  # Invitee name
+    email: Optional[str] = None  # Invitee email
+    start_time: str  # ISO 8601
+    end_time: str  # ISO 8601
+    status: str  # "active" or "canceled"
+    event_type: Optional[str] = None  # Event type name from Calendly
     location: Optional[str] = None
-    calendly_uri: str                  # Calendly event URI (unique ID)
+    calendly_uri: str  # Calendly event URI (unique ID)
 
 
 class ScheduleResponse(BaseModel):
@@ -69,11 +70,11 @@ class ScheduleResponse(BaseModel):
 # Calendly API helpers
 # ---------------------------------------------------------------------------
 
+
 def _headers() -> dict:
     if not CALENDLY_API_TOKEN:
         raise HTTPException(
-            status_code=503,
-            detail="CALENDLY_API_TOKEN not configured. Add it to .env"
+            status_code=503, detail="CALENDLY_API_TOKEN not configured. Add it to .env"
         )
     return {
         "Authorization": f"Bearer {CALENDLY_API_TOKEN}",
@@ -150,16 +151,18 @@ async def poll_calendly() -> List[CalendlyEvent]:
             if event.get("location", {}).get("location"):
                 location_info = event["location"]["location"]
 
-            events.append(CalendlyEvent(
-                name=invitee_name,
-                email=invitee_email,
-                start_time=event["start_time"],
-                end_time=event["end_time"],
-                status=event["status"],
-                event_type=event.get("name"),
-                location=location_info,
-                calendly_uri=event_uri,
-            ))
+            events.append(
+                CalendlyEvent(
+                    name=invitee_name,
+                    email=invitee_email,
+                    start_time=event["start_time"],
+                    end_time=event["end_time"],
+                    status=event["status"],
+                    event_type=event.get("name"),
+                    location=location_info,
+                    calendly_uri=event_uri,
+                )
+            )
 
     _cached_events = [e.model_dump() for e in events]
     _last_polled = datetime.now(timezone.utc).isoformat()
@@ -219,10 +222,7 @@ async def upcoming_events():
             logger.error(f"Calendly poll failed: {e}")
 
     now = datetime.now(timezone.utc).isoformat()
-    upcoming = [
-        e for e in _cached_events
-        if e["start_time"] > now and e["status"] == "active"
-    ]
+    upcoming = [e for e in _cached_events if e["start_time"] > now and e["status"] == "active"]
     upcoming.sort(key=lambda e: e["start_time"])
 
     return {

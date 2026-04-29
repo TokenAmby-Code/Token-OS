@@ -75,15 +75,11 @@ def _get_gcloud_credentials() -> Any:
     )
     token = result.stdout.strip()
     if not token or result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to get gcloud access token: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to get gcloud access token: {result.stderr.strip()}")
     return google.oauth2.credentials.Credentials(token=token)
 
 
-async def _connect_connector(
-    env_config: dict[str, Any], password: str | None
-) -> tuple[Any, Any]:
+async def _connect_connector(env_config: dict[str, Any], password: str | None) -> tuple[Any, Any]:
     """Connect via Cloud SQL Python Connector.
 
     Uses the active gcloud account token (not ADC) for cross-project
@@ -165,9 +161,7 @@ async def _execute_migration(
         )
     except Exception as e:
         elapsed = (time.monotonic() - start) * 1000
-        return MigrationResult(
-            success=False, error=str(e), duration_ms=elapsed, messages=messages
-        )
+        return MigrationResult(success=False, error=str(e), duration_ms=elapsed, messages=messages)
 
 
 async def run_migration(
@@ -204,9 +198,7 @@ async def run_migration(
         )
     except Exception as e:
         elapsed = (time.monotonic() - start) * 1000
-        return MigrationResult(
-            success=False, error=str(e), duration_ms=elapsed
-        )
+        return MigrationResult(success=False, error=str(e), duration_ms=elapsed)
     finally:
         if conn:
             await conn.close()

@@ -396,9 +396,7 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
         if not temp_prompt_file.exists():
             _write_prompt_file(temp_prompt_file, prompt_content)
             if not temp_prompt_file.exists():
-                raise SystemExit(
-                    f"Prompt file could not be prepared: {temp_prompt_file}"
-                )
+                raise SystemExit(f"Prompt file could not be prepared: {temp_prompt_file}")
         _write_codex_launch_status(paths, agent_id, attempt, "pending", display_str, log_path)
 
         try:
@@ -413,7 +411,9 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
         except Exception as exc:  # pragma: no cover - platform dependent
             attempt_error = str(exc)
             last_error = attempt_error
-            _write_codex_launch_status(paths, agent_id, attempt, "failed", display_str, log_path, attempt_error)
+            _write_codex_launch_status(
+                paths, agent_id, attempt, "failed", display_str, log_path, attempt_error
+            )
             print(f"⚠️  Codex launch attempt {attempt} failed: {attempt_error}", file=sys.stderr)
         else:
             if not log_path.exists():
@@ -426,7 +426,9 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
                     attempt_error = "Log file empty - wrapper script may not have started"
 
             if attempt_error is None:
-                _write_codex_launch_status(paths, agent_id, attempt, "launched", display_str, log_path)
+                _write_codex_launch_status(
+                    paths, agent_id, attempt, "launched", display_str, log_path
+                )
                 print(f"🚀 Codex agent {agent_id} running (attempt {attempt}).")
                 try:
                     temp_prompt_file.unlink(missing_ok=True)
@@ -435,7 +437,9 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
                 return
 
             last_error = attempt_error
-            _write_codex_launch_status(paths, agent_id, attempt, "failed", display_str, log_path, attempt_error)
+            _write_codex_launch_status(
+                paths, agent_id, attempt, "failed", display_str, log_path, attempt_error
+            )
             print(f"⚠️  Codex launch attempt {attempt} failed: {attempt_error}", file=sys.stderr)
 
         if attempt == max_attempts:
@@ -449,7 +453,9 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
     except OSError:
         pass
 
-    raise SystemExit(f"Codex launch failed after {max_attempts} attempts: {last_error or 'Unknown error'}")
+    raise SystemExit(
+        f"Codex launch failed after {max_attempts} attempts: {last_error or 'Unknown error'}"
+    )
 
 
 def _write_prompt_file(path: Path, contents: str) -> None:
@@ -488,7 +494,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read the prompt from a file instead of command line arguments. Overrides inline commands.",
     )
     parser.add_argument(
-        "--type", "-t",
+        "--type",
+        "-t",
         type=str,
         choices=_AVAILABLE_TYPES,
         metavar="TYPE",

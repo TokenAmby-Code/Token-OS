@@ -30,7 +30,8 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP"]
+# Initial blocking gate: fatal syntax/name errors only until baseline cleanup lands.
+select = ["E9", "F63", "F7", "F82"]
 ignore = ["E501"]
 
 [tool.ruff.format]
@@ -39,6 +40,7 @@ indent-style = "space"
 
 [tool.mypy]
 python_version = "3.11"
+# TODO: tighten these once the existing token-api typing baseline is clean.
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_return_any = false

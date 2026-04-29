@@ -23,6 +23,11 @@ set -euo pipefail
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
+if [[ -z "${CLI_TOOLS:-}" ]]; then
+    echo "Error: CLI_TOOLS is not set; source nas-path.sh or set CLI_TOOLS" >&2
+    exit 1
+fi
+
 DEPLOY_DIR="$CLI_TOOLS/src/deploy"
 
 # Check if help is requested

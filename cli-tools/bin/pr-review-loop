@@ -19,7 +19,7 @@
 # The tool will:
 #   1. Push current branch to remote (unless --no-push)
 #   2. Post a PR comment requesting re-review
-#   3. Poll for new Greptile review comments
+#   3. Poll for new CodeRabbit review comments
 #   4. Output new review comments and confidence score
 
 set -euo pipefail
@@ -31,7 +31,6 @@ source "$SCRIPT_DIR/../lib/git-remote.sh"
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=480       # 8 minutes default — CodeRabbit assertive on large diffs runs 1–5 min
 REVIEWER_BOT="coderabbitai[bot]"
-REVIEWER_USER="coderabbitai"
 SUMMARY_MARKER="^## Summary by CodeRabbit"
 COMMIT_STATUS_CONTEXT="coderabbit"
 
@@ -64,7 +63,7 @@ Options:
   --message MSG       Description of fixes applied (included in PR comment)
   --no-push           Skip git push step (if already pushed)
   --read              Read-only: skip push and comment, just poll for results
-  --timeout MINS      Max wait time in minutes (default: 15)
+  --timeout MINS      Max wait time in minutes (default: 8)
   -h, --help          Show this help
 
 Examples:

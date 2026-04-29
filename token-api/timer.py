@@ -49,27 +49,27 @@ class TickResult:
 # Break rates as (numerator, denominator) — integer rational arithmetic.
 # break_delta_ms = elapsed_ms * numerator // denominator
 BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
-    TimerMode.WORKING: (1, 1),        # +60 min/hr
-    TimerMode.MULTITASKING: (0, 1),   # neutral
-    TimerMode.IDLE: (0, 1),           # neutral
-    TimerMode.DISTRACTED: (-1, 1),    # -60 min/hr (penalty)
-    TimerMode.BREAK: (-1, 1),         # -60 min/hr (consuming break)
-    TimerMode.SLEEPING: (0, 1),       # neutral
+    TimerMode.WORKING: (1, 1),  # +60 min/hr
+    TimerMode.MULTITASKING: (0, 1),  # neutral
+    TimerMode.IDLE: (0, 1),  # neutral
+    TimerMode.DISTRACTED: (-1, 1),  # -60 min/hr (penalty)
+    TimerMode.BREAK: (-1, 1),  # -60 min/hr (consuming break)
+    TimerMode.SLEEPING: (0, 1),  # neutral
 }
 
 # Timeouts
-IDLE_TIMEOUT_FROM_WORKING_MS = 7_200_000       # 2 hours
-IDLE_TIMEOUT_FROM_MULTITASKING_MS = 120_000    # 2 minutes
-DISTRACTION_TIMEOUT_MS = 600_000               # 10 minutes (scrolling/gaming only)
-GYM_BOUNTY_MS = 1_800_000                      # 30 minutes
+IDLE_TIMEOUT_FROM_WORKING_MS = 7_200_000  # 2 hours
+IDLE_TIMEOUT_FROM_MULTITASKING_MS = 120_000  # 2 minutes
+DISTRACTION_TIMEOUT_MS = 600_000  # 10 minutes (scrolling/gaming only)
+GYM_BOUNTY_MS = 1_800_000  # 30 minutes
 
 # Focus layer — indexes backward from cutoff hour at 1:1
-FOCUS_CUTOFF_BASE_HOUR = 21                      # 9 PM
-FOCUS_CUTOFF_FLOOR_HOUR = 18                     # 6 PM (minimum, prevents gaming)
+FOCUS_CUTOFF_BASE_HOUR = 21  # 9 PM
+FOCUS_CUTOFF_FLOOR_HOUR = 18  # 6 PM (minimum, prevents gaming)
 
-MAX_IDLE_MS = 10 * 60 * 1000                   # 10 min gap detection
-MANUAL_LOCK_DURATION_MS = 20 * 60 * 1000       # 20 minutes
-DEFAULT_BREAK_BUFFER_MS = 5 * 60 * 1000        # 5 min starting break on reset
+MAX_IDLE_MS = 10 * 60 * 1000  # 10 min gap detection
+MANUAL_LOCK_DURATION_MS = 20 * 60 * 1000  # 20 minutes
+DEFAULT_BREAK_BUFFER_MS = 5 * 60 * 1000  # 5 min starting break on reset
 
 # Legacy compat — old code may import these
 IDLE_TO_BREAK_TIMEOUT_MS = IDLE_TIMEOUT_FROM_WORKING_MS
@@ -102,7 +102,10 @@ class TimerEngine:
         # Manual: {trigger: str, lock_until_ms: int|None}
         self._manual_substate: dict | None = None
         # Activity: {distraction_started_ms: int|None, is_scrolling_gaming: bool}
-        self._activity_substate: dict = {"distraction_started_ms": None, "is_scrolling_gaming": False}
+        self._activity_substate: dict = {
+            "distraction_started_ms": None,
+            "is_scrolling_gaming": False,
+        }
         # Productivity: {idle_entered_ms: int|None, idle_timeout_ms: int, idle_timeout_exempt: bool}
         self._productivity_substate: dict = {
             "idle_entered_ms": None,
@@ -140,11 +143,13 @@ class TimerEngine:
         # 3-4. Active + distraction
         if self._productivity_active and self._activity == Activity.DISTRACTION:
             asub = self._activity_substate
-            if (asub["is_scrolling_gaming"]
-                    and asub["distraction_started_ms"] is not None
-                    and self._last_tick_ms - asub["distraction_started_ms"] >= DISTRACTION_TIMEOUT_MS):
+            if (
+                asub["is_scrolling_gaming"]
+                and asub["distraction_started_ms"] is not None
+                and self._last_tick_ms - asub["distraction_started_ms"] >= DISTRACTION_TIMEOUT_MS
+            ):
                 return TimerMode.DISTRACTED  # 3. scrolling/gaming ≥10min
-            return TimerMode.MULTITASKING    # 4. distraction <10min or video
+            return TimerMode.MULTITASKING  # 4. distraction <10min or video
 
         # 5. Inactive + working → IDLE
         if not self._productivity_active and self._activity == Activity.WORKING:
@@ -253,8 +258,13 @@ class TimerEngine:
 
     # ---- Manual mode helpers ----
 
-    def _set_manual_mode(self, mode: TimerMode, trigger: str, now_mono_ms: int,
-                         lock_duration_ms: int = MANUAL_LOCK_DURATION_MS) -> None:
+    def _set_manual_mode(
+        self,
+        mode: TimerMode,
+        trigger: str,
+        now_mono_ms: int,
+        lock_duration_ms: int = MANUAL_LOCK_DURATION_MS,
+    ) -> None:
         """Set manual mode with substate. All manual mode entry goes through here."""
         self._manual_mode = mode
         self._manual_substate = {
@@ -269,7 +279,9 @@ class TimerEngine:
 
     # ---- Layer mutation methods ----
 
-    def set_activity(self, activity: Activity, is_scrolling_gaming: bool, now_mono_ms: int) -> TickResult:
+    def set_activity(
+        self, activity: Activity, is_scrolling_gaming: bool, now_mono_ms: int
+    ) -> TickResult:
         """Update the activity layer. Called by AHK/phone detection."""
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
@@ -317,9 +329,11 @@ class TimerEngine:
             self._productivity_active = active
             sub["idle_entered_ms"] = None
             # Auto-clear break if it was set by idle timeout (user is back)
-            if (self._manual_mode == TimerMode.BREAK
-                    and self._manual_substate
-                    and self._manual_substate.get("trigger") == "idle_timeout"):
+            if (
+                self._manual_mode == TimerMode.BREAK
+                and self._manual_substate
+                and self._manual_substate.get("trigger") == "idle_timeout"
+            ):
                 self._clear_manual_mode()
         elif not active and was_active:
             # Becoming inactive — parameterize idle timeout based on CURRENT mode
@@ -413,16 +427,20 @@ class TimerEngine:
 
     # ---- Tick ----
 
-    def tick(self, now_mono_ms: int, today_date: str, current_hour: int | None = None) -> TickResult:
+    def tick(
+        self, now_mono_ms: int, today_date: str, current_hour: int | None = None
+    ) -> TickResult:
         """Main tick: check daily reset, then advance counters."""
         reset_result = self._check_daily_reset(now_mono_ms, today_date, current_hour)
         if reset_result is not None:
             return reset_result
 
         # Auto-switch from sleeping to working at reset hour
-        if (current_hour is not None
-                and current_hour >= self._reset_hour
-                and self._manual_mode == TimerMode.SLEEPING):
+        if (
+            current_hour is not None
+            and current_hour >= self._reset_hour
+            and self._manual_mode == TimerMode.SLEEPING
+        ):
             old_mode = self.effective_mode
             result = self._advance(now_mono_ms)
             self._clear_manual_mode()
@@ -635,6 +653,7 @@ class TimerEngine:
                 lock_until = now_mono_ms + remaining
             elif has_lock and data.get("manual_mode_lock_until"):
                 import time as _time
+
                 remaining_s = float(data["manual_mode_lock_until"]) - _time.time()
                 if remaining_s > 0:
                     lock_until = now_mono_ms + int(remaining_s * 1000)
@@ -692,9 +711,10 @@ class TimerEngine:
             # 0:0 neutral — no break delta
             # Check if this tick crosses the distraction timeout (scrolling/gaming only)
             asub = self._activity_substate
-            if (asub["is_scrolling_gaming"]
-                    and asub["distraction_started_ms"] is not None):
-                was_before = (self._last_tick_ms - elapsed_ms - asub["distraction_started_ms"]) < DISTRACTION_TIMEOUT_MS
+            if asub["is_scrolling_gaming"] and asub["distraction_started_ms"] is not None:
+                was_before = (
+                    self._last_tick_ms - elapsed_ms - asub["distraction_started_ms"]
+                ) < DISTRACTION_TIMEOUT_MS
                 is_after = (now_mono_ms - asub["distraction_started_ms"]) >= DISTRACTION_TIMEOUT_MS
                 if was_before and is_after:
                     result.events.append(TimerEvent.DISTRACTION_TIMEOUT)
@@ -711,9 +731,11 @@ class TimerEngine:
         elif mode == TimerMode.IDLE:
             # No accumulation. Check idle timeout → auto-break.
             psub = self._productivity_substate
-            if (psub["idle_entered_ms"] is not None
-                    and not psub["idle_timeout_exempt"]
-                    and now_mono_ms - psub["idle_entered_ms"] >= psub["idle_timeout_ms"]):
+            if (
+                psub["idle_entered_ms"] is not None
+                and not psub["idle_timeout_exempt"]
+                and now_mono_ms - psub["idle_entered_ms"] >= psub["idle_timeout_ms"]
+            ):
                 old_mode = self.effective_mode
                 self._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_mono_ms)
                 psub["idle_entered_ms"] = None
@@ -734,7 +756,9 @@ class TimerEngine:
         self._last_tick_ms = now_mono_ms
         return result
 
-    def _check_daily_reset(self, now_mono_ms: int, today_date: str, current_hour: int | None = None) -> TickResult | None:
+    def _check_daily_reset(
+        self, now_mono_ms: int, today_date: str, current_hour: int | None = None
+    ) -> TickResult | None:
         """Check and perform daily reset. Returns TickResult if reset happened."""
         if self._daily_start_date is None:
             self._daily_start_date = today_date

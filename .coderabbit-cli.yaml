@@ -1,0 +1,5 @@
+Push-side advisory review instructions:
+- Use a chill, non-blocking review tone.
+- Prioritize clear correctness, security, and workflow breakage.
+- Avoid blocking-style feedback for style-only issues unless they break CI.
+- Summarize findings for agent consumption.

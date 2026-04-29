@@ -92,8 +92,10 @@ def fmt(ms):
 
 def main():
     import sys
+
     def p(s):
         print(s, flush=True)
+
     p("tick | db_break   | api_break  | predicted  | db_drift | api_drift | mode")
     p("-----+-----------+------------+------------+----------+-----------+------")
 

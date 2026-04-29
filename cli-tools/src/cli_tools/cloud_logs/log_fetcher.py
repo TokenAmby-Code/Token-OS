@@ -27,6 +27,7 @@ def _find_deploy_dir() -> Path:
             return c
     return candidates[0]  # fallback to original
 
+
 DEPLOY_DIR = _find_deploy_dir()
 
 # Mapping of environment names to YAML files
@@ -152,9 +153,7 @@ def parse_duration(duration_str: str) -> timedelta:
     """
     match = re.match(r"^(\d+)([mhd])$", duration_str.lower())
     if not match:
-        raise ValueError(
-            f"Invalid duration: {duration_str}. Use format like '1h', '30m', '2d'"
-        )
+        raise ValueError(f"Invalid duration: {duration_str}. Use format like '1h', '30m', '2d'")
 
     value = int(match.group(1))
     unit = match.group(2)
@@ -501,10 +500,7 @@ def get_service_status(env: str, service: str = DEFAULT_SERVICE) -> dict[str, An
             "service": service,
             "url": status.get("url", ""),
             "latest_revision": status.get("latestReadyRevisionName", ""),
-            "conditions": [
-                {"type": c.get("type"), "status": c.get("status")}
-                for c in conditions
-            ],
+            "conditions": [{"type": c.get("type"), "status": c.get("status")} for c in conditions],
         }
 
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, json.JSONDecodeError) as e:

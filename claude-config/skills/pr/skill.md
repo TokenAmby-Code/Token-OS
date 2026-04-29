@@ -51,7 +51,7 @@ This is the standard flow for getting code reviewed:
    ```
 
 3. **Wait for CodeRabbit + GitHub Actions:**
-   - `pr-create` polls for up to 8 minutes (CodeRabbit assertive on large diffs runs 1–5 min; 8 min gives headroom)
+   - `pr-create` polls for up to 15 minutes (CodeRabbit assertive on large diffs runs 1–5 min; 15 min gives headroom)
    - Stop signals (any one ends the wait):
      - A new comment from `coderabbitai[bot]` whose body matches `^## Summary by CodeRabbit`
      - The `coderabbit` commit status reaches `success` or `failure` on the PR head
@@ -135,7 +135,7 @@ fi
 Before creating a PR, verify:
 
 1. **Not on main/master** — never create PRs from the default branch
-2. **Local checks pass** — run `test` (the unified CI-mirror runner) so you catch
+2. **Local checks pass** — run `cli-tools/bin/test all` (or `test` if `cli-tools/bin` is on PATH) so you catch
    format/lint/type/test failures before pushing. CI runs the same commands;
    "passes locally" means the same thing as "passes CI."
 3. **No secrets staged** — check for `.env`, credentials, API keys in `git diff --cached`

@@ -15,7 +15,7 @@
 #
 # Designed to fail loudly but never block the push (push already happened).
 
-set -uo pipefail
+set -euo pipefail
 
 WORKTREE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
 [[ -z "$WORKTREE_ROOT" ]] && { echo "post-push: not in a git worktree, skipping"; exit 0; }
@@ -65,7 +65,7 @@ fi
 # Also reap anything else still bound to the port.
 if command -v lsof &>/dev/null; then
     STRAY=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
-    [[ -n "$STRAY" ]] && kill -KILL $STRAY 2>/dev/null || true
+    [[ -n "$STRAY" ]] && printf '%s\n' "$STRAY" | xargs kill -KILL 2>/dev/null || true
 fi
 
 echo "post-push: starting dev server on :$PORT"

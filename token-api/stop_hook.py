@@ -53,7 +53,10 @@ def mark_cron_instance_stopped(instance_id: str):
         if rows:
             print(f"[info] Cron instance {instance_id[:8]} marked stopped in DB", file=sys.stderr)
         else:
-            print(f"[info] Cron instance {instance_id[:8]} already stopped or not found", file=sys.stderr)
+            print(
+                f"[info] Cron instance {instance_id[:8]} already stopped or not found",
+                file=sys.stderr,
+            )
     except Exception as e:
         print(f"[warn] Could not mark cron instance stopped: {e}", file=sys.stderr)
 
@@ -61,6 +64,7 @@ def mark_cron_instance_stopped(instance_id: str):
 # ---------------------------------------------------------------------------
 # Tool summarization
 # ---------------------------------------------------------------------------
+
 
 def _truncate(s, n=80):
     s = str(s).strip().replace("\n", " ")
@@ -165,14 +169,18 @@ def collapse_tools(events):
             tool_name = m.group(1)
             filename = m.group(2)
             count = 1
-            while (k + count < len(run)
-                   and _FILE_TOOL_RE.match(run[k + count]["text"])
-                   and _FILE_TOOL_RE.match(run[k + count]["text"]).group(1) == tool_name
-                   and _FILE_TOOL_RE.match(run[k + count]["text"]).group(2) == filename):
+            while (
+                k + count < len(run)
+                and _FILE_TOOL_RE.match(run[k + count]["text"])
+                and _FILE_TOOL_RE.match(run[k + count]["text"]).group(1) == tool_name
+                and _FILE_TOOL_RE.match(run[k + count]["text"]).group(2) == filename
+            ):
                 count += 1
 
             if count > 1:
-                collapsed_run.append({"role": "tool", "text": f"[{count}x {tool_name}: {filename}]"})
+                collapsed_run.append(
+                    {"role": "tool", "text": f"[{count}x {tool_name}: {filename}]"}
+                )
             else:
                 collapsed_run.append(cur)
             k += count
@@ -186,6 +194,7 @@ def collapse_tools(events):
 # ---------------------------------------------------------------------------
 # JSONL parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_jsonl(path):
     lines = []
@@ -274,6 +283,7 @@ def clean_transcript(lines):
 # Render transcript to string
 # ---------------------------------------------------------------------------
 
+
 def render_transcript(events, max_user_chars=1500, max_assistant_chars=2000):
     parts = []
     for ev in events:
@@ -282,12 +292,17 @@ def render_transcript(events, max_user_chars=1500, max_assistant_chars=2000):
 
         if role == "user":
             if len(text) > max_user_chars:
-                text = text[:max_user_chars] + f"\n... [{len(text) - max_user_chars} chars truncated]"
+                text = (
+                    text[:max_user_chars] + f"\n... [{len(text) - max_user_chars} chars truncated]"
+                )
             parts.append(f"USER:\n{text}")
 
         elif role == "assistant":
             if len(text) > max_assistant_chars:
-                text = text[:max_assistant_chars] + f"\n... [{len(text) - max_assistant_chars} chars truncated]"
+                text = (
+                    text[:max_assistant_chars]
+                    + f"\n... [{len(text) - max_assistant_chars} chars truncated]"
+                )
             parts.append(f"ASSISTANT:\n{text}")
 
         elif role == "tool":
@@ -304,10 +319,12 @@ def estimate_tokens(text):
 # Session doc resolution
 # ---------------------------------------------------------------------------
 
+
 def find_instance_for_session(session_id):
     """Return instance dict if found, else None."""
     try:
         import urllib.request
+
         req = urllib.request.Request(f"{TOKEN_API_URL}/api/instances/{session_id}")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
@@ -323,6 +340,7 @@ def fetch_session_doc(doc_id):
     """Return session doc dict if found, else None."""
     try:
         import urllib.request
+
         req = urllib.request.Request(f"{TOKEN_API_URL}/api/session-docs/{doc_id}")
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
@@ -334,6 +352,7 @@ def fetch_session_doc(doc_id):
 # ---------------------------------------------------------------------------
 # Stats extraction
 # ---------------------------------------------------------------------------
+
 
 def extract_stats(events):
     """Extract turn counts and tool breakdown from events."""
@@ -356,7 +375,9 @@ def extract_stats(events):
                 name = m.group(1)
                 tool_counts[name] = tool_counts.get(name, 0) + 1
 
-    tool_summary = ", ".join(f"{v}x {k}" for k, v in sorted(tool_counts.items(), key=lambda x: -x[1]))
+    tool_summary = ", ".join(
+        f"{v}x {k}" for k, v in sorted(tool_counts.items(), key=lambda x: -x[1])
+    )
     return {
         "user_turns": user_turns,
         "assistant_turns": assistant_turns,
@@ -411,12 +432,14 @@ def compact_transcript(events, session_id: str) -> str | None:
         import urllib.request
         import urllib.error
 
-        payload = json.dumps({
-            "model": MINIMAX_MODEL,
-            "max_tokens": 1024,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_content}],
-        }).encode()
+        payload = json.dumps(
+            {
+                "model": MINIMAX_MODEL,
+                "max_tokens": 1024,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        ).encode()
 
         req = urllib.request.Request(
             f"{MINIMAX_BASE_URL}/v1/messages",
@@ -430,8 +453,7 @@ def compact_transcript(events, session_id: str) -> str | None:
         with urllib.request.urlopen(req, timeout=90) as resp:
             data = json.loads(resp.read())
             text = "".join(
-                block["text"] for block in data.get("content", [])
-                if block.get("type") == "text"
+                block["text"] for block in data.get("content", []) if block.get("type") == "text"
             )
             if text.strip():
                 return text.strip()
@@ -443,6 +465,7 @@ def compact_transcript(events, session_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Vault path helpers
 # ---------------------------------------------------------------------------
+
 
 def detect_vault(file_path: str) -> str | None:
     """Detect vault name from an absolute file path."""
@@ -457,7 +480,7 @@ def vault_rel_path(file_path: str) -> str | None:
     parts = Path(file_path).parts
     for i, part in enumerate(parts):
         if part.lower().endswith("-env"):
-            return str(Path(*parts[i + 1:]))
+            return str(Path(*parts[i + 1 :]))
     return None
 
 
@@ -495,6 +518,7 @@ def obsidian_append(vault: str, rel_path: str, content: str) -> bool:
 # Transcript file creation
 # ---------------------------------------------------------------------------
 
+
 def write_transcript_file(session_id, events, instance, session_doc, summary):
     """Create a contained transcript file at Mars/Logs/Transcripts/.
 
@@ -511,18 +535,10 @@ def write_transcript_file(session_id, events, instance, session_doc, summary):
     one_liner = extract_one_liner(events)
 
     # Build frontmatter + content
-    frontmatter = (
-        f"---\n"
-        f"instance_id: {session_id}\n"
-        f"tab_name: {tab_name}\n"
-    )
+    frontmatter = f"---\ninstance_id: {session_id}\ntab_name: {tab_name}\n"
     if doc_id:
         frontmatter += f"session_doc_id: {doc_id}\n"
-    frontmatter += (
-        f"created: {now.strftime('%Y-%m-%dT%H:%M:%S')}\n"
-        f"type: transcript\n"
-        f"---\n"
-    )
+    frontmatter += f"created: {now.strftime('%Y-%m-%dT%H:%M:%S')}\ntype: transcript\n---\n"
 
     body = f"\n# Transcript: {tab_name} — {now.strftime('%Y-%m-%d %H:%M')}\n\n"
 
@@ -553,6 +569,7 @@ def write_transcript_file(session_id, events, instance, session_doc, summary):
 # ---------------------------------------------------------------------------
 # Wikilink insertion
 # ---------------------------------------------------------------------------
+
 
 def append_wikilink_to_session_doc(session_doc_file_path, transcript_filename, tab_name, one_liner):
     """Append a single wikilink line to the session doc's Activity Log."""
@@ -586,6 +603,7 @@ def append_wikilink_to_daily_note(transcript_filename, tab_name):
 # ---------------------------------------------------------------------------
 # Remote JSONL fetch
 # ---------------------------------------------------------------------------
+
 
 def _fetch_remote_jsonl(satellite_url, session_id):
     """Fetch JSONL content from a remote satellite's /files/read endpoint."""
@@ -648,6 +666,7 @@ def _parse_jsonl_string(content):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     if len(sys.argv) >= 2:
         session_id = sys.argv[1].strip()
@@ -678,7 +697,9 @@ def main():
         device_id = instance.get("device_id", LOCAL_DEVICE)
         satellite_url = SATELLITE_URLS.get(device_id)
         if satellite_url:
-            print(f"[info] JSONL not local, fetching from {device_id} satellite...", file=sys.stderr)
+            print(
+                f"[info] JSONL not local, fetching from {device_id} satellite...", file=sys.stderr
+            )
             remote_content = _fetch_remote_jsonl(satellite_url, session_id)
 
     if not jsonl_path and not remote_content:
@@ -707,7 +728,9 @@ def main():
 
     # Skip trivial sessions (< 3 events = no real work)
     if len(events) < 3:
-        print(f"[info] Trivial session ({len(events)} events) — skipping transcript", file=sys.stderr)
+        print(
+            f"[info] Trivial session ({len(events)} events) — skipping transcript", file=sys.stderr
+        )
         return
 
     # Compact via MiniMax (only for substantial sessions)
@@ -735,7 +758,9 @@ def main():
     if session_doc:
         file_path = session_doc.get("file_path", "")
         print(f"[info] Linking transcript to session doc: {file_path}", file=sys.stderr)
-        success = append_wikilink_to_session_doc(file_path, transcript_filename, tab_name, one_liner)
+        success = append_wikilink_to_session_doc(
+            file_path, transcript_filename, tab_name, one_liner
+        )
         if success:
             print(f"[ok] Wikilink appended to session doc", file=sys.stderr)
         else:
