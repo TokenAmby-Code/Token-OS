@@ -179,3 +179,43 @@ class TestReconciliation:
         latest = _mutations_for(app_env, instance_id)[-1]
         assert latest["mutation_type"] == "instance_stopped"
         assert latest["actor"] == "stop-hook"
+
+    def test_primarch_supplant_clears_old_legion_pane_tint(self, client, app_env):
+        old_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, legion, synced, tmux_pane, primarch, registered_at, last_activity)
+               VALUES (?, ?, 'old-custodes', '/tmp/old', 'local', 'Mac-Mini',
+                       'idle', 'custodes', 1, '%old', 'custodes',
+                       datetime('now'), datetime('now'))""",
+            (old_id, str(uuid.uuid4())),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": new_id,
+                "cwd": "/tmp/new",
+                "pid": 12345,
+                "tmux_pane": "%new",
+                "env": {"TOKEN_API_PRIMARCH": "custodes"},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["action"] == "supplanted"
+
+        conn = _db(app_env)
+        rows = conn.execute(
+            "SELECT legion, tmux_pane FROM pane_recolor_queue ORDER BY id ASC"
+        ).fetchall()
+        conn.close()
+
+        assert [tuple(row) for row in rows] == [
+            ("custodes", "%new"),
+            ("astartes", "%old"),
+        ]

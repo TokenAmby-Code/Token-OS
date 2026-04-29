@@ -504,6 +504,8 @@ async def handle_session_start(payload: dict) -> dict:
                     target_working_dir=target_working_dir,
                 )
 
+                old_tmux_pane = existing_row["tmux_pane"]
+
                 # Same-ID transplant (--continue): update the existing row in-place
                 now = datetime.now().isoformat()
                 await sanctioned_update_instance(
@@ -568,7 +570,16 @@ async def handle_session_start(payload: dict) -> dict:
                         "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
                         (session_id, _transplant_legion, tmux_pane),
                     )
-                    await db.commit()
+                if (
+                    old_tmux_pane
+                    and old_tmux_pane != tmux_pane
+                    and _transplant_legion != "astartes"
+                ):
+                    await db.execute(
+                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
+                        (session_id, old_tmux_pane),
+                    )
+                await db.commit()
 
                 # Resolve preserved profile for color
                 cursor = await db.execute(
@@ -632,6 +643,8 @@ async def handle_session_start(payload: dict) -> dict:
                     working_dir=working_dir,
                     target_working_dir=target_working_dir,
                 )
+
+                old_tmux_pane = old_inst["tmux_pane"]
 
                 # Update the old row with new session identity, preserve config
                 await sanctioned_update_instance(
@@ -719,7 +732,12 @@ async def handle_session_start(payload: dict) -> dict:
                         "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
                         (session_id, _supplant_legion, tmux_pane),
                     )
-                    await db.commit()
+                if old_tmux_pane and old_tmux_pane != tmux_pane and _supplant_legion != "astartes":
+                    await db.execute(
+                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
+                        (session_id, old_tmux_pane),
+                    )
+                await db.commit()
 
                 # Resolve cc_color from preserved profile
                 preserved_profile = old_inst["profile_name"]
