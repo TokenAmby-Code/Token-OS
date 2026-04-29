@@ -66,6 +66,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+BRIDGE_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+BRIDGE_DIR="${HOME}/.codex/session-bridges"
+mkdir -p "$BRIDGE_DIR"
+rm -f "${BRIDGE_DIR}/${BRIDGE_ID}.session_id"
 
 post_hook() {
   local action_type="$1"
@@ -86,47 +90,57 @@ build_env_object() {
 }
 
 ENV_OBJ=$(build_env_object)
-START_PAYLOAD=$(jq -nc \
-  --arg sid "$SESSION_ID" \
-  --arg wd "$WORKING_DIR" \
-  --arg prompt "$PROMPT" \
-  --argjson env "$ENV_OBJ" \
+WRAPPER_START_PAYLOAD=$(jq -nc \
+  --arg wrapper_launch_id "$BRIDGE_ID" \
   --arg launcher "$LAUNCHER" \
   --arg engine "codex" \
-  --arg dispatch_target "$DISPATCH_TARGET" \
-  --arg dispatch_window "$DISPATCH_WINDOW" \
-  --arg dispatch_mode "$DISPATCH_MODE" \
-  --arg dispatch_slot "$DISPATCH_SLOT" \
+  --arg wd "$WORKING_DIR" \
   --arg tmux_pane "$RESOLVED_TMUX_PANE" \
-  --arg session_doc "$SESSION_DOC" \
-  --arg target_working_dir "$WORKING_DIR" \
-  --arg launch_mode "$LAUNCH_MODE" \
-  --argjson transplant_expected "$( [[ "$TRANSPLANT_EXPECTED" == "true" ]] && echo true || echo false )" \
+  --argjson pid "$$" \
+  --argjson env "$ENV_OBJ" \
   '{
-    session_id: $sid,
-    cwd: $wd,
-    prompt: $prompt,
-    env: $env,
+    wrapper_launch_id: $wrapper_launch_id,
     launcher: $launcher,
     engine: $engine,
-    dispatch_target: $dispatch_target,
-    dispatch_window: $dispatch_window,
-    dispatch_mode: $dispatch_mode,
-    dispatch_slot: $dispatch_slot,
+    cwd: $wd,
     tmux_pane: $tmux_pane,
-    dispatch_session_doc_path: $session_doc,
-    target_working_dir: $target_working_dir,
-    launch_mode: $launch_mode,
-    transplant_expected: $transplant_expected
+    pid: $pid,
+    env: $env
   }')
-
-post_hook "SessionStart" "$START_PAYLOAD"
+post_hook "WrapperStart" "$WRAPPER_START_PAYLOAD"
 
 cleanup() {
   local exit_code=$?
+  local codex_session_id="$SESSION_ID"
   local end_payload
+  local wrapper_end_payload
+  if [[ -s "${BRIDGE_DIR}/${BRIDGE_ID}.session_id" ]]; then
+    codex_session_id="$(cat "${BRIDGE_DIR}/${BRIDGE_ID}.session_id" 2>/dev/null || printf '%s' "$SESSION_ID")"
+  fi
+  rm -f "${BRIDGE_DIR}/${BRIDGE_ID}.session_id"
+  wrapper_end_payload=$(jq -nc \
+    --arg wrapper_launch_id "$BRIDGE_ID" \
+    --arg launcher "$LAUNCHER" \
+    --arg engine "codex" \
+    --arg wd "$WORKING_DIR" \
+    --arg tmux_pane "$RESOLVED_TMUX_PANE" \
+    --argjson pid "$$" \
+    --argjson code "$exit_code" \
+    --argjson env "$ENV_OBJ" \
+    '{
+      wrapper_launch_id: $wrapper_launch_id,
+      launcher: $launcher,
+      engine: $engine,
+      cwd: $wd,
+      tmux_pane: $tmux_pane,
+      pid: $pid,
+      exit_code: $code,
+      env: $env
+    }')
+  post_hook "WrapperEnd" "$wrapper_end_payload"
   end_payload=$(jq -nc \
-    --arg sid "$SESSION_ID" \
+    --arg sid "$codex_session_id" \
+    --arg wrapper_launch_id "$BRIDGE_ID" \
     --arg wd "$WORKING_DIR" \
     --arg launcher "$LAUNCHER" \
     --arg engine "codex" \
@@ -134,6 +148,7 @@ cleanup() {
     --argjson code "$exit_code" \
     '{
       session_id: $sid,
+      wrapper_launch_id: $wrapper_launch_id,
       cwd: $wd,
       launcher: $launcher,
       engine: $engine,
@@ -151,9 +166,26 @@ else
   BYPASS_FLAG="--full-auto"
 fi
 
+CODEX_ENV=(
+  "TOKEN_API_SESSION_ID=${SESSION_ID}"
+  "TOKEN_API_CODEX_BRIDGE_ID=${BRIDGE_ID}"
+  "TOKEN_API_WRAPPER_LAUNCH_ID=${BRIDGE_ID}"
+  "TOKEN_API_LAUNCHER=${LAUNCHER}"
+  "TOKEN_API_ENGINE=codex"
+  "TOKEN_API_DISPATCH_TARGET=${DISPATCH_TARGET}"
+  "TOKEN_API_DISPATCH_WINDOW=${DISPATCH_WINDOW}"
+  "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
+  "TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}"
+  "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${SESSION_DOC}"
+  "TOKEN_API_TARGET_WORKING_DIR=${WORKING_DIR}"
+  "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
+  "TOKEN_API_TRANSPLANT_EXPECTED=${TRANSPLANT_EXPECTED}"
+  "TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TMUX_PANE}"
+)
+
 if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
   OUTPUT_FILE="/tmp/codex-${SESSION_ID}.md"
-  codex exec "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
+  env "${CODEX_ENV[@]}" codex exec "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
 else
-  codex "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
+  env "${CODEX_ENV[@]}" codex "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
 fi
