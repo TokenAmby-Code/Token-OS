@@ -40,13 +40,13 @@ jobs:
       - name: Sync Python deps (cli-tools)
         if: hashFiles('cli-tools/pyproject.toml') != ''
         working-directory: cli-tools
-        run: uv sync --all-groups || true
+        run: uv sync --all-groups
         continue-on-error: true
 
       - name: Sync Python deps (token-api)
         if: hashFiles('token-api/pyproject.toml') != ''
         working-directory: token-api
-        run: uv sync --all-groups || true
+        run: uv sync --all-groups
         continue-on-error: true
 
       - name: Format check (ruff)

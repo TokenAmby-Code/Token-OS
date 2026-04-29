@@ -107,6 +107,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --timeout)
             TIMEOUT_MINS="$2"
+            if ! [[ "$TIMEOUT_MINS" =~ ^[1-9][0-9]*$ ]]; then
+                error "Invalid --timeout value: must be a positive integer"
+                exit 1
+            fi
             MAX_WAIT_TIME=$((TIMEOUT_MINS * 60))
             shift 2
             ;;
