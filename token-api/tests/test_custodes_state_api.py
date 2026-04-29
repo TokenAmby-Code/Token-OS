@@ -1,32 +1,24 @@
 """Tests for Custodes state-event ingestion."""
 
 import json
-import os
 import sqlite3
-import tempfile
 import uuid
 from pathlib import Path
 
 import pytest
 
-_test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_test_db.close()
-os.environ["TOKEN_API_DB"] = _test_db.name
-
-import main
-from init_db import init_database
+main = None
+_test_db_path: Path | None = None
 
 
 @pytest.fixture(autouse=True)
-def _init_db():
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
-    init_database()
+def _init_db(app_env):
+    global main, _test_db_path
+    main = app_env.main
+    _test_db_path = app_env.db_path
     main._custodes_state_debounce.clear()
     yield
     main._custodes_state_debounce.clear()
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
 
 
 @pytest.fixture
@@ -36,9 +28,14 @@ def client():
     return TestClient(main.app)
 
 
+def _db_path() -> Path:
+    assert _test_db_path is not None
+    return _test_db_path
+
+
 def _insert_instance(*, legion="custodes", synced=1, status="idle", tmux_pane="%5"):
     iid = str(uuid.uuid4())
-    conn = sqlite3.connect(_test_db.name)
+    conn = sqlite3.connect(_db_path())
     now = "2026-04-25T12:00:00"
     conn.execute(
         """INSERT INTO claude_instances
@@ -64,7 +61,7 @@ def _insert_instance(*, legion="custodes", synced=1, status="idle", tmux_pane="%
 
 
 def _events(event_type):
-    conn = sqlite3.connect(_test_db.name)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM events WHERE event_type = ? ORDER BY id ASC",

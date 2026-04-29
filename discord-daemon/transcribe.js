@@ -261,6 +261,9 @@ export function createTranscriber(config, logger) {
     closeUser(userId, botName) {
       if (realtime) realtime.closeUser(userId, botName);
     },
+    commitUser(userId, botName, meta) {
+      if (realtime) realtime.commitUser(userId, botName, meta);
+    },
     closeAll() {
       if (realtime) realtime.closeAll();
     },
