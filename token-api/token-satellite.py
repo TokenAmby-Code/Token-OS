@@ -457,6 +457,9 @@ DESKFLOW_POLL_INTERVAL = 30  # seconds between checks
 DESKFLOW_CONFIRM_CHECKS = 2  # consecutive checks before state transition
 DESKFLOW_STABLE_TIMEOUT = 900  # 15 min: stop polling after this long in RUNNING
 DESKFLOW_PROCESS_CHECK_INTERVAL = 300  # verify DeskFlow process every 5 min
+DESKFLOW_RECONNECT_WAIT = 5  # seconds to allow opportunistic reconnect between recovery tiers
+DESKFLOW_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
+DESKFLOW_MAX_RECOVERY_ATTEMPTS = 6
 
 
 class DeskFlowWatchdog:
@@ -469,6 +472,9 @@ class DeskFlowWatchdog:
         starting  — boot: waiting for Tailscale + DeskFlow startup
         running   — connected, periodic health checks
         waiting   — server up, Mac not connected, polling for connection
+        recovering — tiered reconnect/restart ladder is in progress
+        backoff   — recovery failed, waiting before next attempt
+        ceased    — repeated recovery failures; manual/signal intervention required
         idle      — stable for 15min, reduced polling (still checks server alive)
         held      — manual override, watchdog paused for N minutes
         stopped   — manual force_stop, fully paused
@@ -482,6 +488,10 @@ class DeskFlowWatchdog:
         self.hold_until: float | None = None
         self.last_mac_status: bool | None = None
         self.last_state_change = time.time()
+        self.recovery_attempts = 0
+        self.next_recovery_at = 0.0
+        self.last_recovery_action: str | None = None
+        self.last_observation: dict | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
@@ -533,25 +543,24 @@ class DeskFlowWatchdog:
 
         # Start DeskFlow server immediately — it stays up permanently
         self._start_deskflow_server()
-        time.sleep(5)
+        self._wait_for_connection(DESKFLOW_RECONNECT_WAIT)
 
         # Check if Mac already auto-connected
         if self._check_deskflow_connected():
-            self.state = "running"
-            self.last_state_change = time.time()
-            self.last_process_check = time.time()
+            self._mark_connected()
             logger.info("KVM watchdog: Mac already connected on boot → RUNNING")
         else:
-            # Try to kick the Mac client
-            self._ensure_mac_client_connected()
+            # Run the same tiered ladder used after later disconnects.
+            self._recover_connection(reason="boot")
             if self._check_deskflow_connected():
-                self.state = "running"
-                self.last_state_change = time.time()
-                self.last_process_check = time.time()
+                self._mark_connected()
                 logger.info("KVM watchdog: Mac connected after kick → RUNNING")
             else:
-                self.state = "waiting"
-                logger.info("KVM watchdog: Mac not connected on boot, server running, will poll")
+                if self.state == "recovering":
+                    self.state = "waiting"
+                logger.info(
+                    f"KVM watchdog: Mac not connected on boot, server running, state={self.state}"
+                )
 
         while not self._stop_event.is_set():
             self._stop_event.wait(DESKFLOW_POLL_INTERVAL)
@@ -578,16 +587,28 @@ class DeskFlowWatchdog:
             self._ensure_server_alive()
             return
 
+        # Ceased: stop active retries, but notice if the Mac reconnects on its own.
+        if self.state == "ceased":
+            if self._check_deskflow_connected():
+                logger.info("KVM watchdog: Connection restored while ceased → RUNNING")
+                self._mark_connected()
+            return
+
         # Always ensure the local server is running
         self._ensure_server_alive()
 
-        # Check actual deskflow connection (ESTABLISHED on port 24800)
-        connected = self._check_deskflow_connected()
+        observation = self._observe()
+        self.last_observation = observation
+        connected = observation["deskflow_connected"]
         self.last_mac_status = connected
 
         if connected:
             self.consecutive_up += 1
             self.consecutive_down = 0
+            if self.state in ("waiting", "recovering", "backoff", "starting"):
+                logger.info("KVM watchdog: Mac connected → RUNNING")
+                self._mark_connected()
+                return
         else:
             self.consecutive_down += 1
             self.consecutive_up = 0
@@ -595,16 +616,14 @@ class DeskFlowWatchdog:
         # State transitions based on actual connection
         if self.state in ("waiting", "starting") and connected:
             if self.consecutive_up >= DESKFLOW_CONFIRM_CHECKS:
-                logger.info("KVM watchdog: Mac connected → RUNNING")
-                self.state = "running"
-                self.last_state_change = time.time()
-                self.last_process_check = time.time()
+                self._mark_connected()
 
         elif self.state == "running" and not connected:
             if self.consecutive_down >= DESKFLOW_CONFIRM_CHECKS:
                 logger.info("KVM watchdog: Mac disconnected → WAITING (server stays up)")
                 self.state = "waiting"
                 self.last_state_change = time.time()
+                self.next_recovery_at = time.time()
 
         elif self.state == "running" and connected:
             # Stable — check if we can reduce polling
@@ -621,9 +640,17 @@ class DeskFlowWatchdog:
                 self.last_state_change = time.time()
                 self.consecutive_down = 1
                 self.consecutive_up = 0
+                self.next_recovery_at = time.time()
+
+        if self.state in ("waiting", "backoff") and not connected:
+            if time.time() >= self.next_recovery_at:
+                self._recover_connection(reason=self.state)
+            else:
+                remaining = int(self.next_recovery_at - time.time())
+                logger.info(f"KVM watchdog: Backoff active ({remaining}s until next recovery)")
 
     def _ensure_server_alive(self):
-        """Restart the local DeskFlow server if it died. Lightweight check."""
+        """Restart the local DeskFlow server if it died or stopped listening."""
         now = time.time()
         if now - self.last_process_check < DESKFLOW_PROCESS_CHECK_INTERVAL:
             return
@@ -631,6 +658,10 @@ class DeskFlowWatchdog:
         if not self._check_deskflow_running():
             logger.warning("KVM watchdog: DeskFlow server died, restarting")
             self._start_deskflow_server()
+            return
+        if not self._check_deskflow_listening():
+            logger.warning("KVM watchdog: DeskFlow process exists but port 24800 is not listening")
+            self._reload_deskflow_server()
 
     # ── Reachability ──
 
@@ -640,6 +671,29 @@ class DeskFlowWatchdog:
             return resp.status_code == 200
         except Exception:
             return False
+
+    def _get_mac_kvm_status(self) -> dict:
+        try:
+            resp = http_requests.get(f"{MAC_API_BASE}/api/kvm/status", timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return {"running": None, "reachable": False}
+
+    def _observe(self) -> dict:
+        running = self._check_deskflow_running()
+        listening = self._check_deskflow_listening() if running else False
+        connected = self._check_deskflow_connected() if running else False
+        mac_reachable = self._check_mac_reachable()
+        mac_status = self._get_mac_kvm_status() if mac_reachable else {"running": None}
+        return {
+            "deskflow_running": running,
+            "deskflow_listening": listening,
+            "deskflow_connected": connected,
+            "mac_reachable": mac_reachable,
+            "mac_client_running": mac_status.get("running"),
+        }
 
     # ── Connection check ──
 
@@ -669,6 +723,25 @@ class DeskFlowWatchdog:
             return False
 
     # ── Windows DeskFlow management ──
+
+    def _check_deskflow_listening(self) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    "Get-NetTCPConnection -LocalPort 24800 "
+                    "-State Listen -ErrorAction SilentlyContinue | "
+                    "Select-Object -First 1 LocalPort",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
 
     def _check_deskflow_running(self) -> bool:
         try:
@@ -706,6 +779,25 @@ class DeskFlowWatchdog:
             )
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
+
+    def _reload_deskflow_server(self):
+        """Light local reload: restart only the core process and relaunch the GUI wrapper."""
+        logger.info("KVM watchdog: Reloading local DeskFlow server")
+        try:
+            subprocess.run(
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-Command",
+                    "Stop-Process -Name deskflow-core -Force -ErrorAction SilentlyContinue; "
+                    f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception as e:
+            logger.error(f"KVM watchdog: Failed to reload DeskFlow: {e}")
 
     def _stop_deskflow_server(self):
         logger.info("KVM watchdog: Stopping DeskFlow server")
@@ -748,6 +840,23 @@ class DeskFlowWatchdog:
             logger.warning(f"KVM watchdog: Failed to wake Mac display: {e}")
             return False
 
+    def _start_mac_client(self):
+        self._wake_mac_display()
+        try:
+            resp = http_requests.post(f"{MAC_API_BASE}/api/kvm/start", timeout=10)
+            data = resp.json()
+            logger.info(f"KVM watchdog: Mac client start → {data.get('message', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"KVM watchdog: Mac API start unavailable: {e}")
+
+    def _reload_mac_client(self):
+        try:
+            resp = http_requests.post(f"{MAC_API_BASE}/api/kvm/reload", timeout=10)
+            data = resp.json()
+            logger.info(f"KVM watchdog: Mac client reload → {data.get('message', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"KVM watchdog: Mac API reload unavailable: {e}")
+
     def _restart_mac_client(self):
         """Force-kill and restart the Mac DeskFlow client via SSH.
 
@@ -789,6 +898,126 @@ class DeskFlowWatchdog:
             except Exception:
                 pass
 
+    def _wait_for_connection(self, seconds: int = DESKFLOW_RECONNECT_WAIT) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._stop_event.is_set():
+                return False
+            if self._check_deskflow_connected():
+                self._mark_connected()
+                return True
+            self._stop_event.wait(0.5)
+        if self._check_deskflow_connected():
+            self._mark_connected()
+            return True
+        return False
+
+    def _mark_connected(self):
+        self.state = "running"
+        self.consecutive_up = max(self.consecutive_up, DESKFLOW_CONFIRM_CHECKS)
+        self.consecutive_down = 0
+        self.recovery_attempts = 0
+        self.next_recovery_at = 0.0
+        self.last_recovery_action = None
+        self.last_state_change = time.time()
+        self.last_process_check = time.time()
+
+    def _schedule_backoff(self):
+        self.recovery_attempts += 1
+        if self.recovery_attempts >= DESKFLOW_MAX_RECOVERY_ATTEMPTS:
+            self.state = "ceased"
+            self.last_state_change = time.time()
+            self.last_recovery_action = "ceased"
+            logger.warning(
+                "KVM watchdog: Recovery attempts exhausted → CEASED "
+                "(manual /kvm/control start or satellite restart required)"
+            )
+            return
+        delay = DESKFLOW_BACKOFF_SECONDS[
+            min(self.recovery_attempts - 1, len(DESKFLOW_BACKOFF_SECONDS) - 1)
+        ]
+        self.next_recovery_at = time.time() + delay
+        self.state = "backoff"
+        self.last_state_change = time.time()
+        logger.warning(f"KVM watchdog: Recovery failed → BACKOFF {delay}s")
+
+    def _recover_connection(self, reason: str):
+        if self._check_deskflow_connected():
+            self._mark_connected()
+            return
+
+        self.state = "recovering"
+        self.last_state_change = time.time()
+        observation = self._observe()
+        self.last_observation = observation
+        logger.info(f"KVM watchdog: Recovery start ({reason}) observation={observation}")
+
+        # Tier 0: process exists but the server port is absent. Fix local server first.
+        if observation["deskflow_running"] and not observation["deskflow_listening"]:
+            self.last_recovery_action = "local_reload_not_listening"
+            self._reload_deskflow_server()
+            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                logger.info("KVM watchdog: Recovered after local reload (server was not listening)")
+                return
+            observation = self._observe()
+            self.last_observation = observation
+
+        # Tier 1: server is healthy but Mac is absent. Wake/start client and allow reconnect.
+        if (
+            observation["deskflow_running"]
+            and observation["deskflow_listening"]
+            and observation["mac_reachable"]
+        ):
+            self.last_recovery_action = "mac_quick_reconnect"
+            self._start_mac_client()
+            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                logger.info("KVM watchdog: Recovered after Mac quick reconnect")
+                return
+
+        # Tier 2: local soft reload. This is the CLI equivalent of nudging server state.
+        self.last_recovery_action = "local_reload"
+        self._reload_deskflow_server()
+        if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+            logger.info("KVM watchdog: Recovered after local reload")
+            return
+
+        # Tier 3: full local kill/start, then give the Mac an opportunistic reconnect window.
+        self.last_recovery_action = "local_full_restart"
+        self._stop_deskflow_server()
+        self._stop_event.wait(1)
+        self._start_deskflow_server()
+        if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+            logger.info("KVM watchdog: Recovered after full local restart")
+            return
+
+        # Re-observe before touching the Mac. This prevents a stale escalation
+        # from kicking the user out after the Mac reconnects late.
+        if self._check_deskflow_connected():
+            self._mark_connected()
+            return
+
+        observation = self._observe()
+        self.last_observation = observation
+        if observation["mac_reachable"]:
+            # Tier 3: light Mac reload if available, then full Mac client restart.
+            self.last_recovery_action = "mac_reload"
+            self._reload_mac_client()
+            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                logger.info("KVM watchdog: Recovered after Mac reload")
+                return
+
+            if self._check_deskflow_connected():
+                self._mark_connected()
+                return
+
+            self.last_recovery_action = "mac_full_restart"
+            self._restart_mac_client()
+            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                logger.info("KVM watchdog: Recovered after Mac full restart")
+                return
+
+        self._schedule_backoff()
+
     def _ensure_mac_client_connected(self):
         """Start Mac client if needed, restart if connection is dead.
 
@@ -799,24 +1028,7 @@ class DeskFlowWatchdog:
             logger.info("KVM watchdog: Mac already connected, nothing to do")
             return
 
-        # Not connected — try to wake and start the Mac client
-        self._wake_mac_display()
-        time.sleep(2)
-        try:
-            resp = http_requests.post(f"{MAC_API_BASE}/api/kvm/start", timeout=10)
-            data = resp.json()
-            logger.info(f"KVM watchdog: Mac client → {data.get('message', 'unknown')}")
-        except Exception as e:
-            logger.warning(f"KVM watchdog: Mac API not available (no token-api?): {e}")
-
-        # Wait for connection to establish, then verify
-        time.sleep(8)
-        if not self._check_deskflow_connected():
-            logger.warning(
-                "KVM watchdog: No ESTABLISHED connection on port 24800, "
-                "restarting Mac client via SSH"
-            )
-            self._restart_mac_client()
+        self._recover_connection(reason="manual_ensure")
 
     # ── State transitions are handled inline in _tick() ──
 
@@ -824,14 +1036,26 @@ class DeskFlowWatchdog:
 
     def get_status(self) -> dict:
         running = self._check_deskflow_running()
+        listening = self._check_deskflow_listening() if running else False
         connected = self._check_deskflow_connected() if running else False
+        observation = self.last_observation or self._observe()
         return {
             "state": self.state,
             "mac_connected": connected,
             "deskflow_running": running,
+            "deskflow_listening": listening,
             "deskflow_connected": connected,
+            "mac_reachable": observation.get("mac_reachable"),
+            "mac_client_running": observation.get("mac_client_running"),
             "consecutive_up": self.consecutive_up,
             "consecutive_down": self.consecutive_down,
+            "recovery_attempts": self.recovery_attempts,
+            "next_recovery_at": (
+                datetime.fromtimestamp(self.next_recovery_at).isoformat()
+                if self.next_recovery_at
+                else None
+            ),
+            "last_recovery_action": self.last_recovery_action,
             "last_state_change": datetime.fromtimestamp(self.last_state_change).isoformat(),
             "hold_until": (
                 datetime.fromtimestamp(self.hold_until).isoformat() if self.hold_until else None
@@ -844,16 +1068,23 @@ class DeskFlowWatchdog:
         logger.info(f"KVM watchdog: Held for {minutes} minutes")
 
     def force_start(self):
+        self.recovery_attempts = 0
+        self.next_recovery_at = 0.0
+        self.last_recovery_action = "manual_start"
         self._start_deskflow_server()
-        time.sleep(5)
-        self._ensure_mac_client_connected()
-        self.state = "running"
-        self.last_state_change = time.time()
-        self.last_process_check = time.time()
+        if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+            return
+        self._recover_connection(reason="manual_start")
+        if not self._check_deskflow_connected() and self.state == "recovering":
+            self.state = "waiting"
+            self.last_state_change = time.time()
 
     def force_stop(self):
         self._stop_deskflow_server()
         self.state = "stopped"
+        self.recovery_attempts = 0
+        self.next_recovery_at = 0.0
+        self.last_recovery_action = "manual_stop"
         self.last_state_change = time.time()
 
 
@@ -884,7 +1115,7 @@ class TTSSpeakRequest(BaseModel):
 
 
 class KvmControlRequest(BaseModel):
-    action: str  # "start", "stop", "hold"
+    action: str  # "start", "stop", "reload", "hold"
     hold_minutes: int = 30
 
 
@@ -913,6 +1144,7 @@ def _announce_to_mac():
     time.sleep(3)  # Let the server finish binding
     hostname = socket.gethostname()
     payload = {"hostname": hostname, "port": 7777}
+    _send_lifecycle_event("startup", {"hostname": hostname, "port": 7777})
     for attempt in range(1, 4):
         try:
             resp = http_requests.post(
@@ -932,6 +1164,23 @@ def _announce_to_mac():
     logger.error("Startup announcement to Mac failed after 3 attempts (non-fatal)")
 
 
+def _send_lifecycle_event(event: str, details: dict | None = None):
+    """Best-effort lifecycle signal to Mac Token-API."""
+    payload = {
+        "event_type": "satellite_lifecycle",
+        "details": {
+            "satellite": "wsl",
+            "event": event,
+            "timestamp": datetime.now().isoformat(),
+            **(details or {}),
+        },
+    }
+    try:
+        http_requests.post(f"{MAC_API_BASE}/api/events/log", json=payload, timeout=2)
+    except Exception as e:
+        logger.warning(f"Lifecycle event '{event}' not delivered to Mac: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Warm up TTS engine and start DeskFlow watchdog."""
@@ -942,6 +1191,12 @@ async def startup_event():
     deskflow_watchdog.start()
     # Announce to Mac in background thread (non-blocking, non-fatal)
     threading.Thread(target=_announce_to_mac, daemon=True).start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Best-effort shutdown signal before WSL/systemd takes the satellite down."""
+    _send_lifecycle_event("shutdown", {"kvm_state": deskflow_watchdog.state})
 
 
 @app.get("/health")
@@ -1169,6 +1424,11 @@ async def kvm_control(request: KvmControlRequest):
     if action == "start":
         deskflow_watchdog.force_start()
         return {"success": True, "action": "start", "state": deskflow_watchdog.state}
+    elif action == "reload":
+        deskflow_watchdog.recovery_attempts = 0
+        deskflow_watchdog.next_recovery_at = 0.0
+        deskflow_watchdog._recover_connection(reason="manual_reload")
+        return {"success": True, "action": "reload", "state": deskflow_watchdog.state}
     elif action == "stop":
         deskflow_watchdog.force_stop()
         return {"success": True, "action": "stop", "state": deskflow_watchdog.state}
@@ -1183,7 +1443,7 @@ async def kvm_control(request: KvmControlRequest):
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown action: {action}. Valid: start, stop, hold",
+            detail=f"Unknown action: {action}. Valid: start, stop, reload, hold",
         )
 
 
@@ -1380,6 +1640,7 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
 async def restart_satellite(pull: bool = True):
     """Git pull, write TUI signals, then exit for systemd restart."""
     result = {"pull": None, "tui_signals": False, "restarting": True}
+    _send_lifecycle_event("restart_requested", {"pull": pull})
 
     # 1. Git pull
     if pull:

@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -136,6 +137,10 @@ from timer import (
     TimerMode,
     format_timer_time,
 )
+
+DESKFLOW_SERVER_PORT = 24800
+DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
+MAC_KVM_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -271,6 +276,18 @@ shared.scheduler = scheduler
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
+mac_kvm_supervisor_task = None
+
+MAC_KVM_STATE = {
+    "state": "starting",
+    "server_host": None,
+    "server_reachable": None,
+    "client_running": None,
+    "retry_attempts": 0,
+    "next_probe_at": 0.0,
+    "last_action": None,
+    "last_changed": None,
+}
 
 
 # Pydantic Models
@@ -998,7 +1015,7 @@ async def run_overdue_tasks():
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global stale_flag_cleaner_task, timer_worker_task
+    global stale_flag_cleaner_task, timer_worker_task, mac_kvm_supervisor_task
     import routes.tts as _tts_mod  # For mutable tts_worker_task assignment
 
     # Install asyncio exception handler for this loop
@@ -1067,6 +1084,9 @@ async def lifespan(app: FastAPI):
     # Start phone heartbeat monitor
     asyncio.create_task(phone_heartbeat_worker())
     print("Phone heartbeat monitor started")
+    # Start Mac-side Deskflow backoff supervisor
+    mac_kvm_supervisor_task = asyncio.create_task(mac_kvm_supervisor())
+    print("Mac KVM supervisor started")
     # Start legion pane recolor worker
     asyncio.create_task(legion_pane_recolor_worker())
     print("Legion pane recolor worker started")
@@ -1107,6 +1127,12 @@ async def lifespan(app: FastAPI):
         timer_worker_task.cancel()
         try:
             await timer_worker_task
+        except asyncio.CancelledError:
+            pass
+    if mac_kvm_supervisor_task:
+        mac_kvm_supervisor_task.cancel()
+        try:
+            await mac_kvm_supervisor_task
         except asyncio.CancelledError:
             pass
     scheduler.shutdown(wait=True)
@@ -7386,22 +7412,167 @@ async def cancel_shutdown():
         return {"success": False, "message": str(e)}
 
 
-# ============ KVM (Deskflow) Endpoints ============
+# ============ KVM (Deskflow) ============
+
+
+def _mac_kvm_set_state(**updates):
+    MAC_KVM_STATE.update(updates)
+    MAC_KVM_STATE["last_changed"] = datetime.now().isoformat()
+
+
+def _deskflow_client_remote_host() -> str:
+    try:
+        config_text = DESKFLOW_CLIENT_CONFIG_PATH.read_text()
+    except OSError as e:
+        logger.warning(
+            f"KVM: Could not read Deskflow client config at {DESKFLOW_CLIENT_CONFIG_PATH}: {e}"
+        )
+        return DESKTOP_CONFIG["host"]
+
+    in_client_section = False
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_client_section = line.lower() == "[client]"
+            continue
+        if in_client_section and line.startswith("remoteHost="):
+            host = line.split("=", 1)[1].strip()
+            if host:
+                return host
+
+    logger.warning(
+        f"KVM: Deskflow client config has no [client] remoteHost; falling back to {DESKTOP_CONFIG['host']}"
+    )
+    return DESKTOP_CONFIG["host"]
+
+
+def _wsl_deskflow_server_reachable() -> tuple[bool, str]:
+    host = _deskflow_client_remote_host()
+    try:
+        with socket.create_connection((host, DESKFLOW_SERVER_PORT), timeout=2):
+            return True, host
+    except OSError:
+        return False, host
+
+
+def _mac_deskflow_pids() -> list[str]:
+    pids: list[str] = []
+    for name in ("Deskflow", "deskflow-core"):
+        result = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            pids.extend(line for line in result.stdout.strip().splitlines() if line)
+    return pids
+
+
+def _mac_deskflow_running() -> bool:
+    return bool(_mac_deskflow_pids())
+
+
+def _start_mac_deskflow_client(reason: str):
+    subprocess.Popen(["open", "/Applications/Deskflow.app"])
+    subprocess.Popen(["caffeinate", "-u", "-t", "5"])
+    logger.info(f"KVM: Started Deskflow client ({reason})")
+
+
+def _reload_mac_deskflow_client(reason: str):
+    subprocess.run(["open", "-a", "Deskflow"], capture_output=True, text=True, timeout=5)
+    subprocess.Popen(["caffeinate", "-u", "-t", "5"])
+    logger.info(f"KVM: Reloaded Deskflow client ({reason})")
+
+
+def _stop_mac_deskflow_client(reason: str):
+    result = subprocess.run(
+        ["killall", "-9", "Deskflow", "deskflow-core"],
+        capture_output=True,
+        text=True,
+    )
+    logger.info(f"KVM: Stopped Deskflow client ({reason}, exit={result.returncode})")
+
+
+async def mac_kvm_supervisor():
+    """Mac-side guard that prevents Deskflow's native client from retry-spamming.
+
+    If the WSL Deskflow server port is absent, the Mac client is stopped so
+    deskflow-core cannot loop internally. Token-API then probes with exponential
+    backoff and starts the client only after the server port is reachable.
+    """
+    await asyncio.sleep(5)
+    while True:
+        try:
+            server_reachable, server_host = await asyncio.to_thread(_wsl_deskflow_server_reachable)
+            client_running = await asyncio.to_thread(_mac_deskflow_running)
+
+            if server_reachable:
+                if not client_running:
+                    await asyncio.to_thread(_start_mac_deskflow_client, "server_reachable")
+                    client_running = True
+                    action = "client_started"
+                else:
+                    action = "server_reachable"
+                _mac_kvm_set_state(
+                    state="running",
+                    server_host=server_host,
+                    server_reachable=True,
+                    client_running=client_running,
+                    retry_attempts=0,
+                    next_probe_at=0.0,
+                    last_action=action,
+                )
+                await asyncio.sleep(30)
+                continue
+
+            stopped_client = False
+            if client_running:
+                await asyncio.to_thread(_stop_mac_deskflow_client, "server_unreachable")
+                client_running = False
+                stopped_client = True
+
+            attempts = int(MAC_KVM_STATE.get("retry_attempts") or 0) + 1
+            delay = MAC_KVM_BACKOFF_SECONDS[min(attempts - 1, len(MAC_KVM_BACKOFF_SECONDS) - 1)]
+            next_probe_at = time.time() + delay
+            _mac_kvm_set_state(
+                state="backoff",
+                server_host=server_host,
+                server_reachable=False,
+                client_running=False,
+                retry_attempts=attempts,
+                next_probe_at=next_probe_at,
+                last_action="client_stopped_backoff" if stopped_client else "server_absent_backoff",
+            )
+            logger.info(f"KVM: WSL Deskflow server absent; next Mac probe in {delay}s")
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"KVM supervisor error: {e}")
+            _mac_kvm_set_state(state="error", last_action=str(e)[:200])
+            await asyncio.sleep(60)
 
 
 @app.post("/api/kvm/start")
 async def kvm_start():
     """Start Deskflow client (software KVM) on this Mac."""
     try:
-        result = subprocess.run(["pgrep", "-f", "Deskflow.app"], capture_output=True, text=True)
-        if result.returncode == 0:
+        if _mac_deskflow_running():
             return {"success": True, "message": "Deskflow already running", "already_running": True}
 
-        subprocess.Popen(["open", "/Applications/Deskflow.app"])
-        logger.info("KVM: Started Deskflow client")
+        _start_mac_deskflow_client("api_start")
         return {"success": True, "message": "Deskflow started", "already_running": False}
     except Exception as e:
         logger.error(f"KVM: Failed to start Deskflow: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/kvm/reload")
+async def kvm_reload():
+    """Lightly nudge Deskflow client on this Mac without force-killing the app."""
+    try:
+        _reload_mac_deskflow_client("api_reload")
+        return {"success": True, "message": "Deskflow reload nudged"}
+    except Exception as e:
+        logger.error(f"KVM: Failed to reload Deskflow: {e}")
         return {"success": False, "message": str(e)}
 
 
@@ -7409,9 +7580,9 @@ async def kvm_start():
 async def kvm_stop():
     """Stop Deskflow client on this Mac."""
     try:
-        result = subprocess.run(["pkill", "-f", "Deskflow"], capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("KVM: Stopped Deskflow")
+        was_running = _mac_deskflow_running()
+        _stop_mac_deskflow_client("api_stop")
+        if was_running:
             return {"success": True, "message": "Deskflow stopped"}
         else:
             return {"success": True, "message": "Deskflow was not running"}
@@ -7423,9 +7594,20 @@ async def kvm_stop():
 @app.get("/api/kvm/status")
 async def kvm_status():
     """Check if Deskflow is running on this Mac."""
-    result = subprocess.run(["pgrep", "-f", "Deskflow.app"], capture_output=True, text=True)
-    running = result.returncode == 0
-    return {"running": running, "pids": result.stdout.strip().split("\n") if running else []}
+    pids = _mac_deskflow_pids()
+    running = bool(pids)
+    return {
+        "running": running,
+        "pids": pids,
+        "supervisor": {
+            **MAC_KVM_STATE,
+            "next_probe_at": (
+                datetime.fromtimestamp(MAC_KVM_STATE["next_probe_at"]).isoformat()
+                if MAC_KVM_STATE.get("next_probe_at")
+                else None
+            ),
+        },
+    }
 
 
 # ============ Task Endpoints ============

@@ -169,11 +169,11 @@ GET    /processes                       # List distraction-relevant processes
 POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
 POST   /tts/skip                        # Skip current TTS playback
 GET    /kvm/status                      # DeskFlow watchdog state (state, mac_reachable, deskflow_running)
-POST   /kvm/control                     # Manual DeskFlow control (action: start|stop|hold, hold_minutes: 30)
+POST   /kvm/control                     # Manual DeskFlow control (action: start|reload|stop|hold, hold_minutes: 30)
 POST   /restart                         # Git pull + systemd restart
 ```
 
-**KVM Watchdog**: Background thread manages DeskFlow lifecycle. Starts DeskFlow at boot, monitors Mac via token-api health check (30s interval), wakes Mac display + starts client when Mac is reachable, stops DeskFlow when Mac goes down. Replaces the old "Deskflow" Windows scheduled task (now disabled).
+**KVM Watchdog**: WSL satellite manages the server side. It starts DeskFlow at boot, checks for an established Mac client connection, and uses tiered recovery: Mac wake/start → local DeskFlow reload → full local restart → Mac client reload/restart. Failed recovery attempts back off exponentially and eventually enter `ceased` until manual/signal intervention. Mac Token-API also runs a client-side supervisor: if the WSL DeskFlow port is absent, it stops the Mac client so DeskFlow cannot retry-spam internally, then probes with exponential backoff and reopens the client only when the server port is reachable. Replaces the old "Deskflow" Windows scheduled task (now disabled).
 
 ### Discord Integration
 ```
