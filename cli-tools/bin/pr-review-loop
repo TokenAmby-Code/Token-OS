@@ -241,7 +241,7 @@ while true; do
 
     if [[ $NEW_OVERVIEW_COUNT -gt 0 ]]; then
         LATEST_ISSUE_COMMENT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
-            jq -s --arg bot "$REVIEWER_BOT" -r 'add | .[] | select(.user.login == $bot) | .body' | tail -1)
+            jq -s --arg bot "$REVIEWER_BOT" -r 'add | [.[] | select(.user.login == $bot)] | .[-1].body // ""')
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
             FOUND_OVERVIEW=true
