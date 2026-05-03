@@ -1,44 +1,57 @@
 #!/usr/bin/env bash
 # pane-id.sh — Human-readable tmux pane ID system
-# Sourced by tmux-workspace, tx, and other tmux tools.
+# Sourced by tx, vault-dispatch, tmuxctl, and other tmux tools.
 #
-# Pane IDs use the format window:position (e.g., palace:TR, warp:MON, kreig:1).
+# Pane IDs use the format window:position (e.g., palace:TR, mechanicus:1).
 # Stored as @PANE_ID tmux pane option. Resolves to tmux pane target (%N).
 #
-# Palace positions:
-#   Bridge (Mac):  TL TR BL BR SR
-#   Grid (WSL):    SL TL BL TR BR SR
-# Warp positions:  MON T B
-# Kreig/Legion:    incrementing integers (1, 2, 3...)
-# TUI:             1
+# Palace positions:  SL TL BL TR BR SR  (6-pane: side columns flank a 2x2 grid)
+# Somnium positions: TL TR BL BR SR     (5-pane: 2x2 grid + right TUI column)
+# Mechanicus/Legion: incrementing integers (1, 2, 3...)
+# TUI:               1
+
+_TMUX_STATE_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source=./tmux-state.sh
+source "${_TMUX_STATE_LIB_DIR}/tmux-state.sh" 2>/dev/null || true
 
 # Set @PANE_ID on a pane and derive @GRID_STATE / @PANE_TYPE for backward compat.
 pane_tag() {
     local target="$1" pane_id="$2"
+    local grid_state pane_type
+
+    if ! tmux_is_valid_pane_slot "$pane_id"; then
+        echo "pane_tag: invalid pane id '${pane_id}'" >&2
+        return 1
+    fi
+
     tmux set-option -p -t "$target" @PANE_ID "$pane_id"
 
-    # Derive @GRID_STATE from position
-    local pos="${pane_id#*:}"
-    case "$pos" in
-        SL|SR)  tmux set-option -p -t "$target" @GRID_STATE "side" ;;
-        MON)    tmux set-option -p -t "$target" @GRID_STATE "mini" ;;
-        TL|TR|BL|BR|T|B|[0-9]*) tmux set-option -p -t "$target" @GRID_STATE "small" ;;
-    esac
+    grid_state=$(tmux_grid_state_from_pane_id "$pane_id" 2>/dev/null || true)
+    if tmux_is_valid_grid_state "$grid_state"; then
+        tmux set-option -p -t "$target" @GRID_STATE "$grid_state"
+    fi
 
-    # Derive @PANE_TYPE from window prefix
-    local win="${pane_id%%:*}"
-    case "$win" in
-        kreig)  tmux set-option -p -t "$target" @PANE_TYPE "kreig" ;;
-        legion) tmux set-option -p -t "$target" @PANE_TYPE "legion" ;;
-        tui)    tmux set-option -p -t "$target" @PANE_TYPE "tui" ;;
+    pane_type=$(tmux_pane_type_from_pane_id "$pane_id" 2>/dev/null || true)
+    case "$pane_type" in
+        "$TMUX_PANE_TYPE_MECHANICUS"|"$TMUX_PANE_TYPE_LEGION"|"$TMUX_PANE_TYPE_TUI")
+            tmux set-option -p -t "$target" @PANE_TYPE "$pane_type"
+            ;;
     esac
-    # warp:MON and palace:SR (mac-palace) get @PANE_TYPE "tui" — set by caller
+    # somnium:SR gets @PANE_TYPE "tui" — set by caller
 }
 
 # Resolve a pane ID to a tmux pane target (e.g., palace:TR → %17).
 # Usage: tmux send-keys -t "$(pane_resolve palace:TR)" "echo hi" Enter
 pane_resolve() {
     local id="$1"
+    local resolved
+    resolved=$(PYTHONPATH="${_TMUX_STATE_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli resolve-pane "$id" 2>/dev/null \
+        | awk -F': ' '$1 == "pane_id" { print $2; exit }' || true)
+    if [[ -n "$resolved" ]]; then
+        echo "$resolved"
+        return 0
+    fi
     tmux list-panes -a -F '#{pane_id} #{@PANE_ID}' 2>/dev/null \
         | awk -v id="$id" '$2 == id { print $1; exit }'
 }

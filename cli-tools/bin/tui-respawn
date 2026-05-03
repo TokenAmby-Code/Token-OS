@@ -9,8 +9,8 @@
 #   tui-respawn --dry    # Show what would be respawned, don't act
 #
 # Works regardless of pane state: alive (kills + respawns), dead (respawns),
-# or dirty-flagged (clears flag + respawns). Uses @PANE_TYPE=tui tag set by
-# tmux-workspace to find monitor panes.
+# or dirty-flagged (clears flag + respawns). Uses @PANE_TYPE=tui tags to find
+# monitor panes.
 
 set -euo pipefail
 

@@ -135,9 +135,9 @@ TMUX_PANE='%42'
 assert_eq "pane.from_tmux_pane_env" "%42" "$(origin_pane)"
 
 _reset_origin
-IMPERIUM_ORIGIN_PANE='palace:TR'
+IMPERIUM_ORIGIN_PANE='somnium:TR'
 TMUX_PANE='%99'
-assert_eq "pane.override_beats_env" "palace:TR" "$(origin_pane)"
+assert_eq "pane.override_beats_env" "somnium:TR" "$(origin_pane)"
 
 # ============================================================
 # origin_transport

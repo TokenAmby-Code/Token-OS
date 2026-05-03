@@ -4,29 +4,32 @@
 # AUDIENCE: human
 #
 # Wraps all major tmux functions into a single beginner-friendly command.
-# Routes to tmux-workspace, tmux-reset, tmux-grid-expand, tmux-resume,
-# and tmux-refresh-layout as needed.
+# Workspace creation/teardown lives in the Python tmuxctl planner; this script
+# also routes to tmux-reset, tmux-grid-expand, tmux-resume, tmux-focus, and
+# tmux-refresh-layout as needed.
 #
 # Usage:
 #   tx                    # Show session status (or start if not in tmux)
 #   tx start              # Create/attach to main workspace session
 #   tx restart [-r]       # Kill session and recreate workspace
-#   tx restart --pane     # Reset active pane to default state
-#   tx restart --page     # Reset current window/page to default layout
+#   tx restart-pane       # Reset active pane to default state
+#   tx restart-page       # Reset current window/page to default layout
 #   tx exit               # Detach from tmux
 #   tx status             # Show session/pane overview
-#   tx workspace [...]    # Forward to tmux-workspace
 #   tx reset              # Reset current window layout (menu)
 #   tx expand             # Toggle expand/retract active pane
 #   tx focus              # Drop side columns, keep 2×2 grid only
 #   tx unfocus            # Restore side columns
 #   tx resume [...]       # Inject prompt into Claude pane
+#   tx inspect [...]      # Inspect typed workspace state
+#   tx doctor             # Diagnose managed workspace drift
+#   tx normalize [...]    # Reserved Python normalize path
 #   tx refresh            # Reset panes to canonical proportions
 #   tx list               # List all tmux sessions
 #   tx kill [session]     # Kill a session (default: main)
-#   tx kreig "prompt"     # Dispatch background task (alias: tx kr)
+#   tx mechanicus "prompt" # Dispatch background task (aliases: tx mech, tx mars)
 #   tx legion bump        # Bump current pane to legion window
-#   tx legion recall      # Recall pane from legion to palace
+#   tx legion recall      # Recall pane from legion to somnium
 #   tx help               # Show this help
 
 set -euo pipefail
@@ -55,9 +58,9 @@ log_error()   { echo -e "${RED}✗${RESET} $*" >&2; }
 SESSION_NAME="main"
 
 # --- Workspace flag detection ---
-# Flags that belong to tmux-workspace, not raw tmux.
-# If someone does `tx --focus` or `tx --mac`, route to the right subcommand.
-WORKSPACE_FLAGS=(--attach --window --warp --mobile --mac --portable --focus --unfocus --toggle-focus --window-reset --palace-reset --bridge-reset)
+# Legacy workspace flags (now mapped to tx subcommands or removed).
+# If someone does `tx --focus`, route to the right subcommand.
+WORKSPACE_FLAGS=(--attach --portable --focus --unfocus --toggle-focus)
 
 is_workspace_flag() {
     local flag="$1"
@@ -69,6 +72,10 @@ is_workspace_flag() {
 
 # --- Check if inside tmux ---
 in_tmux() { [[ -n "${TMUX:-}" ]]; }
+
+run_tmuxctl() {
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli "$@"
+}
 
 # --- Help ---
 show_help() {
@@ -84,11 +91,9 @@ tx — tmux wrapper
 SESSION
   tx              status / start
   tx start        create + attach
-  tx start --mac  mac palace layout
-  tx portable     attach portable mon
   tx restart (-r) kill + recreate
-  tx restart --pane  reset pane
-  tx restart --page  reset page
+  tx restart-pane   reset pane
+  tx restart-page   reset page
   tx exit         detach
   tx status       overview
   tx list         all sessions
@@ -98,6 +103,10 @@ LAYOUT
   tx focus     drop side columns
   tx unfocus   restore sides
   tx expand    toggle pane size
+  tx inspect   inspect typed state
+    restart-plan   inspect restart registry/restore plan
+  tx doctor    diagnose drift
+  tx normalize reserved Python path
   tx refresh   reset proportions
   tx reset     reset menu
 
@@ -107,10 +116,10 @@ AGENTS
   tx resume --find-claude "..."
     auto-find Claude pane
 
-KREIG
-  tx kr "prompt"  dispatch task
-  tx kr status    list panes
-  tx kr cleanup   kill dead
+MECHANICUS
+  tx mech "prompt"   dispatch task
+  tx mech status     list panes
+  tx mech cleanup    kill dead
 
 LEGION
   tx legion bump    move pane out
@@ -137,11 +146,9 @@ tx — Imperium tmux wrapper
 Session:
   tx                  status, or start if no tmux
   tx start            create + attach workspace
-  tx start --mac      mac palace layout
-  tx portable         attach with portable monitor status bar
   tx restart, tx -r   kill + recreate session
-  tx restart --pane   reset active pane to default state
-  tx restart --page   reset current window/page to default layout
+  tx restart-pane     reset active pane to default state
+  tx restart-page     reset current window/page to default layout
   tx exit             detach (session stays alive)
   tx status           session/pane overview
   tx list             list all sessions
@@ -151,6 +158,10 @@ Layout:
   tx focus            drop side columns
   tx unfocus          restore side columns
   tx expand           toggle pane expand/retract
+  tx inspect          inspect typed workspace state
+    restart-plan      inspect restart registry/restore plan
+  tx doctor           diagnose managed workspace drift
+  tx normalize        reserved Python normalize path
   tx refresh          reset canonical proportions
   tx reset            interactive reset menu
 
@@ -158,23 +169,20 @@ Agents:
   tx resume "prompt"  inject into Claude pane
     --find-claude     auto-detect Claude pane
 
-Kreig:
-  tx kreig "prompt"         dispatch task to new pane (alias: tx kr)
+Mechanicus:
+  tx mechanicus "prompt"    dispatch task to new pane (aliases: tx mech, tx mars)
     --label name            custom label (auto-derived if omitted)
     --dir path              working directory (default: Imperium-ENV)
-  tx kreig status           list all kreig panes
-  tx kreig cleanup          kill dead panes, re-tile survivors
+  tx mechanicus status      list all mechanicus panes
+  tx mechanicus cleanup     kill dead panes, re-tile survivors
     --all                   kill ALL panes (including running)
 
 Legion:
   tx legion bump [--pane %id]   move pane to legion (default: current)
-  tx legion recall [--pane %id] move pane back to palace
+  tx legion recall [--pane %id] move pane back to somnium
   tx legion status              list all legion panes
   tx legion cleanup             kill dead panes
     --all                       kill ALL panes (including running)
-
-Advanced:
-  tx workspace [...]  forward to tmux-workspace
 
 Keybinds (prefix = Ctrl-Space):
   h/j/k/l     navigate    H/J/K/L  resize
@@ -188,8 +196,6 @@ EOF
 # --- Subcommands ---
 
 cmd_start() {
-    local extra_args=("$@")
-
     if in_tmux; then
         log_warn "Already inside tmux (session: $(tmux display-message -p '#{session_name}'))"
         return 0
@@ -198,10 +204,11 @@ cmd_start() {
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log_info "Attaching to existing session '${SESSION_NAME}'"
         exec tmux attach-session -t "$SESSION_NAME"
-    else
-        log_info "Creating workspace session '${SESSION_NAME}'"
-        exec tmux-workspace --attach ${extra_args[@]+"${extra_args[@]}"}
     fi
+
+    log_info "Creating workspace session '${SESSION_NAME}'"
+    run_tmuxctl create --session "$SESSION_NAME"
+    exec tmux attach-session -t "$SESSION_NAME"
 }
 
 cmd_restart_pane() {
@@ -232,210 +239,49 @@ cmd_restart_pane() {
 }
 
 cmd_restart_page() {
-    # Reset the current window (page) to its default layout
     if ! in_tmux; then
         log_error "Must be inside tmux to restart a page."
         return 1
     fi
-
-    local session window window_name target layout_origin
-    session=$(tmux display-message -p '#{session_name}')
-    window=$(tmux display-message -p '#{window_index}')
-    window_name=$(tmux display-message -p '#{window_name}')
-    target="${session}:${window}"
-    layout_origin=$(tmux show-options -wv -t "$target" @LAYOUT_ORIGIN 2>/dev/null || echo "")
-
-    # Detect window type and rebuild
-    if [[ -n "$layout_origin" ]]; then
-        # Palace (grid or bridge layout) — delegate to tmux-reset hard wipe
-        tmux-reset --do-hard
-        log_success "Page '${window_name}' reset (${layout_origin} layout)"
-    elif [[ "$window_name" == "warp" || "$window_name" == warp* ]]; then
-        # Warp window — kill extra panes and rebuild
-        local monitor_height=6
-
-        # Kill all panes except the first
-        local panes
-        panes=$(tmux list-panes -t "$target" -F '#{pane_id}')
-        local first=true
-        while IFS= read -r pid; do
-            if $first; then
-                first=false
-                continue
-            fi
-            tmux kill-pane -t "$pid"
-        done <<< "$panes"
-
-        # Rebuild warp layout from surviving pane
-        local total_h
-        total_h=$(tmux display-message -t "$target" -p '#{window_height}')
-        local terminal_area=$((total_h - monitor_height - 2))
-        local half_terminal=$((terminal_area / 2))
-
-        tmux split-window -v -t "${target}.1" -l "${terminal_area}"
-        tmux split-window -v -t "${target}.2" -l "${half_terminal}"
-
-        # Set pane metadata
-        pane_tag "${target}.1" "warp:MON"
-        tmux set-option -p -t "${target}.1" @PANE_TYPE "tui"
-        pane_tag "${target}.2" "warp:T"
-        pane_tag "${target}.3" "warp:B"
-        tmux set-option -p -t "${target}.1" @GRID_RESERVED "true"
-        tmux set-option -p -t "${target}.2" @GRID_RESERVED "false"
-        tmux set-option -p -t "${target}.3" @GRID_RESERVED "false"
-
-        tmux send-keys -t "${target}.1" "exec tui-pane-guard" Enter
-        tmux select-pane -t "${target}.2"
-
-        log_success "Page '${window_name}' reset (warp layout)"
-    else
-        log_error "Unknown window type — no @LAYOUT_ORIGIN and not a warp window."
-        return 1
-    fi
+    run_tmuxctl rebuild-window --window current
 }
 
 cmd_restart() {
     local session="$SESSION_NAME"
-    local layout_args=("$@")
 
-    # Snapshot active instances before kill for resurrection
+    # Snapshot active instances for resurrection. The Python executor handles
+    # client park/detach/restore + teardown + rebuild + resume internally.
     tmux-resurrect snapshot 2>/dev/null || true
 
     if in_tmux; then
-        local current_session
+        local current_session group
         current_session=$(tmux display-message -p '#{session_name}')
-
-        # Resolve to the group leader. If we're in a grouped session (e.g., "phone"
-        # grouped to "main"), we need to restart "main", not "phone".
-        local group
         group=$(tmux display-message -p '#{session_group}')
         session="${group:-$current_session}"
-
-        log_info "Restarting session '${session}' (from '${current_session}')..."
-
-        # Save which client is on which session so we can restore them after.
-        # Format: /dev/ttyXXX=session_name (one per line)
-        local client_map="/tmp/.tx-restart-clients"
-        tmux list-clients -F '#{client_tty}=#{session_name}' > "$client_map" 2>/dev/null
-
-        # Park local clients on a temp session; detach remote (phone/SSH) clients.
-        # Parking all clients on one session causes aggressive-resize to shrink
-        # to the smallest client (phone), mangling the Mac display.
-        tmux new-session -d -s _tx_restart -x 80 -y 24 2>/dev/null || true
-        # Display whimsical holding art while workspace rebuilds
-        tmux send-keys -t _tx_restart "cat <<'SERVITOR'
-
-
-             ╔══════════════════════════════════════╗
-             ║                                      ║
-             ║    ₍ᐢ..ᐢ₎    Rebuilding workspace   ║
-             ║   ╭∪──∪╮                             ║
-             ║   │ ≽^•⩊•^≼ │   The Machine Spirit   ║
-             ║   │  is     │   stirs from slumber... ║
-             ║   │ pleased │                         ║
-             ║   ╰────────╯       ⚙ ⚙ ⚙             ║
-             ║                                      ║
-             ║      Praise the Omnissiah.           ║
-             ║                                      ║
-             ╚══════════════════════════════════════╝
-
-
-SERVITOR" Enter
-        # Build list of all sessions in the group. session_group is empty on
-        # tmux <3.5 for non-grouped sessions, so fall back to matching by name.
-        local all_group_sessions
-        all_group_sessions=$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
-            | awk -v grp="$session" '($2 == grp) || ($2 == "" && $1 == grp) { print $1 }')
-
-        local client_tty client_sess
-        while IFS=' ' read -r client_tty client_sess; do
-            for gs in $all_group_sessions; do
-                if [[ "$client_sess" == "$gs" ]]; then
-                    # Detect remote clients (phone/SSH) by checking if TTY is a pts (pseudo-terminal)
-                    if [[ "$client_tty" == */pts/* ]]; then
-                        # Remote client — detach instead of parking (prevents resize contamination)
-                        tmux detach-client -t "$client_tty" 2>/dev/null || true
-                    else
-                        # Local client — park on holding session
-                        tmux switch-client -c "$client_tty" -t _tx_restart 2>/dev/null || true
-                    fi
-                    break
-                fi
-            done
-        done < <(tmux list-clients -F '#{client_tty} #{session_name}' 2>/dev/null)
-
-        # Write the restart+restore script. Runs as a tmux server background
-        # job (run-shell -b) — independent of any session, survives kills.
-        local restart_script="/tmp/.tx-restart.sh"
-        cat > "$restart_script" << RESTARTEOF
-#!/bin/bash
-sleep 0.3
-
-# Kill all sessions in the group
-$(for gs in $all_group_sessions; do
-    [[ "$gs" != "$session" ]] && echo "tmux kill-session -t '$gs' 2>/dev/null || true"
-done)
-tmux kill-session -t '$session' 2>/dev/null || true
-sleep 0.3
-
-# Recreate the workspace
-tmux-workspace 2>/dev/null || true
-
-# Resurrect Claude instances from snapshot
-sleep 0.5
-tmux-resurrect restore 2>/dev/null || true
-
-# Restore each client to its original session type.
-# Clients that were on the group leader (main) go back to main.
-# Clients that were on a grouped session (phone) get a fresh grouped
-# session with mobile window selection and keyboard hooks.
-while IFS='=' read -r tty sess; do
-    if [[ "\$sess" == "$session" ]]; then
-        # Was on group leader — switch straight to main
-        tmux switch-client -c "\$tty" -t '$SESSION_NAME' 2>/dev/null || true
-    else
-        # Was on a grouped session — recreate it with mobile setup
-        if ! tmux has-session -t "\$sess" 2>/dev/null; then
-            tmux new-session -d -t '$SESSION_NAME' -s "\$sess" 2>/dev/null || true
-            tmux select-window -t "\$sess:warp" 2>/dev/null || true
-        fi
-        tmux switch-client -c "\$tty" -t "\$sess" 2>/dev/null || true
-    fi
-done < "$client_map"
-
-rm -f "$client_map"
-sleep 0.5
-tmux kill-session -t _tx_restart 2>/dev/null
-rm -f "$restart_script"
-RESTARTEOF
-        chmod +x "$restart_script"
-
-        tmux run-shell -b "tmux-run bash $restart_script"
-        return
     fi
 
-    # Outside tmux — straightforward kill and recreate
-    if ! tmux has-session -t "$session" 2>/dev/null; then
-        log_warn "No session '${session}' to restart. Starting fresh."
-    else
-        # Kill grouped sessions first
-        local grouped
-        grouped=$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
-            | awk -v grp="$session" '(($2 == grp) || ($2 == "" && $1 == grp)) && $1 != grp { print $1 }')
-        for gs in $grouped; do
-            tmux kill-session -t "$gs" 2>/dev/null || true
-        done
+    log_info "Restarting session '${session}' via tmuxctl…"
 
-        log_info "Killing session '${session}' and recreating..."
-        tmux kill-session -t "$session"
-        sleep 0.3
+    if in_tmux; then
+        # tmuxctl will detach this client; run it as a server background job so
+        # the script doesn't die mid-restart with the parent client.
+        local cli_dir
+        cli_dir="$(dirname "$(readlink -f "$0")")"
+        tmux run-shell -b "tmux-run bash -c '\"${cli_dir}/tx\" __tmuxctl_restart \"$session\"'"
+        return 0
     fi
 
-    # Create workspace without attach, resurrect, then attach
-    tmux-workspace ${layout_args[@]+"${layout_args[@]}"} || true
-    sleep 0.5
+    run_tmuxctl restart --execute --session "$session" || true
     tmux-resurrect restore 2>/dev/null || true
     exec tmux attach-session -t "$SESSION_NAME"
+}
+
+# Internal: invoked by `tx restart` via run-shell -b inside tmux. Runs the
+# Python restart, resurrects, then re-attaches whichever clients survived.
+cmd_internal_tmuxctl_restart() {
+    local session="$1"
+    run_tmuxctl restart --execute --session "$session" || true
+    tmux-resurrect restore 2>/dev/null || true
 }
 
 cmd_exit() {
@@ -469,17 +315,16 @@ cmd_status() {
 
     # If inside tmux, show current window pane details
     if in_tmux; then
-        local target
+        local target window_name
         target="${session}:$(tmux display-message -p '#{window_index}')"
+        window_name=$(tmux display-message -p '#{window_name}')
         local focused
         focused=$(tmux show-options -wv -t "$target" @FOCUSED 2>/dev/null || echo "false")
-        local origin
-        origin=$(tmux show-options -wv -t "$target" @LAYOUT_ORIGIN 2>/dev/null || echo "unknown")
         local expanded
         expanded=$(tmux show-options -wv -t "$target" @GRID_EXPANDED 2>/dev/null || echo "none")
 
         echo -e "${BOLD}Current window:${RESET}"
-        echo -e "  Layout: ${origin}  |  Focused: ${focused}  |  Expanded: ${expanded}"
+        echo -e "  Window: ${window_name}  |  Focused: ${focused}  |  Expanded: ${expanded}"
         echo ""
 
         echo -e "${BOLD}Panes:${RESET}"
@@ -495,14 +340,14 @@ cmd_list() {
     fi
 }
 
-cmd_kreig() {
+cmd_mechanicus() {
     local subcmd="${1:-status}"
     shift 2>/dev/null || true
 
     local TOKEN_API="${TOKEN_API_URL:-http://localhost:7777}"
 
     case "$subcmd" in
-        # tx kreig "prompt text" — dispatch a single task
+        # tx mechanicus "prompt text" — dispatch a single task
         status|cleanup)
             # handled below
             ;;
@@ -510,7 +355,7 @@ cmd_kreig() {
             # Anything else is a prompt — dispatch it
             local prompt="$subcmd${*:+ $*}"
             if [[ -z "$prompt" ]]; then
-                log_error "Usage: tx kreig \"prompt text\" [--label name] [--dir path]"
+                log_error "Usage: tx mechanicus \"prompt text\" [--label name] [--dir path]"
                 return 1
             fi
 
@@ -529,7 +374,7 @@ cmd_kreig() {
                 label=$(echo "$prompt" | tr -d '"'"'" | cut -c1-40 | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
             fi
 
-            log_info "Dispatching to kreig: ${label}"
+            log_info "Dispatching to mechanicus: ${label}"
 
             local payload
             payload=$(python3 -c "
@@ -539,7 +384,7 @@ print(json.dumps({
         'label': sys.argv[1],
         'prompt': sys.argv[2],
         'working_dir': sys.argv[3],
-        'source': 'tx-kreig'
+        'source': 'tx-mechanicus'
     }]
 }))
 " "$label" "$prompt" "$working_dir")
@@ -560,8 +405,8 @@ print(json.dumps({
 
             if [[ "$status_val" == "launched" ]]; then
                 log_success "Launched in pane ${pane_id}"
-                # Rebalance the kreig window
-                tmux select-layout -t "main:kreig" tiled 2>/dev/null || true
+                # Rebalance the mechanicus window
+                tmux select-layout -t "main:mechanicus" tiled 2>/dev/null || true
             else
                 local err
                 err=$(echo "$result" | python3 -c "import sys,json; r=json.load(sys.stdin)['results'][0]; print(r.get('error','unknown'))" 2>/dev/null)
@@ -585,11 +430,11 @@ print(json.dumps({
             total=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
 
             if [[ "$total" == "0" ]]; then
-                log_info "No kreig panes active."
+                log_info "No mechanicus panes active."
                 return 0
             fi
 
-            echo -e "${BOLD}Kreig${RESET} (${total} panes):"
+            echo -e "${BOLD}Mechanicus${RESET} (${total} panes):"
             echo ""
             echo "$result" | python3 -c "
 import sys, json
@@ -699,7 +544,7 @@ cmd_legion() {
             local status_val
             status_val=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
             if [[ "$status_val" == "recalled" ]]; then
-                log_success "Pane ${target_pane} recalled to palace"
+                log_success "Pane ${target_pane} recalled to somnium"
             else
                 local err
                 err=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null)
@@ -811,18 +656,16 @@ fi
 CMD="$1"
 shift
 
-# Catch tmux-workspace flags used directly on tx
+# Catch legacy workspace flags
 if is_workspace_flag "$CMD"; then
-    log_warn "'${CMD}' is a tmux-workspace flag."
+    log_warn "'${CMD}' is not a tx flag."
     case "$CMD" in
-        --focus)   echo -e "  Use: ${BOLD}tx focus${RESET}"; exit 1 ;;
-        --unfocus) echo -e "  Use: ${BOLD}tx unfocus${RESET}"; exit 1 ;;
-        --mac)     echo -e "  Use: ${BOLD}tx start --mac${RESET}"; exit 1 ;;
-        --portable) echo -e "  Use: ${BOLD}tx portable${RESET}"; exit 1 ;;
-        --attach)  echo -e "  Use: ${BOLD}tx start${RESET}"; exit 1 ;;
-        --mobile|--warp) echo -e "  Use: ${BOLD}tx workspace --warp${RESET}"; exit 1 ;;
-        --window)  echo -e "  Use: ${BOLD}tx workspace --window${RESET}"; exit 1 ;;
-        *)         echo -e "  Use: ${BOLD}tx workspace ${CMD}${RESET}"; exit 1 ;;
+        --focus)        echo -e "  Use: ${BOLD}tx focus${RESET}"; exit 1 ;;
+        --unfocus)      echo -e "  Use: ${BOLD}tx unfocus${RESET}"; exit 1 ;;
+        --toggle-focus) echo -e "  Use: ${BOLD}tx toggle-focus${RESET}"; exit 1 ;;
+        --attach)       echo -e "  Use: ${BOLD}tx start${RESET}"; exit 1 ;;
+        --portable)     echo -e "  Use: ${BOLD}tx portable${RESET}  (deprecated)"; exit 1 ;;
+        *)              echo -e "  See: ${BOLD}tx help${RESET}"; exit 1 ;;
     esac
 fi
 
@@ -838,15 +681,29 @@ case "$CMD" in
 esac
 
 case "$CMD" in
+    __tmuxctl_restart)
+        cmd_internal_tmuxctl_restart "$@"
+        ;;
     start)
         cmd_start "$@"
         ;;
     restart|-r)
         case "${1:-}" in
-            --pane) cmd_restart_pane ;;
-            --page) cmd_restart_page ;;
-            *)      cmd_restart "$@" ;;
+            --pane|--page)
+                log_error "restart is reserved for full session rebuilds"
+                echo -e "  Use: ${BOLD}tx restart-pane${RESET} or ${BOLD}tx restart-page${RESET}"
+                exit 1
+                ;;
+            *)
+                cmd_restart "$@"
+                ;;
         esac
+        ;;
+    restart-pane)
+        cmd_restart_pane
+        ;;
+    restart-page)
+        cmd_restart_page
         ;;
     exit|detach)
         cmd_exit
@@ -860,9 +717,6 @@ case "$CMD" in
     kill)
         cmd_kill "$@"
         ;;
-    workspace|ws)
-        exec tmux-workspace "$@"
-        ;;
     reset)
         exec tmux-reset "$@"
         ;;
@@ -874,32 +728,49 @@ case "$CMD" in
             log_error "Must be inside tmux to toggle focus."
             exit 1
         fi
-        exec tmux-workspace --focus
+        exec tmux-focus focus
         ;;
     unfocus)
         if ! in_tmux; then
             log_error "Must be inside tmux to toggle unfocus."
             exit 1
         fi
-        exec tmux-workspace --unfocus
+        exec tmux-focus unfocus
         ;;
-    portable)
-        exec tmux-workspace --portable
+    toggle-focus)
+        if ! in_tmux; then
+            log_error "Must be inside tmux to toggle focus."
+            exit 1
+        fi
+        exec tmux-focus toggle
         ;;
     resume)
         exec tmux-resume "$@"
         ;;
+    inspect)
+        run_tmuxctl inspect "$@"
+        ;;
+    doctor)
+        run_tmuxctl doctor "$@"
+        ;;
+    normalize)
+        run_tmuxctl normalize "$@"
+        ;;
     resurrect)
         exec tmux-resurrect "$@"
         ;;
-    kreig|kr|backrooms|br)
-        cmd_kreig "$@"
+    mechanicus|mech|mars|kreig|kr|backrooms|br)
+        cmd_mechanicus "$@"
         ;;
     legion)
         cmd_legion "$@"
         ;;
     refresh)
-        exec tmux-refresh-layout "$@"
+        if [[ $# -gt 0 ]]; then
+            run_tmuxctl normalize --window "$1"
+        else
+            run_tmuxctl normalize --window current
+        fi
         ;;
     help|-h|--help)
         show_help

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# tmux-tombstone - Placeholder process for relocated managed tmux panes.
+# TAGS: tmux, audience
+# AUDIENCE: human
+
+set -euo pipefail
+
+SOURCE="${1:-${TOMBSTONE_SOURCE:-unknown}}"
+TARGET="${2:-${TOMBSTONE_TARGET:-unknown}}"
+
+if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux set-option -p -t "$TMUX_PANE" @PANE_TYPE "tombstone" 2>/dev/null || true
+    tmux set-option -p -t "$TMUX_PANE" @TOMBSTONE_SOURCE "$SOURCE" 2>/dev/null || true
+    tmux set-option -p -t "$TMUX_PANE" @TOMBSTONE_TARGET "$TARGET" 2>/dev/null || true
+fi
+
+while true; do
+    clear
+    cat <<EOF
+TOMBSTONE
+
+slot:   ${SOURCE}
+target: ${TARGET}
+
+prefix + e jumps to the live pane.
+EOF
+    sleep 3600 &
+    wait $! || true
+done

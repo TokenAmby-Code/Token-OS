@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tui-pane-guard — Lifecycle wrapper for TUI panes
 # TAGS: tmux, tui, lifecycle
-# AUDIENCE: script (called by tmux-workspace, not directly by user)
+# AUDIENCE: script (called by tmuxctl/tx-managed panes, not directly by user)
 #
 # Wraps the TUI monitor command with lifecycle hooks:
 #   - Traps Ctrl+C (SIGINT) → sets @TUI_DIRTY, then exits (no auto-restart)
