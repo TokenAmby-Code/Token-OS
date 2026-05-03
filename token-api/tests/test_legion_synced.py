@@ -498,10 +498,10 @@ class TestWorkflowState:
                 "env": {
                     "TOKEN_API_ENGINE": "codex",
                     "TOKEN_API_LAUNCHER": "vault-dispatch",
-                    "TOKEN_API_DISPATCH_TARGET": "bridge:BL",
+                    "TOKEN_API_DISPATCH_TARGET": "bridge:SW",
                     "TOKEN_API_DISPATCH_WINDOW": "bridge",
                     "TOKEN_API_DISPATCH_MODE": "named_slot",
-                    "TOKEN_API_DISPATCH_SLOT": "BL",
+                    "TOKEN_API_DISPATCH_SLOT": "SW",
                     "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
                     "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
                     "TOKEN_API_LAUNCH_MODE": "direct_target",
