@@ -728,7 +728,7 @@ def test_phone_close_acknowledges_pending_phone_ack(app_env):
     assert row["acknowledged_at"]
 
 
-def test_mewgenics_turn_in_work_mode_creates_ack(app_env):
+def test_mewgenics_turn_legacy_endpoint_does_not_create_ack(app_env):
     from fastapi.testclient import TestClient
 
     app_env.main.DESKTOP_STATE["work_mode"] = "clocked_in"
@@ -746,8 +746,85 @@ def test_mewgenics_turn_in_work_mode_creates_ack(app_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json()["reason"] == "ack_required"
-    assert resp.json()["ack_id"]
+    assert resp.json()["reason"] == "observational_only"
+    assert resp.json()["ack_id"] is None
     rows = _rows(app_env.db_path, "SELECT source, reason FROM expected_acknowledgements")
-    assert rows[0]["source"] == "desktop_gaming"
-    assert rows[0]["reason"] == "Mewgenics turn ended during work"
+    assert rows == []
+
+
+def test_mewgenics_space_break_mode_logs_without_zap(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls = []
+    monkeypatch.setattr(
+        app_env.main,
+        "send_pavlok_stimulus",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"success": True},
+    )
+    monkeypatch.setattr(app_env.main, "is_quiet_hours", lambda *args, **kwargs: False)
+    app_env.main.timer_engine.enter_break(0)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post(
+        "/api/telemetry/mewgenics-space",
+        json={"event": "mewgenics_space", "source": "ahk", "ts": "20260503135500"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"recorded": True, "reason": "break_mode", "zap_fired": False}
+    assert calls == []
+    rows = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id DESC LIMIT 1")
+    assert rows[0]["event_type"] == "mewgenics_space"
+    assert json.loads(rows[0]["details"])["timer_mode"] == "break"
+
+
+def test_mewgenics_space_second_working_press_zaps_directly(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def fake_send(stimulus_type, value, reason, respect_cooldown=True):
+        calls.append((stimulus_type, value, reason, respect_cooldown))
+        return {"success": True}
+
+    monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_send)
+    monkeypatch.setattr(app_env.main, "is_quiet_hours", lambda *args, **kwargs: False)
+    client = TestClient(app_env.main.app)
+
+    first = client.post("/api/telemetry/mewgenics-space", json={"event": "mewgenics_space"})
+    second = client.post("/api/telemetry/mewgenics-space", json={"event": "mewgenics_space"})
+
+    assert first.status_code == 200
+    assert first.json()["reason"] == "armed"
+    assert first.json()["zap_fired"] is False
+    assert second.status_code == 200
+    assert second.json()["reason"] == "direct_zap"
+    assert second.json()["zap_fired"] is True
+    assert calls == [
+        ("zap", app_env.main.PAVLOK_CONFIG.get("friday_zap_value", 30), "mewgenics_space", True)
+    ]
+    rows = _rows(app_env.db_path, "SELECT source FROM expected_acknowledgements")
+    assert rows == []
+
+
+def test_mewgenics_space_work_action_interleave_prevents_second_press_zap(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls = []
+    monkeypatch.setattr(
+        app_env.main,
+        "send_pavlok_stimulus",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"success": True},
+    )
+    monkeypatch.setattr(app_env.main, "is_quiet_hours", lambda *args, **kwargs: False)
+    client = TestClient(app_env.main.app)
+
+    first = client.post("/api/telemetry/mewgenics-space", json={"event": "mewgenics_space"})
+    work = client.post("/api/work-action", json={"source": "true", "note": "stream deck"})
+    second = client.post("/api/telemetry/mewgenics-space", json={"event": "mewgenics_space"})
+
+    assert first.status_code == 200
+    assert work.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == {"recorded": True, "reason": "armed", "zap_fired": False}
+    assert calls == []

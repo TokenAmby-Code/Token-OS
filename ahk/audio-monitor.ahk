@@ -681,20 +681,50 @@ ShowStatus() {
 ; Hotkeys (Optional)
 ; ========================================
 
-PostMewgenicsTurnEnd() {
-    jsonBody := "{`"game`": `"mewgenics`", `"steam_app_id`": `"686060`", `"steam_app_name`": `"Mewgenics`", `"steam_exe`": `"Mewgenics.exe`", `"source`": `"ahk`"}"
-    response := PostToTokenApi("/games/turn", jsonBody)
+global g_LastMewgSpaceTick := 0
+
+PostMewgenicsSpaceTelemetry() {
+    global g_LastMewgSpaceTick
+
+    ; Debounce: skip if we fired within the last 1500 ms (focus-race / double-trigger guard)
+    nowTick := A_TickCount
+    if (g_LastMewgSpaceTick != 0 && (nowTick - g_LastMewgSpaceTick) < 1500) {
+        LogMessage("Mewgenics space telemetry skipped: debounce (" . (nowTick - g_LastMewgSpaceTick) . " ms since last)")
+        return
+    }
+
+    ; Double-check: process AND title must still resolve to Mewgenics at fire time.
+    ; SetTimer fires on a tick boundary after Send "{Space}", so focus may have moved.
+    if (!WinActive("ahk_exe Mewgenics.exe")) {
+        LogMessage("Mewgenics space telemetry skipped: window no longer active at fire time")
+        return
+    }
+    activeTitle := ""
+    try {
+        activeTitle := WinGetTitle("A")
+    } catch {
+        activeTitle := ""
+    }
+    if (activeTitle != "Mewgenics") {
+        LogMessage("Mewgenics space telemetry skipped: active title='" . activeTitle . "' (not Mewgenics)")
+        return
+    }
+
+    g_LastMewgSpaceTick := nowTick
+
+    jsonBody := "{`"event`": `"mewgenics_space`", `"source`": `"ahk`", `"ts`": `"" . A_NowUTC . "`"}"
+    response := PostToTokenApi("/api/telemetry/mewgenics-space", jsonBody)
     if (response.success && response.status == 200) {
-        LogMessage("Mewgenics turn-end event recorded")
+        LogMessage("Mewgenics space telemetry recorded")
     } else {
-        LogMessage("Mewgenics turn-end event failed: " . response.status . " " . response.body)
+        LogMessage("Mewgenics space telemetry failed: " . response.status . " " . response.body)
     }
 }
 
 #HotIf WinActive("ahk_exe Mewgenics.exe")
 Space::{
-    PostMewgenicsTurnEnd()
-    Send "{Space}"
+    Send "{Space}"                            ; forward immediately — no HTTP on the keypath
+    SetTimer(PostMewgenicsSpaceTelemetry, -1) ; async, fires once after 0 ms
 }
 #HotIf
 

@@ -526,6 +526,20 @@ class GameTurnResponse(BaseModel):
     ack_id: str | None = None
 
 
+class MewgenicsSpaceTelemetryRequest(BaseModel):
+    """Policy-free Mewgenics Space key telemetry from AHK."""
+
+    event: str = "mewgenics_space"
+    source: str = "ahk"
+    ts: str | None = None
+
+
+class MewgenicsSpaceTelemetryResponse(BaseModel):
+    recorded: bool
+    reason: str
+    zap_fired: bool = False
+
+
 class EnforcementAckRequest(BaseModel):
     ack_id: str | None = None
     source: str | None = None
@@ -2291,6 +2305,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
         acknowledged_acks = await acknowledge_pending_acks_for_instance(instance_id)
         acknowledged_acks += await acknowledge_pending_work_action_acks()
+        _mark_mewgenics_work_action("prompt_submit", f"instance_id={instance_id}")
         stop_enforcement_cascade(reason="prompt_submit")
     elif request.action == "stop":
         new_status = "idle"
@@ -3345,7 +3360,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
     elif level == 1:
         result = await unified_enforce(
             "notify",
-            f"{message}. Please acknowledge.",
+            message,
             source=ack["source"],
             channel="briefing",
             phone_params={"vibe": 30, "banner_text": "Ack due"},
@@ -3355,7 +3370,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             await asyncio.to_thread(enforce_desktop_app, "mewgenics", "minimize")
         result = await unified_enforce(
             "warn",
-            f"{message}. Ten minutes elapsed.",
+            message,
             source=ack["source"],
             phone_params={"vibe": 50, "beep": 50, "banner_text": "Ack overdue"},
         )
@@ -7277,6 +7292,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 trigger="desktop_detection",
                 source="ahk",
             )
+            if timer_engine.current_mode == TimerMode.WORKING:
+                _mark_mewgenics_work_action("timer_mode_working", "desktop_detection")
 
         ack = None
         if reason == "backlog_violation":
@@ -7310,33 +7327,6 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                     "break_balance_ms": timer_engine.break_balance_ms,
                 },
             )
-        if (
-            detected_mode == "gaming"
-            and work_mode == "clocked_in"
-            and reason != "break_time_available"
-            and reason != "backlog_violation"
-            and not was_timer_break_mode
-        ):
-            if is_quiet_hours():
-                await log_quiet_hours_suppressed(
-                    source="desktop_detection",
-                    event_type="desktop_gaming_ack_creation",
-                    app=request.steam_app_id or request.steam_exe or detected_mode,
-                    details={"window_title": window_title, **steam_details},
-                )
-            else:
-                ack = await create_expected_ack(
-                    source="desktop_gaming",
-                    instance_id=request.steam_app_id or request.steam_exe or "desktop:gaming",
-                    reason=f"Desktop gaming during work: {request.steam_app_name or window_title or 'game'}",
-                    details={
-                        "window_title": window_title,
-                        **steam_details,
-                        "timer_mode": timer_engine.current_mode.value,
-                        "timer_updated": timer_updated,
-                    },
-                )
-
         await log_event(
             "desktop_mode_change",
             details={
@@ -7446,14 +7436,112 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         )
 
 
+MEWGENICS_SPACE_STATE = {
+    "seen_space": False,
+    "work_action_since_last_space": True,
+    "last_space_at": None,
+    "last_work_action_at": None,
+    "last_work_action_source": None,
+}
+
+
+def _mark_mewgenics_work_action(source: str, note: str | None = None) -> None:
+    """Record work evidence for the next Mewgenics space-pair policy check."""
+    MEWGENICS_SPACE_STATE["work_action_since_last_space"] = True
+    MEWGENICS_SPACE_STATE["last_work_action_at"] = datetime.now().isoformat()
+    MEWGENICS_SPACE_STATE["last_work_action_source"] = source
+    if note:
+        MEWGENICS_SPACE_STATE["last_work_action_note"] = note
+
+
+def _reset_mewgenics_space_pair(reason: str) -> None:
+    MEWGENICS_SPACE_STATE["seen_space"] = False
+    MEWGENICS_SPACE_STATE["work_action_since_last_space"] = True
+    MEWGENICS_SPACE_STATE["reset_reason"] = reason
+
+
+@app.post("/api/telemetry/mewgenics-space", response_model=MewgenicsSpaceTelemetryResponse)
+async def handle_mewgenics_space_telemetry(request: MewgenicsSpaceTelemetryRequest):
+    """Consume policy-free Mewgenics Space key telemetry and apply server-side zap policy."""
+    if request.event != "mewgenics_space":
+        raise HTTPException(status_code=400, detail="event must be mewgenics_space")
+
+    now = datetime.now().isoformat()
+    timer_mode = timer_engine.current_mode.value
+    details = {
+        "event": request.event,
+        "source": request.source,
+        "client_ts": request.ts,
+        "timer_mode": timer_mode,
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "work_action_since_last_space": MEWGENICS_SPACE_STATE.get(
+            "work_action_since_last_space", True
+        ),
+        "seen_space": MEWGENICS_SPACE_STATE.get("seen_space", False),
+        "last_space_at": MEWGENICS_SPACE_STATE.get("last_space_at"),
+        "last_work_action_at": MEWGENICS_SPACE_STATE.get("last_work_action_at"),
+        "last_work_action_source": MEWGENICS_SPACE_STATE.get("last_work_action_source"),
+    }
+
+    zap_fired = False
+    reason = "telemetry_only"
+    pavlok_result = None
+
+    if timer_engine.current_mode == TimerMode.BREAK:
+        reason = "break_mode"
+        _reset_mewgenics_space_pair(reason)
+    elif timer_engine.current_mode in (TimerMode.WORKING, TimerMode.MULTITASKING):
+        if MEWGENICS_SPACE_STATE.get("seen_space", False) and not MEWGENICS_SPACE_STATE.get(
+            "work_action_since_last_space", True
+        ):
+            if is_quiet_hours():
+                reason = "suppressed_by_quiet_hours"
+                await log_quiet_hours_suppressed(
+                    source="mewgenics_space",
+                    event_type="mewgenics_space_zap",
+                    app="mewgenics",
+                    details=details,
+                )
+            else:
+                pavlok_result = await asyncio.to_thread(
+                    send_pavlok_stimulus,
+                    "zap",
+                    PAVLOK_CONFIG.get("friday_zap_value", 30),
+                    "mewgenics_space",
+                    True,
+                )
+                zap_fired = bool(pavlok_result.get("success")) and not pavlok_result.get(
+                    "blocked_by_guardrail"
+                )
+                reason = "direct_zap" if zap_fired else "blocked_by_guardrail"
+        else:
+            reason = "armed"
+        MEWGENICS_SPACE_STATE["seen_space"] = True
+        MEWGENICS_SPACE_STATE["work_action_since_last_space"] = False
+    else:
+        reason = "timer_mode_ignored"
+        _reset_mewgenics_space_pair(reason)
+
+    MEWGENICS_SPACE_STATE["last_space_at"] = now
+    details.update(
+        {
+            "reason": reason,
+            "zap_fired": zap_fired,
+            "pavlok_result": pavlok_result,
+            "state_after": dict(MEWGENICS_SPACE_STATE),
+        }
+    )
+    await log_event("mewgenics_space", device_id="desktop", details=details)
+    return MewgenicsSpaceTelemetryResponse(
+        recorded=True,
+        reason=reason,
+        zap_fired=zap_fired,
+    )
+
+
 @app.post("/games/turn", response_model=GameTurnResponse)
 async def handle_game_turn(request: GameTurnRequest):
-    """
-    Record a game-specific turn-end event.
-
-    Layer 1 is observational only. Enforcement decisions for turn events are
-    intentionally deferred until the policy choices in the task note are locked.
-    """
+    """Record legacy game-specific turn-end events without creating acknowledgement ladders."""
     game = request.game.strip().lower()
     if not game:
         raise HTTPException(status_code=400, detail="game is required")
@@ -7465,40 +7553,16 @@ async def handle_game_turn(request: GameTurnRequest):
         "steam_exe": request.steam_exe,
         "source": request.source,
     }
-    ack = None
-    if (
-        game == "mewgenics"
-        and DESKTOP_STATE.get("work_mode", "clocked_in") == "clocked_in"
-        and timer_engine.current_mode != TimerMode.BREAK
-    ):
-        if is_quiet_hours():
-            await log_quiet_hours_suppressed(
-                source="desktop_detection",
-                event_type="game_turn_ack_creation",
-                app=game,
-                details=details,
-            )
-            details["created_ack"] = False
-            details["suppressed_by_quiet_hours"] = True
-        else:
-            ack = await create_expected_ack(
-                source="desktop_gaming",
-                instance_id=request.steam_app_id or request.steam_exe or "desktop:mewgenics",
-                reason="Mewgenics turn ended during work",
-                details={**details, "timer_mode": timer_engine.current_mode.value},
-            )
-            details["created_ack"] = True
-            details["ack_id"] = ack["id"]
-    else:
-        details["created_ack"] = False
+    details["created_ack"] = False
+    details["legacy_policy"] = "ack_creation_disabled"
     await log_event("game_turn_end", device_id="desktop", details=details)
     logger.info(f"Game turn-end recorded: game={game} appid={request.steam_app_id}")
 
     return GameTurnResponse(
         recorded=True,
         block=False,
-        reason="ack_required" if ack else "observational_only",
-        ack_id=ack["id"] if ack else None,
+        reason="observational_only",
+        ack_id=None,
     )
 
 
@@ -8596,6 +8660,8 @@ async def resume_work_mode():
         new_mode = timer_engine.current_mode.value
         await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
         await timer_log_shift(old_mode, new_mode, trigger="manual", source="api")
+        if timer_engine.current_mode == TimerMode.WORKING:
+            _mark_mewgenics_work_action("timer_mode_working", "manual_resume")
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
         _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
@@ -8709,6 +8775,7 @@ async def work_action(request: WorkActionRequest | None = None):
         print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
 
     acknowledged_acks = await acknowledge_pending_work_action_acks()
+    _mark_mewgenics_work_action(request.source, request.note)
     stop_enforcement_cascade(reason=f"work_action:{request.source}")
     if PHONE_STATE.get("is_distracted"):
         PHONE_STATE["current_app"] = None
