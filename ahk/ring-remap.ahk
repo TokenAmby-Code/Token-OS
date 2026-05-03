@@ -2,6 +2,10 @@
 #SingleInstance Off  ; Allow multiple scripts, but we handle uniqueness manually
 Persistent
 
+; Raise hotkey rate-limit ceiling — see script-compiler.ahk for rationale
+A_MaxHotkeysPerInterval := 200
+A_HotkeyInterval := 1000
+
 ; Instance management for admin-mode scripts (AutoHotInterception requires admin)
 PragmaOnce(scriptPath, hwnd) {
     DetectHiddenWindows True

@@ -6,6 +6,10 @@
 ; Safe with ring-remap.ahk: AHK v2 SendLevel 0 (default) synthetic events
 ; don't trigger InputLevel 0 hotkeys, so ring's MouseClick output bypasses these.
 
+; Buffer instead of warning when WheelUp/Down arrives faster than the handler
+#MaxThreadsPerHotkey 2
+#MaxThreadsBuffer true
+
 ; ============== CONFIGURATION ==============
 SCROLL_LOCK_RELEASE_MS := 200     ; Unlock after this much silence
 SCROLL_LOCK_MULTIPLIER := 0.4     ; Velocity added per scroll event
