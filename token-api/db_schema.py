@@ -131,6 +131,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "ALTER TABLE claude_instances ADD COLUMN next_required_action TEXT",
             ),
             ("next_action_owner", "ALTER TABLE claude_instances ADD COLUMN next_action_owner TEXT"),
+            (
+                "parent_instance_id",
+                "ALTER TABLE claude_instances ADD COLUMN parent_instance_id TEXT",
+            ),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -168,6 +172,9 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instances_parent ON claude_instances(parent_instance_id)"
+        )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS devices (
@@ -193,6 +200,24 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at DESC)")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS state_injections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audience_instance_id TEXT NOT NULL,
+                source_instance_id TEXT,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                rendered_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consumed_at TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_state_injections_pending_audience
+            ON state_injections(audience_instance_id, status, created_at)
+        """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS expected_acknowledgements (

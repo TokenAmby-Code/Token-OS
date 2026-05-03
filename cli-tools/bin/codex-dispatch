@@ -19,6 +19,7 @@ DISPATCH_TARGET=""
 DISPATCH_WINDOW=""
 DISPATCH_MODE=""
 DISPATCH_SLOT=""
+PARENT_INSTANCE_ID=""
 RESOLVED_TMUX_PANE=""
 LAUNCH_MODE="direct_target"
 TRANSPLANT_EXPECTED="false"
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --dispatch-window) DISPATCH_WINDOW="$2"; shift 2 ;;
     --dispatch-mode) DISPATCH_MODE="$2"; shift 2 ;;
     --dispatch-slot) DISPATCH_SLOT="$2"; shift 2 ;;
+    --parent) PARENT_INSTANCE_ID="$2"; shift 2 ;;
     --resolved-tmux-pane) RESOLVED_TMUX_PANE="$2"; shift 2 ;;
     --launch-mode) LAUNCH_MODE="$2"; shift 2 ;;
     --transplant-expected) TRANSPLANT_EXPECTED="$2"; shift 2 ;;
@@ -56,6 +58,7 @@ fi
 WORKING_DIR="$1"
 shift
 PROMPT="$*"
+PARENT_INSTANCE_ID="${PARENT_INSTANCE_ID:-${TOKEN_API_PARENT_INSTANCE_ID:-}}"
 
 if [[ ! -d "$WORKING_DIR" ]]; then
   echo "Error: working directory does not exist: $WORKING_DIR" >&2
@@ -102,6 +105,7 @@ build_env_object() {
   [[ -n "${TMUX_PANE:-}" ]]          && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX_PANE" '. + {TMUX_PANE: $v}')
   [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
   [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_CODEX_PROFILE" '. + {TOKEN_API_CODEX_PROFILE: $v}')
+  [[ -n "${TOKEN_API_PARENT_INSTANCE_ID:-${PARENT_INSTANCE_ID:-}}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "${TOKEN_API_PARENT_INSTANCE_ID:-$PARENT_INSTANCE_ID}" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
   echo "$env_obj"
 }
 
@@ -196,6 +200,7 @@ CODEX_ENV=(
   "TOKEN_API_DISPATCH_WINDOW=${DISPATCH_WINDOW}"
   "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
   "TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}"
+  "TOKEN_API_PARENT_INSTANCE_ID=${PARENT_INSTANCE_ID}"
   "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${SESSION_DOC}"
   "TOKEN_API_TARGET_WORKING_DIR=${WORKING_DIR}"
   "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"

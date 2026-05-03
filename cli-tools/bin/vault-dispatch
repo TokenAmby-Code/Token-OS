@@ -26,6 +26,7 @@ set -euo pipefail
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
+source "${_LIB_DIR}/origin.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -348,6 +349,7 @@ Options:
                       still creates a new pane rather than reusing.
   --primarch <name>   Launch as a primarch persona
   --zealotry <1-5>    Set Golden Throne follow-up aggressiveness (default: 5)
+  --parent <id>       Parent/orchestrator instance id (default: current origin)
   --no-gt             Opt out of Golden Throne mode (one-off lane, zealotry 3)
   --context <text>    Extra context to include in the dispatch prompt
   --dry-run           Show what would happen without executing
@@ -373,6 +375,7 @@ ENGINE="claude"
 DISPATCH_TARGET="legion:new"
 PRIMARCH_NAME=""
 ZEALOTRY=""
+PARENT_INSTANCE_ID=""
 GT_MODE=true
 EXTRA_CONTEXT=""
 DRY_RUN=false
@@ -403,6 +406,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --zealotry)
             ZEALOTRY="$2"
+            shift 2
+            ;;
+        --parent)
+            PARENT_INSTANCE_ID="$2"
             shift 2
             ;;
         --no-gt)
@@ -482,6 +489,13 @@ if $GT_MODE; then
 else
     INSTANCE_TYPE="one_off"
     ZEALOTRY="${ZEALOTRY:-3}"
+fi
+
+if [[ -z "$PARENT_INSTANCE_ID" ]]; then
+    PARENT_INSTANCE_ID="${TOKEN_API_SESSION_ID:-${IMPERIUM_ORIGIN_INSTANCE:-}}"
+fi
+if [[ -z "$PARENT_INSTANCE_ID" ]] && command -v origin_record >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    PARENT_INSTANCE_ID="$(origin_record 2>/dev/null | jq -r '.instance_id // empty' 2>/dev/null || true)"
 fi
 
 # --- Check tmux ---
@@ -633,6 +647,9 @@ DISPATCH_ENV=(
     "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${VAULT_DIR}/${SESSION_DOC}"
     "TOKEN_API_TARGET_WORKING_DIR=${WORKING_DIR}"
 )
+if [[ -n "$PARENT_INSTANCE_ID" ]]; then
+    DISPATCH_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${PARENT_INSTANCE_ID}")
+fi
 if [[ -n "$DISPATCH_SLOT" ]]; then
     DISPATCH_ENV+=("TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}")
 fi
@@ -653,6 +670,9 @@ if [[ "$ENGINE" == "codex" ]]; then
     LAUNCH_CMD="cd '${WORKING_DIR}' && ${ENV_PREFIX}'${CODEX_BIN}' --session-doc '${VAULT_DIR}/${SESSION_DOC}' --dispatch-target '${DISPATCH_TARGET}' --dispatch-window '${TARGET_WINDOW}' --dispatch-mode '${DISPATCH_MODE}'"
     if [[ -n "$DISPATCH_SLOT" ]]; then
         LAUNCH_CMD+=" --dispatch-slot '${DISPATCH_SLOT}'"
+    fi
+    if [[ -n "$PARENT_INSTANCE_ID" ]]; then
+        LAUNCH_CMD+=" --parent '${PARENT_INSTANCE_ID}'"
     fi
     LAUNCH_CMD+=" --resolved-tmux-pane '${TARGET_PANE}' --launch-mode 'direct_target' --transplant-expected 'false' --launcher 'vault-dispatch'"
     if ! $GT_MODE; then
@@ -680,6 +700,7 @@ echo -e "  ${DIM}Lane:${NC}         $INSTANCE_TYPE"
 echo -e "  ${DIM}GT mode:${NC}      $($GT_MODE && echo on || echo off)"
 echo -e "  ${DIM}Target:${NC}       $DISPATCH_TARGET"
 echo -e "  ${DIM}Target pane:${NC}  $TARGET_PANE"
+[[ -n "$PARENT_INSTANCE_ID" ]] && echo -e "  ${DIM}Parent:${NC}       $PARENT_INSTANCE_ID"
 [[ -n "$PRIMARCH_NAME" ]] && echo -e "  ${DIM}Primarch:${NC}    $PRIMARCH_NAME"
 echo -e "  ${DIM}Zealotry:${NC}    $ZEALOTRY"
 echo ""

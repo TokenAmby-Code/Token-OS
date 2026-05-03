@@ -58,6 +58,7 @@ INSTANCE_MUTATION_FIELDS = {
     "stop_allowed",
     "next_required_action",
     "next_action_owner",
+    "parent_instance_id",
     "primarch",
     "transplant_expected",
 }

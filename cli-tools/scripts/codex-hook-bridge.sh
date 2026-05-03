@@ -34,6 +34,7 @@ if command -v jq >/dev/null 2>&1; then
             --arg token_dispatch_window "${TOKEN_API_DISPATCH_WINDOW:-}" \
             --arg token_dispatch_mode "${TOKEN_API_DISPATCH_MODE:-}" \
             --arg token_dispatch_slot "${TOKEN_API_DISPATCH_SLOT:-}" \
+            --arg token_parent_instance_id "${TOKEN_API_PARENT_INSTANCE_ID:-}" \
             --arg token_dispatch_session_doc_path "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" \
             --arg token_target_working_dir "${TOKEN_API_TARGET_WORKING_DIR:-}" \
             --arg token_launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \
@@ -55,6 +56,7 @@ if command -v jq >/dev/null 2>&1; then
              | .env.TOKEN_API_DISPATCH_WINDOW = $token_dispatch_window
              | .env.TOKEN_API_DISPATCH_MODE = $token_dispatch_mode
              | .env.TOKEN_API_DISPATCH_SLOT = $token_dispatch_slot
+             | .env.TOKEN_API_PARENT_INSTANCE_ID = $token_parent_instance_id
              | .env.TOKEN_API_DISPATCH_SESSION_DOC_PATH = $token_dispatch_session_doc_path
              | .env.TOKEN_API_TARGET_WORKING_DIR = $token_target_working_dir
              | .env.TOKEN_API_LAUNCH_MODE = $token_launch_mode

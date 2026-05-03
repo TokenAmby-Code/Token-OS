@@ -42,7 +42,7 @@ fi
 
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
-if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" ]]; then
+if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" ]]; then
   JQ_FILTER=".env //= {} | .env"
   [[ -n "$SSH_CLIENT" ]] && JQ_FILTER="$JQ_FILTER + {SSH_CLIENT: \$ssh}"
   [[ -n "$TMUX" ]] && JQ_FILTER="$JQ_FILTER + {TMUX: \$tmux}"
@@ -54,6 +54,7 @@ if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMAR
   [[ -n "${TOKEN_API_DISPATCH_WINDOW:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_DISPATCH_WINDOW: \$dispatch_window}"
   [[ -n "${TOKEN_API_DISPATCH_MODE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_DISPATCH_MODE: \$dispatch_mode}"
   [[ -n "${TOKEN_API_DISPATCH_SLOT:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_DISPATCH_SLOT: \$dispatch_slot}"
+  [[ -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_PARENT_INSTANCE_ID: \$parent_instance_id}"
   [[ -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_DISPATCH_SESSION_DOC_PATH: \$dispatch_session_doc_path}"
   [[ -n "${TOKEN_API_TARGET_WORKING_DIR:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_TARGET_WORKING_DIR: \$target_working_dir}"
   [[ -n "${TOKEN_API_LAUNCH_MODE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_LAUNCH_MODE: \$launch_mode}"
@@ -72,6 +73,7 @@ if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMAR
     --arg dispatch_window "${TOKEN_API_DISPATCH_WINDOW:-}" \
     --arg dispatch_mode "${TOKEN_API_DISPATCH_MODE:-}" \
     --arg dispatch_slot "${TOKEN_API_DISPATCH_SLOT:-}" \
+    --arg parent_instance_id "${TOKEN_API_PARENT_INSTANCE_ID:-}" \
     --arg dispatch_session_doc_path "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" \
     --arg target_working_dir "${TOKEN_API_TARGET_WORKING_DIR:-}" \
     --arg launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \

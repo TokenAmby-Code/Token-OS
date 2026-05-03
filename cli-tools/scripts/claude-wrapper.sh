@@ -37,6 +37,7 @@ build_payload() {
     --arg token_api_dispatch_window "${TOKEN_API_DISPATCH_WINDOW:-}" \
     --arg token_api_dispatch_mode "${TOKEN_API_DISPATCH_MODE:-}" \
     --arg token_api_dispatch_slot "${TOKEN_API_DISPATCH_SLOT:-}" \
+    --arg token_api_parent_instance_id "${TOKEN_API_PARENT_INSTANCE_ID:-}" \
     --arg token_api_dispatch_session_doc_path "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" \
     --arg token_api_target_working_dir "${TOKEN_API_TARGET_WORKING_DIR:-}" \
     --arg token_api_launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \
@@ -65,6 +66,7 @@ build_payload() {
         TOKEN_API_DISPATCH_WINDOW: $token_api_dispatch_window,
         TOKEN_API_DISPATCH_MODE: $token_api_dispatch_mode,
         TOKEN_API_DISPATCH_SLOT: $token_api_dispatch_slot,
+        TOKEN_API_PARENT_INSTANCE_ID: $token_api_parent_instance_id,
         TOKEN_API_DISPATCH_SESSION_DOC_PATH: $token_api_dispatch_session_doc_path,
         TOKEN_API_TARGET_WORKING_DIR: $token_api_target_working_dir,
         TOKEN_API_LAUNCH_MODE: $token_api_launch_mode,
