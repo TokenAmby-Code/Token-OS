@@ -171,13 +171,16 @@ def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
+    """Build the mechanicus stack window. Pane 1 is the orchestrator anchor
+    (future home for the fabricator-general persona), born as a clean shell —
+    symmetric with build_legion_window. Worker panes are added by stack.add_stack_pane.
+    """
     target = f"{session}:{MECHANICUS_WINDOW}"
     adapter.run(
         "new-window", "-t", session, "-n", MECHANICUS_WINDOW, "-d", "-c", _window_dir(MECHANICUS_WINDOW)
     )
-    _pane_tag(adapter, f"{target}.1", "mechanicus:backstop")
-    _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "backstop")
-    adapter.run("send-keys", "-t", f"{target}.1", "exec tmux-backstop", "Enter")
+    _pane_tag(adapter, f"{target}.1", "mechanicus:anchor")
+    _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "mechanicus")
 
 
 def build_tui_window(adapter: TmuxAdapter, session: str) -> None:

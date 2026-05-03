@@ -53,6 +53,26 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--session", default="main")
 
+    resolve_parser = subparsers.add_parser("resolve-pane")
+    resolve_parser.add_argument("target")
+
+    audience_parser = subparsers.add_parser("audience")
+    audience_subparsers = audience_parser.add_subparsers(dest="audience_command", required=True)
+
+    audience_toggle = audience_subparsers.add_parser("toggle")
+    audience_toggle.add_argument("--pane", default="current")
+
+    audience_return = audience_subparsers.add_parser("return")
+    audience_return.add_argument("--pane", default="current")
+
+    stack_parser = subparsers.add_parser("stack")
+    stack_subparsers = stack_parser.add_subparsers(dest="stack_command", required=True)
+
+    stack_add = stack_subparsers.add_parser("add")
+    stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_add.add_argument("--cwd", default=None)
+    stack_add.add_argument("--session", default="main")
+
     create_parser = subparsers.add_parser("create")
     create_parser.add_argument("--session", default="main")
     create_parser.add_argument("--attach", action="store_true")
@@ -101,6 +121,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             print(control.doctor(args.session))
             return 0
+
+        if args.command == "resolve-pane":
+            print(control.resolve_pane(args.target))
+            return 0
+
+        if args.command == "audience":
+            pane = args.pane
+            if pane == "current":
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            if args.audience_command == "toggle":
+                print(control.audience_toggle(pane))
+                return 0
+            if args.audience_command == "return":
+                print(control.audience_return(pane))
+                return 0
+
+        if args.command == "stack":
+            if args.stack_command == "add":
+                from .stack import add_stack_pane
+                pane_id = add_stack_pane(
+                    control.adapter, args.session, args.base, cwd=args.cwd
+                )
+                print(pane_id)
+                return 0
 
         if args.command == "create":
             print(control.create_workspace(args.session))

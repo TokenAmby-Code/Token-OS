@@ -27,6 +27,7 @@ class PaneKind(str, Enum):
     LEGION = "legion"
     MECHANICUS = "mechanicus"
     BACKSTOP = "backstop"
+    TOMBSTONE = "tombstone"
 
 
 class InstanceStatus(str, Enum):

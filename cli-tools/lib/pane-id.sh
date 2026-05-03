@@ -44,6 +44,14 @@ pane_tag() {
 # Usage: tmux send-keys -t "$(pane_resolve palace:TR)" "echo hi" Enter
 pane_resolve() {
     local id="$1"
+    local resolved
+    resolved=$(PYTHONPATH="${_TMUX_STATE_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli resolve-pane "$id" 2>/dev/null \
+        | awk -F': ' '$1 == "pane_id" { print $2; exit }' || true)
+    if [[ -n "$resolved" ]]; then
+        echo "$resolved"
+        return 0
+    fi
     tmux list-panes -a -F '#{pane_id} #{@PANE_ID}' 2>/dev/null \
         | awk -v id="$id" '$2 == id { print $1; exit }'
 }

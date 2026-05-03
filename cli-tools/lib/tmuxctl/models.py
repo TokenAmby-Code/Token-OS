@@ -31,6 +31,8 @@ class PaneSnapshot:
     pane_kind: PaneKind
     reserved: bool
     active: bool
+    tombstone_target: str = ""
+    tombstone_source: str = ""
 
 
 @dataclass(frozen=True)

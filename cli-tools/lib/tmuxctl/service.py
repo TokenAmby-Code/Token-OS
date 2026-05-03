@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .api import build_client_attachments, fetch_instance_registry
+from .audience import audience_return, audience_toggle
 from .builder import (
     PALACE_WINDOW,
     SESSION_NAME,
@@ -21,6 +22,7 @@ from .inspect import (
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
+from .resolver import resolve_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
 
@@ -86,6 +88,25 @@ class TmuxControlPlane:
 
     def normalize(self, session_name: str, window_index: int) -> str:
         return normalize_window(self.adapter, session_name, window_index)
+
+    def resolve_pane(self, target: str) -> str:
+        resolved = resolve_pane(self.adapter, target)
+        chain = " -> ".join(resolved.chain)
+        lines = [
+            f"requested: {resolved.requested}",
+            f"pane_id: {resolved.pane_id}",
+            f"role: {resolved.pane_role or '(unset)'}",
+            f"kind: {resolved.pane_kind.value}",
+        ]
+        if chain:
+            lines.append(f"chain: {chain}")
+        return "\n".join(lines)
+
+    def audience_toggle(self, target: str) -> str:
+        return audience_toggle(self.adapter, target)
+
+    def audience_return(self, target: str) -> str:
+        return audience_return(self.adapter, target)
 
     def create_workspace(self, session_name: str = SESSION_NAME) -> str:
         if self.adapter.has_session(session_name):

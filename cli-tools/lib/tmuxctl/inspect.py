@@ -10,6 +10,18 @@ from .models import (
 
 
 CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus", "tui"}
+# Stack windows may spill into sibling windows suffixed `-N` (e.g. legion-2).
+# These match a canonical base and should not flag as missing or unknown.
+STACK_BASES = {"legion", "mechanicus", "mars", "kreig"}
+
+
+def _canonical_base(window_name: str) -> str:
+    """Strip any `-N` spill suffix; return canonical base name."""
+    base = window_name.split("(", 1)[0]
+    head, sep, tail = base.rpartition("-")
+    if sep and tail.isdigit() and head in STACK_BASES:
+        return head
+    return base
 
 
 def render_workspace(snapshot: WorkspaceSnapshot) -> str:
@@ -34,6 +46,7 @@ def render_pane(snapshot: PaneSnapshot) -> str:
             f"  window: {snapshot.session_name}:{snapshot.window_index} {snapshot.window_name}",
             f"  size: {snapshot.width}x{snapshot.height}",
             f"  state: grid={snapshot.grid_state.value} kind={snapshot.pane_kind.value}{active}{reserved}",
+            f"  tombstone: source={snapshot.tombstone_source or '(unset)'} target={snapshot.tombstone_target or '(unset)'}",
             f"  process: {snapshot.current_command}",
             f"  tty: {snapshot.tty}",
         ]
@@ -102,15 +115,17 @@ def render_restart_result(result: RestartExecutionResult) -> str:
 
 def render_doctor(snapshot: WorkspaceSnapshot) -> str:
     issues: list[str] = []
-    window_bases = {window.window_name.split("(", 1)[0] for window in snapshot.windows}
+    window_bases = {_canonical_base(window.window_name) for window in snapshot.windows}
+    pane_ids = {pane.pane_id for pane in snapshot.iter_panes()}
+    pane_roles = {pane.pane_role for pane in snapshot.iter_panes() if pane.pane_role}
 
     missing_windows = sorted(CANONICAL_WINDOWS - window_bases)
     if missing_windows:
         issues.append(f"missing canonical windows: {', '.join(missing_windows)}")
 
     for window in snapshot.windows:
-        base = window.window_name.split("(", 1)[0]
-        if base.startswith("_stash_") or base.startswith("_fstash_"):
+        raw_base = window.window_name.split("(", 1)[0]
+        if raw_base.startswith("_stash_") or raw_base.startswith("_fstash_"):
             issues.append(f"orphan transient window: {window.window_name}")
         if window.grid_expanded != "none":
             issues.append(f"{window.target} has transient @GRID_EXPANDED={window.grid_expanded}")
@@ -120,6 +135,17 @@ def render_doctor(snapshot: WorkspaceSnapshot) -> str:
             issues.append(f"{window.target} has transient @SIDE_EXPANDED={window.side_expanded}")
         for warning in window.warnings:
             issues.append(f"{window.target}: {warning}")
+        for pane in window.panes:
+            if pane.pane_kind.value == "tombstone" and not pane.tombstone_target:
+                issues.append(f"{pane.pane_id} tombstone missing @TOMBSTONE_TARGET")
+            elif pane.pane_kind.value == "tombstone":
+                target_exists = (
+                    pane.tombstone_target in pane_ids or pane.tombstone_target in pane_roles
+                )
+                if not target_exists:
+                    issues.append(
+                        f"{pane.pane_id} tombstone target missing: {pane.tombstone_target}"
+                    )
 
     lines = [f"doctor session={snapshot.session_name}"]
     if not issues:
@@ -151,11 +177,14 @@ def render_window_lines(snapshot: WindowSnapshot) -> list[str]:
         if pane.reserved:
             flags.append("reserved")
         suffix = f" [{' '.join(flags)}]" if flags else ""
+        tombstone = ""
+        if pane.pane_kind.value == "tombstone":
+            tombstone = f" -> {pane.tombstone_target or '?'}"
         lines.append(
             "    "
             f"{pane.pane_id} {role} "
             f"{pane.width}x{pane.height} "
             f"grid={pane.grid_state.value} kind={pane.pane_kind.value} "
-            f"cmd={pane.current_command}{suffix}"
+            f"cmd={pane.current_command}{tombstone}{suffix}"
         )
     return lines

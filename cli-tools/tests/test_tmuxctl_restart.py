@@ -366,8 +366,9 @@ def test_builder_creates_canonical_workspace_roles():
         "somnium:SR",
     } <= set(roles.values())
     assert roles["main:legion.1"] == "legion:empty"
-    assert roles["main:mechanicus.1"] == "mechanicus:backstop"
+    assert roles["main:mechanicus.1"] == "mechanicus:anchor"
     assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
+    assert adapter.pane_options["main:mechanicus.1"]["@PANE_TYPE"] == "mechanicus"
     assert roles["main:tui.1"] == "tui:1"
     assert adapter.pane_options["main:somnium.5"]["@PANE_TYPE"] == "tui"
     assert adapter.pane_options["main:tui.1"]["@PANE_TYPE"] == "tui"
