@@ -2419,6 +2419,11 @@ EXPECTED_ACK_TERMINAL_STATUSES = {
     "blocked_by_guardrail",
 }
 
+# Temporary shock-test tuning for Golden Throne accountability loops.
+EXPECTED_ACK_DEFAULT_ACK_DELAY = timedelta(seconds=90)
+EXPECTED_ACK_DEFAULT_LEVEL2_DELAY = timedelta(minutes=3)
+EXPECTED_ACK_DEFAULT_PAVLOK_DELAY = timedelta(minutes=3)
+
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
     schedule = shared.get_quiet_hours_status(now)
@@ -2628,9 +2633,9 @@ async def bust_quiet_state(source: str, event_type: str, details: dict | None = 
 def _expected_ack_deadlines(
     now: datetime | None = None,
     *,
-    ack_delay: timedelta = timedelta(minutes=5),
-    level2_delay: timedelta = timedelta(minutes=10),
-    pavlok_delay: timedelta = timedelta(minutes=15),
+    ack_delay: timedelta = EXPECTED_ACK_DEFAULT_ACK_DELAY,
+    level2_delay: timedelta = EXPECTED_ACK_DEFAULT_LEVEL2_DELAY,
+    pavlok_delay: timedelta = EXPECTED_ACK_DEFAULT_PAVLOK_DELAY,
 ) -> dict:
     now = now or datetime.now()
     return {
@@ -2973,9 +2978,9 @@ async def create_expected_ack(
     instance_id: str | None = None,
     details: dict | None = None,
     dedupe_pending: bool = True,
-    ack_delay: timedelta = timedelta(minutes=5),
-    level2_delay: timedelta = timedelta(minutes=10),
-    pavlok_delay: timedelta = timedelta(minutes=15),
+    ack_delay: timedelta = EXPECTED_ACK_DEFAULT_ACK_DELAY,
+    level2_delay: timedelta = EXPECTED_ACK_DEFAULT_LEVEL2_DELAY,
+    pavlok_delay: timedelta = EXPECTED_ACK_DEFAULT_PAVLOK_DELAY,
 ) -> dict:
     """Persist an expected acknowledgement and schedule its escalation ladder."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4245,6 +4250,7 @@ async def handle_custodes_state_event(
                 "event_type": intervention.event_type,
                 "dedupe_key": intervention.dedupe_key,
                 "severity": intervention.severity,
+                "audience_instance_id": "custodes",
                 "prompt": intervention.prompt,
                 "delivery": {
                     "dispatched": False,
@@ -4288,6 +4294,7 @@ async def handle_custodes_state_event(
             "event_type": intervention.event_type,
             "dedupe_key": intervention.dedupe_key,
             "severity": intervention.severity,
+            "audience_instance_id": delivery.get("instance_id") or "custodes",
             "prompt": intervention.prompt,
             "delivery": delivery,
         },
@@ -11635,7 +11642,7 @@ async def enforcement_ack(request: EnforcementAckRequest):
 
 @app.post("/api/enforcement/expect")
 async def enforcement_expect(request: EnforcementExpectRequest):
-    """Create a manual expected acknowledgement using the standard 5/10/15 ladder."""
+    """Create a manual expected acknowledgement using the default enforcement ladder."""
     reason = (request.reason or "").strip()
     if not reason:
         raise HTTPException(status_code=400, detail="reason is required")

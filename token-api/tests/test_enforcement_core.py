@@ -14,6 +14,16 @@ def _rows(db_path, query, params=()):
     return rows
 
 
+def test_expected_ack_deadlines_use_compressed_ladder_defaults(app_env):
+    now = datetime(2026, 5, 3, 12, 0, 0)
+
+    deadlines = app_env.main._expected_ack_deadlines(now=now)
+
+    assert deadlines["ack_due_at"] == now + timedelta(seconds=90)
+    assert deadlines["level2_due_at"] == now + timedelta(seconds=180)
+    assert deadlines["pavlok_due_at"] == now + timedelta(seconds=180)
+
+
 @pytest.mark.asyncio
 async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     ack = await app_env.main.create_expected_ack(
@@ -38,9 +48,9 @@ async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     ack_due_at = datetime.fromisoformat(row["ack_due_at"])
     level2_due_at = datetime.fromisoformat(row["level2_due_at"])
     pavlok_due_at = datetime.fromisoformat(row["pavlok_due_at"])
-    assert ack_due_at - created_at == timedelta(minutes=5)
-    assert level2_due_at - created_at == timedelta(minutes=10)
-    assert pavlok_due_at - created_at == timedelta(minutes=15)
+    assert ack_due_at - created_at == timedelta(seconds=90)
+    assert level2_due_at - created_at == timedelta(seconds=180)
+    assert pavlok_due_at - created_at == timedelta(seconds=180)
 
     event = _rows(
         app_env.db_path,
