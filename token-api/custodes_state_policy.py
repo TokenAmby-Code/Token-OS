@@ -17,6 +17,7 @@ V1_TRIGGERS = {
     "desktop_mode_blocked",
     "enforcement_cascade_started",
     "enforcement_cascade_escalate",
+    "expected_ack_escalated",
 }
 
 
@@ -61,6 +62,13 @@ def build_dedupe_key(event: StateEvent) -> str:
     base = f"{event.event_type}:{event.source}:{subject}"
     if event.event_type == "enforcement_cascade_escalate" and payload.get("level") is not None:
         return f"{base}:level={payload['level']}"
+    if event.event_type == "expected_ack_escalated":
+        ack_id = payload.get("ack_id")
+        level = payload.get("level")
+        if ack_id is not None and level is not None:
+            return f"{base}:ack={ack_id}:level={level}"
+        if level is not None:
+            return f"{base}:level={level}"
     return base
 
 
@@ -145,11 +153,16 @@ def evaluate_state_event(
         "desktop_mode_blocked": "Intervene about the blocked desktop mode and redirect to the active task.",
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
+        "expected_ack_escalated": "Intervene about the missed acknowledgement ladder; mirror the Discord-channel cascade and pull the Emperor back to the work surface.",
     }[event.event_type]
 
     prompt = (
         f"State hook: {event.event_type}. Observed {observed}. "
-        f"{direction} Be direct; do not over-explain."
+        f"{direction} Be direct; do not over-explain. "
+        "AFK rule: state hooks imply the Emperor is not watching this thread. "
+        "Reach him out-of-band — TTS (`tts ...` / /api/notify/tts), "
+        "phone notification (/api/notify/push), or the Discord daily thread. "
+        "Do NOT reply with in-thread text only; in-thread text is invisible until he returns."
     )
     return CustodesIntervention(
         event_type=event.event_type,

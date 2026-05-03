@@ -28,6 +28,9 @@ def test_v1_triggers_emit_interventions():
         assert intervention.dedupe_key == f"{event_type}:test:slay_the_spire"
         assert intervention.prompt.startswith(f"State hook: {event_type}.")
         assert "Be direct; do not over-explain." in intervention.prompt
+        assert "AFK rule" in intervention.prompt
+        assert "TTS" in intervention.prompt
+        assert "Do NOT reply with in-thread text only" in intervention.prompt
 
 
 def test_routine_events_are_noop():
@@ -95,6 +98,30 @@ def test_cascade_escalate_emits_intervention_with_level_dedupe():
     assert "level=3" in intervention.prompt
     assert build_dedupe_key(event).endswith(":level=3")
     assert intervention.dedupe_key.endswith(":level=3")
+
+
+def test_expected_ack_escalated_emits_intervention_with_ack_level_dedupe():
+    event = StateEvent(
+        event_type="expected_ack_escalated",
+        source="desktop_gaming",
+        instance_id="686060",
+        severity=3,
+        payload={
+            "ack_id": "abc-123",
+            "level": 2,
+            "reason": "Mewgenics turn ended during work",
+            "app": "Mewgenics",
+        },
+    )
+    intervention = evaluate_state_event(event, _snapshot())
+
+    assert intervention is not None
+    assert intervention.event_type == "expected_ack_escalated"
+    dedupe = build_dedupe_key(event)
+    assert dedupe == "expected_ack_escalated:desktop_gaming:Mewgenics:ack=abc-123:level=2"
+    assert intervention.dedupe_key == dedupe
+    assert "level=2" in intervention.prompt
+    assert "Mewgenics" in intervention.prompt or "phone_app=" in intervention.prompt
 
 
 def test_severity_defaults_and_normalizes():

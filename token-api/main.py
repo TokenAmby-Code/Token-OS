@@ -3396,6 +3396,19 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
         instance_id=ack["instance_id"],
         details={"ack": ack, "level": level, "result": result},
     )
+    await handle_custodes_state_event(
+        "expected_ack_escalated",
+        ack["source"],
+        instance_id=ack["instance_id"],
+        severity=min(2 + level, 5),
+        payload={
+            "ack_id": ack_id,
+            "level": level,
+            "reason": ack.get("reason"),
+            "app": (ack.get("details") or {}).get("steam_app_name")
+            or (ack.get("details") or {}).get("game"),
+        },
+    )
     return {"ack_id": ack_id, "level": level, "result": result}
 
 
