@@ -22,6 +22,7 @@ _MODULES_TO_RELOAD = [
 def app_env(tmp_path, monkeypatch):
     db_path = tmp_path / "agents.db"
     monkeypatch.setenv("TOKEN_API_DB", str(db_path))
+    monkeypatch.setenv("IMPERIUM_ENV", str(tmp_path / "Imperium-ENV"))
 
     for name in _MODULES_TO_RELOAD:
         if name in sys.modules:

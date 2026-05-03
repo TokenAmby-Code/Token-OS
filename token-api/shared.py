@@ -244,9 +244,30 @@ def is_satellite_tts_available() -> bool:
 
 
 async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
-    """Return tmux's canonical %pane id for any valid pane target."""
+    """Return the live %pane id for a tmux target, following tombstones when present."""
     if not tmux_pane:
         return None
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3",
+            "-m",
+            "tmuxctl.cli",
+            "resolve-pane",
+            tmux_pane,
+            env={**os.environ, "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        if proc.returncode == 0:
+            for line in stdout.decode(errors="ignore").splitlines():
+                if line.startswith("pane_id: "):
+                    pane_id = line.split(": ", 1)[1].strip()
+                    if pane_id:
+                        return pane_id
+    except Exception:
+        pass
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",

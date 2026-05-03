@@ -64,6 +64,11 @@ logger = logging.getLogger("token_api")
 
 router = APIRouter()
 
+_QUESTION_LOG_TITLE = "AskUserQuestion Log"
+_UNANSWERED_TITLE = "Unanswered Questions"
+_ASKQ_PERSIST_LOCK = asyncio.Lock()
+VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off"}
+
 
 # ============ Injected Dependencies ============
 # main.py owns these runtime services and injects them after import.
@@ -374,6 +379,16 @@ def _derive_pool(working_dir: str | None) -> str:
     return "personal"
 
 
+def _parse_launch_zealotry(value: Any) -> int | None:
+    try:
+        zealotry = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= zealotry <= 10:
+        return zealotry
+    return None
+
+
 # ============ Claude Code Hook Handlers ============
 # Centralized handling for all Claude Code hooks
 # Replaces shell scripts with Python for better reliability and debugging
@@ -456,6 +471,14 @@ async def handle_session_start(payload: dict) -> dict:
     if transplant_expected_raw is None:
         transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
     transplant_expected = str(transplant_expected_raw).lower() in {"1", "true", "yes"}
+    launch_instance_type = _normalize_text(
+        payload.get("instance_type") or env.get("TOKEN_API_INSTANCE_TYPE", "")
+    )
+    if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
+        launch_instance_type = None
+    launch_zealotry = _parse_launch_zealotry(
+        payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
+    )
     launch_field_values = (
         wrapper_launch_id,
         launcher,
@@ -582,6 +605,10 @@ async def handle_session_start(payload: dict) -> dict:
                         or existing_row["target_working_dir"],
                         "launch_mode": launch_mode or existing_row["launch_mode"],
                         "transplant_expected": 1 if transplant_expected else 0,
+                        "instance_type": launch_instance_type or existing_row["instance_type"],
+                        "zealotry": launch_zealotry
+                        if launch_zealotry is not None
+                        else existing_row["zealotry"],
                         "session_doc_policy": session_doc_policy
                         or existing_row["session_doc_policy"],
                     },
@@ -720,6 +747,10 @@ async def handle_session_start(payload: dict) -> dict:
                         "target_working_dir": target_working_dir or old_inst["target_working_dir"],
                         "launch_mode": launch_mode or old_inst["launch_mode"],
                         "transplant_expected": 1 if transplant_expected else 0,
+                        "instance_type": launch_instance_type or old_inst["instance_type"],
+                        "zealotry": launch_zealotry
+                        if launch_zealotry is not None
+                        else old_inst["zealotry"],
                         "session_doc_policy": session_doc_policy or old_inst["session_doc_policy"],
                     },
                     mutation_type="instance_updated",
@@ -941,6 +972,8 @@ async def handle_session_start(payload: dict) -> dict:
                 "target_working_dir": target_working_dir,
                 "launch_mode": launch_mode,
                 "transplant_expected": 1 if transplant_expected else 0,
+                "instance_type": launch_instance_type or "one_off",
+                "zealotry": launch_zealotry if launch_zealotry is not None else 4,
                 "session_doc_policy": session_doc_policy,
                 "discord_hosted": _prior_discord_hosted,
                 "discord_channel": _prior_discord_channel,
@@ -1073,6 +1106,8 @@ async def handle_session_start(payload: dict) -> dict:
             "target_working_dir": target_working_dir or None,
             "launch_mode": launch_mode or None,
             "transplant_expected": transplant_expected,
+            "instance_type": launch_instance_type or "one_off",
+            "zealotry": launch_zealotry if launch_zealotry is not None else 4,
             "dispatch_bound_doc": dispatch_bound_doc,
             "session_doc_policy": session_doc_policy,
         },
@@ -1344,7 +1379,11 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # AskUserQuestion answered → cancel any active three-touch ladder.
     # Done before debounce so a quick-answered question always cancels.
     if tool_name == "AskUserQuestion" and session_id in ASKQ_LADDER:
-        await _askq_ladder_cancel(session_id, reason="answered")
+        await _askq_ladder_cancel(
+            session_id,
+            reason="answered",
+            answer=_askq_extract_answer(payload),
+        )
 
     # Debounce: only update every 2 seconds per session
     current_time = time.time()
@@ -1685,6 +1724,211 @@ async def handle_stop(payload: dict) -> dict:
     return result
 
 
+# ============ AskUserQuestion Persistence ============
+
+
+def _imperium_env_root() -> Path:
+    """Resolve the Obsidian vault root without relying on Token-OS cwd."""
+    configured = os.environ.get("IMPERIUM_ENV")
+    if configured:
+        return Path(configured)
+    imperium_root = os.environ.get("IMPERIUM", "/Volumes/Imperium")
+    return Path(imperium_root) / "Imperium-ENV"
+
+
+def _question_log_paths() -> tuple[Path, Path]:
+    inbox = _imperium_env_root() / "Terra" / "Inbox"
+    return inbox / "Questions.md", inbox / "Unanswered.md"
+
+
+def _question_log_frontmatter(title: str) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    return (
+        "---\n"
+        f'title: "{title}"\n'
+        "type: descriptive\n"
+        f"created: {today}\n"
+        "status: active\n"
+        "tags: [terra/inbox, hooks/askuserquestion]\n"
+        "---\n\n"
+        f"# {title}\n\n"
+    )
+
+
+def _ensure_question_log(path: Path, title: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or not path.read_text(encoding="utf-8").strip():
+        path.write_text(_question_log_frontmatter(title), encoding="utf-8")
+
+
+def _askq_instance_label(instance_id: str, instance_row: dict | None) -> str:
+    row = instance_row or {}
+    tab_name = row.get("tab_name") or row.get("name") or instance_id[:12]
+    legion = row.get("legion")
+    if legion:
+        return f"{tab_name} / {legion}"
+    return tab_name
+
+
+def _askq_question_id(session_id: str) -> str:
+    return f"{session_id}:{int(time.time() * 1000)}"
+
+
+def _askq_question_lines(questions: list[dict] | None, fallback_text: str) -> list[str]:
+    if not questions:
+        return [fallback_text]
+    lines: list[str] = []
+    for question in questions:
+        header = question.get("header")
+        text = question.get("question") or question.get("text") or ""
+        if header:
+            lines.append(f"**{header}**")
+        if text:
+            lines.append(text)
+    return lines or [fallback_text]
+
+
+def _askq_option_lines(questions: list[dict] | None, options: list[str]) -> list[str]:
+    if questions:
+        lines: list[str] = []
+        for question in questions:
+            for option in question.get("options") or []:
+                if isinstance(option, str):
+                    lines.append(f"- {option}")
+                elif isinstance(option, dict):
+                    label = option.get("label") or option.get("value") or ""
+                    description = option.get("description") or ""
+                    if label and description:
+                        lines.append(f"- **{label}** — {description}")
+                    elif label:
+                        lines.append(f"- {label}")
+        if lines:
+            return lines
+    return [f"- {option}" for option in options] if options else ["- <none>"]
+
+
+def _askq_format_section(state: dict, *, status: str, answer: str) -> str:
+    started_at = state["started_at_wall"]
+    label = state["instance_label"]
+    instance_id = state["instance_id"]
+    question_id = state["question_id"]
+    tab_name = state.get("tab_name") or ""
+    legion = state.get("legion") or ""
+    header = f"## {started_at} — {label}"
+    question_lines = "\n".join(_askq_question_lines(state.get("questions"), state["question_text"]))
+    option_lines = "\n".join(_askq_option_lines(state.get("questions"), state.get("options") or []))
+
+    return (
+        f"{header}\n\n"
+        f"- Question ID: `{question_id}`\n"
+        f"- Instance ID: `{instance_id}`\n"
+        f"- Tab: {tab_name or '<unknown>'}\n"
+        f"- Legion: {legion or '<unknown>'}\n"
+        f"- Status: {status}\n"
+        f"- Answer: {answer}\n\n"
+        "### Question\n"
+        f"{question_lines}\n\n"
+        "### Options\n"
+        f"{option_lines}\n\n"
+    )
+
+
+def _askq_replace_section(content: str, question_id: str, replacement: str) -> str:
+    marker = f"- Question ID: `{question_id}`"
+    marker_index = content.find(marker)
+    if marker_index == -1:
+        return content.rstrip() + "\n\n" + replacement
+
+    section_start = content.rfind("\n## ", 0, marker_index)
+    if section_start == -1:
+        section_start = content.find("## ")
+    else:
+        section_start += 1
+    next_section = content.find("\n## ", marker_index)
+    if next_section == -1:
+        return content[:section_start] + replacement
+    return content[:section_start] + replacement.rstrip() + "\n" + content[next_section:]
+
+
+def _askq_append_unanswered(path: Path, state: dict, answer: str) -> None:
+    _ensure_question_log(path, _UNANSWERED_TITLE)
+    content = path.read_text(encoding="utf-8")
+    question_id = state["question_id"]
+    if f"- Question ID: `{question_id}`" in content:
+        return
+    started_at = state["started_at_wall"]
+    label = state["instance_label"]
+    question_lines = "\n".join(_askq_question_lines(state.get("questions"), state["question_text"]))
+    entry = (
+        f"## {started_at} — {label}\n\n"
+        f"- [ ] Answer asynchronously\n"
+        f"- Question ID: `{question_id}`\n"
+        f"- Instance ID: `{state['instance_id']}`\n"
+        f"- Status: {answer}\n\n"
+        f"{question_lines}\n\n"
+    )
+    path.write_text(content.rstrip() + "\n\n" + entry, encoding="utf-8")
+
+
+def _askq_persist_sync(state: dict, *, status: str, answer: str, unanswered: bool = False) -> None:
+    questions_path, unanswered_path = _question_log_paths()
+    _ensure_question_log(questions_path, _QUESTION_LOG_TITLE)
+    content = questions_path.read_text(encoding="utf-8")
+    section = _askq_format_section(state, status=status, answer=answer)
+    questions_path.write_text(
+        _askq_replace_section(content, state["question_id"], section),
+        encoding="utf-8",
+    )
+    if unanswered:
+        _askq_append_unanswered(unanswered_path, state, answer)
+
+
+async def _askq_persist(state: dict, *, status: str, answer: str, unanswered: bool = False) -> None:
+    try:
+        async with _ASKQ_PERSIST_LOCK:
+            await asyncio.to_thread(
+                _askq_persist_sync, state, status=status, answer=answer, unanswered=unanswered
+            )
+    except Exception as e:
+        logger.warning(f"AskQ persistence failed for {state.get('instance_id', '')[:12]}: {e}")
+
+
+def _askq_extract_answer(payload: dict) -> str:
+    """Best-effort extraction from Claude Code PostToolUse payload variants."""
+    candidates = [
+        payload.get("tool_response"),
+        payload.get("tool_result"),
+        payload.get("result"),
+        payload.get("response"),
+    ]
+
+    def walk(value: Any) -> str | None:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        if isinstance(value, dict):
+            for key in ("answer", "answers", "value", "text", "content", "response"):
+                if key in value:
+                    found = walk(value[key])
+                    if found:
+                        return found
+            for nested in value.values():
+                found = walk(nested)
+                if found:
+                    return found
+        return None
+
+    for candidate in candidates:
+        found = walk(candidate)
+        if found:
+            return found
+    return "<answered>"
+
+
 # ============ AskUserQuestion Three-Touch Ladder ============
 #
 # Replaces the perma-block / silent auto-approve behavior with a graduated
@@ -1714,7 +1958,11 @@ async def _askq_ladder_run(instance_id: str, question_text: str) -> None:
         await log_event(
             "askq_touch2_enforcement",
             instance_id=instance_id,
-            details={"question": question_text[:200], "elapsed_s": shared.ASKQ_T1_SECONDS},
+            details={
+                "question": question_text[:200],
+                "elapsed_s": shared.ASKQ_T1_SECONDS,
+                "question_id": state.get("question_id"),
+            },
         )
         logger.info(f"AskQ ladder: Touch 2 (enforcement) for {instance_id[:12]}")
         if _askq_touch2_callback is not None:
@@ -1731,7 +1979,7 @@ async def _askq_ladder_run(instance_id: str, question_text: str) -> None:
         await log_event(
             "askq_touch3_repeat",
             instance_id=instance_id,
-            details={"question": question_text[:200]},
+            details={"question": question_text[:200], "question_id": state.get("question_id")},
         )
         logger.info(f"AskQ ladder: Touch 3 (TTS re-read) for {instance_id[:12]}")
         try:
@@ -1745,8 +1993,9 @@ async def _askq_ladder_run(instance_id: str, question_text: str) -> None:
         await log_event(
             "askq_bust",
             instance_id=instance_id,
-            details={"question": question_text[:200]},
+            details={"question": question_text[:200], "question_id": state.get("question_id")},
         )
+        await _askq_persist(state, status="bust", answer="<bust>", unanswered=True)
         logger.info(f"AskQ ladder: BUST for {instance_id[:12]} — sending autonomous prompt")
         await _askq_send_bust_prompt(instance_id, state)
 
@@ -1816,6 +2065,7 @@ async def _askq_ladder_start(
     question_text: str,
     options: list[str],
     instance_row: dict | None,
+    questions: list[dict] | None = None,
 ) -> None:
     """Arm the three-touch ladder for an AskUserQuestion. Cancels any prior ladder
     for the same instance (newer question supersedes)."""
@@ -1824,11 +2074,18 @@ async def _askq_ladder_start(
         prior["task"].cancel()
 
     state: dict[str, Any] = {
+        "question_id": _askq_question_id(session_id),
+        "instance_id": session_id,
         "question_text": question_text,
+        "questions": questions or [],
         "options": options,
+        "started_at_wall": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "started_at": time.monotonic(),
         "current_touch": 1,
         "task": None,
+        "instance_label": _askq_instance_label(session_id, instance_row),
+        "tab_name": (instance_row or {}).get("tab_name"),
+        "legion": (instance_row or {}).get("legion"),
         "tmux_pane": (instance_row or {}).get("tmux_pane"),
         "device_id": (instance_row or {}).get("device_id"),
         "tts_voice": (instance_row or {}).get("tts_voice"),
@@ -1845,12 +2102,16 @@ async def _askq_ladder_start(
             "t1_s": shared.ASKQ_T1_SECONDS,
             "t2_s": shared.ASKQ_T2_SECONDS,
             "t3_s": shared.ASKQ_T3_SECONDS,
+            "question_id": state["question_id"],
         },
     )
+    await _askq_persist(state, status="pending", answer="<pending>")
     logger.info(f"AskQ ladder: Touch 1 armed for {session_id[:12]} — T1={shared.ASKQ_T1_SECONDS}s")
 
 
-async def _askq_ladder_cancel(session_id: str, reason: str = "answered") -> None:
+async def _askq_ladder_cancel(
+    session_id: str, reason: str = "answered", answer: str = "<answered>"
+) -> None:
     """Cancel any active ladder for this instance (called on PostToolUse(AskUserQuestion))."""
     state = ASKQ_LADDER.pop(session_id, None)
     if not state:
@@ -1866,8 +2127,12 @@ async def _askq_ladder_cancel(session_id: str, reason: str = "answered") -> None
             "reason": reason,
             "touch_at_cancel": state.get("current_touch"),
             "elapsed_s": round(elapsed, 1),
+            "answer": answer,
+            "question_id": state.get("question_id"),
         },
     )
+    answer_value = answer if reason == "answered" else f"<{reason}>"
+    await _askq_persist(state, status=reason, answer=answer_value)
     logger.info(
         f"AskQ ladder: cancelled for {session_id[:12]} "
         f"(touch={state.get('current_touch')}, elapsed={elapsed:.1f}s, reason={reason})"
@@ -1910,7 +2175,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT instance_type, tmux_pane, device_id, tts_voice "
+                "SELECT instance_type, tab_name, legion, tmux_pane, device_id, tts_voice "
                 "FROM claude_instances WHERE id = ?",
                 (session_id,),
             )
@@ -1937,7 +2202,13 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                     logger.warning(
                         f"PreToolUse: AskQ Touch 1 TTS failed for {session_id[:12]}: {e}"
                     )
-                await _askq_ladder_start(session_id, tts_message, options, askq_instance_row)
+                await _askq_ladder_start(
+                    session_id,
+                    tts_message,
+                    options,
+                    askq_instance_row,
+                    questions=questions,
+                )
 
     # Voice chat: trigger AHK so dictation captures the answer (voice-chat only).
     if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
