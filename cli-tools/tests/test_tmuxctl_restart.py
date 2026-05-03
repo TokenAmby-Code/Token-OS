@@ -30,7 +30,9 @@ from tmuxctl.models import (
 from tmuxctl.planner import build_restart_plan
 
 
-def _pane(pane_id: str, role: str, *, command: str = "zsh", window: str = "somnium") -> PaneSnapshot:
+def _pane(
+    pane_id: str, role: str, *, command: str = "zsh", window: str = "somnium"
+) -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
         session_name="main",
@@ -98,12 +100,12 @@ def _iso_ago(*, hours: int = 0, seconds: int = 0) -> str:
 
 
 def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
-    workspace = _workspace(_pane("%1", "somnium:TL"))
+    workspace = _workspace(_pane("%1", "somnium:NW"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("old", "somnium:TL", last_activity=_iso_ago(hours=30)),
-            _instance("new", "somnium:TL", last_activity=_iso_ago(hours=1)),
+            _instance("old", "somnium:NW", last_activity=_iso_ago(hours=30)),
+            _instance("new", "somnium:NW", last_activity=_iso_ago(hours=1)),
         ),
     )
 
@@ -114,14 +116,14 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
 
 
 def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
-    workspace = _workspace(_pane("%1", "somnium:TL"), _pane("%2", "somnium:TR"))
+    workspace = _workspace(_pane("%1", "somnium:NW"), _pane("%2", "somnium:NE"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("stale", "somnium:TL", last_activity=_iso_ago(hours=72)),
+            _instance("stale", "somnium:NW", last_activity=_iso_ago(hours=72)),
             _instance(
                 "recent-stop",
-                "somnium:TR",
+                "somnium:NE",
                 status=InstanceStatus.STOPPED,
                 pre_stop_status=InstanceStatus.PROCESSING,
                 stopped_at=_iso_ago(seconds=30),
@@ -137,10 +139,10 @@ def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
 
 
 def test_restart_plan_flags_busy_targets_and_pane_id_drift():
-    workspace = _workspace(_pane("%2", "somnium:TL", command="claude"))
+    workspace = _workspace(_pane("%2", "somnium:NW", command="claude"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc", "somnium:TL", tmux_pane="%1"),),
+        instances=(_instance("abc", "somnium:NW", tmux_pane="%1"),),
     )
 
     plan = build_restart_plan(workspace, registry)
@@ -152,16 +154,16 @@ def test_restart_plan_flags_busy_targets_and_pane_id_drift():
 
 def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
     workspace = _workspace(
-        _pane("%1", "palace:TL", window="palace"),
-        _pane("%2", "palace:TR", window="palace"),
-        _pane("%3", "palace:BL", window="palace"),
-        _pane("%4", "palace:BR", window="palace"),
+        _pane("%1", "palace:NW", window="palace"),
+        _pane("%2", "palace:NE", window="palace"),
+        _pane("%3", "palace:SW", window="palace"),
+        _pane("%4", "palace:SE", window="palace"),
         window="palace",
         archetype=WindowArchetype.PALACE,
     )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc", "palace:SL", tmux_pane="%99"),),
+        instances=(_instance("abc", "palace:WW", tmux_pane="%99"),),
     )
 
     plan = build_restart_plan(workspace, registry)
@@ -173,20 +175,20 @@ def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
 
 def test_palace_happy_path_resumes_grid_and_side_labels():
     workspace = _workspace(
-        _pane("%1", "palace:SL", window="palace"),
-        _pane("%2", "palace:TL", window="palace"),
-        _pane("%3", "palace:BL", window="palace"),
-        _pane("%4", "palace:TR", window="palace"),
-        _pane("%5", "palace:BR", window="palace"),
-        _pane("%6", "palace:SR", window="palace"),
+        _pane("%1", "palace:WW", window="palace"),
+        _pane("%2", "palace:NW", window="palace"),
+        _pane("%3", "palace:SW", window="palace"),
+        _pane("%4", "palace:NE", window="palace"),
+        _pane("%5", "palace:SE", window="palace"),
+        _pane("%6", "palace:EE", window="palace"),
         window="palace",
         archetype=WindowArchetype.PALACE,
     )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("alpha", "palace:TL", tmux_pane="%2"),
-            _instance("beta", "palace:SR", tmux_pane="%6"),
+            _instance("alpha", "palace:NW", tmux_pane="%2"),
+            _instance("beta", "palace:EE", tmux_pane="%6"),
         ),
     )
 
@@ -227,10 +229,10 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
 
 
 def test_dry_run_emits_deterministic_action_order():
-    workspace = _workspace(_pane("%1", "somnium:TL"))
+    workspace = _workspace(_pane("%1", "somnium:NW"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc12345", "somnium:TL"),),
+        instances=(_instance("abc12345", "somnium:NW"),),
     )
     grouped = (
         GroupedSessionSnapshot("main", "main", 0, "somnium"),
@@ -351,19 +353,19 @@ def test_builder_creates_canonical_workspace_roles():
         if "@PANE_ID" in options
     }
     assert {
-        "palace:SL",
-        "palace:TL",
-        "palace:BL",
-        "palace:TR",
-        "palace:BR",
-        "palace:SR",
+        "palace:WW",
+        "palace:NW",
+        "palace:SW",
+        "palace:NE",
+        "palace:SE",
+        "palace:EE",
     } <= set(roles.values())
     assert {
-        "somnium:TL",
-        "somnium:BL",
-        "somnium:TR",
-        "somnium:BR",
-        "somnium:SR",
+        "somnium:NW",
+        "somnium:SW",
+        "somnium:NE",
+        "somnium:SE",
+        "somnium:EE",
     } <= set(roles.values())
     assert roles["main:legion.1"] == "legion:empty"
     assert roles["main:mechanicus.1"] == "mechanicus:anchor"

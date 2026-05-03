@@ -4,6 +4,13 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
+from .labels import (
+    PALACE_GRID_ROLES,
+    PALACE_SIDE_ROLES,
+    SOMNIUM_GRID_ROLES,
+    SOMNIUM_SIDE_ROLES,
+    canonical_pane_role,
+)
 from .models import (
     CoherenceIssue,
     InstanceRegistryEntry,
@@ -28,14 +35,20 @@ def build_restart_plan(
     a registry snapshot that already reflects the current device's instance view.
     """
 
-    pane_by_label = {pane.pane_role: pane for pane in workspace.iter_panes() if pane.pane_role}
+    pane_by_label = {
+        canonical_pane_role(pane.pane_role): pane
+        for pane in workspace.iter_panes()
+        if pane.pane_role
+    }
     legal_labels = _legal_restart_labels(workspace)
     issues: list[CoherenceIssue] = []
     resumes: list[PlannedResume] = []
     skipped: list[PlannedResume] = []
 
     candidates = _dedupe_candidates(_candidate_instances(registry.instances))
-    active_labels = [inst.pane_label for inst in candidates if _is_resumable(inst)]
+    active_labels = [
+        canonical_pane_role(inst.pane_label) for inst in candidates if _is_resumable(inst)
+    ]
     for pane_label, count in Counter(active_labels).items():
         if pane_label and count > 1:
             issues.append(
@@ -48,7 +61,9 @@ def build_restart_plan(
             )
 
     duplicate_claims = Counter(
-        inst.pane_label for inst in registry.instances if inst.pane_label and _is_candidate(inst)
+        canonical_pane_role(inst.pane_label)
+        for inst in registry.instances
+        if inst.pane_label and _is_candidate(inst)
     )
 
     for pane_label, count in duplicate_claims.items():
@@ -63,13 +78,14 @@ def build_restart_plan(
             )
 
     for inst in candidates:
-        target_pane = pane_by_label.get(inst.pane_label)
+        pane_label = canonical_pane_role(inst.pane_label)
+        target_pane = pane_by_label.get(pane_label)
         if target_pane is None:
-            if inst.pane_label in legal_labels:
+            if pane_label in legal_labels:
                 disposition = _resume_disposition(inst)
                 planned = PlannedResume(
                     instance_id=inst.instance_id,
-                    pane_label=inst.pane_label,
+                    pane_label=pane_label,
                     target_pane_id="",
                     working_dir=inst.working_dir,
                     disposition=disposition,
@@ -85,15 +101,15 @@ def build_restart_plan(
                     CoherenceIssue(
                         severity=CoherenceSeverity.WARNING,
                         code="missing_target_pane",
-                        message=f"registry pane label {inst.pane_label} has no live managed pane",
+                        message=f"registry pane label {pane_label} has no live managed pane",
                         instance_id=inst.instance_id,
-                        pane_label=inst.pane_label,
+                        pane_label=pane_label,
                     )
                 )
                 skipped.append(
                     PlannedResume(
                         instance_id=inst.instance_id,
-                        pane_label=inst.pane_label,
+                        pane_label=pane_label,
                         target_pane_id="",
                         working_dir=inst.working_dir,
                         disposition=ResumeDisposition.SKIP,
@@ -109,10 +125,10 @@ def build_restart_plan(
                     code="pane_id_mismatch",
                     message=(
                         f"registry tmux pane {inst.tmux_pane} differs from current "
-                        f"pane {target_pane.pane_id} for {inst.pane_label}"
+                        f"pane {target_pane.pane_id} for {pane_label}"
                     ),
                     instance_id=inst.instance_id,
-                    pane_label=inst.pane_label,
+                    pane_label=pane_label,
                     pane_id=target_pane.pane_id,
                 )
             )
@@ -124,7 +140,7 @@ def build_restart_plan(
                     code="target_busy",
                     message=f"target pane {target_pane.pane_id} already appears to be running claude",
                     instance_id=inst.instance_id,
-                    pane_label=inst.pane_label,
+                    pane_label=pane_label,
                     pane_id=target_pane.pane_id,
                 )
             )
@@ -132,7 +148,7 @@ def build_restart_plan(
         disposition = _resume_disposition(inst)
         planned = PlannedResume(
             instance_id=inst.instance_id,
-            pane_label=inst.pane_label,
+            pane_label=pane_label,
             target_pane_id=target_pane.pane_id,
             working_dir=inst.working_dir,
             disposition=disposition,
@@ -235,7 +251,7 @@ def _dedupe_candidates(
 ) -> list[InstanceRegistryEntry]:
     by_label: dict[str, InstanceRegistryEntry] = {}
     for instance in sorted(instances, key=_instance_sort_key, reverse=True):
-        by_label.setdefault(instance.pane_label, instance)
+        by_label.setdefault(canonical_pane_role(instance.pane_label), instance)
     return list(by_label.values())
 
 
@@ -243,26 +259,11 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
     legal: set[str] = set()
     for window in workspace.windows:
         if window.archetype.value == "palace":
-            legal.update(
-                {
-                    "palace:SL",
-                    "palace:TL",
-                    "palace:BL",
-                    "palace:TR",
-                    "palace:BR",
-                    "palace:SR",
-                }
-            )
+            legal.update(PALACE_SIDE_ROLES)
+            legal.update(PALACE_GRID_ROLES)
         elif window.archetype.value == "somnium":
-            legal.update(
-                {
-                    "somnium:TL",
-                    "somnium:TR",
-                    "somnium:BL",
-                    "somnium:BR",
-                    "somnium:SR",
-                }
-            )
+            legal.update(SOMNIUM_GRID_ROLES)
+            legal.update(SOMNIUM_SIDE_ROLES)
         elif window.archetype.value in {"legion_stack", "mechanicus_stack", "tui_single"}:
             legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
     return legal

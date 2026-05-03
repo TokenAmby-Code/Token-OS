@@ -3,8 +3,22 @@ from __future__ import annotations
 from collections import Counter
 
 from .enums import GridState, PaneKind, WindowArchetype
+from .labels import (
+    PALACE_GRID_ROLES,
+    PALACE_SIDE_ROLES,
+    SOMNIUM_GRID_ROLES,
+    SOMNIUM_SIDE_ROLES,
+    canonical_pane_role,
+)
 from .models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
 from .tmux_adapter import TmuxAdapter, TmuxError
+
+AUDIENCE_WINDOW_PAGES = {
+    "_palace_audience": "palace",
+    "_somnium_audience": "somnium",
+    "_legion_audience": "legion",
+    "_mechanicus_audience": "mechanicus",
+}
 
 
 def _parse_grid_state(value: str) -> GridState:
@@ -57,6 +71,7 @@ def _window_warnings(
     side_expanded: str,
 ) -> tuple[str, ...]:
     warnings: list[str] = []
+    pane_roles = [canonical_pane_role(role) for role in pane_roles]
     role_counts = Counter(role for role in pane_roles if role)
     visible_panes = set(pane_ids)
     stash_panes = set(_parse_grid_stash(grid_stash))
@@ -77,8 +92,19 @@ def _window_warnings(
 
     window_base = window_name.split("(", 1)[0]
 
+    audience_page = AUDIENCE_WINDOW_PAGES.get(window_base)
+    if audience_page:
+        if len(pane_ids) != 1:
+            warnings.append("audience window should contain exactly one pane")
+        audience_roles = [role for role in pane_roles if role.startswith("audience:")]
+        if len(audience_roles) != 1:
+            warnings.append("audience window should contain exactly one audience pane")
+        for role in audience_roles:
+            if not role.startswith(f"audience:{audience_page}:"):
+                warnings.append(f"audience pane role does not match window page: {role}")
+
     if window_base == "palace":
-        grid_required = {"palace:TL", "palace:TR", "palace:BL", "palace:BR"}
+        grid_required = set(PALACE_GRID_ROLES)
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
             if len(missing_grid) != len(stash_panes):
@@ -88,17 +114,17 @@ def _window_warnings(
         elif missing_grid:
             warnings.append(f"missing palace grid roles: {', '.join(missing_grid)}")
 
-        if focused and ("palace:SL" in role_counts or "palace:SR" in role_counts):
-            warnings.append("focused palace should not expose palace:SL or palace:SR")
+        if focused and any(role in role_counts for role in PALACE_SIDE_ROLES):
+            warnings.append("focused palace should not expose palace:WW or palace:EE")
 
         if not focused:
-            side_required = {"palace:SL", "palace:SR"}
+            side_required = set(PALACE_SIDE_ROLES)
             missing_side = sorted(side_required - set(role_counts))
             if missing_side:
                 warnings.append(f"missing palace side roles: {', '.join(missing_side)}")
 
     if window_base == "somnium":
-        grid_required = {"somnium:TL", "somnium:TR", "somnium:BL", "somnium:BR"}
+        grid_required = set(SOMNIUM_GRID_ROLES)
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
             if len(missing_grid) != len(stash_panes):
@@ -108,11 +134,11 @@ def _window_warnings(
         elif missing_grid:
             warnings.append(f"missing somnium grid roles: {', '.join(missing_grid)}")
 
-        if focused and "somnium:SR" in role_counts:
-            warnings.append("focused somnium should not expose somnium:SR")
+        if focused and "somnium:EE" in role_counts:
+            warnings.append("focused somnium should not expose somnium:EE")
 
         if not focused:
-            side_required = {"somnium:SR"}
+            side_required = set(SOMNIUM_SIDE_ROLES)
             missing_side = sorted(side_required - set(role_counts))
             if missing_side:
                 warnings.append(f"missing somnium side roles: {', '.join(missing_side)}")
@@ -150,7 +176,7 @@ def build_window_snapshot(
     for record in pane_records:
         pane_id = record["pane_id"]
         pane_ids.append(pane_id)
-        pane_role = adapter.show_pane_option(pane_id, "@PANE_ID")
+        pane_role = canonical_pane_role(adapter.show_pane_option(pane_id, "@PANE_ID"))
         pane_roles.append(pane_role)
         panes.append(
             PaneSnapshot(

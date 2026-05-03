@@ -29,8 +29,8 @@ tmux_grid_state_from_pane_id() {
     local pane_id="${1:-}" pos
     pos="${pane_id#*:}"
     case "$pos" in
-        SL|SR) echo "$TMUX_GRID_STATE_SIDE" ;;
-        TL|TR|BL|BR|[0-9]*) echo "$TMUX_GRID_STATE_SMALL" ;;
+        WW|EE) echo "$TMUX_GRID_STATE_SIDE" ;;
+        NW|NE|SW|SE|[0-9]*) echo "$TMUX_GRID_STATE_SMALL" ;;
         *) return 1 ;;
     esac
 }
@@ -48,6 +48,8 @@ tmux_pane_type_from_pane_id() {
 
 tmux_is_valid_pane_slot() {
     case "${1:-}" in
+        palace:WW|palace:NW|palace:SW|palace:NE|palace:SE|palace:EE) return 0 ;;
+        somnium:NW|somnium:SW|somnium:NE|somnium:SE|somnium:EE) return 0 ;;
         palace:SL|palace:TL|palace:BL|palace:TR|palace:BR|palace:SR) return 0 ;;
         somnium:TL|somnium:BL|somnium:TR|somnium:BR|somnium:SR) return 0 ;;
         tui:1) return 0 ;;

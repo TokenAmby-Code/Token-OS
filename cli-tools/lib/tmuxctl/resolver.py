@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .enums import GridState, PaneKind
+from .labels import canonical_pane_role, indexable_pane_roles
 from .models import PaneSnapshot, WorkspaceSnapshot
 from .tmux_adapter import TmuxAdapter
 
@@ -83,7 +84,7 @@ def _snapshot_from_live(adapter: TmuxAdapter, target: str) -> PaneSnapshot:
         height=int(height),
         current_command=command,
         tty=tty,
-        pane_role=adapter.show_pane_option(live_pane_id, "@PANE_ID"),
+        pane_role=canonical_pane_role(adapter.show_pane_option(live_pane_id, "@PANE_ID")),
         grid_state=GridState.UNKNOWN,
         pane_kind=kind,
         reserved=adapter.show_pane_option(live_pane_id, "@GRID_RESERVED") == "true",
@@ -101,7 +102,8 @@ def _index_workspace(
     for pane in workspace.iter_panes():
         by_physical[pane.pane_id] = pane
         if pane.pane_role:
-            by_logical[pane.pane_role] = pane
+            for role in indexable_pane_roles(pane.pane_role):
+                by_logical.setdefault(role, pane)
     return by_physical, by_logical
 
 
@@ -111,7 +113,11 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
     def lookup(value: str) -> PaneSnapshot | None:
         if value.startswith("%"):
             return by_physical.get(value)
-        return by_logical.get(value) or by_physical.get(value)
+        return (
+            by_logical.get(value)
+            or by_logical.get(canonical_pane_role(value))
+            or by_physical.get(value)
+        )
 
     current = lookup(target)
     if current is None:
@@ -141,9 +147,7 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
             raise ValueError(f"tombstone {marker} missing @TOMBSTONE_TARGET")
         next_pane = lookup(current.tombstone_target)
         if next_pane is None:
-            raise ValueError(
-                f"tombstone {marker} target not found: {current.tombstone_target}"
-            )
+            raise ValueError(f"tombstone {marker} target not found: {current.tombstone_target}")
         current = next_pane
 
 

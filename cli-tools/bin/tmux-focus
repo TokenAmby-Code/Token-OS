@@ -4,9 +4,9 @@
 # AUDIENCE: human (keybind: prefix + F via `tx toggle-focus`)
 #
 # Focus drops the side column(s), exposing the full 2x2 grid.
-#   palace  → kills both side columns (SL + SR), 20% each
-#   somnium → kills the right TUI column (SR), 33%
-# Unfocus restores the side column(s). Somnium SR auto-launches tui-pane-guard.
+#   palace  → kills both side columns (WW + EE), 20% each
+#   somnium → kills the right TUI column (EE), 33%
+# Unfocus restores the side column(s). Somnium EE auto-launches tui-pane-guard.
 #
 # This is the remaining shell helper for focus state management; a Python port
 # lives in the Phase B scope. Everything else routes through `tmuxctl`.
@@ -146,12 +146,12 @@ unfocus_mode() {
     local total_w
     total_w=$(tmux display-message -t "$target" -p '#{window_width}')
 
-    local has_sl=false has_sr=false
+    local has_ww=false has_ee=false
     while IFS=$'\t' read -r pid state role; do
         [[ "$state" == "side" ]] || continue
         case "$role" in
-            palace:SL|somnium:SL) has_sl=true ;;
-            palace:SR|somnium:SR) has_sr=true ;;
+            palace:WW|palace:SL|somnium:WW|somnium:SL) has_ww=true ;;
+            palace:EE|palace:SR|somnium:EE|somnium:SR) has_ee=true ;;
         esac
     done < <(tmux list-panes -t "$target" -F '#{pane_id}	#{@GRID_STATE}	#{@PANE_ID}')
 
@@ -159,28 +159,28 @@ unfocus_mode() {
         local usable=$((total_w - 5))
         local side_w=$((usable * PALACE_SIDE_RATIO / 100))
 
-        if [[ "$has_sl" != true ]]; then
+        if [[ "$has_ww" != true ]]; then
             local first_pane left_col
             first_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | head -1)
             left_col=$(tmux split-window -fh -b -t "$first_pane" -l "$side_w" -P -F '#{pane_id}' -c "$HOME")
-            pane_tag "$left_col" "palace:SL"
+            pane_tag "$left_col" "palace:WW"
             tmux set-option -p -t "$left_col" @GRID_RESERVED "false"
         fi
 
-        if [[ "$has_sr" != true ]]; then
+        if [[ "$has_ee" != true ]]; then
             local last_pane right_col
             last_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | tail -1)
             right_col=$(tmux split-window -fh -t "$last_pane" -l "$side_w" -P -F '#{pane_id}' -c "$HOME")
-            pane_tag "$right_col" "palace:SR"
+            pane_tag "$right_col" "palace:EE"
             tmux set-option -p -t "$right_col" @GRID_RESERVED "false"
         fi
-    elif [[ "$window_name" == "somnium" && "$has_sr" != true ]]; then
+    elif [[ "$window_name" == "somnium" && "$has_ee" != true ]]; then
         local usable=$((total_w - 2))
         local right_w=$((usable * SOMNIUM_SIDE_RATIO / 100))
         local last_pane right_col
         last_pane=$(tmux list-panes -t "$target" -F '#{pane_id}' | tail -1)
         right_col=$(tmux split-window -fh -t "$last_pane" -l "${right_w}" -P -F '#{pane_id}')
-        pane_tag "$right_col" "somnium:SR"
+        pane_tag "$right_col" "somnium:EE"
         tmux set-option -p -t "$right_col" @PANE_TYPE "tui"
         tmux set-option -p -t "$right_col" @GRID_RESERVED "false"
         tmux send-keys -t "$right_col" "exec tui-pane-guard" Enter

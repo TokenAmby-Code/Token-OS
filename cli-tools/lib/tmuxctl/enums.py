@@ -23,6 +23,7 @@ class GridState(str, Enum):
 
 class PaneKind(str, Enum):
     UNKNOWN = "unknown"
+    AUDIENCE = "audience"
     TUI = "tui"
     LEGION = "legion"
     MECHANICUS = "mechanicus"

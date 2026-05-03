@@ -8,8 +8,8 @@
 #   legion/mechanicus   → popup selector to promote (swap) into a palace or somnium slot
 #
 # Selector layout:
-#   1-6  Palace slots  (SL TL BL TR BR SR)
-#   7-a  Somnium grid  (TL TR BL BR SR)
+#   1-6  Palace slots  (WW NW SW NE SE EE)
+#   7-a  Somnium grid  (NW NE SW SE EE)
 #
 # Dirty panes (Claude processing) are dimmed in the selector.
 
@@ -176,18 +176,18 @@ promote() {
     }
 
     # Palace slots (1-6)
-    add_slot 1 "palace:SL" "Palace SL"
-    add_slot 2 "palace:TL" "Palace TL"
-    add_slot 3 "palace:BL" "Palace BL"
-    add_slot 4 "palace:TR" "Palace TR"
-    add_slot 5 "palace:BR" "Palace BR"
-    add_slot 6 "palace:SR" "Palace SR"
+    add_slot 1 "palace:WW" "Palace WW"
+    add_slot 2 "palace:NW" "Palace NW"
+    add_slot 3 "palace:SW" "Palace SW"
+    add_slot 4 "palace:NE" "Palace NE"
+    add_slot 5 "palace:SE" "Palace SE"
+    add_slot 6 "palace:EE" "Palace EE"
 
     # Somnium grid (7-a)
-    add_slot 7 "somnium:TL" "Somnium TL"
-    add_slot 8 "somnium:TR" "Somnium TR"
-    add_slot 9 "somnium:BL" "Somnium BL"
-    add_slot 0 "somnium:BR" "Somnium BR"
+    add_slot 7 "somnium:NW" "Somnium NW"
+    add_slot 8 "somnium:NE" "Somnium NE"
+    add_slot 9 "somnium:SW" "Somnium SW"
+    add_slot 0 "somnium:SE" "Somnium SE"
 
     if [[ ${#menu_args[@]} -eq 0 ]]; then
         tmux display-message "No target panes found"
