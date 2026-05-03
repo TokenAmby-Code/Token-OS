@@ -2,6 +2,15 @@
 
 #SingleInstance Off  ; Allow multiple scripts, but we handle uniqueness manually
 
+; Suppress the "hotkey has been activated faster than it could be launched"
+; rate-limit dialog. Default is 70 fires / 2000ms — too tight for AFK BT/HID
+; phantom bursts on the dial / ring / mouse wheel. Use writable built-ins
+; (the # directives must be at file top in v2; doing it via A_ vars works
+; from anywhere and is what we want since the master file has Set* statements
+; ahead of any hotkey definitions anyway).
+A_MaxHotkeysPerInterval := 200
+A_HotkeyInterval := 1000
+
 SetCapsLockState "AlwaysOff"
 SetScrollLockState "AlwaysOff"
 

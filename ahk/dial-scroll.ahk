@@ -2,6 +2,10 @@
 ; Dial mapped to F13 (up/right) and F14 (down/left) via Antikater software
 ; Slow ticks = precise sub-line scroll. Fast swipe = exponential ramp.
 
+; Buffer rather than warn when dial spams (BT noise can fire F13/F14 while AFK)
+#MaxThreadsPerHotkey 2
+#MaxThreadsBuffer true
+
 ; ============== CONFIGURATION ==============
 DIAL_BASE_AMOUNT := 0.4              ; Scroll lines per tick at minimum speed
 DIAL_ACCEL_RATE := 1.15              ; Exponential multiplier per rapid input
@@ -10,6 +14,7 @@ DIAL_ACCEL_DECAY := 0.88             ; Multiplier decay per tick (back to base)
 DIAL_ACCEL_WINDOW_MS := 120          ; Inputs faster than this increase accel
 DIAL_TICK_MS := 8                    ; Output timer interval
 DIAL_MIN_ACCUM := 0.05              ; Stop threshold for accumulator
+DIAL_MIN_INPUT_GAP_MS := 3           ; Drop inputs faster than this (BT phantom guard)
 ; ===========================================
 
 ; State
@@ -25,9 +30,15 @@ F14::DialInput(-1)
 DialInput(dir) {
     global dialAccum, dialAccelMultiplier, dialTimerRunning, dialLastInputTime, dialLastDir
     global DIAL_BASE_AMOUNT, DIAL_ACCEL_RATE, DIAL_ACCEL_MAX, DIAL_ACCEL_WINDOW_MS, DIAL_TICK_MS
+    global DIAL_MIN_INPUT_GAP_MS
 
     now := A_TickCount
     timeSinceLast := now - dialLastInputTime
+
+    ; Drop inputs faster than human-possible — guards against BT/HID phantom spam
+    if (timeSinceLast > 0 && timeSinceLast < DIAL_MIN_INPUT_GAP_MS)
+        return
+
     dialLastInputTime := now
 
     ; Direction change resets acceleration
