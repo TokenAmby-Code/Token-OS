@@ -20,6 +20,12 @@ source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
+tmuxctl_resolve_pane() {
+    local target="$1"
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli resolve-pane "$target" 2>/dev/null \
+        | awk -F': ' '$1 == "pane_id" { print $2; exit }'
+}
+
 # --- Help ---
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
@@ -254,6 +260,13 @@ case "$TARGET_MODE" in
         fi
         ;;
 esac
+
+if [[ "$REMOTE" != true && -n "$PANE" ]]; then
+    RESOLVED_PANE=$(tmuxctl_resolve_pane "$PANE" || true)
+    if [[ -n "$RESOLVED_PANE" ]]; then
+        PANE="$RESOLVED_PANE"
+    fi
+fi
 
 # --- Resolve Only Mode ---
 if [[ "$RESOLVE_ONLY" == true ]]; then

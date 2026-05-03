@@ -24,6 +24,8 @@ LAUNCH_MODE="direct_target"
 TRANSPLANT_EXPECTED="false"
 LAUNCHER="codex-dispatch"
 CODEX_PROFILE=""
+GT_MODE=true
+ZEALOTRY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +39,9 @@ while [[ $# -gt 0 ]]; do
     --transplant-expected) TRANSPLANT_EXPECTED="$2"; shift 2 ;;
     --launcher) LAUNCHER="$2"; shift 2 ;;
     --profile) CODEX_PROFILE="$2"; shift 2 ;;
+    --zealotry) ZEALOTRY="$2"; shift 2 ;;
+    --no-gt) GT_MODE=false; shift ;;
+    --gt) GT_MODE=true; shift ;;
     --) shift; break ;;
     -*) echo "Unknown option: $1" >&2; exit 64 ;;
     *) break ;;
@@ -55,6 +60,14 @@ PROMPT="$*"
 if [[ ! -d "$WORKING_DIR" ]]; then
   echo "Error: working directory does not exist: $WORKING_DIR" >&2
   exit 65
+fi
+
+if $GT_MODE; then
+  INSTANCE_TYPE="golden_throne"
+  ZEALOTRY="${ZEALOTRY:-5}"
+else
+  INSTANCE_TYPE="one_off"
+  ZEALOTRY="${ZEALOTRY:-3}"
 fi
 
 if ! command -v codex >/dev/null 2>&1; then
@@ -99,6 +112,8 @@ WRAPPER_START_PAYLOAD=$(jq -nc \
   --arg engine "codex" \
   --arg wd "$WORKING_DIR" \
   --arg tmux_pane "$RESOLVED_TMUX_PANE" \
+  --arg instance_type "$INSTANCE_TYPE" \
+  --argjson zealotry "$ZEALOTRY" \
   --argjson pid "$$" \
   --argjson env "$ENV_OBJ" \
   '{
@@ -107,6 +122,8 @@ WRAPPER_START_PAYLOAD=$(jq -nc \
     engine: $engine,
     cwd: $wd,
     tmux_pane: $tmux_pane,
+    instance_type: $instance_type,
+    zealotry: $zealotry,
     pid: $pid,
     env: $env
   }')
@@ -185,6 +202,8 @@ CODEX_ENV=(
   "TOKEN_API_TRANSPLANT_EXPECTED=${TRANSPLANT_EXPECTED}"
   "TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TMUX_PANE}"
   "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
+  "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
+  "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
 )
 
 CODEX_PROFILE_ARGS=()

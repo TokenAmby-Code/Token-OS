@@ -17,6 +17,7 @@
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --engine codex
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --target mechanicus:new
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --no-gt
 #   vault-dispatch --list-free
 #   vault-dispatch --dry-run Mars/Sessions/my-session.md /home/token/project
 
@@ -167,27 +168,30 @@ resolve_named_dispatch_target() {
     echo "$resolved"
 }
 
-# Create a new pane in a stack window via split-window.
-# Returns the new pane ID. The pane is born as a clean shell — no backstop.
+# Create a new pane in a stack window via the tmuxctl Python wrapper.
+# Returns the new pane ID. Auto-spills into <window>-2, <window>-3, ... when the
+# canonical window can't accept another split (geometric "no space"). The Python
+# module is the single source of truth for stack semantics; do not re-implement
+# split logic here. See cli-tools/lib/tmuxctl/stack.py.
 create_stack_pane() {
     local window="${1:-legion}"
-    local session="main"
-    local target="${session}:${window}"
-
-    # Ensure the window exists
-    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qE "^${window}(\([0-9]*\))?$"; then
-        log_error "Window '$window' does not exist in session '$session'"
-        return 1
-    fi
-
-    # Split a new pane in the stack window (vertical split, starts in $HOME)
+    local lib_dir
+    lib_dir="$(dirname "$(readlink -f "$0")")/../lib"
     local new_pane
-    new_pane=$(tmux split-window -t "$target" -d -P -F '#{pane_id}' -c "$HOME" 2>/dev/null)
-    if [[ -z "$new_pane" ]]; then
-        log_error "Failed to split new pane in $target"
+    local err_log
+    err_log=$(mktemp -t vault-dispatch-stack.XXXXXX)
+    if ! new_pane=$(PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m tmuxctl.cli stack add "$window" --cwd "$HOME" 2>"$err_log"); then
+        log_error "tmuxctl stack add $window failed: $(<"$err_log")"
+        rm -f "$err_log"
         return 1
     fi
-
+    rm -f "$err_log"
+    new_pane="${new_pane//$'\n'/}"
+    if [[ -z "$new_pane" ]]; then
+        log_error "tmuxctl stack add $window returned empty pane id"
+        return 1
+    fi
     echo "$new_pane"
 }
 
@@ -343,7 +347,8 @@ Options:
   --pane <id>         Target a specific pane (overrides --window). In stack windows,
                       still creates a new pane rather than reusing.
   --primarch <name>   Launch as a primarch persona
-  --zealotry <1-5>    Set zealotry level for Golden Throne follow-ups (default: 3)
+  --zealotry <1-5>    Set Golden Throne follow-up aggressiveness (default: 5)
+  --no-gt             Opt out of Golden Throne mode (one-off lane, zealotry 3)
   --context <text>    Extra context to include in the dispatch prompt
   --dry-run           Show what would happen without executing
   --list-free         List free tmux panes (reuse windows only) and exit
@@ -367,7 +372,8 @@ TARGET_WINDOW=""
 ENGINE="claude"
 DISPATCH_TARGET="legion:new"
 PRIMARCH_NAME=""
-ZEALOTRY=3
+ZEALOTRY=""
+GT_MODE=true
 EXTRA_CONTEXT=""
 DRY_RUN=false
 LIST_FREE=false
@@ -398,6 +404,14 @@ while [[ $# -gt 0 ]]; do
         --zealotry)
             ZEALOTRY="$2"
             shift 2
+            ;;
+        --no-gt)
+            GT_MODE=false
+            shift
+            ;;
+        --gt)
+            GT_MODE=true
+            shift
             ;;
         --window|-w)
             TARGET_WINDOW="$2"
@@ -461,6 +475,14 @@ if [[ ! -d "$WORKING_DIR" ]]; then
     exit 1
 fi
 WORKING_DIR=$(cd "$WORKING_DIR" && pwd)
+
+if $GT_MODE; then
+    INSTANCE_TYPE="golden_throne"
+    ZEALOTRY="${ZEALOTRY:-5}"
+else
+    INSTANCE_TYPE="one_off"
+    ZEALOTRY="${ZEALOTRY:-3}"
+fi
 
 # --- Check tmux ---
 if ! tmux display-message -p '#{session_name}' &>/dev/null; then
@@ -603,6 +625,8 @@ DISPATCH_PROMPT=$(build_dispatch_prompt "$SESSION_DOC" "$WORKING_DIR" "$PRIMARCH
 DISPATCH_ENV=(
     "TOKEN_API_LAUNCHER=vault-dispatch"
     "TOKEN_API_ENGINE=${ENGINE}"
+    "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
+    "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
     "TOKEN_API_DISPATCH_TARGET=${DISPATCH_TARGET}"
     "TOKEN_API_DISPATCH_WINDOW=${TARGET_WINDOW}"
     "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
@@ -630,7 +654,11 @@ if [[ "$ENGINE" == "codex" ]]; then
     if [[ -n "$DISPATCH_SLOT" ]]; then
         LAUNCH_CMD+=" --dispatch-slot '${DISPATCH_SLOT}'"
     fi
-    LAUNCH_CMD+=" --resolved-tmux-pane '${TARGET_PANE}' --launch-mode 'direct_target' --transplant-expected 'false' --launcher 'vault-dispatch' '${WORKING_DIR}' '${DISPATCH_PROMPT}'"
+    LAUNCH_CMD+=" --resolved-tmux-pane '${TARGET_PANE}' --launch-mode 'direct_target' --transplant-expected 'false' --launcher 'vault-dispatch'"
+    if ! $GT_MODE; then
+        LAUNCH_CMD+=" --no-gt"
+    fi
+    LAUNCH_CMD+=" --zealotry '${ZEALOTRY}' '${WORKING_DIR}' '${DISPATCH_PROMPT}'"
 else
     if [[ -n "$PRIMARCH_NAME" ]]; then
         LAUNCH_CMD="cd '${VAULT_DIR}' && ${ENV_PREFIX}primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
@@ -648,6 +676,8 @@ echo ""
 echo -e "  ${DIM}Session doc:${NC}  $SESSION_DOC"
 echo -e "  ${DIM}Working dir:${NC}  $WORKING_DIR"
 echo -e "  ${DIM}Engine:${NC}       $ENGINE"
+echo -e "  ${DIM}Lane:${NC}         $INSTANCE_TYPE"
+echo -e "  ${DIM}GT mode:${NC}      $($GT_MODE && echo on || echo off)"
 echo -e "  ${DIM}Target:${NC}       $DISPATCH_TARGET"
 echo -e "  ${DIM}Target pane:${NC}  $TARGET_PANE"
 [[ -n "$PRIMARCH_NAME" ]] && echo -e "  ${DIM}Primarch:${NC}    $PRIMARCH_NAME"
@@ -670,18 +700,33 @@ fi
 # --- Execute dispatch ---
 log_info "Dispatching to pane $TARGET_PANE..."
 
+# Long LAUNCH_CMD (embedded prompt) can exceed the terminal cooked-mode line
+# buffer (~1024 bytes on macOS), causing `tmux send-keys` to silently truncate
+# the command. Bracketed-paste (paste-buffer -p) also fragments at multi-KB
+# sizes through the macOS terminal pty. Stage the command in a tempfile and
+# source it from a short send-keys line so size never matters.
+send_launch_cmd() {
+    local pane="$1"
+    local cmd="$2"
+    local stage
+    stage=$(mktemp -t vault-dispatch.XXXXXX)
+    printf '%s\nrm -- %q\n' "$cmd" "$stage" > "$stage"
+    chmod 0600 "$stage"
+    tmux send-keys -t "$pane" ". ${stage}" Enter
+}
+
 if [[ "$PANE_MODE" == "stack" ]]; then
     # Stack pane: born clean from split-window, inherits default shell (zsh).
     # Shell functions (claude, primarch) load from .zshrc automatically.
     # Brief pause for shell init before sending command.
     sleep 0.5
-    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+    send_launch_cmd "$TARGET_PANE" "$LAUNCH_CMD"
 else
     # Named/reuse pane: clear existing content, then launch.
     # Pane is already running an interactive shell with functions loaded.
     tmux send-keys -t "$TARGET_PANE" "clear" Enter
     sleep 0.3
-    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+    send_launch_cmd "$TARGET_PANE" "$LAUNCH_CMD"
 fi
 
 if [[ "$ENGINE" == "codex" ]]; then
@@ -716,9 +761,9 @@ fi
         done
 
         if [[ -n "$instance_id" ]]; then
-            curl -s -X PATCH "${API_URL}/api/instances/${instance_id}/zealotry" \
+            curl -s -X PATCH "${API_URL}/api/instances/${instance_id}/type" \
                 -H "Content-Type: application/json" \
-                -d "{\"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
+                -d "{\"instance_type\": \"${INSTANCE_TYPE}\", \"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
         fi
     fi
 ) &

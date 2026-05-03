@@ -41,6 +41,8 @@ build_payload() {
     --arg token_api_target_working_dir "${TOKEN_API_TARGET_WORKING_DIR:-}" \
     --arg token_api_launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \
     --arg token_api_transplant_expected "${TOKEN_API_TRANSPLANT_EXPECTED:-}" \
+    --arg token_api_instance_type "${TOKEN_API_INSTANCE_TYPE:-}" \
+    --arg token_api_zealotry "${TOKEN_API_ZEALOTRY:-}" \
     --arg token_api_wrapper_launch_id "$WRAPPER_LAUNCH_ID" \
     --argjson pid "$$" \
     --argjson exit_code "${exit_code:-null}" \
@@ -67,6 +69,8 @@ build_payload() {
         TOKEN_API_TARGET_WORKING_DIR: $token_api_target_working_dir,
         TOKEN_API_LAUNCH_MODE: $token_api_launch_mode,
         TOKEN_API_TRANSPLANT_EXPECTED: $token_api_transplant_expected,
+        TOKEN_API_INSTANCE_TYPE: $token_api_instance_type,
+        TOKEN_API_ZEALOTRY: $token_api_zealotry,
         TOKEN_API_WRAPPER_LAUNCH_ID: $token_api_wrapper_launch_id
       }
     }'

@@ -28,6 +28,18 @@ if command -v jq >/dev/null 2>&1; then
             --arg ssh_client "${SSH_CLIENT:-}" \
             --arg token_session "${TOKEN_API_SESSION_ID:-}" \
             --arg bridge_id "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
+            --arg token_launcher "${TOKEN_API_LAUNCHER:-}" \
+            --arg token_engine "${TOKEN_API_ENGINE:-}" \
+            --arg token_dispatch_target "${TOKEN_API_DISPATCH_TARGET:-}" \
+            --arg token_dispatch_window "${TOKEN_API_DISPATCH_WINDOW:-}" \
+            --arg token_dispatch_mode "${TOKEN_API_DISPATCH_MODE:-}" \
+            --arg token_dispatch_slot "${TOKEN_API_DISPATCH_SLOT:-}" \
+            --arg token_dispatch_session_doc_path "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" \
+            --arg token_target_working_dir "${TOKEN_API_TARGET_WORKING_DIR:-}" \
+            --arg token_launch_mode "${TOKEN_API_LAUNCH_MODE:-}" \
+            --arg token_transplant_expected "${TOKEN_API_TRANSPLANT_EXPECTED:-}" \
+            --arg token_instance_type "${TOKEN_API_INSTANCE_TYPE:-}" \
+            --arg token_zealotry "${TOKEN_API_ZEALOTRY:-}" \
             '.action = $action
              | .cwd //= $cwd
              | .env //= {}
@@ -35,7 +47,20 @@ if command -v jq >/dev/null 2>&1; then
              | .env.TMUX_PANE = $tmux_pane
              | .env.SSH_CLIENT = $ssh_client
              | .env.TOKEN_API_SESSION_ID = $token_session
-             | .env.TOKEN_API_CODEX_BRIDGE_ID = $bridge_id' 2>/dev/null || printf '%s' "$HOOK_INPUT"
+             | .env.TOKEN_API_CODEX_BRIDGE_ID = $bridge_id
+             | .env.TOKEN_API_WRAPPER_LAUNCH_ID = $bridge_id
+             | .env.TOKEN_API_LAUNCHER = $token_launcher
+             | .env.TOKEN_API_ENGINE = $token_engine
+             | .env.TOKEN_API_DISPATCH_TARGET = $token_dispatch_target
+             | .env.TOKEN_API_DISPATCH_WINDOW = $token_dispatch_window
+             | .env.TOKEN_API_DISPATCH_MODE = $token_dispatch_mode
+             | .env.TOKEN_API_DISPATCH_SLOT = $token_dispatch_slot
+             | .env.TOKEN_API_DISPATCH_SESSION_DOC_PATH = $token_dispatch_session_doc_path
+             | .env.TOKEN_API_TARGET_WORKING_DIR = $token_target_working_dir
+             | .env.TOKEN_API_LAUNCH_MODE = $token_launch_mode
+             | .env.TOKEN_API_TRANSPLANT_EXPECTED = $token_transplant_expected
+             | .env.TOKEN_API_INSTANCE_TYPE = $token_instance_type
+             | .env.TOKEN_API_ZEALOTRY = $token_zealotry' 2>/dev/null || printf '%s' "$HOOK_INPUT"
     )"
 fi
 

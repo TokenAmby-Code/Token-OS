@@ -14,6 +14,7 @@
 #   claude-launcher              Interactive mode (full menu)
 #   claude-launcher --prompt "..."       Interactive mode with initial prompt
 #   claude-launcher --prompt-file <path> Interactive mode with initial prompt from file
+#   claude-launcher --no-gt              Opt out of Golden Throne mode
 #   claude-launcher --dry-run --prompt-file <path>
 
 set -euo pipefail
@@ -29,6 +30,7 @@ DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
 DEFAULT_ENGINE_STATE="${HOME}/.claude/launcher-default-engine"
 INITIAL_PROMPT=""
 DRY_RUN=false
+GT_DEFAULT=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --no-gt)
+            GT_DEFAULT=false
             shift
             ;;
         *)
@@ -323,15 +329,15 @@ record_next_default_engine() {
 # =============================================================================
 select_mode() {
     local options=(
-        "Normal — standard interactive session"
+        "Golden Throne — default, zealotry 5 persistence"
         "Sync — synchronous session with Emperor present"
-        "Golden Throne — zealotry 5, maximum persistence"
+        "No GT — one-off session, zealotry 3"
     )
 
     local selected
     if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Mode > " \
-        --header="Select launch mode" \
+        --header="Golden Throne is the default lane; choose No GT to opt out" \
         --height=~8 \
         --layout=reverse \
         --no-info \
@@ -340,10 +346,10 @@ select_mode() {
     fi
 
     case "$selected" in
-        Normal*)          echo "normal" ;;
+        "No GT"*)         echo "no_gt" ;;
         Sync*)            echo "sync" ;;
         "Golden Throne"*) echo "throne" ;;
-        *)                echo "normal" ;;
+        *)                echo "throne" ;;
     esac
 }
 
@@ -420,13 +426,20 @@ if [[ "$ENGINE" == "codex" ]]; then
     CODEX_DIR="${TRANSPLANT_DIR:-$LAUNCH_VAULT}"
     CODEX_PROMPT="${INITIAL_PROMPT}"
     CODEX_DISPATCH_ARGS=("--launcher" "claude-launcher")
+    if ! $GT_DEFAULT; then
+        CODEX_DISPATCH_ARGS+=("--no-gt")
+    fi
     if [[ -n "$PERSONA" ]]; then
         CODEX_DISPATCH_ARGS+=("--profile" "$PERSONA")
     fi
 
+    CODEX_LANE="golden_throne"
+    $GT_DEFAULT || CODEX_LANE="one_off"
     echo ""
     echo -e "${DIM}Launching:${NC}"
     echo -e "  ${DIM}engine:${NC}    codex"
+    echo -e "  ${DIM}lane:${NC}      $CODEX_LANE"
+    echo -e "  ${DIM}gt_mode:${NC}   $($GT_DEFAULT && echo on || echo off)"
     echo -e "  ${DIM}dir:${NC}       $CODEX_DIR"
     [[ -n "$PERSONA_DISPLAY" ]] && echo -e "  ${DIM}persona:${NC}   $PERSONA_DISPLAY"
     [[ -n "$PERSONA" ]] && echo -e "  ${DIM}profile:${NC}   $PERSONA"
@@ -438,6 +451,8 @@ if [[ "$ENGINE" == "codex" ]]; then
         echo -e "${CYAN}${BOLD}codex-dispatch (dry run)${NC}"
         echo -e "  ${DIM}dir:${NC}         $CODEX_DIR"
         echo -e "  ${DIM}launcher:${NC}    claude-launcher"
+        echo -e "  ${DIM}lane:${NC}        $CODEX_LANE"
+        echo -e "  ${DIM}gt_mode:${NC}     $($GT_DEFAULT && echo on || echo off)"
         [[ -n "$PERSONA" ]] && echo -e "  ${DIM}profile:${NC}     $PERSONA"
         if [[ -n "$CODEX_PROMPT" ]]; then
             echo -e "  ${DIM}prompt:${NC}"
@@ -450,9 +465,13 @@ fi
 
 # Claude path — continue with mode selector
 # Step 3: Mode
-if ! MODE=$(select_mode); then
-    echo "Cancelled."
-    exit 130
+if $GT_DEFAULT; then
+    if ! MODE=$(select_mode); then
+        echo "Cancelled."
+        exit 130
+    fi
+else
+    MODE="no_gt"
 fi
 
 # Build dispatch args — launch dir is always the vault
@@ -477,7 +496,14 @@ fi
 
 case "$MODE" in
     sync)   DISPATCH_ARGS+=("--sync") ;;
-    throne) DISPATCH_ARGS+=("--zealotry" "5" "--sync") ;;
+    throne) DISPATCH_ARGS+=("--zealotry" "5") ;;
+    no_gt)  DISPATCH_ARGS+=("--no-gt") ;;
+esac
+
+case "$MODE" in
+    sync)   LANE="sync"; GT_LABEL="off" ;;
+    no_gt)  LANE="one_off"; GT_LABEL="off" ;;
+    *)      LANE="golden_throne"; GT_LABEL="on" ;;
 esac
 
 # Summary
@@ -488,7 +514,8 @@ echo -e "  ${DIM}vault:${NC}     $LAUNCH_VAULT"
 [[ -n "$TRANSPLANT_DIR" ]] && echo -e "  ${DIM}target:${NC}    $TRANSPLANT_DIR"
 [[ -n "$PERSONA_DISPLAY" ]] && echo -e "  ${DIM}persona:${NC}   $PERSONA_DISPLAY"
 [[ "$PERSONA_COMMAND" != "$PERSONA" && -n "$PERSONA_COMMAND" ]] && echo -e "  ${DIM}persona file:${NC} $PERSONA_COMMAND"
-echo -e "  ${DIM}mode:${NC}      $MODE"
+echo -e "  ${DIM}lane:${NC}      $LANE"
+echo -e "  ${DIM}gt_mode:${NC}   $GT_LABEL"
 [[ -n "$INITIAL_PROMPT" ]] && echo -e "  ${DIM}prompt:${NC}    yes"
 echo ""
 
