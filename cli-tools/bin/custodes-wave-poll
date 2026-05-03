@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+# custodes-wave-poll - Poll dispatched cohorts and emit transitions.
+# TAGS: custodes, fleet, dispatch
+# AUDIENCE: agent
+"""One polling pass over active wave cohorts.
+
+Reads `Terra/Inbox/active-waves.json`, queries Token-API for each cohort's
+workers (joined by wrapper_launch_id), detects transitions vs the last
+snapshot, and emits events to:
+  - Today's daily note (Custodes Log section) via `obsidian append`
+  - Discord #fleet via `discord send` (best effort; daily note is canonical)
+
+Usage:
+  custodes-wave-poll                # one pass, exit
+  custodes-wave-poll --watch        # loop, 60s while waves open, 300s otherwise
+  custodes-wave-poll --register WAVE_ID --launch-id ID [--launch-id ID ...]
+                                    # add a cohort to active-waves.json
+  custodes-wave-poll --close WAVE_ID
+  custodes-wave-poll --list
+
+Cohort entries written by the orchestrator look like:
+  {
+    "wave_id": "wave_2",
+    "dispatched_at": "2026-05-02T19:00:00",
+    "launch_ids": ["uuid", ...],
+    "session_docs": ["Mars/Sessions/...md", ...],
+    "status": "open" | "closed",
+    "last_snapshot": {<launch_id>: {<fields>}, ...},
+    "events_seen": [<event_key>, ...]
+  }
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+VAULT = Path(os.environ.get("IMPERIUM_VAULT", "/Volumes/Imperium/Imperium-ENV"))
+WAVES_PATH = VAULT / "Terra/Inbox/active-waves.json"
+DAILY_DIR = VAULT / "Terra/Journal/Daily"
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+STALE_PROCESSING_MIN = 30
+GHOST_GRACE_MIN = 5  # don't flag a stopped-no-victory worker as ghost until grace passed
+DISCORD_CHANNEL = "fleet"
+DISCORD_BOT = "custodes"
+
+TRACKED_FIELDS = (
+    "id", "tab_name", "status", "victory_at", "victory_reason",
+    "closure_required", "closure_surface", "last_activity", "tmux_pane",
+    "session_doc_id", "stopped_at",
+)
+
+
+def _api_get(path: str) -> list | dict:
+    with urllib.request.urlopen(f"{API_URL}{path}", timeout=5) as resp:
+        return json.loads(resp.read())
+
+
+def load_waves() -> dict:
+    if not WAVES_PATH.exists():
+        return {"waves": []}
+    try:
+        return json.loads(WAVES_PATH.read_text() or "{}") or {"waves": []}
+    except json.JSONDecodeError:
+        backup = WAVES_PATH.with_suffix(".json.broken")
+        WAVES_PATH.rename(backup)
+        return {"waves": []}
+
+
+def save_waves(data: dict) -> None:
+    WAVES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WAVES_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, default=str))
+    tmp.replace(WAVES_PATH)
+
+
+def fetch_instances() -> list[dict]:
+    raw = _api_get("/api/instances")
+    return raw if isinstance(raw, list) else raw.get("instances", [])
+
+
+def cohort_workers(instances: list[dict], launch_ids: list[str]) -> list[dict]:
+    ids = set(launch_ids)
+    return [i for i in instances if i.get("wrapper_launch_id") in ids]
+
+
+def _slim(worker: dict) -> dict:
+    return {k: worker.get(k) for k in TRACKED_FIELDS}
+
+
+def _minutes_since(ts: str | None) -> float:
+    if not ts:
+        return 0.0
+    try:
+        if "T" in ts:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+        else:
+            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - dt).total_seconds() / 60.0
+    except Exception:
+        return 0.0
+
+
+def detect_transitions(wave: dict, current: dict[str, dict]) -> list[dict]:
+    """Return event dicts for transitions since last snapshot."""
+    events = []
+    prev = wave.get("last_snapshot", {}) or {}
+    seen = set(wave.get("events_seen", []))
+
+    expected_ids = set(wave.get("launch_ids", []))
+    present_ids = set(current.keys())
+
+    # Vaporized: dispatched but never observed (first poll only)
+    if not prev:
+        for lid in expected_ids - present_ids:
+            key = f"{lid}:vaporized"
+            if key not in seen:
+                events.append({"key": key, "kind": "vaporized", "launch_id": lid,
+                               "msg": f"launch_id {lid[:8]} never registered — never spawned or DB write missed"})
+
+    for lid, now_w in current.items():
+        prev_w = prev.get(lid, {})
+        prev_status = prev_w.get("status")
+        now_status = now_w.get("status")
+        tab = now_w.get("tab_name") or lid[:8]
+        pane = now_w.get("tmux_pane") or "?"
+
+        # Status transitions
+        if prev_status and prev_status != now_status:
+            if now_status == "stopped":
+                if now_w.get("victory_at"):
+                    key = f"{lid}:victory"
+                    if key not in seen:
+                        reason = now_w.get("victory_reason") or "no reason"
+                        events.append({"key": key, "kind": "victory", "launch_id": lid,
+                                       "msg": f"VICTORY [{tab}] {pane} — {reason}"})
+                else:
+                    grace = _minutes_since(now_w.get("stopped_at"))
+                    if grace >= GHOST_GRACE_MIN:
+                        key = f"{lid}:ghost"
+                        if key not in seen:
+                            events.append({"key": key, "kind": "ghost", "launch_id": lid,
+                                           "msg": f"GHOST [{tab}] {pane} — stopped without victory_at (legion-expand class)"})
+
+        # Closure-required latch (fire once per surface change)
+        if now_w.get("closure_required") == 1:
+            surface = now_w.get("closure_surface") or "unknown"
+            key = f"{lid}:closure:{surface}"
+            if key not in seen:
+                events.append({"key": key, "kind": "closure", "launch_id": lid,
+                               "surface": surface, "tab_name": tab,
+                               "msg": f"CLOSURE [{tab}] {pane} — {surface}"})
+
+        # Stuck: still processing, last_activity > 30min ago
+        if now_status == "processing":
+            idle = _minutes_since(now_w.get("last_activity"))
+            if idle >= STALE_PROCESSING_MIN:
+                bucket = int(idle // STALE_PROCESSING_MIN)
+                key = f"{lid}:stuck:{bucket}"
+                if key not in seen:
+                    events.append({"key": key, "kind": "stuck", "launch_id": lid,
+                                   "msg": f"STUCK [{tab}] {pane} — no activity for {int(idle)}m"})
+
+    return events
+
+
+def closure_probe(event: dict) -> str:
+    """Return a brief follow-up string for a closure event (read-only probes only)."""
+    surface = (event.get("surface") or "").strip()
+    if surface.startswith("branch:"):
+        branch = surface.split(":", 1)[1]
+        try:
+            log = subprocess.run(
+                ["git", "-C", str(VAULT), "log", "--oneline", "-3", branch],
+                capture_output=True, text=True, timeout=5,
+            )
+            return f"git tip:\n```\n{log.stdout.strip()[:400]}\n```" if log.returncode == 0 else f"branch `{branch}` not found locally"
+        except Exception as e:
+            return f"git probe failed: {e}"
+    if surface.startswith("pr:"):
+        url = surface.split(":", 1)[1]
+        return f"PR awaiting Emperor review: {url}"
+    if surface.startswith("doc:"):
+        return f"Vault-canon update at {surface[4:]}"
+    if surface == "needs-emperor":
+        return "Escalation — Emperor action required"
+    return f"Surface: {surface}"
+
+
+def append_daily_note(text: str) -> None:
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = f"Terra/Journal/Daily/{today}.md"
+    full = (DAILY_DIR / f"{today}.md")
+    if not full.exists():
+        full.write_text(f"# {today}\n\n## Custodes Log\n\n{text}\n")
+        return
+    try:
+        subprocess.run(
+            ["obsidian", "vault=Imperium-ENV", "append", f"path={note_path}",
+             f"content={text}"],
+            check=True, timeout=10, capture_output=True, text=True,
+        )
+    except Exception:
+        with full.open("a") as f:
+            f.write("\n" + text + "\n")
+
+
+def post_discord(message: str) -> None:
+    try:
+        subprocess.run(
+            ["discord", "send", DISCORD_CHANNEL, "--bot", DISCORD_BOT, message],
+            timeout=15, capture_output=True, text=True,
+        )
+    except Exception:
+        pass
+
+
+def emit_events(wave: dict, events: list[dict]) -> None:
+    if not events:
+        return
+    now = datetime.now().strftime("%H:%M")
+    wave_id = wave.get("wave_id", "wave_?")
+    lines = [f"\n#### Wave Poll — {now} — {wave_id}"]
+    for ev in events:
+        lines.append(f"- **{ev['kind'].upper()}** — {ev['msg']}")
+        if ev["kind"] == "closure":
+            lines.append(f"  - {closure_probe(ev)}")
+    block = "\n".join(lines) + "\n"
+    append_daily_note(block)
+    actionable = [e for e in events if e["kind"] in ("ghost", "closure", "stuck", "vaporized")]
+    if actionable:
+        summary = f"[{wave_id}] " + " | ".join(e["msg"] for e in actionable[:4])
+        if len(actionable) > 4:
+            summary += f" (+{len(actionable) - 4} more)"
+        post_discord(summary[:1800])
+
+
+def maybe_close_wave(wave: dict, current: dict[str, dict]) -> bool:
+    """Mark wave closed if every dispatched worker has reached a terminal state."""
+    if wave.get("status") == "closed":
+        return False
+    expected = set(wave.get("launch_ids", []))
+    if not expected:
+        return False
+    terminal = 0
+    for lid in expected:
+        w = current.get(lid)
+        if not w:
+            continue
+        if w.get("status") == "stopped":
+            terminal += 1
+    if terminal != len(expected):
+        return False
+    successes = sum(1 for lid in expected if (current.get(lid) or {}).get("victory_at"))
+    failures = len(expected) - successes
+    wave["status"] = "closed"
+    wave["closed_at"] = datetime.now().isoformat(timespec="seconds")
+    summary = (f"\n### Wave Roll-Up — {wave['wave_id']} — "
+               f"{datetime.now().strftime('%H:%M')}\n"
+               f"- success: {successes} / {len(expected)}\n"
+               f"- failure: {failures}\n"
+               f"- session_docs:\n"
+               + "\n".join(f"  - [[{p}]]" for p in wave.get("session_docs", []))
+               + "\n")
+    append_daily_note(summary)
+    post_discord(f"[{wave['wave_id']}] closed — {successes} ok, {failures} fail")
+    return True
+
+
+def run_once() -> dict:
+    data = load_waves()
+    waves = data.get("waves", [])
+    open_waves = [w for w in waves if w.get("status") != "closed"]
+    if not open_waves:
+        return {"open": 0, "events": 0}
+
+    instances = fetch_instances()
+    total_events = 0
+    for wave in open_waves:
+        workers = cohort_workers(instances, wave.get("launch_ids", []))
+        current = {w["wrapper_launch_id"]: _slim(w) for w in workers if w.get("wrapper_launch_id")}
+        events = detect_transitions(wave, current)
+        if events:
+            emit_events(wave, events)
+            seen = set(wave.get("events_seen", []))
+            seen.update(e["key"] for e in events)
+            wave["events_seen"] = sorted(seen)
+            total_events += len(events)
+        wave["last_snapshot"] = current
+        wave["last_polled_at"] = datetime.now().isoformat(timespec="seconds")
+        maybe_close_wave(wave, current)
+
+    save_waves(data)
+    return {"open": len(open_waves), "events": total_events}
+
+
+def cmd_register(wave_id: str, launch_ids: list[str], session_docs: list[str]) -> None:
+    data = load_waves()
+    waves = data.setdefault("waves", [])
+    for w in waves:
+        if w.get("wave_id") == wave_id:
+            print(f"wave {wave_id} already exists", file=sys.stderr)
+            sys.exit(2)
+    waves.append({
+        "wave_id": wave_id,
+        "dispatched_at": datetime.now().isoformat(timespec="seconds"),
+        "launch_ids": launch_ids,
+        "session_docs": session_docs,
+        "status": "open",
+        "last_snapshot": {},
+        "events_seen": [],
+    })
+    save_waves(data)
+    print(f"registered {wave_id} with {len(launch_ids)} cohort member(s)")
+
+
+def cmd_close(wave_id: str) -> None:
+    data = load_waves()
+    for w in data.get("waves", []):
+        if w.get("wave_id") == wave_id:
+            w["status"] = "closed"
+            w["closed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_waves(data)
+            print(f"closed {wave_id}")
+            return
+    print(f"wave {wave_id} not found", file=sys.stderr)
+    sys.exit(2)
+
+
+def cmd_list() -> None:
+    data = load_waves()
+    for w in data.get("waves", []):
+        print(f"{w.get('wave_id'):<14} {w.get('status'):<8} "
+              f"workers={len(w.get('launch_ids', []))} "
+              f"polled={w.get('last_polled_at', '-')}")
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        result = run_once()
+        print(json.dumps(result))
+        return 0
+    if args[0] == "--list":
+        cmd_list()
+        return 0
+    if args[0] == "--close" and len(args) >= 2:
+        cmd_close(args[1])
+        return 0
+    if args[0] == "--register" and len(args) >= 2:
+        wave_id = args[1]
+        launch_ids: list[str] = []
+        session_docs: list[str] = []
+        i = 2
+        while i < len(args):
+            if args[i] == "--launch-id" and i + 1 < len(args):
+                launch_ids.append(args[i + 1]); i += 2
+            elif args[i] == "--session-doc" and i + 1 < len(args):
+                session_docs.append(args[i + 1]); i += 2
+            else:
+                i += 1
+        if not launch_ids:
+            print("--register needs at least one --launch-id", file=sys.stderr)
+            return 2
+        cmd_register(wave_id, launch_ids, session_docs)
+        return 0
+    if args[0] in ("--watch", "-w"):
+        while True:
+            res = run_once()
+            interval = 60 if res["open"] > 0 else 300
+            time.sleep(interval)
+    print(__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

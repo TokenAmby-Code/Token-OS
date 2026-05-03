@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# work-action - Signal productive action to Token-API
+# TAGS: token-api, stream-deck
+# AUDIENCE: human, agent
+"""Signal productive action to Token-API.
+
+Usage:
+    work-action
+    work-action --source stream-deck --note "prompt submitted"
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Signal a work action to Token-API")
+    parser.add_argument("--source", default="cli")
+    parser.add_argument("--note", default=None)
+    args = parser.parse_args()
+
+    body = json.dumps({"source": args.source, "note": args.note}).encode()
+    req = urllib.request.Request(
+        f"{API_URL}/api/work-action",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        print(exc.read().decode() or str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"work-action failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "work-action ok: "
+        f"mode={data.get('current_mode')} "
+        f"acks={data.get('acknowledged_expected_acks', 0)}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# tmux-plan-prefix - Prefix current prompt with /plan without submitting
+# TAGS: tmux, plan, keybind
+# AUDIENCE: human
+
+set -euo pipefail
+
+PANE=""
+PREFIX="/plan "
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="$2"; shift 2 ;;
+        --prefix) PREFIX="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '2,/^$/s/^# //p' "$0"
+            exit 0
+            ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$PANE" ]]; then
+    _id=$(tmux display-message -p '#{pane_id}' 2>/dev/null)
+    if [[ "$_id" == %* ]]; then
+        PANE="$_id"
+    else
+        PANE="%${_id}"
+    fi
+fi
+
+# Claude and Codex prompt widgets can keep long drafts in a scrollable input.
+# Match the working /btw navigation pattern: jump to the top-left of the draft,
+# insert the slash command prefix, then return the cursor to the draft end.
+for _ in $(seq 1 50); do
+    tmux send-keys -t "$PANE" PgUp
+done
+tmux send-keys -t "$PANE" Home
+sleep 0.05
+
+tmux send-keys -t "$PANE" -l "$PREFIX"
+sleep 0.05
+
+for _ in $(seq 1 50); do
+    tmux send-keys -t "$PANE" PgDn
+done
+tmux send-keys -t "$PANE" End
