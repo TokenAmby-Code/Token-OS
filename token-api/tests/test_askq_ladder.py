@@ -163,7 +163,7 @@ def test_question_persistence_records_answer(ladder_env):
             sid,
             "Pick a path?",
             ["Alpha", "Beta"],
-            {"tab_name": "palace:TR", "legion": "custodes", "tmux_pane": "%0"},
+            {"tab_name": "palace:NE", "legion": "custodes", "tmux_pane": "%0"},
             questions=[
                 {
                     "header": "Choice",
@@ -183,7 +183,7 @@ def test_question_persistence_records_answer(ladder_env):
     text = questions_path.read_text(encoding="utf-8")
     assert 'title: "AskUserQuestion Log"' in text
     assert "## " in text
-    assert "palace:TR / custodes" in text
+    assert "palace:NE / custodes" in text
     assert "- Status: answered" in text
     assert "- Answer: Alpha" in text
     assert "**Choice**" in text
@@ -247,7 +247,7 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
         (
             sid,
             sid,
-            "palace:BR",
+            "palace:SE",
             "/tmp",
             "local",
             "Mac-Mini",
@@ -291,7 +291,7 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
 
     questions_path = Path(hooks._imperium_env_root()) / "Terra" / "Inbox" / "Questions.md"
     text = questions_path.read_text(encoding="utf-8")
-    assert "palace:BR / custodes" in text
+    assert "palace:SE / custodes" in text
     assert "- Status: answered" in text
     assert "- Answer: Yes" in text
     shared.VOICE_CHAT_SESSIONS.pop(sid, None)

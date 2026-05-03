@@ -79,7 +79,11 @@ _timer_log_shift: Callable[..., Any] | None = None
 _run_stop_evaluators: Callable[..., Any] | None = None
 _auto_name_instance: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
+# AUQ ladder escalation callbacks. Level 2 keeps the historical
+# `_askq_touch2_callback` name for the cascade since main.py already wires it.
+_askq_level1_callback: Callable[..., Any] | None = None
 _askq_touch2_callback: Callable[..., Any] | None = None
+_askq_level3_callback: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -90,12 +94,14 @@ def init_deps(
     run_stop_evaluators=None,
     auto_name_instance=None,
     work_action_callback=None,
+    askq_level1_callback=None,
     askq_touch2_callback=None,
+    askq_level3_callback=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
     global _run_stop_evaluators, _auto_name_instance, _work_action_callback
-    global _askq_touch2_callback
+    global _askq_level1_callback, _askq_touch2_callback, _askq_level3_callback
 
     _scheduler = scheduler
     _timer_engine = timer_engine
@@ -103,7 +109,9 @@ def init_deps(
     _run_stop_evaluators = run_stop_evaluators
     _auto_name_instance = auto_name_instance
     _work_action_callback = work_action_callback
+    _askq_level1_callback = askq_level1_callback
     _askq_touch2_callback = askq_touch2_callback
+    _askq_level3_callback = askq_level3_callback
 
 
 def _require_dep(name: str, value):
@@ -197,6 +205,190 @@ def _normalize_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _json_or_none(value: str | None) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _run_git_value(working_dir: str | None, args: list[str], *, timeout: int = 2) -> str | None:
+    if not working_dir or not Path(working_dir).is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", working_dir, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    text = result.stdout.strip()
+    return text or None
+
+
+def _git_changed_files(working_dir: str | None, *, limit: int = 12) -> list[str]:
+    status = _run_git_value(working_dir, ["status", "--short"], timeout=2)
+    if not status:
+        return []
+    files: list[str] = []
+    for line in status.splitlines():
+        text = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in text:
+            text = text.split(" -> ", 1)[1]
+        if text:
+            files.append(text)
+        if len(files) >= limit:
+            break
+    return files
+
+
+def _render_state_injection(kind: str, payload: dict) -> str:
+    if kind == "child_stopped":
+        child = payload.get("child_instance_id") or "unknown"
+        doc = payload.get("child_session_doc_path") or payload.get("child_session_doc_id")
+        reason = payload.get("exit_reason") or "unknown"
+        files = payload.get("files_changed_summary") or []
+        file_text = ", ".join(str(item) for item in files[:8]) if files else "none reported"
+        lines = [
+            "<system-reminder>",
+            "A dispatched child instance stopped.",
+            f"- child_instance_id: {child}",
+            f"- exit_reason: {reason}",
+            f"- session_doc: {doc or 'unknown'}",
+            f"- files_changed_summary: {file_text}",
+        ]
+        if payload.get("last_commit"):
+            lines.append(f"- last_commit: {payload['last_commit']}")
+        if payload.get("exit_summary"):
+            lines.append(f"- exit_summary: {payload['exit_summary']}")
+        lines.append("</system-reminder>")
+        return "\n".join(lines)
+    return f"<system-reminder>\nState injection: {kind}\n{json.dumps(payload, sort_keys=True)}\n</system-reminder>"
+
+
+async def _enqueue_state_injection(
+    db,
+    *,
+    audience_instance_id: str,
+    source_instance_id: str | None,
+    kind: str,
+    payload: dict,
+) -> int:
+    rendered_text = _render_state_injection(kind, payload)
+    cursor = await db.execute(
+        """INSERT INTO state_injections
+           (audience_instance_id, source_instance_id, kind, payload_json, rendered_text)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            audience_instance_id,
+            source_instance_id,
+            kind,
+            json.dumps(payload, sort_keys=True),
+            rendered_text,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+async def _consume_state_injections(db, audience_instance_id: str) -> list[dict]:
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT id, source_instance_id, kind, payload_json, rendered_text, created_at
+           FROM state_injections
+           WHERE audience_instance_id = ? AND status = 'pending'
+           ORDER BY created_at ASC, id ASC
+           LIMIT 10""",
+        (audience_instance_id,),
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return []
+    ids = [row["id"] for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    await db.execute(
+        f"""UPDATE state_injections
+            SET status = 'consumed', consumed_at = ?
+            WHERE id IN ({placeholders})""",
+        [datetime.now().isoformat(), *ids],
+    )
+    return [
+        {
+            "id": row["id"],
+            "source_instance_id": row["source_instance_id"],
+            "kind": row["kind"],
+            "payload": _json_or_none(row["payload_json"]) or {},
+            "rendered_text": row["rendered_text"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | None:
+    parent_instance_id = _normalize_text(instance.get("parent_instance_id"))
+    if not parent_instance_id:
+        return None
+
+    child_instance_id = instance["id"]
+    child_session_doc_path = None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if instance.get("session_doc_id"):
+            cursor = await db.execute(
+                "SELECT file_path FROM session_documents WHERE id = ?",
+                (instance["session_doc_id"],),
+            )
+            row = await cursor.fetchone()
+            if row:
+                child_session_doc_path = row["file_path"]
+
+        exit_code = payload.get("exit_code")
+        exit_reason = payload.get("exit_reason")
+        if not exit_reason:
+            exit_reason = "errored" if exit_code not in (None, 0, "0") else "normal"
+        injection_payload = {
+            "kind": "child_stopped",
+            "child_instance_id": child_instance_id,
+            "child_session_doc_id": instance.get("session_doc_id"),
+            "child_session_doc_path": child_session_doc_path,
+            "exit_reason": exit_reason,
+            "last_commit": _run_git_value(
+                instance.get("working_dir"), ["rev-parse", "--short", "HEAD"]
+            ),
+            "files_changed_summary": _git_changed_files(instance.get("working_dir")),
+            "exit_summary": payload.get("exit_summary"),
+        }
+        injection_id = await _enqueue_state_injection(
+            db,
+            audience_instance_id=parent_instance_id,
+            source_instance_id=child_instance_id,
+            kind="child_stopped",
+            payload=injection_payload,
+        )
+        await db.commit()
+
+    await log_event(
+        "state_injection_enqueued",
+        instance_id=child_instance_id,
+        details={
+            "audience_instance_id": parent_instance_id,
+            "kind": "child_stopped",
+            "injection_id": injection_id,
+            "payload": injection_payload,
+        },
+    )
+    return {
+        "injection_id": injection_id,
+        "audience_instance_id": parent_instance_id,
+        "payload": injection_payload,
+    }
 
 
 def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | None:
@@ -467,6 +659,9 @@ async def handle_session_start(payload: dict) -> dict:
     wrapper_launch_id = _normalize_text(
         payload.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
     )
+    parent_instance_id = _normalize_text(
+        payload.get("parent_instance_id") or env.get("TOKEN_API_PARENT_INSTANCE_ID", "")
+    )
     transplant_expected_raw = payload.get("transplant_expected")
     if transplant_expected_raw is None:
         transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
@@ -478,19 +673,6 @@ async def handle_session_start(payload: dict) -> dict:
         launch_instance_type = None
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
-    )
-    launch_field_values = (
-        wrapper_launch_id,
-        launcher,
-        engine,
-        dispatch_target,
-        dispatch_window,
-        dispatch_mode,
-        dispatch_slot,
-        dispatch_session_doc_path,
-        target_working_dir,
-        launch_mode,
-        1 if transplant_expected else 0,
     )
     session_doc_policy = None
     dispatch_bound_doc = False
@@ -604,6 +786,8 @@ async def handle_session_start(payload: dict) -> dict:
                         "target_working_dir": target_working_dir
                         or existing_row["target_working_dir"],
                         "launch_mode": launch_mode or existing_row["launch_mode"],
+                        "parent_instance_id": parent_instance_id
+                        or existing_row["parent_instance_id"],
                         "transplant_expected": 1 if transplant_expected else 0,
                         "instance_type": launch_instance_type or existing_row["instance_type"],
                         "zealotry": launch_zealotry
@@ -746,6 +930,7 @@ async def handle_session_start(payload: dict) -> dict:
                         or old_inst["dispatch_session_doc_path"],
                         "target_working_dir": target_working_dir or old_inst["target_working_dir"],
                         "launch_mode": launch_mode or old_inst["launch_mode"],
+                        "parent_instance_id": parent_instance_id or old_inst["parent_instance_id"],
                         "transplant_expected": 1 if transplant_expected else 0,
                         "instance_type": launch_instance_type or old_inst["instance_type"],
                         "zealotry": launch_zealotry
@@ -879,6 +1064,7 @@ async def handle_session_start(payload: dict) -> dict:
         _prior_session_doc_policy = None
         _prior_session_doc_id = None
         _prior_workflow_state = None
+        _prior_parent_instance_id = None
         _prior_dispatch = {}
         cursor = await db.execute(
             """SELECT discord_hosted, discord_channel, legion,
@@ -886,7 +1072,8 @@ async def handle_session_start(payload: dict) -> dict:
                       launcher, engine, dispatch_target, dispatch_window,
                       dispatch_mode, dispatch_slot, dispatch_session_doc_path,
                       target_working_dir, launch_mode, transplant_expected,
-                      session_doc_policy, session_doc_id, workflow_state
+                      session_doc_policy, session_doc_id, workflow_state,
+                      parent_instance_id
                FROM claude_instances WHERE id = ?""",
             (session_id,),
         )
@@ -911,6 +1098,7 @@ async def handle_session_start(payload: dict) -> dict:
             _prior_session_doc_policy = _prior_row[14]
             _prior_session_doc_id = _prior_row[15]
             _prior_workflow_state = _prior_row[16]
+            _prior_parent_instance_id = _prior_row[17]
             # Delete old row so INSERT succeeds (id is PRIMARY KEY)
             await sanctioned_delete_instance(
                 db,
@@ -933,6 +1121,7 @@ async def handle_session_start(payload: dict) -> dict:
         )
         target_working_dir = target_working_dir or _prior_dispatch.get("target_working_dir")
         launch_mode = launch_mode or _prior_dispatch.get("launch_mode")
+        parent_instance_id = parent_instance_id or _prior_parent_instance_id
         if not transplant_expected:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
@@ -971,6 +1160,7 @@ async def handle_session_start(payload: dict) -> dict:
                 "dispatch_session_doc_path": dispatch_session_doc_path,
                 "target_working_dir": target_working_dir,
                 "launch_mode": launch_mode,
+                "parent_instance_id": parent_instance_id,
                 "transplant_expected": 1 if transplant_expected else 0,
                 "instance_type": launch_instance_type or "one_off",
                 "zealotry": launch_zealotry if launch_zealotry is not None else 4,
@@ -1105,6 +1295,7 @@ async def handle_session_start(payload: dict) -> dict:
             "dispatch_session_doc_path": dispatch_session_doc_path or None,
             "target_working_dir": target_working_dir or None,
             "launch_mode": launch_mode or None,
+            "parent_instance_id": parent_instance_id or None,
             "transplant_expected": transplant_expected,
             "instance_type": launch_instance_type or "one_off",
             "zealotry": launch_zealotry if launch_zealotry is not None else 4,
@@ -1309,6 +1500,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
 
     now = datetime.now().isoformat()
+    consumed_injections: list[dict] = []
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -1323,6 +1515,8 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 "action": "ignored_dead_pane",
                 "instance_id": session_id,
             }
+
+        consumed_injections = await _consume_state_injections(db, session_id)
 
         # Also resurrect stopped instances - activity means they're active
         # Backfill PID if payload contains one and DB value is NULL
@@ -1361,12 +1555,30 @@ async def handle_prompt_submit(payload: dict) -> dict:
         pass
 
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
-    return {
+    response = {
         "success": True,
         "action": "processing",
         "instance_id": session_id,
         "exited_idle": exited_idle,
     }
+    if consumed_injections:
+        reminder_text = "\n\n".join(item["rendered_text"] for item in consumed_injections)
+        response["state_injections"] = consumed_injections
+        response["system_reminder"] = reminder_text
+        response["additionalContext"] = reminder_text
+        response["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": reminder_text,
+        }
+        await log_event(
+            "state_injection_consumed",
+            instance_id=session_id,
+            details={
+                "count": len(consumed_injections),
+                "injection_ids": [item["id"] for item in consumed_injections],
+            },
+        )
+    return response
 
 
 async def handle_post_tool_use(payload: dict) -> dict:
@@ -1489,7 +1701,6 @@ async def handle_stop(payload: dict) -> dict:
     instance = dict(instance)
     device_id = instance.get("device_id", "Mac-Mini")
     tab_name = instance.get("tab_name", "Claude")
-    tts_voice = instance.get("tts_voice", "Microsoft David")
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
     # Update last_activity but DON'T set idle yet — that's the evaluators' job.
@@ -1558,6 +1769,9 @@ async def handle_stop(payload: dict) -> dict:
         "instance_id": session_id,
         "device_id": device_id,
     }
+    child_fanout = await _enqueue_child_stop_fanout(instance, payload)
+    if child_fanout:
+        result["parent_fanout"] = child_fanout
 
     # ── Subagent detection: skip all notifications for subagents ──
     # DB flag covers subagent-CLI spawned instances; PID check covers Task tool subagents.

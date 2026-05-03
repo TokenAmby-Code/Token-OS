@@ -255,7 +255,10 @@ async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
             "tmuxctl.cli",
             "resolve-pane",
             tmux_pane,
-            env={**os.environ, "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -430,10 +433,16 @@ VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
 # }
 ASKQ_LADDER = {}
 
-# Touch durations (seconds). Tuned for "engagement, not speed of finishing the answer."
-ASKQ_T1_SECONDS = 30  # Touch 1 (initial TTS) → Touch 2 (enforcement cascade)
-ASKQ_T2_SECONDS = 60  # Touch 2 → Touch 3 (TTS re-read)
-ASKQ_T3_SECONDS = 60  # Touch 3 → Bust (autonomous fallback prompt)
+# Ladder sleep durations (seconds) between escalation levels.
+# Compressed defaults aligned with the GT-compression session's expected_ack ladder
+# (1.5 / 3 / 3 minutes). Total time to pavlok = T1 + T2 + T3 = 7.5 min.
+ASKQ_T1_SECONDS = 90  # arm + initial TTS → Level 1 (TTS reminder + Discord nudge)
+ASKQ_T2_SECONDS = 180  # Level 1 → Level 2 (enforcement cascade + persist Unanswered)
+ASKQ_T3_SECONDS = 180  # Level 2 → Level 3 (pavlok shock + autonomous fallback prompt)
+
+# Minimum zealotry for golden_throne instances to engage the ladder.
+# Voice-chat sessions engage regardless of zealotry.
+ASKQ_MIN_ZEALOTRY = 4
 
 ASKQ_BUST_PROMPT = (
     "Question timed out. Move autonomously for a moment — update documentation, "
