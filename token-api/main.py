@@ -3326,7 +3326,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
                 "vibe": 70,
                 "beep": 60,
                 "banner_text": "Backlog violation",
-                "tts_text": "Backlog violation. Close it or work now.",
+                "tts_text": "backlog violation",
             },
         )
         result = {"unified": result, "desktop": desktop_result}
@@ -3813,8 +3813,40 @@ _CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
 _custodes_state_debounce: dict[str, dict] = {}
 
 
-def _custodes_state_snapshot() -> dict:
+async def _custodes_state_snapshot() -> dict:
     """Small /api/state-style snapshot for Custodes policy prompts."""
+    cascade_count_today = 0
+    open_panes = 0
+    active_threads_count = 0
+    active_threads_names: list[str] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_type='enforcement_cascade_start' "
+                "AND created_at > date('now', 'start of day')"
+            )
+            row = await cursor.fetchone()
+            if row:
+                cascade_count_today = int(row[0] or 0)
+
+            cursor = await db.execute(
+                "SELECT tab_name, status FROM claude_instances "
+                "WHERE status IN ('processing', 'idle') "
+                "AND COALESCE(is_subagent, 0) = 0 "
+                "AND device_id = ?",
+                (LOCAL_DEVICE_NAME,),
+            )
+            inst_rows = await cursor.fetchall()
+            open_panes = len(inst_rows)
+            for tab_name, status in inst_rows:
+                if status == "processing":
+                    active_threads_count += 1
+                    if tab_name:
+                        active_threads_names.append(str(tab_name))
+    except Exception as e:
+        logger.warning(f"_custodes_state_snapshot enrichment failed: {e}")
+
     return {
         "timer": {
             "current_mode": timer_engine.current_mode.value,
@@ -3833,6 +3865,12 @@ def _custodes_state_snapshot() -> dict:
             "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
             "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
             "steam_exe": DESKTOP_STATE.get("steam_exe"),
+        },
+        "cascade_count_today": cascade_count_today,
+        "open_panes": open_panes,
+        "active_threads": {
+            "count": active_threads_count,
+            "names": active_threads_names,
         },
     }
 
@@ -4180,7 +4218,7 @@ async def handle_custodes_state_event(
         },
     )
 
-    intervention = evaluate_state_event(event, _custodes_state_snapshot())
+    intervention = evaluate_state_event(event, await _custodes_state_snapshot())
     if intervention is None:
         return {
             "received": True,
@@ -5514,25 +5552,31 @@ ENFORCEMENT_LEVEL_DELAYS = {
 
 # v3 param mapping per cascade level
 # Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
+# Static cues stay short; Custodes carries the explanatory follow-up.
+# Previous long/static cues:
+# - "Final warning. Close {app}"
+# - "Twitter open for 7 minutes. Forcing break."
+# - "Distraction timeout. Close distractions now."
+# - "Break time exhausted"
 ENFORCE_LEVEL_PARAMS = {
-    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "Close {app}"}},
+    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "close {app}"}},
     2: {
         "endpoint": "/notify",
-        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+        "params": {"vibe": 50, "beep": 30, "tts_text": "close {app}", "banner_text": "close {app}"},
     },
     3: {
         "endpoint": "/notify",
         "params": {
             "vibe": 80,
             "beep": 50,
-            "tts_text": "Final warning. Close {app}",
-            "banner_text": "Final warning",
+            "tts_text": "last call {app}",
+            "banner_text": "last call",
         },
     },
-    4: {"endpoint": "/enforce", "params": {"banner_text": "Enforcement active"}},
+    4: {"endpoint": "/enforce", "params": {"banner_text": "enforcement active"}},
     5: {
         "endpoint": "/enforce",
-        "params": {"zap": 50, "tts_text": "Pavlok fired", "banner_text": "Enforcement — Pavlok"},
+        "params": {"zap": 50, "tts_text": "pavlok fired", "banner_text": "enforcement: Pavlok"},
     },
 }
 
@@ -6759,7 +6803,7 @@ async def _enforcement_cascade_worker(app_name: str):
         "enforcement_cascade_started",
         "phone",
         severity=2,
-        payload={"app": app_name},
+        payload={"app": app_name, "phone_app": app_name},
     )
 
     # Level 0: Discord fallback (soft close)
@@ -6791,6 +6835,17 @@ async def _enforcement_cascade_worker(app_name: str):
             "enforcement_cascade_escalate",
             device_id="phone",
             details={"app": app_name, "level": level, "elapsed_s": round(elapsed)},
+        )
+        await handle_custodes_state_event(
+            "enforcement_cascade_escalate",
+            "phone",
+            severity=min(2 + level, 5),
+            payload={
+                "app": app_name,
+                "phone_app": app_name,
+                "level": level,
+                "elapsed_s": round(elapsed),
+            },
         )
 
         # Try phone first, fall back to server-side Pavlok API, then Discord
@@ -10264,7 +10319,7 @@ async def timer_worker():
                     _session_start_ms = now_ms
                     _mode_change_count += 1
                     loop = asyncio.get_event_loop()
-                    loop.run_in_executor(None, speak_tts, "Idle timeout. Entering break mode.")
+                    loop.run_in_executor(None, speak_tts, "break mode")
                     continue
                 elif event == TimerEvent.DISTRACTION_TIMEOUT:
                     print("TIMER: Distraction timeout — scrolling/gaming ≥10min → DISTRACTED")
@@ -10297,14 +10352,12 @@ async def timer_worker():
                             "/notify",
                             {
                                 "vibe": 30,
-                                "banner_text": "Distraction timeout — close distractions",
+                                "banner_text": "distraction logged",
                             },
                         )
                     )
                     loop = asyncio.get_event_loop()
-                    loop.run_in_executor(
-                        None, speak_tts, "Distraction timeout. Close distractions now."
-                    )
+                    loop.run_in_executor(None, speak_tts, "distraction logged")
                     continue
                 elif event == TimerEvent.MODE_CHANGED and (
                     has_idle_timeout or has_distraction_timeout
@@ -10543,7 +10596,7 @@ async def _async_enforce_twitter_timeout():
     # Desktop: notification sound + TTS
     play_sound()
     try:
-        subprocess.Popen(["say", "-v", "Daniel", "Twitter open for 7 minutes. Forcing break."])
+        subprocess.Popen(["say", "-v", "Daniel", "twitter timeout"])
     except Exception:
         pass
 
@@ -10553,7 +10606,7 @@ async def _async_enforce_twitter_timeout():
         "/enforce",
         {
             "zap": 30,
-            "tts_text": "Twitter 7 minutes. Forcing break.",
+            "tts_text": "twitter timeout",
             "banner_text": "Twitter timeout",
         },
     )
@@ -10646,8 +10699,8 @@ async def enforce_break_exhausted_impl() -> dict:
             {
                 "vibe": 60,
                 "beep": 40,
-                "tts_text": "Break time exhausted",
-                "banner_text": "Break exhausted",
+                "tts_text": "break exhausted",
+                "banner_text": "break exhausted",
             },
         )
 
@@ -11361,16 +11414,16 @@ _ENFORCE_LEVELS = {
 def _enforcement_label(level: str, source: str, message: str = "") -> str:
     haystack = f"{source} {message}".lower()
     if "break_exhausted" in haystack or "break exhausted" in haystack:
-        return "Break exhausted"
+        return "break exhausted"
     if "backlog" in haystack:
-        return "Backlog violation"
+        return "backlog violation"
     if "ack" in haystack:
-        return "Ack overdue" if level != "notify" else "Ack due"
+        return "ack overdue" if level != "notify" else "ack due"
     if level in ("enforce", "block"):
-        return "Enforcement active"
+        return "enforcement active"
     if level == "warn":
-        return "Enforcement imminent"
-    return "Enforcement notice"
+        return "enforcement incoming"
+    return "enforcement notice"
 
 
 async def unified_enforce(

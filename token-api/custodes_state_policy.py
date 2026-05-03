@@ -16,6 +16,7 @@ V1_TRIGGERS = {
     "phone_distraction_blocked",
     "desktop_mode_blocked",
     "enforcement_cascade_started",
+    "enforcement_cascade_escalate",
 }
 
 
@@ -57,7 +58,10 @@ def build_dedupe_key(event: StateEvent) -> str:
         or event.instance_id
         or "global"
     )
-    return f"{event.event_type}:{event.source}:{subject}"
+    base = f"{event.event_type}:{event.source}:{subject}"
+    if event.event_type == "enforcement_cascade_escalate" and payload.get("level") is not None:
+        return f"{base}:level={payload['level']}"
+    return base
 
 
 def _format_minutes(ms: Any) -> str | None:
@@ -95,6 +99,27 @@ def _snapshot_items(snapshot: dict[str, Any], payload: dict[str, Any]) -> list[s
         items.append(f"break_balance={formatted_balance}")
     if payload.get("reason"):
         items.append(f"reason={payload['reason']}")
+
+    cascades_today = snapshot.get("cascade_count_today")
+    if cascades_today is not None:
+        items.append(f"cascades_today={cascades_today}")
+    open_panes = snapshot.get("open_panes")
+    if open_panes is not None:
+        items.append(f"open_panes={open_panes}")
+    threads = snapshot.get("active_threads")
+    if isinstance(threads, dict):
+        thread_count = threads.get("count")
+        if thread_count is not None:
+            items.append(f"active_threads={thread_count}")
+        names = threads.get("names") or []
+        if names:
+            joined = ",".join(str(n) for n in list(names)[:3])
+            items.append(f"thread_names={joined}")
+    elif threads is not None:
+        items.append(f"active_threads={threads}")
+
+    if payload.get("level") is not None:
+        items.append(f"level={payload['level']}")
     return items
 
 
@@ -119,6 +144,7 @@ def evaluate_state_event(
         "phone_distraction_blocked": "Intervene about the blocked phone distraction and redirect attention back to work.",
         "desktop_mode_blocked": "Intervene about the blocked desktop mode and redirect to the active task.",
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
+        "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
     }[event.event_type]
 
     prompt = (

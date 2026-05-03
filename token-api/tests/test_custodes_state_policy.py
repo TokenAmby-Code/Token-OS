@@ -1,4 +1,4 @@
-from custodes_state_policy import StateEvent, evaluate_state_event
+from custodes_state_policy import StateEvent, build_dedupe_key, evaluate_state_event
 
 
 def _snapshot():
@@ -54,6 +54,47 @@ def test_prompt_includes_relevant_snapshot_fields():
     assert "phone_app=slay_the_spire" in intervention.prompt
     assert "timer_mode=break" in intervention.prompt
     assert "break_balance=-12m" in intervention.prompt
+
+
+def test_prompt_includes_enriched_snapshot_fields():
+    snapshot = {
+        "timer": {"current_mode": "break", "break_balance_ms": -12 * 60 * 1000},
+        "phone": {"current_app": "slay_the_spire"},
+        "desktop": {"current_mode": "gaming"},
+        "cascade_count_today": 4,
+        "open_panes": 2,
+        "active_threads": {"count": 1, "names": ["legion-a"]},
+    }
+    intervention = evaluate_state_event(
+        StateEvent(
+            event_type="enforcement_cascade_started",
+            source="phone",
+            payload={"app": "slay_the_spire", "phone_app": "slay_the_spire"},
+        ),
+        snapshot,
+    )
+
+    assert intervention is not None
+    assert "cascades_today=4" in intervention.prompt
+    assert "open_panes=2" in intervention.prompt
+    assert "active_threads=1" in intervention.prompt
+    assert "thread_names=legion-a" in intervention.prompt
+
+
+def test_cascade_escalate_emits_intervention_with_level_dedupe():
+    event = StateEvent(
+        event_type="enforcement_cascade_escalate",
+        source="phone",
+        severity=5,
+        payload={"app": "x", "phone_app": "x", "level": 3, "elapsed_s": 42},
+    )
+    intervention = evaluate_state_event(event, {})
+
+    assert intervention is not None
+    assert intervention.event_type == "enforcement_cascade_escalate"
+    assert "level=3" in intervention.prompt
+    assert build_dedupe_key(event).endswith(":level=3")
+    assert intervention.dedupe_key.endswith(":level=3")
 
 
 def test_severity_defaults_and_normalizes():
