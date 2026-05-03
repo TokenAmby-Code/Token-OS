@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Somnium</title>
+    <link rel="stylesheet" href="/ui/somnium/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">Token-API</p>
+        <h1>Somnium</h1>
+        <p id="status">Loading live state...</p>
+      </header>
+
+      <section aria-label="Live summary" class="grid">
+        <article>
+          <h2>Timer</h2>
+          <dl id="timer"></dl>
+        </article>
+        <article>
+          <h2>Fleet</h2>
+          <dl id="fleet"></dl>
+        </article>
+        <article>
+          <h2>Work State</h2>
+          <dl id="work"></dl>
+        </article>
+      </section>
+
+      <section aria-label="Implementation notes">
+        <h2>Design Stub</h2>
+        <p>
+          This page is an infrastructure stub. It proves Token-API can serve a
+          Somnium HTML surface for browser or Obsidian embedding while richer
+          dashboard design remains separate.
+        </p>
+      </section>
+    </main>
+
+    <script src="/ui/somnium/app.js"></script>
+  </body>
+</html>
