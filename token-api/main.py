@@ -3339,7 +3339,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             desktop_result = close_distraction_windows()
         result = await unified_enforce(
             "warn",
-            f"{message}. Backlog parry window: close it or work now.",
+            f"{message}. Backlog violation.",
             source=ack["source"],
             channel="briefing",
             phone_params={
@@ -3353,7 +3353,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
     elif ack["source"] == "backlog_violation" and level == 2:
         result = await unified_enforce(
             "warn",
-            f"{message}. Pavlok is eligible now unless the distraction is gone.",
+            message,
             source=ack["source"],
             phone_params={"vibe": 90, "beep": 80, "banner_text": "Backlog parry expired"},
         )
@@ -11445,19 +11445,14 @@ def _morning_escalate(level: int) -> None:
     if level == 1:
         _unified_enforce_sync(
             level="notify",
-            message="Morning session waiting. Please acknowledge.",
+            message="Morning session pending.",
             source="morning",
             channel="briefing",
         )
     elif level == 2:
         _unified_enforce_sync(
             level="warn",
-            message=(
-                "**Morning Session — Unacknowledged** (10 min elapsed)\n"
-                "The morning regiment is waiting for your response.\n"
-                "Acknowledge: `POST /api/morning/acknowledge`\n"
-                "Override: `POST /api/morning/override` with a reason."
-            ),
+            message="**Morning Session** (unacknowledged)",
             source="morning",
         )
     elif level == 3:
