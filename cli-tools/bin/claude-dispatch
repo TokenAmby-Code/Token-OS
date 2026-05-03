@@ -166,22 +166,23 @@ if [[ -n "$ZEALOTRY" ]]; then
 fi
 
 # --- Execute ---
+RESOLVED_PANE="${TARGET_PANE:-${TMUX_PANE:-}}"
+QUOTED_RESOLVED_PANE="$(printf '%q' "$RESOLVED_PANE")"
+
 if [[ -n "$TARGET_PANE" ]]; then
     # Remote pane dispatch via tmux send-keys
-    # Write prompt to temp file to avoid shell escaping issues
     if [[ -n "$FULL_PROMPT" ]]; then
-        PROMPT_FILE="/tmp/claude-dispatch-$$.md"
-        printf '%s' "$FULL_PROMPT" > "$PROMPT_FILE"
+        PROMPT_ARG="$(printf '%q' "$FULL_PROMPT")"
         if [[ -n "$PRIMARCH" ]]; then
-            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | primarch ${PRIMARCH}"
+            CMD="cd '${WORK_DIR}' && TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} primarch ${PRIMARCH} ${PROMPT_ARG}"
         else
-            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions ${PROMPT_ARG}"
         fi
     else
         if [[ -n "$PRIMARCH" ]]; then
-            CMD="cd '${WORK_DIR}' && primarch ${PRIMARCH}"
+            CMD="cd '${WORK_DIR}' && TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} primarch ${PRIMARCH}"
         else
-            CMD="cd '${WORK_DIR}' && TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
         fi
     fi
 
@@ -195,17 +196,17 @@ else
     cd "$WORK_DIR"
 
     if [[ -n "$FULL_PROMPT" ]]; then
-        # Pipe prompt as first message
+        # Claude Code 2.x expects an initial prompt as a positional argument.
         if [[ -n "$PRIMARCH" ]]; then
-            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+            TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}" "$FULL_PROMPT"
         else
-            TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}" <<< "$FULL_PROMPT"
+            TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}" "$FULL_PROMPT"
         fi
     else
         if [[ -n "$PRIMARCH" ]]; then
-            exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+            TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
         else
-            TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}"
+            TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude exec "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}"
         fi
     fi
 fi

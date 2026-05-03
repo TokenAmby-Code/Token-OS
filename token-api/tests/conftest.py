@@ -6,6 +6,9 @@ import pytest
 
 _MODULES_TO_RELOAD = [
     "shared",
+    "db_schema",
+    "phone_service",
+    "enforcement_service",
     "routes.voice",
     "routes.tts",
     "routes.hooks",
@@ -31,4 +34,14 @@ def app_env(tmp_path, monkeypatch):
     main = sys.modules["main"]
 
     init_db.init_database()
+
+    async def _no_pane_rows():
+        return []
+
+    async def _no_observed_agents():
+        return []
+
+    monkeypatch.setattr(main, "_tmux_pane_rows", _no_pane_rows)
+    monkeypatch.setattr(main, "_detect_tmux_agent_panes", _no_observed_agents)
+
     return SimpleNamespace(db_path=db_path, shared=shared, init_db=init_db, main=main)

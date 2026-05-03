@@ -28,6 +28,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # Canonical Scripts root — derived from this file's location (token-api/ is one level down)
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+UI_DIR = Path(__file__).resolve().parent / "ui"
+SOMNIUM_SELECTION_PATH = Path.home() / ".claude" / "tui-state" / "somnium.json"
 
 import subprocess
 import tempfile
@@ -40,9 +42,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import shared
@@ -273,6 +275,7 @@ scheduler = AsyncIOScheduler(
     }
 )
 shared.scheduler = scheduler
+APP_LOOP: asyncio.AbstractEventLoop | None = None
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
@@ -333,6 +336,43 @@ class DashboardResponse(BaseModel):
     productivity_active: bool
     recent_events: list[dict]
     tts_queue: dict | None = None  # TTS queue status
+
+
+class AgentRuntime(BaseModel):
+    id: str | None = None
+    name: str | None = None
+    status: str
+    engine: str | None = None
+    working_dir: str | None = None
+    tmux_pane: str | None = None
+    device_id: str | None = None
+    last_activity: str | None = None
+    registered: bool = True
+    live_pane: bool | None = None
+
+
+class ActivityIconState(BaseModel):
+    key: str
+    icon: str
+    label: str
+    active: bool
+    source: str
+
+
+class WorkStateResponse(BaseModel):
+    productivity_active: bool
+    reason: str
+    active_instance_count: int
+    processing_recent_count: int
+    observed_agent_count: int
+    active_instances: list[AgentRuntime]
+    observed_agents: list[AgentRuntime]
+    activity_icons: list[ActivityIconState]
+    timer_mode: str
+    activity: str
+    desktop_mode: str
+    phone_app: str | None = None
+    generated_at: str
 
 
 class TaskResponse(BaseModel):
@@ -483,6 +523,40 @@ class GameTurnResponse(BaseModel):
     recorded: bool
     block: bool = False
     reason: str = "observational_only"
+    ack_id: str | None = None
+
+
+class EnforcementAckRequest(BaseModel):
+    ack_id: str | None = None
+    source: str | None = None
+    instance_id: str | None = None
+
+
+class EnforcementExpectRequest(BaseModel):
+    reason: str
+    source: str = "manual"
+    instance_id: str | None = None
+    details: dict | None = None
+
+
+class EnforcementBailoutRequest(BaseModel):
+    reason: str
+    ack_id: str | None = None
+    source: str | None = None
+    instance_id: str | None = None
+
+
+class WorkActionRequest(BaseModel):
+    source: str = "api"
+    note: str | None = None
+
+
+class StateValidateRequest(BaseModel):
+    state: str | None = None
+    var: str | None = None
+    name: str | None = None
+    app: str | None = None
+    assert_: str | bool | int | float | None = Field(default=None, alias="assert")
 
 
 # ============ Phone Activity Models ============
@@ -1015,11 +1089,12 @@ async def run_overdue_tasks():
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global stale_flag_cleaner_task, timer_worker_task, mac_kvm_supervisor_task
+    global stale_flag_cleaner_task, timer_worker_task, mac_kvm_supervisor_task, APP_LOOP
     import routes.tts as _tts_mod  # For mutable tts_worker_task assignment
 
     # Install asyncio exception handler for this loop
     loop = asyncio.get_running_loop()
+    APP_LOOP = loop
     loop.set_exception_handler(_asyncio_exception_handler)
 
     # Log startup to crash log for context
@@ -1038,10 +1113,13 @@ async def lifespan(app: FastAPI):
     await load_tasks_from_db()
     timer_load_from_db()
     restore_restart_state()
+    recovered_phone_distraction = await recover_recent_phone_distraction_state()
     # Sync timer activity layer with restored desktop mode
     desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
     now_ms = int(time.monotonic() * 1000)
-    if desktop_mode in ("video", "scrolling", "gaming"):
+    if recovered_phone_distraction:
+        print(f"TIMER: Recovered phone distraction state (desktop={desktop_mode})")
+    elif desktop_mode in ("video", "scrolling", "gaming"):
         is_sg = desktop_mode in ("scrolling", "gaming")
         timer_engine.set_activity(
             Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
@@ -1061,8 +1139,21 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True
     )
+    scheduler.add_job(
+        _scheduled_quiet_enter_sync,
+        CronTrigger(hour=shared.QUIET_HOURS_START, minute=0),
+        id="timer_quiet_enter",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _scheduled_quiet_exit_sync,
+        CronTrigger(hour=shared.QUIET_HOURS_END, minute=0),
+        id="timer_quiet_exit",
+        replace_existing=True,
+    )
     scheduler.start()
     print("Scheduler started")
+    await recover_expected_ack_jobs()
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
@@ -2191,19 +2282,60 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
     now = datetime.now().isoformat()
 
     if request.action == "prompt_submit":
+        await bust_quiet_state(
+            "api",
+            "prompt_submit",
+            {"instance_id": instance_id, "action": request.action},
+        )
         new_status = "processing"
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
+        acknowledged_acks = await acknowledge_pending_acks_for_instance(instance_id)
+        acknowledged_acks += await acknowledge_pending_work_action_acks()
+        stop_enforcement_cascade(reason="prompt_submit")
     elif request.action == "stop":
         new_status = "idle"
+        acknowledged_acks = 0
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, tmux_pane, device_id FROM claude_instances WHERE id = ?", (instance_id,)
+        )
         row = await cursor.fetchone()
 
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+
+        tmux_pane = row["tmux_pane"]
+        device_id = row["device_id"]
+        if device_id == LOCAL_DEVICE_NAME and tmux_pane and not await _tmux_pane_exists(tmux_pane):
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "status": "stopped",
+                    "synced": 0,
+                    "stopped_at": now,
+                },
+                mutation_type="instance_stopped",
+                write_source="api",
+                actor=f"activity-{request.action}-dead-pane",
+            )
+            await db.commit()
+            await log_event(
+                "activity_ignored_dead_pane",
+                instance_id=instance_id,
+                details={"action": request.action, "tmux_pane": tmux_pane},
+            )
+            return {
+                "status": "ignored_dead_pane",
+                "instance_id": instance_id,
+                "action": request.action,
+                "new_status": "stopped",
+                "acknowledged_expected_acks": 0,
+            }
 
         await sanctioned_update_instance(
             db,
@@ -2220,6 +2352,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         "instance_id": instance_id,
         "action": request.action,
         "new_status": new_status,
+        "acknowledged_expected_acks": acknowledged_acks,
     }
 
 
@@ -2277,6 +2410,1014 @@ async def get_instance_todos(instance_id: str):
 
 # Zealotry-to-delay mapping (seconds)
 ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 120}
+
+EXPECTED_ACK_PENDING = "pending"
+EXPECTED_ACK_TERMINAL_STATUSES = {
+    "acknowledged",
+    "bailed_out",
+    "expired",
+    "blocked_by_guardrail",
+}
+
+
+def quiet_hours_status(now: datetime | None = None) -> dict:
+    schedule = shared.get_quiet_hours_status(now)
+    return {
+        **schedule,
+        "active": timer_engine.current_mode == TimerMode.QUIET,
+        "reason": "quiet_mode"
+        if timer_engine.current_mode == TimerMode.QUIET
+        else "not_quiet_mode",
+        "schedule_active": schedule["active"],
+        "timer_mode": timer_engine.current_mode.value,
+        "quiet_context": timer_engine.quiet_context,
+    }
+
+
+def is_quiet_hours(now: datetime | None = None) -> bool:
+    return bool(quiet_hours_status(now)["active"])
+
+
+async def log_quiet_hours_suppressed(
+    *,
+    source: str,
+    event_type: str,
+    app: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    quiet = quiet_hours_status()
+    payload = {
+        "source": source,
+        "event_type": event_type,
+        "app": app,
+        "quiet_hours": quiet,
+        "timer_state": {
+            "mode": timer_engine.current_mode.value,
+            "activity": timer_engine.activity.value,
+            "productivity_active": timer_engine.productivity_active,
+            "break_balance_ms": timer_engine.break_balance_ms,
+        },
+        **(details or {}),
+    }
+    await log_event("quiet_hours_suppressed", device_id=source, details=payload)
+    return payload
+
+
+QUIET_RESUME_JOB_ID = "quiet-resume-after-state-buster"
+
+
+async def enter_quiet_mode_internal(
+    *, context: str = "sleeping", source: str = "scheduled_sleep"
+) -> dict:
+    """Enter first-class timer quiet mode without recording a timer shift."""
+    global _current_session_id, _session_start_ms
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    changed, _ = timer_engine.enter_quiet(now_ms, context=context)
+    PHONE_STATE["current_app"] = None
+    PHONE_STATE["app_opened_at"] = None
+    PHONE_STATE["is_distracted"] = False
+    PHONE_STATE["twitter_open_since"] = None
+    PHONE_STATE["twitter_zapped"] = False
+    PHONE_STATE["distraction_ack_app"] = None
+    PHONE_STATE["distraction_ack_id"] = None
+    PHONE_STATE["last_activity"] = datetime.now().isoformat()
+    DESKTOP_STATE["current_mode"] = "silence"
+    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+    stop_enforcement_cascade(reason=f"quiet_enter:{source}")
+    if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _current_session_id > 0:
+            await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session("quiet", today)
+        _session_start_ms = now_ms
+        await timer_log_mode_change(old_mode, "quiet", is_automatic=True)
+        await log_event(
+            "timer_quiet_entered",
+            details={"source": source, "context": context, "old_mode": old_mode},
+        )
+    try:
+        scheduler.remove_job(QUIET_RESUME_JOB_ID)
+    except Exception:
+        pass
+    return {
+        "status": timer_engine.current_mode.value,
+        "quiet_context": timer_engine.quiet_context,
+        "changed": changed,
+    }
+
+
+async def exit_quiet_mode_internal(*, source: str, reason: str) -> dict:
+    """Exit quiet mode without recording a normal timer shift."""
+    global _current_session_id, _session_start_ms
+    if timer_engine.current_mode != TimerMode.QUIET:
+        return {"changed": False, "status": timer_engine.current_mode.value}
+    now_ms = int(time.monotonic() * 1000)
+    old_context = timer_engine.quiet_context
+    changed, _ = timer_engine.resume(now_ms)
+    timer_engine.set_productivity(False, now_ms)
+    new_mode = timer_engine.current_mode.value
+    if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _current_session_id > 0:
+            await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session(new_mode, today)
+        _session_start_ms = now_ms
+        await timer_log_mode_change("quiet", new_mode, is_automatic=True)
+        await log_event(
+            "timer_quiet_exited",
+            details={
+                "source": source,
+                "reason": reason,
+                "old_context": old_context,
+                "new_mode": new_mode,
+            },
+        )
+    return {"changed": changed, "status": new_mode, "old_context": old_context}
+
+
+def _schedule_quiet_resume_after_state_buster() -> None:
+    fires_at = datetime.now() + timedelta(hours=1)
+    scheduler.add_job(
+        _quiet_resume_after_state_buster_sync,
+        DateTrigger(run_date=fires_at),
+        id=QUIET_RESUME_JOB_ID,
+        replace_existing=True,
+    )
+
+
+def _quiet_resume_after_state_buster_sync() -> dict:
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                enter_quiet_mode_internal(context="sleeping", source="state_buster_idle_timeout"),
+                APP_LOOP,
+            )
+            return future.result(timeout=20)
+        return asyncio.run(
+            enter_quiet_mode_internal(context="sleeping", source="state_buster_idle_timeout")
+        )
+    except Exception as exc:
+        logger.warning(f"Quiet resume after state-buster failed: {exc}")
+        return {"success": False, "error": str(exc)}
+
+
+def _scheduled_quiet_enter_sync() -> dict:
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                enter_quiet_mode_internal(context="sleeping", source="quiet_schedule"),
+                APP_LOOP,
+            )
+            return future.result(timeout=20)
+        return asyncio.run(enter_quiet_mode_internal(context="sleeping", source="quiet_schedule"))
+    except Exception as exc:
+        logger.warning(f"Scheduled quiet entry failed: {exc}")
+        return {"success": False, "error": str(exc)}
+
+
+def _scheduled_quiet_exit_sync() -> dict:
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                exit_quiet_mode_internal(source="quiet_schedule", reason="quiet_end"),
+                APP_LOOP,
+            )
+            return future.result(timeout=20)
+        return asyncio.run(exit_quiet_mode_internal(source="quiet_schedule", reason="quiet_end"))
+    except Exception as exc:
+        logger.warning(f"Scheduled quiet exit failed: {exc}")
+        return {"success": False, "error": str(exc)}
+
+
+async def bust_quiet_state(source: str, event_type: str, details: dict | None = None) -> dict:
+    """Leave sleeping quiet because real activity was observed; arm one idle resume."""
+    if timer_engine.current_mode != TimerMode.QUIET:
+        if scheduler.get_job(QUIET_RESUME_JOB_ID):
+            _schedule_quiet_resume_after_state_buster()
+            await log_event(
+                "quiet_state_buster_activity",
+                device_id=source,
+                details={
+                    "source": source,
+                    "event_type": event_type,
+                    "resume_after_seconds": 3600,
+                    **(details or {}),
+                },
+            )
+            return {"busted": False, "resume_rescheduled": True}
+        return {"busted": False}
+    before = quiet_hours_status()
+    exit_result = await exit_quiet_mode_internal(source=source, reason=event_type)
+    _schedule_quiet_resume_after_state_buster()
+    await log_event(
+        "quiet_state_buster",
+        device_id=source,
+        details={
+            "source": source,
+            "event_type": event_type,
+            "before": before,
+            "exit_result": exit_result,
+            "resume_after_seconds": 3600,
+            **(details or {}),
+        },
+    )
+    return {"busted": True, "exit_result": exit_result}
+
+
+def _expected_ack_deadlines(
+    now: datetime | None = None,
+    *,
+    ack_delay: timedelta = timedelta(minutes=5),
+    level2_delay: timedelta = timedelta(minutes=10),
+    pavlok_delay: timedelta = timedelta(minutes=15),
+) -> dict:
+    now = now or datetime.now()
+    return {
+        "created_at": now,
+        "ack_due_at": now + ack_delay,
+        "level2_due_at": now + level2_delay,
+        "pavlok_due_at": now + pavlok_delay,
+    }
+
+
+def _expected_ack_job_id(ack_id: str, level: int) -> str:
+    return f"expected-ack-{ack_id}-l{level}"
+
+
+def _schedule_expected_ack_level(ack_id: str, level: int, due_at: datetime) -> None:
+    scheduler.add_job(
+        _expected_ack_escalate_sync,
+        DateTrigger(run_date=due_at),
+        args=[ack_id, level],
+        id=_expected_ack_job_id(ack_id, level),
+        replace_existing=True,
+        jobstore="golden_throne",
+    )
+
+
+def _schedule_expected_ack_ladder(
+    ack_id: str, ack_due_at: str, level2_due_at: str, pavlok_due_at: str
+) -> None:
+    for level, due_at in (
+        (1, ack_due_at),
+        (2, level2_due_at),
+        (3, pavlok_due_at),
+    ):
+        _schedule_expected_ack_level(ack_id, level, datetime.fromisoformat(due_at))
+
+
+def _schedule_expected_ack_remaining(ack: dict) -> None:
+    fired_levels = set(ack.get("fired_levels") or [])
+    for level, due_at in (
+        (1, ack["ack_due_at"]),
+        (2, ack["level2_due_at"]),
+        (3, ack["pavlok_due_at"]),
+    ):
+        if level not in fired_levels:
+            _schedule_expected_ack_level(ack["id"], level, datetime.fromisoformat(due_at))
+
+
+def _cancel_expected_ack_ladder(ack_id: str) -> None:
+    for level in (1, 2, 3):
+        try:
+            scheduler.remove_job(_expected_ack_job_id(ack_id, level))
+        except Exception:
+            pass
+
+
+async def _tmux_pane_exists(tmux_pane: str | None) -> bool:
+    return await shared.tmux_pane_exists(tmux_pane)
+
+
+async def _tmux_resolve_pane_id(tmux_pane: str | None) -> str | None:
+    return await shared.resolve_tmux_pane_id(tmux_pane)
+
+
+async def _detect_tmux_agent_panes() -> list[AgentRuntime]:
+    pane_rows = await _tmux_pane_rows()
+    agents = []
+    for pane, command, cwd, window, tty in pane_rows:
+        is_agent, engine = await _pane_is_agent(command, cwd, window, tty)
+        if not is_agent:
+            continue
+        agents.append(
+            AgentRuntime(
+                id=None,
+                name=window or engine,
+                status="observed",
+                engine=engine,
+                working_dir=cwd,
+                tmux_pane=pane,
+                device_id=LOCAL_DEVICE_NAME,
+                registered=False,
+                live_pane=True,
+            )
+        )
+    return agents
+
+
+_AGENT_PROCESS_TOKEN_RE = re.compile(r"(?:^|[\s/])(claude|codex)(?:[\s/-]|$)", re.IGNORECASE)
+
+
+def _agent_engine_for_args(args: str) -> str | None:
+    match = _AGENT_PROCESS_TOKEN_RE.search(args)
+    return match.group(1).lower() if match else None
+
+
+async def _tmux_pane_processes(tty: str | None) -> list[str]:
+    if not tty:
+        return []
+    tty_arg = tty[len("/dev/") :] if tty.startswith("/dev/") else tty
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ps",
+            "-t",
+            tty_arg,
+            "-o",
+            "args=",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        if proc.returncode != 0:
+            return []
+    except Exception:
+        return []
+    return [line for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
+
+
+async def _pane_is_agent(
+    command: str | None,
+    cwd: str | None,
+    window: str | None,
+    tty: str | None,
+) -> tuple[bool, str | None]:
+    cmd = (command or "").lower()
+    if cmd in ("codex", "claude"):
+        return True, cmd
+    for line in await _tmux_pane_processes(tty):
+        engine = _agent_engine_for_args(line)
+        if engine:
+            return True, engine
+    return False, None
+
+
+async def _tmux_pane_rows() -> list[tuple[str, str, str, str, str]]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_tty}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        if proc.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    rows = []
+    for line in stdout.decode(errors="ignore").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        if len(parts) == 4:
+            parts.append("")
+        rows.append((parts[0], parts[1], parts[2], parts[3], parts[4]))
+    return rows
+
+
+def _activity_icons() -> list[ActivityIconState]:
+    desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
+    steam_name = (DESKTOP_STATE.get("steam_app_name") or "").lower()
+    steam_exe = (DESKTOP_STATE.get("steam_exe") or "").lower()
+    phone_app = (PHONE_STATE.get("current_app") or "").lower()
+    phone_mode = PHONE_DISTRACTION_APPS.get(phone_app)
+
+    youtube_active = phone_app in ("youtube", "com.google.android.youtube") or (
+        desktop_mode == "video"
+    )
+    spotify_active = phone_app == "spotify" or desktop_mode == "music"
+    mewgenics_active = "mewgenics" in steam_name or "mewgenics" in steam_exe
+    gaming_active = desktop_mode == "gaming" or phone_mode == "gaming"
+
+    return [
+        ActivityIconState(
+            key="youtube", icon="▶", label="YouTube", active=youtube_active, source="phone/desktop"
+        ),
+        ActivityIconState(
+            key="spotify", icon="♪", label="Spotify", active=spotify_active, source="phone/desktop"
+        ),
+        ActivityIconState(
+            key="steam", icon="◉", label="Gaming", active=gaming_active, source="steam/phone"
+        ),
+        ActivityIconState(
+            key="mewgenics",
+            icon="M",
+            label="Mewgenics",
+            active=mewgenics_active,
+            source="steam",
+        ),
+    ]
+
+
+async def compute_work_state() -> WorkStateResponse:
+    now = datetime.now()
+    cutoff = now - timedelta(minutes=30)
+    active_instances: list[AgentRuntime] = []
+    processing_recent_count = 0
+    tracked_panes: set[str] = set()
+    local_pane_rows = {row[0]: row for row in await _tmux_pane_rows()}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id, last_activity
+            FROM claude_instances
+            WHERE status IN ('processing', 'idle')
+              AND COALESCE(is_subagent, 0) = 0
+            """
+        )
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        last_activity = row["last_activity"]
+        is_recent = False
+        try:
+            is_recent = datetime.fromisoformat(last_activity) >= cutoff
+        except Exception:
+            pass
+        live_pane = None
+        pane_is_agent = None
+        canonical_tmux_pane = row["tmux_pane"]
+        if row["tmux_pane"] and row["device_id"] == LOCAL_DEVICE_NAME:
+            live_pane = await _tmux_pane_exists(row["tmux_pane"])
+            canonical_tmux_pane = await _tmux_resolve_pane_id(row["tmux_pane"])
+            if live_pane and not canonical_tmux_pane:
+                canonical_tmux_pane = row["tmux_pane"]
+            pane_row = local_pane_rows.get(canonical_tmux_pane)
+            if pane_row:
+                pane_is_agent, _ = await _pane_is_agent(
+                    pane_row[1], pane_row[2], pane_row[3], pane_row[4]
+                )
+            else:
+                pane_is_agent = False
+        if row["status"] == "processing" and is_recent:
+            processing_recent_count += 1
+        if row["device_id"] == LOCAL_DEVICE_NAME and not pane_is_agent:
+            continue
+        if row["device_id"] != LOCAL_DEVICE_NAME and not is_recent:
+            continue
+        if live_pane is False:
+            continue
+        if canonical_tmux_pane:
+            tracked_panes.add(canonical_tmux_pane)
+        active_instances.append(
+            AgentRuntime(
+                id=row["id"],
+                name=row["tab_name"],
+                status=row["status"],
+                engine=row["engine"],
+                working_dir=row["working_dir"],
+                tmux_pane=row["tmux_pane"],
+                device_id=row["device_id"],
+                last_activity=last_activity,
+                registered=True,
+                live_pane=live_pane,
+            )
+        )
+
+    observed_agents = [
+        agent for agent in await _detect_tmux_agent_panes() if agent.tmux_pane not in tracked_panes
+    ]
+    productivity_active = bool(active_instances or observed_agents)
+    reason = "tracked_or_observed_agent" if productivity_active else "no_live_agent"
+    return WorkStateResponse(
+        productivity_active=productivity_active,
+        reason=reason,
+        active_instance_count=len(active_instances),
+        processing_recent_count=processing_recent_count,
+        observed_agent_count=len(observed_agents),
+        active_instances=active_instances,
+        observed_agents=observed_agents,
+        activity_icons=_activity_icons(),
+        timer_mode=timer_engine.current_mode.value,
+        activity=timer_engine.activity.value,
+        desktop_mode=DESKTOP_STATE.get("current_mode", "silence"),
+        phone_app=PHONE_STATE.get("current_app"),
+        generated_at=now.isoformat(),
+    )
+
+
+async def recover_expected_ack_jobs() -> int:
+    """Re-arm pending acknowledgement ladders after a Token-API restart."""
+    now = datetime.now()
+    immediate = now + timedelta(seconds=1)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM expected_acknowledgements WHERE status = 'pending'"
+        )
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        ack = _expected_ack_row_to_dict(row)
+        ack_due_at = datetime.fromisoformat(ack["ack_due_at"])
+        level2_due_at = datetime.fromisoformat(ack["level2_due_at"])
+        pavlok_due_at = datetime.fromisoformat(ack["pavlok_due_at"])
+        fired_levels = set(ack.get("fired_levels") or [])
+        if now >= pavlok_due_at:
+            if 3 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 3, immediate)
+        elif now >= level2_due_at:
+            if 2 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 2, immediate)
+            if 3 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
+        elif now >= ack_due_at:
+            if 1 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 1, immediate)
+            if 2 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 2, level2_due_at)
+            if 3 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
+        else:
+            if 1 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 1, ack_due_at)
+            if 2 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 2, level2_due_at)
+            if 3 not in fired_levels:
+                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
+
+    if rows:
+        jobs = [
+            {
+                "id": job.id,
+                "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+            }
+            for job in scheduler.get_jobs()
+            if job.id.startswith("expected-ack-")
+        ]
+        logger.info(f"Expected ack recovery: re-armed {len(rows)} pending ack(s): {jobs}")
+    return len(rows)
+
+
+async def create_expected_ack(
+    source: str,
+    reason: str,
+    instance_id: str | None = None,
+    details: dict | None = None,
+    dedupe_pending: bool = True,
+    ack_delay: timedelta = timedelta(minutes=5),
+    level2_delay: timedelta = timedelta(minutes=10),
+    pavlok_delay: timedelta = timedelta(minutes=15),
+) -> dict:
+    """Persist an expected acknowledgement and schedule its escalation ladder."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if dedupe_pending and instance_id:
+            cursor = await db.execute(
+                """
+                SELECT * FROM expected_acknowledgements
+                WHERE source = ? AND instance_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (source, instance_id),
+            )
+            existing = await cursor.fetchone()
+            if existing:
+                ack = _expected_ack_row_to_dict(existing)
+                _schedule_expected_ack_remaining(ack)
+                return ack
+
+        ack_id = str(uuid.uuid4())
+        deadlines = _expected_ack_deadlines(
+            ack_delay=ack_delay, level2_delay=level2_delay, pavlok_delay=pavlok_delay
+        )
+        details_json = json.dumps(details or {})
+        await db.execute(
+            """
+            INSERT INTO expected_acknowledgements (
+                id, source, instance_id, reason, status, created_at,
+                ack_due_at, level2_due_at, pavlok_due_at, fired_levels_json, details_json
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, '[]', ?)
+            """,
+            (
+                ack_id,
+                source,
+                instance_id,
+                reason,
+                deadlines["created_at"].isoformat(),
+                deadlines["ack_due_at"].isoformat(),
+                deadlines["level2_due_at"].isoformat(),
+                deadlines["pavlok_due_at"].isoformat(),
+                details_json,
+            ),
+        )
+        await db.commit()
+
+    _schedule_expected_ack_ladder(
+        ack_id,
+        deadlines["ack_due_at"].isoformat(),
+        deadlines["level2_due_at"].isoformat(),
+        deadlines["pavlok_due_at"].isoformat(),
+    )
+    ack = {
+        "id": ack_id,
+        "source": source,
+        "instance_id": instance_id,
+        "reason": reason,
+        "status": "pending",
+        "created_at": deadlines["created_at"].isoformat(),
+        "ack_due_at": deadlines["ack_due_at"].isoformat(),
+        "level2_due_at": deadlines["level2_due_at"].isoformat(),
+        "pavlok_due_at": deadlines["pavlok_due_at"].isoformat(),
+        "acknowledged_at": None,
+        "bailout_reason": None,
+        "fired_levels": [],
+        "details": details or {},
+    }
+    await log_event("expected_ack_created", instance_id=instance_id, details=ack)
+    return ack
+
+
+def _expected_ack_row_to_dict(row) -> dict:
+    details_raw = row["details_json"] if "details_json" in row.keys() else None
+    fired_raw = row["fired_levels_json"] if "fired_levels_json" in row.keys() else None
+    try:
+        details = json.loads(details_raw) if details_raw else {}
+    except Exception:
+        details = {}
+    try:
+        fired_levels = json.loads(fired_raw) if fired_raw else []
+    except Exception:
+        fired_levels = []
+    return {
+        "id": row["id"],
+        "source": row["source"],
+        "instance_id": row["instance_id"],
+        "reason": row["reason"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "ack_due_at": row["ack_due_at"],
+        "level2_due_at": row["level2_due_at"],
+        "pavlok_due_at": row["pavlok_due_at"],
+        "acknowledged_at": row["acknowledged_at"],
+        "bailout_reason": row["bailout_reason"],
+        "fired_levels": fired_levels,
+        "details": details,
+    }
+
+
+async def _find_expected_ack(
+    ack_id: str | None, source: str | None, instance_id: str | None
+) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if ack_id:
+            cursor = await db.execute(
+                "SELECT * FROM expected_acknowledgements WHERE id = ?", (ack_id,)
+            )
+        elif source and instance_id:
+            cursor = await db.execute(
+                """
+                SELECT * FROM expected_acknowledgements
+                WHERE source = ? AND instance_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (source, instance_id),
+            )
+        else:
+            return None
+        row = await cursor.fetchone()
+    return _expected_ack_row_to_dict(row) if row else None
+
+
+async def _resolve_expected_ack(
+    *,
+    ack_id: str | None,
+    source: str | None,
+    instance_id: str | None,
+    status: str,
+    bailout_reason: str | None = None,
+) -> dict:
+    ack = await _find_expected_ack(ack_id, source, instance_id)
+    if not ack:
+        raise HTTPException(status_code=404, detail="pending acknowledgement not found")
+    if ack["status"] != "pending":
+        return {"updated": False, "ack": ack}
+
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        if status == "acknowledged":
+            await db.execute(
+                """
+                UPDATE expected_acknowledgements
+                SET status = ?, acknowledged_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, now, ack["id"]),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE expected_acknowledgements
+                SET status = ?, acknowledged_at = ?, bailout_reason = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, now, bailout_reason, ack["id"]),
+            )
+        await db.commit()
+
+    _cancel_expected_ack_ladder(ack["id"])
+    ack = await _find_expected_ack(ack["id"], None, None)
+    event_type = (
+        "expected_ack_acknowledged" if status == "acknowledged" else "expected_ack_bailed_out"
+    )
+    await log_event(event_type, instance_id=ack["instance_id"], details=ack)
+    return {"updated": True, "ack": ack}
+
+
+async def acknowledge_pending_acks_for_instance(instance_id: str, source: str | None = None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if source:
+            cursor = await db.execute(
+                """
+                SELECT id FROM expected_acknowledgements
+                WHERE instance_id = ? AND source = ? AND status = 'pending'
+                """,
+                (instance_id, source),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT id FROM expected_acknowledgements
+                WHERE instance_id = ? AND status = 'pending'
+                """,
+                (instance_id,),
+            )
+        rows = await cursor.fetchall()
+
+    count = 0
+    for row in rows:
+        result = await _resolve_expected_ack(
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+        )
+        if result["updated"]:
+            count += 1
+    return count
+
+
+async def acknowledge_pending_work_action_acks() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT id FROM expected_acknowledgements
+            WHERE status = 'pending'
+              AND source IN ('phone_distraction', 'backlog_violation')
+            """
+        )
+        rows = await cursor.fetchall()
+
+    count = 0
+    for row in rows:
+        result = await _resolve_expected_ack(
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+        )
+        if result.get("updated"):
+            count += 1
+    return count
+
+
+async def acknowledge_backlog_surface_acks(surface: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT id FROM expected_acknowledgements
+            WHERE status = 'pending'
+              AND source = 'backlog_violation'
+              AND json_extract(details_json, '$.surface') = ?
+            """,
+            (surface,),
+        )
+        rows = await cursor.fetchall()
+
+    count = 0
+    for row in rows:
+        result = await _resolve_expected_ack(
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+        )
+        if result.get("updated"):
+            count += 1
+    return count
+
+
+async def _terminal_backlog_ack_for_active_span(
+    instance_id: str, active_since: str | None
+) -> dict | None:
+    """Return the latest terminal backlog ack for the same still-open distraction span."""
+    if not active_since:
+        return None
+    try:
+        active_since_dt = datetime.fromisoformat(active_since)
+    except Exception:
+        return None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT * FROM expected_acknowledgements
+            WHERE source = 'backlog_violation'
+              AND instance_id = ?
+              AND status IN ('acknowledged', 'bailed_out', 'expired', 'blocked_by_guardrail')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+
+    ack = _expected_ack_row_to_dict(row)
+    details = ack.get("details") or {}
+    if details.get("active_since") == active_since:
+        return ack
+    try:
+        if datetime.fromisoformat(ack["created_at"]) >= active_since_dt:
+            return ack
+    except Exception:
+        pass
+    return None
+
+
+async def _mark_expected_ack_level_fired(ack: dict, level: int) -> bool:
+    fired_levels = set(ack.get("fired_levels") or [])
+    if level in fired_levels:
+        return False
+    fired_levels.add(level)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE expected_acknowledgements
+            SET fired_levels_json = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (json.dumps(sorted(fired_levels)), ack["id"]),
+        )
+        await db.commit()
+    ack["fired_levels"] = sorted(fired_levels)
+    return True
+
+
+async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
+    ack = await _find_expected_ack(ack_id, None, None)
+    if not ack or ack["status"] != "pending":
+        return {"skipped": True, "reason": "not_pending", "ack_id": ack_id, "level": level}
+    if not await _mark_expected_ack_level_fired(ack, level):
+        return {"skipped": True, "reason": "level_already_fired", "ack_id": ack_id, "level": level}
+
+    ack["escalation_level"] = level
+    if is_quiet_hours():
+        suppression = await log_quiet_hours_suppressed(
+            source=ack["source"],
+            event_type="expected_ack_escalation",
+            details={"ack": ack, "level": level},
+        )
+        await log_event(
+            "expected_ack_escalated",
+            instance_id=ack["instance_id"],
+            details={
+                "ack": ack,
+                "level": level,
+                "suppressed": True,
+                "reason": "quiet_hours",
+                "quiet_hours": suppression["quiet_hours"],
+            },
+        )
+        return {
+            "skipped": True,
+            "reason": "quiet_hours",
+            "ack_id": ack_id,
+            "level": level,
+            "quiet_hours": suppression["quiet_hours"],
+        }
+
+    message = f"Expected acknowledgement missed: {ack['reason']}"
+    if ack["source"] == "backlog_violation" and level == 1:
+        desktop_result = None
+        if DESKTOP_STATE.get("current_mode") in ("video", "scrolling", "gaming"):
+            desktop_result = close_distraction_windows()
+        result = await unified_enforce(
+            "warn",
+            f"{message}. Backlog parry window: close it or work now.",
+            source=ack["source"],
+            channel="briefing",
+            phone_params={
+                "vibe": 70,
+                "beep": 60,
+                "banner_text": "Backlog violation",
+                "tts_text": "Backlog violation. Close it or work now.",
+            },
+        )
+        result = {"unified": result, "desktop": desktop_result}
+    elif ack["source"] == "backlog_violation" and level == 2:
+        result = await unified_enforce(
+            "warn",
+            f"{message}. Pavlok is eligible now unless the distraction is gone.",
+            source=ack["source"],
+            phone_params={"vibe": 90, "beep": 80, "banner_text": "Backlog parry expired"},
+        )
+    elif level == 1:
+        result = await unified_enforce(
+            "notify",
+            f"{message}. Please acknowledge.",
+            source=ack["source"],
+            channel="briefing",
+            phone_params={"vibe": 30, "banner_text": "Ack due"},
+        )
+    elif level == 2:
+        if ack["source"] == "desktop_gaming":
+            await asyncio.to_thread(enforce_desktop_app, "mewgenics", "minimize")
+        result = await unified_enforce(
+            "warn",
+            f"{message}. Ten minutes elapsed.",
+            source=ack["source"],
+            phone_params={"vibe": 50, "beep": 50, "banner_text": "Ack overdue"},
+        )
+    else:
+        if ack["source"] == "backlog_violation" and not _backlog_distraction_still_active(ack):
+            resolved = await _resolve_expected_ack(
+                ack_id=ack_id,
+                source=None,
+                instance_id=None,
+                status="acknowledged",
+            )
+            return {
+                "skipped": True,
+                "reason": "backlog_distraction_resolved",
+                "ack_id": ack_id,
+                "level": level,
+                "result": resolved,
+            }
+        pavlok_result = await asyncio.to_thread(
+            send_pavlok_stimulus,
+            "zap",
+            PAVLOK_CONFIG.get("friday_zap_value", 30),
+            f"expected_ack_{ack['source']}",
+            True,
+        )
+        status = "blocked_by_guardrail" if pavlok_result.get("blocked_by_guardrail") else "expired"
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE expected_acknowledgements SET status = ? WHERE id = ? AND status = 'pending'",
+                (status, ack_id),
+            )
+            await db.commit()
+        _cancel_expected_ack_ladder(ack_id)
+        result = {"pavlok": pavlok_result, "final_status": status}
+
+    await log_event(
+        "expected_ack_escalated",
+        instance_id=ack["instance_id"],
+        details={"ack": ack, "level": level, "result": result},
+    )
+    return {"ack_id": ack_id, "level": level, "result": result}
+
+
+def _expected_ack_escalate_sync(ack_id: str, level: int) -> dict:
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                _expected_ack_escalate(ack_id, level), APP_LOOP
+            )
+            return future.result(timeout=30)
+        return asyncio.run(_expected_ack_escalate(ack_id, level))
+    except Exception as e:
+        logger.warning(f"Expected ack escalation failed for {ack_id} L{level}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def _ack_current_level(ack: dict, now: datetime | None = None) -> int:
+    now = now or datetime.now()
+    if ack["status"] != "pending":
+        return 0
+    if now >= datetime.fromisoformat(ack["pavlok_due_at"]):
+        return 3
+    if now >= datetime.fromisoformat(ack["level2_due_at"]):
+        return 2
+    if now >= datetime.fromisoformat(ack["ack_due_at"]):
+        return 1
+    return 0
 
 
 def _load_golden_throne_sop() -> str:
@@ -2427,6 +3568,16 @@ async def golden_throne_followup(session_id: str):
 
     # Phone notification before satellite dispatch (skip for sync — silent retrigger)
     if instance_type != "sync":
+        await create_expected_ack(
+            source="golden_throne",
+            instance_id=session_id,
+            reason=f"Golden Throne follow-up for {tab_name}",
+            details={
+                "zealotry": instance.get("zealotry", 4),
+                "tab_name": tab_name,
+                "tmux_pane": tmux_pane,
+            },
+        )
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
         try:
@@ -3036,6 +4187,40 @@ async def handle_custodes_state_event(
             "intervention_dispatched": False,
             "dedupe_key": dedupe_key,
             "reason": "no_policy_match",
+        }
+
+    if is_quiet_hours():
+        suppression = await log_quiet_hours_suppressed(
+            source=source,
+            event_type=f"custodes_state_event:{event_type}",
+            details={
+                "dedupe_key": intervention.dedupe_key,
+                "severity": intervention.severity,
+                "payload": payload or {},
+            },
+        )
+        await log_event(
+            "custodes_intervention",
+            instance_id=instance_id,
+            device_id=source,
+            details={
+                "event_type": intervention.event_type,
+                "dedupe_key": intervention.dedupe_key,
+                "severity": intervention.severity,
+                "prompt": intervention.prompt,
+                "delivery": {
+                    "dispatched": False,
+                    "reason": "quiet_hours",
+                    "quiet_hours": suppression["quiet_hours"],
+                },
+            },
+        )
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": intervention.dedupe_key,
+            "reason": "quiet_hours",
+            "quiet_hours": suppression["quiet_hours"],
         }
 
     suppressed, dedupe_reason = await _custodes_state_dedupe_decision(
@@ -4448,7 +5633,18 @@ PHONE_DISTRACTION_APPS = {
     "game": "gaming",
     "minecraft": "gaming",
     "com.mojang.minecraftpe": "gaming",
+    "slay the spire": "gaming",
+    "slay": "gaming",
+    "com.humble.SlayTheSpire": "gaming",
+    "com.humble.slaythespire": "gaming",
 }
+
+PHONE_DISTRACTION_ACK_AFTER_SECONDS = int(
+    os.environ.get("PHONE_DISTRACTION_ACK_AFTER_SECONDS", "60")
+)
+PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS = int(
+    os.environ.get("PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS", str(15 * 60))
+)
 
 # Human-readable display names for phone apps (key = lowercased app name or package)
 PHONE_APP_DISPLAY_NAMES = {
@@ -4460,6 +5656,10 @@ PHONE_APP_DISPLAY_NAMES = {
     "game": "Game",
     "minecraft": "Minecraft",
     "com.mojang.minecraftpe": "Minecraft",
+    "slay the spire": "Slay the Spire",
+    "slay": "Slay the Spire",
+    "com.humble.SlayTheSpire": "Slay the Spire",
+    "com.humble.slaythespire": "Slay the Spire",
 }
 
 
@@ -4479,6 +5679,328 @@ def get_phone_app_display_name(app_name: str, package: str = None) -> str:
     return app_name.title()
 
 
+def _phone_ack_instance_id(source: str, app_name: str) -> str:
+    return f"{source}:phone:{app_name}"
+
+
+def _backlog_ack_instance_id(surface: str, app_name: str | None = None) -> str:
+    return f"backlog:{surface}:{(app_name or 'distraction').lower()}"
+
+
+def _backlog_distraction_still_active(ack: dict) -> bool:
+    details = ack.get("details") or {}
+    surface = details.get("surface")
+    app = (details.get("app") or "").lower()
+    if surface == "phone":
+        return bool(PHONE_STATE.get("is_distracted")) and (
+            not app or (PHONE_STATE.get("current_app") or "").lower() == app
+        )
+    if surface == "desktop":
+        return DESKTOP_STATE.get("current_mode") in ("video", "scrolling", "gaming")
+    return bool(PHONE_STATE.get("is_distracted")) or DESKTOP_STATE.get("current_mode") in (
+        "video",
+        "scrolling",
+        "gaming",
+    )
+
+
+async def maybe_create_backlog_violation_ack(
+    *,
+    surface: str,
+    app_name: str | None,
+    display_name: str | None,
+    package: str | None = None,
+    distraction_mode: str | None = None,
+    trigger: str,
+) -> dict | None:
+    """Create the compressed backlog-enforcement ack when distraction happens in debt."""
+    if DESKTOP_STATE.get("work_mode", "clocked_in") != "clocked_in":
+        return None
+    if timer_engine.break_balance_ms >= 0:
+        return None
+    if is_quiet_hours():
+        await log_quiet_hours_suppressed(
+            source=f"{surface}_detection",
+            event_type="backlog_violation_ack_creation",
+            app=app_name,
+            details={
+                "surface": surface,
+                "display_name": display_name,
+                "package": package,
+                "distraction_mode": distraction_mode,
+                "trigger": trigger,
+                "break_balance_ms": timer_engine.break_balance_ms,
+            },
+        )
+        return None
+    instance_id = _backlog_ack_instance_id(surface, app_name)
+    active_since = (
+        PHONE_STATE.get("app_opened_at")
+        if surface == "phone"
+        else DESKTOP_STATE.get("last_detection")
+    )
+    terminal_ack = await _terminal_backlog_ack_for_active_span(instance_id, active_since)
+    if terminal_ack:
+        await log_event(
+            "backlog_violation_ack_suppressed",
+            instance_id=instance_id,
+            details={
+                "surface": surface,
+                "app": app_name,
+                "display_name": display_name,
+                "active_since": active_since,
+                "terminal_ack_id": terminal_ack["id"],
+                "terminal_status": terminal_ack["status"],
+                "trigger": trigger,
+                "break_balance_ms": timer_engine.break_balance_ms,
+            },
+        )
+        return None
+
+    ack = await create_expected_ack(
+        source="backlog_violation",
+        instance_id=instance_id,
+        reason=f"Backlog distraction: {display_name or app_name or surface}",
+        details={
+            "surface": surface,
+            "app": app_name,
+            "display_name": display_name,
+            "package": package,
+            "distraction_mode": distraction_mode,
+            "active_since": active_since,
+            "timer_mode": timer_engine.current_mode.value,
+            "break_balance_ms": timer_engine.break_balance_ms,
+            "trigger": trigger,
+        },
+        ack_delay=timedelta(seconds=0),
+        level2_delay=timedelta(seconds=15),
+        pavlok_delay=timedelta(seconds=15),
+    )
+    await log_event(
+        "backlog_violation_ack_required",
+        details={
+            "surface": surface,
+            "app": app_name,
+            "display_name": display_name,
+            "distraction_mode": distraction_mode,
+            "ack_id": ack["id"],
+            "trigger": trigger,
+            "break_balance_ms": timer_engine.break_balance_ms,
+        },
+    )
+    return ack
+
+
+async def _recent_productivity_active() -> bool:
+    return (await compute_work_state()).productivity_active
+
+
+async def maybe_create_phone_distraction_ack(
+    *,
+    app_name: str,
+    display_name: str,
+    package: str | None,
+    distraction_mode: str,
+    trigger: str,
+    timer_updated: bool = False,
+    min_open_seconds: int | None = None,
+    productivity_active: bool | None = None,
+) -> dict | None:
+    """Create a guarded ack for sustained phone distraction while clocked in."""
+    if DESKTOP_STATE.get("work_mode", "clocked_in") != "clocked_in":
+        return None
+    if not PHONE_STATE.get("is_distracted"):
+        return None
+    if (PHONE_STATE.get("current_app") or "").lower() != app_name:
+        return None
+    if is_quiet_hours():
+        await log_quiet_hours_suppressed(
+            source="phone_detection",
+            event_type="phone_distraction_ack_creation",
+            app=app_name,
+            details={
+                "display_name": display_name,
+                "package": package,
+                "distraction_mode": distraction_mode,
+                "trigger": trigger,
+            },
+        )
+        return None
+    if timer_engine.break_balance_ms < 0:
+        return await maybe_create_backlog_violation_ack(
+            surface="phone",
+            app_name=app_name,
+            display_name=display_name,
+            package=package,
+            distraction_mode=distraction_mode,
+            trigger=trigger,
+        )
+    if productivity_active is None:
+        productivity_active = await _recent_productivity_active()
+    if productivity_active:
+        return None
+
+    opened_at_raw = PHONE_STATE.get("app_opened_at")
+    try:
+        opened_at = datetime.fromisoformat(opened_at_raw) if opened_at_raw else datetime.now()
+    except Exception:
+        opened_at = datetime.now()
+    open_seconds = (datetime.now() - opened_at).total_seconds()
+    threshold = (
+        PHONE_DISTRACTION_ACK_AFTER_SECONDS if min_open_seconds is None else min_open_seconds
+    )
+    if open_seconds < threshold:
+        return None
+
+    if PHONE_STATE.get("distraction_ack_app") == app_name and PHONE_STATE.get("distraction_ack_id"):
+        return None
+
+    ack = await create_expected_ack(
+        source="phone_distraction",
+        instance_id=_phone_ack_instance_id("phone_distraction", app_name),
+        reason=f"Phone distraction during work: {display_name}",
+        details={
+            "app": app_name,
+            "display_name": display_name,
+            "package": package,
+            "distraction_mode": distraction_mode,
+            "timer_mode": timer_engine.current_mode.value,
+            "timer_updated": timer_updated,
+            "trigger": trigger,
+            "open_seconds": round(open_seconds),
+            "break_balance_ms": timer_engine.break_balance_ms,
+        },
+    )
+    PHONE_STATE["distraction_ack_app"] = app_name
+    PHONE_STATE["distraction_ack_id"] = ack["id"]
+    await log_event(
+        "phone_distraction_ack_required",
+        details={
+            "app": app_name,
+            "display_name": display_name,
+            "package": package,
+            "distraction_mode": distraction_mode,
+            "timer_mode": timer_engine.current_mode.value,
+            "ack_id": ack["id"],
+            "trigger": trigger,
+            "open_seconds": round(open_seconds),
+        },
+    )
+    return ack
+
+
+async def acknowledge_phone_acks(app_name: str) -> int:
+    count = 0
+    for source in ("phone_distraction", "phone_gaming", "backlog_violation"):
+        instance_id = (
+            _backlog_ack_instance_id("phone", app_name)
+            if source == "backlog_violation"
+            else _phone_ack_instance_id(source, app_name)
+        )
+        try:
+            result = await _resolve_expected_ack(
+                ack_id=None,
+                source=source,
+                instance_id=instance_id,
+                status="acknowledged",
+            )
+            if result.get("updated"):
+                count += 1
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+    if PHONE_STATE.get("distraction_ack_app") == app_name:
+        PHONE_STATE["distraction_ack_app"] = None
+        PHONE_STATE["distraction_ack_id"] = None
+    return count
+
+
+async def recover_recent_phone_distraction_state() -> bool:
+    """Restore an open phone distraction after restart when no close event followed it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT details, created_at
+            FROM events
+            WHERE event_type IN ('phone_distraction_allowed', 'phone_distraction_ack_required')
+              AND created_at >= datetime('now', ?)
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            (f"-{PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS} seconds",),
+        )
+        rows = await cursor.fetchall()
+    if not rows:
+        return False
+
+    row = None
+    details = {}
+    app_name = ""
+    distraction_mode = ""
+    for candidate in rows:
+        try:
+            candidate_details = json.loads(candidate["details"] or "{}")
+        except Exception:
+            continue
+        candidate_app = (candidate_details.get("app") or "").lower()
+        candidate_mode = PHONE_DISTRACTION_APPS.get(candidate_app) or candidate_details.get(
+            "distraction_mode"
+        )
+        if not candidate_app or not candidate_mode:
+            continue
+        async with aiosqlite.connect(DB_PATH) as db:
+            close_cursor = await db.execute(
+                """
+                SELECT 1
+                FROM events
+                WHERE event_type = 'phone_app_closed'
+                  AND created_at > ?
+                  AND json_extract(details, '$.app') = ?
+                LIMIT 1
+                """,
+                (candidate["created_at"], candidate_app),
+            )
+            close_row = await close_cursor.fetchone()
+        if close_row:
+            continue
+        row = candidate
+        details = candidate_details
+        app_name = candidate_app
+        distraction_mode = candidate_mode
+        break
+    if not row:
+        return False
+
+    try:
+        event_utc = datetime.fromisoformat(row["created_at"])
+        age_seconds = max(0, (datetime.utcnow() - event_utc).total_seconds())
+    except Exception:
+        age_seconds = 0
+    opened_at = datetime.now() - timedelta(seconds=age_seconds)
+    PHONE_STATE["current_app"] = app_name
+    PHONE_STATE["app_opened_at"] = opened_at.isoformat()
+    PHONE_STATE["last_activity"] = datetime.now().isoformat()
+    PHONE_STATE["is_distracted"] = True
+    DESKTOP_STATE["current_mode"] = distraction_mode
+    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+    timer_engine.set_activity(
+        Activity.DISTRACTION,
+        is_scrolling_gaming=distraction_mode in ("scrolling", "gaming"),
+        now_mono_ms=int(time.monotonic() * 1000),
+    )
+    await log_event(
+        "phone_distraction_state_recovered",
+        details={
+            "app": app_name,
+            "display_name": get_phone_app_display_name(app_name),
+            "distraction_mode": distraction_mode,
+            "event_age_seconds": round(age_seconds),
+        },
+    )
+    return True
+
+
 # MacroDroid trigger name → internal app key
 # MacroDroid's "trigger that fired" gives: "Application Launched (X)", "Application Closed (X)"
 # The name in parens is the app's display name as configured in the trigger.
@@ -4491,6 +6013,7 @@ MACRODROID_TRIGGER_APP_MAP = {
     "20 minutes till dawn": "game",
     "onebit adventure": "game",
     "minecraft": "minecraft",
+    "slay the spire": "slay the spire",
     "spotify": "spotify",
 }
 
@@ -5219,6 +6742,17 @@ async def _enforcement_cascade_worker(app_name: str):
     cascade["started_at"] = start
     cascade["current_level"] = 0
 
+    if is_quiet_hours():
+        cascade["active"] = False
+        cascade["task"] = None
+        print(f"CASCADE SUPPRESSED: quiet hours app={app_name}")
+        await log_quiet_hours_suppressed(
+            source="phone",
+            event_type="enforcement_cascade_started",
+            app=app_name,
+        )
+        return
+
     print(f"CASCADE START: app={app_name}")
     await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
     await handle_custodes_state_event(
@@ -5320,6 +6854,19 @@ async def _enforcement_cascade_worker(app_name: str):
 def start_enforcement_cascade(app_name: str):
     """Start the enforcement cascade for a forbidden app. Idempotent — won't double-start."""
     cascade = ENFORCEMENT_CASCADE
+    if is_quiet_hours():
+        print(f"CASCADE: quiet hours suppressed for {app_name}")
+        try:
+            asyncio.ensure_future(
+                log_quiet_hours_suppressed(
+                    source="phone",
+                    event_type="enforcement_cascade_start",
+                    app=app_name,
+                )
+            )
+        except RuntimeError:
+            pass
+        return
     if cascade["active"]:
         print(f"CASCADE: Already active for {cascade['app']}, ignoring {app_name}")
         return
@@ -5397,15 +6944,9 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     - If productivity is active -> distractions are allowed (earned break)
     - If productivity is NOT active -> distractions should be closed
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Count active Claude instances
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        row = await cursor.fetchone()
-        active_count = row[0] if row else 0
-
-    productivity_active = active_count > 0
+    work_state = await compute_work_state()
+    productivity_active = work_state.productivity_active
+    active_count = work_state.active_instance_count + work_state.observed_agent_count
     should_close = not productivity_active
 
     if productivity_active:
@@ -5422,6 +6963,7 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
             "should_close": should_close,
             "source": request.source if request else "unknown",
             "window_title": request.window_title if request else None,
+            "work_state": work_state.model_dump(),
         },
     )
 
@@ -5488,9 +7030,20 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     print(
         f">>> Desktop detection from {source}: mode={detected_mode} window='{window_title}' work_mode={work_mode}"
     )
+    if detected_mode in ("video", "scrolling", "gaming"):
+        await bust_quiet_state(
+            "desktop_detection",
+            "desktop_distraction_detected",
+            {
+                "detected_mode": detected_mode,
+                "window_title": window_title,
+                **steam_details,
+            },
+        )
 
     # Get current mode
     current_mode = DESKTOP_STATE["current_mode"]
+    was_timer_break_mode = timer_engine.current_mode == TimerMode.BREAK
 
     # Check if mode change is needed
     if detected_mode == current_mode:
@@ -5528,15 +7081,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 timer_updated=False,
             )
 
-    # Check productivity status
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        row = await cursor.fetchone()
-        active_count = row[0] if row else 0
-
-    productivity_active = active_count > 0
+    work_state = await compute_work_state()
+    productivity_active = work_state.productivity_active
+    active_count = work_state.active_instance_count + work_state.observed_agent_count
 
     # Determine if mode change is allowed
     allowed = True
@@ -5557,10 +7104,18 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         has_break_time = timer_engine.break_balance_ms > 0
         break_secs = round(timer_engine.break_balance_ms / 1000)
 
-        if has_break_time:
+        if break_secs < 0:
+            allowed = True
+            reason = "backlog_violation"
+            print(f"    {detected_mode.title()} in backlog: creating compressed enforcement ack")
+        elif has_break_time:
             allowed = True
             reason = "break_time_available"
             print(f"    {detected_mode.title()} allowed: {break_secs}s break available")
+        elif detected_mode == "gaming":
+            allowed = True
+            reason = "gaming_ack_required"
+            print("    Gaming allowed with expected acknowledgement ladder")
         elif productivity_active:
             allowed = True
             reason = "productivity_active"
@@ -5573,6 +7128,23 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     if allowed:
         # Update desktop state
         old_mode = DESKTOP_STATE["current_mode"]
+        if old_mode in ("video", "scrolling", "gaming") and detected_mode not in (
+            "video",
+            "scrolling",
+            "gaming",
+        ):
+            acknowledged_acks = await acknowledge_backlog_surface_acks("desktop")
+            await log_event(
+                "enforcement_negative_edge",
+                details={
+                    "surface": "desktop",
+                    "old_mode": old_mode,
+                    "new_mode": detected_mode,
+                    "window_title": window_title,
+                    "acknowledged_expected_acks": acknowledged_acks,
+                    "reason": "desktop_distraction_closed",
+                },
+            )
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         DESKTOP_STATE["steam_app_id"] = request.steam_app_id if detected_mode == "gaming" else None
@@ -5631,6 +7203,65 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 source="ahk",
             )
 
+        ack = None
+        if reason == "backlog_violation":
+            ack = await maybe_create_backlog_violation_ack(
+                surface="desktop",
+                app_name=request.steam_app_id or request.steam_exe or detected_mode,
+                display_name=request.steam_app_name or window_title or detected_mode,
+                distraction_mode=detected_mode,
+                trigger="desktop_detection",
+            )
+            close_result = (
+                {"skipped": True, "reason": "quiet_hours"}
+                if is_quiet_hours()
+                else close_distraction_windows()
+            )
+            if is_quiet_hours():
+                await log_quiet_hours_suppressed(
+                    source="desktop_detection",
+                    event_type="desktop_backlog_enforcement",
+                    app=request.steam_app_id or request.steam_exe or detected_mode,
+                    details={"detected_mode": detected_mode, "window_title": window_title},
+                )
+            await log_event(
+                "desktop_backlog_violation",
+                details={
+                    "detected_mode": detected_mode,
+                    "window_title": window_title,
+                    **steam_details,
+                    "ack_id": ack["id"] if ack else None,
+                    "enforcement": close_result,
+                    "break_balance_ms": timer_engine.break_balance_ms,
+                },
+            )
+        if (
+            detected_mode == "gaming"
+            and work_mode == "clocked_in"
+            and reason != "break_time_available"
+            and reason != "backlog_violation"
+            and not was_timer_break_mode
+        ):
+            if is_quiet_hours():
+                await log_quiet_hours_suppressed(
+                    source="desktop_detection",
+                    event_type="desktop_gaming_ack_creation",
+                    app=request.steam_app_id or request.steam_exe or detected_mode,
+                    details={"window_title": window_title, **steam_details},
+                )
+            else:
+                ack = await create_expected_ack(
+                    source="desktop_gaming",
+                    instance_id=request.steam_app_id or request.steam_exe or "desktop:gaming",
+                    reason=f"Desktop gaming during work: {request.steam_app_name or window_title or 'game'}",
+                    details={
+                        "window_title": window_title,
+                        **steam_details,
+                        "timer_mode": timer_engine.current_mode.value,
+                        "timer_updated": timer_updated,
+                    },
+                )
+
         await log_event(
             "desktop_mode_change",
             details={
@@ -5642,6 +7273,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "timer_updated": timer_updated,
                 "productivity_active": productivity_active,
                 "active_instances": active_count,
+                "work_state": work_state.model_dump(),
+                "created_ack": bool(ack),
+                "ack_id": ack["id"] if ack else None,
             },
         )
 
@@ -5658,6 +7292,28 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             active_instance_count=active_count,
         )
     else:
+        if is_quiet_hours():
+            suppression = await log_quiet_hours_suppressed(
+                source="desktop_detection",
+                event_type="desktop_mode_blocked",
+                app=detected_mode,
+                details={
+                    "detected_mode": detected_mode,
+                    "reason": reason,
+                    "window_title": window_title,
+                    **steam_details,
+                    "productivity_active": productivity_active,
+                    "active_instances": active_count,
+                },
+            )
+            return DesktopDetectionResponse(
+                action="none",
+                detected_mode=detected_mode,
+                reason="quiet_hours",
+                productivity_active=productivity_active,
+                active_instance_count=active_count,
+                timer_updated=False,
+            )
         # Mode change blocked - immediately enforce by closing distraction windows
         print(f"<<< Mode change BLOCKED: {detected_mode} | reason={reason}")
 
@@ -5734,10 +7390,41 @@ async def handle_game_turn(request: GameTurnRequest):
         "steam_exe": request.steam_exe,
         "source": request.source,
     }
+    ack = None
+    if (
+        game == "mewgenics"
+        and DESKTOP_STATE.get("work_mode", "clocked_in") == "clocked_in"
+        and timer_engine.current_mode != TimerMode.BREAK
+    ):
+        if is_quiet_hours():
+            await log_quiet_hours_suppressed(
+                source="desktop_detection",
+                event_type="game_turn_ack_creation",
+                app=game,
+                details=details,
+            )
+            details["created_ack"] = False
+            details["suppressed_by_quiet_hours"] = True
+        else:
+            ack = await create_expected_ack(
+                source="desktop_gaming",
+                instance_id=request.steam_app_id or request.steam_exe or "desktop:mewgenics",
+                reason="Mewgenics turn ended during work",
+                details={**details, "timer_mode": timer_engine.current_mode.value},
+            )
+            details["created_ack"] = True
+            details["ack_id"] = ack["id"]
+    else:
+        details["created_ack"] = False
     await log_event("game_turn_end", device_id="desktop", details=details)
     logger.info(f"Game turn-end recorded: game={game} appid={request.steam_app_id}")
 
-    return GameTurnResponse(recorded=True)
+    return GameTurnResponse(
+        recorded=True,
+        block=False,
+        reason="ack_required" if ack else "observational_only",
+        ack_id=ack["id"] if ack else None,
+    )
 
 
 # ============ Desktop Satellite Endpoints ============
@@ -5851,7 +7538,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # Handle app close
     if action == "close":
         old_app = PHONE_STATE.get("current_app")
+        opened_at = PHONE_STATE.get("app_opened_at")
+        duration_seconds = None
+        if opened_at:
+            try:
+                duration_seconds = round(
+                    (datetime.now() - datetime.fromisoformat(opened_at)).total_seconds()
+                )
+            except Exception:
+                duration_seconds = None
         PHONE_STATE["current_app"] = None
+        PHONE_STATE["app_opened_at"] = None
         PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
@@ -5865,6 +7562,8 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
         # Switch timer activity to working when distraction app closes
         timer_updated = False
+        acknowledged_acks = await acknowledge_phone_acks(app_name)
+        stop_enforcement_cascade(reason=f"negative_edge_close:{app_name}")
         if old_app:
             DESKTOP_STATE["current_mode"] = "silence"
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
@@ -5890,7 +7589,21 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "app": app_name,
                 "display_name": display_name,
                 "package": package,
+                "duration_seconds": duration_seconds,
+                "timer_mode": timer_engine.current_mode.value,
                 "timer_updated": timer_updated,
+                "acknowledged_expected_acks": acknowledged_acks,
+            },
+        )
+        await log_event(
+            "enforcement_negative_edge",
+            details={
+                "surface": "phone",
+                "app": app_name,
+                "display_name": display_name,
+                "acknowledged_expected_acks": acknowledged_acks,
+                "cascade_stopped": True,
+                "reason": "app_closed",
             },
         )
 
@@ -5907,6 +7620,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         return PhoneActivityResponse(
             allowed=True, reason="not_tracked", message="App not in distraction list"
         )
+
+    await bust_quiet_state(
+        "phone_detection",
+        "phone_distraction_open",
+        {
+            "app": app_name,
+            "display_name": display_name,
+            "package": package,
+            "distraction_mode": distraction_mode,
+        },
+    )
 
     is_twitter = app_name in ("twitter", "x", "com.twitter.android")
 
@@ -5929,8 +7653,26 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     current = (PHONE_STATE.get("current_app") or "").lower()
     if current == app_name or (is_twitter and current in ("twitter", "x", "com.twitter.android")):
         print(f"    Duplicate {app_name} open ignored (already current_app)")
+        ack = None
+        if is_quiet_hours():
+            await log_quiet_hours_suppressed(
+                source="phone_detection",
+                event_type="phone_duplicate_open",
+                app=app_name,
+                details={"display_name": display_name, "package": package},
+            )
+        else:
+            ack = await maybe_create_phone_distraction_ack(
+                app_name=app_name,
+                display_name=display_name,
+                package=package,
+                distraction_mode=distraction_mode,
+                trigger="duplicate_open",
+            )
         return PhoneActivityResponse(
-            allowed=True, reason="already_tracked", message="Already tracking this app"
+            allowed=True,
+            reason="ack_required" if ack else "already_tracked",
+            message="Distraction acknowledgement required" if ack else "Already tracking this app",
         )
 
     # Helper to sync timer activity layer for phone distraction
@@ -5992,10 +7734,44 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Check work mode
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
+    was_break_mode = timer_engine.current_mode == TimerMode.BREAK
+
+    async def _create_phone_gaming_ack(timer_updated: bool) -> dict | None:
+        if distraction_mode != "gaming" or work_mode != "clocked_in":
+            return None
+        if was_break_mode:
+            return None
+        if is_quiet_hours():
+            await log_quiet_hours_suppressed(
+                source="phone_detection",
+                event_type="phone_gaming_ack_creation",
+                app=app_name,
+                details={
+                    "display_name": display_name,
+                    "package": package,
+                    "timer_mode": timer_engine.current_mode.value,
+                    "timer_updated": timer_updated,
+                },
+            )
+            return None
+        ack = await create_expected_ack(
+            source="phone_gaming",
+            instance_id=_phone_ack_instance_id("phone_gaming", app_name),
+            reason=f"Phone gaming during work: {display_name}",
+            details={
+                "app": app_name,
+                "display_name": display_name,
+                "package": package,
+                "timer_mode": timer_engine.current_mode.value,
+                "timer_updated": timer_updated,
+            },
+        )
+        return ack
 
     # Clocked out or gym mode = all allowed
     if work_mode in ("clocked_out", "gym"):
         PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
@@ -6021,18 +7797,55 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             allowed=True, reason=work_mode, message=f"Allowed ({work_mode})"
         )
 
+    if is_quiet_hours():
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
+        PHONE_STATE["is_distracted"] = True
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+        _updated, _old_mode = _sync_phone_timer()
+        if _updated:
+            await timer_log_shift(
+                _old_mode,
+                "work_" + distraction_mode,
+                trigger="phone_app",
+                source="macrodroid",
+                phone_app=app_name,
+            )
+        await log_quiet_hours_suppressed(
+            source="phone_detection",
+            event_type="phone_distraction_open",
+            app=app_name,
+            details={
+                "display_name": display_name,
+                "package": package,
+                "distraction_mode": distraction_mode,
+                "timer_updated": _updated,
+            },
+        )
+        await log_event(
+            "phone_distraction_allowed",
+            details={
+                "app": app_name,
+                "display_name": display_name,
+                "reason": "quiet_hours",
+                "timer_mode": timer_engine.current_mode.value,
+                "created_ack": False,
+                "cascade_started": False,
+            },
+        )
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="quiet_hours",
+            break_seconds=round(timer_engine.break_balance_ms / 1000),
+            message="Quiet hours",
+        )
+
     # Clocked in - check break time and productivity
     break_secs = round(timer_engine.break_balance_ms / 1000)
 
-    # Check productivity (active Claude instances)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        row = await cursor.fetchone()
-        active_count = row[0] if row else 0
-
-    productivity_active = active_count > 0
+    work_state = await compute_work_state()
+    productivity_active = work_state.productivity_active
+    active_count = work_state.active_instance_count + work_state.observed_agent_count
 
     # === TEST SHIM - bypasses break/productivity checks ===
     test_force_block = PHONE_CONFIG.get("test_force_block", False)
@@ -6045,8 +7858,58 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # ======================================================
 
     # Decision logic (same as desktop)
+    if break_secs < 0:
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
+        PHONE_STATE["is_distracted"] = True
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+        _updated, _old_mode = _sync_phone_timer()
+        if _updated:
+            await timer_log_shift(
+                _old_mode,
+                "work_" + distraction_mode,
+                trigger="phone_app",
+                source="macrodroid",
+                phone_app=app_name,
+            )
+        ack = await maybe_create_backlog_violation_ack(
+            surface="phone",
+            app_name=app_name,
+            display_name=display_name,
+            package=package,
+            distraction_mode=distraction_mode,
+            trigger="phone_open_backlog",
+        )
+        if is_quiet_hours():
+            await log_quiet_hours_suppressed(
+                source="phone_detection",
+                event_type="phone_enforcement_cascade_start",
+                app=app_name,
+                details={"reason": "backlog_violation"},
+            )
+        else:
+            start_enforcement_cascade(app_name)
+        await log_event(
+            "phone_backlog_violation",
+            details={
+                "app": app_name,
+                "display_name": display_name,
+                "package": package,
+                "break_seconds": break_secs,
+                "timer_mode": timer_engine.current_mode.value,
+                "ack_id": ack["id"] if ack else None,
+            },
+        )
+        return PhoneActivityResponse(
+            allowed=False,
+            reason="backlog_violation",
+            break_seconds=break_secs,
+            message="Backlog violation: close the app or work now",
+        )
+
     if break_secs > 0:
         PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
@@ -6066,6 +7929,8 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "display_name": display_name,
                 "reason": "break_time",
                 "break_seconds": break_secs,
+                "timer_mode": timer_engine.current_mode.value,
+                "created_ack": False,
             },
         )
 
@@ -6079,6 +7944,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     elif productivity_active:
         PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
         _updated, _old_mode = _sync_phone_timer()
@@ -6091,6 +7957,8 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 phone_app=app_name,
             )
 
+        ack = await _create_phone_gaming_ack(_updated)
+
         await log_event(
             "phone_distraction_allowed",
             details={
@@ -6098,6 +7966,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 "display_name": display_name,
                 "reason": "productivity_active",
                 "active_instances": active_count,
+                "timer_mode": timer_engine.current_mode.value,
+                "created_ack": bool(ack),
+                "ack_id": ack["id"] if ack else None,
             },
         )
 
@@ -6110,9 +7981,60 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     else:
+        if distraction_mode == "gaming" and work_mode == "clocked_in":
+            PHONE_STATE["current_app"] = app_name
+            PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
+            PHONE_STATE["is_distracted"] = True
+            PHONE_STATE["last_activity"] = datetime.now().isoformat()
+            _updated, _old_mode = _sync_phone_timer()
+            if _updated:
+                await timer_log_shift(
+                    _old_mode,
+                    "work_" + distraction_mode,
+                    trigger="phone_app",
+                    source="macrodroid",
+                    phone_app=app_name,
+                )
+            ack = await _create_phone_gaming_ack(_updated)
+            if not ack:
+                ack = await maybe_create_phone_distraction_ack(
+                    app_name=app_name,
+                    display_name=display_name,
+                    package=package,
+                    distraction_mode=distraction_mode,
+                    trigger="no_break_no_productivity",
+                    timer_updated=_updated,
+                    min_open_seconds=0,
+                    productivity_active=False,
+                )
+            await log_event(
+                "phone_gaming_ack_required",
+                details={
+                    "app": app_name,
+                    "display_name": display_name,
+                    "package": package,
+                    "timer_mode": timer_engine.current_mode.value,
+                    "ack_id": ack["id"] if ack else None,
+                },
+            )
+            return PhoneActivityResponse(
+                allowed=True,
+                reason="ack_required",
+                break_seconds=0,
+                message="Gaming during work requires acknowledgement",
+            )
+
         print("    BLOCKED: no break time, no productivity")
         # v2: Start enforcement cascade instead of Shizuku disable
-        start_enforcement_cascade(app_name)
+        if is_quiet_hours():
+            await log_quiet_hours_suppressed(
+                source="phone_detection",
+                event_type="phone_enforcement_cascade_start",
+                app=app_name,
+                details={"reason": "no_break_no_productivity"},
+            )
+        else:
+            start_enforcement_cascade(app_name)
 
         await log_event(
             "phone_distraction_blocked",
@@ -6351,7 +8273,15 @@ async def handle_break_exhausted():
 async def set_break_time(seconds: int):
     """Debug: directly set accumulated break time (in seconds). Negative values set backlog."""
     timer_engine._break_balance_ms = seconds * 1000
-    await log_event("timer_debug_set_break", details={"seconds": seconds})
+    await log_event(
+        "timer_debug_set_break",
+        details={
+            "seconds": seconds,
+            "test_override": True,
+            "break_balance_ms": timer_engine._break_balance_ms,
+            "backlog_ms": abs(min(0, timer_engine._break_balance_ms)),
+        },
+    )
     await timer_save_to_db()
     return {
         "break_balance_ms": timer_engine._break_balance_ms,
@@ -6384,10 +8314,12 @@ async def get_widget_break():
 @app.get("/api/timer")
 async def get_timer_state():
     """Get full timer state (for debugging, dashboards, Stream Deck)."""
+    work_state = await compute_work_state()
     return {
         "current_mode": timer_engine.current_mode.value,
         "activity": timer_engine.activity.value,
-        "productivity_active": timer_engine.productivity_active,
+        "productivity_active": work_state.productivity_active,
+        "work_state": work_state.model_dump(),
         "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
         "total_work_time": format_timer_time(timer_engine.total_work_time_ms),
         "total_work_time_ms": timer_engine.total_work_time_ms,
@@ -6417,6 +8349,12 @@ async def get_timer_state():
         "phone_app": PHONE_STATE.get("current_app"),
         "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
     }
+
+
+@app.get("/api/work-state", response_model=WorkStateResponse)
+async def get_work_state():
+    """Typed read model for what Token-API thinks the operator is doing."""
+    return await compute_work_state()
 
 
 @app.get("/api/timer/shifts")
@@ -6554,20 +8492,14 @@ async def enter_pause_mode():
 
 @app.post("/api/timer/sleep")
 async def enter_sleep_mode():
-    """Enter sleeping mode - neutral, doesn't count as work or break."""
-    global _current_session_id, _session_start_ms
-    now_ms = int(time.monotonic() * 1000)
-    old_mode = timer_engine.current_mode.value
-    changed, tick_result = timer_engine.enter_sleeping(now_ms)
-    if changed:
-        today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_mode_change(old_mode, "sleeping", is_automatic=False)
-        await timer_log_shift(old_mode, "sleeping", trigger="manual", source="api")
-        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
-        _current_session_id = await timer_start_session("sleeping", today)
-        _session_start_ms = now_ms
-        await log_event("timer_mode_change", details={"new_mode": "sleeping", "source": "api"})
-    return {"status": "sleeping", "changed": changed}
+    """Enter sleeping quiet mode - neutral, no enforcement or timer shifts."""
+    return await enter_quiet_mode_internal(context="sleeping", source="api")
+
+
+@app.post("/api/timer/go-to-sleep")
+async def go_to_sleep_mode():
+    """Debrief hook alias for entering sleeping quiet mode."""
+    return await enter_quiet_mode_internal(context="sleeping", source="debrief")
 
 
 @app.post("/api/timer/resume")
@@ -6577,6 +8509,10 @@ async def resume_work_mode():
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
     changed, tick_result = timer_engine.resume(now_ms)
+    try:
+        scheduler.remove_job(QUIET_RESUME_JOB_ID)
+    except Exception:
+        pass
     # Also ensure productivity is active
     timer_engine.set_productivity(True, now_ms)
     if changed:
@@ -6672,9 +8608,15 @@ async def reset_timer():
 
 
 @app.post("/api/work-action")
-async def work_action():
-    """Manual work action signal — sets productivity active."""
+async def work_action(request: WorkActionRequest | None = None):
+    """Manual work action signal — sets productivity active and resolves distraction acks."""
     global _current_session_id, _session_start_ms
+    request = request or WorkActionRequest()
+    await bust_quiet_state(
+        "api",
+        "work_action",
+        {"source": request.source, "note": request.note},
+    )
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
     result = timer_engine.set_productivity(True, now_ms)
@@ -6691,11 +8633,40 @@ async def work_action():
         _session_start_ms = now_ms
         print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
 
+    acknowledged_acks = await acknowledge_pending_work_action_acks()
+    stop_enforcement_cascade(reason=f"work_action:{request.source}")
+    if PHONE_STATE.get("is_distracted"):
+        PHONE_STATE["current_app"] = None
+        PHONE_STATE["app_opened_at"] = None
+        PHONE_STATE["is_distracted"] = False
+        PHONE_STATE["distraction_ack_app"] = None
+        PHONE_STATE["distraction_ack_id"] = None
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+        DESKTOP_STATE["current_mode"] = "silence"
+        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+
+    await log_event(
+        "work_action",
+        details={
+            "source": request.source,
+            "note": request.note,
+            "old_mode": old_mode,
+            "current_mode": timer_engine.current_mode.value,
+            "acknowledged_expected_acks": acknowledged_acks,
+        },
+    )
+
     return {
         "idle_timer_reset": True,
         "exited_idle": exited_idle,
         "current_mode": timer_engine.current_mode.value,
+        "acknowledged_expected_acks": acknowledged_acks,
     }
+
+
+async def hook_work_action_callback(source: str, note: str | None = None):
+    return await work_action(WorkActionRequest(source=source, note=note))
 
 
 # ============ Pavlok Endpoints ============
@@ -6738,6 +8709,13 @@ async def pavlok_status():
             datetime.now() - datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
         ).total_seconds()
         cooldown_remaining = max(0.0, PAVLOK_CONFIG["cooldown_seconds"] - elapsed)
+
+    def _cooldown_remaining(last_at: str | None, cooldown_seconds: int | None) -> int:
+        if not last_at or not cooldown_seconds:
+            return 0
+        elapsed = (datetime.now() - datetime.fromisoformat(last_at)).total_seconds()
+        return round(max(0, cooldown_seconds - elapsed))
+
     return {
         "enabled": PAVLOK_CONFIG["enabled"],
         "token_set": bool(PAVLOK_CONFIG["token"]),
@@ -6745,6 +8723,19 @@ async def pavlok_status():
         "cooldown_remaining_seconds": round(cooldown_remaining),
         "default_zap_value": PAVLOK_CONFIG["default_zap_value"],
         "cooldown_seconds": PAVLOK_CONFIG["cooldown_seconds"],
+        "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
+        "zap_count_date": PAVLOK_STATE.get("zap_count_date"),
+        "zap_count": PAVLOK_STATE.get("zap_count", 0),
+        "zap_cooldown_seconds": PAVLOK_CONFIG.get("zap_cooldown_seconds"),
+        "soft_cooldown_seconds": PAVLOK_CONFIG.get("soft_cooldown_seconds"),
+        "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
+        "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
+        "zap_cooldown_remaining_seconds": _cooldown_remaining(
+            PAVLOK_STATE.get("last_zap_at"), PAVLOK_CONFIG.get("zap_cooldown_seconds")
+        ),
+        "soft_cooldown_remaining_seconds": _cooldown_remaining(
+            PAVLOK_STATE.get("last_soft_at"), PAVLOK_CONFIG.get("soft_cooldown_seconds")
+        ),
     }
 
 
@@ -8176,7 +10167,49 @@ async def root():
         "version": "0.1.0",
         "description": "Local FastAPI server for Claude instance management",
         "docs": "/docs",
+        "ui": "/ui/somnium",
     }
+
+
+@app.get("/ui/somnium")
+async def somnium_ui():
+    """Serve the Somnium HTML dashboard shell."""
+    index_path = UI_DIR / "somnium" / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Somnium UI stub not found")
+    return FileResponse(index_path)
+
+
+@app.get("/ui/somnium/{asset_name}")
+async def somnium_ui_asset(asset_name: str):
+    """Serve Somnium UI stub assets without exposing arbitrary paths."""
+    allowed = {
+        "app.js": "application/javascript",
+        "style.css": "text/css",
+    }
+    if asset_name not in allowed:
+        raise HTTPException(status_code=404, detail="Somnium UI asset not found")
+    asset_path = UI_DIR / "somnium" / asset_name
+    if not asset_path.exists():
+        raise HTTPException(status_code=404, detail="Somnium UI asset not found")
+    return FileResponse(asset_path, media_type=allowed[asset_name])
+
+
+@app.get("/api/ui/somnium/selection")
+async def get_somnium_selection():
+    """Return the operator selection exported by the Somnium TUI."""
+    try:
+        return JSONResponse(json.loads(SOMNIUM_SELECTION_PATH.read_text()))
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Somnium selection state not found"},
+        )
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Somnium selection state is invalid JSON"},
+        )
 
 
 # [MOVED to shared.py / routes/tts.py] — was: # ============ TTS/Notification System ===========
@@ -8437,24 +10470,23 @@ async def timer_worker():
 
             # Productivity layer update (every 10s) — poll DB for active instances
             if now - last_db_save >= 10:  # piggyback on DB save interval
-                any_processing = False
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cursor = await db.execute(
-                        """SELECT COUNT(*) FROM claude_instances
-                           WHERE status = 'processing'
-                           AND last_activity > datetime('now', '-60 seconds', 'localtime')"""
-                    )
-                    row = await cursor.fetchone()
-                    any_processing = (row[0] if row else 0) > 0
+                work_state = await compute_work_state()
+                productivity_active = work_state.productivity_active
 
                 old_mode = timer_engine.current_mode.value
-                prod_result = timer_engine.set_productivity(any_processing, now_ms)
+                prod_result = timer_engine.set_productivity(productivity_active, now_ms)
                 if TimerEvent.MODE_CHANGED in prod_result.events:
                     new_mode = timer_engine.current_mode.value
-                    trigger = "productivity_active" if any_processing else "productivity_inactive"
+                    trigger = (
+                        "productivity_active" if productivity_active else "productivity_inactive"
+                    )
                     print(f"TIMER: Productivity {trigger} — {old_mode} → {new_mode}")
                     await timer_log_shift(
-                        old_mode, new_mode, trigger=trigger, source="timer_worker"
+                        old_mode,
+                        new_mode,
+                        trigger=trigger,
+                        source="timer_worker",
+                        details=work_state.model_dump(),
                     )
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
@@ -8462,6 +10494,20 @@ async def timer_worker():
                     _current_session_id = await timer_start_session(new_mode, today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
+
+                current_phone_app = (PHONE_STATE.get("current_app") or "").lower()
+                current_phone_mode = (
+                    PHONE_DISTRACTION_APPS.get(current_phone_app) if current_phone_app else None
+                )
+                if current_phone_app and current_phone_mode:
+                    await maybe_create_phone_distraction_ack(
+                        app_name=current_phone_app,
+                        display_name=get_phone_app_display_name(current_phone_app),
+                        package=None,
+                        distraction_mode=current_phone_mode,
+                        trigger="timer_worker",
+                        productivity_active=productivity_active,
+                    )
 
             # Update daily note every 30s
             if now - last_daily_update >= 30:
@@ -8544,6 +10590,16 @@ async def enforce_break_exhausted_impl() -> dict:
     desktop_result = None
 
     # Desktop enforcement: close distraction windows
+    if DESKTOP_STATE.get("current_mode") in ("video", "scrolling", "gaming"):
+        await maybe_create_backlog_violation_ack(
+            surface="desktop",
+            app_name=DESKTOP_STATE.get("steam_app_id")
+            or DESKTOP_STATE.get("steam_exe")
+            or DESKTOP_STATE.get("current_mode"),
+            display_name=DESKTOP_STATE.get("steam_app_name") or DESKTOP_STATE.get("current_mode"),
+            distraction_mode=DESKTOP_STATE.get("current_mode"),
+            trigger="break_exhausted",
+        )
     desktop_result = close_distraction_windows()
     if desktop_result.get("closed_count"):
         enforced_any = True
@@ -8554,6 +10610,13 @@ async def enforce_break_exhausted_impl() -> dict:
     # Phone enforcement: disable active distraction app
     current_app = PHONE_STATE.get("current_app")
     if current_app:
+        await maybe_create_backlog_violation_ack(
+            surface="phone",
+            app_name=current_app,
+            display_name=get_phone_app_display_name(current_app),
+            distraction_mode=PHONE_DISTRACTION_APPS.get(current_app),
+            trigger="break_exhausted",
+        )
         enforce_app = current_app
         if current_app in ("x", "twitter", "com.twitter.android"):
             enforce_app = "twitter"
@@ -8575,28 +10638,18 @@ async def enforce_break_exhausted_impl() -> dict:
         phone_result = {"cascade_started": True, "app": enforce_app}
         enforced_any = True
 
-        PHONE_STATE["current_app"] = None
-        PHONE_STATE["is_distracted"] = False
-
-        # Switch timer/desktop back to working since phone distraction is being closed
-        DESKTOP_STATE["current_mode"] = "silence"
-        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-        now_ms = int(time.monotonic() * 1000)
-        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
-
     if enforced_any:
-        # Phone: v3 enforce with notification, fallback to server-side Pavlok API
+        # Phone prompt only; Pavlok is handled by the backlog ack parry deadline.
         phone_notify = await asyncio.to_thread(
             _send_to_phone,
-            "/enforce",
+            "/notify",
             {
-                "zap": 30,
+                "vibe": 60,
+                "beep": 40,
                 "tts_text": "Break time exhausted",
                 "banner_text": "Break exhausted",
             },
         )
-        if not phone_notify["success"]:
-            send_pavlok_stimulus(reason="break_exhausted")
 
     return {
         "enforced": enforced_any,
@@ -8781,10 +10834,41 @@ async def session_doc_sync_worker():
 
 
 async def clear_stale_processing_flags():
-    """Background worker that auto-clears status='processing' for instances inactive > 5 minutes."""
+    """Background worker that clears stale processing and stops dead local pane rows."""
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """SELECT id, tmux_pane, device_id
+                       FROM claude_instances
+                       WHERE status IN ('processing', 'idle')
+                         AND tmux_pane IS NOT NULL
+                         AND device_id = ?""",
+                    (LOCAL_DEVICE_NAME,),
+                )
+                pane_rows = await cursor.fetchall()
+                stopped_dead_panes = []
+                for row in pane_rows:
+                    if await _tmux_pane_exists(row["tmux_pane"]):
+                        continue
+                    try:
+                        await sanctioned_update_instance(
+                            db,
+                            instance_id=row["id"],
+                            updates={
+                                "status": "stopped",
+                                "synced": 0,
+                                "stopped_at": datetime.now().isoformat(),
+                            },
+                            mutation_type="instance_stopped",
+                            write_source="system",
+                            actor="clear-dead-tmux-pane",
+                        )
+                        stopped_dead_panes.append(row["id"])
+                    except LookupError:
+                        continue
+
                 cursor = await db.execute(
                     """SELECT id
                        FROM claude_instances
@@ -8808,6 +10892,10 @@ async def clear_stale_processing_flags():
 
                 if rows:
                     logger.warning(f"Auto-cleared {len(rows)} stale processing flags")
+                if stopped_dead_panes:
+                    logger.warning(
+                        f"Auto-stopped {len(stopped_dead_panes)} dead tmux-pane instance rows"
+                    )
 
             await asyncio.sleep(60)  # Run every minute
 
@@ -9270,6 +11358,21 @@ _ENFORCE_LEVELS = {
 }
 
 
+def _enforcement_label(level: str, source: str, message: str = "") -> str:
+    haystack = f"{source} {message}".lower()
+    if "break_exhausted" in haystack or "break exhausted" in haystack:
+        return "Break exhausted"
+    if "backlog" in haystack:
+        return "Backlog violation"
+    if "ack" in haystack:
+        return "Ack overdue" if level != "notify" else "Ack due"
+    if level in ("enforce", "block"):
+        return "Enforcement active"
+    if level == "warn":
+        return "Enforcement imminent"
+    return "Enforcement notice"
+
+
 async def unified_enforce(
     level: str,
     message: str,
@@ -9295,6 +11398,21 @@ async def unified_enforce(
         return {"success": False, "error": f"Unknown enforce level: {level}"}
 
     result = {"level": level, "source": source, "discord": None, "phone": None, "tts": None}
+    if is_quiet_hours():
+        suppression = await log_quiet_hours_suppressed(
+            source=source,
+            event_type="unified_enforce",
+            details={"level": level, "message": message[:200], "channel": channel, "bot": bot},
+        )
+        result.update(
+            {
+                "success": True,
+                "suppressed": True,
+                "reason": "quiet_hours",
+                "quiet_hours": suppression["quiet_hours"],
+            }
+        )
+        return result
 
     # ── Discord ──
     discord_mode = cfg["discord_mode"]
@@ -9354,10 +11472,9 @@ async def unified_enforce(
         phone_payload["beep"] = p.get("beep", cfg["phone_beep"])
     if "phone_zap" in cfg:
         phone_payload["zap"] = p.get("zap", cfg["phone_zap"])
-    # Strip emoji for TTS
-    tts_clean = message.split("\n")[0][:200]
-    phone_payload["tts_text"] = p.get("tts_text", tts_clean)
-    phone_payload["banner_text"] = p.get("banner_text", f"Enforce: {level}")
+    label = _enforcement_label(level, source, message)
+    phone_payload["tts_text"] = label
+    phone_payload["banner_text"] = label
 
     phone_result = _send_to_phone(phone_endpoint, phone_payload)
     result["phone"] = phone_result
@@ -9371,7 +11488,7 @@ async def unified_enforce(
         logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok {stim} fallback fired")
 
     # ── Desktop TTS ──
-    speak_checkin_tts(tts_clean)
+    speak_checkin_tts(label)
     result["tts"] = "sent"
 
     await log_event("enforce", details={"level": level, "source": source, "message": message[:200]})
@@ -9393,13 +11510,29 @@ def _unified_enforce_sync(
         loop = asyncio.get_event_loop()
         if loop.is_running():
             future = asyncio.run_coroutine_threadsafe(
-                unified_enforce(level, message, source, channel, bot, phone_params, legion_context),
+                unified_enforce(
+                    level,
+                    message,
+                    source,
+                    channel,
+                    bot,
+                    phone_params,
+                    legion_context,
+                ),
                 loop,
             )
             return future.result(timeout=20)
         else:
             return asyncio.run(
-                unified_enforce(level, message, source, channel, bot, phone_params, legion_context)
+                unified_enforce(
+                    level,
+                    message,
+                    source,
+                    channel,
+                    bot,
+                    phone_params,
+                    legion_context,
+                )
             )
     except Exception as e:
         logger.warning(f"Enforce sync wrapper failed: {e}")
@@ -9432,6 +11565,113 @@ async def enforce_endpoint(request: EnforceRequest):
         phone_params=request.phone_params,
         legion_context=request.legion_context,
     )
+
+
+@app.post("/api/enforcement/ack")
+async def enforcement_ack(request: EnforcementAckRequest):
+    """Acknowledge a pending expected acknowledgement."""
+    if not request.ack_id and not (request.source and request.instance_id):
+        raise HTTPException(status_code=400, detail="ack_id or source+instance_id is required")
+    return await _resolve_expected_ack(
+        ack_id=request.ack_id,
+        source=request.source,
+        instance_id=request.instance_id,
+        status="acknowledged",
+    )
+
+
+@app.post("/api/enforcement/expect")
+async def enforcement_expect(request: EnforcementExpectRequest):
+    """Create a manual expected acknowledgement using the standard 5/10/15 ladder."""
+    reason = (request.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    ack = await create_expected_ack(
+        source=(request.source or "manual").strip() or "manual",
+        instance_id=request.instance_id,
+        reason=reason,
+        details=request.details or {},
+    )
+    return {"created": True, "ack": ack}
+
+
+@app.post("/api/enforcement/bailout")
+async def enforcement_bailout(request: EnforcementBailoutRequest):
+    """Manual bailout for one ack. Requires reason and disables Pavlok for that ack."""
+    reason = (request.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    if not request.ack_id and not (request.source and request.instance_id):
+        raise HTTPException(status_code=400, detail="ack_id or source+instance_id is required")
+    return await _resolve_expected_ack(
+        ack_id=request.ack_id,
+        source=request.source,
+        instance_id=request.instance_id,
+        status="bailed_out",
+        bailout_reason=reason,
+    )
+
+
+@app.get("/api/enforcement/status")
+async def enforcement_status():
+    """Return pending acknowledgements plus current escalation and Pavlok guardrail state."""
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT * FROM expected_acknowledgements
+            WHERE status = 'pending'
+            ORDER BY ack_due_at ASC
+            """
+        )
+        rows = await cursor.fetchall()
+
+    pending = []
+    for row in rows:
+        ack = _expected_ack_row_to_dict(row)
+        ack["current_level"] = _ack_current_level(ack, now)
+        ack["scheduled_jobs"] = []
+        for level in (1, 2, 3):
+            job = scheduler.get_job(_expected_ack_job_id(ack["id"], level))
+            if job:
+                ack["scheduled_jobs"].append(
+                    {
+                        "id": job.id,
+                        "level": level,
+                        "next_run_time": job.next_run_time.isoformat()
+                        if job.next_run_time
+                        else None,
+                    }
+                )
+        pending.append(ack)
+
+    def _cooldown_remaining(last_at: str | None, cooldown_seconds: int | None) -> int:
+        if not last_at or not cooldown_seconds:
+            return 0
+        elapsed = (datetime.now() - datetime.fromisoformat(last_at)).total_seconds()
+        return round(max(0, cooldown_seconds - elapsed))
+
+    return {
+        "pending": pending,
+        "pending_count": len(pending),
+        "pavlok": {
+            "enabled": PAVLOK_CONFIG["enabled"],
+            "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
+            "zap_count_date": PAVLOK_STATE.get("zap_count_date"),
+            "zap_count": PAVLOK_STATE.get("zap_count", 0),
+            "zap_cooldown_seconds": PAVLOK_CONFIG.get("zap_cooldown_seconds"),
+            "soft_cooldown_seconds": PAVLOK_CONFIG.get("soft_cooldown_seconds"),
+            "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
+            "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
+            "zap_cooldown_remaining_seconds": _cooldown_remaining(
+                PAVLOK_STATE.get("last_zap_at"), PAVLOK_CONFIG.get("zap_cooldown_seconds")
+            ),
+            "soft_cooldown_remaining_seconds": _cooldown_remaining(
+                PAVLOK_STATE.get("last_soft_at"), PAVLOK_CONFIG.get("soft_cooldown_seconds")
+            ),
+        },
+    }
 
 
 # ── Morning Session ────────────────────────────────────────
@@ -13508,6 +15748,137 @@ async def mark_habit_today(habit_id: str, body: dict = None):
     return {"habit_id": habit_id, "date": today, "action": action, "notes": notes}
 
 
+def _normalize_state_assertion(value) -> str | bool | int | float | None:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "yes", "y", "1", "on"):
+            return True
+        if normalized in ("false", "no", "n", "0", "off"):
+            return False
+        if normalized in ("none", "null", ""):
+            return None
+        return normalized
+    return value
+
+
+def _state_app_matches(app_name: str | None) -> bool:
+    expected = (app_name or "").strip().lower()
+    current = (PHONE_STATE.get("current_app") or "").strip().lower()
+    if not expected:
+        return False
+    return PHONE_STATE.get("is_distracted", False) and current == expected
+
+
+async def _state_validator_observed(request: StateValidateRequest):
+    key = request.state or request.var or request.name
+    if request.app and not key:
+        return {
+            "key": f"app.{request.app}",
+            "observed": _state_app_matches(request.app),
+            "details": {
+                "current_app": PHONE_STATE.get("current_app"),
+                "is_distracted": PHONE_STATE.get("is_distracted", False),
+            },
+        }
+
+    if not key:
+        raise HTTPException(status_code=400, detail="state, var, name, or app is required")
+
+    key = key.strip().lower()
+    work_state = None
+    if key.startswith("work.") or key in ("productivity_active", "work_state.productivity_active"):
+        work_state = await compute_work_state()
+
+    observed_map = {
+        "phone.current_app": PHONE_STATE.get("current_app"),
+        "phone.app": PHONE_STATE.get("current_app"),
+        "phone.is_distracted": PHONE_STATE.get("is_distracted", False),
+        "phone.reachable": PHONE_STATE.get("reachable"),
+        "desktop.current_mode": DESKTOP_STATE.get("current_mode", "silence"),
+        "desktop.mode": DESKTOP_STATE.get("current_mode", "silence"),
+        "desktop.work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "timer.mode": timer_engine.current_mode.value,
+        "timer.activity": timer_engine.activity.value,
+        "timer.break_in_backlog": timer_engine.break_balance_ms < 0,
+        "timer.break_balance_ms": timer_engine.break_balance_ms,
+    }
+    if work_state:
+        observed_map.update(
+            {
+                "work.productivity_active": work_state.productivity_active,
+                "work.reason": work_state.reason,
+                "work.active_instance_count": work_state.active_instance_count,
+                "productivity_active": work_state.productivity_active,
+                "work_state.productivity_active": work_state.productivity_active,
+            }
+        )
+    if key.startswith("app."):
+        app_name = key.split(".", 1)[1]
+        observed_map[key] = _state_app_matches(app_name)
+    if key.startswith("activity."):
+        icon_key = key.split(".", 1)[1]
+        observed_map[key] = next(
+            (icon.active for icon in _activity_icons() if icon.key == icon_key),
+            False,
+        )
+
+    if key not in observed_map:
+        raise HTTPException(status_code=400, detail=f"unknown state key: {key}")
+    return {"key": key, "observed": observed_map[key], "details": {}}
+
+
+def _state_validate_request_from_query(request: Request) -> StateValidateRequest:
+    params = request.query_params
+    return StateValidateRequest.model_validate(
+        {
+            "state": params.get("state"),
+            "var": params.get("var"),
+            "name": params.get("name"),
+            "app": params.get("app"),
+            "assert": params.get("assert"),
+        }
+    )
+
+
+async def _validate_state_response(request: Request, assertion: StateValidateRequest):
+    observed = await _state_validator_observed(assertion)
+    expected = _normalize_state_assertion(assertion.assert_)
+    actual = _normalize_state_assertion(observed["observed"])
+    matched = actual == expected
+    payload = {
+        "match": matched,
+        "key": observed["key"],
+        "expected": expected,
+        "observed": actual,
+        "details": observed["details"],
+    }
+    await log_event(
+        "state_validate",
+        details={
+            **payload,
+            "method": request.method,
+            "client": request.client.host if request.client else None,
+        },
+    )
+    return JSONResponse(status_code=200 if matched else 409, content=payload)
+
+
+@app.api_route("/api/state/validate", methods=["GET", "POST"])
+async def validate_state(
+    request: Request,
+    assertion: StateValidateRequest | None = Body(default=None),
+):
+    """
+    Generic state assertion endpoint for MacroDroid and other pingers.
+
+    Accepts JSON body or query parameters. Returns 200 when the assertion
+    matches and 409 when it does not, so automations can branch on HTTP code.
+    """
+    assertion = assertion or _state_validate_request_from_query(request)
+    return await _validate_state_response(request, assertion)
+
+
 @app.get("/api/state")
 async def get_state():
     """
@@ -13591,6 +15962,30 @@ async def get_state():
     }
 
 
+async def _askq_touch2_callback(instance_id: str, question_text: str) -> None:
+    """Touch 2 of the AskUserQuestion ladder: route through enforcement_cascade_started.
+
+    Coordinate point with the enforce → custodes wire effort. Today this fires the
+    custodes state event with `enforcement_cascade_started` and starts the existing
+    enforcement cascade machinery using a synthetic app name. If the wire evolves,
+    swap the body here without touching routes/hooks.py.
+    """
+    app_name = "askuserquestion"
+    try:
+        await handle_custodes_state_event(
+            "enforcement_cascade_started",
+            "askq_ladder",
+            severity=2,
+            payload={"app": app_name, "question": question_text[:200]},
+        )
+    except Exception as e:
+        logger.warning(f"AskQ Touch 2: custodes event failed: {e}")
+    try:
+        start_enforcement_cascade(app_name)
+    except Exception as e:
+        logger.warning(f"AskQ Touch 2: enforcement cascade start failed: {e}")
+
+
 # Wire hook-route dependencies after hook-owned callbacks are defined.
 hooks_init_deps(
     scheduler=scheduler,
@@ -13598,6 +15993,8 @@ hooks_init_deps(
     timer_log_shift=shared.timer_log_shift,
     run_stop_evaluators=_run_stop_evaluators,
     auto_name_instance=_auto_name_instance,
+    work_action_callback=hook_work_action_callback,
+    askq_touch2_callback=_askq_touch2_callback,
 )
 
 

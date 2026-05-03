@@ -13,10 +13,12 @@ import requests
 
 from shared import (
     DB_PATH,
+    DESKTOP_STATE,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PHONE_CONFIG,
     PHONE_STATE,
+    TTS_GLOBAL_MODE,
     log_event,
 )
 
@@ -111,24 +113,50 @@ def send_pavlok_stimulus(
     respect_cooldown: bool = True,
 ) -> dict:
     """Send a stimulus (zap/beep/vibe) to the Pavlok watch."""
+    stimulus_type = (stimulus_type or "zap").lower()
     if not PAVLOK_CONFIG["token"]:
-        return {"skipped": True, "reason": "no_token", "hint": "Set PAVLOK_API_TOKEN in .env"}
+        result = {
+            "skipped": True,
+            "blocked_by_guardrail": True,
+            "reason": "no_token",
+            "type": stimulus_type,
+            "requested_reason": reason,
+            "hint": "Set PAVLOK_API_TOKEN in .env",
+        }
+        _log_pavlok_guardrail_block(result)
+        return result
     if not PAVLOK_CONFIG["enabled"]:
-        return {"skipped": True, "reason": "disabled"}
+        result = {
+            "skipped": True,
+            "blocked_by_guardrail": True,
+            "reason": "disabled",
+            "type": stimulus_type,
+            "requested_reason": reason,
+        }
+        _log_pavlok_guardrail_block(result)
+        return result
 
     now = datetime.now()
-    if respect_cooldown and PAVLOK_STATE["last_stimulus_at"]:
-        last = datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
-        elapsed = (now - last).total_seconds()
-        if elapsed < PAVLOK_CONFIG["cooldown_seconds"]:
-            return {
-                "skipped": True,
-                "reason": "cooldown",
-                "remaining": round(PAVLOK_CONFIG["cooldown_seconds"] - elapsed),
-            }
+    guardrail = _pavlok_guardrail_block(stimulus_type, now, respect_cooldown)
+    if guardrail:
+        result = {
+            "skipped": True,
+            "blocked_by_guardrail": True,
+            "reason": guardrail["reason"],
+            "type": stimulus_type,
+            "value": value,
+            "requested_reason": reason,
+            **{k: v for k, v in guardrail.items() if k != "reason"},
+        }
+        _log_pavlok_guardrail_block(result)
+        return result
 
     if value is None:
-        value = PAVLOK_CONFIG["default_zap_value"]
+        value = (
+            PAVLOK_CONFIG.get("friday_zap_value", 30)
+            if stimulus_type == "zap"
+            else PAVLOK_CONFIG.get("warning_value", 50)
+        )
 
     try:
         response = requests.post(
@@ -138,6 +166,11 @@ def send_pavlok_stimulus(
             timeout=10,
         )
         PAVLOK_STATE["last_stimulus_at"] = now.isoformat()
+        if stimulus_type == "zap":
+            PAVLOK_STATE["last_zap_at"] = now.isoformat()
+            _increment_daily_zap_count(now)
+        else:
+            PAVLOK_STATE["last_soft_at"] = now.isoformat()
         print(f"PAVLOK: {stimulus_type} value={value} reason={reason} -> {response.status_code}")
         return {
             "success": response.status_code == 200,
@@ -155,6 +188,82 @@ def send_pavlok_stimulus(
     except Exception as e:
         print(f"PAVLOK: Error sending {stimulus_type}: {e}")
         return {"success": False, "error": str(e), "reason": reason}
+
+
+def _pavlok_guardrail_block(
+    stimulus_type: str,
+    now: datetime,
+    respect_cooldown: bool,
+) -> dict | None:
+    """Return a guardrail block reason, or None when stimulus is allowed."""
+    global_mode = (TTS_GLOBAL_MODE.get("mode") or "").lower()
+    if global_mode in ("muted", "silent", "quiet"):
+        return {"reason": "quiet_mode", "global_mode": global_mode}
+    if DESKTOP_STATE.get("in_meeting"):
+        return {"reason": "meeting"}
+    if DESKTOP_STATE.get("work_mode") == "sleeping":
+        return {"reason": "sleep_window"}
+
+    blocked_contexts = {
+        "club": DESKTOP_STATE.get("club_context") or PHONE_STATE.get("club_context"),
+        "driving": DESKTOP_STATE.get("driving_context") or PHONE_STATE.get("driving_context"),
+        "medical": DESKTOP_STATE.get("medical_context") or PHONE_STATE.get("medical_context"),
+    }
+    location_zone = (DESKTOP_STATE.get("location_zone") or "").lower()
+    for context, active in blocked_contexts.items():
+        if active or location_zone == context:
+            return {"reason": f"{context}_context"}
+
+    if stimulus_type == "zap":
+        _roll_daily_zap_count(now)
+        cap = int(PAVLOK_CONFIG.get("daily_zap_cap", 6))
+        if int(PAVLOK_STATE.get("zap_count") or 0) >= cap:
+            return {"reason": "daily_zap_cap", "cap": cap}
+
+    if not respect_cooldown:
+        return None
+
+    if stimulus_type == "zap":
+        last_key = "last_zap_at"
+        cooldown = int(PAVLOK_CONFIG.get("zap_cooldown_seconds", 20 * 60))
+    else:
+        last_key = "last_soft_at"
+        cooldown = int(PAVLOK_CONFIG.get("soft_cooldown_seconds", 3 * 60))
+
+    last_at = PAVLOK_STATE.get(last_key) or PAVLOK_STATE.get("last_stimulus_at")
+    if last_at:
+        elapsed = (now - datetime.fromisoformat(last_at)).total_seconds()
+        if elapsed < cooldown:
+            return {"reason": "cooldown", "remaining": round(cooldown - elapsed)}
+
+    return None
+
+
+def _in_sleep_window(now: datetime) -> bool:
+    return now.hour >= 23 or now.hour < 7
+
+
+def _roll_daily_zap_count(now: datetime) -> None:
+    today = now.date().isoformat()
+    if PAVLOK_STATE.get("zap_count_date") != today:
+        PAVLOK_STATE["zap_count_date"] = today
+        PAVLOK_STATE["zap_count"] = 0
+
+
+def _increment_daily_zap_count(now: datetime) -> None:
+    _roll_daily_zap_count(now)
+    PAVLOK_STATE["zap_count"] = int(PAVLOK_STATE.get("zap_count") or 0) + 1
+
+
+def _log_pavlok_guardrail_block(result: dict) -> None:
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(log_event("pavlok_blocked_by_guardrail", details=result))
+        else:
+            asyncio.run(log_event("pavlok_blocked_by_guardrail", details=result))
+    except Exception as exc:
+        logger.warning(f"PAVLOK: guardrail block logging failed: {exc}")
 
 
 async def check_instance_count_pavlok(remaining_active: int, was_active: int):

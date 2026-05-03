@@ -7,12 +7,15 @@ State dicts live here; both main.py and routes/* import from this module.
 Phase 2 will convert these raw dicts into TypedDicts/dataclasses.
 """
 
+import asyncio
 import json
 import logging
 import os
 import random
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -30,6 +33,38 @@ SERVER_PORT = 7777
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
 STASH_MAX_AGE_HOURS = 24
+QUIET_HOURS_START = int(os.environ.get("TOKEN_API_QUIET_START_HOUR", "23"))
+QUIET_HOURS_END = int(os.environ.get("TOKEN_API_QUIET_END_HOUR", "9"))
+QUIET_HOURS_TIMEZONE = os.environ.get("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
+
+
+def get_quiet_hours_status(now: datetime | None = None) -> dict:
+    """Return the canonical quiet-hours decision and context."""
+    tz = ZoneInfo(QUIET_HOURS_TIMEZONE)
+    local_now = now or datetime.now(tz)
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=tz)
+    else:
+        local_now = local_now.astimezone(tz)
+
+    start = QUIET_HOURS_START
+    end = QUIET_HOURS_END
+    hour_float = local_now.hour + local_now.minute / 60 + local_now.second / 3600
+    if start == end:
+        active = True
+    elif start < end:
+        active = start <= hour_float < end
+    else:
+        active = hour_float >= start or hour_float < end
+
+    return {
+        "active": active,
+        "reason": "quiet_hours" if active else "outside_quiet_hours",
+        "quiet_start": start,
+        "quiet_end": end,
+        "timezone": QUIET_HOURS_TIMEZONE,
+        "local_time": local_now.isoformat(),
+    }
 
 
 # ============ Voice Profiles ============
@@ -208,6 +243,34 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
+    """Return tmux's canonical %pane id for any valid pane target."""
+    if not tmux_pane:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "display-message",
+            "-t",
+            tmux_pane,
+            "-p",
+            "#{pane_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    pane_id = stdout.decode(errors="ignore").strip()
+    return pane_id or None
+
+
+async def tmux_pane_exists(tmux_pane: str | None) -> bool:
+    return await resolve_tmux_pane_id(tmux_pane) is not None
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
@@ -269,6 +332,8 @@ PHONE_STATE = {
     "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
     "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
     "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
+    "distraction_ack_app": None,  # app currently covered by a phone_distraction expected ack
+    "distraction_ack_id": None,
 }
 
 PHONE_HEARTBEAT = {
@@ -282,11 +347,20 @@ PAVLOK_CONFIG = {
     "token": os.getenv("PAVLOK_API_TOKEN"),
     "enabled": True,
     "cooldown_seconds": 30,
+    "zap_cooldown_seconds": 20 * 60,
+    "soft_cooldown_seconds": 3 * 60,
+    "daily_zap_cap": 6,
     "default_zap_value": 50,
+    "friday_zap_value": 30,
+    "warning_value": 50,
 }
 
 PAVLOK_STATE = {
     "last_stimulus_at": None,
+    "last_zap_at": None,
+    "last_soft_at": None,
+    "zap_count_date": None,
+    "zap_count": 0,
 }
 
 
@@ -321,6 +395,30 @@ DESKTOP_STATE = {
 
 # Voice chat state — tracks which instances are in voice conversation mode
 VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
+
+# AskUserQuestion three-touch ladder state — engagement-pressure on per-instance questions.
+# instance_id -> {
+#   "question_text": str,
+#   "options": list[str],
+#   "started_at": float (monotonic),
+#   "current_touch": int (1-3) | "bust",
+#   "task": asyncio.Task | None  (the running ladder coroutine),
+#   "tmux_pane": str | None,
+#   "device_id": str | None,
+#   "tts_voice": str | None,
+# }
+ASKQ_LADDER = {}
+
+# Touch durations (seconds). Tuned for "engagement, not speed of finishing the answer."
+ASKQ_T1_SECONDS = 30  # Touch 1 (initial TTS) → Touch 2 (enforcement cascade)
+ASKQ_T2_SECONDS = 60  # Touch 2 → Touch 3 (TTS re-read)
+ASKQ_T3_SECONDS = 60  # Touch 3 → Bust (autonomous fallback prompt)
+
+ASKQ_BUST_PROMPT = (
+    "Question timed out. Move autonomously for a moment — update documentation, "
+    "run tests, validate, pick low-hanging fruit. If this is blocking, use the "
+    "notification protocol to escalate."
+)
 
 # Global dictation state — tracks whether Wispr Flow is currently active
 # Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),

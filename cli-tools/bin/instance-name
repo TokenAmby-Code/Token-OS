@@ -3,7 +3,7 @@
 # TAGS: instance
 # AUDIENCE: agent
 #
-# Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
+# Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]
 #
 # Examples:
 #   instance-name "auth-refactor"
@@ -15,19 +15,21 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+SOMNIUM_SELECTION_PATH="${HOME}/.claude/tui-state/somnium.json"
 
 # Help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
 Instance Name - Rename current session in Token-API registry
 
-Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
+Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]
 
 Sets the display name for this Claude Code session in the Token-API
 registry dashboard. The name helps identify what you're working on.
 
 Options:
   --id <id>          Explicit instance ID (for ambiguous cases)
+  --selected         Use the instance selected in the Somnium TUI
   --no-ui            Skip Claude Code /rename and /color (for headless/cron)
   --session          Create a session doc named after the instance and assign it
   --session <title>  Find existing session doc by title (fuzzy) and assign it
@@ -54,6 +56,7 @@ fi
 # Parse arguments
 NAME=""
 EXPLICIT_ID=""
+USE_SELECTED=0
 SESSION_FLAG=""
 SESSION_ID=""
 SESSION_PATH=""
@@ -63,6 +66,10 @@ while [[ $# -gt 0 ]]; do
         --id)
             EXPLICIT_ID="$2"
             shift 2
+            ;;
+        --selected)
+            USE_SELECTED=1
+            shift
             ;;
         --no-ui)
             NO_UI=1
@@ -96,7 +103,7 @@ done
 
 # Require name
 if [[ -z "$NAME" ]]; then
-    echo "Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]" >&2
+    echo "Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]" >&2
     exit 1
 fi
 
@@ -126,6 +133,17 @@ _find_claude_pid() {
 # Resolve instance via Token-API (server handles PID → CWD fallback)
 if [[ -n "$EXPLICIT_ID" ]]; then
     INSTANCE_ID="$EXPLICIT_ID"
+elif [[ "$USE_SELECTED" == "1" ]]; then
+    if [[ ! -f "$SOMNIUM_SELECTION_PATH" ]]; then
+        echo "Error: No Somnium selection state found at $SOMNIUM_SELECTION_PATH" >&2
+        exit 1
+    fi
+    INSTANCE_ID=$(jq -r '.selected_instance_id // empty' "$SOMNIUM_SELECTION_PATH" 2>/dev/null || true)
+    if [[ -z "$INSTANCE_ID" ]]; then
+        ACTIVE_TABLE=$(jq -r '.active_table // "unknown"' "$SOMNIUM_SELECTION_PATH" 2>/dev/null || echo unknown)
+        echo "Error: Somnium selection has no instance (active_table=$ACTIVE_TABLE)" >&2
+        exit 1
+    fi
 else
     CLAUDE_PID=$(_find_claude_pid 2>/dev/null || true)
     QUERY="cwd=$(pwd)"

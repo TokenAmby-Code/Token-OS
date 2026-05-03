@@ -88,6 +88,7 @@ _timer_cache = {
     "backlog_secs": 0,
     "mode": "working",
     "work_mode": "clocked_in",
+    "work_state": {},
 }
 
 # Layout detection thresholds
@@ -121,7 +122,10 @@ deploy_auto_switched = False
 DEPLOY_SCAN_DIR = Path.home() / "ProcAgentDir"
 TUI_SIGNAL_DIR = Path.home() / ".claude"
 TUI_SLOTS = ("desktop",)  # Signal file slots
+TUI_STATE_DIR = Path.home() / ".claude" / "tui-state"
+SOMNIUM_SELECTION_PATH = TUI_STATE_DIR / "somnium.json"
 console = Console()
+_last_selection_state_json: str | None = None
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -166,6 +170,69 @@ def check_tui_restart_signal(slot: str) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _selection_summary(
+    displayed: list,
+    cron_jobs: list,
+    archived: list,
+) -> dict:
+    """Build externalized operator selection state for tmux commands."""
+    selected_instance = None
+    selected_cron_job = None
+
+    if table_mode == "instances" and displayed and 0 <= selected_index < len(displayed):
+        selected_instance = displayed[selected_index]
+    elif table_mode == "archived" and archived and 0 <= archived_selected_index < len(archived):
+        selected_instance = archived[archived_selected_index]
+    elif table_mode == "cron" and cron_jobs and 0 <= cron_selected_index < len(cron_jobs):
+        selected_cron_job = cron_jobs[cron_selected_index]
+
+    return {
+        "surface": "somnium",
+        "active_table": table_mode,
+        "selected_instance_id": selected_instance.get("id") if selected_instance else None,
+        "selected_instance_name": (
+            format_instance_name(selected_instance, max_len=80) if selected_instance else None
+        ),
+        "selected_cron_job_id": selected_cron_job.get("id") if selected_cron_job else None,
+        "selected_cron_job_name": (
+            selected_cron_job.get("name") or selected_cron_job.get("id")
+            if selected_cron_job
+            else None
+        ),
+        "indices": {
+            "instances": selected_index,
+            "cron": cron_selected_index,
+            "archived": archived_selected_index,
+        },
+        "counts": {
+            "instances": len(displayed),
+            "cron": len(cron_jobs),
+            "archived": len(archived),
+        },
+        "updated_at": datetime.now().astimezone().isoformat(),
+    }
+
+
+def publish_selection_state(displayed: list, cron_jobs: list, archived: list) -> None:
+    """Publish TUI selection state for tmux active-pane commands."""
+    global _last_selection_state_json
+    try:
+        state = _selection_summary(displayed, cron_jobs, archived)
+        comparable_state = dict(state)
+        comparable_state.pop("updated_at", None)
+        encoded = json.dumps(comparable_state, sort_keys=True, separators=(",", ":"))
+        if encoded == _last_selection_state_json:
+            return
+
+        TUI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = SOMNIUM_SELECTION_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        tmp_path.replace(SOMNIUM_SELECTION_PATH)
+        _last_selection_state_json = encoded
+    except Exception:
+        pass
 
 
 def check_api_health() -> tuple[bool, str | None]:
@@ -720,10 +787,51 @@ def _read_timer() -> dict:
             "activity": data.get("activity", "working"),
             "productivity_active": data.get("productivity_active", False),
             "ahk_reachable": data.get("ahk_reachable"),
+            "work_state": data.get("work_state") or {},
         }
     except Exception:
         pass
     return _timer_cache
+
+
+def _activity_icon_text(timer: dict | None = None) -> Text:
+    """Visible compact icons for what Token-API thinks is active."""
+    timer = timer or _read_timer()
+    icons = (timer.get("work_state") or {}).get("activity_icons") or []
+    text = Text()
+    any_active = False
+    for icon in icons:
+        label = icon.get("label", "")
+        glyph = icon.get("icon", "?")
+        active = icon.get("active", False)
+        style = "bold green" if active else "dim"
+        if active:
+            any_active = True
+        text.append(f"{glyph}", style=style)
+        if label:
+            text.append(f":{label[:3]} ", style=style)
+        else:
+            text.append(" ", style=style)
+    if not icons:
+        text.append("▶:You ♪:Spo ◉:Gam M:Mew ", style="dim")
+    elif not any_active:
+        text.append("clear", style="dim")
+    return text
+
+
+def _active_distraction_label(timer: dict | None = None) -> str:
+    timer = timer or _read_timer()
+    icons = (timer.get("work_state") or {}).get("activity_icons") or []
+    active = [icon for icon in icons if icon.get("active")]
+    if active:
+        return "+".join(f"{icon.get('icon', '?')} {icon.get('label', '?')}" for icon in active)
+    desktop = timer.get("desktop_mode", "silence")
+    phone = timer.get("phone_app")
+    if phone:
+        return f"phone {phone}"
+    if desktop and desktop != "silence":
+        return desktop
+    return "clear"
 
 
 def utc_to_local_timestr(utc_str: str) -> str:
@@ -768,12 +876,13 @@ def break_balance_style(break_secs: int, backlog_secs: int) -> str:
 
 
 def get_timer_header_text() -> Text:
-    """Generate timer/mode display for header. Reads directly from in-memory timer via API."""
+    """Generate the six-line live state header."""
     state = _read_timer()
     break_secs = state["break_secs"]
     backlog_secs = state["backlog_secs"]
     obsidian_mode = state["mode"]
     work_mode = state["work_mode"]
+    work_state = state.get("work_state") or {}
 
     # Mode icons
     mode_icons = {
@@ -802,44 +911,60 @@ def get_timer_header_text() -> Text:
     else:
         work_indicator = ""
 
-    # Build display text
+    active_count = int(work_state.get("active_instance_count", 0) or 0)
+    observed_count = int(work_state.get("observed_agent_count", 0) or 0)
+    processing_count = int(work_state.get("processing_recent_count", 0) or 0)
+    numerator = active_count + observed_count
+    distraction_label = _active_distraction_label(state)
+    prod_active = bool(work_state.get("productivity_active", state.get("productivity_active")))
+    prod_style = "green" if prod_active else "red"
+    prod_label = "productive" if prod_active else "not productive"
+
+    desktop = state.get("desktop_mode", "silence")
+    phone = state.get("phone_app") or "none"
+    reason = work_state.get("reason", "")
+
     text = Text()
-    text.append(f"{icon} ", style="bold")
-    text.append(f"{mode_name}", style="bold white")
-    text.append("  ", style="dim")
-    text.append("⏱ ", style="dim")
+    text.append("Mode       ", style="bold cyan")
+    text.append(f"{icon} {mode_name}", style="bold white")
+    text.append("  Break ", style="dim")
     if is_backlog:
         text.append("BACKLOG ", style=break_style)
     text.append(break_str, style=break_style)
     if work_indicator:
         text.append(f"  {work_indicator}")
+    text.append("\n")
 
-    # Mode distribution bar (compact, inline)
-    shifts_data = _fetch_timer_shifts()
-    mode_dist = shifts_data.get("mode_distribution", {}) if shifts_data else {}
-    if mode_dist:
-        text.append("  ")
-        text.append_text(_mode_bar(mode_dist, width=20))
-        # Inline legend (top 3 modes)
-        total = sum(mode_dist.values())
-        MODE_SHORTS = {
-            "working": ("wrk", "bright_white"),
-            "multitasking": ("multi", "yellow"),
-            "idle": ("idle", "dim"),
-            "break": ("brk", "blue"),
-            "distracted": ("dist", "red"),
-            "sleeping": ("slp", "dim"),
-        }
-        legend_parts = []
-        for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
-            pct = round(secs / total * 100)
-            if pct < 5:
-                continue
-            short, color = MODE_SHORTS.get(mode, (mode[-4:], "white"))
-            legend_parts.append((f" {short}{pct}%", color))
-        text.append(" ")
-        for label, color in legend_parts[:3]:
-            text.append(label, style=color)
+    text.append("Work/Dist  ", style="bold cyan")
+    text.append(str(numerator), style="bold green" if numerator else "bold red")
+    text.append(" / ", style="dim")
+    dist_style = "bold yellow" if distraction_label != "clear" else "dim"
+    text.append(distraction_label, style=dist_style)
+    text.append(f"  [{prod_label}]", style=prod_style)
+    text.append("\n")
+
+    text.append("Signals    ", style="bold cyan")
+    text.append_text(_activity_icon_text(state))
+    text.append("\n")
+
+    text.append("Agents     ", style="bold cyan")
+    text.append(f"tracked={active_count} observed={observed_count} processing={processing_count}", style="white")
+    if reason:
+        text.append(f"  {reason}", style="dim")
+    text.append("\n")
+
+    text.append("Distraction ", style="bold cyan")
+    text.append(f"desktop={desktop}", style="yellow" if desktop not in ("silence", None) else "dim")
+    text.append("  ")
+    text.append(f"phone={phone}", style="yellow" if phone != "none" else "dim")
+    text.append("\n")
+
+    text.append("Control    ", style="bold cyan")
+    text.append(f"work_mode={work_mode}", style="white")
+    text.append("  ")
+    text.append("AHK=", style="dim")
+    ahk = state.get("ahk_reachable")
+    text.append("ok" if ahk else "down/unknown", style="green" if ahk else "red")
 
     return text
 
@@ -1284,6 +1409,7 @@ def create_events_panel(events: list) -> Panel:
         "phone_distraction_blocked": ("red", "📱", "blocked"),
         "phone_app_open": ("yellow", "📱", "opened"),
         "phone_app_close": ("blue", "📱", "closed"),
+        "enforcement_negative_edge": ("green", "✓", "resolved"),
         "phone_geofence": ("cyan", "📍", "geofence"),
         "location_event": ("cyan", "📍", "location"),
         "golden_throne_scheduled": ("magenta", "⏱", "GT scheduled"),
@@ -1324,14 +1450,22 @@ def create_events_panel(events: list) -> Panel:
                 "phone_distraction_blocked",
                 "phone_app_open",
                 "phone_app_close",
+                "enforcement_negative_edge",
             ):
-                app_display = details.get("display_name") or details.get("app", "?")
+                app_display = (
+                    details.get("display_name")
+                    or details.get("app")
+                    or details.get("surface")
+                    or "enforcement"
+                )
                 # Strip raw trigger prefix for cleaner display
                 for prefix in ("Application Launched (", "Application Closed ("):
                     if app_display.startswith(prefix) and app_display.endswith(")"):
                         app_display = app_display[len(prefix) : -1]
                 reason = details.get("reason", "")
                 msg = f"[{color}]{icon}[/{color}] [bold]{app_display}[/bold]: [{color}]{action}[/{color}]"
+                if event_type == "enforcement_negative_edge":
+                    msg += f" [dim]acks={details.get('acknowledged_expected_acks', 0)}[/dim]"
                 if reason and event_type not in ("phone_app_closed", "phone_app_close"):
                     msg += f" [dim]({reason})[/dim]"
             elif event_type in ("phone_geofence", "location_event"):
@@ -2169,6 +2303,7 @@ def _format_context_section() -> list:
     phone_app = timer.get("phone_app")
     activity = timer.get("activity", "working")
     productivity = timer.get("productivity_active", False)
+    work_state = timer.get("work_state") or {}
 
     ACTIVITY_LABELS = {
         "silence": "Focused work (silence)",
@@ -2185,6 +2320,9 @@ def _format_context_section() -> list:
     lines.append(
         Text.from_markup(f"  [bold]Activity[/bold]  [{doing_color}]{doing}[/{doing_color}]")
     )
+    icon_line = Text("  Icons     ", style="bold")
+    icon_line.append_text(_activity_icon_text(timer))
+    lines.append(icon_line)
 
     # Location inference
     location = timer.get("location_zone")
@@ -2194,8 +2332,14 @@ def _format_context_section() -> list:
     # Productivity state
     prod_style = "green" if productivity else "red"
     prod_label = "Active" if productivity else "Inactive"
+    reason = work_state.get("reason", "")
+    active_instances = work_state.get("active_instance_count", 0)
+    observed_agents = work_state.get("observed_agent_count", 0)
     lines.append(
-        Text.from_markup(f"  [bold]Prod[/bold]     [{prod_style}]{prod_label}[/{prod_style}]")
+        Text.from_markup(
+            f"  [bold]Prod[/bold]     [{prod_style}]{prod_label}[/{prod_style}] "
+            f"[dim]tracked={active_instances} observed={observed_agents} {reason}[/dim]"
+        )
     )
 
     # AHK reachable?
@@ -2408,6 +2552,8 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
             text.append("*", style="green")
         else:
             text.append("o", style="dim")
+        text.append(" ")
+        text.append_text(_activity_icon_text(state))
         text.append(f"  sel:{selected_idx + 1}", style="dim")
         text.append(f"  [{page_indicator}]", style="cyan")
 
@@ -2534,6 +2680,8 @@ def generate_mobile_widget(instances: list) -> Layout:
         header.append("  OFF", style="dim")
     elif work_mode == "gym":
         header.append("  GYM", style="magenta")
+    header.append("  ", style="dim")
+    header.append_text(_activity_icon_text(state))
 
     # Instance count
     header.append(f"  [{len(active)}]", style="green" if active else "dim")
@@ -2701,7 +2849,8 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
         info_lines = max(1, info_size - 2)
     else:
         # Normal: header + adaptive sizing
-        header_size = 3
+        # Six live-state rows plus the Rich panel border.
+        header_size = 8
 
         # Instance table: sized to fit content (primary element)
         # Account for group headers and section dividers
@@ -3127,6 +3276,9 @@ def main():
             else set()
         )
         displayed = _get_displayed()
+        cron_jobs = get_cached_cron_jobs()
+        archived = _get_archived()
+        publish_selection_state(displayed, cron_jobs, archived)
         live_ref.update(get_dashboard(displayed, selected_index))
         live_ref.refresh()
         # Re-hide cursor after every render (Rich may re-show it during redraws)
@@ -3157,6 +3309,7 @@ def main():
         # We suppress cursor throughout the TUI lifecycle and only restore it
         # temporarily during input prompts (live.stop() restores normal terminal).
         console.show_cursor(False)
+        publish_selection_state(_get_displayed(), get_cached_cron_jobs(), _get_archived())
         with Live(
             get_dashboard(_get_displayed(), selected_index),
             console=console,

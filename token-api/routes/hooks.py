@@ -43,6 +43,8 @@ from session_doc_helpers import (
     update_frontmatter,
 )
 from shared import (
+    ASKQ_BUST_PROMPT,
+    ASKQ_LADDER,
     DB_PATH,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
@@ -71,6 +73,8 @@ _timer_engine: Any = None
 _timer_log_shift: Callable[..., Any] | None = None
 _run_stop_evaluators: Callable[..., Any] | None = None
 _auto_name_instance: Callable[..., Any] | None = None
+_work_action_callback: Callable[..., Any] | None = None
+_askq_touch2_callback: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -80,16 +84,21 @@ def init_deps(
     timer_log_shift=None,
     run_stop_evaluators=None,
     auto_name_instance=None,
+    work_action_callback=None,
+    askq_touch2_callback=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
-    global _run_stop_evaluators, _auto_name_instance
+    global _run_stop_evaluators, _auto_name_instance, _work_action_callback
+    global _askq_touch2_callback
 
     _scheduler = scheduler
     _timer_engine = timer_engine
     _timer_log_shift = timer_log_shift
     _run_stop_evaluators = run_stop_evaluators
     _auto_name_instance = auto_name_instance
+    _work_action_callback = work_action_callback
+    _askq_touch2_callback = askq_touch2_callback
 
 
 def _require_dep(name: str, value):
@@ -133,6 +142,39 @@ NUDGE_COOLDOWN_SECONDS = 300  # 5 minutes
 # (self-eval complete, chose not to continue), the second stop passes through.
 _self_eval_pending: dict[str, float] = {}  # session_id -> timestamp of block
 SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
+
+
+async def _tmux_pane_exists(tmux_pane: str | None) -> bool:
+    return await shared.tmux_pane_exists(tmux_pane)
+
+
+async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) -> bool:
+    tmux_pane = existing.get("tmux_pane")
+    if not tmux_pane:
+        return False
+    if existing.get("status") == "stopped":
+        return True
+    if await _tmux_pane_exists(tmux_pane):
+        return False
+    await sanctioned_update_instance(
+        db,
+        instance_id=session_id,
+        updates={
+            "status": "stopped",
+            "synced": 0,
+            "stopped_at": datetime.now().isoformat(),
+        },
+        mutation_type="instance_stopped",
+        write_source="hooks",
+        actor=f"{actor}-dead-pane",
+    )
+    await db.commit()
+    await log_event(
+        "hook_ignored_dead_pane",
+        instance_id=session_id,
+        details={"actor": actor, "tmux_pane": tmux_pane},
+    )
+    return True
 
 
 # Legion → Discord bot name mapping
@@ -1239,6 +1281,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
         existing = await cursor.fetchone()
         if not existing:
             return {"success": False, "action": "not_found"}
+        existing_dict = dict(existing)
+        if await _stop_if_dead_pane(db, session_id, existing_dict, "PromptSubmit"):
+            return {
+                "success": True,
+                "action": "ignored_dead_pane",
+                "instance_id": session_id,
+            }
 
         # Also resurrect stopped instances - activity means they're active
         # Backfill PID if payload contains one and DB value is NULL
@@ -1249,7 +1298,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 "status": "processing",
                 "last_activity": now,
                 "stopped_at": None,
-                "pid": existing["pid"] or payload.get("pid"),
+                "pid": existing_dict.get("pid") or payload.get("pid"),
             },
             mutation_type="status_changed",
             write_source="hooks",
@@ -1266,6 +1315,8 @@ async def handle_prompt_submit(payload: dict) -> dict:
         new_mode = shared.timer_engine.current_mode.value
         await shared.timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
         logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
+    if _work_action_callback:
+        await _work_action_callback(source="prompt_submit", note=f"session_id={session_id}")
 
     # Golden Throne: cancel any pending follow-up (user is active)
     try:
@@ -1286,8 +1337,14 @@ async def handle_prompt_submit(payload: dict) -> dict:
 async def handle_post_tool_use(payload: dict) -> dict:
     """Handle PostToolUse hook - heartbeat with debouncing, ensures status='processing'."""
     session_id = payload.get("session_id")
+    tool_name = payload.get("tool_name", "")
     if not session_id:
         return {"success": False, "action": "no_session_id"}
+
+    # AskUserQuestion answered → cancel any active three-touch ladder.
+    # Done before debounce so a quick-answered question always cancels.
+    if tool_name == "AskUserQuestion" and session_id in ASKQ_LADDER:
+        await _askq_ladder_cancel(session_id, reason="answered")
 
     # Debounce: only update every 2 seconds per session
     current_time = time.time()
@@ -1306,6 +1363,12 @@ async def handle_post_tool_use(payload: dict) -> dict:
         existing = await _fetch_instance_row(db, session_id)
         if not existing:
             return {"success": False, "action": "not_found", "instance_id": session_id}
+        if await _stop_if_dead_pane(db, session_id, existing, "PostToolUse"):
+            return {
+                "success": True,
+                "action": "ignored_dead_pane",
+                "instance_id": session_id,
+            }
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
@@ -1622,6 +1685,195 @@ async def handle_stop(payload: dict) -> dict:
     return result
 
 
+# ============ AskUserQuestion Three-Touch Ladder ============
+#
+# Replaces the perma-block / silent auto-approve behavior with a graduated
+# commitment ladder. Brace-for-skip — Touch 2 is the heavy hit, not a polite
+# repeat. Active for voice-chat or golden_throne instances only.
+#
+#   T1 elapses → Touch 2 (enforcement cascade)
+#   T2 elapses → Touch 3 (TTS re-read so Emperor doesn't lose what was asked)
+#   T3 elapses → Bust (autonomous fallback prompt to the asking instance)
+#
+# Cancellation: PostToolUse(AskUserQuestion) means the question was answered.
+
+
+async def _askq_ladder_run(instance_id: str, question_text: str) -> None:
+    """Background coroutine that walks the three-touch ladder for one question.
+
+    Cancelled by PostToolUse(AskUserQuestion) when the user answers.
+    """
+    state = ASKQ_LADDER.get(instance_id)
+    if not state:
+        return
+
+    try:
+        # ── T1 elapses → Touch 2 (enforcement cascade) ──
+        await asyncio.sleep(shared.ASKQ_T1_SECONDS)
+        state["current_touch"] = 2
+        await log_event(
+            "askq_touch2_enforcement",
+            instance_id=instance_id,
+            details={"question": question_text[:200], "elapsed_s": shared.ASKQ_T1_SECONDS},
+        )
+        logger.info(f"AskQ ladder: Touch 2 (enforcement) for {instance_id[:12]}")
+        if _askq_touch2_callback is not None:
+            try:
+                result = _askq_touch2_callback(instance_id, question_text)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"AskQ ladder: Touch 2 callback failed: {e}")
+
+        # ── T2 elapses → Touch 3 (re-read via TTS) ──
+        await asyncio.sleep(shared.ASKQ_T2_SECONDS)
+        state["current_touch"] = 3
+        await log_event(
+            "askq_touch3_repeat",
+            instance_id=instance_id,
+            details={"question": question_text[:200]},
+        )
+        logger.info(f"AskQ ladder: Touch 3 (TTS re-read) for {instance_id[:12]}")
+        try:
+            await queue_tts(instance_id, question_text, queue_target="hot")
+        except Exception as e:
+            logger.warning(f"AskQ ladder: Touch 3 TTS failed: {e}")
+
+        # ── T3 elapses → Bust (autonomous fallback prompt) ──
+        await asyncio.sleep(shared.ASKQ_T3_SECONDS)
+        state["current_touch"] = "bust"
+        await log_event(
+            "askq_bust",
+            instance_id=instance_id,
+            details={"question": question_text[:200]},
+        )
+        logger.info(f"AskQ ladder: BUST for {instance_id[:12]} — sending autonomous prompt")
+        await _askq_send_bust_prompt(instance_id, state)
+
+    except asyncio.CancelledError:
+        logger.info(
+            f"AskQ ladder: cancelled for {instance_id[:12]} (touch={state.get('current_touch')})"
+        )
+        raise
+    finally:
+        # Only clean up our own state — a newer ladder may have replaced us.
+        if ASKQ_LADDER.get(instance_id) is state:
+            ASKQ_LADDER.pop(instance_id, None)
+
+
+async def _askq_send_bust_prompt(instance_id: str, state: dict) -> None:
+    """Deliver the autonomous-fallback prompt to the asking instance via claude-cmd."""
+    tmux_pane = state.get("tmux_pane")
+    if not tmux_pane:
+        # Re-fetch from DB in case state didn't capture it
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                    (instance_id,),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    tmux_pane = row[0]
+        except Exception:
+            pass
+
+    if not tmux_pane:
+        logger.warning(f"AskQ ladder: bust prompt skipped for {instance_id[:12]} — no tmux_pane")
+        return
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude-cmd",
+            "--pane",
+            tmux_pane,
+            ASKQ_BUST_PROMPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            logger.warning(
+                f"AskQ ladder: claude-cmd bust failed for {instance_id[:12]}: "
+                f"{stderr.decode()[:200]}"
+            )
+    except Exception as e:
+        logger.warning(f"AskQ ladder: bust delivery failed for {instance_id[:12]}: {e}")
+
+
+def _askq_should_engage_ladder(instance_row: dict | None, session_id: str) -> bool:
+    """Ladder fires only for voice-chat or golden_throne instances. Plain CLI sessions
+    keep the native dialog."""
+    if session_id in VOICE_CHAT_SESSIONS:
+        return True
+    if not instance_row:
+        return False
+    return instance_row.get("instance_type") == "golden_throne"
+
+
+async def _askq_ladder_start(
+    session_id: str,
+    question_text: str,
+    options: list[str],
+    instance_row: dict | None,
+) -> None:
+    """Arm the three-touch ladder for an AskUserQuestion. Cancels any prior ladder
+    for the same instance (newer question supersedes)."""
+    prior = ASKQ_LADDER.pop(session_id, None)
+    if prior and prior.get("task") and not prior["task"].done():
+        prior["task"].cancel()
+
+    state: dict[str, Any] = {
+        "question_text": question_text,
+        "options": options,
+        "started_at": time.monotonic(),
+        "current_touch": 1,
+        "task": None,
+        "tmux_pane": (instance_row or {}).get("tmux_pane"),
+        "device_id": (instance_row or {}).get("device_id"),
+        "tts_voice": (instance_row or {}).get("tts_voice"),
+    }
+    ASKQ_LADDER[session_id] = state
+    state["task"] = asyncio.create_task(_askq_ladder_run(session_id, question_text))
+
+    await log_event(
+        "askq_touch1_initial",
+        instance_id=session_id,
+        details={
+            "question": question_text[:200],
+            "options": options[:5],
+            "t1_s": shared.ASKQ_T1_SECONDS,
+            "t2_s": shared.ASKQ_T2_SECONDS,
+            "t3_s": shared.ASKQ_T3_SECONDS,
+        },
+    )
+    logger.info(f"AskQ ladder: Touch 1 armed for {session_id[:12]} — T1={shared.ASKQ_T1_SECONDS}s")
+
+
+async def _askq_ladder_cancel(session_id: str, reason: str = "answered") -> None:
+    """Cancel any active ladder for this instance (called on PostToolUse(AskUserQuestion))."""
+    state = ASKQ_LADDER.pop(session_id, None)
+    if not state:
+        return
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()
+    elapsed = time.monotonic() - state.get("started_at", time.monotonic())
+    await log_event(
+        "askq_ladder_cancelled",
+        instance_id=session_id,
+        details={
+            "reason": reason,
+            "touch_at_cancel": state.get("current_touch"),
+            "elapsed_s": round(elapsed, 1),
+        },
+    )
+    logger.info(
+        f"AskQ ladder: cancelled for {session_id[:12]} "
+        f"(touch={state.get('current_touch')}, elapsed={elapsed:.1f}s, reason={reason})"
+    )
+
+
 async def handle_pre_tool_use(payload: dict) -> dict:
     """Handle PreToolUse hook - marks processing, can block operations like 'make deploy'."""
     session_id = payload.get("session_id")
@@ -1651,30 +1903,44 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         )
         return {"success": True, "action": "allowed"}
 
-    # Voice chat: when AskUserQuestion fires for a voice-chat-active instance,
-    # 1) TTS the question text so the user hears it spoken
-    # 2) trigger AHK to auto-select "Other" and start dictation
-    if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
-        # Extract and speak question text
-        questions = tool_input.get("questions", [])
-        if questions:
-            tts_parts = []
-            for q in questions:
-                question_text = q.get("question", "")
-                if question_text:
-                    tts_parts.append(question_text)
-            if tts_parts:
-                tts_message = " ".join(tts_parts)
+    # AskUserQuestion three-touch ladder + voice-chat AHK side effect.
+    # Fetch instance row once for ladder eligibility (voice-chat OR golden_throne).
+    askq_instance_row: dict | None = None
+    if tool_name == "AskUserQuestion" and session_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT instance_type, tmux_pane, device_id, tts_voice "
+                "FROM claude_instances WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                askq_instance_row = dict(row)
+
+        if _askq_should_engage_ladder(askq_instance_row, session_id):
+            # Touch 1: TTS the question text + arm the ladder.
+            questions = tool_input.get("questions", [])
+            tts_parts = [q.get("question", "") for q in questions if q.get("question")]
+            tts_message = " ".join(tts_parts).strip()
+            options = []
+            if questions:
+                options = [o for o in (questions[0].get("options") or []) if isinstance(o, str)]
+            if tts_message:
                 try:
                     await queue_tts(session_id, tts_message, queue_target="hot")
                     logger.info(
-                        f"PreToolUse: Voice chat TTS queued (hot) for {session_id[:12]}: {tts_message[:80]}"
+                        f"PreToolUse: AskQ Touch 1 TTS queued (hot) for {session_id[:12]}: "
+                        f"{tts_message[:80]}"
                     )
                 except Exception as e:
-                    logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
+                    logger.warning(
+                        f"PreToolUse: AskQ Touch 1 TTS failed for {session_id[:12]}: {e}"
+                    )
+                await _askq_ladder_start(session_id, tts_message, options, askq_instance_row)
 
-        # Return local_exec so generic-hook.sh runs AHK on WSL
-        # voice-send-keys.ahk uses tmux send-keys — no WinActivate needed
+    # Voice chat: trigger AHK so dictation captures the answer (voice-chat only).
+    if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
         vc_session = VOICE_CHAT_SESSIONS.get(session_id, {})
         tmux_pane = vc_session.get("tmux_pane", "")
         pane_arg = f' "{tmux_pane}"' if tmux_pane else ""

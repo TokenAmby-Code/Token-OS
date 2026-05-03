@@ -5,6 +5,8 @@ import sqlite3
 def test_game_turn_endpoint_records_observational_event(app_env):
     from fastapi.testclient import TestClient
 
+    app_env.main.DESKTOP_STATE["work_mode"] = "clocked_out"
+
     client = TestClient(app_env.main.app)
     resp = client.post(
         "/games/turn",
@@ -22,6 +24,7 @@ def test_game_turn_endpoint_records_observational_event(app_env):
         "recorded": True,
         "block": False,
         "reason": "observational_only",
+        "ack_id": None,
     }
 
     conn = sqlite3.connect(app_env.db_path)

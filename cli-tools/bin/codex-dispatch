@@ -23,6 +23,7 @@ RESOLVED_TMUX_PANE=""
 LAUNCH_MODE="direct_target"
 TRANSPLANT_EXPECTED="false"
 LAUNCHER="codex-dispatch"
+CODEX_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --launch-mode) LAUNCH_MODE="$2"; shift 2 ;;
     --transplant-expected) TRANSPLANT_EXPECTED="$2"; shift 2 ;;
     --launcher) LAUNCHER="$2"; shift 2 ;;
+    --profile) CODEX_PROFILE="$2"; shift 2 ;;
     --) shift; break ;;
     -*) echo "Unknown option: $1" >&2; exit 64 ;;
     *) break ;;
@@ -86,6 +88,7 @@ build_env_object() {
   [[ -n "${TMUX:-}" ]]               && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
   [[ -n "${TMUX_PANE:-}" ]]          && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX_PANE" '. + {TMUX_PANE: $v}')
   [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
+  [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_CODEX_PROFILE" '. + {TOKEN_API_CODEX_PROFILE: $v}')
   echo "$env_obj"
 }
 
@@ -181,11 +184,17 @@ CODEX_ENV=(
   "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
   "TOKEN_API_TRANSPLANT_EXPECTED=${TRANSPLANT_EXPECTED}"
   "TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TMUX_PANE}"
+  "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
 )
+
+CODEX_PROFILE_ARGS=()
+if [[ -n "$CODEX_PROFILE" ]]; then
+  CODEX_PROFILE_ARGS=(--profile "$CODEX_PROFILE")
+fi
 
 if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
   OUTPUT_FILE="/tmp/codex-${SESSION_ID}.md"
-  env "${CODEX_ENV[@]}" codex exec "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
+  env "${CODEX_ENV[@]}" codex exec ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
 else
-  env "${CODEX_ENV[@]}" codex "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
+  env "${CODEX_ENV[@]}" codex ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
 fi

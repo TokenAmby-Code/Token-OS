@@ -6,7 +6,7 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 - **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
 - **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
-- **TUI**: `token-api-tui.py` - Rich-based dashboard for monitoring instances
+- **Somnium display/control**: HTML/Obsidian is the preferred rich dashboard surface; tmux owns active-pane operational keybindings; `token-api-tui.py` is legacy terminal status/selection UI
 - **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
 
 ### Multi-Device Network
@@ -20,8 +20,22 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
 - **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
 - `token-restart` orchestrates all three: Mac restart → WSL restart → phone signal
-- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`
+- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`, but new rich visualization work should target HTML served by Token-API and embedded in Obsidian
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
+
+### Somnium Display/Control Directive
+
+High-level directive: see `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Somnium Display and Control Surface Directive.md`.
+
+The current direction is:
+
+- HTML is the primary rich visualization surface for somnium dashboards, graphs, timelines, and cohesive state views.
+- Obsidian is the preferred frame for viewing those HTML dashboards.
+- tmux owns active-pane operator keybindings for the somnium pane/window.
+- `token-api-tui.py` should narrow toward compact status rendering and explicit selection-state export.
+- Token-API remains the authoritative state/mutation backend.
+
+Do not add new primary operational keybindings to `token-api-tui.py`. New actions should be Token-API/CLI mutations invoked from tmux keybindings. Existing TUI commands are compatibility behavior while the migration is underway.
 
 ## Key Files
 
@@ -32,7 +46,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
 | `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
-| `token-api-tui.py` | TUI dashboard (~1500 lines) |
+| `token-api-tui.py` | Legacy Rich terminal dashboard; should evolve toward compact status/selection export |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
 
@@ -271,9 +285,9 @@ The `tab_name` field stores the instance display name. The TUI displays:
 Auto-generated names match pattern `Claude HH:MM`. Any other name is considered custom.
 
 Rename via:
-- TUI: Press `r` on selected instance
 - CLI: `instance-name "my-name"`
 - API: `PATCH /api/instances/{id}/rename` with `{"tab_name": "..."}`
+- Legacy TUI compatibility: press `r` on selected instance
 
 ## Subagent Tagging
 
@@ -285,7 +299,7 @@ Headless Claude instances spawned by `subagent --claude`, cron jobs, or scripts 
 3. The server reads `TOKEN_API_SUBAGENT` from the hook payload and sets `is_subagent=1`, `spawner=<value>`
 4. Subagents are auto-named `"sub: <spawner>"` and **skip TTS profile assignment** (no voice slot consumed)
 
-**TUI behavior:**
+**TUI/display behavior:**
 - Subagents are **hidden by default** — press `a` to toggle visibility
 - When visible, subagent rows are dimmed with an `@` prefix
 - Status bar shows `+N sub` count when subagents are hidden
@@ -297,7 +311,20 @@ export TOKEN_API_SUBAGENT="cron:task-worker"
 claude -p "do the thing"
 ```
 
-## TUI Controls
+## Somnium Controls
+
+The old TUI keyboard layer predates the managed tmux workspace and overlaps with tmux responsibilities. Treat it as compatibility behavior.
+
+Preferred model:
+
+- tmux key tables own active-pane operator shortcuts for the somnium pane/window
+- CLI/API commands perform mutations
+- the TUI publishes selected UI object state, for example `~/.claude/tui-state/somnium.json`
+- HTML/Obsidian renders rich dashboards and graphs from Token-API read models
+
+Selection-state files are operator UI state only. Commands consuming them must validate referenced instances/jobs against Token-API before mutating anything.
+
+### Legacy TUI Controls
 
 ```
 ↑↓ / jk  - Navigate instances (up/down)
@@ -425,7 +452,7 @@ Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores th
 
 ### TTS Mode Cycle
 
-Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Cycled via `m` key in TUI. Stored as `tts_mode` in DB per instance.
+Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Stored as `tts_mode` in DB per instance. Legacy TUI compatibility cycles it with `m`; new operator bindings should call CLI/API mutations from tmux.
 
 | Mode | Behavior |
 |------|----------|
@@ -438,7 +465,7 @@ Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Cycled via `m
 
 > **STATUS: UNVALIDATED (2026-03-09)** — Not yet tested end-to-end.
 
-Voice chat is a TTS mode (`voice-chat`) rather than a separate system. The `m` key in TUI cycles into it. When active, the instance name shows a microphone emoji in the TUI (TUI-only display, not stored in DB).
+Voice chat is a TTS mode (`voice-chat`) rather than a separate system. Legacy TUI compatibility cycles into it with `m`. When active, the instance name shows a microphone emoji in the TUI (TUI-only display, not stored in DB).
 
 The old `/api/instances/{id}/voice-chat` endpoint still works but also sets `tts_mode` in DB. `VOICE_CHAT_SESSIONS` in-memory dict is re-hydrated from DB `tts_mode` on instance list queries.
 
@@ -574,6 +601,8 @@ Location: `token-api-tui.py` - `todos_cache` global, `get_instance_todos()` with
 - TUI polls database directly, not via API (for speed)
 - TUI refresh interval: 2 seconds
 - Database changes from CLI/API are picked up on next TUI refresh
+- New rich dashboards should be implemented as HTML served by Token-API, suitable for Obsidian iframe/embed viewing.
+- New operational shortcuts should be tmux active-pane bindings calling CLI/API commands, not new TUI key handlers.
 
 ## Potential Future Tools/Skills
 

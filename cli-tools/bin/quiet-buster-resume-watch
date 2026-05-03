@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# quiet-buster-resume-watch — resume a Codex thread if quiet mode is busted overnight
+# TAGS: token-api, cron, tmux, legion
+# AUDIENCE: agent
+
+set -euo pipefail
+
+DB_PATH="${QUIET_BUSTER_RESUME_DB:-$HOME/.claude/agents.db}"
+THREAD_ID="${QUIET_BUSTER_RESUME_THREAD_ID:-}"
+WORKDIR="${QUIET_BUSTER_RESUME_WORKDIR:-/Volumes/Imperium/Token-OS/token-api}"
+CHECK_AFTER="${QUIET_BUSTER_RESUME_CHECK_AFTER:-}"
+CHECK_UNTIL="${QUIET_BUSTER_RESUME_CHECK_UNTIL:-}"
+FLAG_PATH="${QUIET_BUSTER_RESUME_FLAG:-$HOME/.claude/quiet-buster-resume-fired.flag}"
+TMUX_SESSION="${QUIET_BUSTER_RESUME_TMUX_SESSION:-main}"
+TMUX_WINDOW="${QUIET_BUSTER_RESUME_TMUX_WINDOW:-legion}"
+
+if [[ -z "$THREAD_ID" ]]; then
+  echo "quiet-buster-resume-watch: QUIET_BUSTER_RESUME_THREAD_ID is required" >&2
+  exit 64
+fi
+
+if [[ -z "$CHECK_AFTER" || -z "$CHECK_UNTIL" ]]; then
+  echo "quiet-buster-resume-watch: CHECK_AFTER and CHECK_UNTIL are required" >&2
+  exit 64
+fi
+
+if [[ ! -f "$DB_PATH" ]]; then
+  echo "quiet-buster-resume-watch: database not found: $DB_PATH" >&2
+  exit 65
+fi
+
+disable_cron_job() {
+  if [[ -n "${CRON_JOB_ID:-}" ]]; then
+    sqlite3 "$DB_PATH" \
+      "UPDATE cron_jobs SET enabled = 0, updated_at = datetime('now') WHERE id = '${CRON_JOB_ID//\'/\'\'}';" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
+now_utc="$(date -u '+%Y-%m-%d %H:%M:%S')"
+if [[ "$now_utc" > "$CHECK_UNTIL" ]]; then
+  disable_cron_job
+  exit 0
+fi
+
+if [[ -e "$FLAG_PATH" ]]; then
+  disable_cron_job
+  exit 0
+fi
+
+hit="$(
+  sqlite3 "$DB_PATH" "
+    SELECT id || '|' || event_type || '|' || created_at
+    FROM events
+    WHERE event_type IN ('quiet_state_buster', 'quiet_state_buster_activity')
+      AND created_at >= '$CHECK_AFTER'
+      AND created_at <= '$CHECK_UNTIL'
+    ORDER BY created_at DESC
+    LIMIT 1;
+  "
+)"
+
+if [[ -z "$hit" ]]; then
+  exit 0
+fi
+
+mkdir -p "$(dirname "$FLAG_PATH")"
+printf '%s\n' "$hit" > "$FLAG_PATH"
+disable_cron_job
+
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "quiet-buster-resume-watch: tmux session not found: $TMUX_SESSION" >&2
+  exit 0
+fi
+
+if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qE "^${TMUX_WINDOW}(\([0-9]*\))?$"; then
+  tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" -d -c "$WORKDIR"
+fi
+
+target="${TMUX_SESSION}:${TMUX_WINDOW}"
+pane_id="$(tmux split-window -t "$target" -d -P -F '#{pane_id}' -c "$WORKDIR")"
+tmux select-layout -t "$target" tiled >/dev/null 2>&1 || true
+tmux select-window -t "$target"
+tmux select-pane -t "$pane_id"
+
+prompt="A quiet-mode state buster fired tonight (${hit}). Resume the quiet-hours implementation thread. Start by checking the Token-API worktree, current tests, and recent quiet_state_buster events. Keep the work scoped to the quiet timer state, state-buster resume behavior, and any verification needed from the previous context."
+
+printf -v workdir_q '%q' "$WORKDIR"
+printf -v thread_q '%q' "$THREAD_ID"
+printf -v prompt_q '%q' "$prompt"
+
+cmd="cd ${workdir_q} && codex resume -C ${workdir_q} --dangerously-bypass-approvals-and-sandbox ${thread_q} ${prompt_q}"
+
+sleep 0.5
+tmux send-keys -t "$pane_id" "$cmd" Enter
+tmux display-message "Quiet buster resume launched in ${pane_id}"

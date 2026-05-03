@@ -6,7 +6,7 @@ now_mono_ms parameters for deterministic testing.
 State model: three mode layers compose into 6 effective modes, plus focus overlay.
   Activity:     working | distraction   (from AHK/phone detection)
   Productivity: active | inactive       (from Claude instances / work actions)
-  Manual:       None | BREAK | SLEEPING (user-initiated overrides)
+  Manual:       None | BREAK | QUIET | SLEEPING (user-initiated overrides)
   Focus:        on | off                (user toggle, auto-off on distraction)
 """
 
@@ -27,6 +27,7 @@ class TimerMode(str, Enum):
     DISTRACTED = "distracted"
     IDLE = "idle"
     BREAK = "break"
+    QUIET = "quiet"
     SLEEPING = "sleeping"
 
 
@@ -54,6 +55,7 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
     TimerMode.IDLE: (0, 1),  # neutral
     TimerMode.DISTRACTED: (-1, 1),  # -60 min/hr (penalty)
     TimerMode.BREAK: (-1, 1),  # -60 min/hr (consuming break)
+    TimerMode.QUIET: (0, 1),  # neutral
     TimerMode.SLEEPING: (0, 1),  # neutral
 }
 
@@ -190,6 +192,12 @@ class TimerEngine:
     @property
     def manual_trigger(self) -> str | None:
         if self._manual_substate is None:
+            return None
+        return self._manual_substate.get("trigger")
+
+    @property
+    def quiet_context(self) -> str | None:
+        if self._manual_mode != TimerMode.QUIET or self._manual_substate is None:
             return None
         return self._manual_substate.get("trigger")
 
@@ -385,6 +393,26 @@ class TimerEngine:
             result.old_mode = old_mode
         return True, result
 
+    def enter_quiet(
+        self, now_mono_ms: int, context: str = "sleeping"
+    ) -> tuple[bool, TickResult]:
+        """Enter quiet mode. Context distinguishes sleeping from do-not-disturb."""
+        if self._manual_mode == TimerMode.QUIET and self.quiet_context == context:
+            return False, TickResult()
+
+        old_mode = self.effective_mode
+        result = self._advance(now_mono_ms)
+
+        self._set_manual_mode(TimerMode.QUIET, context, now_mono_ms, lock_duration_ms=0)
+        if self._manual_substate:
+            self._manual_substate["lock_until_ms"] = None
+
+        new_mode = self.effective_mode
+        if new_mode != old_mode:
+            result.events.append(TimerEvent.MODE_CHANGED)
+            result.old_mode = old_mode
+        return True, result
+
     def resume(self, now_mono_ms: int) -> tuple[bool, TickResult]:
         """Exit manual mode (break/sleeping). Returns (changed, result)."""
         if self._manual_mode is None:
@@ -428,21 +456,26 @@ class TimerEngine:
     # ---- Tick ----
 
     def tick(
-        self, now_mono_ms: int, today_date: str, current_hour: int | None = None
+        self,
+        now_mono_ms: int,
+        today_date: str,
+        current_hour: int | None = None,
+        suppress_idle_timeout: bool = False,
     ) -> TickResult:
         """Main tick: check daily reset, then advance counters."""
         reset_result = self._check_daily_reset(now_mono_ms, today_date, current_hour)
         if reset_result is not None:
             return reset_result
 
-        # Auto-switch from sleeping to working at reset hour
+        # Auto-switch from legacy sleeping to working at reset hour.
+        # QUIET is controlled by explicit sleep/wake endpoints and schedules.
         if (
             current_hour is not None
             and current_hour >= self._reset_hour
             and self._manual_mode == TimerMode.SLEEPING
         ):
             old_mode = self.effective_mode
-            result = self._advance(now_mono_ms)
+            result = self._advance(now_mono_ms, suppress_idle_timeout=suppress_idle_timeout)
             self._clear_manual_mode()
             new_mode = self.effective_mode
             if new_mode != old_mode:
@@ -450,7 +483,7 @@ class TimerEngine:
                 result.old_mode = old_mode
             return result
 
-        return self._advance(now_mono_ms)
+        return self._advance(now_mono_ms, suppress_idle_timeout=suppress_idle_timeout)
 
     # ---- Serialization ----
 
@@ -483,6 +516,7 @@ class TimerEngine:
             "activity": self._activity.value,
             "productivity_active": self._productivity_active,
             "manual_mode": self._manual_mode.value if self._manual_mode else None,
+            "quiet_context": self.quiet_context,
             # Focus layer
             "focus_active": self._focus_active,
             "total_focus_time_ms": self._total_focus_time_ms,
@@ -512,6 +546,7 @@ class TimerEngine:
             "activity": self._activity.value,
             "productivityActive": self._productivity_active,
             "manualMode": self._manual_mode.value if self._manual_mode else None,
+            "quietContext": self.quiet_context,
             "breakAvailableSeconds": round(max(0, self._break_balance_ms) / 1000),
             "breakBalanceSeconds": round(self._break_balance_ms / 1000),
             "isInBacklog": self._break_balance_ms < 0,
@@ -559,11 +594,13 @@ class TimerEngine:
         if self._manual_mode is not None:
             has_lock = data.get("manual_mode_lock", False)
             remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
-            trigger = data.get("manual_trigger", "user")  # default to "user" for pre-substate data
+            trigger = data.get("quiet_context") or data.get("manual_trigger", "user")
             self._manual_substate = {
                 "trigger": trigger,
                 "lock_until_ms": now_mono_ms + remaining if has_lock and remaining > 0 else None,
             }
+            if self._manual_mode == TimerMode.QUIET:
+                self._manual_substate["lock_until_ms"] = None
         else:
             self._manual_substate = None
 
@@ -626,10 +663,18 @@ class TimerEngine:
             self._activity = Activity.WORKING
             self._productivity_active = True
             self._clear_manual_mode()
+        elif old_mode == "quiet":
+            self._activity = Activity.WORKING
+            self._productivity_active = True
+            self._set_manual_mode(TimerMode.QUIET, data.get("quiet_context", "sleeping"), now_mono_ms)
+            if self._manual_substate:
+                self._manual_substate["lock_until_ms"] = None
         elif old_mode == "sleeping":
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._set_manual_mode(TimerMode.SLEEPING, "user", now_mono_ms)
+            self._set_manual_mode(TimerMode.QUIET, "sleeping", now_mono_ms)
+            if self._manual_substate:
+                self._manual_substate["lock_until_ms"] = None
         else:
             # Unknown mode — default to working
             self._activity = Activity.WORKING
@@ -687,7 +732,7 @@ class TimerEngine:
 
     # ---- Internal ----
 
-    def _advance(self, now_mono_ms: int) -> TickResult:
+    def _advance(self, now_mono_ms: int, suppress_idle_timeout: bool = False) -> TickResult:
         """Advance timer counters by elapsed time since last tick."""
         result = TickResult()
         elapsed_ms = now_mono_ms - self._last_tick_ms
@@ -731,11 +776,14 @@ class TimerEngine:
         elif mode == TimerMode.IDLE:
             # No accumulation. Check idle timeout → auto-break.
             psub = self._productivity_substate
-            if (
+            idle_timed_out = (
                 psub["idle_entered_ms"] is not None
                 and not psub["idle_timeout_exempt"]
                 and now_mono_ms - psub["idle_entered_ms"] >= psub["idle_timeout_ms"]
-            ):
+            )
+            if idle_timed_out and suppress_idle_timeout:
+                psub["idle_entered_ms"] = now_mono_ms
+            elif idle_timed_out:
                 old_mode = self.effective_mode
                 self._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_mono_ms)
                 psub["idle_entered_ms"] = None
@@ -747,7 +795,7 @@ class TimerEngine:
             self._total_break_time_ms += elapsed_ms
             self._apply_break_delta(-elapsed_ms, result)
 
-        # SLEEPING: no accumulation
+        # QUIET/SLEEPING: no accumulation
 
         # Focus layer: accumulate independently when active
         if self._focus_active:

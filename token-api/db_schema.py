@@ -195,6 +195,38 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at DESC)")
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS expected_acknowledgements (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                instance_id TEXT,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP NOT NULL,
+                ack_due_at TIMESTAMP NOT NULL,
+                level2_due_at TIMESTAMP NOT NULL,
+                pavlok_due_at TIMESTAMP NOT NULL,
+                acknowledged_at TIMESTAMP,
+                bailout_reason TEXT,
+                fired_levels_json TEXT DEFAULT '[]',
+                details_json TEXT
+            )
+        """)
+        cursor = await db.execute("PRAGMA table_info(expected_acknowledgements)")
+        ack_columns = {col[1] for col in await cursor.fetchall()}
+        if "fired_levels_json" not in ack_columns:
+            await db.execute(
+                "ALTER TABLE expected_acknowledgements ADD COLUMN fired_levels_json TEXT DEFAULT '[]'"
+            )
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expected_ack_pending
+            ON expected_acknowledgements(status, ack_due_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expected_ack_source_instance
+            ON expected_acknowledgements(source, instance_id, status)
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS workflow_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_id TEXT NOT NULL,

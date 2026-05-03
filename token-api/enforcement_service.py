@@ -19,13 +19,13 @@ def close_distraction_windows() -> dict:
 
     Mode-aware enforcement:
     - video mode → close brave (YouTube in browser)
-    - gaming mode → close minecraft
+    - gaming mode → minimize known desktop games
     """
     current_mode = DESKTOP_STATE.get("current_mode", "silence")
 
     mode_targets = {
         "video": ["brave"],
-        "gaming": ["minecraft"],
+        "gaming": ["mewgenics", "steam_game"],
     }
 
     targets = mode_targets.get(current_mode, [])
@@ -34,8 +34,9 @@ def close_distraction_windows() -> dict:
         return {"success": True, "closed_count": 0, "mode": current_mode}
 
     results = []
+    action = "minimize" if current_mode == "gaming" else "close"
     for app in targets:
-        result = enforce_desktop_app(app, "close")
+        result = enforce_desktop_app(app, action)
         results.append(result)
 
     closed = sum(1 for r in results if r.get("success"))
