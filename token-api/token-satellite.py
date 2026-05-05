@@ -44,6 +44,7 @@ logger = logging.getLogger("token_satellite")
 app = FastAPI(title="Token Satellite", version="1.0.0")
 
 # Full paths — bare exes aren't on PATH under systemd
+REPO_ROOT = Path(__file__).resolve().parent.parent
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
@@ -453,6 +454,16 @@ tts_engine = TTSEngine()
 MAC_API_BASE = "http://100.95.109.23:7777"
 MAC_TAILSCALE_IP = "100.95.109.23"
 DESKFLOW_EXE = r"C:\Tools\Deskflow\deskflow.exe"
+DESKFLOW_CORE_EXE = r"C:\Tools\Deskflow\deskflow-core.exe"
+DESKFLOW_CORE_EXE_WSL = "/mnt/c/Tools/Deskflow/deskflow-core.exe"
+DESKFLOW_SERVER_CONFIG_WIN = "C:/ProgramData/Deskflow/deskflow-server.conf"
+DESKFLOW_SERVER_CONFIG_WSL = Path("/mnt/c/ProgramData/Deskflow/deskflow-server.conf")
+DESKFLOW_GUI_CONFIG_WSL = Path("/mnt/c/Users/colby/AppData/Roaming/Deskflow/Deskflow.conf")
+DESKFLOW_CORE_LOG = Path("/tmp/deskflow-core.log")
+DESKFLOW_SERVER_CONFIG_BACKUPS = [
+    REPO_ROOT / "config" / "deskflow" / "wsl-server.conf",
+    Path("/mnt/imperium/Scripts/config/deskflow/wsl-server.conf"),
+]
 DESKFLOW_POLL_INTERVAL = 30  # seconds between checks
 DESKFLOW_CONFIRM_CHECKS = 2  # consecutive checks before state transition
 DESKFLOW_STABLE_TIMEOUT = 900  # 15 min: stop polling after this long in RUNNING
@@ -724,6 +735,77 @@ class DeskFlowWatchdog:
 
     # ── Windows DeskFlow management ──
 
+    def _deskflow_server_config_valid(self) -> bool:
+        try:
+            text = DESKFLOW_SERVER_CONFIG_WSL.read_text()
+        except OSError:
+            return False
+        required = (
+            "section: screens",
+            "TokenPC:",
+            "Tokens-Mac-Mini:",
+            "section: links",
+            "right = Tokens-Mac-Mini",
+            "left = TokenPC",
+        )
+        return all(item in text for item in required)
+
+    def _deskflow_backup_config(self) -> Path | None:
+        for path in DESKFLOW_SERVER_CONFIG_BACKUPS:
+            if path.exists():
+                return path
+        return None
+
+    def _ensure_deskflow_config(self):
+        """Restore the server topology if DeskFlow settings cleanup erased it."""
+        if not self._deskflow_server_config_valid():
+            backup = self._deskflow_backup_config()
+            if not backup:
+                logger.error("KVM watchdog: No DeskFlow server config backup found")
+            else:
+                DESKFLOW_SERVER_CONFIG_WSL.parent.mkdir(parents=True, exist_ok=True)
+                DESKFLOW_SERVER_CONFIG_WSL.write_text(backup.read_text())
+                logger.warning(f"KVM watchdog: Restored DeskFlow server config from {backup}")
+
+        DESKFLOW_GUI_CONFIG_WSL.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            gui_text = DESKFLOW_GUI_CONFIG_WSL.read_text()
+        except OSError:
+            gui_text = (
+                "[core]\ncomputerName=TokenPC\nlastVersion=1.26.0.0\ncoreMode=2\n\n"
+                "[gui]\n\n"
+                "[server]\n"
+            )
+
+        if "[gui]" not in gui_text:
+            gui_text += "\n[gui]\n"
+        if "startCoreWithGui=" not in gui_text:
+            gui_text = gui_text.replace("[gui]\n", "[gui]\nstartCoreWithGui=true\n", 1)
+
+        if "[server]" not in gui_text:
+            gui_text += "\n[server]\n"
+        if "externalConfig=" in gui_text:
+            gui_text = gui_text.replace("externalConfig=false", "externalConfig=true")
+        else:
+            gui_text = gui_text.replace("[server]\n", "[server]\nexternalConfig=true\n", 1)
+        if "externalConfigFile=" not in gui_text:
+            gui_text = gui_text.replace(
+                "[server]\n",
+                f"[server]\nexternalConfigFile={DESKFLOW_SERVER_CONFIG_WIN}\n",
+                1,
+            )
+        if "[security]" not in gui_text:
+            gui_text += "\n[security]\n"
+        if "checkPeerFingerprints=" in gui_text:
+            gui_text = gui_text.replace(
+                "checkPeerFingerprints=true", "checkPeerFingerprints=false"
+            )
+        else:
+            gui_text = gui_text.replace(
+                "[security]\n", "[security]\ncheckPeerFingerprints=false\n", 1
+            )
+        DESKFLOW_GUI_CONFIG_WSL.write_text(gui_text)
+
     def _check_deskflow_listening(self) -> bool:
         try:
             result = subprocess.run(
@@ -766,16 +848,13 @@ class DeskFlowWatchdog:
             return
         logger.info("KVM watchdog: Starting DeskFlow server")
         try:
-            subprocess.run(
-                [
-                    POWERSHELL_EXE,
-                    "-NoProfile",
-                    "-Command",
-                    f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
+            self._ensure_deskflow_config()
+            log_file = DESKFLOW_CORE_LOG.open("a")
+            subprocess.Popen(
+                [DESKFLOW_CORE_EXE_WSL, "server"],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
             )
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
@@ -784,18 +863,19 @@ class DeskFlowWatchdog:
         """Light local reload: restart only the core process and relaunch the GUI wrapper."""
         logger.info("KVM watchdog: Reloading local DeskFlow server")
         try:
+            self._ensure_deskflow_config()
             subprocess.run(
                 [
                     POWERSHELL_EXE,
                     "-NoProfile",
                     "-Command",
-                    "Stop-Process -Name deskflow-core -Force -ErrorAction SilentlyContinue; "
-                    f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized",
+                    "Stop-Process -Name deskflow-core -Force -ErrorAction SilentlyContinue",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
+            self._start_deskflow_server()
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to reload DeskFlow: {e}")
 
