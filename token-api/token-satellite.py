@@ -505,6 +505,7 @@ class DeskFlowWatchdog:
         self.last_observation: dict | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._recovery_lock = threading.Lock()
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name="deskflow-watchdog")
@@ -1022,81 +1023,90 @@ class DeskFlowWatchdog:
         logger.warning(f"KVM watchdog: Recovery failed → BACKOFF {delay}s")
 
     def _recover_connection(self, reason: str):
-        if self._check_deskflow_connected():
-            self._mark_connected()
+        if not self._recovery_lock.acquire(blocking=False):
+            logger.info(f"KVM watchdog: Recovery already running, skipping ({reason})")
             return
 
-        self.state = "recovering"
-        self.last_state_change = time.time()
-        observation = self._observe()
-        self.last_observation = observation
-        logger.info(f"KVM watchdog: Recovery start ({reason}) observation={observation}")
-
-        # Tier 0: process exists but the server port is absent. Fix local server first.
-        if observation["deskflow_running"] and not observation["deskflow_listening"]:
-            self.last_recovery_action = "local_reload_not_listening"
-            self._reload_deskflow_server()
-            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-                logger.info("KVM watchdog: Recovered after local reload (server was not listening)")
-                return
-            observation = self._observe()
-            self.last_observation = observation
-
-        # Tier 1: server is healthy but Mac is absent. Wake/start client and allow reconnect.
-        if (
-            observation["deskflow_running"]
-            and observation["deskflow_listening"]
-            and observation["mac_reachable"]
-        ):
-            self.last_recovery_action = "mac_quick_reconnect"
-            self._start_mac_client()
-            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-                logger.info("KVM watchdog: Recovered after Mac quick reconnect")
-                return
-
-        # Tier 2: local soft reload. This is the CLI equivalent of nudging server state.
-        self.last_recovery_action = "local_reload"
-        self._reload_deskflow_server()
-        if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-            logger.info("KVM watchdog: Recovered after local reload")
-            return
-
-        # Tier 3: full local kill/start, then give the Mac an opportunistic reconnect window.
-        self.last_recovery_action = "local_full_restart"
-        self._stop_deskflow_server()
-        self._stop_event.wait(1)
-        self._start_deskflow_server()
-        if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-            logger.info("KVM watchdog: Recovered after full local restart")
-            return
-
-        # Re-observe before touching the Mac. This prevents a stale escalation
-        # from kicking the user out after the Mac reconnects late.
-        if self._check_deskflow_connected():
-            self._mark_connected()
-            return
-
-        observation = self._observe()
-        self.last_observation = observation
-        if observation["mac_reachable"]:
-            # Tier 3: light Mac reload if available, then full Mac client restart.
-            self.last_recovery_action = "mac_reload"
-            self._reload_mac_client()
-            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-                logger.info("KVM watchdog: Recovered after Mac reload")
-                return
-
+        try:
             if self._check_deskflow_connected():
                 self._mark_connected()
                 return
 
-            self.last_recovery_action = "mac_full_restart"
-            self._restart_mac_client()
+            self.state = "recovering"
+            self.last_state_change = time.time()
+            observation = self._observe()
+            self.last_observation = observation
+            logger.info(f"KVM watchdog: Recovery start ({reason}) observation={observation}")
+
+            # Tier 0: process exists but the server port is absent. Fix local server first.
+            if observation["deskflow_running"] and not observation["deskflow_listening"]:
+                self.last_recovery_action = "local_reload_not_listening"
+                self._reload_deskflow_server()
+                if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                    logger.info(
+                        "KVM watchdog: Recovered after local reload (server was not listening)"
+                    )
+                    return
+                observation = self._observe()
+                self.last_observation = observation
+
+            # Tier 1: server is healthy but Mac is absent. Wake/start client and allow reconnect.
+            if (
+                observation["deskflow_running"]
+                and observation["deskflow_listening"]
+                and observation["mac_reachable"]
+            ):
+                self.last_recovery_action = "mac_quick_reconnect"
+                self._start_mac_client()
+                if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                    logger.info("KVM watchdog: Recovered after Mac quick reconnect")
+                    return
+
+            # Tier 2: local soft reload. This is the CLI equivalent of nudging server state.
+            self.last_recovery_action = "local_reload"
+            self._reload_deskflow_server()
             if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
-                logger.info("KVM watchdog: Recovered after Mac full restart")
+                logger.info("KVM watchdog: Recovered after local reload")
                 return
 
-        self._schedule_backoff()
+            # Tier 3: full local kill/start, then give the Mac an opportunistic reconnect window.
+            self.last_recovery_action = "local_full_restart"
+            self._stop_deskflow_server()
+            self._stop_event.wait(1)
+            self._start_deskflow_server()
+            if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                logger.info("KVM watchdog: Recovered after full local restart")
+                return
+
+            # Re-observe before touching the Mac. This prevents a stale escalation
+            # from kicking the user out after the Mac reconnects late.
+            if self._check_deskflow_connected():
+                self._mark_connected()
+                return
+
+            observation = self._observe()
+            self.last_observation = observation
+            if observation["mac_reachable"]:
+                # Tier 4: light Mac reload if available, then full Mac client restart.
+                self.last_recovery_action = "mac_reload"
+                self._reload_mac_client()
+                if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                    logger.info("KVM watchdog: Recovered after Mac reload")
+                    return
+
+                if self._check_deskflow_connected():
+                    self._mark_connected()
+                    return
+
+                self.last_recovery_action = "mac_full_restart"
+                self._restart_mac_client()
+                if self._wait_for_connection(DESKFLOW_RECONNECT_WAIT):
+                    logger.info("KVM watchdog: Recovered after Mac full restart")
+                    return
+
+            self._schedule_backoff()
+        finally:
+            self._recovery_lock.release()
 
     def _ensure_mac_client_connected(self):
         """Start Mac client if needed, restart if connection is dead.
