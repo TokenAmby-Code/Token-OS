@@ -1125,10 +1125,11 @@ class DeskFlowWatchdog:
     # ── API helpers ──
 
     def get_status(self) -> dict:
-        running = self._check_deskflow_running()
-        listening = self._check_deskflow_listening() if running else False
-        connected = self._check_deskflow_connected() if running else False
-        observation = self.last_observation or self._observe()
+        observation = self._observe()
+        self.last_observation = observation
+        running = observation["deskflow_running"]
+        listening = observation["deskflow_listening"]
+        connected = observation["deskflow_connected"]
         return {
             "state": self.state,
             "mac_connected": connected,
@@ -1233,25 +1234,8 @@ def _announce_to_mac():
 
     time.sleep(3)  # Let the server finish binding
     hostname = socket.gethostname()
-    payload = {"hostname": hostname, "port": 7777}
     _send_lifecycle_event("startup", {"hostname": hostname, "port": 7777})
-    for attempt in range(1, 4):
-        try:
-            resp = http_requests.post(
-                f"{MAC_API_BASE}/api/satellite/announce",
-                json=payload,
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                logger.info(f"Startup announcement acknowledged by Mac (attempt {attempt})")
-                return
-            else:
-                logger.warning(f"Mac announce returned {resp.status_code} (attempt {attempt})")
-        except Exception as e:
-            logger.warning(f"Mac announce failed (attempt {attempt}/3): {e}")
-        if attempt < 3:
-            time.sleep(5)
-    logger.error("Startup announcement to Mac failed after 3 attempts (non-fatal)")
+    logger.info("Startup lifecycle event sent to Mac")
 
 
 def _send_lifecycle_event(event: str, details: dict | None = None):
