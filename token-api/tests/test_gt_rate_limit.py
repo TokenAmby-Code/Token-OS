@@ -1,7 +1,6 @@
 """Tests for Golden Throne rolling-window rate limiting."""
 
 import importlib
-import os
 import sqlite3
 import sys
 import tempfile

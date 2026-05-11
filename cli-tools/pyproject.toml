@@ -39,6 +39,13 @@ target-version = "py311"
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]  # line-length handled by formatter
 
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_tmuxctl_*.py" = ["E402"]
+"lib/tmuxctl/enums.py" = ["UP042"]
+"lib/tmuxctl/focus.py" = ["UP042"]
+"lib/tmuxctl/revert.py" = ["UP042"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

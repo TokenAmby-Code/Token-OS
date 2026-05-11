@@ -8,9 +8,7 @@ import time
 import uuid
 
 import pytest
-
 from tmuxctl.tmux_adapter import TmuxAdapter
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_TMUX_SUBMIT_TIMING_INTEGRATION") != "1",

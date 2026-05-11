@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-UTC = timezone.utc  # back-compat for Python 3.9-3.10 (macOS system python3 is 3.9)
-
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
 from .labels import (
     PALACE_ROLES,
@@ -19,6 +17,8 @@ from .models import (
     RestartPlan,
     WorkspaceSnapshot,
 )
+
+UTC = timezone.utc  # noqa: UP017 - keep Python 3.9/3.10 compatibility for direct CLI use
 
 
 def build_restart_plan(

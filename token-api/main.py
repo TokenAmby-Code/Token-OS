@@ -4902,8 +4902,7 @@ def _tmux_pane_label_sync(tmux_pane: str | None) -> str | None:
     try:
         result = subprocess.run(
             ["tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=3,
             check=False,
@@ -8811,7 +8810,7 @@ def _sync_save_daily_score(
     conn.execute(
         """INSERT INTO timer_daily_scores (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON CONFLICT(date) DO UPDATE SET 
+           ON CONFLICT(date) DO UPDATE SET
                productivity_score = excluded.productivity_score,
                total_work_ms = excluded.total_work_ms,
                total_break_used_ms = excluded.total_break_used_ms,
@@ -8919,6 +8918,8 @@ async def timer_9am_reset():
 
 # ============ Audio Proxy State ============
 # Tracks phone audio proxy status for routing phone audio through PC
+
+AUDIO_RECEIVER_PORT = os.getenv("AUDIO_RECEIVER_PORT", "unknown")
 
 AUDIO_PROXY_STATE = {
     "phone_connected": False,
@@ -9538,8 +9539,9 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     - If productivity is active -> distractions are allowed (earned break)
     - If productivity is NOT active -> distractions should be closed
     """
-    productivity_active = timer_engine.productivity_active
-    active_count = 0
+    work_state = await get_cached_work_state()
+    productivity_active = work_state.productivity_active
+    active_count = work_state.active_instance_count
     should_close = not productivity_active
 
     if productivity_active:

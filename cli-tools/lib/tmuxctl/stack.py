@@ -26,7 +26,6 @@ import re
 
 from .tmux_adapter import TmuxAdapter, TmuxError
 
-
 STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig")
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 

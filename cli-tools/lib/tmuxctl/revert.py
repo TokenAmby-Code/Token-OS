@@ -5,10 +5,8 @@ from enum import Enum
 
 from .enums import GridState, WindowArchetype
 from .labels import (
-    PALACE_GRID_ROLES,
     PALACE_ROLES,
     PALACE_SIDE_ROLES,
-    SOMNIUM_GRID_ROLES,
     SOMNIUM_ROLES,
     SOMNIUM_SIDE_ROLES,
 )

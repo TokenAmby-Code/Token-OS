@@ -33,6 +33,24 @@ target-version = "py311"
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["B007", "B008", "B904", "E402", "E722", "F841"]
+"token-api-tui.py" = ["B007", "E402", "E722", "F841"]
+"token-satellite.py" = ["B007", "B904", "F841"]
+"timer.py" = ["UP042"]
+"cron_engine.py" = ["B904"]
+"custodes_checkin.py" = ["E741"]
+"custodes_heartbeat.py" = ["F841"]
+"post_run_graph.py" = ["F841"]
+"routes/voice.py" = ["F841"]
+"schedule.py" = ["B904", "F841"]
+"stop_hook.py" = ["F841"]
+"test_cron_engine.py" = ["E402"]
+"test_timer.py" = ["F841"]
+"tests/test_legion_synced.py" = ["F841"]
+"tests/test_voice_pool.py" = ["F841"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

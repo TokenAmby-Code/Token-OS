@@ -87,7 +87,7 @@ def _window_warnings(
     expanded_role = None
     if grid_expanded and grid_expanded != "none":
         if grid_expanded in visible_panes:
-            for pane_id, pane_role in zip(pane_ids, pane_roles):
+            for pane_id, pane_role in zip(pane_ids, pane_roles, strict=False):
                 if pane_id == grid_expanded:
                     expanded_role = pane_role
                     break

@@ -8,9 +8,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-
 from tmuxctl.tmux_adapter import TmuxAdapter
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_TMUX_CODEX_SUBMIT_INTEGRATION") != "1",

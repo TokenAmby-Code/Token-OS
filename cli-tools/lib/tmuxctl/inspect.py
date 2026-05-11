@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .revert import is_transient_window_name
 from .models import (
     PaneSnapshot,
     RestartExecutionResult,
@@ -8,7 +7,7 @@ from .models import (
     WindowSnapshot,
     WorkspaceSnapshot,
 )
-
+from .revert import is_transient_window_name
 
 CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus", "tui"}
 # Stack windows may spill into sibling windows suffixed `-N` (e.g. legion-2).
