@@ -1,9 +1,10 @@
-"""Workspace construction. Builds a fresh palace + somnium session from empty."""
+"""Workspace construction. Builds a fresh managed tmux session from empty."""
 
 from __future__ import annotations
 
 import os
 
+from .layout import WORKSPACE_LAYOUT
 from .tmux_adapter import TmuxAdapter
 
 SESSION_NAME = "main"
@@ -15,9 +16,6 @@ TUI_WINDOW = "tui"
 
 DETACHED_W = 240
 DETACHED_H = 60
-
-PALACE_SIDE_RATIO = 20
-SOMNIUM_SIDE_RATIO = 33
 
 
 def _home() -> str:
@@ -46,7 +44,7 @@ def _pane_tag(adapter: TmuxAdapter, pane_id: str, tag: str) -> None:
     """Set @PANE_ID and derive @GRID_STATE from the tag suffix."""
     _set_pane_option(adapter, pane_id, "@PANE_ID", tag)
     suffix = tag.split(":", 1)[-1]
-    if suffix in {"WW", "EE"}:
+    if suffix in {"W", "E", "WW", "EE"}:
         state = "side"
     elif suffix == "MON":
         state = "mini"
@@ -59,14 +57,38 @@ def _window_dim(adapter: TmuxAdapter, target: str, fmt: str) -> int:
     return int(adapter.run("display-message", "-t", target, "-p", fmt).strip())
 
 
-def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE_WINDOW) -> None:
-    """Build the 6-pane palace grid: [WW 20%] [2x2] [EE 20%].
+def _pane_id(adapter: TmuxAdapter, target: str) -> str:
+    return adapter.run("display-message", "-t", target, "-p", "#{pane_id}").strip()
 
-    Layout (final, top row → bottom row, left → right):
-      pane 1 = WW (full-height side)
-      pane 2 = NW grid    pane 4 = NE grid
-      pane 3 = SW grid    pane 5 = SE grid
-      pane 6 = EE (full-height side)
+
+def _split_pane(
+    adapter: TmuxAdapter,
+    target: str,
+    *args: str,
+    cwd: str,
+) -> str:
+    return adapter.run(
+        "split-window",
+        *args,
+        "-t",
+        target,
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-c",
+        cwd,
+    ).strip()
+
+
+def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE_WINDOW) -> None:
+    """Build the 4-pane palace H layout: [W 30%] [N/S 40%] [E 30%].
+
+    Layout:
+      W = full-height west side
+      N = center north
+      S = center south
+      E = full-height east side
 
     Side columns are bare shells in $HOME — no auto-launched program.
     The pane-died hook + tmux-pane-respawn handle restart-on-exit.
@@ -77,64 +99,45 @@ def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE
     total_w = _window_dim(adapter, target, "#{window_width}")
     total_h = _window_dim(adapter, target, "#{window_height}")
 
-    usable = total_w - 5  # 5 vertical pane borders for 6 columns
-    side_w = (usable * PALACE_SIDE_RATIO) // 100
-    center_w = usable - side_w * 2
-    center_half = center_w // 2
+    layout = WORKSPACE_LAYOUT.palace
+    side_w = layout.side_width(total_w)
     half_h = total_h // 2
 
-    # Pane 1 starts as full-width. Carve the left side column off the right.
-    adapter.run(
-        "split-window",
+    west = _pane_id(adapter, f"{target}.1")
+    center = _split_pane(
+        adapter,
+        west,
         "-h",
-        "-t",
-        f"{target}.1",
         "-l",
-        str(total_w - side_w - 1),
-        "-c",
-        wdir,
+        str(layout.center_plus_east_split_width(total_w)),
+        cwd=wdir,
     )
-    # Pane 1 = left side, pane 2 = rest. Carve right side column off pane 2.
-    adapter.run("split-window", "-h", "-t", f"{target}.2", "-l", str(side_w), "-c", wdir)
-    # Pane 1 = WW, pane 2 = center, pane 3 = EE. Split center horizontally.
-    adapter.run(
-        "split-window",
-        "-h",
-        "-t",
-        f"{target}.2",
-        "-l",
-        str(center_half),
-        "-c",
-        wdir,
-    )
-    # Now: 1=WW, 2=center-left, 3=center-right, 4=EE. Vertical splits per column.
-    adapter.run("split-window", "-v", "-t", f"{target}.2", "-l", str(half_h), "-c", wdir)
-    adapter.run("split-window", "-v", "-t", f"{target}.4", "-l", str(half_h), "-c", wdir)
+    east = _split_pane(adapter, center, "-h", "-l", str(side_w), cwd=wdir)
+    south = _split_pane(adapter, center, "-v", "-l", str(half_h), cwd=wdir)
 
-    _pane_tag(adapter, f"{target}.1", "palace:WW")
-    _pane_tag(adapter, f"{target}.2", "palace:NW")
-    _pane_tag(adapter, f"{target}.3", "palace:SW")
-    _pane_tag(adapter, f"{target}.4", "palace:NE")
-    _pane_tag(adapter, f"{target}.5", "palace:SE")
-    _pane_tag(adapter, f"{target}.6", "palace:EE")
+    _pane_tag(adapter, west, "palace:W")
+    _pane_tag(adapter, center, "palace:N")
+    _pane_tag(adapter, south, "palace:S")
+    _pane_tag(adapter, east, "palace:E")
 
-    for idx in range(1, 7):
-        _set_pane_option(adapter, f"{target}.{idx}", "@GRID_RESERVED", "false")
+    for pane_id in (west, center, south, east):
+        _set_pane_option(adapter, pane_id, "@GRID_RESERVED", "false")
 
     _set_window_option(adapter, target, "@FOCUSED", "false")
     _set_window_option(adapter, target, "@GRID_EXPANDED", "none")
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
-    adapter.run("select-pane", "-t", f"{target}.2")
+    adapter.run("select-pane", "-t", center)
 
 
 def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNIUM_WINDOW) -> None:
-    """Build the 5-pane somnium grid: 2x2 + right TUI column.
+    """Build the 5-pane somnium layout: left side rail W + right 2x2.
 
     Layout (final):
-      pane 1 = NW grid    pane 3 = NE grid    pane 5 = EE (TUI monitor)
-      pane 2 = SW grid    pane 4 = SE grid
+      W  = full-height west pane
+      N  = right grid north-west    NE = right grid north-east
+      S  = right grid south-west    SE = right grid south-east
     """
     target = f"{session}:{window}"
     wdir = _window_dir(window)
@@ -142,52 +145,67 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
     total_w = _window_dim(adapter, target, "#{window_width}")
     total_h = _window_dim(adapter, target, "#{window_height}")
 
-    usable = total_w - 2  # pane borders
-    right_w = (usable * SOMNIUM_SIDE_RATIO) // 100
-    grid_w = usable - right_w
-    grid_half = grid_w // 2
+    layout = WORKSPACE_LAYOUT.somnium
+    _, east_grid_w = layout.grid_column_widths(total_w)
     half_h = total_h // 2
 
-    # Split off right column from full-width pane 1.
-    adapter.run("split-window", "-h", "-t", f"{target}.1", "-l", str(right_w), "-c", wdir)
-    # Split grid area into left/right halves.
-    adapter.run("split-window", "-h", "-t", f"{target}.1", "-l", str(grid_half), "-c", wdir)
-    # Split each grid column vertically.
-    adapter.run("split-window", "-v", "-t", f"{target}.1", "-l", str(half_h), "-c", wdir)
-    adapter.run("split-window", "-v", "-t", f"{target}.3", "-l", str(half_h), "-c", wdir)
+    west = _pane_id(adapter, f"{target}.1")
+    right = _split_pane(
+        adapter,
+        west,
+        "-h",
+        "-l",
+        str(layout.right_grid_split_width(total_w)),
+        cwd=wdir,
+    )
+    ne = _split_pane(adapter, right, "-h", "-l", str(east_grid_w), cwd=wdir)
+    south = _split_pane(adapter, right, "-v", "-l", str(half_h), cwd=wdir)
+    se = _split_pane(adapter, ne, "-v", "-l", str(half_h), cwd=wdir)
 
-    _pane_tag(adapter, f"{target}.1", "somnium:NW")
-    _pane_tag(adapter, f"{target}.2", "somnium:SW")
-    _pane_tag(adapter, f"{target}.3", "somnium:NE")
-    _pane_tag(adapter, f"{target}.4", "somnium:SE")
-    _pane_tag(adapter, f"{target}.5", "somnium:EE")
-    _set_pane_option(adapter, f"{target}.5", "@PANE_TYPE", "tui")
+    _pane_tag(adapter, west, "somnium:W")
+    _pane_tag(adapter, right, "somnium:N")
+    _pane_tag(adapter, south, "somnium:S")
+    _pane_tag(adapter, ne, "somnium:NE")
+    _pane_tag(adapter, se, "somnium:SE")
 
-    for idx in range(1, 6):
-        _set_pane_option(adapter, f"{target}.{idx}", "@GRID_RESERVED", "false")
+    for pane_id in (west, right, south, ne, se):
+        _set_pane_option(adapter, pane_id, "@GRID_RESERVED", "false")
 
     _set_window_option(adapter, target, "@FOCUSED", "false")
     _set_window_option(adapter, target, "@GRID_EXPANDED", "none")
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
-    adapter.run("send-keys", "-t", f"{target}.5", "exec tui-pane-guard", "Enter")
-    adapter.run("select-pane", "-t", f"{target}.1")
+    adapter.run("select-pane", "-t", west)
 
 
 def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
+    """Build the legion stack window.
+
+    Pane 1 is the Custodes orchestrator slot. If that orchestrator is promoted
+    to an audience surface, this pane becomes its tombstone.
+    """
     target = f"{session}:{LEGION_WINDOW}"
     adapter.run(
-        "new-window", "-t", session, "-n", LEGION_WINDOW, "-d", "-c", _window_dir(LEGION_WINDOW)
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        LEGION_WINDOW,
+        "-d",
+        "-c",
+        _window_dir(LEGION_WINDOW),
     )
-    _pane_tag(adapter, f"{target}.1", "legion:empty")
+    _pane_tag(adapter, f"{target}.1", "legion:custodes")
     _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "legion")
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
-    """Build the mechanicus stack window. Pane 1 is the orchestrator anchor
-    (future home for the fabricator-general persona), born as a clean shell —
-    symmetric with build_legion_window. Worker panes are added by stack.add_stack_pane.
+    """Build the mechanicus stack window.
+
+    Pane 1 is the Fabricator-General orchestrator slot. If that orchestrator is
+    promoted to an audience surface, this pane becomes its tombstone. Worker
+    panes are added by stack.add_stack_pane.
     """
     target = f"{session}:{MECHANICUS_WINDOW}"
     adapter.run(
@@ -200,7 +218,7 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
         "-c",
         _window_dir(MECHANICUS_WINDOW),
     )
-    _pane_tag(adapter, f"{target}.1", "mechanicus:anchor")
+    _pane_tag(adapter, f"{target}.1", "mechanicus:fabricator-general")
     _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "mechanicus")
 
 
@@ -242,7 +260,6 @@ def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     build_somnium_window(adapter, session, SOMNIUM_WINDOW)
     build_legion_window(adapter, session)
     build_mechanicus_window(adapter, session)
-    build_tui_window(adapter, session)
     adapter.run("select-window", "-t", f"{session}:{PALACE_WINDOW}")
 
 

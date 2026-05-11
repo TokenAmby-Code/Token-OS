@@ -10,9 +10,9 @@
 #   work-loop complete [options]                   # Wrap up: merge, cleanup, exit
 #   work-loop status                               # Show active work-loop panes
 #
-# Dispatch creates a backrooms pane, launches Claude in the vault, and briefs it
-# to create a worktree, transplant, and work autonomously. Callable from any
-# instance, voice injection, or directly.
+# Dispatch creates a managed legion worker pane through tmuxctl, launches Claude
+# in the vault, and briefs it to create a worktree, transplant, and work
+# autonomously. Callable from any instance, voice injection, or directly.
 #
 # Complete is called BY the dispatched instance when work is done. It merges the
 # PR, updates the session doc, and exits — returning the pane to a bare shell.
@@ -53,58 +53,31 @@ log_dry()     { echo -e "${CYAN}~${NC} $1"; }
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
 
-# --- Backrooms pane management ---
-# Split a new pane in the backrooms window. Returns the new pane ID.
-split_backrooms_pane() {
+# --- Managed legion worker pane allocation ---
+# Create a new managed legion worker pane. Returns the new pane ID.
+create_workloop_pane() {
     local session="${1:-main}"
-
-    # Check if backrooms window exists
-    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q '^backrooms$'; then
-        log_error "No backrooms window in session '$session'"
-        echo "  Create one with: tx start"
-        return 1
-    fi
-
-    # Get the first pane in backrooms to split from
-    local base_pane
-    base_pane=$(tmux list-panes -t "${session}:backrooms" -F '#{pane_id}' 2>/dev/null | head -1)
-
-    if [[ -z "$base_pane" ]]; then
-        log_error "No panes in backrooms window"
-        return 1
-    fi
-
-    # Split horizontally (side-by-side) from the base pane
-    # -d: don't switch focus, -P: print new pane info, -F: format
     local new_pane
-    new_pane=$(tmux split-window -h -t "$base_pane" -d -P -F '#{pane_id}' -c "$HOME" 2>/dev/null)
-
+    new_pane=$("${_LIB_DIR}/../bin/tmuxctl" stack add legion --session "$session" --cwd "$HOME" 2>/dev/null || true)
     if [[ -z "$new_pane" ]]; then
-        # Horizontal split failed (too narrow), try vertical
-        new_pane=$(tmux split-window -v -t "$base_pane" -d -P -F '#{pane_id}' -c "$HOME" 2>/dev/null)
-    fi
-
-    if [[ -z "$new_pane" ]]; then
-        log_error "Could not split backrooms pane (window too small?)"
+        log_error "Could not allocate managed legion worker pane"
         return 1
     fi
-
-    # Tag it as a work-loop pane
-    tmux set-option -p -t "$new_pane" @PANE_TYPE "work-loop" 2>/dev/null || true
-
+    tmux set-option -p -t "$new_pane" @WORK_LOOP "true" 2>/dev/null || true
     echo "$new_pane"
 }
 
-# List work-loop panes in backrooms
+# List work-loop panes in the managed legion worker stack.
 list_workloop_panes() {
     local session="${1:-main}"
     local panes=()
 
-    while IFS=$'\t' read -r pane_id pane_type cmd window_name; do
-        [[ "$window_name" == "backrooms" ]] || continue
-        [[ "$pane_type" == "work-loop" ]] || continue
+    while IFS=$'\t' read -r pane_id work_loop cmd window_name pane_role; do
+        [[ "${window_name%%(*}" == "legion" ]] || continue
+        [[ "$pane_role" == "legion:worker" ]] || continue
+        [[ "$work_loop" == "true" ]] || continue
         panes+=("$pane_id")
-    done < <(tmux list-panes -a -F "#{pane_id}	#{@PANE_TYPE}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    done < <(tmux list-panes -a -F "#{pane_id}	#{@WORK_LOOP}	#{pane_current_command}	#{window_name}	#{@PANE_ID}" 2>/dev/null)
 
     printf '%s\n' "${panes[@]+"${panes[@]}"}"
 }
@@ -163,7 +136,7 @@ You are dispatched into the work loop. Your mission:
 IMPORTANT:
 - Do NOT use TTS
 - Do NOT block on AskUserQuestion — make judgment calls instead
-- You are running in a backrooms pane — this is autonomous background work
+- You are running in a managed legion worker pane — this is autonomous background work
 - Your zealotry level is ${zealotry} (1=minimal follow-up, 5=aggressive)
 PROMPT
 
@@ -189,14 +162,14 @@ do_dispatch() {
     local zealotry=3
     local extra_context=""
     local dry_run=false
-    local no_backrooms=false
+    local created_managed_pane=false
 
     # Parse dispatch-specific args
     while [[ $# -gt 0 ]]; do
         case $1 in
             --branch)     branch_name="$2"; shift 2 ;;
             --project)    project="$2"; shift 2 ;;
-            --pane)       target_pane="$2"; no_backrooms=true; shift 2 ;;
+            --pane)       target_pane="$2"; shift 2 ;;
             --primarch)   primarch_name="$2"; shift 2 ;;
             --zealotry)   zealotry="$2"; shift 2 ;;
             --context)    extra_context="$2"; shift 2 ;;
@@ -246,12 +219,13 @@ do_dispatch() {
 
     # --- Resolve pane ---
     if [[ -z "$target_pane" ]]; then
-        target_pane=$(split_backrooms_pane "$tmux_session")
+        target_pane=$(create_workloop_pane "$tmux_session")
         if [[ -z "$target_pane" ]]; then
-            log_error "Could not create backrooms pane"
+            log_error "Could not create managed legion worker pane"
             exit 1
         fi
-        log_success "Split backrooms pane: $target_pane"
+        created_managed_pane=true
+        log_success "Created managed legion worker pane: $target_pane"
     else
         if ! tmux display-message -t "$target_pane" -p '#{pane_id}' &>/dev/null; then
             log_error "Pane not found: $target_pane"
@@ -300,8 +274,8 @@ do_dispatch() {
         echo -e "${DIM}"
         echo "$dispatch_prompt" | sed 's/^/  /'
         echo -e "${NC}"
-        # Kill the pane we split (if we created one)
-        if [[ "$no_backrooms" != "true" ]]; then
+        # Kill the pane we created for this dry run.
+        if [[ "$created_managed_pane" == "true" ]]; then
             tmux kill-pane -t "$target_pane" 2>/dev/null || true
         fi
         exit 0
@@ -471,9 +445,10 @@ do_status() {
 
     local found=false
 
-    # Check all backrooms panes for work-loop metadata
-    while IFS=$'\t' read -r pane_id pane_type cmd window_name; do
-        [[ "$window_name" == "backrooms" ]] || continue
+    # Check managed legion workers for work-loop metadata.
+    while IFS=$'\t' read -r pane_id work_loop cmd window_name pane_role; do
+        [[ "${window_name%%(*}" == "legion" ]] || continue
+        [[ "$pane_role" == "legion:worker" ]] || continue
 
         local session_doc branch project dispatched
         session_doc=$(tmux show-options -p -t "$pane_id" -v @WORKLOOP_SESSION_DOC 2>/dev/null || true)
@@ -481,7 +456,7 @@ do_status() {
         project=$(tmux show-options -p -t "$pane_id" -v @WORKLOOP_PROJECT 2>/dev/null || true)
         dispatched=$(tmux show-options -p -t "$pane_id" -v @WORKLOOP_DISPATCHED 2>/dev/null || true)
 
-        # Skip panes without work-loop metadata (original backrooms pane)
+        # Skip panes without work-loop metadata.
         [[ -z "$session_doc" ]] && continue
 
         found=true
@@ -502,7 +477,7 @@ do_status() {
         echo -e "    ${DIM}project:${NC}  $project"
         echo -e "    ${DIM}since:${NC}    $dispatched"
         echo ""
-    done < <(tmux list-panes -a -F "#{pane_id}	#{@PANE_TYPE}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    done < <(tmux list-panes -a -F "#{pane_id}	#{@WORK_LOOP}	#{pane_current_command}	#{window_name}	#{@PANE_ID}" 2>/dev/null)
 
     if [[ "$found" != "true" ]]; then
         echo -e "  ${DIM}No active work-loop panes${NC}"
@@ -525,7 +500,7 @@ Usage:
 Dispatch Options:
   --branch <name>       Branch name (default: derived from session doc filename)
   --project <name>      Project config (default: auto-detected from vault)
-  --pane <id>           Use specific tmux pane instead of splitting backrooms
+  --pane <id>           Use specific tmux pane instead of creating a managed legion worker
   --primarch <name>     Launch as a primarch persona
   --zealotry <1-5>      Golden Throne follow-up aggressiveness (default: 3)
   --context <text>      Extra context for the dispatch prompt

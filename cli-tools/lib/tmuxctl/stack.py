@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 
 from .tmux_adapter import TmuxAdapter, TmuxError
 
@@ -116,6 +117,11 @@ def add_stack_pane(
         raise ValueError(f"not a stack window: {base}")
     cwd = cwd or os.path.expanduser("~")
 
+    if base in {"legion", "mechanicus"}:
+        from .legion import add_orchestrator_stack_pane
+
+        return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd)
+
     existing = _list_spill_windows(adapter, session, base)
     if not existing:
         # No canonical window yet — create it as the first stack window.
@@ -136,4 +142,48 @@ def add_stack_pane(
     new_name = _spill_name(base, next_n)
     pane = _create_spill_window(adapter, session, new_name, cwd)
     _tag_worker(adapter, pane, base)
+    return pane
+
+
+def dispatch_stack_command(
+    adapter: TmuxAdapter,
+    session: str,
+    base: str,
+    command: str,
+    *,
+    cwd: str | None = None,
+    focus: bool = True,
+    settle_seconds: float = 0.5,
+) -> str:
+    """Create one managed stack worker pane and run a command in it.
+
+    This is the pane-backed dispatch primitive for legion/mechanicus worker
+    launches. Callers may still use ``stack add`` when they need to stage their
+    own input, but entry points that create-and-launch work should route through
+    this function instead of doing raw ``tmux split-window`` themselves.
+    """
+    pane = add_stack_pane(adapter, session, base, cwd=cwd)
+    if focus:
+        window_target = adapter.run(
+            "display-message", "-t", pane, "-p", "#{session_name}:#{window_name}", allow_failure=True
+        ).strip()
+        if window_target:
+            adapter.run("select-window", "-t", window_target, allow_failure=True)
+        adapter.run("select-pane", "-t", pane, allow_failure=True)
+        if base in {"legion", "mechanicus"}:
+            from .legion import enforce_stack_layout
+
+            target = adapter.run(
+                "display-message",
+                "-t",
+                pane,
+                "-p",
+                "#{session_name}:#{window_index}",
+                allow_failure=True,
+            ).strip()
+            if target:
+                enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+    adapter.run("send-keys", "-t", pane, command, "Enter")
     return pane

@@ -18,7 +18,7 @@ Usage:
   tmux-legion-prompt --prompt-file /path/to/prompt
   tmux-legion-prompt --dry-run --prompt "text"
 
-Opens or uses a prompt, creates a new main:legion pane, then sends:
+Opens or uses a prompt, creates a new managed main:legion pane, then sends:
   cd ~ && c --prompt-file <prompt-file>
 EOF
 }
@@ -83,34 +83,26 @@ if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qE 
 fi
 
 LEGION_TARGET="${SESSION}:${WINDOW}"
-LEGION_BASE_PANE="$(tmux list-panes -t "$LEGION_TARGET" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 
 if $DRY_RUN; then
     log "DRY RUN"
     log "session: $SESSION"
     log "window:  $WINDOW"
     log "prompt:  $PROMPT_FILE"
-    if [[ -n "$LEGION_BASE_PANE" ]]; then
-        log "retract: tmux-grid-expand --pane '$LEGION_BASE_PANE' --retract"
-    fi
     log "command: cd ~ && c --prompt-file '$PROMPT_FILE'"
-    log "view:    select legion pane, then expand it"
+    log "layout:  tmuxctl stack dispatch legion"
     exit 0
 fi
-
-if [[ -n "$LEGION_BASE_PANE" ]]; then
-    tmux-grid-expand --pane "$LEGION_BASE_PANE" --retract >/dev/null 2>&1 || true
-fi
-
-PANE_ID="$(tmux split-window -t "$LEGION_TARGET" -d -P -F '#{pane_id}' -c "$HOME")"
-tmux select-layout -t "$LEGION_TARGET" tiled >/dev/null 2>&1 || true
-tmux select-window -t "$LEGION_TARGET"
-tmux select-pane -t "$PANE_ID"
-tmux-grid-expand --pane "$PANE_ID" >/dev/null 2>&1 || true
 
 printf -v PROMPT_FILE_Q '%q' "$PROMPT_FILE"
 LAUNCH_CMD="cd ~ && c --prompt-file ${PROMPT_FILE_Q}"
 
-sleep 0.5
-tmux send-keys -t "$PANE_ID" "$LAUNCH_CMD" Enter
+PANE_ID="$(
+    PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli stack dispatch legion \
+            --session "$SESSION" \
+            --cwd "$HOME" \
+            --command "$LAUNCH_CMD"
+)"
 tmux display-message "Legion prompt launched in ${PANE_ID}"

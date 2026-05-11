@@ -19,6 +19,25 @@ if ! tmux has-session -t "$PANE_ID" 2>/dev/null; then
 fi
 
 PANE_TYPE=$(tmux show-options -pv -t "$PANE_ID" @PANE_TYPE 2>/dev/null || echo "")
+PANE_ROLE=$(tmux show-options -pv -t "$PANE_ID" @PANE_ID 2>/dev/null || echo "")
+WINDOW_NAME=$(tmux display-message -p -t "$PANE_ID" '#{window_name}' 2>/dev/null || echo "")
+WINDOW_BASE="${WINDOW_NAME%%(*}"
+WINDOW_TARGET=$(tmux display-message -p -t "$PANE_ID" '#{session_name}:#{window_index}' 2>/dev/null || echo "")
+
+case "$WINDOW_BASE:$PANE_ROLE" in
+    legion:legion:custodes|mechanicus:mechanicus:fabricator-general)
+        ;;
+    legion:*|mechanicus:*)
+        # Stack workers are disposable process panes. If the process exits,
+        # remove the pane instead of respawning a blank shell, then reassert
+        # the remaining page layout.
+        tmux kill-pane -t "$PANE_ID" 2>/dev/null || true
+        if [[ -n "$WINDOW_TARGET" ]]; then
+            tmux-run tmuxctl stack enforce --window "$WINDOW_TARGET" >/dev/null 2>&1 || true
+        fi
+        exit 0
+        ;;
+esac
 
 if [[ "$PANE_TYPE" == "tui" ]]; then
     TUI_DIRTY=$(tmux show-options -pv -t "$PANE_ID" @TUI_DIRTY 2>/dev/null || echo "false")
@@ -26,8 +45,6 @@ if [[ "$PANE_TYPE" == "tui" ]]; then
         exit 0
     fi
     tmux respawn-pane -k -t "$PANE_ID" tui-pane-guard
-elif [[ "$PANE_TYPE" == "backstop" ]]; then
-    tmux respawn-pane -k -t "$PANE_ID" tmux-backstop
 elif [[ "$PANE_TYPE" == "tombstone" ]]; then
     SOURCE=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_SOURCE 2>/dev/null || echo "unknown")
     TARGET=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_TARGET 2>/dev/null || echo "unknown")
