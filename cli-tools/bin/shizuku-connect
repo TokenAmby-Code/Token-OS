@@ -24,7 +24,7 @@ LOG_FILE="$HOME/.claude/shizuku-connect.log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
-    echo "$*"
+    echo "$*" >&2
 }
 
 is_connected() {
@@ -45,7 +45,7 @@ cmd_status() {
 
 cmd_connect() {
     if is_connected; then
-        echo "Already connected to ${PHONE_TARGET}"
+        echo "Already connected to ${PHONE_TARGET}" >&2
         return 0
     fi
 
