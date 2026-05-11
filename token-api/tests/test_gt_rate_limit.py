@@ -1,47 +1,61 @@
 """Tests for Golden Throne rolling-window rate limiting."""
 
+import importlib
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from apscheduler.triggers.date import DateTrigger
 
-# Set test DB before importing main (DB_PATH is read at import time).
 _test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _test_db.close()
-os.environ["TOKEN_API_DB"] = _test_db.name
-
-from init_db import init_database
-from main import (
-    _golden_throne_fire_times,
-    _golden_throne_rate_limit_delay,
-    golden_throne_followup,
-)
 
 
-@pytest.fixture(autouse=True)
-def _clean_state(monkeypatch):
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
-    init_database()
-    _golden_throne_fire_times.clear()
+@pytest.fixture
+def gt_env(monkeypatch):
+    """Reload Token-API modules against an isolated DB for each rate-limit test.
+
+    The wider suite reloads ``main`` via ``app_env``. Importing main-level mutable
+    globals once at collection time leaves tests pointing at stale objects after
+    those reloads, so these tests intentionally resolve main/init_db fresh per
+    test.
+    """
+    db_path = Path(_test_db.name)
+    if db_path.exists():
+        db_path.unlink()
+    monkeypatch.setenv("TOKEN_API_DB", str(db_path))
     monkeypatch.delenv("GT_MAX_FIRES_PER_WINDOW", raising=False)
     monkeypatch.delenv("GT_RATE_WINDOW_SECONDS", raising=False)
-    yield
-    _golden_throne_fire_times.clear()
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
+
+    for name in ("shared", "db_schema", "init_db", "main"):
+        if name in sys.modules:
+            importlib.reload(sys.modules[name])
+        else:
+            importlib.import_module(name)
+
+    init_db = sys.modules["init_db"]
+    main = sys.modules["main"]
+    init_db.init_database()
+    main._golden_throne_fire_times.clear()
+
+    yield SimpleNamespace(db_path=db_path, main=main)
+
+    main._golden_throne_fire_times.clear()
+    if db_path.exists():
+        db_path.unlink()
 
 
-def _insert_instance(instance_id: str | None = None) -> str:
+def _insert_instance(db_path: Path, instance_id: str | None = None) -> str:
     iid = instance_id or str(uuid.uuid4())
     now = datetime.now().isoformat()
-    conn = sqlite3.connect(_test_db.name)
+    conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
@@ -54,51 +68,53 @@ def _insert_instance(instance_id: str | None = None) -> str:
     return iid
 
 
-def test_under_cap_records_fire_without_delay(monkeypatch):
+def test_under_cap_records_fire_without_delay(gt_env, monkeypatch):
     monkeypatch.setenv("GT_MAX_FIRES_PER_WINDOW", "3")
     monkeypatch.setenv("GT_RATE_WINDOW_SECONDS", "60")
 
     for offset in (0, 1, 2):
-        delay, details = _golden_throne_rate_limit_delay(now=1_000.0 + offset)
+        delay, details = gt_env.main._golden_throne_rate_limit_delay(now=1_000.0 + offset)
         assert delay is None
         assert details["recent_fires"] == offset + 1
 
-    assert len(_golden_throne_fire_times) == 3
+    assert len(gt_env.main._golden_throne_fire_times) == 3
 
 
-def test_at_cap_returns_delay_until_next_available_slot(monkeypatch):
+def test_at_cap_returns_delay_until_next_available_slot(gt_env, monkeypatch):
     monkeypatch.setenv("GT_MAX_FIRES_PER_WINDOW", "3")
     monkeypatch.setenv("GT_RATE_WINDOW_SECONDS", "60")
-    _golden_throne_fire_times.extend([1_000.0, 1_001.0, 1_002.0])
+    gt_env.main._golden_throne_fire_times.extend([1_000.0, 1_001.0, 1_002.0])
 
-    delay, details = _golden_throne_rate_limit_delay(now=1_010.0)
+    delay, details = gt_env.main._golden_throne_rate_limit_delay(now=1_010.0)
 
     assert delay == 50.0
     assert details["max_fires"] == 3
     assert details["window_seconds"] == 60
     assert details["recent_fires"] == 3
-    assert len(_golden_throne_fire_times) == 3  # Deferred calls do not consume fire slots.
+    assert (
+        len(gt_env.main._golden_throne_fire_times) == 3
+    )  # Deferred calls do not consume fire slots.
 
 
-def test_env_override_changes_cap_and_window(monkeypatch):
+def test_env_override_changes_cap_and_window(gt_env, monkeypatch):
     monkeypatch.setenv("GT_MAX_FIRES_PER_WINDOW", "1")
     monkeypatch.setenv("GT_RATE_WINDOW_SECONDS", "10")
 
-    delay, _ = _golden_throne_rate_limit_delay(now=100.0)
+    delay, _ = gt_env.main._golden_throne_rate_limit_delay(now=100.0)
     assert delay is None
 
-    delay, details = _golden_throne_rate_limit_delay(now=104.0)
+    delay, details = gt_env.main._golden_throne_rate_limit_delay(now=104.0)
     assert delay == 6.0
     assert details["max_fires"] == 1
     assert details["window_seconds"] == 10
 
 
 @pytest.mark.asyncio
-async def test_over_cap_defers_via_date_trigger_and_logs(monkeypatch):
+async def test_over_cap_defers_via_date_trigger_and_logs(gt_env, monkeypatch):
     monkeypatch.setenv("GT_MAX_FIRES_PER_WINDOW", "1")
     monkeypatch.setenv("GT_RATE_WINDOW_SECONDS", "60")
-    instance_id = _insert_instance()
-    _golden_throne_fire_times.append(time.time())
+    instance_id = _insert_instance(gt_env.db_path)
+    gt_env.main._golden_throne_fire_times.append(time.time())
 
     added_jobs = []
 
@@ -111,14 +127,14 @@ async def test_over_cap_defers_via_date_trigger_and_logs(monkeypatch):
     async def fake_log_event(event_type, **kwargs):
         events.append((event_type, kwargs))
 
-    monkeypatch.setattr("main.scheduler", FakeScheduler())
-    monkeypatch.setattr("main.log_event", fake_log_event)
+    monkeypatch.setattr(gt_env.main, "scheduler", FakeScheduler())
+    monkeypatch.setattr(gt_env.main, "log_event", fake_log_event)
 
-    await golden_throne_followup(instance_id)
+    await gt_env.main.golden_throne_followup(instance_id)
 
     assert len(added_jobs) == 1
     args, kwargs = added_jobs[0]
-    assert args[0] is golden_throne_followup
+    assert args[0] is gt_env.main.golden_throne_followup
     assert isinstance(args[1], DateTrigger)
     assert kwargs["args"] == [instance_id]
     assert kwargs["id"] == f"golden-throne-{instance_id}"
