@@ -6,12 +6,16 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.legion import LEGION_COLLAPSED_HEIGHT, focus_selected
+from tmuxctl.legion import LEGION_COLLAPSED_HEIGHT, enforce_stack_layout, focus_selected
 
 
 class FakeLegionAdapter:
-    def __init__(self, *, guard: bool = False) -> None:
+    def __init__(
+        self, *, guard: bool = False, window_name: str = "legion", rows: list[str] | None = None
+    ) -> None:
         self.guard = guard
+        self.window_name = window_name
+        self.rows = rows
         self.commands: list[tuple[str, ...]] = []
         self.window_options: dict[str, str] = {}
 
@@ -26,16 +30,20 @@ class FakeLegionAdapter:
             target = args[args.index("-t") + 1] if "-t" in args else ""
             fmt = args[-1]
             if fmt == "#{session_name}\t#{window_index}\t#{window_name}":
-                return "main\t3\tlegion\n"
+                return f"main\t3\t{self.window_name}\n"
             if fmt == "#{window_width}":
                 return "200\n"
             if fmt == "#{window_height}":
                 return "50\n"
+            if fmt == "#{window_name}":
+                return f"{self.window_name}\n"
             if fmt == "#{session_name}:#{window_index}":
                 return "main:3\n"
             if fmt == "#{pane_id}":
                 return f"{target}\n"
         if args[0] == "list-panes":
+            if self.rows is not None:
+                return "\n".join(self.rows)
             return "\n".join(
                 [
                     "%C\tlegion:custodes\t0\t0\t50",
@@ -45,6 +53,26 @@ class FakeLegionAdapter:
             )
         if args[0] == "set-option" and "-w" in args:
             self.window_options[args[-2]] = args[-1]
+        if args[0] == "set-option" and "-p" in args and self.rows is not None:
+            target = args[args.index("-t") + 1]
+            option = args[-2]
+            value = args[-1]
+            updated = []
+            for row in self.rows:
+                parts = row.split("\t")
+                if parts[0] == target:
+                    if option == "@PANE_ID":
+                        parts[1] = value
+                    elif option == "@PANE_TYPE":
+                        parts[2] = value
+                    elif option == "@GRID_STATE":
+                        pass
+                    row = "\t".join(parts)
+                updated.append(row)
+            self.rows = updated
+        if args[0] == "kill-pane" and self.rows is not None:
+            pane = args[args.index("-t") + 1]
+            self.rows = [row for row in self.rows if not row.startswith(f"{pane}\t")]
         return ""
 
 
@@ -77,3 +105,49 @@ def test_legion_focus_guard_makes_hook_reentry_noop():
 
     assert result.endswith(": guarded")
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
+
+
+def test_clear_legion_worker_is_killed_instead_of_becoming_blank_stack_pane():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude",
+            "%1\tlegion:worker\tstack-worker\t1\t81\t0\t80\t10\tzsh",
+        ]
+    )
+
+    result = enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
+
+    assert result == "normalized legion layout main:3: orchestrator only"
+    assert ("kill-pane", "-t", "%1") in adapter.commands
+
+
+def test_mechanicus_stack_uses_fabricator_left_column_and_worker_right_stack():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude",
+            "%1\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tcodex",
+        ],
+    )
+
+    result = enforce_stack_layout(adapter, "main:4", focused_pane="%1")  # type: ignore[arg-type]
+
+    assert result == "focused mechanicus %1 in main:4"
+    assert ("set-window-option", "-t", "main:4", "main-pane-width", "80") in adapter.commands
+    assert ("resize-pane", "-t", "%F", "-x", "80") in adapter.commands
+    assert adapter.window_options["@LEGION_FOCUSED_PANE"] == "%1"
+
+
+def test_blank_orchestrator_tag_is_moved_to_single_untyped_live_pane():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%blank\tlegion:custodes\tlegion\t0\t0\t0\t80\t20\tzsh",
+            "%live\t\t\t1\t0\t0\t160\t50\tclaude",
+        ]
+    )
+
+    result = enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
+
+    assert result == "normalized legion layout main:3: orchestrator only"
+    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:custodes") in adapter.commands
+    assert ("kill-pane", "-t", "%blank") in adapter.commands
