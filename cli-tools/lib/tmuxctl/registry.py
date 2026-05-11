@@ -47,6 +47,7 @@ def build_registry_snapshot(
                     str(row.get("pre_stop_status", "") or "")
                 ),
                 is_subagent=bool(row.get("is_subagent", False)),
+                legion=str(row.get("legion", "") or ""),
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
             )

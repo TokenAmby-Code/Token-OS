@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .revert import is_transient_window_name
 from .models import (
     PaneSnapshot,
     RestartExecutionResult,
@@ -77,10 +78,11 @@ def render_restart_plan(plan: RestartPlan) -> str:
             )
     for resume in plan.resumes:
         target = resume.target_pane_id or "<post-rebuild>"
+        tombstone = f" tombstone={resume.tombstone_role}" if resume.tombstone_role else ""
         lines.append(
             "  "
             f"resume {resume.instance_id[:8]} pane={resume.pane_label} "
-            f"target={target} mode={resume.disposition.value}"
+            f"target={target} mode={resume.disposition.value}{tombstone}"
         )
     for resume in plan.skipped:
         lines.append(
@@ -119,20 +121,42 @@ def render_doctor(snapshot: WorkspaceSnapshot) -> str:
     pane_ids = {pane.pane_id for pane in snapshot.iter_panes()}
     pane_roles = {pane.pane_role for pane in snapshot.iter_panes() if pane.pane_role}
 
+    referenced_focus_stash = {
+        f"_focus_stash_{window.window_name.split('(', 1)[0]}"
+        for window in snapshot.windows
+        if window.grid_focus_active and window.grid_focus_stash
+    }
+
     missing_windows = sorted(CANONICAL_WINDOWS - window_bases)
     if missing_windows:
         issues.append(f"missing canonical windows: {', '.join(missing_windows)}")
 
     for window in snapshot.windows:
         raw_base = window.window_name.split("(", 1)[0]
-        if raw_base.startswith("_stash_") or raw_base.startswith("_fstash_"):
+        if is_transient_window_name(window.window_name) and raw_base not in referenced_focus_stash:
             issues.append(f"orphan transient window: {window.window_name}")
+        if raw_base.startswith("_focus_stash_"):
+            if not any(pane.pane_role for pane in window.panes):
+                issues.append(f"empty/broken focus stash window: {window.window_name}")
         if window.grid_expanded != "none":
             issues.append(f"{window.target} has transient @GRID_EXPANDED={window.grid_expanded}")
         if window.grid_stash:
             issues.append(f"{window.target} has transient @GRID_STASH set")
         if window.side_expanded != "none":
             issues.append(f"{window.target} has transient @SIDE_EXPANDED={window.side_expanded}")
+        if window.grid_focus_active:
+            if not window.grid_focus_pane or window.grid_focus_pane not in pane_ids:
+                issues.append(f"{window.target} has broken grid focus pane: {window.grid_focus_pane or '(unset)'}")
+            stash_ids = [entry.split(':', 1)[0] for entry in window.grid_focus_stash.split(',') if entry]
+            missing = [pane_id for pane_id in stash_ids if pane_id not in pane_ids]
+            if missing:
+                issues.append(f"{window.target} has missing grid focus stash panes: {', '.join(missing)}")
+            if len(stash_ids) not in {0, 3}:
+                issues.append(f"{window.target} has invalid grid focus stash size: {len(stash_ids)}")
+        elif window.grid_focus_stash:
+            issues.append(f"{window.target} has stale @FOCUS_GRID_STASH set")
+        if window.side_focus_active and window.side_focus_pane not in pane_ids:
+            issues.append(f"{window.target} has broken side focus pane: {window.side_focus_pane or '(unset)'}")
         for warning in window.warnings:
             issues.append(f"{window.target}: {warning}")
         for pane in window.panes:
@@ -164,7 +188,9 @@ def render_window_lines(snapshot: WindowSnapshot) -> list[str]:
             f"focused={'true' if snapshot.focused else 'false'} "
             f"grid={snapshot.grid_expanded} "
             f"stash={'set' if snapshot.grid_stash else 'none'} "
-            f"side={snapshot.side_expanded}"
+            f"side={snapshot.side_expanded} "
+            f"focus_grid={snapshot.grid_focus_pane if snapshot.grid_focus_active else 'none'} "
+            f"focus_side={snapshot.side_focus_pane if snapshot.side_focus_active else 'none'}"
         )
     ]
     for warning in snapshot.warnings:

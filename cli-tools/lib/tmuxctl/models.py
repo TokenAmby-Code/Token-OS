@@ -45,6 +45,11 @@ class WindowSnapshot:
     grid_expanded: str
     grid_stash: str
     side_expanded: str
+    grid_focus_active: bool = False
+    grid_focus_pane: str = ""
+    grid_focus_stash: str = ""
+    side_focus_active: bool = False
+    side_focus_pane: str = ""
     panes: tuple[PaneSnapshot, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -73,6 +78,7 @@ class InstanceRegistryEntry:
     status: InstanceStatus
     pre_stop_status: InstanceStatus
     is_subagent: bool = False
+    legion: str = ""
     last_activity: str = ""
     stopped_at: str = ""
 
@@ -129,6 +135,7 @@ class PlannedResume:
     disposition: ResumeDisposition
     reason: str
     target_hidden_until_rebuild: bool = False
+    tombstone_role: str = ""
 
 
 @dataclass(frozen=True)

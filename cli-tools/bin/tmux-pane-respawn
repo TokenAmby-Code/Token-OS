@@ -26,8 +26,6 @@ if [[ "$PANE_TYPE" == "tui" ]]; then
         exit 0
     fi
     tmux respawn-pane -k -t "$PANE_ID" tui-pane-guard
-elif [[ "$PANE_TYPE" == "backstop" ]]; then
-    tmux respawn-pane -k -t "$PANE_ID" tmux-backstop
 elif [[ "$PANE_TYPE" == "tombstone" ]]; then
     SOURCE=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_SOURCE 2>/dev/null || echo "unknown")
     TARGET=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_TARGET 2>/dev/null || echo "unknown")

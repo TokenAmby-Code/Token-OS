@@ -5,8 +5,10 @@ from collections import Counter
 from .enums import GridState, PaneKind, WindowArchetype
 from .labels import (
     PALACE_GRID_ROLES,
+    PALACE_ROLES,
     PALACE_SIDE_ROLES,
     SOMNIUM_GRID_ROLES,
+    SOMNIUM_ROLES,
     SOMNIUM_SIDE_ROLES,
     canonical_pane_role,
 )
@@ -69,6 +71,8 @@ def _window_warnings(
     grid_expanded: str,
     grid_stash: str,
     side_expanded: str,
+    grid_focus_active: bool = False,
+    grid_focus_stash: str = "",
 ) -> tuple[str, ...]:
     warnings: list[str] = []
     pane_roles = [canonical_pane_role(role) for role in pane_roles]
@@ -104,18 +108,27 @@ def _window_warnings(
                 warnings.append(f"audience pane role does not match window page: {role}")
 
     if window_base == "palace":
+        required = set(PALACE_ROLES)
+        extra = sorted(set(role_counts) - required)
+        if extra:
+            warnings.append(f"unexpected palace roles: {', '.join(extra)}")
         grid_required = set(PALACE_GRID_ROLES)
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
             if len(missing_grid) != len(stash_panes):
                 warnings.append("expanded palace grid stash does not match missing grid panes")
-            elif len(stash_panes) != 3:
-                warnings.append("expanded palace grid should stash exactly 3 panes")
-        elif missing_grid:
+            elif len(stash_panes) != len(PALACE_GRID_ROLES) - 1:
+                warnings.append(f"expanded palace grid should stash exactly {len(PALACE_GRID_ROLES) - 1} panes")
+        elif missing_grid and not grid_focus_active:
             warnings.append(f"missing palace grid roles: {', '.join(missing_grid)}")
+        elif missing_grid and grid_focus_active:
+            focus_stash_count = len([entry for entry in grid_focus_stash.split(",") if entry])
+            if focus_stash_count != len(missing_grid):
+                warnings.append("focused palace grid stash does not match missing grid panes")
 
-        if focused and any(role in role_counts for role in PALACE_SIDE_ROLES):
-            warnings.append("focused palace should not expose palace:WW or palace:EE")
+        # @FOCUSED is now a coarse compatibility marker. Typed focus axes decide
+        # whether side panes should be visible; partial grid focus intentionally
+        # preserves palace sides.
 
         if not focused:
             side_required = set(PALACE_SIDE_ROLES)
@@ -124,6 +137,10 @@ def _window_warnings(
                 warnings.append(f"missing palace side roles: {', '.join(missing_side)}")
 
     if window_base == "somnium":
+        required = set(SOMNIUM_ROLES)
+        extra = sorted(set(role_counts) - required)
+        if extra:
+            warnings.append(f"unexpected somnium roles: {', '.join(extra)}")
         grid_required = set(SOMNIUM_GRID_ROLES)
         missing_grid = sorted(grid_required - set(role_counts))
         if expanded_role:
@@ -131,11 +148,12 @@ def _window_warnings(
                 warnings.append("expanded somnium grid stash does not match missing grid panes")
             elif len(stash_panes) != 3:
                 warnings.append("expanded somnium grid should stash exactly 3 panes")
-        elif missing_grid:
+        elif missing_grid and not grid_focus_active:
             warnings.append(f"missing somnium grid roles: {', '.join(missing_grid)}")
-
-        if focused and "somnium:EE" in role_counts:
-            warnings.append("focused somnium should not expose somnium:EE")
+        elif missing_grid and grid_focus_active:
+            focus_stash_count = len([entry for entry in grid_focus_stash.split(",") if entry])
+            if focus_stash_count != len(missing_grid):
+                warnings.append("focused somnium grid stash does not match missing grid panes")
 
         if not focused:
             side_required = set(SOMNIUM_SIDE_ROLES)
@@ -169,6 +187,11 @@ def build_window_snapshot(
     grid_expanded = adapter.show_window_option(target, "@GRID_EXPANDED") or "none"
     grid_stash = adapter.show_window_option(target, "@GRID_STASH")
     side_expanded = adapter.show_window_option(target, "@SIDE_EXPANDED") or "none"
+    grid_focus_active = adapter.show_window_option(target, "@FOCUS_GRID_ACTIVE") == "true"
+    grid_focus_pane = adapter.show_window_option(target, "@FOCUS_GRID_PANE")
+    grid_focus_stash = adapter.show_window_option(target, "@FOCUS_GRID_STASH")
+    side_focus_active = adapter.show_window_option(target, "@FOCUS_SIDE_ACTIVE") == "true"
+    side_focus_pane = adapter.show_window_option(target, "@FOCUS_SIDE_PANE")
 
     panes: list[PaneSnapshot] = []
     pane_roles: list[str] = []
@@ -208,7 +231,12 @@ def build_window_snapshot(
         grid_expanded=grid_expanded,
         grid_stash=grid_stash,
         side_expanded=side_expanded,
+        grid_focus_active=grid_focus_active,
+        grid_focus_stash=grid_focus_stash,
     )
+    window_base = window_name.split("(", 1)[0]
+    if window_base in {"palace", "somnium"} and any(p.pane_kind is PaneKind.TUI for p in panes):
+        warnings = (*warnings, f"{window_base} must not contain @PANE_TYPE=tui panes")
 
     return WindowSnapshot(
         session_name=session_name,
@@ -219,6 +247,11 @@ def build_window_snapshot(
         grid_expanded=grid_expanded,
         grid_stash=grid_stash,
         side_expanded=side_expanded,
+        grid_focus_active=grid_focus_active,
+        grid_focus_pane=grid_focus_pane,
+        grid_focus_stash=grid_focus_stash,
+        side_focus_active=side_focus_active,
+        side_focus_pane=side_focus_pane,
         panes=tuple(sorted(panes, key=lambda pane: pane.pane_index)),
         warnings=warnings,
     )

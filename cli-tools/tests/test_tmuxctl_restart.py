@@ -80,6 +80,7 @@ def _instance(
     stopped_at: str = "",
     tmux_pane: str = "%1",
     is_subagent: bool = False,
+    legion: str = "",
 ) -> InstanceRegistryEntry:
     return InstanceRegistryEntry(
         instance_id=instance_id,
@@ -90,6 +91,7 @@ def _instance(
         status=status,
         pre_stop_status=pre_stop_status,
         is_subagent=is_subagent,
+        legion=legion,
         last_activity=last_activity if last_activity is not None else _iso_ago(hours=1),
         stopped_at=stopped_at,
     )
@@ -104,7 +106,7 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("old", "somnium:NW", last_activity=_iso_ago(hours=30)),
+            _instance("old", "somnium:NW", last_activity=_iso_ago(hours=2)),
             _instance("new", "somnium:NW", last_activity=_iso_ago(hours=1)),
         ),
     )
@@ -112,7 +114,29 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
     plan = build_restart_plan(workspace, registry)
 
     assert [resume.instance_id for resume in plan.resumes] == ["new"]
-    assert any(issue.code == "duplicate_pane_label" for issue in plan.coherence_issues)
+    assert any(issue.code == "duplicate_pane_label" and issue.severity is CoherenceSeverity.WARNING for issue in plan.coherence_issues)
+
+
+def test_restart_plan_ignores_stale_stopped_duplicate_claims():
+    workspace = _workspace(_pane("%1", "somnium:NW"))
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(
+            _instance(
+                "old-stopped",
+                "somnium:NW",
+                status=InstanceStatus.STOPPED,
+                stopped_at=_iso_ago(hours=1),
+                tmux_pane="%9",
+            ),
+            _instance("active", "somnium:NW", last_activity=_iso_ago(seconds=30)),
+        ),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert [resume.instance_id for resume in plan.resumes] == ["active"]
+    assert not any(issue.code == "duplicate_pane_label" for issue in plan.coherence_issues)
 
 
 def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
@@ -152,18 +176,55 @@ def test_restart_plan_flags_busy_targets_and_pane_id_drift():
     assert codes["target_busy"] is CoherenceSeverity.ERROR
 
 
+def test_restart_plan_flags_codex_targets_busy():
+    workspace = _workspace(_pane("%2", "somnium:NW", command="codex"))
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("abc", "somnium:NW", tmux_pane="%2"),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    codes = {issue.code: issue.severity for issue in plan.coherence_issues}
+    assert codes["target_busy"] is CoherenceSeverity.ERROR
+
+
+def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
+    workspace = _workspace(_pane("%2", "somnium:NE"))
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("custodes", "somnium:NE", tmux_pane="%2", legion="custodes"),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert plan.resumes[0].pane_label == "somnium:NE"
+    assert plan.resumes[0].tombstone_role == "legion:custodes"
+
+
+def test_restart_plan_marks_promoted_fabricator_for_mechanicus_tombstone():
+    workspace = _workspace(_pane("%2", "palace:N", window="palace"))
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("fabricator", "palace:NE", tmux_pane="%2", legion="fabricator"),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert plan.resumes[0].pane_label == "palace:N"
+    assert plan.resumes[0].tombstone_role == "mechanicus:fabricator-general"
+
+
 def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
     workspace = _workspace(
-        _pane("%1", "palace:NW", window="palace"),
-        _pane("%2", "palace:NE", window="palace"),
-        _pane("%3", "palace:SW", window="palace"),
-        _pane("%4", "palace:SE", window="palace"),
+        _pane("%1", "palace:N", window="palace"),
+        _pane("%3", "palace:S", window="palace"),
         window="palace",
         archetype=WindowArchetype.PALACE,
     )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
-        instances=(_instance("abc", "palace:WW", tmux_pane="%99"),),
+        instances=(_instance("abc", "palace:W", tmux_pane="%99"),),
     )
 
     plan = build_restart_plan(workspace, registry)
@@ -175,20 +236,18 @@ def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
 
 def test_palace_happy_path_resumes_grid_and_side_labels():
     workspace = _workspace(
-        _pane("%1", "palace:WW", window="palace"),
-        _pane("%2", "palace:NW", window="palace"),
-        _pane("%3", "palace:SW", window="palace"),
-        _pane("%4", "palace:NE", window="palace"),
-        _pane("%5", "palace:SE", window="palace"),
-        _pane("%6", "palace:EE", window="palace"),
+        _pane("%1", "palace:W", window="palace"),
+        _pane("%2", "palace:N", window="palace"),
+        _pane("%3", "palace:S", window="palace"),
+        _pane("%6", "palace:E", window="palace"),
         window="palace",
         archetype=WindowArchetype.PALACE,
     )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
-            _instance("alpha", "palace:NW", tmux_pane="%2"),
-            _instance("beta", "palace:EE", tmux_pane="%6"),
+            _instance("alpha", "palace:N", tmux_pane="%2"),
+            _instance("beta", "palace:E", tmux_pane="%6"),
         ),
     )
 
@@ -346,31 +405,28 @@ def test_builder_creates_canonical_workspace_roles():
 
     build_workspace(adapter, "main")  # type: ignore[arg-type]
 
-    assert adapter.windows["main"] == ["palace", "somnium", "legion", "mechanicus", "tui"]
+    assert adapter.windows["main"] == ["palace", "somnium", "legion", "mechanicus"]
     roles = {
         target: options.get("@PANE_ID")
         for target, options in adapter.pane_options.items()
         if "@PANE_ID" in options
     }
     assert {
-        "palace:WW",
-        "palace:NW",
-        "palace:SW",
-        "palace:NE",
-        "palace:SE",
-        "palace:EE",
+        "palace:W",
+        "palace:N",
+        "palace:S",
+        "palace:E",
     } <= set(roles.values())
     assert {
-        "somnium:NW",
-        "somnium:SW",
+        "somnium:W",
+        "somnium:N",
         "somnium:NE",
+        "somnium:S",
         "somnium:SE",
-        "somnium:EE",
     } <= set(roles.values())
-    assert roles["main:legion.1"] == "legion:empty"
-    assert roles["main:mechanicus.1"] == "mechanicus:anchor"
+    assert roles["main:legion.1"] == "legion:custodes"
+    assert roles["main:mechanicus.1"] == "mechanicus:fabricator-general"
     assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
     assert adapter.pane_options["main:mechanicus.1"]["@PANE_TYPE"] == "mechanicus"
-    assert roles["main:tui.1"] == "tui:1"
-    assert adapter.pane_options["main:somnium.5"]["@PANE_TYPE"] == "tui"
-    assert adapter.pane_options["main:tui.1"]["@PANE_TYPE"] == "tui"
+    pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
+    assert "tui" not in pane_types

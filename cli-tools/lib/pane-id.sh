@@ -2,13 +2,13 @@
 # pane-id.sh — Human-readable tmux pane ID system
 # Sourced by tx, vault-dispatch, tmuxctl, and other tmux tools.
 #
-# Pane IDs use the format window:position (e.g., palace:NE, mechanicus:1).
+# Pane IDs use the format window:position (e.g., palace:N, mechanicus:1).
 # Stored as @PANE_ID tmux pane option. Resolves to tmux pane target (%N).
 #
-# Palace positions:  WW NW SW NE SE EE  (6-pane: side columns flank a 2x2 grid)
-# Somnium positions: NW NE SW SE EE     (5-pane: 2x2 grid + right TUI column)
-# Mechanicus/Legion: incrementing integers (1, 2, 3...)
-# TUI:               1
+# Palace positions:  W N S E          (4-pane H layout)
+# Somnium positions: W N NE S SE      (left side rail + right 2x2)
+# Mechanicus/Legion: named/worker roles
+# TUI: legacy compatibility only; no default workspace TUI window
 
 _TMUX_STATE_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=./tmux-state.sh
@@ -18,13 +18,14 @@ pane_canonical_id() {
     local pane_id="${1:-}" window pos
     window="${pane_id%:*}"
     pos="${pane_id#*:}"
-    case "$pos" in
-        TL) pos="NW" ;;
-        TR) pos="NE" ;;
-        BL) pos="SW" ;;
-        BR) pos="SE" ;;
-        SL) pos="WW" ;;
-        SR) pos="EE" ;;
+    case "${window}:${pos}" in
+        palace:WW|palace:SL) pos="W" ;;
+        palace:EE|palace:SR) pos="E" ;;
+        palace:NW|palace:NE|palace:TL|palace:TR) pos="N" ;;
+        palace:SW|palace:SE|palace:BL|palace:BR) pos="S" ;;
+        somnium:NW|somnium:SW|somnium:TL|somnium:BL) pos="W" ;;
+        somnium:TR) pos="NE" ;;
+        somnium:BR) pos="SE" ;;
     esac
     echo "${window}:${pos}"
 }
@@ -54,11 +55,10 @@ pane_tag() {
             tmux set-option -p -t "$target" @PANE_TYPE "$pane_type"
             ;;
     esac
-    # somnium:EE gets @PANE_TYPE "tui" — set by caller
 }
 
-# Resolve a pane ID to a tmux pane target (e.g., palace:NE → %17).
-# Usage: tmux send-keys -t "$(pane_resolve palace:NE)" "echo hi" Enter
+# Resolve a pane ID to a tmux pane target (e.g., palace:N → %17).
+# Usage: tmux send-keys -t "$(pane_resolve palace:N)" "echo hi" Enter
 pane_resolve() {
     local id="$1"
     local resolved
@@ -75,14 +75,14 @@ pane_resolve() {
 }
 
 # List all pane IDs and their tmux targets.
-# Output: %0 palace:NW\n%1 palace:SW\n...
+# Output: %0 palace:N\n%1 palace:S\n...
 pane_list() {
     tmux list-panes -a -F '#{pane_id} #{@PANE_ID}' 2>/dev/null \
         | awk '$2 != "" && $2 != "(null)" { print }'
 }
 
 # Get the @PANE_ID for a given tmux pane target.
-# Usage: pane_id_of %5  →  palace:NE
+# Usage: pane_id_of %5  →  palace:N
 pane_id_of() {
     local target="$1"
     tmux show-options -pv -t "$target" @PANE_ID 2>/dev/null || echo ""
