@@ -146,17 +146,27 @@ def render_doctor(snapshot: WorkspaceSnapshot) -> str:
             issues.append(f"{window.target} has transient @SIDE_EXPANDED={window.side_expanded}")
         if window.grid_focus_active:
             if not window.grid_focus_pane or window.grid_focus_pane not in pane_ids:
-                issues.append(f"{window.target} has broken grid focus pane: {window.grid_focus_pane or '(unset)'}")
-            stash_ids = [entry.split(':', 1)[0] for entry in window.grid_focus_stash.split(',') if entry]
+                issues.append(
+                    f"{window.target} has broken grid focus pane: {window.grid_focus_pane or '(unset)'}"
+                )
+            stash_ids = [
+                entry.split(":", 1)[0] for entry in window.grid_focus_stash.split(",") if entry
+            ]
             missing = [pane_id for pane_id in stash_ids if pane_id not in pane_ids]
             if missing:
-                issues.append(f"{window.target} has missing grid focus stash panes: {', '.join(missing)}")
+                issues.append(
+                    f"{window.target} has missing grid focus stash panes: {', '.join(missing)}"
+                )
             if len(stash_ids) not in {0, 3}:
-                issues.append(f"{window.target} has invalid grid focus stash size: {len(stash_ids)}")
+                issues.append(
+                    f"{window.target} has invalid grid focus stash size: {len(stash_ids)}"
+                )
         elif window.grid_focus_stash:
             issues.append(f"{window.target} has stale @FOCUS_GRID_STASH set")
         if window.side_focus_active and window.side_focus_pane not in pane_ids:
-            issues.append(f"{window.target} has broken side focus pane: {window.side_focus_pane or '(unset)'}")
+            issues.append(
+                f"{window.target} has broken side focus pane: {window.side_focus_pane or '(unset)'}"
+            )
         for warning in window.warnings:
             issues.append(f"{window.target}: {warning}")
         for pane in window.panes:

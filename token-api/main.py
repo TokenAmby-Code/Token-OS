@@ -7917,11 +7917,30 @@ ENFORCEMENT_LEVEL_DELAYS = {
 # Pavlok is dispatched server-side first by fire_cascade_event(). These params are
 # only downstream companion phone effects and are never sent unless Pavlok fired.
 ENFORCE_LEVEL_PARAMS = {
-    1: {"endpoint": "/notify", "params": {"vibe": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
-    2: {"endpoint": "/notify", "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
-    3: {"endpoint": "/notify", "params": {"vibe": 80, "beep": 50, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
-    4: {"endpoint": "/enforce", "params": {"tts_text": "Close {app}", "banner_text": "Enforcement active"}},
-    5: {"endpoint": "/enforce", "params": {"zap": 50, "tts_text": "Pavlok fired. Close {app}", "banner_text": "Enforcement — Pavlok"}},
+    1: {
+        "endpoint": "/notify",
+        "params": {"vibe": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+    },
+    2: {
+        "endpoint": "/notify",
+        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+    },
+    3: {
+        "endpoint": "/notify",
+        "params": {"vibe": 80, "beep": 50, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+    },
+    4: {
+        "endpoint": "/enforce",
+        "params": {"tts_text": "Close {app}", "banner_text": "Enforcement active"},
+    },
+    5: {
+        "endpoint": "/enforce",
+        "params": {
+            "zap": 50,
+            "tts_text": "Pavlok fired. Close {app}",
+            "banner_text": "Enforcement — Pavlok",
+        },
+    },
 }
 
 ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
@@ -9214,7 +9233,6 @@ def _enforcement_state_payload(
     return payload
 
 
-
 async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
     """Atomically fire one cascade event.
 
@@ -9225,7 +9243,9 @@ async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
     repeat = bool(payload.get("repeat"))
     endpoint, phone_params = _cascade_level_endpoint_params(app_name, level)
     pavlok_value = int(payload.get("pavlok_value") or _cascade_pavlok_value(level, phone_params))
-    reason = payload.get("reason") or ("cascade_level_5_repeat" if repeat else f"cascade_level_{level}")
+    reason = payload.get("reason") or (
+        "cascade_level_5_repeat" if repeat else f"cascade_level_{level}"
+    )
 
     pavlok_result = await asyncio.to_thread(
         send_pavlok_stimulus,
@@ -9338,7 +9358,12 @@ async def _enforcement_cascade_worker(app_name: str):
         await log_event(
             "enforcement_cascade_escalate",
             device_id="phone",
-            details={"app": app_name, "level": level, "ack_id": ack_id, "elapsed_s": round(elapsed)},
+            details={
+                "app": app_name,
+                "level": level,
+                "ack_id": ack_id,
+                "elapsed_s": round(elapsed),
+            },
         )
         await handle_custodes_state_event(
             "enforcement_cascade_escalate",

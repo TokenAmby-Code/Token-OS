@@ -118,7 +118,9 @@ def _window_warnings(
             if len(missing_grid) != len(stash_panes):
                 warnings.append("expanded palace grid stash does not match missing grid panes")
             elif len(stash_panes) != len(PALACE_GRID_ROLES) - 1:
-                warnings.append(f"expanded palace grid should stash exactly {len(PALACE_GRID_ROLES) - 1} panes")
+                warnings.append(
+                    f"expanded palace grid should stash exactly {len(PALACE_GRID_ROLES) - 1} panes"
+                )
         elif missing_grid and not grid_focus_active:
             warnings.append(f"missing palace grid roles: {', '.join(missing_grid)}")
         elif missing_grid and grid_focus_active:

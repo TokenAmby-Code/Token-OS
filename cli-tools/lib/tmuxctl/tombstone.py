@@ -91,4 +91,3 @@ def jump_tombstone(adapter: TmuxAdapter, target: str, *, client: str = "") -> st
     chain = _display_chain(resolved.chain)
     destination = _display_role(adapter, resolved.pane_id)
     return f"selected {destination}" + (f" via {chain}" if chain else "")
-

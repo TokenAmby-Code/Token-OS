@@ -181,9 +181,7 @@ def set_day_started_at_sync(
     result["already_started"] = False
     result["updated"] = True
     if db_path is None or Path(db_path) == DB_PATH:
-        _DAY_STATE_CACHE.update(
-            {"date": date_str, "value": result, "monotonic": time.monotonic()}
-        )
+        _DAY_STATE_CACHE.update({"date": date_str, "value": result, "monotonic": time.monotonic()})
     return result
 
 

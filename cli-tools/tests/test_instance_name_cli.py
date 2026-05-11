@@ -18,7 +18,11 @@ class _RenameHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         type(self).received = {"path": self.path, "payload": payload}
         body = json.dumps(
-            {"status": "renamed", "instance_id": "abcdef1234567890", "tab_name": payload["tab_name"]}
+            {
+                "status": "renamed",
+                "instance_id": "abcdef1234567890",
+                "tab_name": payload["tab_name"],
+            }
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

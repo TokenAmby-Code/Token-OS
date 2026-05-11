@@ -45,7 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_parser.add_argument("--window", default="current")
 
     focus_parser = subparsers.add_parser("focus")
-    focus_parser.add_argument("mode", nargs="?", default="toggle", choices=["toggle", "focus-grid", "unfocus-grid", "focus-side", "unfocus-side"])
+    focus_parser.add_argument(
+        "mode",
+        nargs="?",
+        default="toggle",
+        choices=["toggle", "focus-grid", "unfocus-grid", "focus-side", "unfocus-side"],
+    )
     focus_parser.add_argument("--window", default="current")
 
     restart_parser = subparsers.add_parser("restart")
@@ -79,9 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     audience_return.add_argument("--client", default="")
 
     tombstone_parser = subparsers.add_parser("tombstone")
-    tombstone_subparsers = tombstone_parser.add_subparsers(
-        dest="tombstone_command", required=True
-    )
+    tombstone_subparsers = tombstone_parser.add_subparsers(dest="tombstone_command", required=True)
 
     tombstone_jump = tombstone_subparsers.add_parser("jump")
     tombstone_jump.add_argument("--pane", default="current")
@@ -159,7 +162,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "focus":
             session_name, window_index = _parse_window_ref(args.window, control)
-            print(control.focus(session_name=session_name, window_index=window_index, mode=args.mode))
+            print(
+                control.focus(session_name=session_name, window_index=window_index, mode=args.mode)
+            )
             return 0
 
         if args.command == "restart":
@@ -219,9 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "stack":
             if args.stack_command == "add":
                 from .stack import add_stack_pane
-                pane_id = add_stack_pane(
-                    control.adapter, args.session, args.base, cwd=args.cwd
-                )
+
+                pane_id = add_stack_pane(control.adapter, args.session, args.base, cwd=args.cwd)
                 print(pane_id)
                 return 0
             if args.stack_command == "enforce":
@@ -280,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             print(control.create_workspace(args.session))
             if args.attach:
                 from .builder import attach_workspace
+
                 attach_workspace(args.session)
             return 0
 

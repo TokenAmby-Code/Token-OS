@@ -61,9 +61,7 @@ def build_restart_plan(
             )
 
     duplicate_claims = Counter(
-        canonical_pane_role(inst.pane_label)
-        for inst in candidate_instances
-        if inst.pane_label
+        canonical_pane_role(inst.pane_label) for inst in candidate_instances if inst.pane_label
     )
 
     for pane_label, count in duplicate_claims.items():

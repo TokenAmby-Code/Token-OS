@@ -296,7 +296,9 @@ class RestartExecutor:
         actions.append(
             RestartAction(RestartPhase.TEARDOWN, f"kill leader session {plan.session_name}")
         )
-        actions.append(RestartAction(RestartPhase.REBUILD, "recreate workspace via builder.build_workspace"))
+        actions.append(
+            RestartAction(RestartPhase.REBUILD, "recreate workspace via builder.build_workspace")
+        )
         actions.append(
             RestartAction(RestartPhase.REBUILD, "normalize managed windows before restore")
         )
