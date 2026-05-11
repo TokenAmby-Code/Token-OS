@@ -13,6 +13,7 @@ from .models import (
     CoherenceIssue,
     InstanceRegistryEntry,
     InstanceRegistrySnapshot,
+    PaneSnapshot,
     PlannedResume,
     RestartPlan,
     WorkspaceSnapshot,
@@ -35,7 +36,7 @@ def build_restart_plan(
     a registry snapshot that already reflects the current device's instance view.
     """
 
-    pane_by_label = {}
+    pane_by_label: dict[str, PaneSnapshot] = {}
     for pane in workspace.iter_panes():
         if pane.pane_role:
             pane_by_label.setdefault(canonical_pane_role(pane.pane_role), pane)

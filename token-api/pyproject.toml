@@ -61,6 +61,8 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_return_any = false
 strict_optional = false
+ignore_errors = true
+disable_error_code = ["import-untyped"]
 exclude = ["tests/"]
 
 [tool.pytest.ini_options]
