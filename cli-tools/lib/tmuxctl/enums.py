@@ -18,7 +18,6 @@ class GridState(str, Enum):
     SIDE = "side"
     MINI = "mini"
     WIDE = "wide"
-    TALL_GRID = "tall-grid"
 
 
 class PaneKind(str, Enum):
@@ -27,7 +26,6 @@ class PaneKind(str, Enum):
     TUI = "tui"
     LEGION = "legion"
     MECHANICUS = "mechanicus"
-    BACKSTOP = "backstop"
     TOMBSTONE = "tombstone"
 
 

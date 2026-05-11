@@ -116,6 +116,11 @@ def add_stack_pane(
         raise ValueError(f"not a stack window: {base}")
     cwd = cwd or os.path.expanduser("~")
 
+    if base in {"legion", "mechanicus"}:
+        from .legion import add_orchestrator_stack_pane
+
+        return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd)
+
     existing = _list_spill_windows(adapter, session, base)
     if not existing:
         # No canonical window yet — create it as the first stack window.
