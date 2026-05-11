@@ -53,13 +53,24 @@ def _window_base(name: str) -> str:
 
 
 def _pane_exists(adapter: TmuxAdapter, pane_id: str) -> bool:
-    return bool(adapter.run("display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True).strip())
+    return bool(
+        adapter.run(
+            "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
+        ).strip()
+    )
 
 
 def _window_names(adapter: TmuxAdapter, session_name: str) -> set[str]:
     return {
         row.split("\t", 1)[1]
-        for row in adapter.run("list-windows", "-t", session_name, "-F", "#{window_index}\t#{window_name}", allow_failure=True).splitlines()
+        for row in adapter.run(
+            "list-windows",
+            "-t",
+            session_name,
+            "-F",
+            "#{window_index}\t#{window_name}",
+            allow_failure=True,
+        ).splitlines()
         if "\t" in row
     }
 
@@ -76,12 +87,17 @@ def _coord(role: str) -> tuple[int, int] | None:
 
 
 def _grid_panes(window: WindowSnapshot) -> list[PaneSnapshot]:
-    return [p for p in window.panes if p.grid_state is GridState.SMALL and _coord(p.pane_role) is not None]
+    return [
+        p
+        for p in window.panes
+        if p.grid_state is GridState.SMALL and _coord(p.pane_role) is not None
+    ]
 
 
 def _side_panes(window: WindowSnapshot) -> list[PaneSnapshot]:
     return [
-        p for p in window.panes
+        p
+        for p in window.panes
         if p.grid_state is GridState.SIDE or canonical_pane_role(p.pane_role) in SIDE_ROLES
     ]
 
@@ -109,18 +125,36 @@ def _stash_window_target(window: WindowSnapshot) -> str:
     return f"{window.session_name}:{_stash_name(window)}"
 
 
-def plan_focus_grid(adapter: TmuxAdapter, window: WindowSnapshot, active: PaneSnapshot) -> FocusPlan:
+def plan_focus_grid(
+    adapter: TmuxAdapter, window: WindowSnapshot, active: PaneSnapshot
+) -> FocusPlan:
     if window.grid_focus_active and window.grid_focus_pane == active.pane_id:
         return plan_unfocus_grid(adapter, window, active)
     if window.grid_focus_active:
-        return FocusPlan(FocusAxis.GRID, "refuse", window.target, active.pane_id, (), "grid focus already active; unfocus first")
+        return FocusPlan(
+            FocusAxis.GRID,
+            "refuse",
+            window.target,
+            active.pane_id,
+            (),
+            "grid focus already active; unfocus first",
+        )
 
     grid = _grid_panes(window)
     if active not in grid:
-        return FocusPlan(FocusAxis.GRID, "noop", window.target, active.pane_id, (), "active pane is not a grid pane")
+        return FocusPlan(
+            FocusAxis.GRID,
+            "noop",
+            window.target,
+            active.pane_id,
+            (),
+            "active pane is not a grid pane",
+        )
     siblings = [p for p in grid if p.pane_id != active.pane_id]
     if not siblings:
-        return FocusPlan(FocusAxis.GRID, "noop", window.target, active.pane_id, (), "no grid siblings to stash")
+        return FocusPlan(
+            FocusAxis.GRID, "noop", window.target, active.pane_id, (), "no grid siblings to stash"
+        )
 
     stash = _stash_name(window)
     stash_target = _stash_window_target(window)
@@ -131,34 +165,48 @@ def plan_focus_grid(adapter: TmuxAdapter, window: WindowSnapshot, active: PaneSn
     for i, pane in enumerate(siblings):
         pos = pane.pane_role.rsplit(":", 1)[1] if ":" in pane.pane_role else str(i)
         manifest.append(f"{pane.pane_id}:{pane.pane_role}:{pos}")
-        actions.extend([
-            _set_pane(pane.pane_id, "@FOCUS_SOURCE_WINDOW", window.target),
-            _set_pane(pane.pane_id, "@FOCUS_SOURCE_ROLE", pane.pane_role),
-            _set_pane(pane.pane_id, "@FOCUS_AXIS", FocusAxis.GRID.value),
-            _set_pane(pane.pane_id, "@FOCUS_RESTORE_POSITION", pos),
-        ])
+        actions.extend(
+            [
+                _set_pane(pane.pane_id, "@FOCUS_SOURCE_WINDOW", window.target),
+                _set_pane(pane.pane_id, "@FOCUS_SOURCE_ROLE", pane.pane_role),
+                _set_pane(pane.pane_id, "@FOCUS_AXIS", FocusAxis.GRID.value),
+                _set_pane(pane.pane_id, "@FOCUS_RESTORE_POSITION", pos),
+            ]
+        )
         if not stash_exists:
-            actions.append(FocusAction(("break-pane", "-d", "-s", pane.pane_id, "-n", stash), False))
+            actions.append(
+                FocusAction(("break-pane", "-d", "-s", pane.pane_id, "-n", stash), False)
+            )
             stash_exists = True
         else:
-            actions.append(FocusAction(("move-pane", "-d", "-s", pane.pane_id, "-t", stash_target), False))
-    actions.extend([
-        _set_window("@FOCUSED", "true", window.target),
-        _set_window("@FOCUS_GRID_ACTIVE", "true", window.target),
-        _set_window("@FOCUS_GRID_PANE", active.pane_id, window.target),
-        _set_window("@FOCUS_GRID_STASH", ",".join(manifest), window.target),
-        _set_window("@GRID_EXPANDED", "none", window.target),
-        _set_window("@GRID_STASH", "", window.target),
-    ])
+            actions.append(
+                FocusAction(("move-pane", "-d", "-s", pane.pane_id, "-t", stash_target), False)
+            )
+    actions.extend(
+        [
+            _set_window("@FOCUSED", "true", window.target),
+            _set_window("@FOCUS_GRID_ACTIVE", "true", window.target),
+            _set_window("@FOCUS_GRID_PANE", active.pane_id, window.target),
+            _set_window("@FOCUS_GRID_STASH", ",".join(manifest), window.target),
+            _set_window("@GRID_EXPANDED", "none", window.target),
+            _set_window("@GRID_STASH", "", window.target),
+        ]
+    )
     return FocusPlan(FocusAxis.GRID, "focus", window.target, active.pane_id, tuple(actions))
 
 
-def plan_unfocus_grid(adapter: TmuxAdapter, window: WindowSnapshot, active: PaneSnapshot | None = None) -> FocusPlan:
+def plan_unfocus_grid(
+    adapter: TmuxAdapter, window: WindowSnapshot, active: PaneSnapshot | None = None
+) -> FocusPlan:
     focus_pane = window.grid_focus_pane or (active.pane_id if active else "")
     if not window.grid_focus_active:
-        return FocusPlan(FocusAxis.GRID, "noop", window.target, focus_pane, (), "grid focus is not active")
+        return FocusPlan(
+            FocusAxis.GRID, "noop", window.target, focus_pane, (), "grid focus is not active"
+        )
     if not focus_pane or not _pane_exists(adapter, focus_pane):
-        return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), "focused grid pane is missing")
+        return FocusPlan(
+            FocusAxis.GRID, "refuse", window.target, focus_pane, (), "focused grid pane is missing"
+        )
 
     focus_role = ""
     for pane in window.panes:
@@ -167,26 +215,56 @@ def plan_unfocus_grid(adapter: TmuxAdapter, window: WindowSnapshot, active: Pane
             break
     focus_coord = _coord(focus_role)
     if focus_coord is None:
-        return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), "focused pane has no grid role")
+        return FocusPlan(
+            FocusAxis.GRID, "refuse", window.target, focus_pane, (), "focused pane has no grid role"
+        )
 
     entries: list[tuple[str, str, tuple[int, int]]] = []
     for entry in [e for e in window.grid_focus_stash.split(",") if e]:
         parts = entry.split(":")
         if len(parts) < 3:
-            return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), f"invalid focus stash entry: {entry}")
+            return FocusPlan(
+                FocusAxis.GRID,
+                "refuse",
+                window.target,
+                focus_pane,
+                (),
+                f"invalid focus stash entry: {entry}",
+            )
         pane_id = parts[0]
         role = ":".join(parts[1:-1])
         coord = _coord(role)
         if coord is None:
             coord = _GRID_POS.get(parts[-1])
         if coord is None:
-            return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), f"invalid restore coordinate: {entry}")
+            return FocusPlan(
+                FocusAxis.GRID,
+                "refuse",
+                window.target,
+                focus_pane,
+                (),
+                f"invalid restore coordinate: {entry}",
+            )
         if not _pane_exists(adapter, pane_id):
-            return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), f"stashed pane is missing: {pane_id}")
+            return FocusPlan(
+                FocusAxis.GRID,
+                "refuse",
+                window.target,
+                focus_pane,
+                (),
+                f"stashed pane is missing: {pane_id}",
+            )
         entries.append((pane_id, role, coord))
 
     if len(entries) not in {1, 3}:
-        return FocusPlan(FocusAxis.GRID, "refuse", window.target, focus_pane, (), "grid focus stash must contain exactly 1 or 3 panes")
+        return FocusPlan(
+            FocusAxis.GRID,
+            "refuse",
+            window.target,
+            focus_pane,
+            (),
+            "grid focus stash must contain exactly 1 or 3 panes",
+        )
 
     fx, fy = focus_coord
     h_partner = next((e for e in entries if e[2][1] == fy and e[2][0] != fx), None)
@@ -209,21 +287,25 @@ def plan_unfocus_grid(adapter: TmuxAdapter, window: WindowSnapshot, active: Pane
             args.insert(3, "-b")
         actions.append(FocusAction(tuple(args), False))
     for pane_id, role, _ in entries:
-        actions.extend([
-            _set_pane(pane_id, "@GRID_STATE", GridState.SMALL.value),
-            _set_pane(pane_id, "@PANE_ID", role),
-            _clear_pane(pane_id, "@FOCUS_SOURCE_WINDOW"),
-            _clear_pane(pane_id, "@FOCUS_SOURCE_ROLE"),
-            _clear_pane(pane_id, "@FOCUS_AXIS"),
-            _clear_pane(pane_id, "@FOCUS_RESTORE_POSITION"),
-        ])
-    actions.extend([
-        _set_window("@FOCUS_GRID_ACTIVE", "false", window.target),
-        _set_window("@FOCUS_GRID_PANE", "", window.target),
-        _set_window("@FOCUS_GRID_STASH", "", window.target),
-        _set_window("@GRID_EXPANDED", "none", window.target),
-        _set_window("@GRID_STASH", "", window.target),
-    ])
+        actions.extend(
+            [
+                _set_pane(pane_id, "@GRID_STATE", GridState.SMALL.value),
+                _set_pane(pane_id, "@PANE_ID", role),
+                _clear_pane(pane_id, "@FOCUS_SOURCE_WINDOW"),
+                _clear_pane(pane_id, "@FOCUS_SOURCE_ROLE"),
+                _clear_pane(pane_id, "@FOCUS_AXIS"),
+                _clear_pane(pane_id, "@FOCUS_RESTORE_POSITION"),
+            ]
+        )
+    actions.extend(
+        [
+            _set_window("@FOCUS_GRID_ACTIVE", "false", window.target),
+            _set_window("@FOCUS_GRID_PANE", "", window.target),
+            _set_window("@FOCUS_GRID_STASH", "", window.target),
+            _set_window("@GRID_EXPANDED", "none", window.target),
+            _set_window("@GRID_STASH", "", window.target),
+        ]
+    )
     if not window.side_focus_active:
         actions.append(_set_window("@FOCUSED", "false", window.target))
     return FocusPlan(FocusAxis.GRID, "unfocus", window.target, focus_pane, tuple(actions))
@@ -233,7 +315,14 @@ def plan_focus_side(window: WindowSnapshot, active: PaneSnapshot) -> FocusPlan:
     if window.side_focus_active and window.side_focus_pane == active.pane_id:
         return plan_unfocus_side(window, active)
     if active not in _side_panes(window):
-        return FocusPlan(FocusAxis.SIDE, "noop", window.target, active.pane_id, (), "active pane is not a side pane")
+        return FocusPlan(
+            FocusAxis.SIDE,
+            "noop",
+            window.target,
+            active.pane_id,
+            (),
+            "active pane is not a side pane",
+        )
     desired = max(1, (sum(p.width for p in window.panes) * SIDE_FOCUS_RATIO) // 100)
     actions = (
         _set_window("@FOCUSED", "true", window.target),
@@ -248,7 +337,9 @@ def plan_focus_side(window: WindowSnapshot, active: PaneSnapshot) -> FocusPlan:
 def plan_unfocus_side(window: WindowSnapshot, active: PaneSnapshot | None = None) -> FocusPlan:
     pane_id = window.side_focus_pane or (active.pane_id if active else "")
     if not window.side_focus_active:
-        return FocusPlan(FocusAxis.SIDE, "noop", window.target, pane_id, (), "side focus is not active")
+        return FocusPlan(
+            FocusAxis.SIDE, "noop", window.target, pane_id, (), "side focus is not active"
+        )
     actions: list[FocusAction] = [
         _set_window("@FOCUS_SIDE_ACTIVE", "false", window.target),
         _set_window("@FOCUS_SIDE_PANE", "", window.target),
@@ -279,7 +370,9 @@ def build_focus_plan(adapter: TmuxAdapter, window: WindowSnapshot, mode: str) ->
         return plan_unfocus_grid(adapter, window, active)
     if window.side_focus_active:
         return plan_unfocus_side(window, active)
-    return FocusPlan(FocusAxis.GRID, "noop", window.target, active.pane_id, (), "active pane is not focusable")
+    return FocusPlan(
+        FocusAxis.GRID, "noop", window.target, active.pane_id, (), "active pane is not focusable"
+    )
 
 
 def execute_focus_plan(adapter: TmuxAdapter, plan: FocusPlan) -> str:
@@ -296,12 +389,18 @@ def execute_focus_plan(adapter: TmuxAdapter, plan: FocusPlan) -> str:
 
 def focus_window(adapter: TmuxAdapter, session_name: str, window_index: int, mode: str) -> str:
     window = build_window_snapshot(adapter, session_name, window_index)
+    if window.archetype in {WindowArchetype.LEGION_STACK, WindowArchetype.MECHANICUS_STACK}:
+        from .legion import enforce_stack_layout
+
+        active = _active_pane(window)
+        return enforce_stack_layout(adapter, window.target, focused_pane=active.pane_id)
     if window.archetype not in {WindowArchetype.PALACE, WindowArchetype.SOMNIUM}:
         return f"noop focus {window.target}: unsupported window {window.window_name}"
     plan = build_focus_plan(adapter, window, mode)
     result = execute_focus_plan(adapter, plan)
     if plan.operation == "unfocus":
         from .revert import enforce_known_window_state
+
         enforced = enforce_known_window_state(adapter, session_name, window_index)
         if not enforced.ok:
             raise ValueError("; ".join(enforced.violations))

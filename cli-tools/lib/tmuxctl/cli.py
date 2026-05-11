@@ -99,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
     stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
     stack_add.add_argument("--cwd", default=None)
     stack_add.add_argument("--session", default="main")
+    stack_enforce = stack_subparsers.add_parser("enforce")
+    stack_enforce.add_argument("--pane", default="current")
+    stack_enforce.add_argument("--window", default="")
+
+    legion_parser = subparsers.add_parser("legion")
+    legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
+
+    legion_focus = legion_subparsers.add_parser("focus-selected")
+    legion_focus.add_argument("--pane", default="current")
+
+    legion_enforce = legion_subparsers.add_parser("enforce")
+    legion_enforce.add_argument("--pane", default="current")
 
     legion_parser = subparsers.add_parser("legion")
     legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
@@ -211,6 +223,39 @@ def main(argv: list[str] | None = None) -> int:
                     control.adapter, args.session, args.base, cwd=args.cwd
                 )
                 print(pane_id)
+                return 0
+            if args.stack_command == "enforce":
+                from .legion import enforce_stack_layout
+
+                if args.window:
+                    target = args.window
+                    pane = ""
+                else:
+                    pane = args.pane
+                    if pane == "current":
+                        pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+                    target = control.adapter.run(
+                        "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
+                    ).strip()
+                print(enforce_stack_layout(control.adapter, target, focused_pane=pane))
+                return 0
+
+        if args.command == "legion":
+            pane = args.pane
+            if pane == "current":
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            if args.legion_command == "focus-selected":
+                from .legion import focus_selected
+
+                print(focus_selected(control.adapter, pane))
+                return 0
+            if args.legion_command == "enforce":
+                from .legion import enforce_legion_layout
+
+                target = control.adapter.run(
+                    "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
+                ).strip()
+                print(enforce_legion_layout(control.adapter, target, focused_pane=pane))
                 return 0
 
         if args.command == "legion":
