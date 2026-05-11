@@ -7836,45 +7836,26 @@ ENFORCEMENT_CASCADE = {
 
 # Level delays (seconds after previous level)
 ENFORCEMENT_LEVEL_DELAYS = {
-    1: 0,  # Vibe — immediate after Discord fallback timeout
-    2: 15,  # Vibe + beep + TTS
-    3: 15,  # Stronger vibe + beep + TTS warning
-    4: 10,  # Spotify redirect
-    5: 30,  # Pavlok zap (repeats every 30s)
+    1: 0,  # Immediate Pavlok + companion TTS/push
+    2: 15,  # Stronger Pavlok + companion TTS/push
+    3: 15,  # Stronger Pavlok + companion TTS/push
+    4: 10,  # Pavlok + enforcement banner/TTS
+    5: 30,  # Pavlok repeat every 30s
 }
 
 # v3 param mapping per cascade level
-# Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
-# Static cues stay short; Custodes carries the explanatory follow-up.
-# Previous long/static cues:
-# - "Final warning. Close {app}"
-# - "Twitter open for 7 minutes. Forcing break."
-# - "Distraction timeout. Close distractions now."
-# - "Break time exhausted"
+# Pavlok is dispatched server-side first by fire_cascade_event(). These params are
+# only downstream companion phone effects and are never sent unless Pavlok fired.
 ENFORCE_LEVEL_PARAMS = {
-    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "close {app}"}},
-    2: {
-        "endpoint": "/notify",
-        "params": {"vibe": 50, "beep": 30, "tts_text": "close {app}", "banner_text": "close {app}"},
-    },
-    3: {
-        "endpoint": "/notify",
-        "params": {
-            "vibe": 80,
-            "beep": 50,
-            "tts_text": "last call {app}",
-            "banner_text": "last call",
-        },
-    },
-    4: {"endpoint": "/enforce", "params": {"banner_text": "enforcement active"}},
-    5: {
-        "endpoint": "/enforce",
-        "params": {"zap": 50, "tts_text": "pavlok fired", "banner_text": "enforcement: Pavlok"},
-    },
+    1: {"endpoint": "/notify", "params": {"vibe": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
+    2: {"endpoint": "/notify", "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
+    3: {"endpoint": "/notify", "params": {"vibe": 80, "beep": 50, "tts_text": "Close {app}", "banner_text": "Close {app}"}},
+    4: {"endpoint": "/enforce", "params": {"tts_text": "Close {app}", "banner_text": "Enforcement active"}},
+    5: {"endpoint": "/enforce", "params": {"zap": 50, "tts_text": "Pavlok fired. Close {app}", "banner_text": "Enforcement — Pavlok"}},
 }
 
 ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
-DISCORD_FALLBACK_TIMEOUT = 30  # 30s to wait for app_close via Discord
+DISCORD_FALLBACK_TIMEOUT = 30  # retained for compatibility with older callers
 
 
 # [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
@@ -9067,51 +9048,45 @@ from routes.voice import init_deps as voice_init_deps
 voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
 
 
-def _send_enforce_to_phone(app_name: str, level: int) -> dict:
-    """Send enforcement level to phone using v3 params.
-
-    Maps cascade level to v3 endpoint + params, sends to phone.
-    Returns dict with success status.
-    """
+def _cascade_level_endpoint_params(app_name: str, level: int) -> tuple[str, dict]:
+    """Return formatted phone endpoint/params for a cascade level."""
     level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
     endpoint = level_config["endpoint"]
     params = {
         k: v.format(app=app_name) if isinstance(v, str) else v
         for k, v in level_config["params"].items()
     }
-    pavlok_result = None
-    if endpoint == "/enforce":
-        # Any mobile /enforce path must also have a server-side Pavlok path.
-        # If the phone is known offline, skip the dead mobile route entirely.
-        pavlok_result = send_pavlok_stimulus(
-            "zap",
-            params.get("zap", 30),
-            reason=f"phone_enforce_level_{level}_{app_name}",
-            respect_cooldown=False,
-        )
-        if PHONE_STATE.get("reachable") is False:
-            return {
-                "success": bool(pavlok_result.get("success")),
-                "endpoint": endpoint,
-                "phone_skipped": True,
-                "reason": "phone_known_offline",
-                "pavlok": pavlok_result,
-            }
-    phone_result = _send_to_phone(endpoint, params)
-    if pavlok_result is not None:
-        return {
-            **phone_result,
-            "endpoint": endpoint,
-            "pavlok": pavlok_result,
-            "success": bool(phone_result.get("success") or pavlok_result.get("success")),
-        }
-    return phone_result
+    return endpoint, params
+
+
+def _cascade_pavlok_value(level: int, params: dict) -> int:
+    """Map cascade level to Pavlok zap intensity.
+
+    Historical lower levels carried phone vibe values. The cascade mandate is
+    shock+TTS at every level, so those values now become the zap ramp.
+    """
+    if "zap" in params:
+        return int(params["zap"])
+    if "vibe" in params:
+        return int(params["vibe"])
+    return min(100, max(10, level * 10))
+
+
+def _cascade_dispatch_result(pavlok_result: dict) -> str:
+    """Normalize send_pavlok_stimulus return shapes for cascade gating."""
+    if pavlok_result.get("success") is True:
+        return "fired"
+    if pavlok_result.get("skipped"):
+        return "skipped"
+    if pavlok_result.get("error") in {"timeout", "connection_error"}:
+        return "unreachable"
+    return "failed"
 
 
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
 
 
-async def _send_discord_fallback(app_name: str, level: int):
+async def _send_discord_fallback(app_name: str, level: int, params_override: dict | None = None):
     """Send enforcement command to Discord #fallback via webhook.
 
     Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
@@ -9120,11 +9095,10 @@ async def _send_discord_fallback(app_name: str, level: int):
     notification, parses the JSON, and relays to its own localhost:7777/enforce.
     Only /phone/enforce is accepted — no arbitrary code execution.
     """
-    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
-    params = {
-        k: v.format(app=app_name) if isinstance(v, str) else v
-        for k, v in level_config["params"].items()
-    }
+    if params_override is None:
+        _, params = _cascade_level_endpoint_params(app_name, level)
+    else:
+        params = params_override
     msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
     logger.info(f"DISCORD FALLBACK: {msg}")
     try:
@@ -9170,17 +9144,84 @@ def _enforcement_state_payload(
     return payload
 
 
+
+async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
+    """Atomically fire one cascade event.
+
+    Pavlok dispatch is the gate. Companion phone TTS/push and Discord fallback
+    are sent only when Pavlok returns dispatch_result == "fired".
+    """
+    app_name = payload.get("app") or payload.get("app_name") or "unknown"
+    repeat = bool(payload.get("repeat"))
+    endpoint, phone_params = _cascade_level_endpoint_params(app_name, level)
+    pavlok_value = int(payload.get("pavlok_value") or _cascade_pavlok_value(level, phone_params))
+    reason = payload.get("reason") or ("cascade_level_5_repeat" if repeat else f"cascade_level_{level}")
+
+    pavlok_result = await asyncio.to_thread(
+        send_pavlok_stimulus,
+        "zap",
+        pavlok_value,
+        reason,
+        False,
+    )
+    dispatch_result = _cascade_dispatch_result(pavlok_result)
+    result = {
+        "level": level,
+        "ack_id": ack_id,
+        "app": app_name,
+        "dispatch_result": dispatch_result,
+        "pavlok": pavlok_result,
+        "phone": None,
+        "discord": None,
+    }
+
+    if dispatch_result != "fired":
+        await log_event(
+            "cascade_event_skipped",
+            device_id="phone",
+            details={
+                "app": app_name,
+                "level": level,
+                "ack_id": ack_id,
+                "repeat": repeat,
+                "dispatch_result": dispatch_result,
+                "pavlok": pavlok_result,
+            },
+        )
+        logger.warning(
+            "CASCADE: skipped companion notify app=%s level=%s ack_id=%s dispatch_result=%s",
+            app_name,
+            level,
+            ack_id,
+            dispatch_result,
+        )
+        return result
+
+    # Server-side Pavlok already fired. Do not ask the phone/Discord relay to
+    # zap again; send only companion TTS/push/banner effects.
+    companion_params = dict(phone_params)
+    companion_params.pop("zap", None)
+    phone_result = await asyncio.to_thread(_send_to_phone, endpoint, companion_params)
+    result["phone"] = phone_result
+    if not phone_result.get("success"):
+        await _send_discord_fallback(app_name, level, params_override=companion_params)
+        result["discord"] = "fallback_attempted"
+
+    return result
+
+
 async def _enforcement_cascade_worker(app_name: str):
     """Background task that escalates enforcement levels until app_close or timeout.
 
     Flow:
-      1. Send Discord fallback (level 0 — soft close via notification)
-      2. Wait DISCORD_FALLBACK_TIMEOUT for app_close
-      3. If still open, escalate through levels 1-5 with configured delays
-      4. Level 5 (Pavlok) repeats every 30s until close or cascade timeout
+      1. Escalate through levels 1-5 with configured delays
+      2. Each level fires Pavlok first through fire_cascade_event()
+      3. Companion TTS/push/Discord are sent only after Pavlok fires
+      4. Level 5 repeats every 30s until close or cascade timeout
     """
     cascade = ENFORCEMENT_CASCADE
     start = time.monotonic()
+    ack_id = f"cascade:{app_name}:{int(time.time())}"
     cascade["started_at"] = start
     cascade["current_level"] = 0
 
@@ -9196,22 +9237,17 @@ async def _enforcement_cascade_worker(app_name: str):
         return
 
     print(f"CASCADE START: app={app_name}")
-    await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
+    await log_event(
+        "enforcement_cascade_start",
+        device_id="phone",
+        details={"app": app_name, "ack_id": ack_id},
+    )
     await handle_custodes_state_event(
         "enforcement_cascade_started",
         "phone",
         severity=2,
-        payload=_enforcement_state_payload(source="phone", app=app_name),
+        payload=_enforcement_state_payload(source="phone", app=app_name, ack_id=ack_id),
     )
-
-    # Level 0: Discord fallback (soft close)
-    await _send_discord_fallback(app_name, 1)
-
-    # Wait for Discord fallback to work
-    await asyncio.sleep(DISCORD_FALLBACK_TIMEOUT)
-    if not cascade["active"]:
-        print("CASCADE: app_close received during Discord fallback wait")
-        return
 
     # Escalate through levels 1-5
     for level in range(1, 6):
@@ -9232,7 +9268,7 @@ async def _enforcement_cascade_worker(app_name: str):
         await log_event(
             "enforcement_cascade_escalate",
             device_id="phone",
-            details={"app": app_name, "level": level, "elapsed_s": round(elapsed)},
+            details={"app": app_name, "level": level, "ack_id": ack_id, "elapsed_s": round(elapsed)},
         )
         await handle_custodes_state_event(
             "enforcement_cascade_escalate",
@@ -9242,31 +9278,28 @@ async def _enforcement_cascade_worker(app_name: str):
                 source="phone",
                 app=app_name,
                 level=level,
+                ack_id=ack_id,
                 elapsed_s=round(elapsed),
             ),
         )
 
-        # Try phone first, fall back to server-side Pavlok API, then Discord
-        result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
-        if not result["success"]:
-            # Phone unreachable — try server-side Pavlok API for levels with haptics
-            level_params = ENFORCE_LEVEL_PARAMS.get(level, {}).get("params", {})
-            if "zap" in level_params:
-                send_pavlok_stimulus(
-                    "zap",
-                    level_params["zap"],
-                    reason=f"cascade_level_{level}",
-                    respect_cooldown=False,
-                )
-            elif "vibe" in level_params:
-                send_pavlok_stimulus(
-                    "vibe",
-                    level_params["vibe"],
-                    reason=f"cascade_level_{level}",
-                    respect_cooldown=False,
-                )
-            # Discord as last resort
-            await _send_discord_fallback(app_name, level)
+        result = await fire_cascade_event(level, ack_id, {"app": app_name})
+        if result.get("dispatch_result") != "fired":
+            cascade["active"] = False
+            cascade["task"] = None
+            await log_event(
+                "enforcement_cascade_end",
+                device_id="phone",
+                details={
+                    "app": app_name,
+                    "final_level": level,
+                    "ack_id": ack_id,
+                    "elapsed_s": round(elapsed),
+                    "reason": "pavlok_not_fired",
+                    "dispatch_result": result.get("dispatch_result"),
+                },
+            )
+            return
 
         # Wait before next level (level 5 repeats in a loop)
         if level == 5:
@@ -9275,12 +9308,24 @@ async def _enforcement_cascade_worker(app_name: str):
                 await asyncio.sleep(30)
                 if not cascade["active"]:
                     break
-                result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
-                if not result["success"]:
-                    send_pavlok_stimulus(
-                        "zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False
+                result = await fire_cascade_event(5, ack_id, {"app": app_name, "repeat": True})
+                if result.get("dispatch_result") != "fired":
+                    cascade["active"] = False
+                    cascade["task"] = None
+                    elapsed = time.monotonic() - start
+                    await log_event(
+                        "enforcement_cascade_end",
+                        device_id="phone",
+                        details={
+                            "app": app_name,
+                            "final_level": 5,
+                            "ack_id": ack_id,
+                            "elapsed_s": round(elapsed),
+                            "reason": "pavlok_not_fired",
+                            "dispatch_result": result.get("dispatch_result"),
+                        },
                     )
-                    await _send_discord_fallback(app_name, 5)
+                    return
         else:
             delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
             await asyncio.sleep(delay)
@@ -9298,6 +9343,7 @@ async def _enforcement_cascade_worker(app_name: str):
         details={
             "app": app_name,
             "final_level": cascade["current_level"],
+            "ack_id": ack_id,
             "elapsed_s": round(elapsed),
             "reason": "timeout_or_exhausted",
         },
