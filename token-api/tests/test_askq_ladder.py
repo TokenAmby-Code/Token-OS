@@ -1,7 +1,7 @@
-"""Tests for the AskUserQuestion three-touch ladder.
+"""Tests for the AskUserQuestion three-level ladder.
 
-Touch 1 → Touch 2 (enforcement cascade) → Touch 3 (TTS re-read) → Bust (autonomous prompt).
-PostToolUse(AskUserQuestion) cancels the ladder.
+Arm → L1 (TTS re-read + Discord nudge) → L2 (enforcement cascade + persist Unanswered)
+→ L3 (pavlok shock + autonomous prompt). PostToolUse(AskUserQuestion) cancels the ladder.
 """
 
 from __future__ import annotations
@@ -80,17 +80,25 @@ def test_ladder_cancelled_on_post_tool_use(ladder_env):
     asyncio.run(run())
 
 
-def test_ladder_full_walkthrough_fires_touch2_touch3_bust(ladder_env, monkeypatch):
-    """No answer → Touch 2 callback fires, Touch 3 re-reads TTS, Bust attempts claude-cmd."""
+def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
+    """No answer → L1 nudge fires, L2 enforcement fires, L3 pavlok + bust prompt fires."""
     hooks = sys.modules["routes.hooks"]
     shared = ladder_env.shared
 
-    touch2_calls: list[tuple[str, str]] = []
+    level1_calls: list[tuple[str, str]] = []
+    level2_calls: list[tuple[str, str]] = []
+    level3_calls: list[tuple[str, str]] = []
     tts_calls: list[tuple[str, str]] = []
     bust_calls: list[dict] = []
 
+    async def fake_level1(instance_id, question_text, state):
+        level1_calls.append((instance_id, question_text))
+
     async def fake_touch2(instance_id, question_text):
-        touch2_calls.append((instance_id, question_text))
+        level2_calls.append((instance_id, question_text))
+
+    async def fake_level3(instance_id, question_text, state):
+        level3_calls.append((instance_id, question_text))
 
     async def fake_queue_tts(instance_id, text, queue_target="hot"):
         tts_calls.append((instance_id, text))
@@ -98,7 +106,9 @@ def test_ladder_full_walkthrough_fires_touch2_touch3_bust(ladder_env, monkeypatc
     async def fake_send_bust(instance_id, state):
         bust_calls.append({"instance_id": instance_id, "state": dict(state)})
 
+    hooks._askq_level1_callback = fake_level1
     hooks._askq_touch2_callback = fake_touch2
+    hooks._askq_level3_callback = fake_level3
     monkeypatch.setattr(hooks, "queue_tts", fake_queue_tts)
     monkeypatch.setattr(hooks, "_askq_send_bust_prompt", fake_send_bust)
 
@@ -110,14 +120,116 @@ def test_ladder_full_walkthrough_fires_touch2_touch3_bust(ladder_env, monkeypatc
         # Wait long enough for T1 + T2 + T3 to all elapse (each is 0.05s).
         await asyncio.sleep(0.4)
 
-        # All three callback paths exercised, ladder cleaned up.
-        assert touch2_calls == [(sid, "Pick a path?")]
+        assert level1_calls == [(sid, "Pick a path?")]
+        assert level2_calls == [(sid, "Pick a path?")]
+        assert level3_calls == [(sid, "Pick a path?")]
+        # TTS re-read fires inline at L1.
         assert tts_calls == [(sid, "Pick a path?")]
         assert len(bust_calls) == 1
         assert bust_calls[0]["instance_id"] == sid
         assert sid not in shared.ASKQ_LADDER
 
     asyncio.run(run())
+
+
+def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch):
+    """Answer arrives between L1 and L2 → L2/L3 callbacks suppressed."""
+    hooks = sys.modules["routes.hooks"]
+    shared = ladder_env.shared
+
+    # T1 short, T2/T3 long enough that we can cancel between them.
+    shared.ASKQ_T1_SECONDS = 0.05
+    shared.ASKQ_T2_SECONDS = 0.5
+    shared.ASKQ_T3_SECONDS = 0.5
+
+    level1_calls: list[str] = []
+    level2_calls: list[str] = []
+    level3_calls: list[str] = []
+
+    async def fake_level1(instance_id, question_text, state):
+        level1_calls.append(instance_id)
+
+    async def fake_touch2(instance_id, question_text):
+        level2_calls.append(instance_id)
+
+    async def fake_level3(instance_id, question_text, state):
+        level3_calls.append(instance_id)
+
+    async def fake_queue_tts(instance_id, text, queue_target="hot"):
+        return None
+
+    hooks._askq_level1_callback = fake_level1
+    hooks._askq_touch2_callback = fake_touch2
+    hooks._askq_level3_callback = fake_level3
+    monkeypatch.setattr(hooks, "queue_tts", fake_queue_tts)
+
+    async def run():
+        sid = "answered-after-l1"
+        await hooks._askq_ladder_start(sid, "Q?", [], {"tmux_pane": "%0"})
+        # Let L1 fire.
+        await asyncio.sleep(0.15)
+        assert level1_calls == [sid]
+        # Answer arrives before L2.
+        await hooks._askq_ladder_cancel(sid, reason="answered", answer="Yes")
+        # Wait past where L2 + L3 would have fired.
+        await asyncio.sleep(0.6)
+        assert level2_calls == []
+        assert level3_calls == []
+        assert sid not in shared.ASKQ_LADDER
+
+    asyncio.run(run())
+
+
+def test_l2_persists_unanswered(ladder_env, monkeypatch):
+    """When L2 fires, the question is appended to Unanswered.md."""
+    hooks = sys.modules["routes.hooks"]
+    shared = ladder_env.shared
+
+    # Let L1+L2 fire, but cancel before L3 to keep the test scoped to L2 persistence.
+    shared.ASKQ_T1_SECONDS = 0.05
+    shared.ASKQ_T2_SECONDS = 0.05
+    shared.ASKQ_T3_SECONDS = 1.0
+
+    async def noop_l1(instance_id, question_text, state):
+        return None
+
+    async def noop_touch2(instance_id, question_text):
+        return None
+
+    async def noop_l3(instance_id, question_text, state):
+        return None
+
+    async def fake_queue_tts(instance_id, text, queue_target="hot"):
+        return None
+
+    async def fake_send_bust(instance_id, state):
+        return None
+
+    hooks._askq_level1_callback = noop_l1
+    hooks._askq_touch2_callback = noop_touch2
+    hooks._askq_level3_callback = noop_l3
+    monkeypatch.setattr(hooks, "queue_tts", fake_queue_tts)
+    monkeypatch.setattr(hooks, "_askq_send_bust_prompt", fake_send_bust)
+
+    async def run():
+        sid = "persist-l2"
+        await hooks._askq_ladder_start(
+            sid,
+            "Where to?",
+            ["A"],
+            {"tab_name": "palace:SE", "legion": "custodes", "tmux_pane": "%0"},
+        )
+        # Wait past L2 but cancel before L3.
+        await asyncio.sleep(0.2)
+        await hooks._askq_ladder_cancel(sid, reason="test_cleanup")
+
+    asyncio.run(run())
+
+    unanswered = (Path(hooks._imperium_env_root()) / "Terra" / "Inbox" / "Unanswered.md").read_text(
+        encoding="utf-8"
+    )
+    assert 'title: "Unanswered Questions"' in unanswered
+    assert "Where to?" in unanswered
 
 
 def test_new_question_supersedes_prior_ladder(ladder_env, monkeypatch):
@@ -193,7 +305,13 @@ def test_question_persistence_records_answer(ladder_env):
 def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
 
+    async def noop_l1(instance_id, question_text, state):
+        return None
+
     async def fake_touch2(instance_id, question_text):
+        return None
+
+    async def noop_l3(instance_id, question_text, state):
         return None
 
     async def fake_queue_tts(instance_id, text, queue_target="hot"):
@@ -202,7 +320,9 @@ def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
     async def fake_send_bust(instance_id, state):
         return None
 
+    hooks._askq_level1_callback = noop_l1
     hooks._askq_touch2_callback = fake_touch2
+    hooks._askq_level3_callback = noop_l3
     monkeypatch.setattr(hooks, "queue_tts", fake_queue_tts)
     monkeypatch.setattr(hooks, "_askq_send_bust_prompt", fake_send_bust)
 
@@ -235,7 +355,15 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
     async def fake_queue_tts(instance_id, text, queue_target="hot"):
         return None
 
+    async def noop_l1(instance_id, question_text, state):
+        return None
+
+    async def noop_l3(instance_id, question_text, state):
+        return None
+
     monkeypatch.setattr(hooks, "queue_tts", fake_queue_tts)
+    hooks._askq_level1_callback = noop_l1
+    hooks._askq_level3_callback = noop_l3
     shared.VOICE_CHAT_SESSIONS[sid] = {"active": True, "tmux_pane": "%2"}
 
     conn = sqlite3.connect(ladder_env.db_path)

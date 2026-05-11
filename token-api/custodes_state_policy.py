@@ -52,8 +52,9 @@ def normalize_severity(value: int | str | None) -> int:
 def build_dedupe_key(event: StateEvent) -> str:
     payload = event.payload or {}
     subject = (
-        payload.get("app")
-        or payload.get("phone_app")
+        payload.get("phone_app")
+        or payload.get("app")
+        or payload.get("ack_source")
         or payload.get("desktop_mode")
         or payload.get("mode")
         or event.instance_id
@@ -80,12 +81,40 @@ def _format_minutes(ms: Any) -> str | None:
     return f"-{minutes}m" if int(ms) < 0 else f"{minutes}m"
 
 
-def _snapshot_items(snapshot: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+PHONE_APP_SOURCES = {
+    "phone",
+    "phone_detection",
+    "phone_distraction",
+    "phone_gaming",
+    "backlog_violation",
+}
+
+
+def _source_allows_app_as_phone_app(source: str) -> bool:
+    return source in PHONE_APP_SOURCES or source.startswith("phone_")
+
+
+def _snapshot_items(
+    snapshot: dict[str, Any],
+    payload: dict[str, Any],
+    source: str,
+) -> list[str]:
     timer = snapshot.get("timer") or {}
     phone = snapshot.get("phone") or {}
     desktop = snapshot.get("desktop") or {}
 
-    phone_app = payload.get("phone_app") or payload.get("app") or phone.get("current_app")
+    payload_app = payload.get("app")
+    explicit_phone_app = payload.get("phone_app")
+    ack_source = payload.get("ack_source")
+    phone_app = explicit_phone_app
+    app = None
+    if not phone_app and payload_app:
+        if _source_allows_app_as_phone_app(source):
+            phone_app = payload_app
+        else:
+            app = payload_app
+    if not phone_app and not app and _source_allows_app_as_phone_app(source):
+        phone_app = phone.get("current_app")
     timer_mode = payload.get("timer_mode") or timer.get("current_mode") or timer.get("mode")
     desktop_mode = payload.get("desktop_mode") or desktop.get("current_mode")
     break_balance = (
@@ -98,6 +127,10 @@ def _snapshot_items(snapshot: dict[str, Any], payload: dict[str, Any]) -> list[s
     items: list[str] = []
     if phone_app:
         items.append(f"phone_app={phone_app}")
+    if app:
+        items.append(f"app={app}")
+    if ack_source:
+        items.append(f"ack_source={ack_source}")
     if timer_mode:
         items.append(f"timer_mode={timer_mode}")
     if desktop_mode:
@@ -143,7 +176,7 @@ def evaluate_state_event(
     snapshot = snapshot or {}
     severity = normalize_severity(event.severity)
     dedupe_key = build_dedupe_key(event)
-    observed = ", ".join(_snapshot_items(snapshot, payload)) or "no extra state"
+    observed = ", ".join(_snapshot_items(snapshot, payload, event.source)) or "no extra state"
 
     direction = {
         "idle_timeout": "Intervene with the Emperor about low-hanging fruit to restart work.",

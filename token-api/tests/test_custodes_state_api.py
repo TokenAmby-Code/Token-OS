@@ -232,3 +232,133 @@ def test_higher_severity_repeat_bypasses_debounce(client, monkeypatch):
     assert len(calls) == 2
     details = [json.loads(event["details"]) for event in _events("custodes_intervention")]
     assert [detail["severity"] for detail in details] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_expected_ack_intervention_cancels_if_ack_resolved_during_dispatch(monkeypatch):
+    """Regression: app close/negative-edge after state event must cancel queued delivery."""
+    ack_id = "race-ack"
+    conn = sqlite3.connect(_db_path())
+    now = "2026-05-10T08:09:16"
+    conn.execute(
+        """INSERT INTO expected_acknowledgements
+           (id, source, instance_id, reason, status, created_at,
+            ack_due_at, level2_due_at, pavlok_due_at, fired_levels_json, details_json)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+        (
+            ack_id,
+            "phone_gaming",
+            "phone_gaming:phone:slay_the_spire",
+            "Phone gaming during work: Slay the Spire",
+            now,
+            now,
+            now,
+            now,
+            json.dumps([1, 2]),
+            json.dumps({"app": "slay_the_spire", "display_name": "Slay the Spire"}),
+        ),
+    )
+    conn.execute(
+        """INSERT INTO claude_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id,
+            status, legion, synced, tmux_pane, registered_at, last_activity)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'custodes', 1, NULL, ?, ?)""",
+        (
+            "custodes-race",
+            str(uuid.uuid4()),
+            "custodes-test",
+            "/tmp",
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    async def fake_find_custodes_pane():
+        await main._resolve_expected_ack(
+            ack_id=ack_id,
+            source=None,
+            instance_id=None,
+            status="acknowledged",
+        )
+        return "%99"
+
+    async def fail_inject(prompt, tmux_pane, *, instance_id=None):
+        raise AssertionError("stale intervention reached pane injection after ack was resolved")
+
+    monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find_custodes_pane)
+    monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fail_inject)
+    monkeypatch.setattr(
+        main,
+        "send_pavlok_stimulus",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale intervention reached Pavlok")
+        ),
+    )
+
+    result = await main.handle_custodes_state_event(
+        "expected_ack_escalated",
+        "phone_gaming",
+        instance_id="phone_gaming:phone:slay_the_spire",
+        severity=5,
+        payload={
+            "ack_id": ack_id,
+            "level": 3,
+            "reason": "Phone gaming during work: Slay the Spire",
+            "app": "slay_the_spire",
+        },
+    )
+
+    assert result["intervention_dispatched"] is False
+    assert result["reason"] == "intervention_canceled_by_negative_edge"
+    assert _events("custodes_intervention") == []
+    canceled = _events("intervention_canceled_by_negative_edge")
+    assert len(canceled) == 1
+    details = json.loads(canceled[0]["details"])
+    assert details["ack_id"] == ack_id
+    assert details["ack_status"] == "acknowledged"
+    assert details["stage"] == "pre_pane_inject"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_counts_custodes_cascade_state_events():
+    conn = sqlite3.connect(_db_path())
+    conn.execute(
+        "INSERT INTO events (event_type, device_id, details) VALUES (?, ?, ?)",
+        (
+            "custodes_state_event",
+            "askq_ladder",
+            json.dumps(
+                {
+                    "event_type": "enforcement_cascade_started",
+                    "source": "askq_ladder",
+                    "payload": {"ack_source": "askuserquestion"},
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert (await main._custodes_state_snapshot())["cascade_count_today"] == 1
+
+    conn = sqlite3.connect(_db_path())
+    conn.execute(
+        "INSERT INTO events (event_type, device_id, details) VALUES (?, ?, ?)",
+        (
+            "custodes_state_event",
+            "golden_throne",
+            json.dumps(
+                {
+                    "event_type": "enforcement_cascade_started",
+                    "source": "golden_throne",
+                    "payload": {"ack_source": "golden_throne"},
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert (await main._custodes_state_snapshot())["cascade_count_today"] == 2

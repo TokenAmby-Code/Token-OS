@@ -54,10 +54,12 @@ def human_pane_surface(tab_name: str | None, tmux_pane: str | None, pane_label: 
     """Return the operator-facing pane surface.
 
     Prefer ``<position> <name>`` when both are available. Never return a
-    ``Claude HH:MM`` launch-placeholder name.
+    ``Claude HH:MM`` launch-placeholder name. Fall back to the raw tmux pane
+    when no human name or stable pane label exists; callers need a concrete
+    surface, not a generic "session" bucket, when addressing live panes.
     """
     position = pane_position_id(pane_label)
     name = human_tab_name(tab_name)
     if position and name:
         return f"{position} {name}"
-    return position or name or "session"
+    return position or name or tmux_pane or "session"

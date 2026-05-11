@@ -15,6 +15,7 @@ Does NOT own:
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import re
@@ -43,6 +44,7 @@ from shared import (
     TTS_GLOBAL_MODE,
     ULTIMATE_FALLBACK,
     get_next_available_profile,
+    get_quiet_hours_status,
     is_phone_reachable,
     is_satellite_tts_available,
     log_event,
@@ -276,11 +278,34 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
         if resp.status_code == 200:
             data = resp.json()
             method = "skipped" if data.get("skipped") else data.get("method", "wsl_sapi")
+            expected_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            rendered_hash = data.get("rendered_hash")
+            if data.get("success") and not data.get("skipped") and not rendered_hash:
+                return {
+                    "success": False,
+                    "error": "satellite_missing_text_integrity_ack",
+                    "method": method,
+                    "voice": voice,
+                    "message_chars": len(message),
+                }
+            if data.get("success") and rendered_hash and rendered_hash != expected_hash:
+                return {
+                    "success": False,
+                    "error": "satellite_text_integrity_check_failed",
+                    "method": method,
+                    "voice": voice,
+                    "message_chars": len(message),
+                    "rendered_chars": data.get("rendered_chars"),
+                }
             return {
                 "success": data.get("success", False),
                 "method": method,
                 "voice": voice,
                 "message": message[:50],
+                "message_chars": len(message),
+                "rendered_chars": data.get("rendered_chars"),
+                "rendered_hash": rendered_hash,
+                "transport": data.get("transport"),
             }
         elif resp.status_code == 409:
             return {"success": False, "error": "satellite_busy"}
@@ -682,10 +707,9 @@ async def tts_queue_worker():
 # ============ TTS Helpers ============
 
 
-def _is_quiet_hours() -> bool:
-    """Return True if current time is in quiet hours (11 PM - 9 AM). No TTS during sleep."""
-    hour = datetime.now().hour
-    return hour >= 23 or hour < 9
+def _is_quiet_hours(now: datetime | None = None) -> bool:
+    """Return True when TTS/sound should be suppressed for quiet hours."""
+    return bool(get_quiet_hours_status(now).get("active"))
 
 
 async def queue_tts(instance_id: str, message: str, queue_target: str = "pause") -> dict:

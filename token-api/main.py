@@ -9,6 +9,7 @@ This server provides:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -37,17 +38,17 @@ import tempfile
 import aiosqlite
 import httpx
 import requests
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import shared
+import temp_message as temp_message_service
 from cron_engine import CronEngine
 from custodes_state_policy import (
     StateEvent,
@@ -55,12 +56,29 @@ from custodes_state_policy import (
     evaluate_state_event,
     normalize_severity,
 )
+from dailynote_callout import (
+    ALLOWED_CALLOUT_TYPES,
+    CALLOUT_ID_RE,
+    MAX_CONTENT_BYTES,
+    CalloutConflictError,
+    CalloutError,
+    apply_callout,
+)
 from db_schema import init_database_async
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     get_instance_mutations,
     reconcile_instance,
     sanctioned_update_instance,
+)
+from pane_surface import (
+    DEFAULT_TAB_NAME_RX,
+)
+from pane_surface import (
+    human_pane_surface as _format_human_pane_surface,
+)
+from pane_surface import (
+    is_meaningful_tab_name as _is_meaningful_surface_name,
 )
 from phone_service import (
     _persist_twitter_zap_cooldown,
@@ -70,6 +88,8 @@ from phone_service import (
     push_phone_widget_async,
     send_pavlok_stimulus,
 )
+from routes.day_start import fire_day_start_internal, sync_day_start_schedule_from_daily_note
+from routes.day_start import router as day_start_router
 from routes.hooks import (
     NUDGE_COOLDOWN_SECONDS,
     _recently_nudged,
@@ -266,14 +286,11 @@ LEGION_PANE_COLORS = {
 }
 
 
-# Scheduler instance — dual job stores:
-#   'default' = in-memory (cron engine jobs with unpicklable bound methods)
-#   'golden_throne' = SQLite-persisted (restart-safe date-trigger follow-ups)
-scheduler = AsyncIOScheduler(
-    jobstores={
-        "golden_throne": SQLAlchemyJobStore(url=f"sqlite:///{DB_PATH.parent / 'apscheduler.db'}")
-    }
-)
+# Scheduler instance. Jobs stay in memory; restart recovery is driven from the
+# application DB by recover_expected_ack_jobs() and
+# recover_recent_stopped_golden_throne_timers(). Avoid APScheduler's synchronous
+# SQLite job store on the asyncio thread.
+scheduler = AsyncIOScheduler()
 shared.scheduler = scheduler
 APP_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -324,6 +341,12 @@ class InstanceResponse(BaseModel):
 
 class ActivityRequest(BaseModel):
     action: str  # "prompt_submit" or "stop"
+
+
+class TempMessageRequest(BaseModel):
+    selector: str = Field(..., min_length=1)
+    payload: str = Field(..., min_length=1)
+    idempotency_key: str | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -721,6 +744,13 @@ class SessionDocMergeRequest(BaseModel):
     context: str | None = None
 
 
+class NamingNudgeRequest(BaseModel):
+    """Stop-hook payload for active tab-name enforcement."""
+
+    session_id: str | None = None
+    instance_id: str | None = None
+
+
 # [MOVED to routes/hooks.py or shared.py] — was: # ============ Hook Handler State ============
 
 
@@ -730,6 +760,32 @@ async def get_db():
     db = await aiosqlite.connect(DB_PATH)
     await db.execute("PRAGMA busy_timeout=5000")
     return db
+
+
+TOKEN_API_HEARTBEAT_PATH = Path.home() / ".claude" / "token-api-heartbeat.json"
+
+
+def _write_token_api_heartbeat() -> None:
+    """Update the watchdog heartbeat file atomically."""
+    payload = {
+        "pid": os.getpid(),
+        "timestamp": datetime.now().isoformat(),
+        "service": "ai.openclaw.tokenapi",
+    }
+    TOKEN_API_HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = TOKEN_API_HEARTBEAT_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, sort_keys=True))
+    tmp_path.replace(TOKEN_API_HEARTBEAT_PATH)
+
+
+async def token_api_heartbeat_worker() -> None:
+    """Emit the file heartbeat consumed by tokenapi-watchdog."""
+    while True:
+        try:
+            await asyncio.to_thread(_write_token_api_heartbeat)
+        except Exception as exc:
+            logger.warning(f"Token-API heartbeat write failed: {exc}")
+        await asyncio.sleep(30)
 
 
 # [MOVED to shared.py / routes/tts.py] — was: async def log_event(event_type: str, instance_id:
@@ -880,6 +936,10 @@ async def purge_old_events() -> dict:
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
     "purge_old_events": purge_old_events,
+    "day_start_schedule_fallback": lambda: fire_day_start_internal(
+        source="schedule_fallback",
+        details={"schedule": "wake_anchor"},
+    ),
     "checkin_morning_start": lambda: trigger_checkin("morning_start"),
     "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
     "checkin_decision_point": lambda: trigger_checkin("decision_point"),
@@ -1124,6 +1184,15 @@ async def lifespan(app: FastAPI):
 
     # Startup
     await init_database_async(DB_PATH)
+    try:
+        day_start_schedule = await sync_day_start_schedule_from_daily_note()
+        print(
+            "Day-start schedule fallback synced "
+            f"to wake_anchor={day_start_schedule['wake_anchor']} "
+            f"({day_start_schedule['cron']})"
+        )
+    except Exception as exc:
+        logger.warning(f"Day-start schedule fallback sync failed: {exc}")
     await load_tasks_from_db()
     timer_load_from_db()
     restore_restart_state()
@@ -1165,18 +1234,32 @@ async def lifespan(app: FastAPI):
         id="timer_quiet_exit",
         replace_existing=True,
     )
+    if os.environ.get("TOKEN_API_ENABLE_PANE_WRITE_QUEUE_WORKER") == "1":
+        scheduler.add_job(
+            _process_pane_write_queue_sync,
+            IntervalTrigger(seconds=5),
+            id="pane_write_queue_worker",
+            replace_existing=True,
+            max_instances=1,
+        )
     scheduler.start()
     print("Scheduler started")
     await recover_expected_ack_jobs()
+    recovered_gt = await recover_recent_stopped_golden_throne_timers()
+    if recovered_gt:
+        print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
     await cron_engine.recover_orphaned_runs()
     await cron_engine.ensure_permanent_jobs()
+    cron_engine.register_now_widget_job(DB_PATH, DAILY_NOTE_DIR)
     print("Cron engine loaded")
     # Start TTS queue worker
     _tts_mod.tts_worker_task = asyncio.create_task(tts_queue_worker())
     print("TTS queue worker started")
+    asyncio.create_task(token_api_heartbeat_worker())
+    print("Token-API watchdog heartbeat started")
     # Start stale flag cleaner
     stale_flag_cleaner_task = asyncio.create_task(clear_stale_processing_flags())
     print("Stale flag cleaner started")
@@ -1201,6 +1284,9 @@ async def lifespan(app: FastAPI):
     # Start session doc sync worker
     asyncio.create_task(session_doc_sync_worker())
     print("Session doc sync worker started")
+    # Start tmux↔DB reconciler worker
+    asyncio.create_task(tmux_db_reconciler_worker())
+    print("tmux↔DB reconciler worker started")
     await run_overdue_tasks()
     yield
 
@@ -1266,6 +1352,180 @@ app.include_router(schedule_router)
 app.include_router(tts_router)
 app.include_router(voice_router)
 app.include_router(hooks_router)
+app.include_router(day_start_router)
+
+
+NAMING_NUDGE_MAX_PER_INSTANCE = 3
+NAMING_NUDGE_EVENT_TYPE = "naming_nudge_sent"
+NAMING_NUDGE_QUEUE_SOURCE = "naming_nudge"
+NAMING_NUDGE_QUEUE_PURPOSE = "name_missing"
+
+
+async def _count_naming_nudges(db, instance_id: str) -> int:
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM events WHERE instance_id = ? AND event_type = ?",
+        (instance_id, NAMING_NUDGE_EVENT_TYPE),
+    )
+    row = await cursor.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+async def _has_pending_naming_nudge(db, instance_id: str) -> bool:
+    cursor = await db.execute(
+        """
+        SELECT 1
+        FROM pane_write_queue
+        WHERE instance_id = ?
+          AND source = ?
+          AND purpose = ?
+          AND status = 'pending'
+        LIMIT 1
+        """,
+        (instance_id, NAMING_NUDGE_QUEUE_SOURCE, NAMING_NUDGE_QUEUE_PURPOSE),
+    )
+    return bool(await cursor.fetchone())
+
+
+def _build_naming_nudge_message(slug: str | None) -> str:
+    derived = (slug or "your-task-name").strip() or "your-task-name"
+    command_slug = derived.replace("'", "").strip() or "your-task-name"
+    return (
+        f"Your name is missing. Run `instance-name '{command_slug}'` "
+        f"(use slug `{derived}` from your session doc, or pick your own "
+        "3-6 word descriptor of what you're doing)."
+    )
+
+
+@app.post("/api/orchestrator/naming_nudge")
+async def orchestrator_naming_nudge(request: NamingNudgeRequest):
+    """Nudge a stopped pane that still has a placeholder tab name.
+
+    This endpoint is intentionally idempotent for renamed panes and capped to
+    three nudges per instance. Durable writes go through sanctioned mutation
+    helpers; the nudge count is derived from the append-only events table.
+    """
+
+    instance_id = request.instance_id or request.session_id
+    if not instance_id:
+        return {"success": False, "action": "missing_instance_id"}
+
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.id, ci.tab_name, ci.tmux_pane, ci.workflow_blocked_reason,
+                   ci.session_doc_id, ci.dispatch_session_doc_path,
+                   sd.file_path AS session_doc_path
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+            WHERE ci.id = ?
+            """,
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"success": False, "action": "instance_not_found", "instance_id": instance_id}
+
+        instance = dict(row)
+        if not _is_placeholder_tab_name(instance.get("tab_name")):
+            return {
+                "success": True,
+                "action": "noop_named",
+                "instance_id": instance_id,
+                "tab_name": instance.get("tab_name"),
+            }
+
+        if instance.get("workflow_blocked_reason") == "naming_refused":
+            return {
+                "success": True,
+                "action": "noop_cap_reached",
+                "instance_id": instance_id,
+                "nudges": NAMING_NUDGE_MAX_PER_INSTANCE,
+            }
+
+        tmux_pane = (instance.get("tmux_pane") or "").strip()
+        if not tmux_pane:
+            return {"success": False, "action": "missing_tmux_pane", "instance_id": instance_id}
+
+        nudge_count = await _count_naming_nudges(db, instance_id)
+        if nudge_count >= NAMING_NUDGE_MAX_PER_INSTANCE:
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"workflow_blocked_reason": "naming_refused"},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="naming-nudge",
+            )
+            await db.commit()
+            await log_event(
+                "naming_nudge_cap_reached",
+                instance_id=instance_id,
+                details={"nudges": nudge_count, "tmux_pane": tmux_pane},
+            )
+            return {
+                "success": True,
+                "action": "cap_reached",
+                "instance_id": instance_id,
+                "nudges": nudge_count,
+                "workflow_blocked_reason": "naming_refused",
+            }
+
+        if await _has_pending_naming_nudge(db, instance_id):
+            return {
+                "success": True,
+                "action": "noop_pending_nudge",
+                "instance_id": instance_id,
+                "nudges": nudge_count,
+            }
+
+        if instance.get("workflow_blocked_reason") != "tab_name_placeholder":
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"workflow_blocked_reason": "tab_name_placeholder"},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="naming-nudge",
+            )
+            await db.commit()
+
+    session_doc_path = instance.get("session_doc_path") or instance.get("dispatch_session_doc_path")
+    slug = _derive_session_doc_slug(session_doc_path)
+    message = _build_naming_nudge_message(slug)
+    queued = await enqueue_pane_write(
+        instance_id=instance_id,
+        tmux_pane=tmux_pane,
+        source=NAMING_NUDGE_QUEUE_SOURCE,
+        purpose=NAMING_NUDGE_QUEUE_PURPOSE,
+        payload=message,
+    )
+    queue_results = await process_pane_write_queue_once(queued["id"])
+    queue_result = queue_results[0] if queue_results else queued
+    next_count = nudge_count + 1
+    await log_event(
+        NAMING_NUDGE_EVENT_TYPE,
+        instance_id=instance_id,
+        details={
+            "tmux_pane": tmux_pane,
+            "slug": slug,
+            "queue_id": queued["id"],
+            "queue_status": queue_result.get("status"),
+            "nudge_number": next_count,
+        },
+    )
+
+    return {
+        "success": True,
+        "action": "nudge_sent",
+        "instance_id": instance_id,
+        "tmux_pane": tmux_pane,
+        "slug": slug,
+        "nudge_number": next_count,
+        "queue_id": queued["id"],
+        "queue_status": queue_result.get("status"),
+        "defer_reason": queue_result.get("reason"),
+    }
 
 
 # Instance Registration Endpoints
@@ -2121,6 +2381,58 @@ class RenameInstanceRequest(BaseModel):
     tab_name: str
 
 
+class PaneRenameRequest(BaseModel):
+    tmux_pane: str
+    tab_name: str
+
+
+INSTANCE_NAME_MAX_CHARS = 40
+INSTANCE_NAME_SPINNER_PREFIXES = "✳⠐⠸ "
+INSTANCE_NAME_PLACEHOLDER_RX = re.compile(r"^Claude \d{2}:\d{2}$")
+
+
+def _validate_instance_name_slug(tab_name: str | None) -> str:
+    clean = (tab_name or "").strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    if len(clean) > INSTANCE_NAME_MAX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Name must be {INSTANCE_NAME_MAX_CHARS} characters or fewer",
+        )
+    placeholder_candidate = clean.lstrip(INSTANCE_NAME_SPINNER_PREFIXES).strip()
+    if INSTANCE_NAME_PLACEHOLDER_RX.match(placeholder_candidate):
+        raise HTTPException(
+            status_code=400,
+            detail="Name cannot be a placeholder like 'Claude HH:MM'",
+        )
+    return clean
+
+
+async def _refresh_tmux_pane_label(tmux_pane: str | None) -> None:
+    """Best-effort refresh for DB-backed tmux pane border labels."""
+    if not tmux_pane:
+        return
+    try:
+        cache_dir = Path(
+            os.environ.get("TMUX_PANE_LABEL_CACHE", "~/.claude/tmux-pane-label-cache")
+        ).expanduser()
+        (cache_dir / tmux_pane.replace("%", "")).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "refresh-client",
+            "-S",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except Exception as exc:
+        logger.debug(f"Pane label refresh failed for {tmux_pane}: {exc}")
+
+
 class LogEntry(BaseModel):
     """Single log entry."""
 
@@ -2140,14 +2452,14 @@ class LogsResponse(BaseModel):
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     """Rename an instance's tab_name. Auto-generated docs may mirror the title.
 
-    Enforces kebab-case: strips ✳ artifacts, lowercases, converts spaces to
-    hyphens, removes non-alphanumeric chars, truncates to 4 words.
+    Enforces kebab-case but preserves slot-style identifiers: strips ✳ artifacts,
+    converts spaces to hyphens, drops most non-alphanumerics but keeps `:` and
+    case so pane-slot names like `palace:NW` survive intact. Truncates to 4 words.
     """
     import re as _re
 
-    # Normalize to kebab-case
     clean = (request.tab_name or "").lstrip("✳ ").strip()
-    clean = _re.sub(r"[^a-z0-9 -]", "", clean.lower())
+    clean = _re.sub(r"[^A-Za-z0-9: -]", "", clean)
     clean = _re.sub(r"[ -]+", "-", clean).strip("-")
     clean = "-".join(clean.split("-")[:4])
     if not clean:
@@ -2202,6 +2514,66 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
+
+
+@app.post("/api/instance/rename")
+async def rename_instance_by_pane(request: PaneRenameRequest):
+    """Rename the active instance attached to a tmux pane.
+
+    Used by the `instance-name` CLI from inside an agent pane. This route is
+    intentionally pane-scoped so agents do not need to know their instance id.
+    """
+    tmux_pane = (request.tmux_pane or "").strip()
+    if not tmux_pane:
+        raise HTTPException(status_code=400, detail="tmux_pane is required")
+    tab_name = _validate_instance_name_slug(request.tab_name)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tab_name, tmux_pane
+               FROM claude_instances
+               WHERE tmux_pane = ?
+                 AND COALESCE(status, '') != 'stopped'
+               ORDER BY datetime(COALESCE(last_activity, registered_at, '1970-01-01')) DESC,
+                        registered_at DESC
+               LIMIT 1""",
+            (tmux_pane,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
+
+        old_name = row["tab_name"]
+        instance_id = row["id"]
+        result = await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"tab_name": tab_name},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="instance-name-cli",
+        )
+        await db.commit()
+
+    await _refresh_tmux_pane_label(tmux_pane)
+    await log_event(
+        "instance_renamed",
+        instance_id=instance_id,
+        details={
+            "old_name": old_name,
+            "new_name": tab_name,
+            "tmux_pane": tmux_pane,
+            "source": "instance-name-cli",
+        },
+    )
+    return {
+        "status": "renamed",
+        "instance_id": instance_id,
+        "tmux_pane": tmux_pane,
+        "tab_name": tab_name,
+        "changed_fields": result.get("changed_fields", []),
+    }
 
 
 @app.patch("/api/instances/{instance_id}/transplant-pending")
@@ -2316,7 +2688,8 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tmux_pane, device_id FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT * FROM claude_instances WHERE id = ?",
+            (instance_id,),
         )
         row = await cursor.fetchone()
 
@@ -2361,6 +2734,17 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
             actor=f"activity-{request.action}",
         )
         await db.commit()
+
+    if request.action == "stop":
+        stopped_instance = dict(row)
+        stopped_instance.update({"status": new_status, "last_activity": now})
+        try:
+            await schedule_golden_throne_followup(stopped_instance, reason="stop_hook")
+        except Exception as exc:
+            logger.warning(
+                f"Golden Throne: failed to schedule stop-hook follow-up "
+                f"for {instance_id[:12]}: {exc}"
+            )
 
     return {
         "status": "updated",
@@ -2424,7 +2808,10 @@ async def get_instance_todos(instance_id: str):
 # Thread persistence engine — zealotry controls follow-up frequency
 
 # Zealotry-to-delay mapping (seconds)
-ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 120}
+ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 60}
+GT_ENFORCEMENT_RESUME_THRESHOLD = 2
+GT_RESUME_WINDOW = timedelta(hours=24)
+GOLDEN_THRONE_QUIET_HOURS_BUFFER = timedelta(minutes=5)
 
 EXPECTED_ACK_PENDING = "pending"
 EXPECTED_ACK_TERMINAL_STATUSES = {
@@ -2438,6 +2825,495 @@ EXPECTED_ACK_TERMINAL_STATUSES = {
 EXPECTED_ACK_DEFAULT_ACK_DELAY = timedelta(seconds=90)
 EXPECTED_ACK_DEFAULT_LEVEL2_DELAY = timedelta(minutes=3)
 EXPECTED_ACK_DEFAULT_PAVLOK_DELAY = timedelta(minutes=3)
+ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS = 300
+
+EXPECTED_ACK_STAGE_NOTIFY = "notify"
+EXPECTED_ACK_STAGE_WARN = "warn"
+EXPECTED_ACK_STAGE_ENFORCE = "enforce"
+EXPECTED_ACK_STAGE_BY_LEVEL = {
+    1: EXPECTED_ACK_STAGE_NOTIFY,
+    2: EXPECTED_ACK_STAGE_WARN,
+    3: EXPECTED_ACK_STAGE_ENFORCE,
+}
+EXPECTED_ACK_LEVEL_BY_STAGE = {stage: level for level, stage in EXPECTED_ACK_STAGE_BY_LEVEL.items()}
+EXPECTED_ACK_DUE_FIELD_BY_STAGE = {
+    EXPECTED_ACK_STAGE_NOTIFY: "ack_due_at",
+    EXPECTED_ACK_STAGE_WARN: "level2_due_at",
+    EXPECTED_ACK_STAGE_ENFORCE: "pavlok_due_at",
+}
+EXPECTED_ACK_POLICY_DEFAULT = (
+    EXPECTED_ACK_STAGE_NOTIFY,
+    EXPECTED_ACK_STAGE_WARN,
+    EXPECTED_ACK_STAGE_ENFORCE,
+)
+EXPECTED_ACK_POLICY_BY_SOURCE = {}
+
+
+def _agent_engine(instance: dict) -> str:
+    engine = (instance.get("engine") or "").strip().lower()
+    if engine in {"codex", "claude"}:
+        return engine
+    launcher = (instance.get("launcher") or "").strip().lower()
+    if "codex" in launcher:
+        return "codex"
+    return "claude"
+
+
+def _agent_is_alive_command(engine: str, current_cmd: str) -> bool:
+    current = (current_cmd or "").lower()
+    if engine == "codex":
+        return "codex" in current
+    return "claude" in current or (current[:1].isdigit() and "." in current)
+
+
+async def _run_subprocess_offloop(
+    args: list[str] | tuple[str, ...],
+    *,
+    timeout: float | None = None,
+    stdout=None,
+    stderr=None,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run short utility subprocesses in a worker thread.
+
+    On macOS, `asyncio.create_subprocess_exec()` performs the fork/exec setup on
+    the event-loop thread before the awaitable yields. These small tmux/ps/CLI
+    calls are frequent enough that samples can catch the main loop in
+    `_posixsubprocess`. Keep process creation off-loop.
+    """
+    return await asyncio.to_thread(
+        subprocess.run,
+        list(args),
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        timeout=timeout,
+        check=False,
+    )
+
+
+async def _tmux_pane_pid(tmux_pane: str | None) -> int | None:
+    if not tmux_pane:
+        return None
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_pid}"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        raw = proc.stdout.decode().strip()
+        return int(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _tmux_pane_has_agent_process(tmux_pane: str | None, engine: str) -> bool:
+    """Detect live agents hidden below a pane shell.
+
+    Codex dispatch often leaves tmux's pane_current_command as "bash" while
+    the actual Codex TUI is a descendant process. GT must not paste a resume
+    command into that live prompt.
+    """
+    pane_pid = await _tmux_pane_pid(tmux_pane)
+    if not pane_pid:
+        return False
+    try:
+        proc = await _run_subprocess_offloop(
+            ("ps", "-axo", "pid=,ppid=,command="),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return False
+    except Exception:
+        return False
+
+    children: dict[int, list[int]] = {}
+    commands: dict[int, str] = {}
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        commands[pid] = parts[2].lower()
+        children.setdefault(ppid, []).append(pid)
+
+    stack = list(children.get(pane_pid, []))
+    seen: set[int] = set()
+    needles = ("codex",) if engine == "codex" else ("claude",)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        command = commands.get(pid, "")
+        if any(needle in command for needle in needles):
+            return True
+        stack.extend(children.get(pid, []))
+    return False
+
+
+async def _tmux_pane_current_command(tmux_pane: str | None) -> str:
+    if not tmux_pane:
+        return ""
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_current_command}"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.decode(errors="replace").strip()
+    except Exception:
+        return ""
+
+
+async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str | None:
+    """Fail closed on startup recovery when the recorded pane is now just a shell.
+
+    Normal stop-hook scheduling still owns fresh GT timers. Startup recovery is
+    only a repair path; if the original local pane exists but no longer contains
+    the target agent, resuming from that stale row risks driving the wrong pane.
+    """
+    if instance.get("status") != "stopped":
+        return None
+    if instance.get("device_id") != LOCAL_DEVICE_NAME:
+        return None
+    tmux_pane = instance.get("tmux_pane")
+    if not tmux_pane:
+        return None
+    if not await _tmux_pane_exists(tmux_pane):
+        return None
+    engine = _agent_engine(instance)
+    current_cmd = await _tmux_pane_current_command(tmux_pane)
+    if _agent_is_alive_command(engine, current_cmd):
+        return None
+    if await _tmux_pane_has_agent_process(tmux_pane, engine):
+        return None
+    return "stale_reused_or_empty_pane"
+
+
+def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
+    quoted_working_dir = shlex.quote(working_dir)
+    quoted_session_id = shlex.quote(session_id)
+    quoted_sop_file = shlex.quote(sop_file)
+    if engine == "codex":
+        dispatch_bin = shlex.quote(
+            os.environ.get("CODEX_DISPATCH_BIN")
+            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
+        )
+        return (
+            f"cd {quoted_working_dir} && {dispatch_bin} "
+            f"--resume-session {quoted_session_id} "
+            f"--launcher golden-throne --launch-mode golden-throne-resume "
+            f"{quoted_working_dir} "
+            f'"$(cat {quoted_sop_file})"'
+        )
+    return (
+        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
+        f"--resume {quoted_session_id} --dangerously-skip-permissions"
+    )
+
+
+def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
+    total_seconds = int(round((hour_float % 24) * 3600)) % 86400
+    midnight = datetime.combine(
+        local_now.date(),
+        datetime.min.time(),
+        tzinfo=local_now.tzinfo,
+    )
+    return midnight + timedelta(seconds=total_seconds)
+
+
+def _golden_throne_quiet_hours_fire_at(quiet_hours: dict) -> datetime:
+    local_now = datetime.fromisoformat(quiet_hours["local_time"])
+    quiet_start = float(quiet_hours["quiet_start"])
+    quiet_end = float(quiet_hours["quiet_end"])
+    hour_float = local_now.hour + local_now.minute / 60 + local_now.second / 3600
+    quiet_end_at = _quiet_hour_datetime(local_now, quiet_end)
+    if quiet_start > quiet_end and hour_float >= quiet_start:
+        quiet_end_at += timedelta(days=1)
+    elif quiet_end_at <= local_now:
+        quiet_end_at += timedelta(days=1)
+    return quiet_end_at + GOLDEN_THRONE_QUIET_HOURS_BUFFER
+
+
+async def record_golden_throne_resume(instance: dict) -> dict:
+    """Increment per-instance GT resume count and enforce on the second resume."""
+    session_id = instance["id"]
+    now = datetime.now()
+    window_started_raw = instance.get("gt_resume_window_started_at")
+    try:
+        window_started = datetime.fromisoformat(window_started_raw) if window_started_raw else None
+    except Exception:
+        window_started = None
+    if not window_started or now - window_started > GT_RESUME_WINDOW:
+        window_started = now
+        count = 0
+    else:
+        count = int(instance.get("gt_resume_count") or 0)
+    count += 1
+    updates = {
+        "gt_resume_count": count,
+        "gt_resume_window_started_at": window_started.isoformat(),
+        "gt_last_resume_at": now.isoformat(),
+    }
+    async with aiosqlite.connect(DB_PATH) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=session_id,
+            updates=updates,
+            mutation_type="instance_updated",
+            write_source="golden_throne",
+            actor="golden-throne-followup",
+        )
+        await db.commit()
+
+    enforced = count >= GT_ENFORCEMENT_RESUME_THRESHOLD
+    result = {
+        "resume_count": count,
+        "window_started_at": window_started.isoformat(),
+        "enforced": enforced,
+    }
+    await log_event(
+        "golden_throne_resume_counted",
+        instance_id=session_id,
+        details={**result, "threshold": GT_ENFORCEMENT_RESUME_THRESHOLD},
+    )
+    if enforced:
+        tab_name = instance.get("tab_name") or "session"
+        pane_surface = (
+            instance.get("pane_surface") or instance.get("pane_label") or instance.get("tmux_pane")
+        )
+        human_surface = instance.get("human_pane_surface") or _golden_throne_human_surface(
+            tab_name,
+            instance.get("tmux_pane"),
+            instance.get("pane_label"),
+        )
+        payload = _enforcement_state_payload(
+            source="golden_throne",
+            ack_source="golden_throne",
+            trigger="second_resume",
+            instance_id=session_id,
+            tab_name=tab_name,
+            tmux_pane=instance.get("tmux_pane"),
+            pane_label=instance.get("pane_label"),
+            pane_surface=pane_surface,
+            human_pane_surface=human_surface,
+            resume_count=count,
+        )
+        await handle_custodes_state_event(
+            "enforcement_cascade_started",
+            "golden_throne",
+            instance_id=session_id,
+            severity=4,
+            payload=payload,
+        )
+        enforcement = await unified_enforce(
+            "enforce",
+            f"Golden Throne second resume: {human_surface}",
+            source="golden_throne",
+            phone_params={
+                "zap": PAVLOK_CONFIG.get("friday_zap_value", 30),
+                "tts_text": f"golden throne enforcement {human_surface}",
+                "banner_text": f"GT enforce: {human_surface}",
+            },
+        )
+        await log_event(
+            "golden_throne_second_resume_enforced",
+            instance_id=session_id,
+            details={**payload, "enforcement": enforcement},
+        )
+        result["enforcement"] = enforcement
+    return result
+
+
+async def golden_throne_user_activity(instance_id: str, source: str = "prompt_submit") -> dict:
+    """Treat real activity in a Golden Throne pane as the authoritative reset."""
+    cancelled_writes = await cancel_pending_pane_writes(
+        instance_id,
+        source="golden_throne",
+    )
+    try:
+        scheduler.remove_job(f"golden-throne-{instance_id}")
+    except Exception:
+        pass
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "gt_resume_count": 0,
+                "gt_resume_window_started_at": None,
+                "gt_last_resume_at": now,
+            },
+            mutation_type="instance_updated",
+            write_source="golden_throne",
+            actor=f"golden-throne-{source}",
+        )
+        await db.commit()
+    result = {
+        "cancelled_pane_writes": cancelled_writes,
+        "gt_resume_count": 0,
+        "source": source,
+    }
+    await log_event("golden_throne_user_activity_reset", instance_id=instance_id, details=result)
+    return result
+
+
+def _golden_throne_followup_sync(instance_id: str) -> dict:
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(golden_throne_followup(instance_id), APP_LOOP)
+            future.result(timeout=60)
+        else:
+            asyncio.run(golden_throne_followup(instance_id))
+        return {"success": True, "instance_id": instance_id}
+    except Exception as exc:
+        logger.exception(f"Golden Throne: scheduled follow-up failed for {instance_id[:12]}")
+        return {"success": False, "instance_id": instance_id, "error": str(exc)}
+
+
+async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
+    """Arm the one-shot Golden Throne follow-up timer for an idle instance."""
+    instance_id = instance["id"]
+    instance_type = instance.get("instance_type", "one_off")
+    zealotry = int(instance.get("zealotry") or 4)
+    if instance_type != "golden_throne":
+        return {"scheduled": False, "reason": "not_golden_throne"}
+    if instance.get("victory_at"):
+        return {"scheduled": False, "reason": "victory_declared"}
+    if zealotry < 4:
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
+
+    delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, ZEALOTRY_DELAY_MAP[4])
+    original_fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+    fire_at = original_fire_at
+    quiet_hours = shared.get_quiet_hours_status()
+    quiet_hours_shifted = False
+    if quiet_hours.get("active"):
+        fire_at = _golden_throne_quiet_hours_fire_at(quiet_hours)
+        quiet_hours_shifted = True
+    scheduler.add_job(
+        _golden_throne_followup_sync,
+        DateTrigger(run_date=fire_at),
+        args=[instance_id],
+        id=f"golden-throne-{instance_id}",
+        replace_existing=True,
+        misfire_grace_time=ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS,
+    )
+    details = {
+        "zealotry": zealotry,
+        "delay_seconds": delay_seconds,
+        "fire_at": fire_at.isoformat(),
+        "reason": reason,
+        "engine": _agent_engine(instance),
+        "quiet_hours": quiet_hours,
+        "quiet_hours_shifted": quiet_hours_shifted,
+    }
+    if quiet_hours_shifted:
+        details["original_fire_at"] = original_fire_at.isoformat()
+    await log_event("golden_throne_scheduled", instance_id=instance_id, details=details)
+    logger.info(
+        f"Golden Throne: scheduled {instance_id[:12]} zealotry={zealotry} "
+        f"delay={delay_seconds}s fire_at={fire_at.isoformat()} "
+        f"quiet_hours_shifted={quiet_hours_shifted}"
+    )
+    return {"scheduled": True, **details}
+
+
+async def recover_recent_stopped_golden_throne_timers(
+    *,
+    lookback_minutes: int = 24 * 60,
+) -> list[dict]:
+    """Arm GT timers for quiet sessions that missed or lost scheduling.
+
+    Golden Throne state is persisted in SQLite, but APScheduler date jobs are a
+    runtime concern. A restart, a manual promotion to golden_throne, or a missed
+    stop-hook can leave an idle GT instance with no in-memory follow-up job. Use
+    a day-scale recovery window so active panes restored from tmux are enforced
+    after restart instead of silently sitting idle.
+    """
+    recovered: list[dict] = []
+    now = datetime.now()
+    lookback = timedelta(minutes=lookback_minutes)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM claude_instances
+            WHERE status IN ('idle', 'stopped')
+              AND instance_type = 'golden_throne'
+              AND COALESCE(zealotry, 4) >= 4
+              AND victory_at IS NULL
+              AND COALESCE(stopped_at, last_activity) IS NOT NULL
+            ORDER BY COALESCE(stopped_at, last_activity) DESC
+            """,
+        )
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        instance = dict(row)
+        instance_id = instance["id"]
+        quiet_at_raw = instance.get("stopped_at") or instance.get("last_activity")
+        try:
+            quiet_at = datetime.fromisoformat(quiet_at_raw)
+        except Exception:
+            continue
+        if now - quiet_at > lookback:
+            continue
+        if instance.get("status") == "stopped":
+            gt_last_resume_raw = instance.get("gt_last_resume_at")
+            try:
+                gt_last_resume_at = (
+                    datetime.fromisoformat(gt_last_resume_raw) if gt_last_resume_raw else None
+                )
+            except Exception:
+                gt_last_resume_at = None
+            if gt_last_resume_at and gt_last_resume_at >= quiet_at:
+                continue
+        stale_pane_reason = await _golden_throne_recovery_blocked_by_stale_pane(instance)
+        if stale_pane_reason:
+            await log_event(
+                "golden_throne_recovery_skipped_stale_pane",
+                instance_id=instance_id,
+                details={
+                    "reason": stale_pane_reason,
+                    "tmux_pane": instance.get("tmux_pane"),
+                    "status": instance.get("status"),
+                    "quiet_at": quiet_at.isoformat(),
+                },
+            )
+            continue
+        if scheduler.get_job(f"golden-throne-{instance_id}"):
+            continue
+        result = await schedule_golden_throne_followup(instance, reason="startup-recover-quiet")
+        if result.get("scheduled"):
+            recovered.append({"instance_id": instance_id, **result})
+
+    if recovered:
+        await log_event(
+            "golden_throne_recovered_stopped_timers",
+            details={"count": len(recovered), "instances": recovered},
+        )
+        logger.info(f"Golden Throne: recovered {len(recovered)} stopped GT timer(s)")
+    return recovered
 
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
@@ -2672,29 +3548,63 @@ def _schedule_expected_ack_level(ack_id: str, level: int, due_at: datetime) -> N
         args=[ack_id, level],
         id=_expected_ack_job_id(ack_id, level),
         replace_existing=True,
-        jobstore="golden_throne",
+        misfire_grace_time=ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS,
+    )
+
+
+def _expected_ack_policy(source: str | None) -> tuple[str, ...]:
+    return EXPECTED_ACK_POLICY_BY_SOURCE.get(source or "", EXPECTED_ACK_POLICY_DEFAULT)
+
+
+def _expected_ack_scheduled_levels(source: str | None) -> tuple[int, ...]:
+    return tuple(EXPECTED_ACK_LEVEL_BY_STAGE[stage] for stage in _expected_ack_policy(source))
+
+
+def _expected_ack_stage_for_level(source: str | None, level: int) -> str | None:
+    stage = EXPECTED_ACK_STAGE_BY_LEVEL.get(level)
+    if stage not in _expected_ack_policy(source):
+        return None
+    return stage
+
+
+def _expected_ack_due_at_for_stage(ack: dict, stage: str) -> str:
+    return ack[EXPECTED_ACK_DUE_FIELD_BY_STAGE[stage]]
+
+
+def _expected_ack_scheduled_stages(source: str | None) -> tuple[dict, ...]:
+    return tuple(
+        {
+            "stage": stage,
+            "level": EXPECTED_ACK_LEVEL_BY_STAGE[stage],
+            "due_field": EXPECTED_ACK_DUE_FIELD_BY_STAGE[stage],
+        }
+        for stage in _expected_ack_policy(source)
     )
 
 
 def _schedule_expected_ack_ladder(
-    ack_id: str, ack_due_at: str, level2_due_at: str, pavlok_due_at: str
+    ack_id: str,
+    ack_due_at: str,
+    level2_due_at: str,
+    pavlok_due_at: str,
+    source: str | None = None,
 ) -> None:
-    for level, due_at in (
-        (1, ack_due_at),
-        (2, level2_due_at),
-        (3, pavlok_due_at),
-    ):
-        _schedule_expected_ack_level(ack_id, level, datetime.fromisoformat(due_at))
+    due_by_field = {
+        "ack_due_at": ack_due_at,
+        "level2_due_at": level2_due_at,
+        "pavlok_due_at": pavlok_due_at,
+    }
+    for stage in _expected_ack_scheduled_stages(source):
+        due_at = due_by_field[stage["due_field"]]
+        _schedule_expected_ack_level(ack_id, stage["level"], datetime.fromisoformat(due_at))
 
 
 def _schedule_expected_ack_remaining(ack: dict) -> None:
     fired_levels = set(ack.get("fired_levels") or [])
-    for level, due_at in (
-        (1, ack["ack_due_at"]),
-        (2, ack["level2_due_at"]),
-        (3, ack["pavlok_due_at"]),
-    ):
+    for stage in _expected_ack_scheduled_stages(ack.get("source")):
+        level = stage["level"]
         if level not in fired_levels:
+            due_at = _expected_ack_due_at_for_stage(ack, stage["stage"])
             _schedule_expected_ack_level(ack["id"], level, datetime.fromisoformat(due_at))
 
 
@@ -2706,8 +3616,289 @@ def _cancel_expected_ack_ladder(ack_id: str) -> None:
             pass
 
 
+def _snippet(value: bytes | str | None, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode(errors="replace")
+    else:
+        text = str(value)
+    text = text.strip()
+    return text[:limit]
+
+
 async def _tmux_pane_exists(tmux_pane: str | None) -> bool:
     return await shared.tmux_pane_exists(tmux_pane)
+
+
+PANE_WRITE_PENDING = "pending"
+PANE_WRITE_SENT = "sent"
+PANE_WRITE_FAILED = "failed"
+PANE_WRITE_CANCELLED = "cancelled"
+PANE_WRITE_DEFERRED = "deferred"
+
+
+def _pane_input_line_has_text(line: str) -> bool:
+    stripped = line.rstrip()
+    if not stripped:
+        return False
+    if re.search(r"^[\s│░▒▓]*>\s*$", stripped):
+        return False
+    if re.search(r"[$%#>❯]\s*$", stripped):
+        return False
+    if not re.search(r"[$%#>❯]", stripped):
+        return False
+    return True
+
+
+async def _tmux_pane_has_pending_input(tmux_pane: str) -> bool:
+    """Server-owned typing guard for automated pane writes."""
+    proc = await _run_subprocess_offloop(
+        ("tmux", "capture-pane", "-t", tmux_pane, "-p"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        return False
+    lines = [line for line in proc.stdout.decode(errors="replace").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return _pane_input_line_has_text(lines[-1])
+
+
+async def enqueue_pane_write(
+    *,
+    instance_id: str,
+    tmux_pane: str,
+    source: str,
+    purpose: str,
+    payload: str,
+) -> dict:
+    if not (tmux_pane or "").strip():
+        raise ValueError("pane write requires a concrete tmux pane target")
+    queue_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO pane_write_queue (
+                id, instance_id, tmux_pane, source, purpose, payload,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now),
+        )
+        await db.commit()
+    return {
+        "id": queue_id,
+        "instance_id": instance_id,
+        "tmux_pane": tmux_pane,
+        "source": source,
+        "purpose": purpose,
+        "payload": payload,
+        "status": PANE_WRITE_PENDING,
+        "created_at": now,
+    }
+
+
+async def cancel_pending_pane_writes(
+    instance_id: str,
+    *,
+    source: str | None = None,
+    purpose: str | None = None,
+) -> int:
+    clauses = ["instance_id = ?", "status = 'pending'"]
+    params: list[str] = [instance_id]
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
+    if purpose:
+        clauses.append("purpose = ?")
+        params.append(purpose)
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"""
+            UPDATE pane_write_queue
+            SET status = 'cancelled',
+                cancelled_at = ?,
+                updated_at = ?,
+                last_result_json = ?
+            WHERE {" AND ".join(clauses)}
+            """,
+            (
+                now,
+                now,
+                json.dumps({"cancelled_by": "user_activity"}),
+                *params,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount or 0
+
+
+async def _mark_pane_write(
+    queue_id: str,
+    *,
+    status: str,
+    result: dict,
+    error: str | None = None,
+) -> None:
+    now = datetime.now().isoformat()
+    sent_at = now if status == PANE_WRITE_SENT else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE pane_write_queue
+            SET status = ?,
+                updated_at = ?,
+                attempted_at = COALESCE(attempted_at, ?),
+                sent_at = COALESCE(sent_at, ?),
+                last_error = ?,
+                last_result_json = ?
+            WHERE id = ?
+            """,
+            (status, now, now, sent_at, error, json.dumps(result), queue_id),
+        )
+        await db.commit()
+
+
+async def _tmux_send_payload_then_submit(
+    tmux_pane: str,
+    payload: str,
+    *,
+    clear_prompt: bool = False,
+) -> dict:
+    """Send text and submit through tmuxctl's pane-write primitive."""
+    from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+
+    adapter = TmuxAdapter()
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                adapter.send_text_then_submit,
+                tmux_pane,
+                payload,
+                clear_prompt=clear_prompt,
+            ),
+            timeout=10,
+        )
+    except TmuxError as exc:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": str(exc),
+            "failed_operation": ["tmuxctl", "send_text_then_submit"],
+        }
+
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "operation": "tmuxctl.send_text_then_submit",
+    }
+
+
+async def process_pane_write_queue_once(
+    queue_id: str | None = None, *, limit: int = 10
+) -> list[dict]:
+    """Drain pending automated pane writes that are safe to deliver."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if queue_id:
+            cursor = await db.execute(
+                "SELECT * FROM pane_write_queue WHERE id = ? AND status = 'pending'",
+                (queue_id,),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT * FROM pane_write_queue
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        pane = item["tmux_pane"]
+        base = {
+            "queue_id": item["id"],
+            "instance_id": item["instance_id"],
+            "tmux_pane": pane,
+            "source": item["source"],
+            "purpose": item["purpose"],
+        }
+        try:
+            if await _tmux_pane_has_pending_input(pane):
+                result = {**base, "status": PANE_WRITE_PENDING, "reason": "dispatch_deferred"}
+                await _mark_pane_write(
+                    item["id"],
+                    status=PANE_WRITE_PENDING,
+                    result=result,
+                    error="user_input_pending",
+                )
+                results.append(result)
+                continue
+            send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
+            result = {
+                **base,
+                "status": PANE_WRITE_SENT if send_result["returncode"] == 0 else PANE_WRITE_FAILED,
+                **send_result,
+            }
+            await _mark_pane_write(
+                item["id"],
+                status=result["status"],
+                result=result,
+                error=result["stderr"] if send_result["returncode"] != 0 else None,
+            )
+            results.append(result)
+        except Exception as exc:
+            result = {**base, "status": PANE_WRITE_FAILED, "error": str(exc)}
+            await _mark_pane_write(
+                item["id"],
+                status=PANE_WRITE_FAILED,
+                result=result,
+                error=str(exc),
+            )
+            results.append(result)
+    return results
+
+
+def _process_pane_write_queue_sync() -> dict:
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            pending_count = conn.execute(
+                "SELECT COUNT(*) FROM pane_write_queue WHERE status = 'pending'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        if not pending_count:
+            return {"success": True, "processed": 0}
+        if APP_LOOP and APP_LOOP.is_running():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is APP_LOOP:
+                APP_LOOP.create_task(process_pane_write_queue_once())
+                return {"success": True, "scheduled": True}
+            future = asyncio.run_coroutine_threadsafe(process_pane_write_queue_once(), APP_LOOP)
+            results = future.result(timeout=30)
+        else:
+            results = asyncio.run(process_pane_write_queue_once())
+        return {"success": True, "processed": len(results)}
+    except Exception as exc:
+        logger.warning(f"Pane write queue worker failed: {exc}")
+        return {"success": False, "error": str(exc)}
 
 
 async def _tmux_resolve_pane_id(tmux_pane: str | None) -> str | None:
@@ -2746,25 +3937,27 @@ def _agent_engine_for_args(args: str) -> str | None:
 
 
 async def _tmux_pane_processes(tty: str | None) -> list[str]:
+    return await asyncio.to_thread(_tmux_pane_processes_sync, tty)
+
+
+def _tmux_pane_processes_sync(tty: str | None) -> list[str]:
     if not tty:
         return []
     tty_arg = tty[len("/dev/") :] if tty.startswith("/dev/") else tty
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ps",
-            "-t",
-            tty_arg,
-            "-o",
-            "args=",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        result = subprocess.run(
+            ["ps", "-t", tty_arg, "-o", "args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-        if proc.returncode != 0:
+        if result.returncode != 0:
             return []
     except Exception:
         return []
-    return [line for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
+    return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 async def _pane_is_agent(
@@ -2784,24 +3977,32 @@ async def _pane_is_agent(
 
 
 async def _tmux_pane_rows() -> list[tuple[str, str, str, str, str]]:
+    return await asyncio.to_thread(_tmux_pane_rows_sync)
+
+
+def _tmux_pane_rows_sync() -> list[tuple[str, str, str, str, str]]:
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_tty}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_tty}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-        if proc.returncode != 0:
+        if result.returncode != 0:
             return []
     except Exception:
         return []
 
     rows = []
-    for line in stdout.decode(errors="ignore").splitlines():
+    for line in result.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 4:
             continue
@@ -2809,6 +4010,93 @@ async def _tmux_pane_rows() -> list[tuple[str, str, str, str, str]]:
             parts.append("")
         rows.append((parts[0], parts[1], parts[2], parts[3], parts[4]))
     return rows
+
+
+def _normalize_tty(tty: str | None) -> str | None:
+    if not tty:
+        return None
+    return tty[len("/dev/") :] if tty.startswith("/dev/") else tty
+
+
+def _agent_engine_by_tty_sync() -> dict[str, str]:
+    """Return tty -> agent engine from one ps scan.
+
+    This avoids one `ps -t` fork per tmux pane in the high-frequency work-state
+    read model. It intentionally runs in a worker thread via
+    `_agent_engine_by_tty()` so subprocess fork/exec cannot park the asyncio
+    main thread.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "axo", "tty=,args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            return {}
+    except Exception:
+        return {}
+
+    engines: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) != 2:
+            continue
+        tty, args = parts
+        if tty == "??":
+            continue
+        engine = _agent_engine_for_args(args)
+        if engine and tty not in engines:
+            engines[tty] = engine
+    return engines
+
+
+async def _agent_engine_by_tty() -> dict[str, str]:
+    return await asyncio.to_thread(_agent_engine_by_tty_sync)
+
+
+def _pane_is_agent_from_snapshot(
+    command: str | None,
+    tty: str | None,
+    agent_engines_by_tty: dict[str, str],
+) -> tuple[bool, str | None]:
+    cmd = (command or "").lower()
+    if cmd in ("codex", "claude"):
+        return True, cmd
+    tty_key = _normalize_tty(tty)
+    engine = agent_engines_by_tty.get(tty_key or "")
+    if engine:
+        return True, engine
+    return False, None
+
+
+def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
+    if not tmux_pane:
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
+async def _resolve_tmux_pane_id_for_read_model(tmux_pane: str | None) -> str | None:
+    return await asyncio.to_thread(_resolve_tmux_pane_id_sync, tmux_pane)
 
 
 def _activity_icons() -> list[ActivityIconState]:
@@ -2851,7 +4139,9 @@ async def compute_work_state() -> WorkStateResponse:
     active_instances: list[AgentRuntime] = []
     processing_recent_count = 0
     tracked_panes: set[str] = set()
-    local_pane_rows = {row[0]: row for row in await _tmux_pane_rows()}
+    local_pane_row_list = await _tmux_pane_rows()
+    local_pane_rows = {row[0]: row for row in local_pane_row_list}
+    agent_engines_by_tty = await _agent_engine_by_tty()
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -2876,14 +4166,21 @@ async def compute_work_state() -> WorkStateResponse:
         pane_is_agent = None
         canonical_tmux_pane = row["tmux_pane"]
         if row["tmux_pane"] and row["device_id"] == LOCAL_DEVICE_NAME:
-            live_pane = await _tmux_pane_exists(row["tmux_pane"])
-            canonical_tmux_pane = await _tmux_resolve_pane_id(row["tmux_pane"])
-            if live_pane and not canonical_tmux_pane:
+            if row["tmux_pane"] in local_pane_rows:
                 canonical_tmux_pane = row["tmux_pane"]
+            elif str(row["tmux_pane"]).startswith("%"):
+                canonical_tmux_pane = None
+            else:
+                # Rare non-% tmux targets can still be resolved, but do it in a
+                # worker thread. The prior path used async subprocess creation in
+                # the event loop for every row, which reintroduced the P0
+                # fork/exec blocker on cold `/api/timer` polls.
+                canonical_tmux_pane = await _resolve_tmux_pane_id_for_read_model(row["tmux_pane"])
+            live_pane = canonical_tmux_pane in local_pane_rows
             pane_row = local_pane_rows.get(canonical_tmux_pane)
             if pane_row:
-                pane_is_agent, _ = await _pane_is_agent(
-                    pane_row[1], pane_row[2], pane_row[3], pane_row[4]
+                pane_is_agent, _ = _pane_is_agent_from_snapshot(
+                    pane_row[1], pane_row[4], agent_engines_by_tty
                 )
             else:
                 pane_is_agent = False
@@ -2912,9 +4209,26 @@ async def compute_work_state() -> WorkStateResponse:
             )
         )
 
-    observed_agents = [
-        agent for agent in await _detect_tmux_agent_panes() if agent.tmux_pane not in tracked_panes
-    ]
+    observed_agents = []
+    for pane, command, cwd, window, tty in local_pane_row_list:
+        if pane in tracked_panes:
+            continue
+        is_agent, engine = _pane_is_agent_from_snapshot(command, tty, agent_engines_by_tty)
+        if not is_agent:
+            continue
+        observed_agents.append(
+            AgentRuntime(
+                id=None,
+                name=window or engine,
+                status="observed",
+                engine=engine,
+                working_dir=cwd,
+                tmux_pane=pane,
+                device_id=LOCAL_DEVICE_NAME,
+                registered=False,
+                live_pane=True,
+            )
+        )
     productivity_active = bool(active_instances or observed_agents)
     reason = "tracked_or_observed_agent" if productivity_active else "no_live_agent"
     return WorkStateResponse(
@@ -2934,6 +4248,63 @@ async def compute_work_state() -> WorkStateResponse:
     )
 
 
+_WORK_STATE_CACHE: dict[str, object] = {"value": None, "monotonic": 0.0}
+_WORK_STATE_CACHE_LOCK = asyncio.Lock()
+_WORK_STATE_REFRESH_TASK: asyncio.Task | None = None
+
+
+async def _refresh_work_state_cache() -> None:
+    async with _WORK_STATE_CACHE_LOCK:
+        value = await compute_work_state()
+        _WORK_STATE_CACHE["value"] = value
+        _WORK_STATE_CACHE["monotonic"] = time.monotonic()
+
+
+def _schedule_work_state_refresh() -> None:
+    global _WORK_STATE_REFRESH_TASK
+    if _WORK_STATE_REFRESH_TASK and not _WORK_STATE_REFRESH_TASK.done():
+        return
+    _WORK_STATE_REFRESH_TASK = asyncio.create_task(_refresh_work_state_cache())
+
+
+async def get_cached_work_state(max_age_seconds: float = 1.0) -> WorkStateResponse:
+    """Collapse high-frequency dashboard polls onto a short-lived work-state cache.
+
+    `compute_work_state()` shells out to tmux/ps and reads SQLite. Calling it once
+    per `/api/timer` poll creates a thundering herd under dashboards. Timer-worker
+    internals still call `compute_work_state()` directly when they need a fresh
+    sample; HTTP read models can tolerate a sub-second snapshot.
+    """
+    now = time.monotonic()
+    cached = _WORK_STATE_CACHE.get("value")
+    cached_at = float(_WORK_STATE_CACHE.get("monotonic") or 0.0)
+    if isinstance(cached, WorkStateResponse) and (now - cached_at) <= max_age_seconds:
+        return cached
+    if isinstance(cached, WorkStateResponse):
+        # Stale-while-revalidate for HTTP dashboards. A cold work-state sample can
+        # take ~2s when tmux/ps are slow; making the first `/api/timer` caller wait
+        # violates the P0 latency gate even though the event loop is not blocked.
+        # Return the last snapshot and refresh in the background.
+        _schedule_work_state_refresh()
+        return cached
+
+    async with _WORK_STATE_CACHE_LOCK:
+        now = time.monotonic()
+        cached = _WORK_STATE_CACHE.get("value")
+        cached_at = float(_WORK_STATE_CACHE.get("monotonic") or 0.0)
+        if isinstance(cached, WorkStateResponse) and (now - cached_at) <= max_age_seconds:
+            return cached
+        if isinstance(cached, WorkStateResponse):
+            _schedule_work_state_refresh()
+            return cached
+
+        # Startup path: no cached snapshot exists yet, so compute once.
+        value = await compute_work_state()
+        _WORK_STATE_CACHE["value"] = value
+        _WORK_STATE_CACHE["monotonic"] = time.monotonic()
+        return value
+
+
 async def recover_expected_ack_jobs() -> int:
     """Re-arm pending acknowledgement ladders after a Token-API restart."""
     now = datetime.now()
@@ -2947,32 +4318,13 @@ async def recover_expected_ack_jobs() -> int:
 
     for row in rows:
         ack = _expected_ack_row_to_dict(row)
-        ack_due_at = datetime.fromisoformat(ack["ack_due_at"])
-        level2_due_at = datetime.fromisoformat(ack["level2_due_at"])
-        pavlok_due_at = datetime.fromisoformat(ack["pavlok_due_at"])
         fired_levels = set(ack.get("fired_levels") or [])
-        if now >= pavlok_due_at:
-            if 3 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 3, immediate)
-        elif now >= level2_due_at:
-            if 2 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 2, immediate)
-            if 3 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
-        elif now >= ack_due_at:
-            if 1 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 1, immediate)
-            if 2 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 2, level2_due_at)
-            if 3 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
-        else:
-            if 1 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 1, ack_due_at)
-            if 2 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 2, level2_due_at)
-            if 3 not in fired_levels:
-                _schedule_expected_ack_level(ack["id"], 3, pavlok_due_at)
+        for stage in _expected_ack_scheduled_stages(ack.get("source")):
+            level = stage["level"]
+            if level in fired_levels:
+                continue
+            due_at = datetime.fromisoformat(_expected_ack_due_at_for_stage(ack, stage["stage"]))
+            _schedule_expected_ack_level(ack["id"], level, immediate if now >= due_at else due_at)
 
     if rows:
         jobs = [
@@ -3046,6 +4398,7 @@ async def create_expected_ack(
         deadlines["ack_due_at"].isoformat(),
         deadlines["level2_due_at"].isoformat(),
         deadlines["pavlok_due_at"].isoformat(),
+        source=source,
     )
     ack = {
         "id": ack_id,
@@ -3092,6 +4445,19 @@ def _expected_ack_row_to_dict(row) -> dict:
         "fired_levels": fired_levels,
         "details": details,
     }
+
+
+async def _update_expected_ack_details(ack_id: str, details: dict) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE expected_acknowledgements
+            SET details_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps(details), ack_id),
+        )
+        await db.commit()
 
 
 async def _find_expected_ack(
@@ -3281,11 +4647,29 @@ async def _terminal_backlog_ack_for_active_span(
 
 
 async def _mark_expected_ack_level_fired(ack: dict, level: int) -> bool:
-    fired_levels = set(ack.get("fired_levels") or [])
-    if level in fired_levels:
-        return False
-    fired_levels.add(level)
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """
+            SELECT fired_levels_json
+            FROM expected_acknowledgements
+            WHERE id = ? AND status = 'pending'
+            """,
+            (ack["id"],),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await db.rollback()
+            return False
+        try:
+            fired_levels = set(json.loads(row["fired_levels_json"] or "[]"))
+        except Exception:
+            fired_levels = set()
+        if level in fired_levels:
+            await db.rollback()
+            return False
+        fired_levels.add(level)
         await db.execute(
             """
             UPDATE expected_acknowledgements
@@ -3303,10 +4687,27 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
     ack = await _find_expected_ack(ack_id, None, None)
     if not ack or ack["status"] != "pending":
         return {"skipped": True, "reason": "not_pending", "ack_id": ack_id, "level": level}
+    stage = _expected_ack_stage_for_level(ack["source"], level)
+    if stage is None:
+        result = {
+            "skipped": True,
+            "reason": "stage_not_in_policy",
+            "ack_id": ack_id,
+            "level": level,
+            "source": ack["source"],
+        }
+        await log_event(
+            "expected_ack_stage_skipped",
+            instance_id=ack["instance_id"],
+            details={"ack": ack, "level": level, "result": result},
+        )
+        return result
     if not await _mark_expected_ack_level_fired(ack, level):
         return {"skipped": True, "reason": "level_already_fired", "ack_id": ack_id, "level": level}
 
     ack["escalation_level"] = level
+    ack["escalation_stage"] = stage
+
     if is_quiet_hours():
         suppression = await log_quiet_hours_suppressed(
             source=ack["source"],
@@ -3333,6 +4734,23 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
         }
 
     message = f"Expected acknowledgement missed: {ack['reason']}"
+    ack_details = ack.get("details") or {}
+    derived_ack_surface = None
+    if ack_details.get("tab_name") or ack_details.get("tmux_pane") or ack_details.get("pane_label"):
+        derived_ack_surface = _format_human_pane_surface(
+            ack_details.get("tab_name"),
+            ack_details.get("tmux_pane"),
+            ack_details.get("pane_label"),
+        )
+    ack_surface = (
+        ack_details.get("human_pane_surface")
+        or derived_ack_surface
+        or ack_details.get("pane_surface")
+        or ack_details.get("pane_label")
+        or ack_details.get("tmux_pane")
+    )
+    ack_due_text = f"Ack due: {ack_surface}" if ack_surface else "Ack due"
+    ack_overdue_text = f"Ack overdue: {ack_surface}" if ack_surface else "Ack overdue"
     if ack["source"] == "backlog_violation" and level == 1:
         desktop_result = None
         if DESKTOP_STATE.get("current_mode") in ("video", "scrolling", "gaming"):
@@ -3363,7 +4781,11 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             message,
             source=ack["source"],
             channel="briefing",
-            phone_params={"vibe": 30, "banner_text": "Ack due"},
+            phone_params={
+                "vibe": 30,
+                "banner_text": ack_due_text,
+                "tts_text": ack_due_text,
+            },
         )
     elif level == 2:
         if ack["source"] == "desktop_gaming":
@@ -3372,7 +4794,12 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             "warn",
             message,
             source=ack["source"],
-            phone_params={"vibe": 50, "beep": 50, "banner_text": "Ack overdue"},
+            phone_params={
+                "vibe": 50,
+                "beep": 50,
+                "banner_text": ack_overdue_text,
+                "tts_text": ack_overdue_text,
+            },
         )
     else:
         if ack["source"] == "backlog_violation" and not _backlog_distraction_still_active(ack):
@@ -3444,12 +4871,12 @@ def _ack_current_level(ack: dict, now: datetime | None = None) -> int:
     now = now or datetime.now()
     if ack["status"] != "pending":
         return 0
-    if now >= datetime.fromisoformat(ack["pavlok_due_at"]):
-        return 3
-    if now >= datetime.fromisoformat(ack["level2_due_at"]):
-        return 2
-    if now >= datetime.fromisoformat(ack["ack_due_at"]):
-        return 1
+    current_level = 0
+    for stage in _expected_ack_scheduled_stages(ack.get("source")):
+        if now >= datetime.fromisoformat(_expected_ack_due_at_for_stage(ack, stage["stage"])):
+            current_level = max(current_level, stage["level"])
+    if current_level:
+        return current_level
     return 0
 
 
@@ -3463,6 +4890,115 @@ def _load_golden_throne_sop() -> str:
         "Act if clear, escalate if blocked. Update session doc. "
         "Declare victory when exhausted."
     )
+
+
+async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
+    return await asyncio.to_thread(_tmux_pane_label_sync, tmux_pane)
+
+
+def _tmux_pane_label_sync(tmux_pane: str | None) -> str | None:
+    if not tmux_pane:
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode == 0:
+            label = result.stdout.strip()
+            return label or None
+    except Exception as exc:
+        logger.debug(f"Golden Throne: pane label lookup failed for {tmux_pane}: {exc}")
+    return None
+
+
+_PANE_LABEL_REPAIR_TASK: asyncio.Task | None = None
+_PANE_LABEL_REPAIR_LAST_MONOTONIC = 0.0
+_PANE_LABEL_REPAIR_MIN_INTERVAL_SECONDS = 30.0
+
+
+def _schedule_pane_label_repair(candidates: list[dict]) -> None:
+    """Best-effort pane-label repair outside high-traffic read requests.
+
+    `/api/instances` used to run tmux subprocesses and DB writes while its
+    aiosqlite connection was open. Under polling load that amplified lock waits
+    and subprocess thread growth. Keep the read endpoint pure; repair labels in a
+    debounced background task.
+    """
+    global _PANE_LABEL_REPAIR_TASK, _PANE_LABEL_REPAIR_LAST_MONOTONIC
+
+    candidates = [
+        {"id": c.get("id"), "tmux_pane": c.get("tmux_pane")}
+        for c in candidates
+        if c.get("id") and c.get("tmux_pane")
+    ][:20]
+    if not candidates:
+        return
+    if _PANE_LABEL_REPAIR_TASK and not _PANE_LABEL_REPAIR_TASK.done():
+        return
+    now = time.monotonic()
+    if now - _PANE_LABEL_REPAIR_LAST_MONOTONIC < _PANE_LABEL_REPAIR_MIN_INTERVAL_SECONDS:
+        return
+    _PANE_LABEL_REPAIR_LAST_MONOTONIC = now
+    _PANE_LABEL_REPAIR_TASK = asyncio.create_task(_repair_missing_pane_labels(candidates))
+
+
+async def _repair_missing_pane_labels(candidates: list[dict]) -> None:
+    for candidate in candidates:
+        instance_id = candidate["id"]
+        tmux_pane = candidate["tmux_pane"]
+        try:
+            pane_label = await _tmux_pane_label(tmux_pane)
+            if not pane_label:
+                continue
+            async with aiosqlite.connect(DB_PATH) as db:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"pane_label": pane_label},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="background-pane-label-repair",
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.debug(f"Pane label background repair failed for {tmux_pane}: {exc}")
+
+
+def _golden_throne_surface(tab_name: str, tmux_pane: str | None, pane_label: str | None) -> str:
+    if pane_label and tmux_pane:
+        return f"{pane_label} ({tmux_pane})"
+    if pane_label:
+        return pane_label
+    if tmux_pane:
+        return tmux_pane
+    return tab_name
+
+
+def _golden_throne_human_surface(
+    tab_name: str, tmux_pane: str | None, pane_label: str | None
+) -> str:
+    """Human-spoken pane name: '<position> <name>' when both are available."""
+    return _format_human_pane_surface(tab_name, tmux_pane, pane_label)
+
+
+def _is_meaningful_tab_name(tab_name: str | None) -> bool:
+    """True if tab_name has been set to something more useful than the default."""
+    return _is_meaningful_surface_name(tab_name)
+
+
+def _golden_throne_tts_text(tab_name: str | None, human_pane_surface: str) -> str:
+    """Spoken GT resume notification body; surface already includes name when available."""
+    return f"Golden Throne resuming {human_pane_surface}"
+
+
+def _golden_throne_banner_text(tab_name: str | None, human_pane_surface: str) -> str:
+    """On-screen GT resume banner; surface already includes name when available."""
+    return f"GT resume: {human_pane_surface}"
 
 
 async def _get_or_create_backrooms_pane() -> str:
@@ -3512,8 +5048,11 @@ async def _get_or_create_backrooms_pane() -> str:
             logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
             return pane_id
         # split failed (too many panes?) — fall through to use first existing
+        pane_id = stdout.decode().strip().split("\n")[0]
+        if not pane_id:
+            raise RuntimeError("backrooms pane lookup returned empty pane id")
         logger.warning("Golden Throne: split-window failed, reusing existing backrooms pane")
-        return stdout.decode().strip().split("\n")[0]
+        return pane_id
 
     # Create backrooms window (detached so it doesn't steal focus)
     proc = await asyncio.create_subprocess_exec(
@@ -3527,7 +5066,11 @@ async def _get_or_create_backrooms_pane() -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await asyncio.wait_for(proc.communicate(), timeout=5)
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"failed to create backrooms window: {stderr.decode(errors='replace').strip()}"
+        )
 
     # Tag it and get the pane ID
     proc = await asyncio.create_subprocess_exec(
@@ -3541,7 +5084,11 @@ async def _get_or_create_backrooms_pane() -> str:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode != 0:
+        raise RuntimeError("failed to list backrooms panes after window creation")
     pane_id = stdout.decode().strip().split("\n")[0]
+    if not pane_id:
+        raise RuntimeError("backrooms window created without a pane id")
 
     # Tag pane type
     await asyncio.create_subprocess_exec(
@@ -3555,6 +5102,14 @@ async def _get_or_create_backrooms_pane() -> str:
     )
     logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
     return pane_id
+
+
+async def _log_golden_throne_dispatch_failed(session_id: str, details: dict) -> None:
+    await log_event("golden_throne_dispatch_failed", instance_id=session_id, details=details)
+    logger.error(
+        "Golden Throne: dispatch failed for "
+        f"{session_id[:12]} transport={details.get('transport')} rc={details.get('returncode')}"
+    )
 
 
 async def golden_throne_followup(session_id: str):
@@ -3581,6 +5136,23 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
+    quiet_hours = shared.get_quiet_hours_status()
+    if quiet_hours.get("active"):
+        rescheduled = await schedule_golden_throne_followup(
+            instance,
+            reason="quiet-hours-deferred-dispatch",
+        )
+        await log_event(
+            "golden_throne_dispatch_suppressed_quiet_hours",
+            instance_id=session_id,
+            details={"quiet_hours": quiet_hours, "rescheduled": rescheduled},
+        )
+        logger.info(
+            f"Golden Throne: suppressed dispatch for {session_id[:12]} during quiet hours; "
+            f"rescheduled={rescheduled.get('scheduled')}"
+        )
+        return
+
     # SOP selection: custom per-instance override, then default.
     # (Sync retrigger path removed — sync instances now self-evaluate via StopValidate.)
     instance_type = instance.get("instance_type", "one_off")
@@ -3598,40 +5170,32 @@ async def golden_throne_followup(session_id: str):
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
-
-    # Phone notification before satellite dispatch (skip for sync — silent retrigger)
-    if instance_type != "sync":
-        await create_expected_ack(
-            source="golden_throne",
-            instance_id=session_id,
-            reason=f"Golden Throne follow-up for {tab_name}",
-            details={
-                "zealotry": instance.get("zealotry", 4),
-                "tab_name": tab_name,
-                "tmux_pane": tmux_pane,
-            },
-        )
-        zealotry = instance.get("zealotry") or 4
-        vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
-        try:
-            await asyncio.to_thread(
-                _send_to_phone,
-                "/notify",
-                {
-                    "vibe": vibe_intensity,
-                    "tts_text": "Golden Throne resuming work",
-                    "banner_text": f"Resuming: {tab_name}",
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
+    engine = _agent_engine(instance)
+    pane_label = await _tmux_pane_label(tmux_pane)
+    pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
+    human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    instance["pane_label"] = pane_label
+    instance["pane_surface"] = pane_surface
+    instance["human_pane_surface"] = human_pane_surface
 
     # Dispatch: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
+    followup_id = str(uuid.uuid4())
+    dispatch_details = {
+        "followup_id": followup_id,
+        "pane": tmux_pane,
+        "engine": engine,
+        "transport": "unknown",
+        "target_pane": tmux_pane,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "tmux_pane_exists": False,
+        "device_id": device_id,
+    }
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
         # Local delivery — transport detection per Golden Throne spec:
         # Check pane_current_command to decide send-keys vs claude --resume
-        transport = "unknown"
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -3643,18 +5207,22 @@ async def golden_throne_followup(session_id: str):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             current_cmd = stdout.decode().strip() if proc.returncode == 0 else ""
-        except Exception:
+            dispatch_details["pane_current_command_returncode"] = proc.returncode
+            dispatch_details["pane_current_command_stdout"] = _snippet(stdout)
+            dispatch_details["pane_current_command_stderr"] = _snippet(stderr)
+        except Exception as exc:
             current_cmd = ""
+            dispatch_details["pane_current_command_error"] = str(exc)
 
-        # On Mac, pane_current_command shows version string (e.g. "2.1.88") not "claude"
-        cmd_is_claude = current_cmd and (
-            "claude" in current_cmd.lower()
-            or (current_cmd[0:1].isdigit() and "." in current_cmd)  # version string like "2.1.88"
-        )
-        if cmd_is_claude:
-            # Claude alive in pane — inject via claude-cmd send-keys.
+        agent_alive = _agent_is_alive_command(
+            engine, current_cmd
+        ) or await _tmux_pane_has_agent_process(tmux_pane, engine)
+        dispatch_details["agent_alive"] = agent_alive
+
+        if agent_alive:
+            # Agent alive in pane — queue a guarded pane write.
             # send-keys can only reliably deliver short single-line prompts.
             # For long/multi-line SOPs, write to file and send a short read command.
             MAX_SENDKEYS_LEN = 200
@@ -3667,54 +5235,103 @@ async def golden_throne_followup(session_id: str):
                     f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
                 )
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "claude-cmd",
-                    "--pane",
-                    tmux_pane,
-                    inject_prompt,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                queued = await enqueue_pane_write(
+                    instance_id=session_id,
+                    tmux_pane=tmux_pane,
+                    source="golden_throne",
+                    purpose="followup",
+                    payload=inject_prompt,
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-                if proc.returncode == 0:
-                    transport = "send-keys"
+                queue_results = await process_pane_write_queue_once(queued["id"])
+                queue_result = queue_results[0] if queue_results else queued
+                dispatch_details.update(
+                    {
+                        "transport": "send-keys",
+                        "target_pane": tmux_pane,
+                        "returncode": queue_result.get("returncode"),
+                        "stdout": queue_result.get("stdout", ""),
+                        "stderr": queue_result.get("stderr", ""),
+                        "queue_id": queued["id"],
+                        "queue_status": queue_result.get("status"),
+                        "defer_reason": queue_result.get("reason"),
+                        "tmux_pane_exists": await _tmux_pane_exists(tmux_pane),
+                    }
+                )
+                if queue_result.get("status") == PANE_WRITE_SENT:
                     logger.info(
-                        f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys pane={tmux_pane}"
+                        f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys "
+                        f"engine={engine} pane={tmux_pane}"
+                    )
+                elif queue_result.get("reason") == "dispatch_deferred":
+                    logger.info(
+                        f"Golden Throne: follow-up deferred for {session_id[:12]} "
+                        f"because pane has pending user input"
                     )
                 else:
                     logger.error(
-                        f"Golden Throne: claude-cmd failed for {session_id[:12]}: {stderr.decode()[:200]}"
+                        f"Golden Throne: queued send failed for {session_id[:12]}: "
+                        f"{queue_result.get('stderr') or queue_result.get('error')}"
                     )
             except Exception as e:
+                dispatch_details.update(
+                    {
+                        "transport": "send-keys",
+                        "target_pane": tmux_pane,
+                        "error": str(e),
+                        "tmux_pane_exists": await _tmux_pane_exists(tmux_pane),
+                    }
+                )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Claude not running — resume in backrooms with SOP prompt
+            # Agent not running — resume in backrooms with SOP prompt
             try:
                 backrooms_pane = await _get_or_create_backrooms_pane()
                 # Write SOP to temp file (avoids shell escaping issues)
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                resume_cmd = (
-                    f'cd {working_dir} && claude -p "$(cat {sop_file})" '
-                    f"--resume {session_id} --dangerously-skip-permissions"
+                resume_cmd = _agent_resume_command(engine, session_id, working_dir, sop_file)
+                queued = await enqueue_pane_write(
+                    instance_id=session_id,
+                    tmux_pane=backrooms_pane,
+                    source="golden_throne",
+                    purpose="followup",
+                    payload=resume_cmd,
                 )
-                proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "send-keys",
-                    "-t",
-                    backrooms_pane,
-                    resume_cmd,
-                    "Enter",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                queue_results = await process_pane_write_queue_once(queued["id"])
+                queue_result = queue_results[0] if queue_results else queued
+                dispatch_details.update(
+                    {
+                        "transport": "resume",
+                        "target_pane": backrooms_pane,
+                        "backrooms_pane": backrooms_pane,
+                        "resume_command": resume_cmd,
+                        "returncode": queue_result.get("returncode"),
+                        "stdout": queue_result.get("stdout", ""),
+                        "stderr": queue_result.get("stderr", ""),
+                        "queue_id": queued["id"],
+                        "queue_status": queue_result.get("status"),
+                        "defer_reason": queue_result.get("reason"),
+                        "tmux_pane_exists": await _tmux_pane_exists(backrooms_pane),
+                    }
                 )
-                await asyncio.wait_for(proc.communicate(), timeout=10)
-                transport = "resume"
-                logger.info(
-                    f"Golden Throne: resumed {session_id[:12]} in backrooms "
-                    f"pane={backrooms_pane} via claude --resume"
-                )
+                if queue_result.get("status") == PANE_WRITE_SENT:
+                    logger.info(
+                        f"Golden Throne: resumed {session_id[:12]} in backrooms "
+                        f"pane={backrooms_pane} via {engine} resume"
+                    )
+                elif queue_result.get("reason") == "dispatch_deferred":
+                    logger.info(
+                        f"Golden Throne: resume deferred for {session_id[:12]} "
+                        f"because pane has pending user input"
+                    )
             except Exception as e:
+                dispatch_details.update(
+                    {
+                        "transport": "resume",
+                        "error": str(e),
+                        "tmux_pane_exists": False,
+                    }
+                )
                 logger.error(f"Golden Throne: resume failed for {session_id[:12]}: {e}")
     else:
         # Remote delivery via satellite
@@ -3727,20 +5344,134 @@ async def golden_throne_followup(session_id: str):
                         "tmux_pane": tmux_pane,
                         "working_dir": working_dir,
                         "prompt": sop_prompt,
+                        "engine": engine,
                     },
                 )
-                result = resp.json()
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = {"raw_body": resp.text[:500]}
+                remote_success = resp.status_code < 400 and result.get("success") is True
+                dispatch_details.update(
+                    {
+                        "transport": result.get("transport", "satellite"),
+                        "target_pane": result.get("pane") or result.get("target_pane") or tmux_pane,
+                        "returncode": 0 if remote_success else 1,
+                        "stdout": _snippet(result),
+                        "stderr": "" if resp.status_code < 400 else _snippet(resp.text),
+                        "tmux_pane_exists": remote_success,
+                        "defer_reason": result.get("reason")
+                        if result.get("status") == "deferred"
+                        else None,
+                        "satellite_status_code": resp.status_code,
+                        "satellite_result": result,
+                    }
+                )
                 logger.info(
                     f"Golden Throne: follow-up dispatched for {session_id[:12]} "
                     f"via {result.get('transport', '?')}"
                 )
         except Exception as e:
+            dispatch_details.update(
+                {
+                    "transport": "satellite",
+                    "error": str(e),
+                    "tmux_pane_exists": False,
+                }
+            )
             logger.error(f"Golden Throne: satellite dispatch failed for {session_id[:12]}: {e}")
+
+    dispatch_ok = (
+        dispatch_details.get("returncode") == 0
+        and bool(dispatch_details.get("target_pane"))
+        and bool(dispatch_details.get("tmux_pane_exists"))
+    )
+    if dispatch_details.get("defer_reason") == "dispatch_deferred":
+        if dispatch_details.get("queue_id"):
+            try:
+                await _mark_pane_write(
+                    dispatch_details["queue_id"],
+                    status=PANE_WRITE_CANCELLED,
+                    result={
+                        "status": PANE_WRITE_CANCELLED,
+                        "reason": "dispatch_deferred_rescheduled",
+                        "reschedule_source": "golden_throne",
+                    },
+                    error="dispatch_deferred_rescheduled",
+                )
+            except Exception as exc:
+                dispatch_details["queue_cancel_error"] = str(exc)
+        try:
+            rescheduled = await schedule_golden_throne_followup(
+                instance,
+                reason="dispatch-deferred",
+            )
+            dispatch_details["rescheduled"] = rescheduled
+        except Exception as exc:
+            dispatch_details["reschedule_error"] = str(exc)
+            logger.warning(
+                f"Golden Throne: failed to reschedule deferred dispatch "
+                f"for {session_id[:12]}: {exc}"
+            )
+        await log_event(
+            "golden_throne_dispatch_deferred",
+            instance_id=session_id,
+            details=dispatch_details,
+        )
+        return
+    if not dispatch_ok:
+        await _log_golden_throne_dispatch_failed(session_id, dispatch_details)
+        return
+
+    resume_state = await record_golden_throne_resume(instance)
+    dispatch_details["resume_state"] = resume_state
+    await log_event(
+        "golden_throne_dispatch_validated",
+        instance_id=session_id,
+        details=dispatch_details,
+    )
+
+    phone_result = None
+    if instance_type != "sync":
+        zealotry = instance.get("zealotry") or 4
+        vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
+        try:
+            phone_result = await asyncio.to_thread(
+                _send_to_phone,
+                "/notify",
+                {
+                    "vibe": vibe_intensity,
+                    "tts_text": _golden_throne_tts_text(tab_name, human_pane_surface),
+                    "banner_text": _golden_throne_banner_text(tab_name, human_pane_surface),
+                },
+            )
+        except Exception as e:
+            phone_result = {"success": False, "error": str(e)}
+            logger.warning(f"Golden Throne: phone notify failed for {session_id[:12]}: {e}")
+        await log_event(
+            "golden_throne_resume_notify",
+            instance_id=session_id,
+            details={
+                "followup_id": followup_id,
+                "phone_result": phone_result,
+                "pane_surface": pane_surface,
+                "human_pane_surface": human_pane_surface,
+                "resume_count": resume_state["resume_count"],
+            },
+        )
 
     await log_event(
         "golden_throne_followup",
         instance_id=session_id,
-        details={"zealotry": instance.get("zealotry", 4)},
+        details={
+            "zealotry": instance.get("zealotry", 4),
+            "engine": engine,
+            "resume_count": resume_state["resume_count"],
+            "enforced": resume_state["enforced"],
+            "followup_id": followup_id,
+            "dispatch_ack": dispatch_details,
+            "phone_result": phone_result,
+        },
     )
 
 
@@ -3844,6 +5575,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
 
 _CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
 _custodes_state_debounce: dict[str, dict] = {}
+_CUSTODES_CANCEL_REASON = "intervention_canceled_by_negative_edge"
 
 
 async def _custodes_state_snapshot() -> dict:
@@ -3856,8 +5588,22 @@ async def _custodes_state_snapshot() -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM events "
-                "WHERE event_type='enforcement_cascade_start' "
-                "AND created_at > date('now', 'start of day')"
+                "WHERE created_at > date('now', 'start of day') "
+                "AND ("
+                "  (event_type='custodes_state_event' "
+                "   AND json_extract(details, '$.event_type')='enforcement_cascade_started') "
+                "  OR (event_type='enforcement_cascade_start' "
+                "      AND NOT EXISTS ("
+                "        SELECT 1 FROM events paired "
+                "        WHERE paired.event_type='custodes_state_event' "
+                "          AND json_extract(paired.details, '$.event_type')='enforcement_cascade_started' "
+                "          AND paired.created_at > date('now', 'start of day') "
+                "          AND paired.created_at BETWEEN datetime(events.created_at, '-5 seconds') "
+                "                                  AND datetime(events.created_at, '+5 seconds') "
+                "          AND COALESCE(json_extract(paired.details, '$.payload.app'), '') = "
+                "              COALESCE(json_extract(events.details, '$.app'), '')"
+                "      ))"
+                ")"
             )
             row = await cursor.fetchone()
             if row:
@@ -3946,10 +5692,76 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
     return False, "not_duplicate"
 
 
+async def _custodes_intervention_negative_edge_cancel_result(
+    event: StateEvent,
+    intervention,
+    *,
+    stage: str,
+) -> dict | None:
+    """Cancel stale intervention delivery after a compliance/negative-edge signal.
+
+    State events can be generated before an app close / ack resolution, then sit
+    behind tmux/CLI dispatch work. Re-read the authoritative state immediately
+    before delivery so a queued Custodes intervention cannot fire after the user
+    has complied.
+    """
+    payload = event.payload or {}
+    cancel_details: dict | None = None
+
+    if event.event_type == "expected_ack_escalated" and payload.get("ack_id"):
+        ack = await _find_expected_ack(str(payload["ack_id"]), None, None)
+        if not ack:
+            cancel_details = {
+                "reason": "ack_missing",
+                "ack_id": payload.get("ack_id"),
+            }
+        elif ack.get("status") != EXPECTED_ACK_PENDING:
+            cancel_details = {
+                "reason": "ack_not_pending",
+                "ack_id": ack.get("id"),
+                "ack_status": ack.get("status"),
+                "ack_source": ack.get("source"),
+                "ack_instance_id": ack.get("instance_id"),
+            }
+
+    if cancel_details is None:
+        return None
+
+    details = {
+        **cancel_details,
+        "stage": stage,
+        "event_type": event.event_type,
+        "source": event.source,
+        "severity": intervention.severity,
+        "dedupe_key": intervention.dedupe_key,
+        "payload": payload,
+    }
+    await log_event(
+        _CUSTODES_CANCEL_REASON,
+        instance_id=event.instance_id,
+        device_id=event.source,
+        details=details,
+    )
+    return {
+        "dispatched": False,
+        "reason": _CUSTODES_CANCEL_REASON,
+        "canceled": True,
+        "cancel_details": details,
+    }
+
+
 async def _inject_custodes_prompt_to_pane(
-    prompt: str, tmux_pane: str, *, instance_id: str | None = None
+    prompt: str,
+    tmux_pane: str,
+    *,
+    instance_id: str | None = None,
+    cancel_check=None,
 ) -> dict:
     """Inject a Custodes prompt into a known tmux pane."""
+    if cancel_check:
+        canceled = await cancel_check("pre_pane_inject")
+        if canceled:
+            return canceled
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
@@ -4041,7 +5853,7 @@ async def _find_custodes_tmux_pane() -> str | None:
 
 
 async def _create_custodes_legion_pane() -> str | None:
-    """Create or split the local legion window and return a pane id."""
+    """Create or return the fixed Custodes pane in the local legion window."""
     try:
         exists = await asyncio.create_subprocess_exec(
             "tmux",
@@ -4057,18 +5869,58 @@ async def _create_custodes_legion_pane() -> str | None:
         windows = stdout.decode().splitlines() if exists.returncode == 0 else []
 
         if "legion" in windows:
-            proc = await asyncio.create_subprocess_exec(
+            list_proc = await asyncio.create_subprocess_exec(
                 "tmux",
-                "split-window",
+                "list-panes",
                 "-t",
                 "main:legion",
-                "-d",
-                "-P",
                 "-F",
-                "#{pane_id}",
+                "#{pane_id}\t#{@PANE_ID}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            pane_stdout, pane_stderr = await asyncio.wait_for(list_proc.communicate(), timeout=5)
+            if list_proc.returncode != 0:
+                logger.warning(
+                    f"Custodes state hook: could not inspect legion panes: {pane_stderr.decode()[:200]}"
+                )
+                return None
+            first_pane = ""
+            for line in pane_stdout.decode().splitlines():
+                try:
+                    pane_id, pane_role = line.split("\t", 1)
+                except ValueError:
+                    continue
+                first_pane = first_pane or pane_id
+                if pane_role == "legion:custodes":
+                    return pane_id
+            if first_pane:
+                tag_proc = await asyncio.create_subprocess_exec(
+                    "tmux",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    first_pane,
+                    "@PANE_ID",
+                    "legion:custodes",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(tag_proc.communicate(), timeout=5)
+                type_proc = await asyncio.create_subprocess_exec(
+                    "tmux",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    first_pane,
+                    "@PANE_TYPE",
+                    "legion",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(type_proc.communicate(), timeout=5)
+                return first_pane
+            return None
         else:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -4092,26 +5944,45 @@ async def _create_custodes_legion_pane() -> str | None:
             return None
         pane_id = pane_stdout.decode().strip().splitlines()[0]
 
-        await asyncio.create_subprocess_exec(
+        tag_proc = await asyncio.create_subprocess_exec(
             "tmux",
-            "select-layout",
+            "set-option",
+            "-p",
             "-t",
-            "main:legion",
-            "tiled",
+            pane_id,
+            "@PANE_ID",
+            "legion:custodes",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        await asyncio.wait_for(tag_proc.communicate(), timeout=5)
+        type_proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@PANE_TYPE",
+            "legion",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(type_proc.communicate(), timeout=5)
         return pane_id
     except Exception as exc:
         logger.warning(f"Custodes state hook: legion pane creation failed: {exc}")
         return None
 
 
-async def _launch_custodes_for_intervention(prompt: str) -> dict:
+async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -> dict:
     """Launch a new Custodes singleton carrying the missed state-hook prompt."""
     pane_id = await _create_custodes_legion_pane()
     if not pane_id:
         return {"dispatched": False, "reason": "custodes_launch_no_pane"}
+    if cancel_check:
+        canceled = await cancel_check("pre_launch_prompt")
+        if canceled:
+            return canceled
 
     prompt_file = Path(tempfile.gettempdir()) / f"custodes-state-hook-{uuid.uuid4().hex}.md"
     launch_prompt = (
@@ -4151,8 +6022,59 @@ async def _launch_custodes_for_intervention(prompt: str) -> dict:
     return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": pane_id}
 
 
-async def _dispatch_custodes_intervention(prompt: str) -> dict:
+async def _inject_custodes_prompt_to_pane_maybe_cancel(
+    prompt: str,
+    tmux_pane: str,
+    *,
+    instance_id: str | None = None,
+    cancel_check=None,
+) -> dict:
+    inject = _inject_custodes_prompt_to_pane
+    try:
+        supports_cancel_check = "cancel_check" in inspect.signature(inject).parameters
+    except (TypeError, ValueError):
+        supports_cancel_check = False
+    if supports_cancel_check:
+        return await inject(
+            prompt,
+            tmux_pane,
+            instance_id=instance_id,
+            cancel_check=cancel_check,
+        )
+
+    if cancel_check:
+        canceled = await cancel_check("pre_pane_inject")
+        if canceled:
+            return canceled
+    return await inject(prompt, tmux_pane, instance_id=instance_id)
+
+
+async def _launch_custodes_for_intervention_maybe_cancel(
+    prompt: str,
+    *,
+    cancel_check=None,
+) -> dict:
+    launch = _launch_custodes_for_intervention
+    try:
+        supports_cancel_check = "cancel_check" in inspect.signature(launch).parameters
+    except (TypeError, ValueError):
+        supports_cancel_check = False
+    if supports_cancel_check:
+        return await launch(prompt, cancel_check=cancel_check)
+
+    if cancel_check:
+        canceled = await cancel_check("pre_launch_prompt")
+        if canceled:
+            return canceled
+    return await launch(prompt)
+
+
+async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> dict:
     """Inject into Custodes, recovering or launching the singleton if needed."""
+    if cancel_check:
+        canceled = await cancel_check("pre_dispatch_lookup")
+        if canceled:
+            return canceled
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -4172,12 +6094,19 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
             logger.warning(
                 f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}"
             )
-            delivery = await _inject_custodes_prompt_to_pane(prompt, recovered_pane)
+            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
+                prompt,
+                recovered_pane,
+                cancel_check=cancel_check,
+            )
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
             return delivery
         logger.warning("Custodes state hook: no live singleton found; launching new Custodes")
-        return await _launch_custodes_for_intervention(prompt)
+        return await _launch_custodes_for_intervention_maybe_cancel(
+            prompt,
+            cancel_check=cancel_check,
+        )
 
     instance = dict(row)
     tmux_pane = instance.get("tmux_pane")
@@ -4187,8 +6116,11 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
             logger.warning(
                 f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}"
             )
-            delivery = await _inject_custodes_prompt_to_pane(
-                prompt, recovered_pane, instance_id=instance["id"]
+            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
+                prompt,
+                recovered_pane,
+                instance_id=instance["id"],
+                cancel_check=cancel_check,
             )
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
@@ -4196,7 +6128,10 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
         logger.warning(
             f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement"
         )
-        return await _launch_custodes_for_intervention(prompt)
+        return await _launch_custodes_for_intervention_maybe_cancel(
+            prompt,
+            cancel_check=cancel_check,
+        )
 
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     if device_id != LOCAL_DEVICE_NAME:
@@ -4205,8 +6140,11 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
             logger.warning(
                 f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}"
             )
-            delivery = await _inject_custodes_prompt_to_pane(
-                prompt, recovered_pane, instance_id=instance["id"]
+            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
+                prompt,
+                recovered_pane,
+                instance_id=instance["id"],
+                cancel_check=cancel_check,
             )
             if delivery.get("dispatched"):
                 delivery["reason"] = "recovered_tmux_pane"
@@ -4214,9 +6152,38 @@ async def _dispatch_custodes_intervention(prompt: str) -> dict:
         logger.warning(
             f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement"
         )
-        return await _launch_custodes_for_intervention(prompt)
+        return await _launch_custodes_for_intervention_maybe_cancel(
+            prompt,
+            cancel_check=cancel_check,
+        )
 
-    return await _inject_custodes_prompt_to_pane(prompt, tmux_pane, instance_id=instance["id"])
+    return await _inject_custodes_prompt_to_pane_maybe_cancel(
+        prompt,
+        tmux_pane,
+        instance_id=instance["id"],
+        cancel_check=cancel_check,
+    )
+
+
+async def _dispatch_custodes_intervention_maybe_cancel(prompt: str, cancel_check) -> dict:
+    """Call the intervention dispatcher with cancellation when supported.
+
+    Tests often monkeypatch `_dispatch_custodes_intervention` with a one-arg
+    fake; keep that supported while the production dispatcher receives the
+    dispatch-time negative-edge guard.
+    """
+    dispatch = _dispatch_custodes_intervention
+    try:
+        supports_cancel_check = "cancel_check" in inspect.signature(dispatch).parameters
+    except (TypeError, ValueError):
+        supports_cancel_check = False
+    if supports_cancel_check:
+        return await dispatch(prompt, cancel_check=cancel_check)
+
+    canceled = await cancel_check("pre_dispatch")
+    if canceled:
+        return canceled
+    return await dispatch(prompt)
 
 
 async def handle_custodes_state_event(
@@ -4307,7 +6274,25 @@ async def handle_custodes_state_event(
             "reason": dedupe_reason,
         }
 
-    delivery = await _dispatch_custodes_intervention(intervention.prompt)
+    async def cancel_check(stage: str) -> dict | None:
+        return await _custodes_intervention_negative_edge_cancel_result(
+            event,
+            intervention,
+            stage=stage,
+        )
+
+    delivery = await _dispatch_custodes_intervention_maybe_cancel(
+        intervention.prompt,
+        cancel_check,
+    )
+    if delivery.get("canceled"):
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "dedupe_key": intervention.dedupe_key,
+            "reason": delivery.get("reason", _CUSTODES_CANCEL_REASON),
+            "cancel_details": delivery.get("cancel_details"),
+        }
     if delivery.get("dispatched"):
         _custodes_state_debounce[intervention.dedupe_key] = {
             "at": time.time(),
@@ -4591,13 +6576,21 @@ async def declare_victory(instance_id: str, request: Request):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
         tab_name = row["tab_name"] or instance_id[:12]
+        victory_surface = tab_name if _is_meaningful_tab_name(tab_name) else instance_id[:12]
         session_doc_id = row["session_doc_id"]
 
         # DB write (existing behavior)
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"victory_at": now, "victory_reason": reason, "instance_type": "one_off"},
+            updates={
+                "victory_at": now,
+                "victory_reason": reason,
+                "instance_type": "one_off",
+                "gt_resume_count": 0,
+                "gt_resume_window_started_at": None,
+                "gt_last_resume_at": None,
+            },
             mutation_type="instance_updated",
             write_source="api",
             actor="victory",
@@ -4648,8 +6641,14 @@ async def declare_victory(instance_id: str, request: Request):
 
     # Discord notification
     try:
-        subprocess.run(
-            ["discord", "send", "fleet", f"⚔️ **IMPERIUM VICTORIOUS** — {tab_name}\n> {reason}"],
+        await asyncio.to_thread(
+            subprocess.run,
+            [
+                "discord",
+                "send",
+                "fleet",
+                f"⚔️ **IMPERIUM VICTORIOUS** — {victory_surface}\n> {reason}",
+            ],
             timeout=10,
             capture_output=True,
         )
@@ -4752,6 +6751,17 @@ async def set_instance_type(instance_id: str, request: Request):
             scheduler.remove_job(f"sync-retrigger-{instance_id}")
         except Exception:
             pass
+    elif new_type == "golden_throne":
+        refreshed = dict(instance)
+        refreshed.update(updates)
+        if refreshed.get("status") in ("idle", "stopped") and not refreshed.get("victory_at"):
+            try:
+                await schedule_golden_throne_followup(refreshed, reason="instance-type")
+            except Exception as exc:
+                logger.warning(
+                    f"Golden Throne: failed to schedule after type change "
+                    f"for {instance_id[:12]}: {exc}"
+                )
 
     await log_event(
         "instance_type_changed",
@@ -4889,9 +6899,18 @@ async def pedal_left():
         return {"action": "waiting", "reason": "first_tap"}
 
 
+_INSTANCES_READ_CACHE: dict[tuple[str, str, int], tuple[float, list[dict]]] = {}
+_INSTANCES_READ_CACHE_LOCK = asyncio.Lock()
+_INSTANCES_READ_CACHE_TTL_SECONDS = 0.5
+
+
 @app.get("/api/instances", response_model=list[dict])
-async def list_instances(status: str | None = None, sort: str | None = None):
-    """List all instances, optionally filtered by status and sorted."""
+async def list_instances(
+    status: str | None = None,
+    sort: str | None = None,
+    limit: int = 300,
+):
+    """List instances, optionally filtered by status and sorted."""
     order_clauses = {
         "status": "status ASC, last_activity DESC",
         "recent_activity": "last_activity DESC",
@@ -4899,19 +6918,37 @@ async def list_instances(status: str | None = None, sort: str | None = None):
         "created": "registered_at DESC",
     }
     order_by = order_clauses.get(sort, "registered_at DESC")
+    limit = max(1, min(int(limit or 300), 1000))
+    cache_key = (status or "", sort or "", limit)
+    cache_hit = _INSTANCES_READ_CACHE.get(cache_key)
+    now_mono = time.monotonic()
+    if cache_hit and now_mono - cache_hit[0] <= _INSTANCES_READ_CACHE_TTL_SECONDS:
+        return cache_hit[1]
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with _INSTANCES_READ_CACHE_LOCK:
+        cache_hit = _INSTANCES_READ_CACHE.get(cache_key)
+        now_mono = time.monotonic()
+        if cache_hit and now_mono - cache_hit[0] <= _INSTANCES_READ_CACHE_TTL_SECONDS:
+            return cache_hit[1]
 
-        if status:
-            cursor = await db.execute(
-                f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by}", (status,)
-            )
-        else:
-            cursor = await db.execute(f"SELECT * FROM claude_instances ORDER BY {order_by}")
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
 
-        rows = await cursor.fetchall()
+            if status:
+                cursor = await db.execute(
+                    f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by} LIMIT ?",
+                    (status, limit),
+                )
+            else:
+                cursor = await db.execute(
+                    f"SELECT * FROM claude_instances ORDER BY {order_by} LIMIT ?",
+                    (limit,),
+                )
+
+            rows = await cursor.fetchall()
+
         instances = []
+        pane_label_repair_candidates = []
         for row in rows:
             inst = dict(row)
             # voice_chat derived from tts_mode column (DB-authoritative)
@@ -4938,8 +6975,20 @@ async def list_instances(status: str | None = None, sort: str | None = None):
             inst["gt_next_fire"] = (
                 gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
             )
+            if (
+                not inst.get("pane_label")
+                and inst.get("status") != "stopped"
+                and inst.get("device_id") == LOCAL_DEVICE_NAME
+                and inst.get("tmux_pane")
+            ):
+                pane_label_repair_candidates.append(
+                    {"id": inst["id"], "tmux_pane": inst.get("tmux_pane")}
+                )
 
             instances.append(inst)
+
+        _schedule_pane_label_repair(pane_label_repair_candidates)
+        _INSTANCES_READ_CACHE[cache_key] = (time.monotonic(), instances)
         return instances
 
 
@@ -5183,6 +7232,162 @@ async def pane_session_doc(tmux_pane: str):
             "title": row["title"],
             "project": row["project"],
         }
+
+
+@app.get("/api/panes/{tmux_pane}/instance")
+async def pane_instance(tmux_pane: str):
+    """Resolve the most recent active instance bound to a tmux pane."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT *
+               FROM claude_instances
+               WHERE tmux_pane = ? AND status != 'stopped'
+               ORDER BY last_activity DESC
+               LIMIT 1""",
+            (tmux_pane,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"No active instance for pane {tmux_pane}")
+
+    inst = dict(row)
+    gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
+    inst["gt_next_fire"] = (
+        gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
+    )
+    return inst
+
+
+@app.get("/api/orchestrator/pane_truth")
+async def orchestrator_pane_truth():
+    """Merged tmux↔DB pane truth for the orchestrator.
+
+    Joins live ``tmux list-panes -a`` against ``claude_instances`` (active or
+    pane-resident) and ``session_documents``. Drift flags are computed live —
+    independent of whether the reconciler has run yet.
+
+    Anti-archaeology: one query, one answer. No caller writes its own join.
+    """
+    panes = await _read_tmux_panes()
+    if panes is None:
+        panes = {}
+    pane_ids_in_tmux = set(panes.keys())
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT ci.id AS instance_id, ci.tmux_pane, ci.pane_label, ci.tab_name,
+                      ci.status, ci.last_activity, ci.engine, ci.legion,
+                      ci.session_doc_id, ci.workflow_state, ci.workflow_blocked_reason,
+                      sd.file_path AS session_doc_path,
+                      sd.title AS session_doc_title
+               FROM claude_instances ci
+               LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+               WHERE ci.status IN ('processing', 'idle', 'active')
+                  OR (ci.tmux_pane IS NOT NULL AND ci.tmux_pane != '')
+               ORDER BY ci.last_activity DESC"""
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+    # Filter rows: keep active rows OR rows whose tmux_pane is currently live.
+    # (A stopped row whose pane never existed in tmux is noise.)
+    filtered: list[dict] = []
+    for row in rows:
+        if row.get("status") in ("processing", "idle", "active"):
+            filtered.append(row)
+            continue
+        if row.get("tmux_pane") and row["tmux_pane"] in pane_ids_in_tmux:
+            filtered.append(row)
+
+    # Identify duplicate-pane owners for the superseded_duplicate flag.
+    by_pane: dict[str, list[dict]] = {}
+    for row in filtered:
+        tp = row.get("tmux_pane")
+        if tp:
+            by_pane.setdefault(tp, []).append(row)
+    duplicate_pane_ids: set[str] = set()
+    superseded_row_ids: set[str] = set()
+    for tp, group in by_pane.items():
+        if len(group) <= 1:
+            continue
+        duplicate_pane_ids.add(tp)
+        ordered = sorted(
+            group,
+            key=lambda r: (r.get("last_activity") or "", r.get("instance_id") or ""),
+            reverse=True,
+        )
+        for losing in ordered[1:]:
+            superseded_row_ids.add(losing["instance_id"])
+
+    out: list[dict] = []
+    for row in filtered:
+        tmux_pane = row.get("tmux_pane")
+        pane_meta = panes.get(tmux_pane) if tmux_pane else None
+        # Compute drift flags. superseded_duplicate is per-row, not per-pane.
+        flags: list[str] = []
+        if row["instance_id"] in superseded_row_ids:
+            flags.append("superseded_duplicate")
+        if tmux_pane and tmux_pane not in pane_ids_in_tmux:
+            flags.append("pane_missing")
+        if pane_meta and row.get("pane_label") != pane_meta["session_window"]:
+            flags.append("pane_label_drift")
+        if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
+            flags.append("tab_name_placeholder")
+        if _tab_name_session_doc_mismatch(row.get("tab_name"), row.get("session_doc_path")):
+            flags.append("tab_name_session_doc_mismatch")
+
+        descriptive_name = _clean_tab_name(row.get("tab_name")) or None
+        is_placeholder = _is_placeholder_tab_name(row.get("tab_name"))
+
+        out.append(
+            {
+                "instance_id": row["instance_id"],
+                "tmux_pane": tmux_pane,
+                "tmux_session_window": pane_meta["session_window"] if pane_meta else None,
+                "tmux_current_command": pane_meta["current_command"] if pane_meta else None,
+                "pane_label": row.get("pane_label"),
+                "descriptive_name": None if is_placeholder else descriptive_name,
+                "is_placeholder_name": is_placeholder,
+                "session_doc_id": row.get("session_doc_id"),
+                "session_doc_path": row.get("session_doc_path"),
+                "session_doc_title": row.get("session_doc_title"),
+                "status": row.get("status"),
+                "last_activity": row.get("last_activity"),
+                "engine": row.get("engine"),
+                "legion": row.get("legion"),
+                "workflow_state": row.get("workflow_state"),
+                "workflow_blocked_reason": row.get("workflow_blocked_reason"),
+                "drift_flags": flags,
+            }
+        )
+
+    return out
+
+
+@app.post("/api/orchestrator/temp_message")
+async def orchestrator_temp_message(request: TempMessageRequest):
+    """Dispatch an ephemeral roll-call prompt to panes selected by engine/page/name."""
+    poll_id = request.idempotency_key or str(uuid.uuid4())
+    try:
+        receipts = await temp_message_service.broadcast_temp_message(
+            request.selector,
+            request.payload,
+            idempotency_key=poll_id,
+            db_path=DB_PATH,
+            queue_sender=enqueue_pane_write,
+            queue_drainer=process_pane_write_queue_once,
+        )
+    except temp_message_service.SelectorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "ok",
+        "poll_id": poll_id,
+        "selector": request.selector,
+        "target_count": len(receipts),
+        "receipts": receipts,
+    }
 
 
 # Dashboard Endpoint
@@ -5543,6 +7748,14 @@ class DailyNoteAppendRequest(BaseModel):
     section: str = ""  # optional section header; if provided, used as ## heading
 
 
+class DailyNoteCalloutRequest(BaseModel):
+    callout_id: str
+    content: str
+    title: str | None = None
+    callout_type: str = "info"
+    date: str | None = None
+
+
 @app.post("/api/daily-note/append")
 async def append_daily_note(request: DailyNoteAppendRequest):
     """Append a timestamped section to today's daily note."""
@@ -5562,6 +7775,51 @@ async def append_daily_note(request: DailyNoteAppendRequest):
         f.write(block)
 
     return {"ok": True, "date": today, "appended_chars": len(block)}
+
+
+@app.put("/api/daily-note/callout")
+async def put_daily_note_callout(request: DailyNoteCalloutRequest):
+    """Atomically replace or append a managed callout block in a daily note."""
+    if not CALLOUT_ID_RE.fullmatch(request.callout_id or ""):
+        raise HTTPException(status_code=400, detail="callout_id must match [a-z0-9_-]+")
+    if request.callout_type not in ALLOWED_CALLOUT_TYPES:
+        allowed = ", ".join(sorted(ALLOWED_CALLOUT_TYPES))
+        raise HTTPException(status_code=400, detail=f"callout_type must be one of: {allowed}")
+    if len(request.content.encode("utf-8")) > MAX_CONTENT_BYTES:
+        raise HTTPException(status_code=400, detail=f"content exceeds {MAX_CONTENT_BYTES} bytes")
+
+    date_str = request.date or datetime.now().strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    note_path = DAILY_NOTE_DIR / f"{date_str}.md"
+    if not note_path.exists():
+        raise HTTPException(status_code=404, detail=f"Daily note not found: {note_path}")
+
+    try:
+        result = await asyncio.to_thread(
+            apply_callout,
+            note_path,
+            request.callout_id,
+            request.content,
+            request.title,
+            request.callout_type,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Daily note not found: {note_path}") from None
+    except CalloutConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CalloutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "date": date_str,
+        "callout_id": request.callout_id,
+        "action": result.action,
+        "path": str(result.path),
+        "bytes_written": result.bytes_written,
+    }
 
 
 # ============ Enforcement Cascade v3 ============
@@ -5781,6 +8039,36 @@ def _backlog_distraction_still_active(ack: dict) -> bool:
         "scrolling",
         "gaming",
     )
+
+
+def _sync_activity_from_remaining_distraction_signals(now_mono_ms: int) -> bool:
+    """Recompute the activity layer after one distraction source is cleared."""
+    desktop_mode = DESKTOP_STATE.get("current_mode")
+    phone_app = (PHONE_STATE.get("current_app") or "").lower()
+    phone_mode = PHONE_DISTRACTION_APPS.get(phone_app) if PHONE_STATE.get("is_distracted") else None
+
+    if phone_mode:
+        result = timer_engine.set_activity(
+            Activity.DISTRACTION,
+            is_scrolling_gaming=phone_mode in ("scrolling", "gaming"),
+            now_mono_ms=now_mono_ms,
+        )
+        return TimerEvent.MODE_CHANGED in result.events
+
+    if desktop_mode in ("video", "scrolling", "gaming"):
+        result = timer_engine.set_activity(
+            Activity.DISTRACTION,
+            is_scrolling_gaming=desktop_mode in ("scrolling", "gaming"),
+            now_mono_ms=now_mono_ms,
+        )
+        return TimerEvent.MODE_CHANGED in result.events
+
+    result = timer_engine.set_activity(
+        Activity.WORKING,
+        is_scrolling_gaming=False,
+        now_mono_ms=now_mono_ms,
+    )
+    return TimerEvent.MODE_CHANGED in result.events
 
 
 async def maybe_create_backlog_violation_ack(
@@ -6683,6 +8971,23 @@ def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool 
 
     url = f"http://{host}:{port}/enforce"
     params = {"action": action, "app": app_name}
+    pavlok_result = None
+
+    if action != "enable":
+        # /enforce must not depend solely on the mobile MacroDroid route.
+        pavlok_result = send_pavlok_stimulus(
+            "zap",
+            30,
+            reason=f"manual_phone_enforce_{action}_{app_name}",
+            respect_cooldown=False,
+        )
+        if PHONE_STATE.get("reachable") is False:
+            return {
+                "success": bool(pavlok_result.get("success")),
+                "phone_skipped": True,
+                "reason": "phone_known_offline",
+                "pavlok": pavlok_result,
+            }
 
     try:
         response = requests.get(url, params=params, timeout=timeout)
@@ -6701,9 +9006,11 @@ def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool 
         except (ValueError, AttributeError):
             pass
         return {
-            "success": response.status_code == 200,
+            "success": response.status_code == 200
+            or bool(pavlok_result and pavlok_result.get("success")),
             "status_code": response.status_code,
             "response": response.text[:200] if response.text else None,
+            "pavlok": pavlok_result,
         }
     except requests.exceptions.Timeout:
         PHONE_STATE["reachable"] = False
@@ -6772,7 +9079,33 @@ def _send_enforce_to_phone(app_name: str, level: int) -> dict:
         k: v.format(app=app_name) if isinstance(v, str) else v
         for k, v in level_config["params"].items()
     }
-    return _send_to_phone(endpoint, params)
+    pavlok_result = None
+    if endpoint == "/enforce":
+        # Any mobile /enforce path must also have a server-side Pavlok path.
+        # If the phone is known offline, skip the dead mobile route entirely.
+        pavlok_result = send_pavlok_stimulus(
+            "zap",
+            params.get("zap", 30),
+            reason=f"phone_enforce_level_{level}_{app_name}",
+            respect_cooldown=False,
+        )
+        if PHONE_STATE.get("reachable") is False:
+            return {
+                "success": bool(pavlok_result.get("success")),
+                "endpoint": endpoint,
+                "phone_skipped": True,
+                "reason": "phone_known_offline",
+                "pavlok": pavlok_result,
+            }
+    phone_result = _send_to_phone(endpoint, params)
+    if pavlok_result is not None:
+        return {
+            **phone_result,
+            "endpoint": endpoint,
+            "pavlok": pavlok_result,
+            "success": bool(phone_result.get("success") or pavlok_result.get("success")),
+        }
+    return phone_result
 
 
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
@@ -6807,6 +9140,36 @@ async def _send_discord_fallback(app_name: str, level: int):
         logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
 
 
+def _enforcement_state_payload(
+    *,
+    source: str,
+    app: str | None = None,
+    phone_app: str | None = None,
+    ack_source: str | None = None,
+    **extra,
+) -> dict:
+    """Build Custodes enforcement-state payloads without app/ack slot bleed.
+
+    `phone_app`/`app` are foreground application telemetry fields for the
+    phone cascade. Internal acknowledgement identifiers (AskUserQuestion,
+    Golden Throne, expected-ack namespaces) are diagnostic ack sources and must
+    never populate the cascade app slots.
+    """
+    payload = dict(extra)
+    if source == "phone":
+        resolved_phone_app = phone_app or app
+        if resolved_phone_app is not None:
+            payload["app"] = resolved_phone_app
+        payload["phone_app"] = resolved_phone_app
+    else:
+        if ack_source is None and app is not None:
+            ack_source = app
+        if ack_source is not None:
+            payload["ack_source"] = ack_source
+        payload["phone_app"] = None
+    return payload
+
+
 async def _enforcement_cascade_worker(app_name: str):
     """Background task that escalates enforcement levels until app_close or timeout.
 
@@ -6838,7 +9201,7 @@ async def _enforcement_cascade_worker(app_name: str):
         "enforcement_cascade_started",
         "phone",
         severity=2,
-        payload={"app": app_name, "phone_app": app_name},
+        payload=_enforcement_state_payload(source="phone", app=app_name),
     )
 
     # Level 0: Discord fallback (soft close)
@@ -6875,12 +9238,12 @@ async def _enforcement_cascade_worker(app_name: str):
             "enforcement_cascade_escalate",
             "phone",
             severity=min(2 + level, 5),
-            payload={
-                "app": app_name,
-                "phone_app": app_name,
-                "level": level,
-                "elapsed_s": round(elapsed),
-            },
+            payload=_enforcement_state_payload(
+                source="phone",
+                app=app_name,
+                level=level,
+                elapsed_s=round(elapsed),
+            ),
         )
 
         # Try phone first, fall back to server-side Pavlok API, then Discord
@@ -7034,9 +9397,8 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     - If productivity is active -> distractions are allowed (earned break)
     - If productivity is NOT active -> distractions should be closed
     """
-    work_state = await compute_work_state()
-    productivity_active = work_state.productivity_active
-    active_count = work_state.active_instance_count + work_state.observed_agent_count
+    productivity_active = timer_engine.productivity_active
+    active_count = 0
     should_close = not productivity_active
 
     if productivity_active:
@@ -7699,27 +10061,12 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             timer_engine._clear_manual_mode()
             print("    Twitter closed, manual mode cleared")
 
-        # Switch timer activity to working when distraction app closes
+        # Phone close is observational; server-side work/activity derivation owns timer state.
         timer_updated = False
         acknowledged_acks = await acknowledge_phone_acks(app_name)
         stop_enforcement_cascade(reason=f"negative_edge_close:{app_name}")
         if old_app:
-            DESKTOP_STATE["current_mode"] = "silence"
-            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            now_ms = int(time.monotonic() * 1000)
-            old_timer_mode = timer_engine.current_mode.value
-            result = timer_engine.set_activity(
-                Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms
-            )
-            timer_updated = TimerEvent.MODE_CHANGED in result.events
-            if timer_updated:
-                await timer_log_shift(
-                    old_timer_mode,
-                    timer_engine.current_mode.value,
-                    trigger="phone_app",
-                    source="macrodroid",
-                    phone_app=app_name,
-                )
+            timer_updated = False
             print(f"    Phone close -> working | timer={timer_updated}")
 
         await log_event(
@@ -7814,48 +10161,59 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             message="Distraction acknowledgement required" if ack else "Already tracking this app",
         )
 
-    # Helper to sync timer activity layer for phone distraction
-    def _sync_phone_timer():
+    async def _observe_phone_distraction(productivity_active: bool | None = None) -> bool:
+        """Feed phone foreground into the composite timer state without direct mode assertions."""
         # If twitter was already zapped, don't let phantom opens change timer mode
         # (this prevents phantom opens from burning break time → break_exhausted zaps)
         if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get(
             "twitter_zapped"
         ):
-            print("    Skipping timer sync — twitter already zapped")
-            return False, timer_engine.current_mode.value
-        old_timer_mode = timer_engine.current_mode.value
-        DESKTOP_STATE["current_mode"] = distraction_mode
-        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+            print("    Skipping phone observation — twitter already zapped")
+            return False
+        PHONE_STATE["distraction_observed_count"] = (
+            int(PHONE_STATE.get("distraction_observed_count") or 0) + 1
+        )
         now_ms = int(time.monotonic() * 1000)
-        # Phone distractions → set activity to DISTRACTION
+        old_timer_mode = timer_engine.current_mode.value
+        old_activity = timer_engine.activity.value
+        if productivity_active is not None:
+            timer_engine.set_productivity(productivity_active, now_ms)
         was_focused = timer_engine.focus_active
         is_sg = distraction_mode in ("scrolling", "gaming")
         result = timer_engine.set_activity(
             Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
         )
-        updated = TimerEvent.MODE_CHANGED in result.events
-        print(
-            f"    Phone open -> {distraction_mode} (activity=DISTRACTION, sg={is_sg}) | timer={updated}"
-        )
-        # Log focus auto-exit on phone distraction
+        timer_updated = TimerEvent.MODE_CHANGED in result.events
+        shift_to_log = (old_timer_mode, timer_engine.current_mode.value) if timer_updated else None
         if was_focused and not timer_engine.focus_active:
-            focus_min = round(timer_engine.total_focus_time_ms / 60000)
-            asyncio.ensure_future(
-                log_event(
-                    "focus_toggle",
-                    details={
-                        "action": "off",
-                        "trigger": "phone_distraction",
-                        "app": app_name,
-                        "total_focus_time_ms": timer_engine.total_focus_time_ms,
-                        "focus_cutoff_time": timer_engine.focus_cutoff_time,
-                    },
-                )
+            await log_event(
+                "focus_toggle",
+                details={
+                    "action": "off",
+                    "trigger": "phone_distraction",
+                    "app": app_name,
+                    "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                    "focus_cutoff_time": timer_engine.focus_cutoff_time,
+                },
             )
-            loop = asyncio.get_event_loop()
-            loop.run_in_executor(
-                None, speak_tts, f"Focus broken by phone. {focus_min} minutes earned."
-            )
+        await log_event(
+            "phone_distraction_observed",
+            device_id="phone",
+            details={
+                "app": app_name,
+                "display_name": display_name,
+                "package": package,
+                "distraction_mode": distraction_mode,
+                "old_timer_mode": old_timer_mode,
+                "timer_mode": timer_engine.current_mode.value,
+                "old_activity": old_activity,
+                "activity": timer_engine.activity.value,
+                "productivity_active": timer_engine.productivity_active,
+                "timer_updated": timer_updated,
+                "count": PHONE_STATE["distraction_observed_count"],
+            },
+        )
+        print(f"    Phone open observed -> {distraction_mode} | timer={timer_updated}")
         # Track Twitter open time for 7-minute enforcement
         if app_name in ("twitter", "x", "com.twitter.android"):
             if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
@@ -7869,7 +10227,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 print(f"    Clearing stale Twitter timer (new app: {app_name})")
                 PHONE_STATE["twitter_open_since"] = None
                 PHONE_STATE["twitter_zapped"] = False
-        return updated, old_timer_mode
+        if shift_to_log:
+            asyncio.create_task(
+                timer_log_shift(
+                    shift_to_log[0],
+                    shift_to_log[1],
+                    trigger="phone_distraction",
+                    source="macrodroid",
+                    phone_app=app_name,
+                )
+            )
+        return timer_updated
 
     # Check work mode
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
@@ -7913,15 +10281,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _updated, _old_mode = _sync_phone_timer()
-        if _updated:
-            await timer_log_shift(
-                _old_mode,
-                "work_" + distraction_mode,
-                trigger="phone_app",
-                source="macrodroid",
-                phone_app=app_name,
-            )
+        _updated = await _observe_phone_distraction()
 
         await log_event(
             "phone_distraction_allowed",
@@ -7941,15 +10301,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _updated, _old_mode = _sync_phone_timer()
-        if _updated:
-            await timer_log_shift(
-                _old_mode,
-                "work_" + distraction_mode,
-                trigger="phone_app",
-                source="macrodroid",
-                phone_app=app_name,
-            )
+        _updated = await _observe_phone_distraction()
         await log_quiet_hours_suppressed(
             source="phone_detection",
             event_type="phone_distraction_open",
@@ -8002,15 +10354,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _updated, _old_mode = _sync_phone_timer()
-        if _updated:
-            await timer_log_shift(
-                _old_mode,
-                "work_" + distraction_mode,
-                trigger="phone_app",
-                source="macrodroid",
-                phone_app=app_name,
-            )
+        _updated = await _observe_phone_distraction(productivity_active=productivity_active)
         ack = await maybe_create_backlog_violation_ack(
             surface="phone",
             app_name=app_name,
@@ -8051,15 +10395,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _updated, _old_mode = _sync_phone_timer()
-        if _updated:
-            await timer_log_shift(
-                _old_mode,
-                "work_" + distraction_mode,
-                trigger="phone_app",
-                source="macrodroid",
-                phone_app=app_name,
-            )
+        _updated = await _observe_phone_distraction(productivity_active=productivity_active)
 
         await log_event(
             "phone_distraction_allowed",
@@ -8086,15 +10422,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _updated, _old_mode = _sync_phone_timer()
-        if _updated:
-            await timer_log_shift(
-                _old_mode,
-                "work_" + distraction_mode,
-                trigger="phone_app",
-                source="macrodroid",
-                phone_app=app_name,
-            )
+        _updated = await _observe_phone_distraction(productivity_active=productivity_active)
 
         ack = await _create_phone_gaming_ack(_updated)
 
@@ -8125,15 +10453,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
             PHONE_STATE["is_distracted"] = True
             PHONE_STATE["last_activity"] = datetime.now().isoformat()
-            _updated, _old_mode = _sync_phone_timer()
-            if _updated:
-                await timer_log_shift(
-                    _old_mode,
-                    "work_" + distraction_mode,
-                    trigger="phone_app",
-                    source="macrodroid",
-                    phone_app=app_name,
-                )
+            _updated = await _observe_phone_distraction(productivity_active=productivity_active)
             ack = await _create_phone_gaming_ack(_updated)
             if not ack:
                 ack = await maybe_create_phone_distraction_ack(
@@ -8453,7 +10773,7 @@ async def get_widget_break():
 @app.get("/api/timer")
 async def get_timer_state():
     """Get full timer state (for debugging, dashboards, Stream Deck)."""
-    work_state = await compute_work_state()
+    work_state = await get_cached_work_state()
     return {
         "current_mode": timer_engine.current_mode.value,
         "activity": timer_engine.activity.value,
@@ -8493,7 +10813,7 @@ async def get_timer_state():
 @app.get("/api/work-state", response_model=WorkStateResponse)
 async def get_work_state():
     """Typed read model for what Token-API thinks the operator is doing."""
-    return await compute_work_state()
+    return await get_cached_work_state()
 
 
 @app.get("/api/timer/shifts")
@@ -8784,9 +11104,8 @@ async def work_action(request: WorkActionRequest | None = None):
         PHONE_STATE["distraction_ack_app"] = None
         PHONE_STATE["distraction_ack_id"] = None
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        DESKTOP_STATE["current_mode"] = "silence"
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+        _sync_activity_from_remaining_distraction_signals(now_ms)
 
     await log_event(
         "work_action",
@@ -9499,7 +11818,9 @@ async def system_shutdown(request: ShutdownRequest):
     cmd.append(f"+{delay_minutes}" if delay_minutes > 0 else "now")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
 
         if result.returncode == 0:
             logger.info(f"SYSTEM: Initiated {action} with delay={delay_minutes}min")
@@ -9530,8 +11851,12 @@ async def system_shutdown(request: ShutdownRequest):
 async def cancel_shutdown():
     """Cancel a pending shutdown/restart."""
     try:
-        result = subprocess.run(
-            ["sudo", "killall", "shutdown"], capture_output=True, text=True, timeout=10
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["sudo", "killall", "shutdown"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
             logger.info("SYSTEM: Cancelled pending shutdown")
@@ -10235,8 +12560,12 @@ async def get_heartbeat_status():
     # Get openclaw heartbeat status
     openclaw_status = None
     try:
-        result = subprocess.run(
-            ["openclaw", "system", "heartbeat", "last"], capture_output=True, text=True, timeout=5
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["openclaw", "system", "heartbeat", "last"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             openclaw_status = json.loads(result.stdout)
@@ -10322,6 +12651,12 @@ async def somnium_ui():
     return FileResponse(index_path)
 
 
+@app.get("/ui/somnium/terminal", response_class=HTMLResponse)
+async def somnium_terminal_ui_route():
+    """Route-order shim: keep terminal HTML from being captured as a static asset."""
+    return await somnium_terminal_ui()
+
+
 @app.get("/ui/somnium/{asset_name}")
 async def somnium_ui_asset(asset_name: str):
     """Serve Somnium UI stub assets without exposing arbitrary paths."""
@@ -10335,6 +12670,356 @@ async def somnium_ui_asset(asset_name: str):
     if not asset_path.exists():
         raise HTTPException(status_code=404, detail="Somnium UI asset not found")
     return FileResponse(asset_path, media_type=allowed[asset_name])
+
+
+def _minutes_since(timestamp: str | None) -> int | None:
+    if not timestamp:
+        return None
+    try:
+        return max(
+            0, int((datetime.now() - datetime.fromisoformat(timestamp)).total_seconds() // 60)
+        )
+    except Exception:
+        return None
+
+
+async def _somnium_session_doc_lanes(db: aiosqlite.Connection) -> dict[str, list[dict]]:
+    lanes = {
+        "active": [],
+        "held": [],
+        "completed": [],
+        "deployment": [],
+    }
+    cursor = await db.execute(
+        """
+        SELECT sd.*,
+               COUNT(ci.id) AS linked_instances,
+               SUM(CASE WHEN ci.status IN ('processing', 'idle') THEN 1 ELSE 0 END) AS live_instances
+        FROM session_documents sd
+        LEFT JOIN claude_instances ci ON ci.session_doc_id = sd.id
+        WHERE sd.status IN ('active', 'held', 'completed', 'deployment')
+        GROUP BY sd.id
+        ORDER BY sd.updated_at DESC
+        LIMIT 80
+        """
+    )
+    for row in await cursor.fetchall():
+        doc = dict(row)
+        lane = doc.get("status") or "active"
+        doc["age_minutes"] = _minutes_since(doc.get("updated_at") or doc.get("created_at"))
+        lanes.setdefault(lane, []).append(doc)
+    return lanes
+
+
+@app.get("/api/ui/somnium/state")
+async def get_somnium_display_state():
+    """Aggregate read model for the browser display that replaces the Rich TUI."""
+    now = datetime.now()
+    work_state = await get_cached_work_state()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            WHERE ci.status IN ('processing', 'idle')
+            ORDER BY
+                CASE ci.status WHEN 'processing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                ci.last_activity DESC
+            LIMIT 120
+            """
+        )
+        active_rows = await cursor.fetchall()
+        active_instances = []
+        status_counts: dict[str, int] = {}
+        engine_counts: dict[str, int] = {}
+        legion_counts: dict[str, int] = {}
+
+        for row in active_rows:
+            inst = dict(row)
+            status = inst.get("status") or "unknown"
+            engine = inst.get("engine") or "claude"
+            legion = inst.get("legion") or inst.get("instance_type") or "unassigned"
+            status_counts[status] = status_counts.get(status, 0) + 1
+            engine_counts[engine] = engine_counts.get(engine, 0) + 1
+            legion_counts[legion] = legion_counts.get(legion, 0) + 1
+            inst["age_minutes"] = _minutes_since(
+                inst.get("last_activity") or inst.get("registered_at")
+            )
+            inst["display_name"] = (
+                inst.get("tab_name")
+                or inst.get("pane_label")
+                or inst.get("session_doc_title")
+                or inst.get("id", "")[:12]
+            )
+            active_instances.append(inst)
+
+        cursor = await db.execute(
+            """
+            SELECT event_type, instance_id, details, created_at
+            FROM events
+            ORDER BY created_at DESC
+            LIMIT 16
+            """
+        )
+        events = [dict(row) for row in await cursor.fetchall()]
+
+        session_docs = await _somnium_session_doc_lanes(db)
+
+    return {
+        "generated_at": now.isoformat(),
+        "timer": {
+            "current_mode": timer_engine.current_mode.value,
+            "activity": timer_engine.activity.value,
+            "break_balance_ms": timer_engine.break_balance_ms,
+            "break_backlog_ms": abs(min(0, timer_engine.break_balance_ms)),
+            "focus_active": timer_engine.focus_active,
+            "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
+            "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+            "phone_app": PHONE_STATE.get("current_app"),
+        },
+        "work_state": work_state.model_dump(),
+        "instances": {
+            "active": active_instances,
+            "status_counts": status_counts,
+            "engine_counts": engine_counts,
+            "legion_counts": legion_counts,
+        },
+        "session_docs": session_docs,
+        "events": events,
+    }
+
+
+def _somnium_minutes_label(value: int | None) -> str:
+    if value is None:
+        return "no activity"
+    if value < 1:
+        return "just now"
+    if value == 1:
+        return "1 min"
+    if value < 90:
+        return f"{value} min"
+    return f"{round(value / 60)} hr"
+
+
+def _somnium_compact_path(path: str | None) -> str:
+    if not path:
+        return ""
+    parts = str(path).split("/")
+    return "/".join(parts[-3:])
+
+
+@app.get("/ui/somnium/terminal", response_class=HTMLResponse)
+async def somnium_terminal_ui():
+    """Server-rendered Somnium HTML for terminal browsers such as w3m.
+
+    The primary `/ui/somnium` shell is a JavaScript dashboard for GUI browsers.
+    Terminal browsers generally cannot run that UI, so this endpoint renders
+    the same read model into static HTML that can actually display inside tmux.
+    """
+    import html as _html
+
+    generated_at = datetime.now().isoformat()
+    timer = {
+        "current_mode": timer_engine.current_mode.value,
+        "activity": timer_engine.activity.value,
+        "break_backlog_ms": abs(min(0, timer_engine.break_balance_ms)),
+        "focus_active": timer_engine.focus_active,
+        "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "phone_app": PHONE_STATE.get("current_app"),
+    }
+    work = {
+        "productivity_active": None,
+        "reason": "terminal_lightweight_read_model",
+    }
+
+    instances = []
+    session_docs = {
+        "active": [],
+        "held": [],
+        "completed": [],
+        "deployment": [],
+    }
+    events = []
+    db_error = None
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=0.2) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT ci.id, ci.status, ci.tab_name, ci.engine, ci.legion, ci.instance_type,
+                       ci.tmux_pane, ci.pane_label, ci.dispatch_window, ci.working_dir,
+                       ci.last_activity, ci.registered_at,
+                       sd.title AS session_doc_title,
+                       sd.file_path AS session_doc_path,
+                       sd.status AS session_doc_status,
+                       sd.project AS session_doc_project
+                FROM claude_instances ci
+                LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+                WHERE ci.status IN ('processing', 'idle')
+                ORDER BY
+                    CASE ci.status WHEN 'processing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                    ci.last_activity DESC
+                LIMIT 40
+                """
+            )
+            for row in await cursor.fetchall():
+                inst = dict(row)
+                inst["age_minutes"] = _minutes_since(
+                    inst.get("last_activity") or inst.get("registered_at")
+                )
+                inst["display_name"] = (
+                    inst.get("tab_name")
+                    or inst.get("pane_label")
+                    or inst.get("session_doc_title")
+                    or inst.get("id", "")[:12]
+                )
+                instances.append(inst)
+
+            # Deliberately avoid the fuller browser read-model join here. This
+            # endpoint is polled by terminal browsers inside tmux panes; it must
+            # stay cheap so it cannot starve /health or the rest of Token-API.
+            cursor = await db.execute(
+                """
+                SELECT id, title, status, project, created_at, updated_at
+                FROM session_documents
+                WHERE status IN ('active', 'held', 'completed', 'deployment')
+                ORDER BY updated_at DESC
+                LIMIT 40
+                """
+            )
+            for row in await cursor.fetchall():
+                doc = dict(row)
+                lane = doc.get("status") or "active"
+                doc["age_minutes"] = _minutes_since(doc.get("updated_at") or doc.get("created_at"))
+                doc["live_instances"] = None
+                session_docs.setdefault(lane, []).append(doc)
+
+            cursor = await db.execute(
+                """
+                SELECT event_type, instance_id, created_at
+                FROM events
+                ORDER BY created_at DESC
+                LIMIT 12
+                """
+            )
+            events = [dict(row) for row in await cursor.fetchall()]
+    except Exception as exc:
+        db_error = f"{type(exc).__name__}: {exc}"
+
+    def esc(value) -> str:
+        return _html.escape("" if value is None else str(value))
+
+    instance_rows = []
+    for inst in instances[:40]:
+        pane = inst.get("pane_label") or inst.get("tmux_pane") or inst.get("dispatch_window") or ""
+        doc = inst.get("session_doc_title") or "no session doc"
+        name = inst.get("display_name") or inst.get("id", "")[:12]
+        flags = []
+        if not pane:
+            flags.append("no-pane")
+        if not inst.get("session_doc_title"):
+            flags.append("no-doc")
+        flag_text = f" [{' '.join(flags)}]" if flags else ""
+        instance_rows.append(
+            "<tr>"
+            f"<td>{esc(inst.get('status'))}</td>"
+            f"<td>{esc(name)}{esc(flag_text)}</td>"
+            f"<td>{esc(inst.get('engine') or 'claude')}</td>"
+            f"<td>{esc(inst.get('legion') or inst.get('instance_type') or '')}</td>"
+            f"<td>{esc(pane)}</td>"
+            f"<td>{esc(doc)}</td>"
+            f"<td>{esc(_somnium_minutes_label(inst.get('age_minutes')))}</td>"
+            f"<td>{esc(_somnium_compact_path(inst.get('working_dir') or inst.get('session_doc_path')))}</td>"
+            "</tr>"
+        )
+
+    lane_blocks = []
+    for lane_name in ("active", "held", "completed", "deployment"):
+        docs = session_docs.get(lane_name, [])
+        rows = []
+        for doc in docs[:10]:
+            doc_title = doc.get("title") or f"Session {doc.get('id')}"
+            live_label = doc.get("live_instances")
+            live_text = "unknown" if live_label is None else str(live_label)
+            rows.append(
+                "<li>"
+                f"{esc(doc_title)} "
+                f"({esc(doc.get('project') or 'no project')}; "
+                f"{esc(live_text)} live; "
+                f"{esc(_somnium_minutes_label(doc.get('age_minutes')))})"
+                "</li>"
+            )
+        lane_blocks.append(
+            f"<section><h3>{esc(lane_name)} {len(docs)}</h3><ul>{''.join(rows)}</ul></section>"
+        )
+
+    event_rows = []
+    for event in events[:12]:
+        event_rows.append(
+            "<li>"
+            f"{esc(event.get('created_at'))} — {esc(event.get('event_type'))} "
+            f"({esc((event.get('instance_id') or 'system')[:16])})"
+            "</li>"
+        )
+
+    backlog_minutes = round((timer.get("break_backlog_ms") or 0) / 60000)
+    detail = (
+        f"{backlog_minutes} min backlog" if backlog_minutes else f"{timer.get('activity')} activity"
+    )
+    active_count = len(instances)
+    processing_count = sum(1 for inst in instances if inst.get("status") == "processing")
+
+    refresh_note = "manual refresh with R · terminal HTML"
+    db_note = f'<p class="muted">DB read degraded: {esc(db_error)}</p>' if db_error else ""
+
+    return HTMLResponse(
+        f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Somnium Terminal</title>
+  <style>
+    body {{ background:#0d1014; color:#eef3f7; font-family:monospace; }}
+    h1,h2,h3 {{ margin:0.35em 0; }}
+    .muted {{ color:#9aa8b5; }}
+    .metrics {{ display:block; margin-bottom:1em; }}
+    table {{ border-collapse:collapse; width:100%; }}
+    th,td {{ border:1px solid #303b48; padding:2px 4px; vertical-align:top; }}
+    th {{ color:#9aa8b5; }}
+    section {{ margin:0.75em 0; }}
+  </style>
+</head>
+<body>
+  <h1>Somnium</h1>
+  <p class="muted">generated {esc(generated_at)} · {esc(refresh_note)}</p>
+  {db_note}
+  <div class="metrics">
+    <b>Timer:</b> {esc(timer.get("current_mode"))} — {esc(detail)}<br>
+    <b>Work:</b> {esc("productive" if work.get("productivity_active") else "unverified")} — {esc(work.get("reason"))}<br>
+    <b>Fleet:</b> {active_count} live — {processing_count} processing<br>
+    <b>Attention:</b> {esc("focus" if timer.get("focus_active") else timer.get("desktop_mode"))} — mode {esc(timer.get("work_mode"))} — phone {esc(timer.get("phone_app") or "none")}
+  </div>
+  <h2>Instances</h2>
+  <table>
+    <tr><th>S</th><th>Name</th><th>Engine</th><th>Legion</th><th>Pane</th><th>Session Doc</th><th>Age</th><th>Path</th></tr>
+    {"".join(instance_rows)}
+  </table>
+  <h2>Session Docs</h2>
+  {"".join(lane_blocks)}
+  <h2>Events</h2>
+  <ul>{"".join(event_rows)}</ul>
+</body>
+</html>"""
+    )
 
 
 @app.get("/api/ui/somnium/selection")
@@ -10352,6 +13037,23 @@ async def get_somnium_selection():
             status_code=500,
             content={"detail": "Somnium selection state is invalid JSON"},
         )
+
+
+@app.post("/api/ui/somnium/selection")
+async def set_somnium_selection(request: Request):
+    """Persist browser-published Somnium selection for tmux/CLI commands."""
+    payload = await request.json()
+    selection = {
+        "surface": "somnium",
+        "active_table": payload.get("active_table") or "instances",
+        "selected_instance_id": payload.get("selected_instance_id"),
+        "selected_cron_job_id": payload.get("selected_cron_job_id"),
+        "updated_at": datetime.now().isoformat(),
+        "source": "browser",
+    }
+    SOMNIUM_SELECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SOMNIUM_SELECTION_PATH.write_text(json.dumps(selection, indent=2, sort_keys=True))
+    return selection
 
 
 # [MOVED to shared.py / routes/tts.py] — was: # ============ TTS/Notification System ===========
@@ -10554,12 +13256,8 @@ async def timer_worker():
                         PHONE_STATE["is_distracted"] = False
                         if _phone_app in ("twitter", "x", "com.twitter.android"):
                             PHONE_STATE["twitter_open_since"] = None
-                        # Restore timer activity to working
-                        DESKTOP_STATE["current_mode"] = "silence"
-                        timer_engine.set_activity(
-                            Activity.WORKING,
-                            is_scrolling_gaming=False,
-                            now_mono_ms=int(time.monotonic() * 1000),
+                        _sync_activity_from_remaining_distraction_signals(
+                            int(time.monotonic() * 1000)
                         )
                 except Exception:
                     pass
@@ -10626,7 +13324,11 @@ async def timer_worker():
                         new_mode,
                         trigger=trigger,
                         source="timer_worker",
-                        details=work_state.model_dump(),
+                        details=json.dumps(
+                            work_state.model_dump(),
+                            sort_keys=True,
+                            default=str,
+                        ),
                     )
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
@@ -10683,7 +13385,7 @@ async def _async_enforce_twitter_timeout():
     # Desktop: notification sound + TTS
     play_sound()
     try:
-        subprocess.Popen(["say", "-v", "Daniel", "twitter timeout"])
+        await asyncio.to_thread(subprocess.Popen, ["say", "-v", "Daniel", "twitter timeout"])
     except Exception:
         pass
 
@@ -10841,12 +13543,12 @@ async def legion_pane_recolor_worker():
                                 cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", "bg=default"]
                             else:
                                 cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", f"bg={bg}"]
-                            proc = await asyncio.create_subprocess_exec(
-                                *cmd,
+                            await _run_subprocess_offloop(
+                                cmd,
                                 stdout=asyncio.subprocess.DEVNULL,
                                 stderr=asyncio.subprocess.DEVNULL,
+                                timeout=5,
                             )
-                            await proc.wait()
                             logger.info(
                                 f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})"
                             )
@@ -10901,18 +13603,20 @@ async def pane_state_worker():
                         pane = r["tmux_pane"] if r else None
                     if pane:
                         try:
-                            proc = await asyncio.create_subprocess_exec(
-                                "tmux",
-                                "set-option",
-                                "-p",
-                                "-t",
-                                pane,
-                                row["variable"],
-                                row["value"],
+                            await _run_subprocess_offloop(
+                                (
+                                    "tmux",
+                                    "set-option",
+                                    "-p",
+                                    "-t",
+                                    pane,
+                                    row["variable"],
+                                    row["value"],
+                                ),
                                 stdout=asyncio.subprocess.DEVNULL,
                                 stderr=asyncio.subprocess.DEVNULL,
+                                timeout=5,
                             )
-                            await proc.wait()
                             logger.info(
                                 f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
                             )
@@ -10927,6 +13631,354 @@ async def pane_state_worker():
         except Exception as e:
             logger.error(f"Pane state worker error: {e}")
         await asyncio.sleep(1)
+
+
+# ============ tmux↔DB Reconciler ============
+
+RECONCILE_CYCLE_SECONDS = 30
+RECONCILE_IDLE_THRESHOLD_SECONDS = 60
+RECONCILE_PROCESSING_THRESHOLD_SECONDS = 10
+
+
+async def _read_tmux_panes() -> dict[str, dict] | None:
+    """Return ``{pane_id: {session_window, current_command, title}}`` from tmux.
+
+    Returns ``None`` when tmux itself is unreachable (don't reconcile a blind cycle).
+    Returns ``{}`` when tmux is alive but has zero panes.
+    """
+    try:
+        proc = await _run_subprocess_offloop(
+            (
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}|#{session_name}:#{window_name}|#{pane_current_command}|#{pane_title}",
+            ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    panes: dict[str, dict] = {}
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 4:
+            continue
+        pane_id, session_window, current_command, title = parts
+        if pane_id:
+            panes[pane_id] = {
+                "session_window": session_window,
+                "current_command": current_command,
+                "title": title,
+            }
+    return panes
+
+
+def _parse_last_activity(value) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).replace("Z", "")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        # Fallback to space-separated SQLite TIMESTAMP form
+        try:
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
+def _reconcile_eligible(row: dict, now: datetime) -> bool:
+    """Reconciler only mutates rows that aren't fresh writes from a live dispatch.
+
+    - idle/active rows: ≥60s of inactivity (don't fight a fresh dispatch).
+    - processing rows: ≥10s of inactivity (the bot is mid-tool-use; let it be).
+    """
+    last = _parse_last_activity(row.get("last_activity"))
+    if last is None:
+        return True
+    age = (now - last).total_seconds()
+    if row.get("status") == "processing":
+        return age >= RECONCILE_PROCESSING_THRESHOLD_SECONDS
+    return age >= RECONCILE_IDLE_THRESHOLD_SECONDS
+
+
+def _is_placeholder_tab_name(tab_name: str | None) -> bool:
+    if not tab_name:
+        return False
+    cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
+    if not cleaned:
+        return False
+    return bool(DEFAULT_TAB_NAME_RX.match(cleaned))
+
+
+def _clean_tab_name(tab_name: str | None) -> str:
+    if not tab_name:
+        return ""
+    return tab_name.lstrip("✳⠐⠸ ").strip()
+
+
+_SESSION_DOC_DATE_PREFIX_RX = re.compile(r"^\d{4}-\d{2}-\d{2}-(.+)$")
+
+
+def _derive_session_doc_slug(file_path: str | None) -> str | None:
+    """Extract the slug portion of a session doc filename (post date prefix)."""
+    if not file_path:
+        return None
+    name = file_path.rsplit("/", 1)[-1]
+    if name.endswith(".md"):
+        name = name[:-3]
+    match = _SESSION_DOC_DATE_PREFIX_RX.match(name)
+    return match.group(1) if match else (name or None)
+
+
+def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) -> bool:
+    cleaned = _clean_tab_name(tab_name)
+    if not cleaned or _is_placeholder_tab_name(tab_name):
+        return False
+    slug = _derive_session_doc_slug(file_path)
+    if not slug:
+        return False
+    a = cleaned.lower()
+    b = slug.lower()
+    if a == b:
+        return False
+    # Tolerant: either side wholly contained in the other counts as a match.
+    return a not in b and b not in a
+
+
+def _compute_drift_flags(
+    row: dict,
+    panes: dict[str, dict],
+    duplicate_pane_ids: set[str],
+) -> list[str]:
+    """Return live drift flags for a single instance row.
+
+    Vocabulary matches the reconciler event log:
+    pane_label_drift, tab_name_placeholder, tab_name_session_doc_mismatch,
+    superseded_duplicate, pane_missing.
+    """
+    flags: list[str] = []
+    tmux_pane = row.get("tmux_pane")
+    if tmux_pane and tmux_pane in duplicate_pane_ids:
+        flags.append("superseded_duplicate")
+    if tmux_pane and tmux_pane not in panes:
+        flags.append("pane_missing")
+    if tmux_pane and tmux_pane in panes:
+        tmux_sw = panes[tmux_pane]["session_window"]
+        if row.get("pane_label") != tmux_sw:
+            flags.append("pane_label_drift")
+    if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
+        flags.append("tab_name_placeholder")
+    if _tab_name_session_doc_mismatch(row.get("tab_name"), row.get("session_doc_path")):
+        flags.append("tab_name_session_doc_mismatch")
+    return flags
+
+
+async def _run_tmux_db_reconcile_cycle() -> dict:
+    """Single reconciliation pass. Returns counts dict for telemetry."""
+    counts = {
+        "pane_vanished": 0,
+        "pane_label_drift": 0,
+        "superseded_duplicate": 0,
+        "placeholder_tab_name_drift": 0,
+        "tab_name_session_doc_mismatch": 0,
+    }
+    panes = await _read_tmux_panes()
+    if panes is None:
+        # tmux unreachable — skip the cycle rather than stop a fleet of rows.
+        return counts
+
+    now = datetime.now()
+    deferred_events: list[tuple[str, str, dict]] = []  # (event_type, instance_id, details)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Wait up to 5s for other writers before raising "database is locked".
+        await db.execute("PRAGMA busy_timeout = 5000")
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT ci.id, ci.tmux_pane, ci.pane_label, ci.tab_name, ci.session_doc_id,
+                      ci.status, ci.last_activity, ci.workflow_blocked_reason,
+                      sd.file_path AS session_doc_path
+               FROM claude_instances ci
+               LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+               WHERE ci.status != 'stopped'"""
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        # Group rows by tmux_pane for duplicate detection.
+        by_pane: dict[str, list[dict]] = {}
+        for row in rows:
+            tp = row.get("tmux_pane")
+            if tp:
+                by_pane.setdefault(tp, []).append(row)
+
+        # Resolve which row "owns" each pane; the rest are superseded duplicates.
+        owners: set[str] = set()
+        superseded: list[dict] = []
+        for tp, group in by_pane.items():
+            if len(group) <= 1:
+                owners.add(group[0]["id"])
+                continue
+            # Newest by last_activity wins. Fall back to id for stable order.
+            ordered = sorted(
+                group,
+                key=lambda r: (r.get("last_activity") or "", r.get("id") or ""),
+                reverse=True,
+            )
+            owners.add(ordered[0]["id"])
+            superseded.extend(ordered[1:])
+
+        # Stop superseded duplicates first.
+        for row in superseded:
+            if not _reconcile_eligible(row, now):
+                continue
+            try:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row["id"],
+                    updates={
+                        "status": "stopped",
+                        "stopped_at": now.isoformat(),
+                    },
+                    mutation_type="reconcile_superseded",
+                    write_source="tmux_db_reconciler",
+                    actor="reconciler",
+                )
+                counts["superseded_duplicate"] += 1
+            except Exception as e:
+                logger.warning(f"Reconciler superseded mutation failed for {row.get('id')}: {e}")
+
+        # Process owners + tmux_pane-less rows.
+        for row in rows:
+            tmux_pane = row.get("tmux_pane")
+            if tmux_pane and row["id"] not in owners:
+                continue  # already handled above
+            if not _reconcile_eligible(row, now):
+                continue
+
+            # Pane vanished.
+            if tmux_pane and tmux_pane not in panes:
+                try:
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=row["id"],
+                        updates={
+                            "status": "stopped",
+                            "stopped_at": now.isoformat(),
+                        },
+                        mutation_type="reconcile_pane_missing",
+                        write_source="tmux_db_reconciler",
+                        actor="reconciler",
+                    )
+                    counts["pane_vanished"] += 1
+                except Exception as e:
+                    logger.warning(
+                        f"Reconciler pane_missing mutation failed for {row.get('id')}: {e}"
+                    )
+                continue
+
+            # Pane label drift.
+            if tmux_pane and tmux_pane in panes:
+                tmux_sw = panes[tmux_pane]["session_window"]
+                if row.get("pane_label") != tmux_sw:
+                    try:
+                        await sanctioned_update_instance(
+                            db,
+                            instance_id=row["id"],
+                            updates={"pane_label": tmux_sw},
+                            mutation_type="reconcile_pane_label",
+                            write_source="tmux_db_reconciler",
+                            actor="reconciler",
+                        )
+                        counts["pane_label_drift"] += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"Reconciler pane_label mutation failed for {row.get('id')}: {e}"
+                        )
+
+            # Placeholder tab_name with attached session doc — flag, don't rename.
+            if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
+                counts["placeholder_tab_name_drift"] += 1
+                if row.get("workflow_blocked_reason") != "tab_name_placeholder":
+                    try:
+                        await sanctioned_update_instance(
+                            db,
+                            instance_id=row["id"],
+                            updates={"workflow_blocked_reason": "tab_name_placeholder"},
+                            mutation_type="reconcile_flag_placeholder",
+                            write_source="tmux_db_reconciler",
+                            actor="reconciler",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Reconciler placeholder flag failed for {row.get('id')}: {e}"
+                        )
+                deferred_events.append(
+                    (
+                        "placeholder_tab_name_drift",
+                        row["id"],
+                        {
+                            "tab_name": row.get("tab_name"),
+                            "session_doc_id": row.get("session_doc_id"),
+                        },
+                    )
+                )
+
+            # tab_name ↔ session_doc mismatch — log only, no mutation.
+            if _tab_name_session_doc_mismatch(row.get("tab_name"), row.get("session_doc_path")):
+                counts["tab_name_session_doc_mismatch"] += 1
+                deferred_events.append(
+                    (
+                        "tab_name_session_doc_mismatch",
+                        row["id"],
+                        {
+                            "tab_name": row.get("tab_name"),
+                            "derived_slug": _derive_session_doc_slug(row.get("session_doc_path")),
+                            "session_doc_path": row.get("session_doc_path"),
+                        },
+                    )
+                )
+
+        await db.commit()
+
+    # Emit deferred events after the reconciler's connection is closed so we
+    # don't fight ourselves on the SQLite write lock.
+    for event_type, instance_id, details in deferred_events:
+        try:
+            await log_event(event_type, instance_id=instance_id, details=details)
+        except Exception as e:
+            logger.warning(f"Reconciler deferred log_event {event_type} failed: {e}")
+
+    return counts
+
+
+async def tmux_db_reconciler_worker():
+    """Background worker that converges ``claude_instances`` to tmux truth.
+
+    Every ``RECONCILE_CYCLE_SECONDS`` it walks ``tmux list-panes -a``, marks
+    orphan rows stopped, fixes ``pane_label`` drift, dedupes duplicate rows for
+    the same ``tmux_pane`` (keeping the newest), and logs (does NOT auto-rename)
+    ``Claude HH:MM`` placeholder tab_names plus tab_name↔session_doc mismatches.
+
+    All mutations go through ``sanctioned_update_instance`` so the audit log
+    records the reconciler as the agent. Telemetry: one
+    ``tmux_db_reconcile_cycle`` event per cycle that found drift.
+    """
+    while True:
+        try:
+            await asyncio.sleep(RECONCILE_CYCLE_SECONDS)
+            counts = await _run_tmux_db_reconcile_cycle()
+            if any(counts.values()):
+                await log_event("tmux_db_reconcile_cycle", details=counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"tmux_db_reconciler_worker error: {e}")
 
 
 async def session_doc_sync_worker():
@@ -10980,7 +14032,7 @@ async def clear_stale_processing_flags():
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
-                    """SELECT id, tmux_pane, device_id
+                    """SELECT *
                        FROM claude_instances
                        WHERE status IN ('processing', 'idle')
                          AND tmux_pane IS NOT NULL
@@ -11005,27 +14057,29 @@ async def clear_stale_processing_flags():
                             write_source="system",
                             actor="clear-dead-tmux-pane",
                         )
-                        stopped_dead_panes.append(row["id"])
+                        stopped_dead_panes.append(dict(row))
                     except LookupError:
                         continue
 
                 cursor = await db.execute(
-                    """SELECT id
+                    """SELECT *
                        FROM claude_instances
                        WHERE status = 'processing'
                          AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')"""
                 )
                 rows = await cursor.fetchall()
+                stale_idle_instances = []
                 for row in rows:
                     try:
                         await sanctioned_update_instance(
                             db,
-                            instance_id=row[0],
+                            instance_id=row["id"],
                             updates={"status": "idle"},
                             mutation_type="status_changed",
                             write_source="system",
                             actor="clear-stale-processing",
                         )
+                        stale_idle_instances.append(dict(row))
                     except LookupError:
                         continue
                 await db.commit()
@@ -11036,6 +14090,31 @@ async def clear_stale_processing_flags():
                     logger.warning(
                         f"Auto-stopped {len(stopped_dead_panes)} dead tmux-pane instance rows"
                     )
+                    for stopped in stopped_dead_panes:
+                        if stopped.get("instance_type") != "golden_throne":
+                            continue
+                        try:
+                            await schedule_golden_throne_followup(
+                                stopped, reason="clear-dead-tmux-pane"
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Golden Throne: failed to schedule dead-pane follow-up "
+                                f"for {stopped.get('id', '')[:12]}: {exc}"
+                            )
+                for stale_idle in stale_idle_instances:
+                    if stale_idle.get("instance_type") != "golden_throne":
+                        continue
+                    stale_idle["status"] = "idle"
+                    try:
+                        await schedule_golden_throne_followup(
+                            stale_idle, reason="clear-stale-processing"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Golden Throne: failed to schedule stale-processing follow-up "
+                            f"for {stale_idle.get('id', '')[:12]}: {exc}"
+                        )
 
             await asyncio.sleep(60)  # Run every minute
 
@@ -11147,15 +14226,12 @@ async def phone_heartbeat_worker():
                 msg = f"⚡ Phone heartbeat silent {silence_min:.0f}min — Pavlok ZAP fired. Check Tailscale."
                 logger.warning(f"PHONE HB: {msg}")
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "discord",
-                        "send",
-                        "alerts",
-                        msg,
+                    await _run_subprocess_offloop(
+                        ("discord", "send", "alerts", msg),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        timeout=15,
                     )
-                    await asyncio.wait_for(proc.communicate(), timeout=15)
                 except Exception as e:
                     logger.warning(f"PHONE HB: Discord alert failed: {e}")
                 await asyncio.to_thread(
@@ -11172,15 +14248,12 @@ async def phone_heartbeat_worker():
                 msg = f"📵 Phone heartbeat silent {silence_min:.0f}min — Tailscale may be down."
                 logger.warning(f"PHONE HB: {msg}")
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "discord",
-                        "send",
-                        "fallback",
-                        msg,
+                    await _run_subprocess_offloop(
+                        ("discord", "send", "fallback", msg),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        timeout=15,
                     )
-                    await asyncio.wait_for(proc.communicate(), timeout=15)
                 except Exception as e:
                     logger.warning(f"PHONE HB: Discord alert failed: {e}")
                 await asyncio.to_thread(
@@ -11605,25 +14678,39 @@ async def unified_enforce(
         phone_payload["vibe"] = p.get("vibe", cfg["phone_vibe"])
     if "phone_beep" in cfg:
         phone_payload["beep"] = p.get("beep", cfg["phone_beep"])
-    if "phone_zap" in cfg:
-        phone_payload["zap"] = p.get("zap", cfg["phone_zap"])
+    direct_pavlok = level in ("enforce", "block") and p.get("direct_pavlok", True)
+    zap_value = p.get("zap", cfg.get("phone_zap", 30))
+    if "phone_zap" in cfg and not direct_pavlok:
+        phone_payload["zap"] = zap_value
     label = _enforcement_label(level, source, message)
-    phone_payload["tts_text"] = label
-    phone_payload["banner_text"] = label
+    phone_payload["tts_text"] = p.get("tts_text", label)
+    phone_payload["banner_text"] = p.get("banner_text", label)
 
     phone_result = _send_to_phone(phone_endpoint, phone_payload)
     result["phone"] = phone_result
-    if not phone_result.get("success") and level in ("enforce", "block"):
-        stim = "zap" if level in ("enforce", "block") else "vibe"
-        send_pavlok_stimulus(
-            stim,
-            value=phone_payload.get("zap", phone_payload.get("vibe", 30)),
-            reason=f"enforce_{level}_{source}",
-        )
-        logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok {stim} fallback fired")
+    if level in ("enforce", "block"):
+        if direct_pavlok:
+            pavlok_result = send_pavlok_stimulus(
+                "zap",
+                value=zap_value,
+                reason=f"enforce_{level}_{source}",
+            )
+            result["pavlok"] = pavlok_result
+            await log_event("pavlok_stimulus", details=pavlok_result)
+            if not pavlok_result.get("success"):
+                logger.warning(f"Enforce [{level}]: direct Pavlok zap failed: {pavlok_result}")
+        elif not phone_result.get("success"):
+            pavlok_result = send_pavlok_stimulus(
+                "zap",
+                value=zap_value,
+                reason=f"enforce_{level}_{source}",
+            )
+            result["pavlok"] = pavlok_result
+            await log_event("pavlok_stimulus", details=pavlok_result)
+            logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok zap fallback fired")
 
     # ── Desktop TTS ──
-    speak_checkin_tts(label)
+    speak_checkin_tts(p.get("desktop_tts_text", phone_payload["tts_text"]))
     result["tts"] = "sent"
 
     await log_event("enforce", details={"level": level, "source": source, "message": message[:200]})
@@ -11767,7 +14854,8 @@ async def enforcement_status():
         ack = _expected_ack_row_to_dict(row)
         ack["current_level"] = _ack_current_level(ack, now)
         ack["scheduled_jobs"] = []
-        for level in (1, 2, 3):
+        ack["policy_stages"] = list(_expected_ack_scheduled_stages(ack.get("source")))
+        for level in _expected_ack_scheduled_levels(ack.get("source")):
             job = scheduler.get_job(_expected_ack_job_id(ack["id"], level))
             if job:
                 ack["scheduled_jobs"].append(
@@ -11812,6 +14900,104 @@ async def enforcement_status():
 # ── Morning Session ────────────────────────────────────────
 
 
+class MorningBriefRequest(BaseModel):
+    date: str | None = None
+
+
+@app.post("/api/custodes/morning-brief")
+async def custodes_morning_brief(request: MorningBriefRequest | None = None):
+    """Morning-session-as-compaction proxy.
+
+    If a Custodes singleton is alive, inject a 3-step prompt (handoff blurb →
+    /compact → morning brief) into its pane to preserve continuity. Otherwise
+    fall back to the existing spawn path via run_morning_session().
+    """
+    from morning_session import (
+        build_prompt,
+        gather_context,
+        get_daily_thread_id,
+        run_morning_session,
+    )
+
+    today = request.date if request and request.date else datetime.now().strftime("%Y-%m-%d")
+
+    # Resolve alive Custodes singleton
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id
+               FROM claude_instances
+               WHERE legion = 'custodes'
+                 AND status IN ('idle', 'processing')
+                 AND stopped_at IS NULL
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+
+    target_pane: str | None = None
+    target_instance: str | None = None
+    if row and (row["tmux_pane"] or "").strip():
+        if await _tmux_pane_exists(row["tmux_pane"]):
+            target_pane = row["tmux_pane"]
+            target_instance = row["id"]
+    if not target_pane:
+        # DB stale — try recovering from tmux directly
+        recovered = await _find_custodes_tmux_pane()
+        if recovered:
+            target_pane = recovered
+
+    if target_pane:
+        # Build the morning brief body from the same source the standalone launcher uses
+        ctx = gather_context()
+        ctx["trigger"] = "alarm"
+        ctx["daily_thread_id"] = get_daily_thread_id(today) or ""
+        morning_brief_body = build_prompt(ctx)
+
+        injection = (
+            f"Morning session — running into existing Custodes pane.\n\n"
+            f"Step 1 — write today's handoff blurb to Terra/Journal/Daily/{today}.md.\n"
+            f"The blurb should cover: yesterday's open carryover (cascades, pending decisions, anything mid-flight),\n"
+            f"harness regressions surfaced overnight, and any persistent state that compaction would lose.\n"
+            f"Write it as a tight section (not a stream-of-consciousness dump). Keep <500 words.\n\n"
+            f"Step 2 — /compact\n\n"
+            f"Step 3 — morning session brief follows.\n\n"
+            f"{morning_brief_body}"
+        )
+
+        delivery = await _inject_custodes_prompt_to_pane(
+            injection, target_pane, instance_id=target_instance
+        )
+        await log_event(
+            "custodes_morning_brief_dispatched",
+            details={
+                "mode": "inject",
+                "target_pane": target_pane,
+                "instance_id": target_instance,
+                "date": today,
+                "dispatched": delivery.get("dispatched", False),
+                "reason": delivery.get("reason"),
+            },
+        )
+        return {
+            "mode": "inject",
+            "target_pane": target_pane,
+            "instance_id": target_instance,
+            "date": today,
+            "delivery": delivery,
+        }
+
+    # Fallback: no live Custodes — spawn fresh via existing synchronous path
+    # without blocking the event loop.
+    asyncio.create_task(asyncio.to_thread(run_morning_session))
+    _register_morning_expected_response("morning_session")
+    await log_event(
+        "custodes_morning_brief_dispatched",
+        details={"mode": "spawn", "target_pane": None, "instance_id": None, "date": today},
+    )
+    return {"mode": "spawn", "date": today}
+
+
 @app.post("/api/morning/start")
 async def start_morning_session():
     """Trigger the Custodes morning session.
@@ -11833,8 +15019,8 @@ async def start_morning_session():
         if data.get("status") == "active":
             return {"status": "already_active", "session_id": data.get("session_id")}
 
-    # Fire and forget — the session runs in background
-    asyncio.create_task(run_morning_session())
+    # Fire and forget — the synchronous launcher runs in a worker thread.
+    asyncio.create_task(asyncio.to_thread(run_morning_session))
 
     # Register enforce expected response — escalation chain fires if unanswered
     _register_morning_expected_response("morning_session")
@@ -14222,6 +17408,9 @@ STOP_EVALUATORS = {
         "system": (
             "You are a Plan Auditor. Given a session document and recent activity, "
             "identify if any part of the Plan section needs updating based on what just happened.\n\n"
+            "Do not block solely because the Plan section is empty or says 'No plan defined yet'. "
+            "That placeholder is not actionable by itself. Only block when an existing concrete "
+            "plan is now stale or contradicted by the latest activity.\n\n"
             "You may reason through your analysis freely, "
             "but you MUST end your response with exactly one of these lines:\n\n"
             "VERDICT: BLOCK The Plan section currently shows <current state> but <what changed>. "
@@ -14233,6 +17422,28 @@ STOP_EVALUATORS = {
         "requires_session_doc": True,
     },
 }
+
+
+_EVALUATOR_NO_CONTENT_MARKERS = (
+    "no transcript",
+    "without the actual agent message",
+    "actual agent message",
+    "actual final message",
+    "message content was provided",
+    "content was provided",
+    "context appears incomplete",
+    "cannot analyze",
+    "unable to validate",
+    "lacks the actual",
+)
+
+
+_PLAN_AUDITOR_PLACEHOLDER_MARKERS = (
+    "no plan defined",
+    "no plan currently defined",
+    "plan section is empty",
+    "plan section currently empty",
+)
 
 
 def _parse_verdict_from_tail(text: str) -> tuple[str | None, str]:
@@ -14298,10 +17509,24 @@ def _parse_evaluator_result(evaluator_name: str, text: str) -> tuple[bool, str, 
     text = text.strip()
     if not text:
         return False, "", False
+    text_lower = text.lower()
+    if any(marker in text_lower for marker in _EVALUATOR_NO_CONTENT_MARKERS):
+        return False, "", False
+    if evaluator_name == "plan_auditor" and any(
+        marker in text_lower for marker in _PLAN_AUDITOR_PLACEHOLDER_MARKERS
+    ):
+        return False, "", False
 
     verdict, finding = _parse_verdict_from_tail(text)
 
     if verdict == "block":
+        finding_lower = finding.lower()
+        if any(marker in finding_lower for marker in _EVALUATOR_NO_CONTENT_MARKERS):
+            return False, "", False
+        if evaluator_name == "plan_auditor" and any(
+            marker in finding_lower for marker in _PLAN_AUDITOR_PLACEHOLDER_MARKERS
+        ):
+            return False, "", False
         return (
             True,
             finding or f"{evaluator_name.replace('_', ' ').title()} flagged this session",
@@ -14363,7 +17588,8 @@ async def _gather_evaluator_context(
     transcript_rel = await _find_latest_transcript(prefix)
     if transcript_rel:
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["obsidian", "vault=Imperium-ENV", "read", f"path={transcript_rel}"],
                 capture_output=True,
                 text=True,
@@ -14574,6 +17800,15 @@ async def _run_stop_evaluators(
     for name, config in STOP_EVALUATORS.items():
         if config.get("requires_session_doc") and not ctx["session_doc"]:
             continue
+        if (
+            name == "action_validator"
+            and not ctx["recent_tail"].strip()
+            and not ctx["compacted_history"].strip()
+        ):
+            logger.info(
+                f"StopEval: skipping action_validator for {instance_id[:12]} — no transcript content"
+            )
+            continue
         prompt = _build_evaluator_prompt(name, ctx)
         tasks[name] = asyncio.create_task(
             minimax_chat(config["system"], prompt, config["max_tokens"])
@@ -14665,7 +17900,8 @@ async def _run_stop_evaluators(
     if transcript_rel:
         audit_section = f"\n\n## Evaluator Finding\n\n**{nudge_evaluator}**: {nudge_finding}\n"
         try:
-            subprocess.run(
+            await asyncio.to_thread(
+                subprocess.run,
                 [
                     "obsidian",
                     "vault=Imperium-ENV",
@@ -14697,7 +17933,8 @@ async def _find_latest_transcript(instance_id_short: str) -> str | None:
 
     pattern = f"Mars/Logs/Transcripts/{instance_id_short}-*.md"
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["obsidian", "vault=Imperium-ENV", "search", f"query=path:{pattern}"],
             capture_output=True,
             text=True,
@@ -15922,7 +19159,7 @@ async def _state_validator_observed(request: StateValidateRequest):
     key = key.strip().lower()
     work_state = None
     if key.startswith("work.") or key in ("productivity_active", "work_state.productivity_active"):
-        work_state = await compute_work_state()
+        work_state = await get_cached_work_state()
 
     observed_map = {
         "phone.current_app": PHONE_STATE.get("current_app"),
@@ -16097,28 +19334,112 @@ async def get_state():
     }
 
 
-async def _askq_touch2_callback(instance_id: str, question_text: str) -> None:
-    """Touch 2 of the AskUserQuestion ladder: route through enforcement_cascade_started.
+def _askq_label(state: dict | None) -> str:
+    if not state:
+        return "an instance"
+    label = state.get("instance_label") or state.get("tab_name")
+    return label or (state.get("instance_id") or "")[:12] or "an instance"
 
-    Coordinate point with the enforce → custodes wire effort. Today this fires the
-    custodes state event with `enforcement_cascade_started` and starts the existing
-    enforcement cascade machinery using a synthetic app name. If the wire evolves,
-    swap the body here without touching routes/hooks.py.
+
+async def _askq_level1_callback(instance_id: str, question_text: str, state: dict) -> None:
+    """Level 1 of the AskUserQuestion ladder: Discord nudge.
+
+    The TTS re-read fires inline in routes/hooks.py. This callback owns the
+    Discord nudge so the Emperor sees the open question even if TTS was missed.
+    """
+    label = _askq_label(state)
+    snippet = question_text.strip().splitlines()[0] if question_text else ""
+    if len(snippet) > 160:
+        snippet = snippet[:157] + "..."
+    msg = f"Open question on **{label}**: {snippet}" if snippet else f"Open question on **{label}**"
+    try:
+        await unified_enforce(
+            "notify",
+            msg,
+            source="askq_ladder",
+            channel="briefing",
+            phone_params={
+                "vibe": 30,
+                "banner_text": f"AskQ open: {label}",
+                "tts_text": f"You have an open question on {label}.",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"AskQ Level 1: Discord/phone nudge failed: {e}")
+
+
+async def _askq_touch2_callback(instance_id: str, question_text: str) -> None:
+    """Level 2 of the AskUserQuestion ladder: warn without phone-app cascade.
+
+    Coordinate point with the enforce → custodes wire effort. Fires the custodes
+    state event with `enforcement_cascade_started`, but does not route the
+    internal ack name through the phone-app cascade. The historical name
+    `_askq_touch2_callback` is preserved because routes/hooks.py wires it as
+    the level-2 hook.
     """
     app_name = "askuserquestion"
+    question_snippet = question_text[:200]
     try:
         await handle_custodes_state_event(
             "enforcement_cascade_started",
             "askq_ladder",
-            severity=2,
-            payload={"app": app_name, "question": question_text[:200]},
+            severity=3,
+            payload=_enforcement_state_payload(
+                source="askq_ladder",
+                ack_source=app_name,
+                question=question_snippet,
+            ),
         )
     except Exception as e:
-        logger.warning(f"AskQ Touch 2: custodes event failed: {e}")
+        logger.warning(f"AskQ Level 2: custodes event failed: {e}")
     try:
-        start_enforcement_cascade(app_name)
+        await unified_enforce(
+            "warn",
+            f"AskUserQuestion still needs an answer: {question_snippet}",
+            source="askq_ladder",
+            channel="briefing",
+            phone_params={
+                "vibe": 50,
+                "beep": 50,
+                "banner_text": "AskUserQuestion overdue",
+                "tts_text": "AskUserQuestion overdue",
+            },
+        )
     except Exception as e:
-        logger.warning(f"AskQ Touch 2: enforcement cascade start failed: {e}")
+        logger.warning(f"AskQ Level 2: warning enforce failed: {e}")
+
+
+async def _askq_level3_callback(instance_id: str, question_text: str, state: dict) -> None:
+    """Level 3 of the AskUserQuestion ladder: pavlok shock.
+
+    Final tier — same path as expected_ack pavlok. The autonomous fallback
+    prompt is delivered separately by routes/hooks.py via `_askq_send_bust_prompt`.
+    """
+    try:
+        pavlok_result = await asyncio.to_thread(
+            send_pavlok_stimulus,
+            "zap",
+            PAVLOK_CONFIG.get("friday_zap_value", 30),
+            "askq_ladder_bust",
+            True,
+        )
+        await log_event("pavlok_stimulus", details=pavlok_result)
+    except Exception as e:
+        logger.warning(f"AskQ Level 3: pavlok zap failed: {e}")
+    try:
+        await handle_custodes_state_event(
+            "enforcement_cascade_escalate",
+            "askq_ladder",
+            severity=5,
+            payload=_enforcement_state_payload(
+                source="askq_ladder",
+                ack_source="askuserquestion",
+                level=3,
+                question=question_text[:200],
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"AskQ Level 3: custodes event failed: {e}")
 
 
 # Wire hook-route dependencies after hook-owned callbacks are defined.
@@ -16129,7 +19450,11 @@ hooks_init_deps(
     run_stop_evaluators=_run_stop_evaluators,
     auto_name_instance=_auto_name_instance,
     work_action_callback=hook_work_action_callback,
+    schedule_golden_throne_callback=schedule_golden_throne_followup,
+    golden_throne_activity_callback=golden_throne_user_activity,
+    askq_level1_callback=_askq_level1_callback,
     askq_touch2_callback=_askq_touch2_callback,
+    askq_level3_callback=_askq_level3_callback,
 )
 
 
