@@ -27,6 +27,7 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${_LIB_DIR}/origin.sh" 2>/dev/null || true
+source "${_LIB_DIR}/base-staleness.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -353,6 +354,9 @@ Options:
   --no-gt             Opt out of Golden Throne mode (one-off lane, zealotry 3)
   --context <text>    Extra context to include in the dispatch prompt
   --dry-run           Show what would happen without executing
+  --strict-base       Refuse dispatch (non-zero exit) when the worktree's source
+                      branch is behind the parent repo HEAD, or when the parent
+                      repo has uncommitted changes. Default: warn only.
   --list-free         List free tmux panes (reuse windows only) and exit
   -h, --help          Show this help message
 
@@ -380,6 +384,7 @@ GT_MODE=true
 EXTRA_CONTEXT=""
 DRY_RUN=false
 LIST_FREE=false
+STRICT_BASE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -432,6 +437,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --strict-base)
+            STRICT_BASE=true
+            shift
+            ;;
         -*)
             log_error "Unknown option: $1"
             exit 1
@@ -482,6 +491,16 @@ if [[ ! -d "$WORKING_DIR" ]]; then
     exit 1
 fi
 WORKING_DIR=$(cd "$WORKING_DIR" && pwd)
+
+# --- Base-staleness check ---
+# Warn (or refuse, under --strict-base) when the worktree at $WORKING_DIR is
+# dispatched against a branch that lags the parent repo, or when the parent
+# repo has uncommitted changes the worktree won't see. See cli-tools/lib/base-staleness.sh.
+if declare -F check_base_staleness >/dev/null 2>&1; then
+    if ! check_base_staleness "$WORKING_DIR" "$STRICT_BASE"; then
+        exit 2
+    fi
+fi
 
 if $GT_MODE; then
     INSTANCE_TYPE="golden_throne"
@@ -664,26 +683,40 @@ fi
 
 # --- Build the claude launch command ---
 # Claude uses native hook path; Codex uses backend bridge.
+# Use printf %q for any value that may carry user input (DISPATCH_PROMPT carries
+# --context verbatim, so apostrophes inside it must survive). Single-quote
+# wrapping ('${VAR}') is unsafe for values that may contain apostrophes.
 ENV_PREFIX=$(printf '%q ' "${DISPATCH_ENV[@]}")
+DISPATCH_PROMPT_Q=$(printf '%q' "$DISPATCH_PROMPT")
+WORKING_DIR_Q=$(printf '%q' "$WORKING_DIR")
+VAULT_DIR_Q=$(printf '%q' "$VAULT_DIR")
+SESSION_DOC_PATH_Q=$(printf '%q' "${VAULT_DIR}/${SESSION_DOC}")
+DISPATCH_TARGET_Q=$(printf '%q' "$DISPATCH_TARGET")
+TARGET_WINDOW_Q=$(printf '%q' "${TARGET_WINDOW:-}")
+DISPATCH_MODE_Q=$(printf '%q' "$DISPATCH_MODE")
+TARGET_PANE_Q=$(printf '%q' "$TARGET_PANE")
+ZEALOTRY_Q=$(printf '%q' "$ZEALOTRY")
 if [[ "$ENGINE" == "codex" ]]; then
     CODEX_BIN="$(dirname "$(readlink -f "$0")")/codex-dispatch"
-    LAUNCH_CMD="cd '${WORKING_DIR}' && ${ENV_PREFIX}'${CODEX_BIN}' --session-doc '${VAULT_DIR}/${SESSION_DOC}' --dispatch-target '${DISPATCH_TARGET}' --dispatch-window '${TARGET_WINDOW}' --dispatch-mode '${DISPATCH_MODE}'"
+    CODEX_BIN_Q=$(printf '%q' "$CODEX_BIN")
+    LAUNCH_CMD="cd ${WORKING_DIR_Q} && ${ENV_PREFIX}${CODEX_BIN_Q} --session-doc ${SESSION_DOC_PATH_Q} --dispatch-target ${DISPATCH_TARGET_Q} --dispatch-window ${TARGET_WINDOW_Q} --dispatch-mode ${DISPATCH_MODE_Q}"
     if [[ -n "$DISPATCH_SLOT" ]]; then
-        LAUNCH_CMD+=" --dispatch-slot '${DISPATCH_SLOT}'"
+        LAUNCH_CMD+=" --dispatch-slot $(printf '%q' "$DISPATCH_SLOT")"
     fi
     if [[ -n "$PARENT_INSTANCE_ID" ]]; then
-        LAUNCH_CMD+=" --parent '${PARENT_INSTANCE_ID}'"
+        LAUNCH_CMD+=" --parent $(printf '%q' "$PARENT_INSTANCE_ID")"
     fi
-    LAUNCH_CMD+=" --resolved-tmux-pane '${TARGET_PANE}' --launch-mode 'direct_target' --transplant-expected 'false' --launcher 'vault-dispatch'"
+    LAUNCH_CMD+=" --resolved-tmux-pane ${TARGET_PANE_Q} --launch-mode direct_target --transplant-expected false --launcher vault-dispatch"
     if ! $GT_MODE; then
         LAUNCH_CMD+=" --no-gt"
     fi
-    LAUNCH_CMD+=" --zealotry '${ZEALOTRY}' '${WORKING_DIR}' '${DISPATCH_PROMPT}'"
+    LAUNCH_CMD+=" --zealotry ${ZEALOTRY_Q} ${WORKING_DIR_Q} ${DISPATCH_PROMPT_Q}"
 else
     if [[ -n "$PRIMARCH_NAME" ]]; then
-        LAUNCH_CMD="cd '${VAULT_DIR}' && ${ENV_PREFIX}primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
+        PRIMARCH_NAME_Q=$(printf '%q' "$PRIMARCH_NAME")
+        LAUNCH_CMD="cd ${VAULT_DIR_Q} && ${ENV_PREFIX}primarch ${PRIMARCH_NAME_Q} ${DISPATCH_PROMPT_Q}"
     else
-        LAUNCH_CMD="cd '${VAULT_DIR}' && ${ENV_PREFIX}claude --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
+        LAUNCH_CMD="cd ${VAULT_DIR_Q} && ${ENV_PREFIX}claude --dangerously-skip-permissions ${DISPATCH_PROMPT_Q}"
     fi
 fi
 
