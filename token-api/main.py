@@ -6778,6 +6778,38 @@ def _send_enforce_to_phone(app_name: str, level: int) -> dict:
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
 
 
+
+
+def _enforcement_state_payload(
+    *,
+    source: str,
+    app: str | None = None,
+    phone_app: str | None = None,
+    ack_source: str | None = None,
+    **extra,
+) -> dict:
+    """Build Custodes enforcement-state payloads without app/ack slot bleed.
+
+    ``phone_app``/``app`` are foreground application telemetry fields for the
+    phone cascade. Internal acknowledgement identifiers (AskUserQuestion,
+    Golden Throne, expected-ack namespaces) are diagnostic ack sources and must
+    never populate the phone-app/app slots for non-phone emitters.
+    """
+    payload = dict(extra)
+    if source == "phone":
+        resolved_phone_app = phone_app or app
+        if resolved_phone_app is not None:
+            payload["app"] = resolved_phone_app
+        payload["phone_app"] = resolved_phone_app
+    else:
+        if ack_source is None and app is not None:
+            ack_source = app
+        if ack_source is not None:
+            payload["ack_source"] = ack_source
+        payload["phone_app"] = None
+    return payload
+
+
 async def _send_discord_fallback(app_name: str, level: int):
     """Send enforcement command to Discord #fallback via webhook.
 
@@ -6838,7 +6870,7 @@ async def _enforcement_cascade_worker(app_name: str):
         "enforcement_cascade_started",
         "phone",
         severity=2,
-        payload={"app": app_name, "phone_app": app_name},
+        payload=_enforcement_state_payload(source="phone", app=app_name),
     )
 
     # Level 0: Discord fallback (soft close)
@@ -16111,7 +16143,11 @@ async def _askq_touch2_callback(instance_id: str, question_text: str) -> None:
             "enforcement_cascade_started",
             "askq_ladder",
             severity=2,
-            payload={"app": app_name, "question": question_text[:200]},
+            payload=_enforcement_state_payload(
+                source="askq_ladder",
+                ack_source=app_name,
+                question=question_text[:200],
+            ),
         )
     except Exception as e:
         logger.warning(f"AskQ Touch 2: custodes event failed: {e}")
