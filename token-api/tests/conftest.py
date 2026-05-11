@@ -44,6 +44,9 @@ def app_env(tmp_path, monkeypatch):
     async def _no_observed_agents():
         return []
 
+    # Golden Throne fixtures insert Mac-Mini-local instances; pin the
+    # reloaded module so Linux CI does not route them through satellite dispatch.
+    monkeypatch.setattr(main, "LOCAL_DEVICE_NAME", "Mac-Mini")
     monkeypatch.setattr(main, "_tmux_pane_rows", _no_pane_rows)
     monkeypatch.setattr(main, "_detect_tmux_agent_panes", _no_observed_agents)
 
