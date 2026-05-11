@@ -252,6 +252,32 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_polls (
+                poll_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                response_json TEXT,
+                PRIMARY KEY (poll_id, instance_id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_poll
+            ON pending_polls(poll_id, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_instance
+            ON pending_polls(instance_id, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_expires
+            ON pending_polls(expires_at)
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS workflow_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_id TEXT NOT NULL,
