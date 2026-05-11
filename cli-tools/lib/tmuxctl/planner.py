@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+UTC = timezone.utc  # back-compat for Python 3.9-3.10 (macOS system python3 is 3.9)
 
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
 from .labels import (
-    PALACE_GRID_ROLES,
-    PALACE_SIDE_ROLES,
-    SOMNIUM_GRID_ROLES,
-    SOMNIUM_SIDE_ROLES,
+    PALACE_ROLES,
+    SOMNIUM_ROLES,
     canonical_pane_role,
 )
 from .models import (
@@ -35,17 +35,17 @@ def build_restart_plan(
     a registry snapshot that already reflects the current device's instance view.
     """
 
-    pane_by_label = {
-        canonical_pane_role(pane.pane_role): pane
-        for pane in workspace.iter_panes()
-        if pane.pane_role
-    }
+    pane_by_label = {}
+    for pane in workspace.iter_panes():
+        if pane.pane_role:
+            pane_by_label.setdefault(canonical_pane_role(pane.pane_role), pane)
     legal_labels = _legal_restart_labels(workspace)
     issues: list[CoherenceIssue] = []
     resumes: list[PlannedResume] = []
     skipped: list[PlannedResume] = []
 
-    candidates = _dedupe_candidates(_candidate_instances(registry.instances))
+    candidate_instances = _candidate_instances(registry.instances)
+    candidates = _dedupe_candidates(candidate_instances)
     active_labels = [
         canonical_pane_role(inst.pane_label) for inst in candidates if _is_resumable(inst)
     ]
@@ -53,26 +53,26 @@ def build_restart_plan(
         if pane_label and count > 1:
             issues.append(
                 CoherenceIssue(
-                    severity=CoherenceSeverity.ERROR,
+                    severity=CoherenceSeverity.WARNING,
                     code="duplicate_pane_label",
-                    message=f"multiple resumable instances claim {pane_label}",
+                    message=f"multiple resumable instances collapse to {pane_label}; newest candidate wins",
                     pane_label=pane_label,
                 )
             )
 
     duplicate_claims = Counter(
         canonical_pane_role(inst.pane_label)
-        for inst in registry.instances
-        if inst.pane_label and _is_candidate(inst)
+        for inst in candidate_instances
+        if inst.pane_label
     )
 
     for pane_label, count in duplicate_claims.items():
         if count > 1:
             issues.append(
                 CoherenceIssue(
-                    severity=CoherenceSeverity.ERROR,
+                    severity=CoherenceSeverity.WARNING,
                     code="duplicate_pane_label",
-                    message=f"multiple resumable instances claim {pane_label}",
+                    message=f"multiple registry instances collapse to {pane_label}; stale losers skipped",
                     pane_label=pane_label,
                 )
             )
@@ -91,6 +91,7 @@ def build_restart_plan(
                     disposition=disposition,
                     reason="target pane hidden in current topology; resolve after rebuild",
                     target_hidden_until_rebuild=True,
+                    tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
                 )
                 if disposition is ResumeDisposition.SKIP:
                     skipped.append(planned)
@@ -114,6 +115,7 @@ def build_restart_plan(
                         working_dir=inst.working_dir,
                         disposition=ResumeDisposition.SKIP,
                         reason="target pane missing from workspace snapshot",
+                        tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
                     )
                 )
             continue
@@ -133,12 +135,13 @@ def build_restart_plan(
                 )
             )
 
-        if "claude" in target_pane.current_command:
+        current_command = target_pane.current_command.lower()
+        if any(agent in current_command for agent in ("claude", "codex", "node")):
             issues.append(
                 CoherenceIssue(
                     severity=CoherenceSeverity.ERROR,
                     code="target_busy",
-                    message=f"target pane {target_pane.pane_id} already appears to be running claude",
+                    message=f"target pane {target_pane.pane_id} already appears to be running an agent",
                     instance_id=inst.instance_id,
                     pane_label=pane_label,
                     pane_id=target_pane.pane_id,
@@ -154,6 +157,7 @@ def build_restart_plan(
             disposition=disposition,
             reason=_resume_reason(inst, disposition),
             target_hidden_until_rebuild=False,
+            tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
         )
         if disposition is ResumeDisposition.SKIP:
             skipped.append(planned)
@@ -259,11 +263,9 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
     legal: set[str] = set()
     for window in workspace.windows:
         if window.archetype.value == "palace":
-            legal.update(PALACE_SIDE_ROLES)
-            legal.update(PALACE_GRID_ROLES)
+            legal.update(PALACE_ROLES)
         elif window.archetype.value == "somnium":
-            legal.update(SOMNIUM_GRID_ROLES)
-            legal.update(SOMNIUM_SIDE_ROLES)
+            legal.update(SOMNIUM_ROLES)
         elif window.archetype.value in {"legion_stack", "mechanicus_stack", "tui_single"}:
             legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
     return legal
@@ -283,3 +285,12 @@ def _resume_reason(instance: InstanceRegistryEntry, disposition: ResumeDispositi
     if disposition is ResumeDisposition.RESUME:
         return "instance has resumable registry state"
     return f"instance status {instance.status.value} is not resumable"
+
+
+def _orchestrator_tombstone_role(instance: InstanceRegistryEntry, pane_label: str) -> str:
+    legion = instance.legion.strip().lower()
+    if legion == "custodes" and pane_label != "legion:custodes":
+        return "legion:custodes"
+    if legion == "fabricator" and pane_label != "mechanicus:fabricator-general":
+        return "mechanicus:fabricator-general"
+    return ""

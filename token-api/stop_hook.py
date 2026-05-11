@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from instance_mutation import sanctioned_update_instance_sync
+from pane_surface import human_tab_name
 
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
@@ -704,7 +705,8 @@ def _notify_tts_queue(session_id, tab_name):
         if count == 0:
             return
 
-        msg = f"{tab_name} has {count} TTS item{'s' if count != 1 else ''} queued"
+        surface = human_tab_name(tab_name) or session_id[:12]
+        msg = f"{surface} has {count} TTS item{'s' if count != 1 else ''} queued"
         print(f"[info] TTS queue alert: {msg}", file=sys.stderr)
 
         # Fire AHK notification to WSL satellite

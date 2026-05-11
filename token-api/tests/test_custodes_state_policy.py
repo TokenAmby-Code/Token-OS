@@ -84,6 +84,41 @@ def test_prompt_includes_enriched_snapshot_fields():
     assert "thread_names=legion-a" in intervention.prompt
 
 
+def test_internal_enforcement_sources_are_labeled_as_ack_sources():
+    for source, internal_name in (
+        ("askq_ladder", "askuserquestion"),
+        ("golden_throne", "golden_throne"),
+    ):
+        intervention = evaluate_state_event(
+            StateEvent(
+                event_type="enforcement_cascade_started",
+                source=source,
+                payload={"ack_source": internal_name, "phone_app": None},
+            ),
+            {"phone": {"current_app": "slay_the_spire"}},
+        )
+
+        assert intervention is not None
+        assert f"ack_source={internal_name}" in intervention.prompt
+        assert f"app={internal_name}" not in intervention.prompt
+        assert f"phone_app={internal_name}" not in intervention.prompt
+        assert "phone_app=slay_the_spire" not in intervention.prompt
+
+
+def test_phone_source_app_still_labels_as_phone_app():
+    intervention = evaluate_state_event(
+        StateEvent(
+            event_type="enforcement_cascade_started",
+            source="phone",
+            payload={"app": "slay_the_spire"},
+        ),
+        {},
+    )
+
+    assert intervention is not None
+    assert "phone_app=slay_the_spire" in intervention.prompt
+
+
 def test_cascade_escalate_emits_intervention_with_level_dedupe():
     event = StateEvent(
         event_type="enforcement_cascade_escalate",

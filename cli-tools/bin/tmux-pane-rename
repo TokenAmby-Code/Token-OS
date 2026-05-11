@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# tmux-pane-rename - Rename the Token-API instance bound to a tmux pane
+# TAGS: tmux, instance
+# AUDIENCE: human
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+PANE="${1:-}"
+NAME="${2:-}"
+
+if [[ -z "$PANE" || -z "$NAME" ]]; then
+    tmux display-message "rename: pane and name required" 2>/dev/null || true
+    exit 1
+fi
+
+INSTANCES=$(curl -s --connect-timeout 2 "$API_URL/api/instances" 2>/dev/null || true)
+INSTANCE_ID=$(printf '%s' "$INSTANCES" | jq -r --arg pane "$PANE" \
+    '.[] | select(.tmux_pane == $pane and (.status != "stopped")) | .id' 2>/dev/null | head -1)
+
+if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+    tmux display-message "rename: no active instance for $PANE" 2>/dev/null || true
+    exit 1
+fi
+
+if RESPONSE=$(instance-name "$NAME" --id "$INSTANCE_ID" --no-ui 2>&1); then
+    INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$INSTANCE_ID" 2>/dev/null || true)
+    TAB_NAME=$(printf '%s' "$INSTANCE_DATA" | jq -r '.tab_name // empty' 2>/dev/null || true)
+    if [[ -n "$TAB_NAME" ]]; then
+        claude-cmd --instance "$INSTANCE_ID" "/rename $TAB_NAME" >/dev/null 2>&1 || true
+    fi
+    tmux display-message "${RESPONSE}; sent /rename ${TAB_NAME:-$NAME}" 2>/dev/null || true
+else
+    tmux display-message "rename failed: $RESPONSE" 2>/dev/null || true
+    exit 1
+fi

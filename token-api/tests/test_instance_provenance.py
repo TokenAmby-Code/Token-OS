@@ -1,6 +1,7 @@
 """Tests for instance provenance logging and reconciliation surfaces."""
 
 import sqlite3
+import sys
 import uuid
 
 import pytest
@@ -68,6 +69,67 @@ class TestProvenance:
         assert rows[0]["mutation_type"] == "instance_registered"
         assert rows[0]["write_source"] == "hooks"
         assert rows[0]["actor"] == "SessionStart"
+
+    def test_session_start_reactivates_existing_stopped_codex_row(
+        self, client, app_env, monkeypatch
+    ):
+        instance_id = str(uuid.uuid4())
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, synced, tmux_pane, pane_label, engine, stopped_at,
+                registered_at, last_activity)
+               VALUES (?, ?, 'stale codex', '/tmp/old', 'local', 'Mac-Mini',
+                       'stopped', 0, '%old', 'somnium:NW', 'codex',
+                       '2026-01-01T00:00:00',
+                       '2026-01-01T00:00:00', '2026-01-01T00:00:00')""",
+            (instance_id, str(uuid.uuid4())),
+        )
+        conn.commit()
+        conn.close()
+
+        async def pane_label(pane):
+            assert pane == "%new"
+            return "somnium:NE"
+
+        monkeypatch.setattr(sys.modules["routes.hooks"], "_tmux_pane_label", pane_label)
+
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": instance_id,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "pid": 4242,
+                "tmux_pane": "%new",
+                "env": {
+                    "TOKEN_API_ENGINE": "codex",
+                    "TOKEN_API_LAUNCHER": "codex-dispatch",
+                    "TOKEN_API_WRAPPER_LAUNCH_ID": "bridge-1",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["action"] == "reregistered"
+
+        conn = _db(app_env)
+        row = conn.execute(
+            """SELECT status, stopped_at, tmux_pane, pane_label, working_dir,
+                      pid, engine, launcher, wrapper_launch_id
+               FROM claude_instances WHERE id = ?""",
+            (instance_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "idle"
+        assert row["stopped_at"] is None
+        assert row["tmux_pane"] == "%new"
+        assert row["pane_label"] == "somnium:NE"
+        assert row["working_dir"] == "/Volumes/Imperium/Imperium-ENV"
+        assert row["pid"] == 4242
+        assert row["engine"] == "codex"
+        assert row["launcher"] == "codex-dispatch"
+        assert row["wrapper_launch_id"] == "bridge-1"
 
     def test_manual_assign_doc_writes_continuity_mutation(self, client, app_env):
         instance_id = _session_start(client)

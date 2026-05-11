@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+# macrodroid-validate - Validate official MacroDroid .macro wrapper JSON
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+DEFAULT_SCHEMA = Path('/Volumes/Imperium/Token-OS/mobile/macrodroid-llm-schema.yaml')
+
+
+def load_json(path):
+    if path == '-':
+        return json.load(sys.stdin)
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def extract_class_sets(schema_path):
+    classes = {'Trigger': set(), 'Action': set(), 'Constraint': set()}
+    if not schema_path or not schema_path.exists():
+        return classes
+    text = schema_path.read_text(errors='ignore')
+    for m in re.finditer(r'^\s{4}([A-Za-z][A-Za-z0-9_]*(Trigger|Action|Constraint)):\s*$', text, re.M):
+        name, suffix = m.group(1), m.group(2)
+        classes[suffix].add(name)
+    classes['Trigger'].add('EmptyTrigger')
+    return classes
+
+
+def item_list(macro, key, errors):
+    value = macro.get(key, [])
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        errors.append(f'macro.{key} must be an array')
+        return []
+    return value
+
+
+def validate(data, classes, allow_unknown=False, allow_mdr_guids=False):
+    errors = []
+    warnings = []
+
+    if not isinstance(data, dict):
+        return ['root must be a JSON object'], []
+
+    # Official .macro export wrapper. No bare macros, no legacy YAML, no shims.
+    if data.get('macroExportVersion') != 1:
+        errors.append('macroExportVersion must be 1')
+    if 'macro' not in data:
+        errors.append('missing top-level macro')
+    if not isinstance(data.get('globalVariables'), list):
+        errors.append('top-level globalVariables must be present and must be an array')
+    if 'userIcons' not in data:
+        errors.append('top-level userIcons must be present; use null when unused')
+    if not isinstance(data.get('aiFeedback'), str):
+        errors.append('top-level aiFeedback must be present and must be a string')
+
+    macro = data.get('macro')
+    if macro is None:
+        warnings.append('macro is null; valid as an AI failure payload but imports no macro')
+        return errors, warnings
+    if not isinstance(macro, dict):
+        errors.append('macro must be an object or null')
+        return errors, warnings
+
+    required_macro = ['m_name', 'm_enabled', 'm_completed', 'm_GUID', 'aiGenerated', 'm_description', 'm_triggerList', 'm_actionList']
+    for key in required_macro:
+        if key not in macro:
+            errors.append(f'macro missing required field {key}')
+
+    if macro.get('m_completed') is not True:
+        errors.append('macro.m_completed must be true')
+    if macro.get('aiGenerated') != 1:
+        errors.append('macro.aiGenerated must be 1')
+    if not allow_mdr_guids and macro.get('m_GUID') != 0:
+        errors.append('macro.m_GUID must be 0 for importable official .macro JSON')
+
+    triggers = item_list(macro, 'm_triggerList', errors)
+    actions = item_list(macro, 'm_actionList', errors)
+    constraints = item_list(macro, 'm_constraintList', errors)
+
+    if isinstance(triggers, list) and len(triggers) == 0:
+        errors.append('m_triggerList must contain at least one trigger; use EmptyTrigger for manual-only macros')
+
+    for list_key, expected, seq in [
+        ('m_triggerList', 'Trigger', triggers),
+        ('m_actionList', 'Action', actions),
+        ('m_constraintList', 'Constraint', constraints),
+    ]:
+        for i, item in enumerate(seq):
+            if not isinstance(item, dict):
+                errors.append(f'{list_key}[{i}] must be an object')
+                continue
+            ct = item.get('m_classType')
+            if not isinstance(ct, str) or not ct:
+                errors.append(f'{list_key}[{i}] missing string m_classType')
+                continue
+            if not ct.endswith(expected):
+                errors.append(f'{list_key}[{i}] has {ct}; expected a {expected} class in {list_key}')
+            if classes[expected] and ct not in classes[expected]:
+                msg = f'{list_key}[{i}] class {ct} is not present in official schema catalog'
+                (warnings if allow_unknown else errors).append(msg)
+            if 'm_SIGUID' not in item:
+                errors.append(f'{list_key}[{i}] {ct} missing m_SIGUID')
+
+            # Item-level constraints must themselves be constraints.
+            item_constraints = item.get('m_constraintList', [])
+            if item_constraints is None:
+                item_constraints = []
+            if not isinstance(item_constraints, list):
+                errors.append(f'{list_key}[{i}] {ct}.m_constraintList must be an array when present')
+            else:
+                for j, c in enumerate(item_constraints):
+                    ctype = c.get('m_classType') if isinstance(c, dict) else None
+                    if not isinstance(c, dict) or not isinstance(ctype, str):
+                        errors.append(f'{list_key}[{i}] {ct}.m_constraintList[{j}] must be a constraint object')
+                    elif not ctype.endswith('Constraint'):
+                        errors.append(f'{list_key}[{i}] {ct}.m_constraintList[{j}] has {ctype}; expected Constraint')
+
+    # Flat action control-flow sanity checks.
+    if_depth = 0
+    loop_depth = 0
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        ct = action.get('m_classType')
+        if ct == 'IfConditionAction':
+            if_depth += 1
+            if not action.get('m_constraintList'):
+                warnings.append(f'm_actionList[{i}] IfConditionAction has no constraints; condition is effectively always true')
+        elif ct in ('ElseAction', 'ElseIfConditionAction'):
+            if if_depth <= 0:
+                errors.append(f'm_actionList[{i}] {ct} without open IfConditionAction')
+        elif ct == 'EndIfAction':
+            if_depth -= 1
+            if if_depth < 0:
+                errors.append(f'm_actionList[{i}] EndIfAction without matching IfConditionAction')
+                if_depth = 0
+        elif ct == 'LoopAction':
+            loop_depth += 1
+        elif ct == 'EndLoopAction':
+            loop_depth -= 1
+            if loop_depth < 0:
+                errors.append(f'm_actionList[{i}] EndLoopAction without matching LoopAction')
+                loop_depth = 0
+    if if_depth:
+        errors.append(f'm_actionList has {if_depth} unterminated IfConditionAction block(s)')
+    if loop_depth:
+        errors.append(f'm_actionList has {loop_depth} unterminated LoopAction block(s)')
+
+    return errors, warnings
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Validate official MacroDroid .macro wrapper JSON')
+    ap.add_argument('file', help='official .macro JSON file, or - for stdin')
+    ap.add_argument('--schema', default=str(DEFAULT_SCHEMA), help='MacroDroid LLM schema YAML path')
+    ap.add_argument('--allow-unknown', action='store_true', help='warn instead of fail for classes missing from schema catalog')
+    ap.add_argument('--allow-mdr-guids', action='store_true', help='allow non-zero macro GUIDs from raw .mdr exports')
+    ap.add_argument('--quiet', action='store_true', help='only print errors/warnings')
+    args = ap.parse_args()
+
+    try:
+        data = load_json(args.file)
+    except Exception as e:
+        print(f'ERROR: invalid JSON: {e}', file=sys.stderr)
+        return 2
+
+    classes = extract_class_sets(Path(args.schema) if args.schema else None)
+    errors, warnings = validate(data, classes, allow_unknown=args.allow_unknown, allow_mdr_guids=args.allow_mdr_guids)
+
+    for w in warnings:
+        print(f'WARN: {w}', file=sys.stderr)
+    for e in errors:
+        print(f'ERROR: {e}', file=sys.stderr)
+
+    if errors:
+        return 1
+    if not args.quiet:
+        macro = data.get('macro') or {}
+        print(f'OK: {macro.get("m_name", "<null macro>")}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

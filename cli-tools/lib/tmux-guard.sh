@@ -33,9 +33,18 @@
 tmux_pane_has_input() {
     local pane="$1"
 
-    # Capture just the cursor line (last line with content)
+    # Capture just the cursor line (last line with content), filtering out
+    # Claude Code / Codex status chrome that confuses the prompt-marker heuristic:
+    #   "  4% 38k/1.0M $0.19"             — Claude Code context % footer (the `%` was a false-positive prompt marker)
+    #   "  ⏵⏵ bypass permissions ..."      — Claude Code hint line
+    #   "  esc again to edit previous ..." — Codex CLI hint line
     local last_line
-    last_line=$(tmux capture-pane -t "$pane" -p 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -1)
+    last_line=$(tmux capture-pane -t "$pane" -p 2>/dev/null \
+        | sed '/^[[:space:]]*$/d' \
+        | grep -vE '^[[:space:]]*[0-9]+%[[:space:]]+[0-9]' \
+        | grep -vE '^[[:space:]]*⏵' \
+        | grep -vE '^[[:space:]]*esc again' \
+        | tail -1)
 
     # Empty pane or no content
     [[ -z "$last_line" ]] && return 1

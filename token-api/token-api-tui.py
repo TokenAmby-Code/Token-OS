@@ -238,7 +238,7 @@ def publish_selection_state(displayed: list, cron_jobs: list, archived: list) ->
 def check_api_health() -> tuple[bool, str | None]:
     """Check if the API server is reachable."""
     try:
-        req = urllib.request.Request(f"{API_URL}/api/instances", method="GET")
+        req = urllib.request.Request(f"{API_URL}/health", method="GET")
         with urllib.request.urlopen(req, timeout=3) as response:
             if response.status == 200:
                 return True, None
@@ -448,7 +448,7 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
 def get_instances():
     """Fetch all instances from the API with current sort order."""
     try:
-        req = urllib.request.Request(f"{API_URL}/api/instances?sort={sort_mode}")
+        req = urllib.request.Request(f"{API_URL}/api/instances?sort={sort_mode}&limit=300")
         with urllib.request.urlopen(req, timeout=3) as response:
             return json.loads(response.read().decode())
     except Exception:
@@ -515,8 +515,8 @@ def kill_instance(instance_id: str) -> dict:
             headers={"Content-Type": "application/json"},
             data=b"{}",
         )
-        resp = urllib.request.urlopen(req, timeout=20)  # longer timeout for SIGINT×2 sequence
-        return json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
@@ -536,8 +536,8 @@ def unstick_instance(instance_id: str, level: int = 1) -> dict:
             headers={"Content-Type": "application/json"},
             data=b"{}",
         )
-        resp = urllib.request.urlopen(req, timeout=10)  # 4s server wait + margin
-        return json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
@@ -4014,7 +4014,8 @@ def main():
                                     headers={"Content-Type": "application/json"},
                                     data=b"{}",
                                 )
-                                urllib.request.urlopen(req, timeout=5)
+                                with urllib.request.urlopen(req, timeout=5):
+                                    pass
                                 resume_feedback = (
                                     time.time(),
                                     f"Archived {format_instance_name(instance)}",
@@ -4033,7 +4034,8 @@ def main():
                                         headers={"Content-Type": "application/json"},
                                         data=b"{}",
                                     )
-                                    urllib.request.urlopen(req, timeout=5)
+                                    with urllib.request.urlopen(req, timeout=5):
+                                        pass
                                     resume_feedback = (
                                         time.time(),
                                         f"Unarchived {format_instance_name(instance)}",
@@ -4067,7 +4069,8 @@ def main():
                                     headers={"Content-Type": "application/json"},
                                     data=body,
                                 )
-                                urllib.request.urlopen(req, timeout=5)
+                                with urllib.request.urlopen(req, timeout=5):
+                                    pass
                                 resume_feedback = (time.time(), f"Type → {new_type}")
                             except KeyboardInterrupt:
                                 pass

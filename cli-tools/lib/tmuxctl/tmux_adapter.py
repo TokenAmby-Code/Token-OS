@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 
 class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
+
+
+DEFAULT_SUBMIT_SETTLE_SECONDS = 0.3
 
 
 class TmuxAdapter:
@@ -162,3 +166,32 @@ class TmuxAdapter:
 
     def send_keys(self, target: str, *keys: str) -> None:
         self.run("send-keys", "-t", target, *keys)
+
+    def send_text_then_submit(
+        self,
+        target: str,
+        text: str,
+        *,
+        clear_prompt: bool = False,
+        submit_settle_seconds: float = DEFAULT_SUBMIT_SETTLE_SECONDS,
+    ) -> None:
+        """Inject literal text and submit robustly.
+
+        2026-05-10 live Codex repro: a prompt left queued by immediate
+        text+submit was submitted by a later standalone key: ``tmux send-keys
+        -t %119 Enter`` submitted the queued prompt and ``tmux send-keys -t
+        %124 C-m`` submitted the queued prompt. That means the recovery token is
+        a second submit after the TUI has had time to ingest the queued text.
+
+        Implementation: send literal text, send C-m once, wait, then send C-m
+        again. If the first C-m submits normally, the second C-m lands on an
+        empty prompt and is a no-op in Claude/Codex. If the first C-m was
+        swallowed as a newline, the delayed second C-m submits the queued prompt.
+        """
+        if clear_prompt:
+            self.send_keys(target, "C-u")
+        self.run("send-keys", "-t", target, "-l", text)
+        self.send_keys(target, "C-m")
+        if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
+            self.send_keys(target, "C-m")

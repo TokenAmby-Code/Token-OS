@@ -142,6 +142,9 @@ fi
 # --- Send the prompt (guarded) ---
 # Wait for user to finish typing before injecting
 tmux_send_guarded -t "$TARGET" -l "$TEXT"
-tmux_send_guarded -t "$TARGET" Enter
+# Claude Code and Codex can interpret tmux's Enter key token as an
+# in-prompt newline in some states. C-m is the PTY carriage-return submit
+# event; use it for automated prompt delivery.
+tmux_send_guarded -t "$TARGET" C-m
 
 echo "Prompt injected into $TARGET" >&2

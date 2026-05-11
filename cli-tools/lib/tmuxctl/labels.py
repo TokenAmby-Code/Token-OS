@@ -13,13 +13,56 @@ POSITION_ALIASES = {
 
 POSITION_LEGACY_ALIASES = {value: key for key, value in POSITION_ALIASES.items()}
 
-CARDINAL_GRID = ("NW", "NE", "SW", "SE")
-CARDINAL_SIDE = ("WW", "EE")
+# Canonical workspace roles after the 2026 tmuxctl layout overhaul.
+#
+# palace:  4-pane H layout: W | N/S | E
+# somnium: 5-pane layout: W | N/NE/S/SE
+PALACE_GRID_ROLES = ("palace:N", "palace:S")
+PALACE_SIDE_ROLES = ("palace:W", "palace:E")
+PALACE_ROLES = PALACE_SIDE_ROLES[:1] + PALACE_GRID_ROLES + PALACE_SIDE_ROLES[1:]
 
-PALACE_GRID_ROLES = tuple(f"palace:{slot}" for slot in CARDINAL_GRID)
-PALACE_SIDE_ROLES = tuple(f"palace:{slot}" for slot in CARDINAL_SIDE)
-SOMNIUM_GRID_ROLES = tuple(f"somnium:{slot}" for slot in CARDINAL_GRID)
-SOMNIUM_SIDE_ROLES = ("somnium:EE",)
+SOMNIUM_SIDE_ROLES = ("somnium:W",)
+SOMNIUM_GRID_ROLES = ("somnium:N", "somnium:NE", "somnium:S", "somnium:SE")
+SOMNIUM_ROLES = SOMNIUM_SIDE_ROLES + SOMNIUM_GRID_ROLES
+
+PAGE_POSITION_ALIASES = {
+    "palace": {
+        "WW": "W",
+        "EE": "E",
+        "SL": "W",
+        "SR": "E",
+        "NW": "N",
+        "NE": "N",
+        "TL": "N",
+        "TR": "N",
+        "SW": "S",
+        "SE": "S",
+        "BL": "S",
+        "BR": "S",
+    },
+    "somnium": {
+        "NW": "W",
+        "SW": "W",
+        "TL": "W",
+        "BL": "W",
+        # old right-grid slots keep their right-column semantics
+        "TR": "NE",
+        "BR": "SE",
+    },
+}
+
+PAGE_LEGACY_POSITION_ALIASES = {
+    "palace": {
+        "W": "WW",
+        "E": "EE",
+        "N": "NW",
+        "S": "SW",
+    },
+    "somnium": {
+        "W": "NW",
+        "N": "NE",
+    },
+}
 
 
 def canonical_position(position: str) -> str:
@@ -36,7 +79,8 @@ def canonical_pane_role(role: str) -> str:
     if ":" not in role:
         return role
     page, position = role.rsplit(":", 1)
-    return f"{page}:{canonical_position(position)}"
+    position = PAGE_POSITION_ALIASES.get(page, {}).get(position, canonical_position(position))
+    return f"{page}:{position}"
 
 
 def legacy_pane_role(role: str) -> str:
@@ -45,7 +89,8 @@ def legacy_pane_role(role: str) -> str:
     if ":" not in role:
         return role
     page, position = role.rsplit(":", 1)
-    return f"{page}:{legacy_position(position)}"
+    position = PAGE_LEGACY_POSITION_ALIASES.get(page, {}).get(position, legacy_position(position))
+    return f"{page}:{position}"
 
 
 def pane_role_aliases(role: str) -> tuple[str, ...]:

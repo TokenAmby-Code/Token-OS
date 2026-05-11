@@ -17,6 +17,7 @@ PAGE_AUDIENCE = {
 
 AUDIENCE_ROLES = {
     "legion:custodes",
+    "mechanicus:fabricator-general",
 }
 
 
@@ -213,9 +214,45 @@ def _list_audience_panes(
 
 
 def _select_pane(adapter: TmuxAdapter, pane_id: str) -> None:
-    target_window = _show(adapter, pane_id, "#{session_name}:#{window_id}")
+    target_window = _show(adapter, pane_id, "#{session_name}:#{window_index}")
+    _switch_client(adapter, target_window)
     adapter.run("select-window", "-t", target_window, allow_failure=True)
     adapter.run("select-pane", "-t", pane_id, allow_failure=True)
+
+
+def _switch_client(adapter: TmuxAdapter, target_window: str, client: str = "") -> None:
+    if client:
+        adapter.run("switch-client", "-c", client, "-t", target_window, allow_failure=True)
+        return
+    adapter.run("switch-client", "-t", target_window, allow_failure=True)
+
+
+def _select_pane_for_client(adapter: TmuxAdapter, pane_id: str, client: str = "") -> None:
+    target_window = _show(adapter, pane_id, "#{session_name}:#{window_index}")
+    _switch_client(adapter, target_window, client)
+    adapter.run("select-window", "-t", target_window, allow_failure=True)
+    adapter.run("select-pane", "-t", pane_id, allow_failure=True)
+
+
+def _select_tui_window(adapter: TmuxAdapter, session_name: str, client: str = "") -> None:
+    target = f"{session_name}:tui"
+    _switch_client(adapter, target, client)
+    adapter.run("select-window", "-t", target)
+    adapter.run("select-pane", "-t", f"{target}.1", allow_failure=True)
+
+
+def _display_role(adapter: TmuxAdapter, target: str) -> str:
+    if not target:
+        return ""
+    role = _pane_option(adapter, target, "@PANE_ID")
+    if not role:
+        return target
+    canonical = canonical_pane_role(role)
+    return canonical.removeprefix("audience:")
+
+
+def _display_chain(chain: tuple[str, ...]) -> str:
+    return " -> ".join(role.removeprefix("audience:") for role in chain)
 
 
 def _native_zoom(adapter: TmuxAdapter, pane_id: str) -> str:
@@ -357,32 +394,41 @@ def audience_expand(adapter: TmuxAdapter, target: str) -> str:
         _clear_pane_option(adapter, pane_id, "@AUDIENCE_SOURCE_PANE_TYPE")
     _clear_pane_option(adapter, pane_id, "@TOMBSTONE_TARGET")
     _select_pane(adapter, pane_id)
-    return f"expanded {role} to {PAGE_AUDIENCE[page]} ({pane_id})"
+    return f"expanded {role} to {PAGE_AUDIENCE[page]}"
 
 
-def audience_jump(adapter: TmuxAdapter, target: str) -> str:
+def audience_jump(adapter: TmuxAdapter, target: str, *, client: str = "") -> str:
     resolved = resolve_pane(adapter, target)
-    _select_pane(adapter, resolved.pane_id)
-    chain = " -> ".join(resolved.chain)
-    return f"selected {resolved.pane_id}" + (f" via {chain}" if chain else "")
+    _select_pane_for_client(adapter, resolved.pane_id, client)
+    chain = _display_chain(resolved.chain)
+    destination = _display_role(adapter, resolved.pane_id)
+    return f"selected {destination}" + (f" via {chain}" if chain else "")
 
 
-def audience_return(adapter: TmuxAdapter, target: str) -> str:
+def audience_return(adapter: TmuxAdapter, target: str, *, client: str = "") -> str:
     resolved = resolve_pane(adapter, target)
     pane_id = resolved.pane_id
     source_role = _pane_option(adapter, pane_id, "@TOMBSTONE_SOURCE")
     _restore_audience_pane(adapter, pane_id, source_role, select=True)
-    return f"returned {pane_id} to {source_role}"
+    if client:
+        _select_pane_for_client(adapter, pane_id, client)
+    return f"returned {source_role}"
 
 
-def audience_toggle(adapter: TmuxAdapter, target: str) -> str:
+def audience_toggle(adapter: TmuxAdapter, target: str, *, client: str = "") -> str:
     context = _pane_context(adapter, target)
     pane_id = context.pane_id
     pane_type = context.pane_type
     window_name = _window_base(context.window_name)
 
+    if pane_type == PaneKind.TUI.value and window_name != "tui":
+        _select_tui_window(adapter, context.session_name, client)
+        return f"selected {context.session_name}:tui"
     if pane_type == PaneKind.TOMBSTONE.value:
-        return audience_jump(adapter, pane_id)
+        return audience_jump(adapter, pane_id, client=client)
     if window_name in set(PAGE_AUDIENCE.values()):
-        return audience_return(adapter, pane_id)
-    return audience_expand(adapter, pane_id)
+        return audience_return(adapter, pane_id, client=client)
+    # Audience expansion is retired as a focus/expand control path. Keep the
+    # command automation-safe by falling back to native tmux zoom instead of
+    # moving panes through audience/tombstone topology.
+    return _native_zoom(adapter, pane_id)

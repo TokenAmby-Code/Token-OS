@@ -38,11 +38,11 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}>${NC} $1"; }
-log_success() { echo -e "${GREEN}+${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}x${NC} $1"; }
-log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}+${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error()   { echo -e "${RED}x${NC} $1" >&2; }
+log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
@@ -459,8 +459,8 @@ fi
 # --- Validate inputs ---
 if [[ -z "$SESSION_DOC" || -z "$WORKING_DIR" ]]; then
     log_error "Both <session-doc> and <working-dir> are required"
-    echo "Usage: vault-dispatch <session-doc> <working-dir> [options]"
-    echo "       vault-dispatch --list-free"
+    echo "Usage: vault-dispatch <session-doc> <working-dir> [options]" >&2
+    echo "       vault-dispatch --list-free" >&2
     exit 1
 fi
 
@@ -616,11 +616,11 @@ else
         done < <(find_free_panes)
         if [[ -z "$TARGET_PANE" ]]; then
             log_error "No free panes in the palace/somnium reuse windows"
-            echo ""
-            echo "  Options:"
-            echo "  1. Use --window legion (default) to create a stack pane"
-            echo "  2. Use --pane <id> to target a specific pane"
-            echo "  3. Stop an existing instance first"
+            echo "" >&2
+            echo "  Options:" >&2
+            echo "  1. Use --window legion (default) to create a stack pane" >&2
+            echo "  2. Use --pane <id> to target a specific pane" >&2
+            echo "  3. Stop an existing instance first" >&2
             exit 1
         fi
         PANE_MODE="reuse"

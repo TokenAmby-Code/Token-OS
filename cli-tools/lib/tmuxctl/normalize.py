@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from .labels import canonical_pane_role
+from .labels import PALACE_SIDE_ROLES, SOMNIUM_SIDE_ROLES, canonical_pane_role
+from .layout import WORKSPACE_LAYOUT
 from .tmux_adapter import TmuxAdapter
 
 GRID_STATE_SMALL = "small"
 GRID_STATE_SIDE = "side"
-
-PALACE_SIDE_RATIO = 20
-SOMNIUM_SIDE_RATIO = 33
+SIDE_ROLES = set(PALACE_SIDE_ROLES + SOMNIUM_SIDE_ROLES)
 
 
 def _window_base(window_name: str) -> str:
@@ -64,7 +63,11 @@ def _grid_panes(adapter: TmuxAdapter, target: str) -> list[dict[str, str]]:
 
 
 def _side_panes(adapter: TmuxAdapter, target: str) -> list[dict[str, str]]:
-    return [row for row in _pane_rows(adapter, target) if row["grid_state"] == GRID_STATE_SIDE]
+    return [
+        row for row in _pane_rows(adapter, target)
+        if row["grid_state"] == GRID_STATE_SIDE
+        or canonical_pane_role(row["pane_role"]) in SIDE_ROLES
+    ]
 
 
 def _current_path(adapter: TmuxAdapter, target: str) -> str:
@@ -102,50 +105,46 @@ def _split_window(
 
 def _ensure_palace_side_slots(adapter: TmuxAdapter, target: str, win_w: int) -> None:
     pane_tags = set(_pane_tags(adapter, target))
-    side_w = ((win_w - 5) * PALACE_SIDE_RATIO) // 100
+    side_w = WORKSPACE_LAYOUT.palace.side_width(win_w)
     path = _current_path(adapter, target)
 
-    if "palace:WW" not in pane_tags:
+    if "palace:W" not in pane_tags:
         first_pane = adapter.run("list-panes", "-t", target, "-F", "#{pane_id}").splitlines()[0]
         new_left = _split_window(adapter, first_pane, True, side_w, path)
-        _set_pane_option(adapter, new_left, "@PANE_ID", "palace:WW")
+        _set_pane_option(adapter, new_left, "@PANE_ID", "palace:W")
         _set_pane_option(adapter, new_left, "@GRID_STATE", GRID_STATE_SIDE)
         _set_pane_option(adapter, new_left, "@GRID_RESERVED", "false")
 
-    if "palace:EE" not in pane_tags:
+    if "palace:E" not in pane_tags:
         new_right = _split_window(adapter, _last_pane_id(adapter, target), False, side_w, path)
-        _set_pane_option(adapter, new_right, "@PANE_ID", "palace:EE")
+        _set_pane_option(adapter, new_right, "@PANE_ID", "palace:E")
         _set_pane_option(adapter, new_right, "@GRID_STATE", GRID_STATE_SIDE)
         _set_pane_option(adapter, new_right, "@GRID_RESERVED", "false")
 
 
 def _ensure_somnium_side_slot(adapter: TmuxAdapter, target: str, win_w: int) -> None:
     pane_tags = set(_pane_tags(adapter, target))
-    if "somnium:EE" in pane_tags:
+    if "somnium:W" in pane_tags:
         return
 
-    side_w = ((win_w - 2) * SOMNIUM_SIDE_RATIO) // 100
+    side_w = WORKSPACE_LAYOUT.somnium.west_width(win_w)
     path = _current_path(adapter, target)
-    new_right = _split_window(adapter, _last_pane_id(adapter, target), False, side_w, path)
-    _set_pane_option(adapter, new_right, "@PANE_ID", "somnium:EE")
-    _set_pane_option(adapter, new_right, "@GRID_STATE", GRID_STATE_SIDE)
-    _set_pane_option(adapter, new_right, "@GRID_RESERVED", "false")
-    _set_pane_option(adapter, new_right, "@PANE_TYPE", "tui")
-    adapter.run("send-keys", "-t", new_right, "exec tui-pane-guard", "Enter")
+    first_pane = adapter.run("list-panes", "-t", target, "-F", "#{pane_id}").splitlines()[0]
+    new_left = _split_window(adapter, first_pane, True, side_w, path)
+    _set_pane_option(adapter, new_left, "@PANE_ID", "somnium:W")
+    _set_pane_option(adapter, new_left, "@GRID_STATE", GRID_STATE_SIDE)
+    _set_pane_option(adapter, new_left, "@GRID_RESERVED", "false")
 
 
 def _reset_side_columns(
     adapter: TmuxAdapter,
     side_panes: list[dict[str, str]],
-    win_w: int,
-    *,
-    ratio: int = SOMNIUM_SIDE_RATIO,
-    border_count: int = 2,
+    desired: int,
 ) -> None:
     if not side_panes:
         return
-    desired = ((win_w - border_count) * ratio) // 100
     for pane in side_panes:
+        _set_pane_option(adapter, pane["pane_id"], "@GRID_STATE", GRID_STATE_SIDE)
         adapter.run("resize-pane", "-t", pane["pane_id"], "-x", str(desired))
 
 
@@ -157,6 +156,14 @@ def _drop_side_panes(adapter: TmuxAdapter, side_panes: list[dict[str, str]]) -> 
 def _rebalance_grid(adapter: TmuxAdapter, target: str) -> None:
     grid_panes = _grid_panes(adapter, target)
     if len(grid_panes) < 2:
+        return
+    if len(grid_panes) == 2:
+        north = next((p for p in grid_panes if canonical_pane_role(p["pane_role"]).endswith(":N")), None)
+        if north:
+            grid_top = min(int(pane["top"]) for pane in grid_panes)
+            grid_bottom = max(int(pane["top"]) + int(pane["height"]) for pane in grid_panes)
+            even_h = max(1, (grid_bottom - grid_top - 1) // 2)
+            adapter.run("resize-pane", "-t", north["pane_id"], "-y", str(even_h))
         return
 
     grid_left = min(int(pane["left"]) for pane in grid_panes)
@@ -273,6 +280,17 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
     window_name = _show(adapter, target, "#{window_name}")
     window_base = _window_base(window_name)
 
+    # Restore typed partial-focus stash before legacy expansion normalization.
+    grid_focus_active = (_window_option(adapter, target, "@FOCUS_GRID_ACTIVE") or "false") == "true"
+    if grid_focus_active:
+        from .focus import focus_window
+        focus_window(adapter, session_name, window_index, "unfocus-grid")
+
+    side_focus_active = (_window_option(adapter, target, "@FOCUS_SIDE_ACTIVE") or "false") == "true"
+    if side_focus_active:
+        from .focus import focus_window
+        focus_window(adapter, session_name, window_index, "unfocus-side")
+
     grid_expanded = _window_option(adapter, target, "@GRID_EXPANDED") or "none"
     grid_stash = _window_option(adapter, target, "@GRID_STASH")
     restored = _restore_expanded_grid(adapter, session_name, target, grid_expanded, grid_stash)
@@ -291,7 +309,7 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
             _drop_side_panes(adapter, side_panes)
 
         side_panes = _side_panes(adapter, target)
-        _reset_side_columns(adapter, side_panes, win_w, ratio=PALACE_SIDE_RATIO, border_count=5)
+        _reset_side_columns(adapter, side_panes, WORKSPACE_LAYOUT.palace.side_width(win_w))
         _rebalance_grid(adapter, target)
 
     elif window_base == "somnium":
@@ -302,12 +320,23 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
             _drop_side_panes(adapter, side_panes)
 
         side_panes = _side_panes(adapter, target)
-        _reset_side_columns(adapter, side_panes, win_w)
+        _reset_side_columns(adapter, side_panes, WORKSPACE_LAYOUT.somnium.west_width(win_w))
         _rebalance_grid(adapter, target)
 
     _set_window_option(adapter, target, "@GRID_EXPANDED", "none")
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
+    _set_window_option(adapter, target, "@FOCUS_GRID_ACTIVE", "false")
+    _set_window_option(adapter, target, "@FOCUS_GRID_PANE", "")
+    _set_window_option(adapter, target, "@FOCUS_GRID_STASH", "")
+    _set_window_option(adapter, target, "@FOCUS_SIDE_ACTIVE", "false")
+    _set_window_option(adapter, target, "@FOCUS_SIDE_PANE", "")
+    _set_window_option(adapter, target, "@FOCUSED", "false")
+
+    from .revert import enforce_known_window_state
+    enforced = enforce_known_window_state(adapter, session_name, window_index)
+    if not enforced.ok:
+        raise ValueError("; ".join(enforced.violations))
 
     if restored:
         return f"normalized {target} via restore"

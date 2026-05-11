@@ -11,6 +11,7 @@ from .builder import (
     build_workspace,
 )
 from .executor import RestartExecutor
+from .focus import focus_window
 from .inspect import (
     render_doctor,
     render_pane,
@@ -25,6 +26,7 @@ from .planner import build_restart_plan
 from .resolver import resolve_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
+from .tombstone import install_tombstone, jump_tombstone
 
 
 class TmuxControlPlane:
@@ -89,6 +91,9 @@ class TmuxControlPlane:
     def normalize(self, session_name: str, window_index: int) -> str:
         return normalize_window(self.adapter, session_name, window_index)
 
+    def focus(self, session_name: str, window_index: int, mode: str) -> str:
+        return focus_window(self.adapter, session_name, window_index, mode)
+
     def resolve_pane(self, target: str) -> str:
         resolved = resolve_pane(self.adapter, target)
         chain = " -> ".join(resolved.chain)
@@ -102,11 +107,17 @@ class TmuxControlPlane:
             lines.append(f"chain: {chain}")
         return "\n".join(lines)
 
-    def audience_toggle(self, target: str) -> str:
-        return audience_toggle(self.adapter, target)
+    def audience_toggle(self, target: str, *, client: str = "") -> str:
+        return audience_toggle(self.adapter, target, client=client)
 
-    def audience_return(self, target: str) -> str:
-        return audience_return(self.adapter, target)
+    def audience_return(self, target: str, *, client: str = "") -> str:
+        return audience_return(self.adapter, target, client=client)
+
+    def tombstone_jump(self, target: str, *, client: str = "") -> str:
+        return jump_tombstone(self.adapter, target, client=client)
+
+    def tombstone_install(self, slot_pane: str, source_role: str, target_pane: str) -> str:
+        return install_tombstone(self.adapter, slot_pane, source_role, target_pane)
 
     def create_workspace(self, session_name: str = SESSION_NAME) -> str:
         if self.adapter.has_session(session_name):

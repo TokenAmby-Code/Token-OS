@@ -386,22 +386,8 @@ def main():
     # TTS state: now owned by Token-API (pushes @TTS_STATE to pane directly).
     # tmux-context no longer polls /api/notify/queue/status.
 
-    # --- Name sync: tmux pane title → Token-API tab_name ---
-    # Only sync kebab-case names (our naming convention). Claude Code auto-generates
-    # verbose sentence-case titles (e.g., "Fix tmux quit keybind regression") which
-    # must NOT overwrite the DB — otherwise _auto_name_instance sees a non-default
-    # name at Stop and skips MiniMax kebab-case naming entirely.
-    if instance and pane_id:
-        pane_title = get_pane_title(pane_id)
-        api_name = instance.get("tab_name", "")
-        # Only sync if: non-empty, differs from DB, and looks like an intentional
-        # rename (no spaces = kebab-case). Skip Claude Code auto-titles, spinner
-        # artifacts, paths, and fallback names.
-        is_our_name = bool(pane_title and " " not in pane_title
-                           and "/" not in pane_title and "..." not in pane_title
-                           and pane_title not in ("Claude Code", "claude"))
-        if pane_title and pane_title != api_name and is_our_name:
-            api_patch(f"/api/instances/{instance['id']}/rename", {"tab_name": pane_title})
+    # Name is DB-authoritative. Pane titles are presentation state and must not
+    # write back into Token-API automatically.
 
     # --- 1. Build pane border info ---
     used_str = format_tokens(used_tokens)

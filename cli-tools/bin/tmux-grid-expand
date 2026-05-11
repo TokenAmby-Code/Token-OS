@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# tmux-grid-expand - Toggle managed audience expansion or native pane zoom.
+# tmux-grid-expand - Toggle native tmux pane zoom.
 # TAGS: tmux, zoom, expand
 # AUDIENCE: human + script
 #
 # Usage:
-#   tmux-grid-expand              # Toggle zoom for the active pane
-#   tmux-grid-expand --pane %12   # Toggle zoom for a specific pane
+#   tmux-grid-expand              # Toggle native zoom for the active pane
+#   tmux-grid-expand --pane %12   # Toggle native zoom for a specific pane
 #   tmux-grid-expand --retract    # Unzoom the target window if zoomed
 
 set -euo pipefail
 
 TARGET_PANE=""
 RETRACT=false
+CLIENT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -21,6 +22,10 @@ while [[ $# -gt 0 ]]; do
                 tmux display-message "expand: --pane requires a pane id"
                 exit 1
             fi
+            shift 2
+            ;;
+        --client)
+            CLIENT="${2:-}"
             shift 2
             ;;
         --retract)
@@ -47,17 +52,10 @@ if ! tmux display-message -t "$TARGET_PANE" -p '' >/dev/null 2>&1; then
     exit 1
 fi
 
-_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
-run_tmuxctl() {
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli "$@"
-}
-
-if [[ "$RETRACT" == false ]]; then
-    if output=$(run_tmuxctl audience toggle --pane "$TARGET_PANE" 2>&1); then
-        tmux display-message "$output" 2>/dev/null || true
-        exit 0
-    fi
-fi
+# Native tmux zoom is the canonical expand implementation. It preserves pane
+# identity, window membership, running processes, and explicit send-keys targets.
+# The old audience/tombstone and pane-stash expansion paths are intentionally not
+# used here; they complicated automation and made pane resolution harder.
 
 TARGET_WINDOW=$(tmux display-message -t "$TARGET_PANE" -p '#{session_name}:#{window_index}')
 WINDOW_ZOOMED=$(tmux display-message -t "$TARGET_WINDOW" -p '#{window_zoomed_flag}')
