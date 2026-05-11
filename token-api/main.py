@@ -5112,6 +5112,48 @@ async def _log_golden_throne_dispatch_failed(session_id: str, details: dict) -> 
     )
 
 
+_golden_throne_fire_times: deque[float] = deque()
+
+
+def _golden_throne_rate_limit_delay(now: float | None = None) -> tuple[float | None, dict]:
+    """Return defer delay if Golden Throne is over its rolling fire cap.
+
+    Mirrors the Pavlok cooldown pattern: keep recent fire timestamps in memory,
+    drop expired entries at function entry, and only append when the fire is
+    allowed to proceed.
+    """
+    try:
+        max_fires = int(os.getenv("GT_MAX_FIRES_PER_WINDOW", "3"))
+    except (TypeError, ValueError):
+        max_fires = 3
+    try:
+        window_seconds = int(os.getenv("GT_RATE_WINDOW_SECONDS", "60"))
+    except (TypeError, ValueError):
+        window_seconds = 60
+    max_fires = max(1, max_fires)
+    window_seconds = max(1, window_seconds)
+
+    now = now if now is not None else time.time()
+    while _golden_throne_fire_times and _golden_throne_fire_times[0] <= now - window_seconds:
+        _golden_throne_fire_times.popleft()
+
+    details = {
+        "max_fires": max_fires,
+        "window_seconds": window_seconds,
+        "recent_fires": len(_golden_throne_fire_times),
+    }
+
+    if len(_golden_throne_fire_times) >= max_fires:
+        oldest = _golden_throne_fire_times[0]
+        delay_seconds = max(0.001, window_seconds - (now - oldest))
+        details["deferred_seconds"] = delay_seconds
+        return delay_seconds, details
+
+    _golden_throne_fire_times.append(now)
+    details["recent_fires"] = len(_golden_throne_fire_times)
+    return None, details
+
+
 async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5150,6 +5192,34 @@ async def golden_throne_followup(session_id: str):
         logger.info(
             f"Golden Throne: suppressed dispatch for {session_id[:12]} during quiet hours; "
             f"rescheduled={rescheduled.get('scheduled')}"
+        )
+        return
+
+    delay_seconds, rate_details = _golden_throne_rate_limit_delay()
+    if delay_seconds is not None:
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=f"golden-throne-{session_id}",
+            replace_existing=True,
+            name=f"Golden Throne follow-up {session_id[:12]}",
+            misfire_grace_time=300,
+            jobstore="golden_throne",
+        )
+        logger.info(
+            f"Golden Throne: rate limited {session_id[:12]}, deferred "
+            f"{delay_seconds:.1f}s until {fire_at.isoformat()}"
+        )
+        await log_event(
+            "gt_fire_deferred",
+            instance_id=session_id,
+            details={
+                "reason": "rate_limit",
+                "fire_at": fire_at.isoformat(),
+                **rate_details,
+            },
         )
         return
 
