@@ -8,7 +8,13 @@
 set -uo pipefail
 
 ACTION_TYPE="${1:-Unknown}"
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+if [[ -f "$LIB_DIR/nas-path.sh" ]]; then
+    # shellcheck source=../lib/nas-path.sh
+    source "$LIB_DIR/nas-path.sh" 2>/dev/null || true
+fi
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
 RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/scripts/agent-session-end-resume.sh"
@@ -23,8 +29,10 @@ if command -v jq >/dev/null 2>&1; then
         printf '%s' "$HOOK_INPUT" | jq -c \
             --arg action "$ACTION_TYPE" \
             --arg cwd "$(pwd)" \
+            --arg pid "$$" \
             --arg tmux "${TMUX:-}" \
             --arg tmux_pane "${TMUX_PANE:-}" \
+            --arg token_resolved_pane "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" \
             --arg ssh_client "${SSH_CLIENT:-}" \
             --arg token_session "${TOKEN_API_SESSION_ID:-}" \
             --arg bridge_id "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
@@ -43,9 +51,10 @@ if command -v jq >/dev/null 2>&1; then
             --arg token_zealotry "${TOKEN_API_ZEALOTRY:-}" \
             '.action = $action
              | .cwd //= $cwd
+             | .pid //= ($pid | tonumber)
              | .env //= {}
              | .env.TMUX = $tmux
-             | .env.TMUX_PANE = $tmux_pane
+             | .env.TMUX_PANE = (if $tmux_pane == "" then $token_resolved_pane else $tmux_pane end)
              | .env.SSH_CLIENT = $ssh_client
              | .env.TOKEN_API_SESSION_ID = $token_session
              | .env.TOKEN_API_CODEX_BRIDGE_ID = $bridge_id
@@ -60,6 +69,7 @@ if command -v jq >/dev/null 2>&1; then
              | .env.TOKEN_API_DISPATCH_SESSION_DOC_PATH = $token_dispatch_session_doc_path
              | .env.TOKEN_API_TARGET_WORKING_DIR = $token_target_working_dir
              | .env.TOKEN_API_LAUNCH_MODE = $token_launch_mode
+             | .env.TOKEN_API_DISPATCH_RESOLVED_PANE = $token_resolved_pane
              | .env.TOKEN_API_TRANSPLANT_EXPECTED = $token_transplant_expected
              | .env.TOKEN_API_INSTANCE_TYPE = $token_instance_type
              | .env.TOKEN_API_ZEALOTRY = $token_zealotry' 2>/dev/null || printf '%s' "$HOOK_INPUT"

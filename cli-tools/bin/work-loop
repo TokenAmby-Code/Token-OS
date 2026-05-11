@@ -44,11 +44,11 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}>${NC} $1"; }
-log_success() { echo -e "${GREEN}+${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}x${NC} $1"; }
-log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}+${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error()   { echo -e "${RED}x${NC} $1" >&2; }
+log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
@@ -61,7 +61,7 @@ split_backrooms_pane() {
     # Check if backrooms window exists
     if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q '^backrooms$'; then
         log_error "No backrooms window in session '$session'"
-        echo "  Create one with: tx start"
+        echo "  Create one with: tx start" >&2
         return 1
     fi
 

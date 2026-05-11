@@ -30,11 +30,11 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}>${NC} $1"; }
-log_success() { echo -e "${GREEN}+${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}x${NC} $1"; }
-log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}+${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error()   { echo -e "${RED}x${NC} $1" >&2; }
+log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 
 # --- Host mapping (reuses ssh-connect aliases) ---
 host_to_ssh() {
@@ -595,7 +595,7 @@ PLAN_FILE="${HOME}/.claude/transplant-pending/plan"
 if $EXECUTE_PLAN; then
     if [[ ! -f "$PLAN_FILE" ]]; then
         log_error "No pending plan found at $PLAN_FILE"
-        echo "  Use 'transplant --plan <target-dir>' first"
+        echo "  Use 'transplant --plan <target-dir>' first" >&2
         exit 1
     fi
     # Re-invoke transplant with the saved args (strips --plan, adds nothing extra)
@@ -813,8 +813,8 @@ fi
 
 if [[ -z "$session_id" ]]; then
     log_error "No session ID found"
-    echo "  Cache dir: ${HOME}/.claude/session-pids/"
-    echo "  Source project dir: $source_project_dir"
+    echo "  Cache dir: ${HOME}/.claude/session-pids/" >&2
+    echo "  Source project dir: $source_project_dir" >&2
     exit 1
 fi
 log_success "Session ID: ${session_id:0:12}..."
@@ -857,7 +857,7 @@ if $PRIMARCH_MODE && [[ -z "$PRIMARCH_NAME" ]]; then
         log_success "Primarch from env: $PRIMARCH_NAME"
     else
         log_error "No primarch name given and none found in instance DB or env"
-        echo "  Usage: transplant --primarch <name> <target-dir>"
+        echo "  Usage: transplant --primarch <name> <target-dir>" >&2
         exit 1
     fi
 elif ! $PRIMARCH_MODE && [[ -n "$old_primarch" ]]; then
@@ -878,7 +878,7 @@ if [[ -z "$pane_target" && -z "$REMOTE_HOST" ]] || [[ -z "$pane_target" && $RELA
         : # headless remote doesn't need a pane
     else
         log_error "Could not identify tmux pane"
-        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --continue"
+        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --continue" >&2
         exit 1
     fi
 fi
