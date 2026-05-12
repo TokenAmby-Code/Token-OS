@@ -1904,7 +1904,7 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
 
     Called by Mac token-api when the Golden Throne timer fires for a WSL instance.
     Transport detection: if the tmux pane has claude running, send-keys the SOP prompt.
-    Otherwise, spawn `claude --resume` in the backrooms window.
+    Otherwise, spawn `claude --resume` in the remote managed worker stack.
     """
     transport = "unknown"
     pane = req.tmux_pane

@@ -5000,13 +5000,12 @@ def _golden_throne_banner_text(tab_name: str | None, human_pane_surface: str) ->
     return f"GT resume: {human_pane_surface}"
 
 
-async def _get_or_create_backrooms_pane() -> str:
+async def _get_or_create_legion_pane() -> str:
     """Allocate a managed legion worker pane for an autonomous resume.
 
-    Historical name retained for tests/callers during migration. The backrooms
-    window is no longer a dispatch target; pane allocation is delegated to the
-    typed tmuxctl stack primitive so Custodes remains the left orchestrator and
-    all autonomous resume panes file into the right-side legion worker stack.
+    Pane allocation is delegated to the typed tmuxctl stack primitive so
+    Custodes remains the left orchestrator and autonomous resume panes file
+    into the right-side legion worker stack.
     """
     tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
     proc = await asyncio.create_subprocess_exec(
@@ -5285,7 +5284,7 @@ async def golden_throne_followup(session_id: str):
         else:
             # Agent not running — resume in a managed legion worker pane with SOP prompt
             try:
-                resume_pane = await _get_or_create_backrooms_pane()
+                resume_pane = await _get_or_create_legion_pane()
                 # Write SOP to temp file (avoids shell escaping issues)
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)

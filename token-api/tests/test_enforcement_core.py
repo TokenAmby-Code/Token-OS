@@ -570,8 +570,8 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
 
 
 @pytest.mark.asyncio
-async def test_golden_throne_empty_backrooms_pane_fails_closed(app_env, monkeypatch):
-    _insert_gt_instance(app_env.db_path, "gt-empty-backrooms", tmux_pane="%134")
+async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch):
+    _insert_gt_instance(app_env.db_path, "gt-empty-legion", tmux_pane="%134")
     calls = []
 
     async def pane_label(pane):
@@ -583,7 +583,7 @@ async def test_golden_throne_empty_backrooms_pane_fails_closed(app_env, monkeypa
     async def no_agent_process(pane, engine):
         return False
 
-    async def empty_backrooms():
+    async def empty_legion():
         return ""
 
     async def fake_subprocess_exec(*args, **kwargs):
@@ -591,30 +591,30 @@ async def test_golden_throne_empty_backrooms_pane_fails_closed(app_env, monkeypa
         if args[:2] == ("tmux", "display-message"):
             return _FakeProc(0, b"bash\n", b"")
         if args[:2] == ("tmux", "send-keys"):
-            raise AssertionError("empty backrooms target must not be sent")
+            raise AssertionError("empty legion target must not be sent")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(app_env.main, "_load_golden_throne_sop", lambda: "resume work")
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", pane_label)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_agent_process", no_agent_process)
-    monkeypatch.setattr(app_env.main, "_get_or_create_backrooms_pane", empty_backrooms)
+    monkeypatch.setattr(app_env.main, "_get_or_create_legion_pane", empty_legion)
     monkeypatch.setattr(app_env.main.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
-    await app_env.main.golden_throne_followup("gt-empty-backrooms")
+    await app_env.main.golden_throne_followup("gt-empty-legion")
 
     assert (
         _rows(
             app_env.db_path,
             "SELECT * FROM pane_write_queue WHERE instance_id = ?",
-            ("gt-empty-backrooms",),
+            ("gt-empty-legion",),
         )
         == []
     )
     instance_row = _rows(
         app_env.db_path,
         "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
-        ("gt-empty-backrooms",),
+        ("gt-empty-legion",),
     )[0]
     assert instance_row["gt_resume_count"] == 0
     events = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id")
