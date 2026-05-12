@@ -202,16 +202,16 @@ find_free_panes() {
     local grid_panes=()
     local other_panes=()
     local seen=()
-    while IFS=$'\t' read -r pane_id cmd window_name; do
+    while IFS=$'\t' read -r pane_id cmd window_name pane_type; do
         # Dedup (tmux list-panes -a can repeat across window iterations)
         for s in "${seen[@]+"${seen[@]}"}"; do
             [[ "$s" == "$pane_id" ]] && continue 2
         done
         seen+=("$pane_id")
-        # Skip TUI, backrooms, and stack windows
+        # Skip TUI, stack windows, and typed/special panes
         [[ "$window_name" == "tui" ]] && continue
-        [[ "$window_name" == "backrooms" ]] && continue
         is_stack_window "$window_name" && continue
+        [[ -n "$pane_type" ]] && continue
         # Only consider panes running a shell (bash/zsh)
         [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
         # Verify no claude process in the pane's process tree
@@ -237,7 +237,7 @@ find_free_panes() {
         else
             other_panes+=("$pane_id")
         fi
-    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}	#{@PANE_TYPE}" 2>/dev/null)
     # Grid first, then others
     printf '%s\n' "${grid_panes[@]+"${grid_panes[@]}"}" "${other_panes[@]+"${other_panes[@]}"}"
 }
@@ -247,13 +247,14 @@ list_free_panes() {
     echo -e "\n${BOLD}Free tmux panes${NC}\n"
     local found=false
     local seen=()
-    while IFS=$'\t' read -r pane_id cmd window_name; do
+    while IFS=$'\t' read -r pane_id cmd window_name pane_type; do
         for s in "${seen[@]+"${seen[@]}"}"; do
             [[ "$s" == "$pane_id" ]] && continue 2
         done
         seen+=("$pane_id")
         [[ "$window_name" == "tui" ]] && continue
-        [[ "$window_name" == "backrooms" ]] && continue
+        is_stack_window "$window_name" && continue
+        [[ -n "$pane_type" ]] && continue
         [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
         local pane_pid
         pane_pid=$(pane_pid_of "$pane_id")
@@ -275,7 +276,7 @@ list_free_panes() {
         fi
         echo -e "  ${CYAN}${pane_id}${NC}  ${DIM}window:${NC}${window_name}  ${DIM}cmd:${NC}${cmd}${claim_tag}"
         found=true
-    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}" 2>/dev/null)
+    done < <(tmux list-panes -a -F "#{pane_id}	#{pane_current_command}	#{window_name}	#{@PANE_TYPE}" 2>/dev/null)
     if [[ "$found" != "true" ]]; then
         echo -e "  ${DIM}No free panes available${NC}"
     fi

@@ -795,7 +795,7 @@ case "$CMD" in
     resurrect)
         exec tmux-resurrect "$@"
         ;;
-    mechanicus|mech|mars|kreig|kr|backrooms|br)
+    mechanicus|mech|mars|kreig|kr)
         cmd_mechanicus "$@"
         ;;
     legion)

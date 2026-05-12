@@ -227,7 +227,7 @@ worktree-sync status
 worktree-delete <branch-name> -b
 ```
 
-## Automated Dispatch (Backrooms / Fleet)
+## Automated Dispatch (Legion / Fleet)
 
 For autonomous work without manual intervention:
 
@@ -238,9 +238,9 @@ vault-dispatch <session-doc> <working-dir> [--primarch <name>]
 # Full cycle: vault → worktree → implement → PR → merge → cleanup
 work-loop dispatch <session-doc> [--primarch <name>] [--branch <name>]
 
-# Monitor backrooms
-tx br status
-tx br cleanup
+# Monitor legion
+tx legion status
+tx legion cleanup
 ```
 
 ## Anti-Patterns
