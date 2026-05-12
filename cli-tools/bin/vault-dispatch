@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vault-dispatch — Spawn a Claude instance in the vault, brief it, and transplant to work
+# vault-dispatch — Spawn a work session via Claude or Codex with structured dispatch metadata
 # TAGS: instance, workflow, dispatch
 # AUDIENCE: human, agent
 #
@@ -9,15 +9,15 @@
 #   vault-dispatch --list-free                    # Show free tmux panes
 #
 # The dispatch pattern:
-#   1. Create a new pane in a stack window (legion/kreig) or find a free pane
-#      in a reuse window (palace/warp)
-#   2. Launch Claude (or primarch) in the vault via shell function
-#   3. Send dispatch prompt: read session doc → gather context → transplant → work
+#   1. Resolve a human target (legion:new, mechanicus:new, etc.) to a tmux pane
+#   2. Launch Claude or Codex with structured dispatch metadata
+#   3. Bind the launched instance to the intended session doc at registration time
 #
 # Examples:
 #   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os
-#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --primarch vulkan
-#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --pane %3
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --engine codex
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --target mechanicus:new
+#   vault-dispatch Mars/Sessions/2026-04-03-vault-dispatch.md ~/projects/token-os --no-gt
 #   vault-dispatch --list-free
 #   vault-dispatch --dry-run Mars/Sessions/my-session.md /home/token/project
 
@@ -25,6 +25,8 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
+source "${_LIB_DIR}/origin.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -36,11 +38,11 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}>${NC} $1"; }
-log_success() { echo -e "${GREEN}+${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}x${NC} $1"; }
-log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}+${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error()   { echo -e "${RED}x${NC} $1" >&2; }
+log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
@@ -79,8 +81,8 @@ release_claim() {
     rm -f "${CLAIM_DIR}/claim-${pane_id#%}" 2>/dev/null || true
 }
 
-# --- Stack windows (legion/kreig) vs reuse windows (palace/warp) ---
-STACK_WINDOWS=("legion" "kreig")
+# --- Stack windows vs reuse windows ---
+STACK_WINDOWS=("legion" "mechanicus" "mars" "kreig")
 
 is_stack_window() {
     local win="$1"
@@ -95,33 +97,108 @@ pane_window() {
     tmux display-message -t "$1" -p '#{window_name}' 2>/dev/null
 }
 
-# Create a new pane in a stack window via split-window.
-# Returns the new pane ID. The pane is born as a clean shell — no backstop.
+pane_current_command() {
+    tmux display-message -t "$1" -p '#{pane_current_command}' 2>/dev/null
+}
+
+pane_has_live_children() {
+    local pane_pid="$1"
+    [[ -n "$pane_pid" ]] || return 1
+    pgrep -P "$pane_pid" >/dev/null 2>&1
+}
+
+pane_has_agent_children() {
+    local pane_pid="$1"
+    [[ -n "$pane_pid" ]] || return 1
+    pgrep -P "$pane_pid" -af 'claude|codex|codex-dispatch|claude-dispatch|primarch' >/dev/null 2>&1
+}
+
+pane_pid_of() {
+    tmux display-message -t "$1" -p '#{pane_pid}' 2>/dev/null || true
+}
+
+pane_is_idle_shell() {
+    local pane="$1"
+    local cmd pid
+    cmd=$(pane_current_command "$pane")
+    [[ "$cmd" == "bash" || "$cmd" == "zsh" ]] || return 1
+    pid=$(pane_pid_of "$pane")
+    pane_has_live_children "$pid" && return 1
+    return 0
+}
+
+ensure_named_target_is_idle_shell() {
+    local pane="$1"
+    local target="$2"
+    local target_cmd
+    local target_pid
+
+    target_cmd=$(pane_current_command "$pane")
+    if [[ "$target_cmd" != "bash" && "$target_cmd" != "zsh" ]]; then
+        log_error "Named dispatch target $target is not a shell (current: ${target_cmd:-unknown})"
+        return 1
+    fi
+
+    target_pid=$(pane_pid_of "$pane")
+    if pane_has_live_children "$target_pid"; then
+        log_error "Named dispatch target $target is not idle (child process still attached)"
+        return 1
+    fi
+
+    return 0
+}
+
+dispatch_slot_of_target() {
+    local target="$1"
+    [[ "$target" == *:* ]] || return 0
+    echo "${target#*:}"
+}
+
+resolve_named_dispatch_target() {
+    local target="$1"
+    local resolved=""
+
+    if command -v pane_resolve >/dev/null 2>&1; then
+        resolved=$(pane_resolve "$target")
+    fi
+
+    if [[ -z "$resolved" ]]; then
+        return 1
+    fi
+
+    echo "$resolved"
+}
+
+# Create a new pane in a stack window via the tmuxctl Python wrapper.
+# Returns the new pane ID. Auto-spills into <window>-2, <window>-3, ... when the
+# canonical window can't accept another split (geometric "no space"). The Python
+# module is the single source of truth for stack semantics; do not re-implement
+# split logic here. See cli-tools/lib/tmuxctl/stack.py.
 create_stack_pane() {
     local window="${1:-legion}"
-    local session="main"
-    local target="${session}:${window}"
-
-    # Ensure the window exists
-    if ! tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qE "^${window}(\([0-9]*\))?$"; then
-        log_error "Window '$window' does not exist in session '$session'"
-        return 1
-    fi
-
-    # Split a new pane in the stack window (vertical split, starts in $HOME)
+    local lib_dir
+    lib_dir="$(dirname "$(readlink -f "$0")")/../lib"
     local new_pane
-    new_pane=$(tmux split-window -t "$target" -d -P -F '#{pane_id}' -c "$HOME" 2>/dev/null)
-    if [[ -z "$new_pane" ]]; then
-        log_error "Failed to split new pane in $target"
+    local err_log
+    err_log=$(mktemp -t vault-dispatch-stack.XXXXXX)
+    if ! new_pane=$(PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m tmuxctl.cli stack add "$window" --cwd "$HOME" 2>"$err_log"); then
+        log_error "tmuxctl stack add $window failed: $(<"$err_log")"
+        rm -f "$err_log"
         return 1
     fi
-
+    rm -f "$err_log"
+    new_pane="${new_pane//$'\n'/}"
+    if [[ -z "$new_pane" ]]; then
+        log_error "tmuxctl stack add $window returned empty pane id"
+        return 1
+    fi
     echo "$new_pane"
 }
 
-# --- Free pane detection (for palace/warp reuse) ---
+# --- Free pane detection (for palace + somnium reuse) ---
 # Returns pane IDs that are running plain bash/zsh (no Claude, no TUI, no special process)
-# Only scans reuse windows (palace, warp). Stack windows (legion, kreig) always split.
+# Only scans the palace + somnium reuse windows. Stack windows always split.
 find_free_panes() {
     local grid_panes=()
     local other_panes=()
@@ -140,11 +217,9 @@ find_free_panes() {
         [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
         # Verify no claude process in the pane's process tree
         local pane_pid
-        pane_pid=$(tmux list-panes -a -F "#{pane_id} #{pane_pid}" 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
-        if [[ -n "$pane_pid" ]]; then
-            if pgrep -P "$pane_pid" -f "claude" &>/dev/null; then
-                continue
-            fi
+        pane_pid=$(pane_pid_of "$pane_id")
+        if pane_has_live_children "$pane_pid" || pane_has_agent_children "$pane_pid"; then
+            continue
         fi
         # Skip panes with active (non-stale) claims
         local claim_file="${CLAIM_DIR}/claim-${pane_id#%}"
@@ -157,8 +232,8 @@ find_free_panes() {
             # Stale claim — reap it
             rm -f "$claim_file"
         fi
-        # Prioritize palace panes over mobile/other
-        if [[ "$window_name" == "palace" ]]; then
+        # Prioritize palace + somnium grid panes over other windows
+        if [[ "$window_name" == "palace" || "$window_name" == "somnium" ]]; then
             grid_panes+=("$pane_id")
         else
             other_panes+=("$pane_id")
@@ -182,8 +257,8 @@ list_free_panes() {
         [[ "$window_name" == "backrooms" ]] && continue
         [[ "$cmd" != "bash" && "$cmd" != "zsh" ]] && continue
         local pane_pid
-        pane_pid=$(tmux list-panes -a -F "#{pane_id} #{pane_pid}" 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
-        if [[ -n "$pane_pid" ]] && pgrep -P "$pane_pid" -f "claude" &>/dev/null; then
+        pane_pid=$(pane_pid_of "$pane_id")
+        if pane_has_live_children "$pane_pid" || pane_has_agent_children "$pane_pid"; then
             continue
         fi
         # Check for active claim
@@ -214,6 +289,7 @@ build_dispatch_prompt() {
     local working_dir="$2"
     local primarch_name="${3:-}"
     local extra_context="${4:-}"
+    local engine="${5:-claude}"
 
     local prompt="You are dispatched to work on this session. Read your session doc at ${session_doc} first."
 
@@ -226,14 +302,18 @@ build_dispatch_prompt() {
     # Add assessment phase
     prompt+=" Assess what can be done autonomously vs. what needs escalation."
 
-    # Add transplant instruction
-    prompt+=" Then transplant to the working directory: transplant ${working_dir}"
-    if [[ -n "$primarch_name" ]]; then
-        prompt+=" --primarch ${primarch_name}"
+    if [[ "$engine" == "codex" ]]; then
+        prompt+=" You are already launched in the target working directory ${working_dir}. Begin work there after reading context. Update your session doc work log as you go."
+    else
+        # Add transplant instruction
+        prompt+=" Then transplant to the working directory: transplant ${working_dir}"
+        if [[ -n "$primarch_name" ]]; then
+            prompt+=" --primarch ${primarch_name}"
+        fi
+        # Add work instruction
+        prompt+=" Once transplanted, begin work following SOP: act autonomously on clear tasks, escalate ambiguity via discord send, update your session doc work log as you go."
     fi
-
-    # Add work instruction
-    prompt+=" Once transplanted, begin work following SOP: act autonomously on clear tasks, escalate ambiguity via discord send, update your session doc work log as you go. Do NOT use TTS."
+    prompt+=" Do NOT use TTS."
 
     # Add extra context if provided
     if [[ -n "$extra_context" ]]; then
@@ -261,12 +341,16 @@ Arguments:
   <working-dir>       Absolute path to the target working directory
 
 Options:
-  --window, -w <name> Target window (default: legion). Stack windows (legion, kreig)
-                      create a new pane. Reuse windows (palace, warp) scan for free panes.
+  --engine <name>     Launch engine: claude (default) or codex
+  --target <name>     Human dispatch target (default: legion:new)
+  --window, -w <name> Legacy target window. Stack windows (legion, mechanicus)
+                      create a new pane. The somnium reuse window scans for free panes.
   --pane <id>         Target a specific pane (overrides --window). In stack windows,
                       still creates a new pane rather than reusing.
   --primarch <name>   Launch as a primarch persona
-  --zealotry <1-5>    Set zealotry level for Golden Throne follow-ups (default: 3)
+  --zealotry <1-5>    Set Golden Throne follow-up aggressiveness (default: 5)
+  --parent <id>       Parent/orchestrator instance id (default: current origin)
+  --no-gt             Opt out of Golden Throne mode (one-off lane, zealotry 3)
   --context <text>    Extra context to include in the dispatch prompt
   --dry-run           Show what would happen without executing
   --list-free         List free tmux panes (reuse windows only) and exit
@@ -274,9 +358,9 @@ Options:
 
 Examples:
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp
-  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w kreig
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w mechanicus
   vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp --primarch vulkan
-  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w palace
+  vault-dispatch Mars/Sessions/2026-04-03-auth.md ~/projects/myapp -w somnium
   vault-dispatch --list-free
 EOF
     exit 0
@@ -287,8 +371,12 @@ SESSION_DOC=""
 WORKING_DIR=""
 TARGET_PANE=""
 TARGET_WINDOW=""
+ENGINE="claude"
+DISPATCH_TARGET="legion:new"
 PRIMARCH_NAME=""
-ZEALOTRY=3
+ZEALOTRY=""
+PARENT_INSTANCE_ID=""
+GT_MODE=true
 EXTRA_CONTEXT=""
 DRY_RUN=false
 LIST_FREE=false
@@ -304,6 +392,14 @@ while [[ $# -gt 0 ]]; do
             TARGET_PANE="$2"
             shift 2
             ;;
+        --engine)
+            ENGINE="$2"
+            shift 2
+            ;;
+        --target)
+            DISPATCH_TARGET="$2"
+            shift 2
+            ;;
         --primarch)
             PRIMARCH_NAME="$2"
             shift 2
@@ -311,6 +407,18 @@ while [[ $# -gt 0 ]]; do
         --zealotry)
             ZEALOTRY="$2"
             shift 2
+            ;;
+        --parent)
+            PARENT_INSTANCE_ID="$2"
+            shift 2
+            ;;
+        --no-gt)
+            GT_MODE=false
+            shift
+            ;;
+        --gt)
+            GT_MODE=true
+            shift
             ;;
         --window|-w)
             TARGET_WINDOW="$2"
@@ -351,8 +459,13 @@ fi
 # --- Validate inputs ---
 if [[ -z "$SESSION_DOC" || -z "$WORKING_DIR" ]]; then
     log_error "Both <session-doc> and <working-dir> are required"
-    echo "Usage: vault-dispatch <session-doc> <working-dir> [options]"
-    echo "       vault-dispatch --list-free"
+    echo "Usage: vault-dispatch <session-doc> <working-dir> [options]" >&2
+    echo "       vault-dispatch --list-free" >&2
+    exit 1
+fi
+
+if [[ "$ENGINE" != "claude" && "$ENGINE" != "codex" ]]; then
+    log_error "Unsupported engine: $ENGINE"
     exit 1
 fi
 
@@ -370,11 +483,57 @@ if [[ ! -d "$WORKING_DIR" ]]; then
 fi
 WORKING_DIR=$(cd "$WORKING_DIR" && pwd)
 
+if $GT_MODE; then
+    INSTANCE_TYPE="golden_throne"
+    ZEALOTRY="${ZEALOTRY:-5}"
+else
+    INSTANCE_TYPE="one_off"
+    ZEALOTRY="${ZEALOTRY:-3}"
+fi
+
+if [[ -z "$PARENT_INSTANCE_ID" ]]; then
+    PARENT_INSTANCE_ID="${TOKEN_API_SESSION_ID:-${IMPERIUM_ORIGIN_INSTANCE:-}}"
+fi
+if [[ -z "$PARENT_INSTANCE_ID" ]] && command -v origin_record >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    PARENT_INSTANCE_ID="$(origin_record 2>/dev/null | jq -r '.instance_id // empty' 2>/dev/null || true)"
+fi
+
 # --- Check tmux ---
 if ! tmux display-message -p '#{session_name}' &>/dev/null; then
     log_error "Not in tmux — vault-dispatch requires tmux"
     exit 1
 fi
+
+# --- Resolve human dispatch target into pane behavior ---
+# Current pass supports:
+#   legion:new
+#   mechanicus:new
+#   mars:new
+#   kreig:new
+#   palace:<slot>
+#   somnium:<slot>
+if [[ -n "$TARGET_WINDOW" && "$DISPATCH_TARGET" == "legion:new" ]]; then
+    DISPATCH_TARGET="${TARGET_WINDOW}:new"
+fi
+
+DISPATCH_MODE=""
+DISPATCH_SLOT=""
+
+case "$DISPATCH_TARGET" in
+    legion:new|mechanicus:new|mars:new|kreig:new)
+        TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
+        DISPATCH_MODE="stack_new"
+        ;;
+    palace:*|somnium:*)
+        TARGET_WINDOW="${DISPATCH_TARGET%%:*}"
+        DISPATCH_SLOT="$(dispatch_slot_of_target "$DISPATCH_TARGET")"
+        DISPATCH_MODE="named_slot"
+        ;;
+    *)
+        log_error "Unsupported dispatch target: $DISPATCH_TARGET"
+        exit 1
+        ;;
+esac
 
 # --- Resolve pane (skip for dry-run to avoid side effects) ---
 # Three paths:
@@ -385,7 +544,18 @@ PANE_MODE=""  # "stack" or "reuse"
 
 if $DRY_RUN; then
     TARGET_WINDOW="${TARGET_WINDOW:-legion}"
-    if is_stack_window "$TARGET_WINDOW"; then
+    if [[ "$DISPATCH_MODE" == "named_slot" ]]; then
+        TARGET_PANE="$(resolve_named_dispatch_target "$DISPATCH_TARGET" 2>/dev/null || echo "unresolved")"
+        PANE_MODE="named"
+        if [[ "$TARGET_PANE" == "unresolved" ]]; then
+            log_error "Named dispatch target not found in tmux: $DISPATCH_TARGET"
+            exit 1
+        fi
+        if ! pane_is_idle_shell "$TARGET_PANE"; then
+            log_error "Named dispatch target $DISPATCH_TARGET is not an idle shell"
+            exit 1
+        fi
+    elif is_stack_window "$TARGET_WINDOW"; then
         PANE_MODE="stack"
         TARGET_PANE="(new pane in $TARGET_WINDOW)"
     else
@@ -406,6 +576,10 @@ elif [[ -n "$TARGET_PANE" ]]; then
         TARGET_PANE=$(create_stack_pane "$pane_win") || exit 1
         PANE_MODE="stack"
     else
+        if ! pane_is_idle_shell "$TARGET_PANE"; then
+            log_error "Manual target pane $TARGET_PANE is not an idle shell"
+            exit 1
+        fi
         if ! claim_pane "$TARGET_PANE"; then
             log_error "Pane $TARGET_PANE already claimed by another dispatch"
             exit 1
@@ -414,10 +588,18 @@ elif [[ -n "$TARGET_PANE" ]]; then
     fi
     log_success "Using pane: $TARGET_PANE ($PANE_MODE)"
 else
-    # No --pane specified. Use --window or default to legion.
+    # No --pane specified. Use resolved dispatch target or default to legion:new.
     TARGET_WINDOW="${TARGET_WINDOW:-legion}"
 
-    if is_stack_window "$TARGET_WINDOW"; then
+    if [[ "$DISPATCH_MODE" == "named_slot" ]]; then
+        TARGET_PANE=$(resolve_named_dispatch_target "$DISPATCH_TARGET") || {
+            log_error "Named dispatch target not found in tmux: $DISPATCH_TARGET"
+            exit 1
+        }
+        ensure_named_target_is_idle_shell "$TARGET_PANE" "$DISPATCH_TARGET" || exit 1
+        PANE_MODE="named"
+        log_success "Resolved named target $DISPATCH_TARGET -> $TARGET_PANE"
+    elif is_stack_window "$TARGET_WINDOW"; then
         # Stack window: always create a new pane
         TARGET_PANE=$(create_stack_pane "$TARGET_WINDOW") || exit 1
         PANE_MODE="stack"
@@ -433,12 +615,12 @@ else
             fi
         done < <(find_free_panes)
         if [[ -z "$TARGET_PANE" ]]; then
-            log_error "No free panes in reuse windows (palace/warp)"
-            echo ""
-            echo "  Options:"
-            echo "  1. Use --window legion (default) to create a stack pane"
-            echo "  2. Use --pane <id> to target a specific pane"
-            echo "  3. Stop an existing instance first"
+            log_error "No free panes in the palace/somnium reuse windows"
+            echo "" >&2
+            echo "  Options:" >&2
+            echo "  1. Use --window legion (default) to create a stack pane" >&2
+            echo "  2. Use --pane <id> to target a specific pane" >&2
+            echo "  3. Stop an existing instance first" >&2
             exit 1
         fi
         PANE_MODE="reuse"
@@ -452,15 +634,57 @@ if [[ "$PANE_MODE" == "reuse" ]]; then
 fi
 
 # --- Build the dispatch prompt ---
-DISPATCH_PROMPT=$(build_dispatch_prompt "$SESSION_DOC" "$WORKING_DIR" "$PRIMARCH_NAME" "$EXTRA_CONTEXT")
+DISPATCH_PROMPT=$(build_dispatch_prompt "$SESSION_DOC" "$WORKING_DIR" "$PRIMARCH_NAME" "$EXTRA_CONTEXT" "$ENGINE")
+
+DISPATCH_ENV=(
+    "TOKEN_API_LAUNCHER=vault-dispatch"
+    "TOKEN_API_ENGINE=${ENGINE}"
+    "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
+    "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
+    "TOKEN_API_DISPATCH_TARGET=${DISPATCH_TARGET}"
+    "TOKEN_API_DISPATCH_WINDOW=${TARGET_WINDOW}"
+    "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
+    "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${VAULT_DIR}/${SESSION_DOC}"
+    "TOKEN_API_TARGET_WORKING_DIR=${WORKING_DIR}"
+)
+if [[ -n "$PARENT_INSTANCE_ID" ]]; then
+    DISPATCH_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${PARENT_INSTANCE_ID}")
+fi
+if [[ -n "$DISPATCH_SLOT" ]]; then
+    DISPATCH_ENV+=("TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}")
+fi
+if [[ "$ENGINE" == "codex" ]]; then
+    DISPATCH_ENV+=("TOKEN_API_LAUNCH_MODE=direct_target" "TOKEN_API_TRANSPLANT_EXPECTED=false")
+else
+    DISPATCH_ENV+=("TOKEN_API_LAUNCH_MODE=vault_then_transplant" "TOKEN_API_TRANSPLANT_EXPECTED=true")
+fi
+if [[ -n "$TARGET_PANE" && "$TARGET_PANE" != "(new pane in $TARGET_WINDOW)" ]]; then
+    DISPATCH_ENV+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${TARGET_PANE}")
+fi
 
 # --- Build the claude launch command ---
-# Use the shell function (loaded via .zshrc) not the raw binary — the wrapper
-# handles auto-cd, primarch routing, and env setup.
-if [[ -n "$PRIMARCH_NAME" ]]; then
-    LAUNCH_CMD="cd '${VAULT_DIR}' && primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
+# Claude uses native hook path; Codex uses backend bridge.
+ENV_PREFIX=$(printf '%q ' "${DISPATCH_ENV[@]}")
+if [[ "$ENGINE" == "codex" ]]; then
+    CODEX_BIN="$(dirname "$(readlink -f "$0")")/codex-dispatch"
+    LAUNCH_CMD="cd '${WORKING_DIR}' && ${ENV_PREFIX}'${CODEX_BIN}' --session-doc '${VAULT_DIR}/${SESSION_DOC}' --dispatch-target '${DISPATCH_TARGET}' --dispatch-window '${TARGET_WINDOW}' --dispatch-mode '${DISPATCH_MODE}'"
+    if [[ -n "$DISPATCH_SLOT" ]]; then
+        LAUNCH_CMD+=" --dispatch-slot '${DISPATCH_SLOT}'"
+    fi
+    if [[ -n "$PARENT_INSTANCE_ID" ]]; then
+        LAUNCH_CMD+=" --parent '${PARENT_INSTANCE_ID}'"
+    fi
+    LAUNCH_CMD+=" --resolved-tmux-pane '${TARGET_PANE}' --launch-mode 'direct_target' --transplant-expected 'false' --launcher 'vault-dispatch'"
+    if ! $GT_MODE; then
+        LAUNCH_CMD+=" --no-gt"
+    fi
+    LAUNCH_CMD+=" --zealotry '${ZEALOTRY}' '${WORKING_DIR}' '${DISPATCH_PROMPT}'"
 else
-    LAUNCH_CMD="cd '${VAULT_DIR}' && claude --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
+    if [[ -n "$PRIMARCH_NAME" ]]; then
+        LAUNCH_CMD="cd '${VAULT_DIR}' && ${ENV_PREFIX}primarch ${PRIMARCH_NAME} '${DISPATCH_PROMPT}'"
+    else
+        LAUNCH_CMD="cd '${VAULT_DIR}' && ${ENV_PREFIX}claude --dangerously-skip-permissions '${DISPATCH_PROMPT}'"
+    fi
 fi
 
 # --- Display summary ---
@@ -471,7 +695,12 @@ echo -e "${BOLD}=========================================${NC}"
 echo ""
 echo -e "  ${DIM}Session doc:${NC}  $SESSION_DOC"
 echo -e "  ${DIM}Working dir:${NC}  $WORKING_DIR"
+echo -e "  ${DIM}Engine:${NC}       $ENGINE"
+echo -e "  ${DIM}Lane:${NC}         $INSTANCE_TYPE"
+echo -e "  ${DIM}GT mode:${NC}      $($GT_MODE && echo on || echo off)"
+echo -e "  ${DIM}Target:${NC}       $DISPATCH_TARGET"
 echo -e "  ${DIM}Target pane:${NC}  $TARGET_PANE"
+[[ -n "$PARENT_INSTANCE_ID" ]] && echo -e "  ${DIM}Parent:${NC}       $PARENT_INSTANCE_ID"
 [[ -n "$PRIMARCH_NAME" ]] && echo -e "  ${DIM}Primarch:${NC}    $PRIMARCH_NAME"
 echo -e "  ${DIM}Zealotry:${NC}    $ZEALOTRY"
 echo ""
@@ -492,45 +721,70 @@ fi
 # --- Execute dispatch ---
 log_info "Dispatching to pane $TARGET_PANE..."
 
+# Long LAUNCH_CMD (embedded prompt) can exceed the terminal cooked-mode line
+# buffer (~1024 bytes on macOS), causing `tmux send-keys` to silently truncate
+# the command. Bracketed-paste (paste-buffer -p) also fragments at multi-KB
+# sizes through the macOS terminal pty. Stage the command in a tempfile and
+# source it from a short send-keys line so size never matters.
+send_launch_cmd() {
+    local pane="$1"
+    local cmd="$2"
+    local stage
+    stage=$(mktemp -t vault-dispatch.XXXXXX)
+    printf '%s\nrm -- %q\n' "$cmd" "$stage" > "$stage"
+    chmod 0600 "$stage"
+    tmux send-keys -t "$pane" ". ${stage}" Enter
+}
+
 if [[ "$PANE_MODE" == "stack" ]]; then
     # Stack pane: born clean from split-window, inherits default shell (zsh).
     # Shell functions (claude, primarch) load from .zshrc automatically.
     # Brief pause for shell init before sending command.
     sleep 0.5
-    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+    send_launch_cmd "$TARGET_PANE" "$LAUNCH_CMD"
 else
-    # Reuse pane: clear existing content, then launch.
+    # Named/reuse pane: clear existing content, then launch.
     # Pane is already running an interactive shell with functions loaded.
     tmux send-keys -t "$TARGET_PANE" "clear" Enter
     sleep 0.3
-    tmux send-keys -t "$TARGET_PANE" "$LAUNCH_CMD" Enter
+    send_launch_cmd "$TARGET_PANE" "$LAUNCH_CMD"
 fi
 
-log_success "Claude launched in vault"
+if [[ "$ENGINE" == "codex" ]]; then
+    log_success "Codex launched via dispatch backend"
+else
+    log_success "Claude launched in vault"
+fi
 
 # --- Wait for Claude to start, then release claim and register with Token-API ---
 # The claim prevented races during pane selection (reuse mode only). Once claude
 # is running, the process tree check in find_free_panes takes over as source of truth.
 (
-    sleep 8
-
     # Release the dispatch claim (no-op for stack panes which don't use claims)
+    sleep 8
     [[ "$PANE_MODE" == "reuse" ]] && release_claim "$TARGET_PANE"
 
     # Try to find the new instance and set zealotry
     if command -v curl &>/dev/null && command -v jq &>/dev/null; then
         API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+        instance_id=""
 
-        # Find instance in the target pane
-        instance_id=$(curl -s "${API_URL}/api/instances" 2>/dev/null | \
-            jq -r --arg pane "$TARGET_PANE" \
-            '.[] | select(.tmux_pane == $pane and (.stopped_at == null)) | .id' 2>/dev/null | head -1)
+        # Registration is asynchronous and can lag behind the pane launch.
+        # Retry briefly so zealotry override lands on slower starts too.
+        for _attempt in {1..10}; do
+            instance_id=$(curl -s "${API_URL}/api/instances" 2>/dev/null | \
+                jq -r --arg pane "$TARGET_PANE" \
+                '.[] | select(.tmux_pane == $pane and (.stopped_at == null)) | .id' 2>/dev/null | head -1)
+            if [[ -n "$instance_id" ]]; then
+                break
+            fi
+            sleep 2
+        done
 
         if [[ -n "$instance_id" ]]; then
-            # Set zealotry via Token-API
-            curl -s -X PATCH "${API_URL}/api/instances/${instance_id}" \
+            curl -s -X PATCH "${API_URL}/api/instances/${instance_id}/type" \
                 -H "Content-Type: application/json" \
-                -d "{\"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
+                -d "{\"instance_type\": \"${INSTANCE_TYPE}\", \"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
         fi
     fi
 ) &
@@ -542,6 +796,10 @@ echo ""
 echo -e "  ${DIM}The instance will:${NC}"
 echo -e "  ${DIM}1. Read session doc at ${SESSION_DOC}${NC}"
 echo -e "  ${DIM}2. Gather context from linked notes${NC}"
-echo -e "  ${DIM}3. Transplant to ${WORKING_DIR}${NC}"
+if [[ "$ENGINE" == "codex" ]]; then
+    echo -e "  ${DIM}3. Work directly in ${WORKING_DIR}${NC}"
+else
+    echo -e "  ${DIM}3. Transplant to ${WORKING_DIR}${NC}"
+fi
 echo -e "  ${DIM}4. Begin autonomous work${NC}"
 echo ""

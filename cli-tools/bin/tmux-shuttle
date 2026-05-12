@@ -4,13 +4,12 @@
 # AUDIENCE: human (keybind: prefix + d)
 #
 # Window-aware behavior:
-#   palace/warp   → demote current pane to legion (fresh shell replaces it)
-#   legion/kreig  → popup selector to promote (swap) into palace/warp slot
+#   palace/somnium      → demote current pane to legion (fresh shell replaces it)
+#   legion/mechanicus   → popup selector to promote (swap) into a palace or somnium slot
 #
 # Selector layout:
-#   1-4  Palace grid (TL TR BL BR)
-#   5-6  Warp terminals (Top Bot)
-#   7-8  WSL side columns (SL SR) — only shown on WSL layout
+#   1-4  Palace slots  (W N S E)
+#   5-9  Somnium slots (W N NE S SE)
 #
 # Dirty panes (Claude processing) are dimmed in the selector.
 
@@ -24,6 +23,19 @@ source "${_LIB_DIR}/pane-id.sh"
 
 SESSION="main"
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+CLIENT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --client)
+            CLIENT="${2:-}"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 # Resolve a base window name to its actual tmux name (may have instance count suffix)
 # e.g. "legion" → "legion(2)" if renamed by instance count system
@@ -35,9 +47,20 @@ resolve_window() {
 # Update pane_label in Token-API DB so orchestration knows the new location
 relocate_pane() {
     local pane_id="$1" label="$2"
-    curl -s -X PATCH "${API_URL}/api/pane/relocate" \
+    if curl -fsS -X PATCH "${API_URL}/api/pane/relocate" \
         -H "Content-Type: application/json" \
         -d "{\"tmux_pane\": \"${pane_id}\", \"pane_label\": \"${label}\"}" \
+        >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local db_path="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    [[ -f "$db_path" ]] || return 0
+    pane_id="${pane_id//\'/\'\'}"
+    label="${label//\'/\'\'}"
+    sqlite3 "$db_path" \
+        "UPDATE claude_instances SET pane_label='${label}' WHERE tmux_pane='${pane_id}' AND stopped_at IS NULL;" \
         >/dev/null 2>&1 || true
 }
 
@@ -52,20 +75,36 @@ if [[ "${1:-}" == "--do-swap" ]]; then
     src_tag=$(pane_id_of "$src") || true
     src_window="${src_tag%%:*}"
     src_window="${src_window:-legion}"
+    tombstone_source=""
+    case "$src_tag" in
+        legion:custodes|mechanicus:fabricator-general|mechanicus:anchor)
+            tombstone_source="$src_tag"
+            ;;
+    esac
 
     tmux swap-pane -s "$src" -t "$dst" || { echo "swap-pane failed"; exit 1; }
 
     # After swap: src content is at dst's position, dst content is at src's position.
     # Pane IDs (%N) follow content, so:
-    #   $src (now in palace/warp position) gets the palace/warp tag
-    #   $dst (now in legion/kreig position) gets demoted tag
+    #   $src (now in somnium position) gets the somnium tag
+    #   $dst (now in legion/mechanicus position) gets demoted tag
     pane_tag "$src" "$dst_tag" || true
-    pane_tag "$dst" "${src_window}:bumped" || true
-    tmux set-option -p -t "$dst" @PANE_TYPE "legion" 2>/dev/null || true
+    if [[ -n "$tombstone_source" ]]; then
+        pane_tag "$dst" "$tombstone_source" || true
+        tmux set-option -p -t "$dst" @PANE_TYPE "tombstone" 2>/dev/null || true
+        tmux set-option -p -t "$dst" @TOMBSTONE_SOURCE "$tombstone_source" 2>/dev/null || true
+        tmux set-option -p -t "$dst" @TOMBSTONE_TARGET "$src" 2>/dev/null || true
+        tmux send-keys -t "$dst" "exec tmux-tombstone '$tombstone_source' '$src'" Enter
+    else
+        pane_tag "$dst" "${src_window}:bumped" || true
+        tmux set-option -p -t "$dst" @PANE_TYPE "$src_window" 2>/dev/null || true
+    fi
 
     # Update Token-API DB so orchestration sees the new locations
     relocate_pane "$src" "$dst_tag"
-    relocate_pane "$dst" "${src_window}:bumped"
+    if [[ -z "$tombstone_source" ]]; then
+        relocate_pane "$dst" "${src_window}:bumped"
+    fi
 
     # Trigger workspace audit (backburner cleanup, etc.) — fire and forget
     tmux-audit --force &
@@ -78,15 +117,26 @@ current_window=$(tmux display-message -p '#{window_name}')
 current_window="${current_window%%(*}"  # Strip instance count suffix
 current_pane=$(tmux display-message -p '#{pane_id}')
 current_tag=$(pane_id_of "$current_pane")
+current_type=$(tmux show-options -pv -t "$current_pane" @PANE_TYPE 2>/dev/null || true)
 
-# --- DEMOTE: palace/warp → legion ---
+if [[ "$current_type" == "tombstone" ]]; then
+    # Tombstone jump remains a shuttle operation. Expand (`prefix + e`) is now
+    # native zoom in all cases and must not perform audience/tombstone routing.
+    args=(tombstone jump --pane "$current_pane")
+    if [[ -n "$CLIENT" ]]; then
+        args+=(--client "$CLIENT")
+    fi
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.cli "${args[@]}"
+fi
+
+# --- DEMOTE: somnium → legion ---
 demote() {
     # Ensure legion window exists; resolve actual name (may have instance count suffix)
     local legion_win
     legion_win=$(resolve_window legion)
     if ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -q "^legion"; then
         tmux new-window -t "$SESSION" -n legion -d -c "$HOME"
-        pane_tag "${SESSION}:legion.1" "legion:1"
+        pane_tag "${SESSION}:legion.1" "legion:custodes"
         legion_win="legion"
     fi
 
@@ -109,12 +159,13 @@ demote() {
     pane_tag "$current_pane" "legion:demoted"
     tmux set-option -p -t "$current_pane" @PANE_TYPE "legion"
     tmux move-pane -s "$current_pane" -t "${SESSION}:${legion_win}" -d
-    tmux select-layout -t "${SESSION}:${legion_win}" tiled 2>/dev/null || true
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli legion focus-selected --pane "$current_pane" >/dev/null 2>&1 || true
 
     # Update Token-API DB so orchestration sees the new location
     relocate_pane "$current_pane" "legion:demoted"
 
-    # Refresh palace/warp layout so the replacement pane fills the correct geometry
+    # Refresh somnium layout so the replacement pane fills the correct geometry
     tmux-refresh-layout 2>/dev/null || true
 
     # Trigger workspace audit (backburner cleanup, etc.) — fire and forget
@@ -123,7 +174,7 @@ demote() {
     tmux display-message "Shipped to legion"
 }
 
-# --- PROMOTE: legion/kreig → palace/warp (selector) ---
+# --- PROMOTE: legion/mechanicus → somnium (selector) ---
 promote() {
     # Collect pane data into flat parallel arrays (no associative arrays — compat)
     local pd_tags="" pd_pids="" pd_cmds="" pd_states=""
@@ -140,7 +191,7 @@ promote() {
             -F '#{pane_id}	#{@PANE_ID}	#{pane_current_command}	#{@CC_STATE}' 2>/dev/null || true)
     }
     collect_panes palace
-    collect_panes warp
+    collect_panes somnium
 
     # Lookup helper: find pid/cmd/state for a given tag
     lookup_tag() {
@@ -160,10 +211,6 @@ promote() {
         done
     }
 
-    # Detect WSL layout
-    local layout_origin
-    layout_origin=$(tmux show-options -wv -t "${SESSION}:palace" @LAYOUT_ORIGIN 2>/dev/null || echo "")
-
     # Build display-menu arguments in order
     local menu_args=()
 
@@ -180,25 +227,18 @@ promote() {
         fi
     }
 
-    # Palace grid (1-4)
-    add_slot 1 "palace:TL" "Palace TL"
-    add_slot 2 "palace:TR" "Palace TR"
-    add_slot 3 "palace:BL" "Palace BL"
-    add_slot 4 "palace:BR" "Palace BR"
+    # Palace slots (1-4)
+    add_slot 1 "palace:W" "Palace W"
+    add_slot 2 "palace:N" "Palace N"
+    add_slot 3 "palace:S" "Palace S"
+    add_slot 4 "palace:E" "Palace E"
 
-    # Separator
-    menu_args+=("" "" "")
-
-    # Warp terminals (5-6)
-    add_slot 5 "warp:T" "Warp Top"
-    add_slot 6 "warp:B" "Warp Bot"
-
-    # WSL side columns (7-8)
-    if [[ "$layout_origin" == "wsl" ]]; then
-        menu_args+=("" "" "")
-        add_slot 7 "palace:SL" "WSL Side-L"
-        add_slot 8 "palace:SR" "WSL Side-R"
-    fi
+    # Somnium slots (5-9)
+    add_slot 5 "somnium:W" "Somnium W"
+    add_slot 6 "somnium:N" "Somnium N"
+    add_slot 7 "somnium:NE" "Somnium NE"
+    add_slot 8 "somnium:S" "Somnium S"
+    add_slot 9 "somnium:SE" "Somnium SE"
 
     if [[ ${#menu_args[@]} -eq 0 ]]; then
         tmux display-message "No target panes found"
@@ -210,13 +250,13 @@ promote() {
 
 # --- Route based on current window ---
 case "$current_window" in
-    palace|warp)
+    palace|somnium)
         demote
         ;;
-    legion|kreig)
+    legion|mechanicus|mars|kreig)
         promote
         ;;
     *)
-        tmux display-message "Shuttle: only works on palace/warp/legion/kreig"
+        tmux display-message "Shuttle: only works on palace/somnium/legion/mechanicus"
         ;;
 esac

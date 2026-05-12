@@ -1,5 +1,5 @@
 # mobile-shell-init — Dirty bit tracking for mobile tmux panes
-# Sourced automatically by tmux-workspace in mobile window panes
+# Sourced from .zshrc/.bashrc on phones attached to the somnium workspace.
 # Works in both zsh (Mac) and bash (WSL)
 #
 # Dirty bit: window name gets '*' appended when any command runs.

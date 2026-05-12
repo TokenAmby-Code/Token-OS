@@ -2,8 +2,8 @@
 
 from .cli import main
 from .query_runner import (
-    ENVIRONMENTS,
     ENV_ALIASES,
+    ENVIRONMENTS,
     QueryResult,
     describe_table,
     execute_query,

@@ -4,8 +4,8 @@ Provides easy access to Cloud Run logs with smart defaults for deployment debugg
 """
 
 from .log_fetcher import (
-    ENVIRONMENTS,
     ENV_ALIASES,
+    ENVIRONMENTS,
     SERVICES,
     fetch_logs,
     get_latest_revision,

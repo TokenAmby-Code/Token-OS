@@ -50,7 +50,9 @@ def test_get_next_codex_agent_id_increments(tmp_path: Path) -> None:
     assert paths.counter_path.read_text(encoding="utf-8").strip() == "2"
 
 
-def test_handle_codex_launch_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_handle_codex_launch_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     paths = _build_paths(tmp_path)
     launches: dict[str, object] = {}
 
@@ -69,7 +71,9 @@ def test_handle_codex_launch_success(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(subagent_main, "launch_in_new_terminal", fake_launch)
     monkeypatch.setattr(subagent_main, "detect_terminal_emulator", lambda: "gnome-terminal")
-    monkeypatch.setattr(subagent_main.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None)
+    monkeypatch.setattr(
+        subagent_main.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None
+    )
     monkeypatch.setattr(subagent_main.time, "sleep", lambda *_: None)
 
     args = argparse.Namespace(prompt_file=None, codex_command=["echo", "hello"])
@@ -126,7 +130,9 @@ def test_handle_codex_uses_packaged_env_when_configured(
     assert command[4] == str(codex_stub)
 
 
-def test_handle_codex_falls_back_to_repo_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_codex_falls_back_to_repo_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _build_paths(tmp_path)
     codex_stub = _create_codex_stub(paths.invocation_root / ".venv" / "bin")
     launches: dict[str, object] = {}
@@ -154,12 +160,16 @@ def test_handle_codex_falls_back_to_repo_venv(tmp_path: Path, monkeypatch: pytes
     assert command[4] == str(codex_stub)
 
 
-def test_handle_codex_launch_retries_and_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_codex_launch_retries_and_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _build_paths(tmp_path)
 
     monkeypatch.setattr(subagent_main, "launch_in_new_terminal", lambda *_, **__: None)
     monkeypatch.setattr(subagent_main, "detect_terminal_emulator", lambda: "gnome-terminal")
-    monkeypatch.setattr(subagent_main.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None)
+    monkeypatch.setattr(
+        subagent_main.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None
+    )
     monkeypatch.setattr(subagent_main.time, "sleep", lambda *_: None)
 
     args = argparse.Namespace(prompt_file=None, codex_command=["echo", "fail"])

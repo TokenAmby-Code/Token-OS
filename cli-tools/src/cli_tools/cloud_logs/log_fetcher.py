@@ -6,11 +6,10 @@ Handles gcloud CLI interactions and log parsing.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,7 @@ def _find_deploy_dir() -> Path:
         if c.exists():
             return c
     return candidates[0]  # fallback to original
+
 
 DEPLOY_DIR = _find_deploy_dir()
 
@@ -152,9 +152,7 @@ def parse_duration(duration_str: str) -> timedelta:
     """
     match = re.match(r"^(\d+)([mhd])$", duration_str.lower())
     if not match:
-        raise ValueError(
-            f"Invalid duration: {duration_str}. Use format like '1h', '30m', '2d'"
-        )
+        raise ValueError(f"Invalid duration: {duration_str}. Use format like '1h', '30m', '2d'")
 
     value = int(match.group(1))
     unit = match.group(2)
@@ -222,7 +220,7 @@ def get_recent_deployment_time(
             # Handle various formats
             for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%dT%H:%M:%S%z"]:
                 try:
-                    return datetime.strptime(timestamp_str, fmt).replace(tzinfo=timezone.utc)
+                    return datetime.strptime(timestamp_str, fmt).replace(tzinfo=UTC)
                 except ValueError:
                     continue
             # Try ISO format as fallback
@@ -264,7 +262,7 @@ def _build_log_filter(
 
     if since:
         # Calculate timestamp
-        cutoff = datetime.now(timezone.utc) - since
+        cutoff = datetime.now(UTC) - since
         timestamp = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
         filters.append(f'timestamp>="{timestamp}"')
 
@@ -371,7 +369,7 @@ def fetch_logs(
     if since_deployment:
         deploy_time = get_recent_deployment_time(project, service)
         if deploy_time:
-            since = datetime.now(timezone.utc) - deploy_time
+            since = datetime.now(UTC) - deploy_time
             # Add a small buffer (5 minutes before deployment)
             since = since + timedelta(minutes=5)
         else:
@@ -501,10 +499,7 @@ def get_service_status(env: str, service: str = DEFAULT_SERVICE) -> dict[str, An
             "service": service,
             "url": status.get("url", ""),
             "latest_revision": status.get("latestReadyRevisionName", ""),
-            "conditions": [
-                {"type": c.get("type"), "status": c.get("status")}
-                for c in conditions
-            ],
+            "conditions": [{"type": c.get("type"), "status": c.get("status")} for c in conditions],
         }
 
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, json.JSONDecodeError) as e:

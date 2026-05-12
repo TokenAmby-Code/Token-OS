@@ -121,7 +121,11 @@ def _print_result_summary(result: LogResult, env: str) -> None:
     env_name = normalize_env(env)
     console.print(f"\n[dim]Environment: {env_name} | Found: {result.count} entries[/dim]")
     if result.query_used:
-        console.print(f"[dim]Filter: {result.query_used[:100]}...[/dim]" if len(result.query_used) > 100 else f"[dim]Filter: {result.query_used}[/dim]")
+        console.print(
+            f"[dim]Filter: {result.query_used[:100]}...[/dim]"
+            if len(result.query_used) > 100
+            else f"[dim]Filter: {result.query_used}[/dim]"
+        )
 
 
 def cmd_errors(args: argparse.Namespace) -> int:
@@ -134,7 +138,9 @@ def cmd_errors(args: argparse.Namespace) -> int:
             console.print(f"[red]Error: {e}[/red]")
             return 1
 
-    console.print(f"[cyan]Fetching errors from {args.service} ({normalize_env(args.env)})...[/cyan]")
+    console.print(
+        f"[cyan]Fetching errors from {args.service} ({normalize_env(args.env)})...[/cyan]"
+    )
 
     result = fetch_logs(
         env=args.env,
@@ -168,7 +174,9 @@ def cmd_recent(args: argparse.Namespace) -> int:
             console.print(f"[red]Error: {e}[/red]")
             return 1
 
-    console.print(f"[cyan]Fetching recent logs from {args.service} ({normalize_env(args.env)})...[/cyan]")
+    console.print(
+        f"[cyan]Fetching recent logs from {args.service} ({normalize_env(args.env)})...[/cyan]"
+    )
 
     result = fetch_logs(
         env=args.env,
@@ -201,7 +209,9 @@ def cmd_http(args: argparse.Namespace) -> int:
             console.print(f"[red]Error: {e}[/red]")
             return 1
 
-    console.print(f"[cyan]Fetching HTTP logs from {args.service} ({normalize_env(args.env)})...[/cyan]")
+    console.print(
+        f"[cyan]Fetching HTTP logs from {args.service} ({normalize_env(args.env)})...[/cyan]"
+    )
 
     result = fetch_logs(
         env=args.env,
@@ -234,7 +244,9 @@ def cmd_search(args: argparse.Namespace) -> int:
             console.print(f"[red]Error: {e}[/red]")
             return 1
 
-    console.print(f"[cyan]Searching for '{args.pattern}' in {args.service} ({normalize_env(args.env)})...[/cyan]")
+    console.print(
+        f"[cyan]Searching for '{args.pattern}' in {args.service} ({normalize_env(args.env)})...[/cyan]"
+    )
 
     result = fetch_logs(
         env=args.env,

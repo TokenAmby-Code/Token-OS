@@ -5,6 +5,7 @@
 #
 # Usage:
 #   timer-test 60       # Save real break time, set to 60 minutes
+#   timer-test -180     # Save real break time, set to 3 hours of backlog
 #   timer-test 30       # Already in test mode — set to 30 min (original preserved)
 #   timer-test pop      # Restore saved break time, clean up
 
@@ -27,7 +28,7 @@ set_break_seconds() {
 
 case "${1:-}" in
     -h|--help|"")
-        echo "Usage: timer-test <minutes>   Set break time (saves real value first)"
+        echo "Usage: timer-test <minutes>   Set break time (negative values set backlog)"
         echo "       timer-test pop         Restore saved break time"
         exit 0
         ;;
@@ -40,7 +41,7 @@ case "${1:-}" in
         ;;
     *)
         input="$1"
-        [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "Expected a number of minutes or 'pop'"
+        [[ "$input" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "Expected a number of minutes or 'pop'"
 
         # Save current break time only if not already in test mode
         if [[ ! -f "$SAVE_FILE" ]]; then

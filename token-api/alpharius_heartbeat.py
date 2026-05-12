@@ -10,7 +10,7 @@ Runs every 30 minutes. Reports via Mechanicus Discord account.
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 API = "http://localhost:7777"
 FLEET_CHANNEL = "1473184628155088918"
@@ -27,7 +27,9 @@ def _get(path: str):
     try:
         result = subprocess.run(
             ["curl", "-s", f"{API}{path}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return json.loads(result.stdout)
     except Exception:
@@ -38,7 +40,8 @@ def _alert(message: str):
     """Post to Discord #fleet via Mechanicus account. Alpharius wears the cog."""
     subprocess.run(
         ["discord", "send", FLEET_CHANNEL, "--bot", "mechanicus", message],
-        capture_output=True, timeout=15,
+        capture_output=True,
+        timeout=15,
     )
     print(f"  ALERT: {message}")
 
@@ -47,7 +50,7 @@ def _check_fg_cadence(fg_id: str, max_hours: int) -> str | None:
     """Check if FG has completed successfully within the expected window."""
     runs = _get(f"/api/cron/jobs/{fg_id}/runs?limit=10")
     if not runs or not runs.get("runs"):
-        return f"fabricator-general has NO run history. Fleet may never have been orchestrated."
+        return "fabricator-general has NO run history. Fleet may never have been orchestrated."
 
     # Cron engine stores naive local timestamps via datetime.now().isoformat()
     cutoff = datetime.now() - timedelta(hours=max_hours)

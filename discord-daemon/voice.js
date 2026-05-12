@@ -47,6 +47,10 @@ export function createVoiceManager(botClients, config, logger) {
 
   // Transcription callback — set externally
   let onTranscription = null;
+  let onAudioFrame = null;
+  let onAudioEnd = null;
+  let onAudioCommit = null;
+  const SILENCE_PCM_20MS = Buffer.alloc(48000 / 50 * 2);
 
   function getBotState(botName) {
     if (!botStates.has(botName)) {
@@ -190,18 +194,27 @@ export function createVoiceManager(botClients, config, logger) {
         if (totalBytes > 0) {
           logger.info(`Voice [${botName}]: silence detected (${SILENCE_FLUSH_MS}ms), flushing chunk`);
           flushChunk();
+          if (onAudioCommit) {
+            try { onAudioCommit(userId, botName, { reason: 'silence', silenceMs: SILENCE_FLUSH_MS }); } catch {}
+          }
         }
       }, SILENCE_FLUSH_MS);
     }
 
     // Silence frames from Discord trigger the flush timer
     silenceFilter.on('silence', () => {
+      if (onAudioFrame) {
+        try { onAudioFrame(userId, SILENCE_PCM_20MS, botName, { silence: true }); } catch {}
+      }
       if (totalBytes > 0) {
         startSilenceTimer();
       }
     });
 
     decoder.on('data', (chunk) => {
+      if (onAudioFrame) {
+        try { onAudioFrame(userId, chunk, botName, { silence: false }); } catch {}
+      }
       // Real audio arrived — cancel any pending silence flush
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
 
@@ -221,6 +234,9 @@ export function createVoiceManager(botClients, config, logger) {
     decoder.on('end', () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       state.activeSubscriptions.delete(userId);
+      if (onAudioEnd) {
+        try { onAudioEnd(userId, botName); } catch {}
+      }
       if (totalBytes > 0) {
         flushChunk();
       }
@@ -230,12 +246,18 @@ export function createVoiceManager(botClients, config, logger) {
       if (silenceTimer) clearTimeout(silenceTimer);
       logger.error(`Voice [${botName}]: decoder error for ${userId}: ${err.message}`);
       state.activeSubscriptions.delete(userId);
+      if (onAudioEnd) {
+        try { onAudioEnd(userId, botName); } catch {}
+      }
     });
 
     audioStream.on('error', (err) => {
       if (silenceTimer) clearTimeout(silenceTimer);
       logger.error(`Voice [${botName}]: stream error for ${userId}: ${err.message}`);
       state.activeSubscriptions.delete(userId);
+      if (onAudioEnd) {
+        try { onAudioEnd(userId, botName); } catch {}
+      }
     });
 
     state.activeSubscriptions.set(userId, { stream: audioStream, decoder, flush: flushChunk });
@@ -272,6 +294,9 @@ export function createVoiceManager(botClients, config, logger) {
       if (sub.flush) {
         try { sub.flush(); } catch {}
       }
+      if (onAudioCommit) {
+        try { onAudioCommit(userId, botName, { reason: 'leave' }); } catch {}
+      }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
     }
@@ -302,6 +327,9 @@ export function createVoiceManager(botClients, config, logger) {
     for (const [userId, sub] of state.activeSubscriptions) {
       if (sub.flush) {
         try { sub.flush(); } catch {}
+      }
+      if (onAudioCommit) {
+        try { onAudioCommit(userId, botName, { reason: 'stop' }); } catch {}
       }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
@@ -401,6 +429,63 @@ export function createVoiceManager(botClients, config, logger) {
       });
 
       logger.info(`Voice auto-join [${botName}]: watching for operator in channel ${channelId}`);
+    }
+  }
+
+  /**
+   * Startup reconciliation for the common case where the operator is already
+   * in a configured VC before this daemon finishes connecting. In that case
+   * Discord does not emit a fresh VoiceStateUpdate, so auto-join never fires.
+   */
+  async function reconcileOperatorVoiceState() {
+    if (!operatorUserId) {
+      logger.warn('Voice startup sync: no operator_user_id configured');
+      return { joined: false, reason: 'missing_operator_user_id' };
+    }
+
+    const lookupClient = Object.values(botClients).find(c => c?.client);
+    if (!lookupClient?.client) {
+      logger.warn('Voice startup sync: no connected bot client available');
+      return { joined: false, reason: 'no_client' };
+    }
+
+    let currentChannelId = null;
+    try {
+      const guild = await lookupClient.client.guilds.fetch(guildId);
+      const member = await guild.members.fetch(operatorUserId);
+      currentChannelId = member.voice?.channelId || guild.voiceStates.cache.get(operatorUserId)?.channelId || null;
+    } catch (err) {
+      logger.warn(`Voice startup sync: failed to fetch operator voice state: ${err.message}`);
+      return { joined: false, reason: 'fetch_failed', error: err.message };
+    }
+
+    if (!currentChannelId) {
+      logger.info('Voice startup sync: operator is not in a voice channel; waiting for auto-join event');
+      return { joined: false, reason: 'operator_not_in_voice' };
+    }
+
+    const match = Object.entries(voiceChannels).find(([, channelId]) => channelId === currentChannelId);
+    if (!match) {
+      logger.info(`Voice startup sync: operator is in unassigned channel ${currentChannelId}; waiting for auto-join event`);
+      return { joined: false, reason: 'unassigned_channel', channelId: currentChannelId };
+    }
+
+    const [botName, channelId] = match;
+    const state = getBotState(botName);
+    if (state.connection) {
+      logger.info(`Voice startup sync [${botName}]: already connected to ${state.channelId}`);
+      return { joined: false, reason: 'already_connected', botName, channelId: state.channelId };
+    }
+
+    logger.info(`Voice startup sync [${botName}]: operator already in ${channelId}, joining...`);
+    try {
+      await joinChannel(channelId, botName);
+      startRecording(botName);
+      logger.info(`Voice startup sync [${botName}]: joined and recording`);
+      return { joined: true, botName, channelId };
+    } catch (err) {
+      logger.error(`Voice startup sync [${botName}]: failed to join: ${err.message}`);
+      return { joined: false, reason: 'join_failed', botName, channelId, error: err.message };
     }
   }
 
@@ -549,5 +634,9 @@ export function createVoiceManager(botClients, config, logger) {
     stopPlayback,
     playTTS,
     setTranscriptionCallback(cb) { onTranscription = cb; },
+    setAudioFrameCallback(cb) { onAudioFrame = cb; },
+    setAudioEndCallback(cb) { onAudioEnd = cb; },
+    setAudioCommitCallback(cb) { onAudioCommit = cb; },
+    reconcileOperatorVoiceState,
   };
 }

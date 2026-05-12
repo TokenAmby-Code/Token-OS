@@ -6,6 +6,7 @@ INTERESTING: reads session docs for up to 2 processing instances, enriches obser
 ROUTINE: appends quietly to daily note.
 BREAK NUDGE: independently fires when break balance is deeply negative or manual BREAK too long.
 """
+
 import datetime
 import json
 import os
@@ -42,7 +43,11 @@ def extract_metrics(timer: dict, instances: list, cron_jobs: list) -> dict:
     effective_mode = timer.get("current_mode", "unknown").upper()
     break_minutes = int(timer.get("break_balance_ms", 0) / 60000)
     work_minutes = int(timer.get("work_time_ms", timer.get("work_ms", 0)) / 60000)
-    alive = [i for i in instances if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")]
+    alive = [
+        i
+        for i in instances
+        if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")
+    ]
     cron_count = sum(1 for i in alive if i.get("origin_type") == "cron")
     manual_count = len(alive) - cron_count
     processing_count = sum(1 for i in instances if i.get("is_processing") == 1)
@@ -55,8 +60,8 @@ def extract_metrics(timer: dict, instances: list, cron_jobs: list) -> dict:
         "effective_mode": effective_mode,
         "break_minutes": break_minutes,
         "work_minutes": work_minutes,
-        "active_count": manual_count,       # Emperor's manual instances only
-        "cron_count": cron_count,            # Mechanicus cron workers (instances)
+        "active_count": manual_count,  # Emperor's manual instances only
+        "cron_count": cron_count,  # Mechanicus cron workers (instances)
         "processing_count": processing_count,
         "manual_mode": (timer.get("manual_mode") or "").upper(),
         "active_cron_jobs": len(active_cron_jobs),
@@ -169,6 +174,7 @@ def track_and_check_oscillation(mode: str) -> str | None:
 
 # ── Guardsman evaluation ───────────────────────────────────────────────────────
 
+
 def evaluate_with_guardsman(metrics: dict, extra_flags: dict) -> bool:
     """Guardsman PASS/FAIL based on state-commentary conditions (not habits).
 
@@ -201,8 +207,7 @@ def evaluate_with_guardsman(metrics: dict, extra_flags: dict) -> bool:
         "Otherwise FAIL."
     )
     result = subprocess.run(
-        ["guardsman", f"echo '{summary}' | {assertion}"],
-        capture_output=True, text=True, timeout=30
+        ["guardsman", f"echo '{summary}' | {assertion}"], capture_output=True, text=True, timeout=30
     )
     output = result.stdout.strip()
     print(f"  guardsman: {output}")
@@ -213,13 +218,17 @@ def get_active_session_doc() -> str | None:
     """Return file_path of session doc for the most recently active non-subagent instance."""
     result = subprocess.run(
         [
-            "agents-db", "--json", "query",
+            "agents-db",
+            "--json",
+            "query",
             "SELECT sd.file_path FROM claude_instances ci "
             "JOIN session_documents sd ON ci.session_doc_id = sd.id "
             "WHERE ci.status='active' AND ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
             "ORDER BY ci.last_activity DESC LIMIT 1",
         ],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     try:
         rows = json.loads(result.stdout)
@@ -236,13 +245,17 @@ def get_recent_session_doc() -> tuple[str | None, str | None]:
     """
     result = subprocess.run(
         [
-            "agents-db", "--json", "query",
+            "agents-db",
+            "--json",
+            "query",
             "SELECT sd.file_path, sd.title FROM claude_instances ci "
             "JOIN session_documents sd ON ci.session_doc_id = sd.id "
             "WHERE ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
             "ORDER BY ci.last_activity DESC LIMIT 1",
         ],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     try:
         rows = json.loads(result.stdout)
@@ -279,9 +292,15 @@ def extract_session_topic(instance: dict) -> str:
         return tab_name
     try:
         result = subprocess.run(
-            ["agents-db", "--json", "query",
-             f"SELECT title FROM session_documents WHERE id={int(doc_id)}"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "agents-db",
+                "--json",
+                "query",
+                f"SELECT title FROM session_documents WHERE id={int(doc_id)}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         rows = json.loads(result.stdout)
         title = rows[0].get("title") if rows else None
@@ -308,9 +327,21 @@ def generate_observation(summary: str, session_ctx: str | None) -> str:
     )
     session_id = f"custodes-obs-{int(_time.time())}"
     result = subprocess.run(
-        ["openclaw", "agent", "--agent", "main", "--session-id", session_id,
-         "-m", prompt, "--local", "--json"],
-        capture_output=True, text=True, timeout=30,
+        [
+            "openclaw",
+            "agent",
+            "--agent",
+            "main",
+            "--session-id",
+            session_id,
+            "-m",
+            prompt,
+            "--local",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if result.returncode == 0:
         try:
@@ -327,7 +358,7 @@ def build_comment(metrics: dict) -> str:
     mode = metrics["effective_mode"]
     break_min = metrics["break_minutes"]
     work_min = metrics.get("work_minutes", 0)
-    active = metrics["active_count"]      # Emperor's manual instances
+    active = metrics["active_count"]  # Emperor's manual instances
     cron = metrics.get("cron_count", 0)
     processing = metrics.get("processing_count", 0)
     victories = metrics.get("recent_victories", [])
@@ -355,7 +386,9 @@ def build_comment(metrics: dict) -> str:
 def send_discord(message: str, channel: str = BRIEFING_CHANNEL):
     result = subprocess.run(
         ["discord", "send", channel, "--bot", "custodes", message],
-        capture_output=True, text=True, timeout=15
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     if result.returncode == 0:
         print(f"  Posted to #{channel} via custodes bot")
@@ -376,7 +409,9 @@ def get_or_create_daily_thread() -> str | None:
     thread_name = f"Custodes — {today}"
     result = subprocess.run(
         ["discord", "thread", "create", BRIEFING_CHANNEL, thread_name, "--bot", "custodes"],
-        capture_output=True, text=True, timeout=15
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     if result.returncode != 0:
         print(f"  Thread create failed: {result.stderr.strip()}")
@@ -404,7 +439,9 @@ def send_discord_thread(message: str):
     if thread_id:
         result = subprocess.run(
             ["discord", "thread", "send", thread_id, "--bot", "custodes", message],
-            capture_output=True, text=True, timeout=15
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if result.returncode == 0:
             print(f"  Posted to daily thread {thread_id} via custodes bot")
@@ -420,11 +457,15 @@ def check_break_nudge(metrics: dict) -> str | None:
 
     # Deep debt: more than 60 min in the red — always nudge regardless of mode
     if break_min < -60:
-        return f"Break balance is {break_min:.0f} min — significant debt. Consider wrapping up soon."
+        return (
+            f"Break balance is {break_min:.0f} min — significant debt. Consider wrapping up soon."
+        )
 
     # Manual BREAK with meaningful debt — prompt to resume or keep resting
     if mode == "BREAK" and break_min < -30:
-        return f"In BREAK mode with {break_min:.0f} min balance. Still recovering or time to resume?"
+        return (
+            f"In BREAK mode with {break_min:.0f} min balance. Still recovering or time to resume?"
+        )
 
     return None
 
@@ -521,7 +562,11 @@ def check_instance_zero(metrics: dict, instances: list) -> tuple[str | None, str
     if active_count == 0:
         if not FLAG.exists():
             FLAG.touch()
-            cron_note = f" {cron_count} Mechanicus worker(s) continue autonomously." if cron_count > 0 else ""
+            cron_note = (
+                f" {cron_count} Mechanicus worker(s) continue autonomously."
+                if cron_count > 0
+                else ""
+            )
             return f"Emperor has gone offline.{cron_note}", "fleet"
         return None, None  # already sent, suppress
 
@@ -537,7 +582,9 @@ def check_morning_greeting(metrics: dict) -> str | None:
     """Post a morning greeting on the first heartbeat of the day (9am+ Phoenix time).
     Creates the daily thread as a side effect. Only fires once per day via flag file.
     """
-    phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
+    phoenix_now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - datetime.timedelta(
+        hours=7
+    )
 
     # Only fire from 9am onward (alarm 8:30, work starts 9)
     if phoenix_now.hour < 9:
@@ -627,10 +674,10 @@ def main():
     # 1b. Morning greeting — first heartbeat of the day, creates daily thread
     morning = check_morning_greeting(metrics)
     if morning:
-        print(f"  Morning greeting: posting to daily thread")
+        print("  Morning greeting: posting to daily thread")
         send_discord_thread(f"Custodes: {morning}")
         send_discord(
-            f"Good morning, Emperor. Daily thread is live. Overnight report in #fleet.",
+            "Good morning, Emperor. Daily thread is live. Overnight report in #fleet.",
             channel=BRIEFING_CHANNEL,
         )
 
@@ -659,8 +706,7 @@ def main():
                 print(f"  Context: {title}")
         else:
             active_non_sub = [
-                i for i in instances
-                if i.get("status") == "active" and not i.get("is_subagent")
+                i for i in instances if i.get("status") == "active" and not i.get("is_subagent")
             ]
             if active_non_sub:
                 topic = extract_session_topic(active_non_sub[0])
@@ -716,8 +762,7 @@ def main():
 
         # Build "Active work: <topic> (<project>), ..." from processing instances (up to 2)
         processing = [
-            i for i in instances
-            if i.get("is_processing") == 1 and not i.get("is_subagent")
+            i for i in instances if i.get("is_processing") == 1 and not i.get("is_subagent")
         ][:2]
         active_work_suffix = ""
         if processing:

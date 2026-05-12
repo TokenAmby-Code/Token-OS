@@ -1,0 +1,65 @@
+"""Human-safe pane surface formatting.
+
+These helpers are used anywhere a Claude instance/pane identifier is surfaced to
+the operator. In particular, they reject launch-placeholder tab names such as
+``Claude 08:14`` so those placeholders cannot leak into TTS, push, Discord, or
+the daily-note NOW widget.
+"""
+
+from __future__ import annotations
+
+import re
+
+DEFAULT_TAB_NAME_RX = re.compile(r"^Claude\s+\d{1,2}:\d{2}$")
+
+_PANE_PAGE_NUMBERS = {
+    "palace": "1",
+    "somnium": "2",
+}
+
+
+def is_meaningful_tab_name(tab_name: str | None) -> bool:
+    """True when ``tab_name`` is not blank and not the default launch stamp."""
+    return human_tab_name(tab_name) is not None
+
+
+def human_tab_name(tab_name: str | None) -> str | None:
+    """Return the cleaned human name, or None for placeholders/blank names."""
+    if not tab_name:
+        return None
+    cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
+    if not cleaned:
+        return None
+    if DEFAULT_TAB_NAME_RX.match(cleaned):
+        return None
+    return cleaned
+
+
+def pane_position_id(pane_label: str | None) -> str | None:
+    """Return the stable page-number:slot position, e.g. ``1:N``.
+
+    Only fixed two-dimensional workspaces have positional identity. Dynamic
+    workspaces such as legion/mechanicus/custodes do not get fake positions.
+    """
+    if not pane_label:
+        return None
+    page, _, slot = pane_label.partition(":")
+    page_number = _PANE_PAGE_NUMBERS.get(page)
+    if page_number and slot:
+        return f"{page_number}:{slot}"
+    return None
+
+
+def human_pane_surface(tab_name: str | None, tmux_pane: str | None, pane_label: str | None) -> str:
+    """Return the operator-facing pane surface.
+
+    Prefer ``<position> <name>`` when both are available. Never return a
+    ``Claude HH:MM`` launch-placeholder name. Fall back to the raw tmux pane
+    when no human name or stable pane label exists; callers need a concrete
+    surface, not a generic "session" bucket, when addressing live panes.
+    """
+    position = pane_position_id(pane_label)
+    name = human_tab_name(tab_name)
+    if position and name:
+        return f"{position} {name}"
+    return position or name or tmux_pane or "session"

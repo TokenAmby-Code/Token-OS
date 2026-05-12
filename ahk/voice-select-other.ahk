@@ -1,6 +1,10 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; Raise hotkey rate-limit ceiling — see script-compiler.ahk for rationale
+A_MaxHotkeysPerInterval := 200
+A_HotkeyInterval := 1000
+
 ; Voice chat executor. Called via local_exec from generic-hook.sh when voice chat is active.
 ; Uses explicit on/off for Wispr control via Token-API dictation state (no toggle guessing).
 

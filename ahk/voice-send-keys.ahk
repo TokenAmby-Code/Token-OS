@@ -1,6 +1,10 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; Raise hotkey rate-limit ceiling — see script-compiler.ahk for rationale
+A_MaxHotkeysPerInterval := 200
+A_HotkeyInterval := 1000
+
 ; voice-send-keys.ahk — Voice dictation via tmux send-keys
 ;
 ; Simple: on each Wispr dictation stop, grab transcript via !+z

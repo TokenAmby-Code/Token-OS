@@ -1,25 +1,24 @@
 """Unit tests for TimerEngine v2 — layered composite model, no I/O dependencies."""
 
-import pytest
 from timer import (
-    TimerEngine,
-    TimerMode,
-    TimerEvent,
-    Activity,
-    TickResult,
-    format_timer_time,
     BREAK_RATE_TABLE,
-    MANUAL_LOCK_DURATION_MS,
-    MAX_IDLE_MS,
-    IDLE_TIMEOUT_FROM_WORKING_MS,
-    IDLE_TIMEOUT_FROM_MULTITASKING_MS,
+    DEFAULT_BREAK_BUFFER_MS,
     DISTRACTION_TIMEOUT_MS,
     GYM_BOUNTY_MS,
-    DEFAULT_BREAK_BUFFER_MS,
+    IDLE_TIMEOUT_FROM_MULTITASKING_MS,
+    IDLE_TIMEOUT_FROM_WORKING_MS,
+    MANUAL_LOCK_DURATION_MS,
+    MAX_IDLE_MS,
+    Activity,
+    TickResult,
+    TimerEngine,
+    TimerEvent,
+    TimerMode,
+    format_timer_time,
 )
 
-
 # ---- Helpers ----
+
 
 def make_engine(now_ms: int = 0, date: str = "2026-02-11") -> TimerEngine:
     """Create an engine and initialize its daily_start_date."""
@@ -28,7 +27,9 @@ def make_engine(now_ms: int = 0, date: str = "2026-02-11") -> TimerEngine:
     return engine
 
 
-def advance(engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-02-11") -> TickResult:
+def advance(
+    engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-02-11"
+) -> TickResult:
     """Advance the engine by `seconds` in 1-second ticks, returning the last result."""
     result = TickResult()
     for i in range(seconds):
@@ -36,7 +37,9 @@ def advance(engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-
     return result
 
 
-def collect_events(engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-02-11") -> list[TimerEvent]:
+def collect_events(
+    engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-02-11"
+) -> list[TimerEvent]:
     """Advance and collect all events across all ticks."""
     events = []
     for i in range(seconds):
@@ -46,6 +49,7 @@ def collect_events(engine: TimerEngine, start_ms: int, seconds: int, date: str =
 
 
 # ---- format_timer_time ----
+
 
 class TestFormatTimerTime:
     def test_zero(self):
@@ -62,6 +66,7 @@ class TestFormatTimerTime:
 
 
 # ---- Basic tick / WORKING mode ----
+
 
 class TestBasicTick:
     def test_working_earns_one_to_one(self):
@@ -98,6 +103,7 @@ class TestBasicTick:
 
 
 # ---- Effective mode derivation ----
+
 
 class TestEffectiveMode:
     def test_working_active_working(self):
@@ -158,10 +164,13 @@ class TestEffectiveMode:
 
 # ---- Layer transitions ----
 
+
 class TestLayerTransitions:
     def test_set_activity_working_to_distraction(self):
         engine = make_engine(0)
-        result = engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=1000)
+        result = engine.set_activity(
+            Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=1000
+        )
         assert TimerEvent.MODE_CHANGED in result.events
         assert result.old_mode == TimerMode.WORKING
         assert engine.effective_mode == TimerMode.MULTITASKING
@@ -198,6 +207,7 @@ class TestLayerTransitions:
 
 # ---- Multitasking ----
 
+
 class TestMultitasking:
     def test_multitasking_neutral_rate(self):
         """MULTITASKING earns 0 break (neutral)."""
@@ -223,6 +233,7 @@ class TestMultitasking:
 
 
 # ---- Distracted ----
+
 
 class TestDistracted:
     def test_distracted_penalty_rate(self):
@@ -274,6 +285,7 @@ class TestDistracted:
 
 
 # ---- Parameterized idle ----
+
 
 class TestParameterizedIdle:
     def test_idle_from_working_2hr_timeout(self):
@@ -372,7 +384,9 @@ class TestParameterizedIdle:
         timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
         advance(engine, 0, timeout_secs + 60)
         assert engine.effective_mode == TimerMode.IDLE
-        assert TimerEvent.IDLE_TIMEOUT not in collect_events(engine, timeout_secs * 1000 + 60_000, 10)
+        assert TimerEvent.IDLE_TIMEOUT not in collect_events(
+            engine, timeout_secs * 1000 + 60_000, 10
+        )
 
     def test_productivity_active_clears_idle(self):
         """Becoming productive again clears idle state."""
@@ -384,6 +398,7 @@ class TestParameterizedIdle:
 
 
 # ---- Gym bounty ----
+
 
 class TestGymBounty:
     def test_apply_gym_bounty(self):
@@ -413,6 +428,7 @@ class TestGymBounty:
 
 # ---- Break consumption ----
 
+
 class TestBreakConsumption:
     def test_break_mode_consumes_accumulated(self):
         """Enter break mode, verify accumulated_break_ms decreases."""
@@ -432,6 +448,7 @@ class TestBreakConsumption:
 
 
 # ---- Break exhaustion ----
+
 
 class TestBreakExhaustion:
     def test_break_exhaustion_event(self):
@@ -483,6 +500,7 @@ class TestBreakExhaustion:
 
 # ---- Backlog mechanics ----
 
+
 class TestBacklog:
     def test_backlog_grows_during_break(self):
         """No break earned, go to break → backlog grows."""
@@ -504,6 +522,7 @@ class TestBacklog:
 
 # ---- Idle detection (gap) ----
 
+
 class TestIdleDetection:
     def test_large_gap_skips_accumulation(self):
         """Idle >10 min → no accumulation for that tick."""
@@ -524,6 +543,7 @@ class TestIdleDetection:
 
 
 # ---- Daily reset ----
+
 
 class TestDailyReset:
     def test_reset_on_new_day(self):
@@ -589,6 +609,7 @@ class TestDailyReset:
 
 # ---- Manual mode (break/sleeping) ----
 
+
 class TestManualMode:
     def test_enter_break(self):
         engine = make_engine(0)
@@ -602,6 +623,23 @@ class TestManualMode:
         changed, result = engine.enter_sleeping(0)
         assert changed
         assert engine.effective_mode == TimerMode.SLEEPING
+
+    def test_enter_quiet_sleeping_context(self):
+        engine = make_engine(0)
+        changed, result = engine.enter_quiet(0, context="sleeping")
+        assert changed
+        assert engine.effective_mode == TimerMode.QUIET
+        assert engine.quiet_context == "sleeping"
+        assert TimerEvent.MODE_CHANGED in result.events
+
+    def test_quiet_camps_idle_timeout(self):
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        engine.enter_quiet(1_000, context="sleeping")
+        timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
+        events = collect_events(engine, 1_000, timeout_secs + 60)
+        assert TimerEvent.IDLE_TIMEOUT not in events
+        assert engine.effective_mode == TimerMode.QUIET
 
     def test_resume_from_break(self):
         engine = make_engine(0)
@@ -700,6 +738,7 @@ class TestManualMode:
 
 # ---- Serialization round-trip (v2) ----
 
+
 class TestSerialization:
     def test_round_trip(self):
         """to_dict → from_dict preserves state."""
@@ -789,6 +828,7 @@ class TestSerialization:
 
 # ---- Legacy migration ----
 
+
 class TestLegacyMigration:
     def test_work_silence_migration(self):
         old_data = {
@@ -847,8 +887,9 @@ class TestLegacyMigration:
         old_data = {"current_mode": "sleeping"}
         engine = TimerEngine(now_mono_ms=0)
         engine.from_dict(old_data, now_mono_ms=0)
-        assert engine.manual_mode == TimerMode.SLEEPING
-        assert engine.effective_mode == TimerMode.SLEEPING
+        assert engine.manual_mode == TimerMode.QUIET
+        assert engine.effective_mode == TimerMode.QUIET
+        assert engine.quiet_context == "sleeping"
 
     def test_idle_migration(self):
         old_data = {"current_mode": "idle"}
@@ -890,6 +931,7 @@ class TestLegacyMigration:
 
 
 # ---- Edge cases ----
+
 
 class TestEdgeCases:
     def test_zero_elapsed(self):

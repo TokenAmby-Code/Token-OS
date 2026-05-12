@@ -40,7 +40,7 @@ New binaries:
 
 Modified:
 - `cli-tools/bin/tmux-status` (minor)
-- `cli-tools/bin/tmux-workspace` (if changed)
+- `cli-tools/lib/tmuxctl/builder.py` / `cli-tools/bin/tx` (workspace creation/restart)
 
 ---
 

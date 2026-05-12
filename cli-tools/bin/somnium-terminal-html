@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DB="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
+NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+html_escape() {
+  python3 -c 'import html,sys; print(html.escape(sys.stdin.read()), end="")'
+}
+
+query_html() {
+  local sql="$1"
+  if [[ ! -r "$DB" ]]; then
+    printf '<p class="muted">database unavailable: %s</p>\n' "$(printf '%s' "$DB" | html_escape)"
+    return 0
+  fi
+  sqlite3 -readonly -html "$DB" "$sql" 2>/dev/null || printf '<tr><td colspan="8">query unavailable</td></tr>\n'
+}
+
+cat <<HTML
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="5">
+  <title>Somnium Terminal</title>
+  <style>
+    body { background:#0d1014; color:#eef3f7; font-family:monospace; }
+    h1,h2,h3 { margin:0.35em 0; }
+    .muted { color:#9aa8b5; }
+    .metrics { margin-bottom:1em; }
+    table { border-collapse:collapse; width:100%; }
+    th,td { border:1px solid #303b48; padding:2px 4px; vertical-align:top; }
+    th { color:#9aa8b5; }
+    section { margin:0.75em 0; }
+  </style>
+</head>
+<body>
+  <h1>Somnium</h1>
+  <p class="muted">generated $NOW · local file snapshot · refresh 5s</p>
+  <div class="metrics">
+    <b>Surface:</b> terminal HTML via w3m<br>
+    <b>DB:</b> $(printf '%s' "$DB" | html_escape)<br>
+  </div>
+  <h2>Instances</h2>
+  <table>
+    <tr><th>S</th><th>Name</th><th>Engine</th><th>Legion</th><th>Pane</th><th>Session Doc</th><th>Age</th><th>Path</th></tr>
+HTML
+
+query_html "
+SELECT
+  COALESCE(ci.status,''),
+  COALESCE(NULLIF(ci.tab_name,''), NULLIF(ci.pane_label,''), substr(ci.id,1,12)),
+  COALESCE(ci.engine,'claude'),
+  COALESCE(NULLIF(ci.legion,''), ci.instance_type, ''),
+  COALESCE(NULLIF(ci.pane_label,''), NULLIF(ci.tmux_pane,''), NULLIF(ci.dispatch_window,''), ''),
+  COALESCE(sd.title, 'no session doc'),
+  CASE
+    WHEN COALESCE(ci.last_activity, ci.registered_at) IS NULL THEN 'no activity'
+    ELSE CAST((strftime('%s','now') - strftime('%s', COALESCE(ci.last_activity, ci.registered_at))) / 60 AS INT) || ' min'
+  END,
+  COALESCE(ci.working_dir, sd.file_path, '')
+FROM claude_instances ci
+LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+WHERE ci.status IN ('processing','idle')
+ORDER BY CASE ci.status WHEN 'processing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END, ci.last_activity DESC
+LIMIT 40;
+"
+
+cat <<HTML
+  </table>
+  <h2>Session Docs</h2>
+  <table>
+    <tr><th>Status</th><th>Title</th><th>Project</th><th>Age</th></tr>
+HTML
+
+query_html "
+SELECT
+  COALESCE(status,''),
+  COALESCE(title, 'Session ' || id),
+  COALESCE(project, 'no project'),
+  CASE
+    WHEN COALESCE(updated_at, created_at) IS NULL THEN 'no activity'
+    ELSE CAST((strftime('%s','now') - strftime('%s', COALESCE(updated_at, created_at))) / 60 AS INT) || ' min'
+  END
+FROM session_documents
+WHERE status IN ('active','held','completed','deployment')
+ORDER BY updated_at DESC
+LIMIT 40;
+"
+
+cat <<HTML
+  </table>
+  <h2>Events</h2>
+  <table>
+    <tr><th>Created</th><th>Event</th><th>Instance</th></tr>
+HTML
+
+query_html "
+SELECT created_at, event_type, COALESCE(substr(instance_id,1,16),'system')
+FROM events
+ORDER BY created_at DESC
+LIMIT 12;
+"
+
+cat <<HTML
+  </table>
+</body>
+</html>
+HTML

@@ -46,10 +46,15 @@ global AM_STATE := {
     lockUntil: 0,                    ; Timestamp when lock expires
     lastTrigger: 0,                  ; Last time we triggered a mode change
     lastWindowTitle: "",             ; Last detected window title (for token-api)
+    lastSteamAppId: "",              ; Last detected Steam app ID
+    lastSteamAppName: "",            ; Last detected Steam app name
+    lastSteamExe: "",                ; Last detected Steam executable
     lastBlockNotify: 0,              ; Timestamp of last block notification
     blockNotifyCooldown: 60000,      ; 60 second cooldown for block notifications
     pollCount: 0                     ; Poll counter for heartbeat interval
 }
+
+global STEAM_REGISTRY := Map()
 
 ; ========================================
 ; Mode Definitions
@@ -78,7 +83,7 @@ global AM_MODES := Map(
         name: "Gaming",
         icon: "🎮",
         command: "timer-auto-work-gaming",
-        description: "Minecraft (Lucky World Invasion) detected"
+        description: "Steam game detected"
     },
     "meeting", {
         name: "Meeting",
@@ -91,6 +96,31 @@ global AM_MODES := Map(
 ; ========================================
 ; Main Detection Logic
 ; ========================================
+
+ResetSteamDetection() {
+    AM_STATE.lastSteamAppId := ""
+    AM_STATE.lastSteamAppName := ""
+    AM_STATE.lastSteamExe := ""
+}
+
+DetectSteamGame() {
+    try {
+        activeProc := StrLower(WinGetProcessName("A"))
+        if (activeProc != "" && STEAM_REGISTRY.Has(activeProc)) {
+            info := STEAM_REGISTRY[activeProc]
+            AM_STATE.lastSteamAppId := info.appid
+            AM_STATE.lastSteamAppName := info.name
+            AM_STATE.lastSteamExe := activeProc
+            AM_STATE.lastWindowTitle := info.name
+            LogMessage("Detected: Steam game " . info.name . " (appid=" . info.appid . ", exe=" . activeProc . ")")
+            return true
+        }
+    } catch as err {
+        LogMessage("Steam active-window detection failed: " . err.Message)
+    }
+
+    return false
+}
 
 DetectAudioState() {
     ; Check if we're in manual lock mode
@@ -105,7 +135,7 @@ DetectAudioState() {
 
     ; Detection Priority:
     ; 1. Meeting (Zoom process or Google Meet in Brave) → Meeting
-    ; 2. Minecraft window title (Lucky World Invasion) → Gaming
+    ; 2. Active Steam game executable → Gaming
     ; 3. Spotify (if running) → Music
     ; 4. YouTube in browser → Video
     ; 5. Nothing detected → Silence
@@ -125,6 +155,7 @@ DetectAudioState() {
                     if (InStr(title, "Zoom Meeting")) {
                         LogMessage("Detected: Zoom meeting (" . title . ")")
                         AM_STATE.lastWindowTitle := title
+                        ResetSteamDetection()
                         return "meeting"
                     }
                 } catch {
@@ -149,6 +180,7 @@ DetectAudioState() {
                     if (RegExMatch(title, "^Meet - [a-z]") || RegExMatch(title, ".+[\|\-] Google Meet")) {
                         LogMessage("Detected: Google Meet in Brave (" . title . ")")
                         AM_STATE.lastWindowTitle := title
+                        ResetSteamDetection()
                         return "meeting"
                     }
                 } catch {
@@ -160,18 +192,9 @@ DetectAudioState() {
         ; ignore
     }
 
-    ; Check for Minecraft (Java) - window title contains "Lucky World Invasion"
-    try {
-        if (WinExist("Lucky World Invasion")) {
-            title := WinGetTitle("Lucky World Invasion")
-            if (InStr(title, "Lucky World Invasion")) {
-                LogMessage("Detected: Minecraft (" . title . ")")
-                AM_STATE.lastWindowTitle := title
-                return "gaming"
-            }
-        }
-    } catch {
-        ; ignore
+    ; Check for active Steam game by executable name discovered from Steam manifests.
+    if (DetectSteamGame()) {
+        return "gaming"
     }
 
     ; Check for Spotify
@@ -185,6 +208,7 @@ DetectAudioState() {
         if (InStr(spotifyTitle, " - ")) {
             LogMessage("Detected: Spotify playing (" . spotifyTitle . ")")
             AM_STATE.lastWindowTitle := spotifyTitle
+            ResetSteamDetection()
             return "music"
         }
     }
@@ -215,6 +239,7 @@ DetectAudioState() {
                     if (InStr(title, "YouTube")) {
                         LogMessage("Detected: YouTube in " . browser.exe . " (" . title . ")")
                         AM_STATE.lastWindowTitle := title
+                        ResetSteamDetection()
                         return "video"
                     }
                 } catch {
@@ -228,6 +253,7 @@ DetectAudioState() {
     ; No audio sources detected
     LogMessage("Detected: No audio sources (Silence)")
     AM_STATE.lastWindowTitle := ""
+    ResetSteamDetection()
     return "silence"
 }
 
@@ -406,8 +432,135 @@ LogMessage(message) {
 }
 
 ; ========================================
+; Steam Registry
+; ========================================
+
+GetSteamRoot() {
+    try {
+        steamPath := RegRead("HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath")
+        if (steamPath != "") {
+            return StrReplace(steamPath, "/", "\")
+        }
+    } catch {
+        ; Fall back to the default install path.
+    }
+
+    return "C:\Program Files (x86)\Steam"
+}
+
+UnescapeVdfPath(path) {
+    return StrReplace(path, "\\", "\")
+}
+
+ParseVdfKeyValues(filePath) {
+    values := Map()
+    try {
+        content := FileRead(filePath)
+    } catch as err {
+        LogMessage("Unable to read VDF file " . filePath . ": " . err.Message)
+        return values
+    }
+
+    for line in StrSplit(content, "`n", "`r") {
+        if (RegExMatch(line, "^\s*`"([^`"]+)`"\s+`"(.*)`"\s*$", &match)) {
+            values[match[1]] := StrReplace(match[2], "\`"", Chr(34))
+        }
+    }
+
+    return values
+}
+
+ParseVdfValuesForKey(filePath, targetKey) {
+    matches := []
+    try {
+        content := FileRead(filePath)
+    } catch as err {
+        LogMessage("Unable to read VDF file " . filePath . ": " . err.Message)
+        return matches
+    }
+
+    for line in StrSplit(content, "`n", "`r") {
+        if (RegExMatch(line, "^\s*`"([^`"]+)`"\s+`"(.*)`"\s*$", &match) && match[1] == targetKey) {
+            matches.Push(StrReplace(match[2], "\`"", Chr(34)))
+        }
+    }
+
+    return matches
+}
+
+FindSteamLibraries() {
+    libraries := Map()
+    steamRoot := GetSteamRoot()
+    if (DirExist(steamRoot)) {
+        libraries[StrLower(steamRoot)] := steamRoot
+    }
+
+    libraryFile := steamRoot . "\steamapps\libraryfolders.vdf"
+    for value in ParseVdfValuesForKey(libraryFile, "path") {
+        path := UnescapeVdfPath(value)
+        if (DirExist(path)) {
+            libraries[StrLower(path)] := path
+        }
+    }
+
+    return libraries
+}
+
+BuildSteamRegistry() {
+    registry := Map()
+    libraries := FindSteamLibraries()
+
+    for _, libraryPath in libraries {
+        manifestGlob := libraryPath . "\steamapps\appmanifest_*.acf"
+        Loop Files manifestGlob, "F" {
+            manifest := ParseVdfKeyValues(A_LoopFileFullPath)
+            appid := manifest.Has("appid") ? manifest["appid"] : ""
+            installdir := manifest.Has("installdir") ? manifest["installdir"] : ""
+            name := manifest.Has("name") ? manifest["name"] : ""
+            if (appid == "" || installdir == "" || name == "") {
+                continue
+            }
+
+            installPath := libraryPath . "\steamapps\common\" . installdir
+            if (!DirExist(installPath)) {
+                continue
+            }
+
+            Loop Files installPath . "\*.exe", "F" {
+                exeName := StrLower(A_LoopFileName)
+                if (!registry.Has(exeName)) {
+                    registry[exeName] := {
+                        appid: appid,
+                        name: name,
+                        installdir: installdir,
+                        exe: exeName
+                    }
+                }
+            }
+        }
+    }
+
+    return registry
+}
+
+InitializeSteamRegistry() {
+    global STEAM_REGISTRY
+    STEAM_REGISTRY := BuildSteamRegistry()
+    LogMessage("Steam registry loaded: " . STEAM_REGISTRY.Count . " executable(s)")
+}
+
+; ========================================
 ; token-api Integration
 ; ========================================
+
+JsonEscape(value) {
+    value := StrReplace(value, "\", "\\")
+    value := StrReplace(value, Chr(34), "\" . Chr(34))
+    value := StrReplace(value, "`r", "\r")
+    value := StrReplace(value, "`n", "\n")
+    value := StrReplace(value, "`t", "\t")
+    return value
+}
 
 PostToTokenApi(endpoint, jsonBody) {
     ; POST JSON to token-api server
@@ -418,6 +571,7 @@ PostToTokenApi(endpoint, jsonBody) {
     try {
         http := ComObject("WinHttp.WinHttpRequest.5.1")
         http.Open("POST", url, false)
+        http.SetTimeouts(1000, 1000, 1000, 2000)
         http.SetRequestHeader("Content-Type", "application/json")
         http.Send(jsonBody)
 
@@ -443,7 +597,13 @@ NotifyTokenApiDetection(detectedMode, windowTitle := "") {
     ; Notify token-api of detected mode change
     ; token-api decides if mode change is allowed and triggers Obsidian
 
-    jsonBody := '{"detected_mode": "' . detectedMode . '", "window_title": "' . windowTitle . '", "source": "ahk"}'
+    jsonBody := "{`"detected_mode`": `"" . JsonEscape(detectedMode) . "`", `"window_title`": `"" . JsonEscape(windowTitle) . "`", `"source`": `"ahk`""
+    if (detectedMode == "gaming" && AM_STATE.lastSteamAppId != "") {
+        jsonBody .= ", `"steam_app_id`": `"" . JsonEscape(AM_STATE.lastSteamAppId) . "`""
+        jsonBody .= ", `"steam_app_name`": `"" . JsonEscape(AM_STATE.lastSteamAppName) . "`""
+        jsonBody .= ", `"steam_exe`": `"" . JsonEscape(AM_STATE.lastSteamExe) . "`""
+    }
+    jsonBody .= "}"
 
     response := PostToTokenApi("/desktop", jsonBody)
 
@@ -521,6 +681,53 @@ ShowStatus() {
 ; Hotkeys (Optional)
 ; ========================================
 
+global g_LastMewgSpaceTick := 0
+
+PostMewgenicsSpaceTelemetry() {
+    global g_LastMewgSpaceTick
+
+    ; Debounce: skip if we fired within the last 1500 ms (focus-race / double-trigger guard)
+    nowTick := A_TickCount
+    if (g_LastMewgSpaceTick != 0 && (nowTick - g_LastMewgSpaceTick) < 1500) {
+        LogMessage("Mewgenics space telemetry skipped: debounce (" . (nowTick - g_LastMewgSpaceTick) . " ms since last)")
+        return
+    }
+
+    ; Double-check: process AND title must still resolve to Mewgenics at fire time.
+    ; SetTimer fires on a tick boundary after Send "{Space}", so focus may have moved.
+    if (!WinActive("ahk_exe Mewgenics.exe")) {
+        LogMessage("Mewgenics space telemetry skipped: window no longer active at fire time")
+        return
+    }
+    activeTitle := ""
+    try {
+        activeTitle := WinGetTitle("A")
+    } catch {
+        activeTitle := ""
+    }
+    if (activeTitle != "Mewgenics") {
+        LogMessage("Mewgenics space telemetry skipped: active title='" . activeTitle . "' (not Mewgenics)")
+        return
+    }
+
+    g_LastMewgSpaceTick := nowTick
+
+    jsonBody := "{`"event`": `"mewgenics_space`", `"source`": `"ahk`", `"ts`": `"" . A_NowUTC . "`"}"
+    response := PostToTokenApi("/api/telemetry/mewgenics-space", jsonBody)
+    if (response.success && response.status == 200) {
+        LogMessage("Mewgenics space telemetry recorded")
+    } else {
+        LogMessage("Mewgenics space telemetry failed: " . response.status . " " . response.body)
+    }
+}
+
+#HotIf WinActive("ahk_exe Mewgenics.exe")
+Space::{
+    Send "{Space}"                            ; forward immediately — no HTTP on the keypath
+    SetTimer(PostMewgenicsSpaceTelemetry, -1) ; async, fires once after 0 ms
+}
+#HotIf
+
 ; Ctrl+Alt+Shift+A - Toggle auto/manual mode
 ^!+a::ToggleLock()
 
@@ -574,6 +781,7 @@ LogMessage("token-api: ENABLED (" . AM_CONFIG.tokenApiUrl . ")")
 LogMessage("  - Mode changes: POST /desktop")
 LogMessage("  - Heartbeat: POST /desktop/heartbeat (every ~30s)")
 
+InitializeSteamRegistry()
 SetupTrayMenu()
 
 ; Start polling

@@ -6,7 +6,7 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 - **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
 - **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
-- **TUI**: `token-api-tui.py` - Rich-based dashboard for monitoring instances
+- **Somnium display/control**: HTML/Obsidian is the preferred rich dashboard surface; tmux owns active-pane operational keybindings; `token-api-tui.py` is legacy terminal status/selection UI
 - **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
 
 ### Multi-Device Network
@@ -20,8 +20,22 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
 - **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
 - `token-restart` orchestrates all three: Mac restart → WSL restart → phone signal
-- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`
+- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`, but new rich visualization work should target HTML served by Token-API and embedded in Obsidian
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
+
+### Somnium Display/Control Directive
+
+High-level directive: see `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Somnium Display and Control Surface Directive.md`.
+
+The current direction is:
+
+- HTML is the primary rich visualization surface for somnium dashboards, graphs, timelines, and cohesive state views.
+- Obsidian is the preferred frame for viewing those HTML dashboards.
+- tmux owns active-pane operator keybindings for the somnium pane/window.
+- `token-api-tui.py` should narrow toward compact status rendering and explicit selection-state export.
+- Token-API remains the authoritative state/mutation backend.
+
+Do not add new primary operational keybindings to `token-api-tui.py`. New actions should be Token-API/CLI mutations invoked from tmux keybindings. Existing TUI commands are compatibility behavior while the migration is underway.
 
 ## Key Files
 
@@ -32,7 +46,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
 | `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
-| `token-api-tui.py` | TUI dashboard (~1500 lines) |
+| `token-api-tui.py` | Legacy Rich terminal dashboard; should evolve toward compact status/selection export |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
 
@@ -52,18 +66,48 @@ agents-db --json instances       # JSON output
 ## Key Tables
 
 ### claude_instances
-Core instance registry. Key columns:
+Core instance registry. This remains the source of truth for live instance state,
+but sanctioned writes now flow through the `instance_mutation.py` helper so
+provenance and reconciliation can reason about drift. Key columns:
 - `id` - Instance UUID
 - `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
 - `working_dir` - Instance working directory
-- `status` - 'active' or 'stopped'
-- `is_processing` - 1 when actively processing a prompt
-- `device_id` - 'desktop', 'Token-S24', etc.
-- `is_subagent` - 1 if spawned by `subagent` CLI or headless `claude -p` (0 for interactive)
-- `spawner` - Origin tag, e.g. `"subagent:claude"`, `"cron:task-worker"` (NULL for interactive)
+- `status` - typically `idle`, `processing`, or `stopped`
+- `last_activity` - heartbeat timestamp used for stale detection and reconciliation ordering
+- `device_id` - runtime host identity, e.g. `Mac-Mini`, `Token-S24`
+- `is_subagent` - 1 if spawned headlessly or as a background worker
+- `tmux_pane` - pane projection target for `@CC_STATE` and legion tint
+- `legion` / `synced` / `input_lock` - high-frequency control-plane fields now covered by provenance
+- `tts_mode` / `tts_voice` / `notification_sound` - per-instance voice and mute state
+- `session_doc_id` / `session_doc_policy` / `continuity_binding_source` - active continuity binding
+- `workflow_state` / `workflow_updated_at` / `stop_allowed` / `next_required_action` - coarse workflow state
+- `dispatch_target` / `dispatch_window` / `dispatch_mode` / `dispatch_slot` - dispatch identity
+- `instance_type` / `follow_up_sop` / `zealotry` / `victory_at` / `victory_reason` - lifecycle + follow-up controls
+- `discord_hosted` / `discord_channel` / `transplant_target_session` - operator linkage and transplant handoff state
+- `wrapper_launch_id` - wrapper ingress correlation key when present
 
 ### events
 Event log for instance lifecycle, renames, TTS, notifications.
+
+### workflow_events
+Append-only workflow/continuity event stream for machine-readable state transitions.
+Examples: `session_doc_bound`, `continuity_binding_changed`, `workflow_state_changed`, `workflow_closed`.
+
+### instance_mutations
+Append-only provenance log for sanctioned `claude_instances` row mutations.
+Key fields:
+- `mutation_type` - coarse mutation class such as `instance_registered`, `status_changed`, `continuity_binding_changed`, `instance_stopped`
+- `write_source` - sanctioned writer identity: `hooks`, `api`, `system_worker`, `migration`, `exceptional_direct`
+- `write_txn_id` - per-write correlation UUID
+- `actor` - request or subsystem actor, e.g. `SessionStart`, `SessionEnd`, `assign-doc`
+- `service_version` - git SHA or fallback app version captured at process boot
+- `wrapper_launch_id` - launcher correlation when the mutation is tied to wrapper ingress
+- `field_names_json`, `before_json`, `after_json` - concise changed-field snapshot, not full row dumps
+
+Sanction policy:
+- Direct reads are fine.
+- New instance-row writes should prefer `sanctioned_update_instance()` / `sanctioned_insert_instance()`.
+- Remaining direct SQL writes to `claude_instances` should be treated as explicit debt and will show up as suspicious in reconciliation until migrated.
 
 ## Core API Endpoints
 
@@ -77,6 +121,10 @@ POST   /api/instances/{id}/unstick     # Nudge stuck instance (?level=1 SIGWINCH
 GET    /api/instances/{id}/diagnose    # Get detailed process diagnostics
 GET    /api/instances                   # List all instances
 GET    /api/instances/{id}/todos        # Get instance task list
+GET    /api/instances/{id}/workflow-events  # Recent workflow event log
+GET    /api/instances/{id}/provenance       # Recent sanctioned instance mutations
+GET    /api/instances/{id}/reconciliation   # Drift classification for one instance
+GET    /api/reconciliation/instances        # Fleet reconciliation read model
 ```
 
 ### Notifications
@@ -135,11 +183,11 @@ GET    /processes                       # List distraction-relevant processes
 POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
 POST   /tts/skip                        # Skip current TTS playback
 GET    /kvm/status                      # DeskFlow watchdog state (state, mac_reachable, deskflow_running)
-POST   /kvm/control                     # Manual DeskFlow control (action: start|stop|hold, hold_minutes: 30)
+POST   /kvm/control                     # Manual DeskFlow control (action: start|reload|stop|hold, hold_minutes: 30)
 POST   /restart                         # Git pull + systemd restart
 ```
 
-**KVM Watchdog**: Background thread manages DeskFlow lifecycle. Starts DeskFlow at boot, monitors Mac via token-api health check (30s interval), wakes Mac display + starts client when Mac is reachable, stops DeskFlow when Mac goes down. Replaces the old "Deskflow" Windows scheduled task (now disabled).
+**KVM Watchdog**: WSL satellite manages the server side. It starts DeskFlow at boot, checks for an established Mac client connection, and uses tiered recovery: Mac wake/start → local DeskFlow reload → full local restart → Mac client reload/restart. Failed recovery attempts back off exponentially and eventually enter `ceased` until manual/signal intervention. Mac Token-API also runs a client-side supervisor: if the WSL DeskFlow port is absent, it stops the Mac client so DeskFlow cannot retry-spam internally, then probes with exponential backoff and reopens the client only when the server port is reachable. Replaces the old "Deskflow" Windows scheduled task (now disabled).
 
 ### Discord Integration
 ```
@@ -155,7 +203,9 @@ agents-db query "SELECT json_extract(details, '$.channel_name') as channel, json
 
 ## Timer State Machine (v2 — Layered Composite Model)
 
-Three independent layers compose into 6 effective modes:
+Inputs are signals, not output modes. Productivity detections and distraction detections contribute to internal layer state; the server derives the public timer mode from that composite. Phone, desktop, work-action, process, and geofence observations should not directly assert final modes such as `working`, `multitasking`, or `break`.
+
+Three independent layers currently compose into 6 effective modes:
 
 ### Layers
 
@@ -190,6 +240,9 @@ Three independent layers compose into 6 effective modes:
 ### Key Rules
 
 - **DISTRACTED requires productivity** — only scrolling/gaming trigger it after 10min. Video stays MULTITASKING.
+- **Phone foreground is a distraction contribution** — it may move the derived activity layer to `distraction`, but it must not create `trigger=phone_app` shifts or assert `work_gaming`.
+- **Productivity remains server-derived** — active Claude/Codex instances and work-action calls drive `Productivity`; phone apps have no authority to mark work active.
+- **Location is a modifier** — geofence state can apply exemptions/bounties/manual context, but it should feed the composite state rather than bypassing derivation.
 - **Parameterized idle timeout**: 2hr from WORKING, 2min from MULTITASKING.
 - **Gym bounty**: +30 min break on gym exit (`apply_gym_bounty()`).
 - **Daily reset**: 7 AM (CronTrigger hour=7).
@@ -223,7 +276,7 @@ GET    /api/timer/shifts              # Today's shift analytics
 ### Integration Points (main.py)
 
 - **Desktop detection** (`handle_desktop_detection`): silence/music → `set_activity(WORKING)`, video/scrolling/gaming → `set_activity(DISTRACTION)`
-- **Phone activity** (`handle_phone_activity`): same activity-layer mapping
+- **Phone activity** (`handle_phone_activity`): open events for distraction apps contribute `Activity.DISTRACTION` and log `phone_distraction_observed`; close/stale events should remove or age out that contribution, not assert work by themselves
 - **Timer worker** (every 10s): polls DB for processing instances → `set_productivity()`
 - **Hook handlers** (`prompt_submit`, `post_tool_use`): → `set_productivity(True)`
 - **Location events**: gym exit → `apply_gym_bounty()`, gym/campus → `idle_timeout_exempt`
@@ -237,9 +290,9 @@ The `tab_name` field stores the instance display name. The TUI displays:
 Auto-generated names match pattern `Claude HH:MM`. Any other name is considered custom.
 
 Rename via:
-- TUI: Press `r` on selected instance
 - CLI: `instance-name "my-name"`
 - API: `PATCH /api/instances/{id}/rename` with `{"tab_name": "..."}`
+- Legacy TUI compatibility: press `r` on selected instance
 
 ## Subagent Tagging
 
@@ -251,7 +304,7 @@ Headless Claude instances spawned by `subagent --claude`, cron jobs, or scripts 
 3. The server reads `TOKEN_API_SUBAGENT` from the hook payload and sets `is_subagent=1`, `spawner=<value>`
 4. Subagents are auto-named `"sub: <spawner>"` and **skip TTS profile assignment** (no voice slot consumed)
 
-**TUI behavior:**
+**TUI/display behavior:**
 - Subagents are **hidden by default** — press `a` to toggle visibility
 - When visible, subagent rows are dimmed with an `@` prefix
 - Status bar shows `+N sub` count when subagents are hidden
@@ -263,7 +316,20 @@ export TOKEN_API_SUBAGENT="cron:task-worker"
 claude -p "do the thing"
 ```
 
-## TUI Controls
+## Somnium Controls
+
+The old TUI keyboard layer predates the managed tmux workspace and overlaps with tmux responsibilities. Treat it as compatibility behavior.
+
+Preferred model:
+
+- tmux key tables own active-pane operator shortcuts for the somnium pane/window
+- CLI/API commands perform mutations
+- the TUI publishes selected UI object state, for example `~/.claude/tui-state/somnium.json`
+- HTML/Obsidian renders rich dashboards and graphs from Token-API read models
+
+Selection-state files are operator UI state only. Commands consuming them must validate referenced instances/jobs against Token-API before mutating anything.
+
+### Legacy TUI Controls
 
 ```
 ↑↓ / jk  - Navigate instances (up/down)
@@ -306,6 +372,12 @@ agents-db events --limit 20
 # Verify rename worked
 agents-db query "SELECT id, tab_name FROM claude_instances WHERE id='...'"
 
+# Inspect sanctioned instance writes
+agents-db query "SELECT mutation_type, write_source, actor, write_txn_id, created_at FROM instance_mutations ORDER BY id DESC LIMIT 20"
+
+# Inspect workflow event stream
+agents-db query "SELECT event_type, workflow_state, event_owner, created_at FROM workflow_events ORDER BY id DESC LIMIT 20"
+
 # Watch server logs (if running via systemd)
 journalctl -u token-api -f
 
@@ -339,6 +411,38 @@ Voices assigned via **random-start linear probe** (open addressing): one random 
 **Fallback pool** (US English, used when primary is exhausted):
 - David, Zira, Mark → less distinct, but functional
 
+## Provenance And Reconciliation
+
+### Sanctioned Write Layer
+
+`instance_mutation.py` is the sanctioned bridge layer for `claude_instances` row writes.
+It is not the final service extraction, but it now covers most runtime control-plane mutations.
+
+Current sanctioned coverage:
+- hook-driven registration, supplant refresh, and session end flows already migrated in `main.py`
+- manual session-doc bind / create / unbind and hard-delete unlink side effects
+- API writes for rename, activity/status, stop, kill fallback stop-marking, unstick PID refresh, legion, synced, input_lock
+- API writes for transplant pending, zealotry, discord linkage, instance type, archive / unarchive, and victory metadata
+- per-instance voice reassignment, per-instance `tts_mode`, voice-chat mode sync, and global TTS mode fanout
+- background/system writes for stale cleanup, stale processing clear, stop-evaluator idle transition, auto-name rename
+- sync stop-hook stop marking via `sanctioned_update_instance_sync()`
+
+Remaining direct-write debt worth tracking:
+- bootstrap / migration / full-table admin operations still use direct SQL where provenance is not the goal
+- the main runtime exception is full-table admin deletion in `DELETE /api/instances/all`
+- reconciliation still treats any future unmigrated runtime writes as suspicious rather than fatal
+
+### Reconciliation Statuses
+
+`GET /api/instances/{id}/reconciliation` classifies:
+- `clean` - current row and pane projection align with sanctioned writes
+- `pending_projection` - pane queue entries exist, so tmux projection is expected to catch up
+- `unprovenanced_write` - current row diverges from latest sanctioned value for one or more tracked fields
+- `state_drift` - workflow / continuity fields are internally incoherent
+- `projection_drift` - tmux pane state is stale or missing with no pending queue
+
+Suspicious statuses emit `instance_reconciliation_drift` into the normal `events` log.
+
 **Ultimate fallback**: Microsoft David (if 12+ concurrent instances somehow)
 
 Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores the WSL voice name. Profile lookup derives mac_voice for fallback.
@@ -353,7 +457,7 @@ Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores th
 
 ### TTS Mode Cycle
 
-Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Cycled via `m` key in TUI. Stored as `tts_mode` in DB per instance.
+Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Stored as `tts_mode` in DB per instance. Legacy TUI compatibility cycles it with `m`; new operator bindings should call CLI/API mutations from tmux.
 
 | Mode | Behavior |
 |------|----------|
@@ -366,7 +470,7 @@ Mode cycle: `verbose -> muted -> silent -> voice-chat -> verbose`. Cycled via `m
 
 > **STATUS: UNVALIDATED (2026-03-09)** — Not yet tested end-to-end.
 
-Voice chat is a TTS mode (`voice-chat`) rather than a separate system. The `m` key in TUI cycles into it. When active, the instance name shows a microphone emoji in the TUI (TUI-only display, not stored in DB).
+Voice chat is a TTS mode (`voice-chat`) rather than a separate system. Legacy TUI compatibility cycles into it with `m`. When active, the instance name shows a microphone emoji in the TUI (TUI-only display, not stored in DB).
 
 The old `/api/instances/{id}/voice-chat` endpoint still works but also sets `tts_mode` in DB. `VOICE_CHAT_SESSIONS` in-memory dict is re-hydrated from DB `tts_mode` on instance list queries.
 
@@ -502,6 +606,8 @@ Location: `token-api-tui.py` - `todos_cache` global, `get_instance_todos()` with
 - TUI polls database directly, not via API (for speed)
 - TUI refresh interval: 2 seconds
 - Database changes from CLI/API are picked up on next TUI refresh
+- New rich dashboards should be implemented as HTML served by Token-API, suitable for Obsidian iframe/embed viewing.
+- New operational shortcuts should be tmux active-pane bindings calling CLI/API commands, not new TUI key handlers.
 
 ## Potential Future Tools/Skills
 

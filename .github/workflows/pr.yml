@@ -1,0 +1,92 @@
+name: PR Gate (blocking)
+
+# Tier 2 — assertive, blocking.
+# Triggered on PR open / synchronize / reopen against main. Failures here
+# block merge via branch protection. CodeRabbit GitHub App handles the
+# assertive review (governed by .coderabbit.yaml in repo root) — this
+# workflow runs the deterministic gates: format, lint, typecheck, tests.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Python deps (cli-tools)
+        if: hashFiles('cli-tools/pyproject.toml') != ''
+        working-directory: cli-tools
+        run: uv sync --python 3.11 --all-groups
+
+      - name: Sync Python deps (token-api)
+        if: hashFiles('token-api/pyproject.toml') != ''
+        working-directory: token-api
+        run: uv sync --python 3.11 --all-groups
+
+      - name: Format check (ruff)
+        run: |
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev ruff format --check .)
+          fi
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --python 3.11 --group dev ruff format --check .)
+          fi
+
+      - name: Lint (ruff)
+        run: |
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev ruff check .)
+          fi
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --python 3.11 --group dev ruff check .)
+          fi
+
+      - name: Typecheck (mypy)
+        run: |
+          if [ -f cli-tools/pyproject.toml ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
+          fi
+          if [ -f token-api/pyproject.toml ]; then
+            (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
+          fi
+
+      - name: Test (pytest)
+        run: |
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev pytest --tb=short)
+          fi
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run --python 3.11 --group dev pytest --tb=short)
+          fi
+
+  # CodeRabbit GitHub App posts its own `coderabbit` commit status. Branch
+  # protection on main is configured to require BOTH "PR Gate (blocking) /
+  # quality" AND "coderabbit" to pass before merge.

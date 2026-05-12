@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# push — git push wrapper that runs the per-worktree post-push hook on success.
+# TAGS: git, workflow
+# AUDIENCE: human, agent
+
+set -euo pipefail
+
+git push "$@"
+
+hook_path="$(git rev-parse --git-path hooks/post-push 2>/dev/null || true)"
+if [[ -n "$hook_path" && -x "$hook_path" ]]; then
+    "$hook_path" || true
+fi

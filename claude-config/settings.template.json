@@ -79,6 +79,16 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/naming-nudge.sh",
+            "async": true
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -166,6 +176,16 @@
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_AGENT=claude bash /Volumes/Imperium/Token-OS/cli-tools/scripts/post-tool-format.sh",
+            "timeout": 15000
+          }
+        ]
+      },
       {
         "matcher": "",
         "hooks": [

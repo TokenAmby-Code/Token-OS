@@ -8,8 +8,8 @@
 # fallback. Each assertion is a self-contained function.
 #
 # Assertions:
-#   backburner  — No idle shells in legion/kreig; backstop placeholder management
-#   grid        — Palace power grid has expected pane count
+#   backburner  — No extra idle shells in stack windows
+#   grid        — Palace (6 panes) and somnium (5 panes) grids have expected pane counts
 #   tui         — TUI monitor panes are alive, not dead/stuck
 #   layout      — Pane proportions haven't drifted
 #
@@ -66,7 +66,9 @@ fi
 
 # ============================================================
 # ASSERTION: backburner
-# No idle shells in legion/kreig. Backstop placeholder management.
+# No extra idle shells in stack windows. The first legion/mechanicus panes are
+# orchestrator slots, not synthetic backstops; when promoted, those slots should
+# be occupied by tombstones.
 # ============================================================
 assert_backburner() {
     local IDLE_SHELLS="bash zsh sh fish"
@@ -79,17 +81,17 @@ assert_backburner() {
         return 1
     }
 
-    for win in legion kreig; do
+    for win in legion mechanicus mars kreig; do
         local pane_data
         pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
-            -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}' 2>/dev/null) || continue
+            -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}	#{@PANE_ID}' 2>/dev/null) || continue
 
-        local idle_panes=() backstop_panes=() real_panes=()
+        local idle_panes=() real_panes=()
 
-        while IFS=$'\t' read -r pid cmd ptype; do
+        while IFS=$'\t' read -r pid cmd ptype pane_label; do
             [[ -z "$pid" ]] && continue
-            if [[ "$ptype" == "backstop" ]]; then
-                backstop_panes+=("$pid")
+            if [[ "$ptype" == "tombstone" ]]; then
+                real_panes+=("$pid")
             elif is_idle_shell "$cmd"; then
                 idle_panes+=("$pid")
             else
@@ -97,27 +99,13 @@ assert_backburner() {
             fi
         done <<< "$pane_data"
 
-        local total=$(( ${#idle_panes[@]} + ${#backstop_panes[@]} + ${#real_panes[@]} ))
+        local total=$(( ${#idle_panes[@]} + ${#real_panes[@]} ))
         local changed=false
 
-        # Real work present + backstop → cull backstop
-        if [[ ${#real_panes[@]} -gt 0 && ${#backstop_panes[@]} -gt 0 ]]; then
-            for pid in "${backstop_panes[@]}"; do
-                tmux kill-pane -t "$pid" 2>/dev/null || true
-                (( total-- )) || true
-            done
-            backstop_panes=()
-            changed=true
-        fi
-
-        # Kill idle shells; convert last-standing to backstop
+        # Preserve the final pane in a stack window; it is the orchestrator slot
+        # or its tombstone. Cull only surplus idle shells.
         for pid in "${idle_panes[@]}"; do
-            if [[ $total -le 1 && ${#backstop_panes[@]} -eq 0 ]]; then
-                tmux respawn-pane -k -t "$pid" "tmux-backstop" 2>/dev/null || true
-                backstop_panes+=("$pid")
-                changed=true
-                continue
-            fi
+            [[ $total -le 1 ]] && continue
             tmux kill-pane -t "$pid" 2>/dev/null || true
             (( total-- )) || true
             changed=true
@@ -131,29 +119,36 @@ assert_backburner() {
 
 # ============================================================
 # ASSERTION: grid
-# Palace power grid has expected pane count (4 grid + sides).
+# Palace and somnium grids each have their expected pane count.
+#   palace  → 4 panes (W | N/S | E)
+#   somnium → 5 panes (W | N/NE/S/SE)
 # ============================================================
 assert_grid() {
-    # Only check if palace window exists
-    tmux list-panes -t "${SESSION}:palace" -F '' 2>/dev/null || return 0
+    local win expected actual focused
+    declare -A expected_for=(
+        [palace]=4
+        [somnium]=5
+    )
 
-    local layout_origin
-    layout_origin=$(tmux show-options -wv -t "${SESSION}:palace" @LAYOUT_ORIGIN 2>/dev/null || echo "")
+    for win in palace somnium; do
+        tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null || continue
+        expected="${expected_for[$win]}"
 
-    local expected_grid=4
-    local expected_total
-    case "$layout_origin" in
-        wsl) expected_total=6 ;;  # 4 grid + 2 sides
-        mac) expected_total=5 ;;  # 4 grid + 1 right col (TUI)
-        *)   return 0 ;;         # Unknown layout, skip
-    esac
+        focused=$(tmux show-options -wv -t "${SESSION}:${win}" @FOCUS_GRID_ACTIVE 2>/dev/null || echo "false")
+        if [[ "$focused" == "true" ]]; then
+            # Grid focus stashes only grid siblings; side/tall panes remain visible.
+            if [[ "$win" == "palace" ]]; then
+                expected=3
+            else
+                expected=2
+            fi
+        fi
 
-    local actual
-    actual=$(tmux list-panes -t "${SESSION}:palace" -F '' 2>/dev/null | wc -l | tr -d ' ')
-
-    if [[ "$actual" -ne "$expected_total" ]]; then
-        echo "grid: palace has $actual panes, expected $expected_total ($layout_origin layout)"
-    fi
+        actual=$(tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$actual" -ne "$expected" ]]; then
+            echo "grid: ${win} has $actual panes, expected $expected"
+        fi
+    done
 }
 
 # ============================================================
@@ -178,33 +173,33 @@ assert_tui() {
 
 # ============================================================
 # ASSERTION: layout
-# Palace pane proportions haven't drifted from canonical sizing.
+# Palace + somnium pane proportions haven't drifted from canonical sizing.
 # Light check: only flags, doesn't auto-fix (refresh-layout is destructive
 # if the user intentionally resized).
 # ============================================================
 assert_layout() {
-    # Check if expanded mode is active — skip audit during expand
-    local expanded
-    expanded=$(tmux show-options -wv -t "${SESSION}:palace" @GRID_EXPANDED 2>/dev/null || echo "none")
-    if [[ "$expanded" != "none" && -n "$expanded" ]]; then
-        return 0
-    fi
+    local win expanded focused
+    for win in palace somnium; do
+        tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null || continue
 
-    # Check if focused — different expected layout
-    local focused
-    focused=$(tmux show-options -wv -t "${SESSION}:palace" @FOCUSED 2>/dev/null || echo "false")
-    if [[ "$focused" == "true" ]]; then
-        return 0
-    fi
-
-    # Basic check: are any grid panes unreasonably small? (< 10 cols or < 5 rows)
-    while IFS=$'\t' read -r pid w h state; do
-        [[ "$state" != "small" ]] && continue
-        if [[ "$w" -lt 10 || "$h" -lt 5 ]]; then
-            echo "layout: grid pane $pid is ${w}x${h} — may need refresh"
+        expanded=$(tmux show-options -wv -t "${SESSION}:${win}" @GRID_EXPANDED 2>/dev/null || echo "none")
+        if [[ "$expanded" != "none" && -n "$expanded" ]]; then
+            continue
         fi
-    done < <(tmux list-panes -t "${SESSION}:palace" \
-        -F '#{pane_id}	#{pane_width}	#{pane_height}	#{@GRID_STATE}' 2>/dev/null || true)
+
+        focused=$(tmux show-options -wv -t "${SESSION}:${win}" @FOCUSED 2>/dev/null || echo "false")
+        if [[ "$focused" == "true" ]]; then
+            continue
+        fi
+
+        while IFS=$'\t' read -r pid w h state; do
+            [[ "$state" != "small" ]] && continue
+            if [[ "$w" -lt 10 || "$h" -lt 5 ]]; then
+                echo "layout: ${win} grid pane $pid is ${w}x${h} — may need refresh"
+            fi
+        done < <(tmux list-panes -t "${SESSION}:${win}" \
+            -F '#{pane_id}	#{pane_width}	#{pane_height}	#{@GRID_STATE}' 2>/dev/null || true)
+    done
 }
 
 # ============================================================

@@ -12,6 +12,10 @@
 #
 # Usage:
 #   claude-launcher              Interactive mode (full menu)
+#   claude-launcher --prompt "..."       Interactive mode with initial prompt
+#   claude-launcher --prompt-file <path> Interactive mode with initial prompt from file
+#   claude-launcher --no-gt              Opt out of Golden Throne mode
+#   claude-launcher --dry-run --prompt-file <path>
 
 set -euo pipefail
 
@@ -19,8 +23,43 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/claude-dispatch"
+CODEX_DISPATCH_BIN="$(dirname "$(readlink -f "$0")")/codex-dispatch"
 IMPERIUM_ROOT="${IMPERIUM:-/Volumes/Imperium}"
+CIVIC_ROOT="${CIVIC:-/Volumes/Civic}"
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
+DEFAULT_ENGINE_STATE="${HOME}/.claude/launcher-default-engine"
+INITIAL_PROMPT=""
+DRY_RUN=false
+GT_DEFAULT=true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prompt)
+            INITIAL_PROMPT="$2"
+            shift 2
+            ;;
+        --prompt-file)
+            if [[ ! -f "$2" ]]; then
+                echo "Prompt file not found: $2" >&2
+                exit 1
+            fi
+            INITIAL_PROMPT="$(<"$2")"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --no-gt)
+            GT_DEFAULT=false
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # --- Colors ---
 CYAN='\033[0;36m'
@@ -42,9 +81,13 @@ fi
 select_target() {
     local options=()
 
+    if [[ "$PWD" != "$HOME" ]]; then
+        options+=("$PWD (current)")
+    fi
+
     # Vault-only options (no transplant — stay in vault)
-    options+=("Imperium-ENV (vault only)")
-    [[ -d "${IMPERIUM_ROOT}/Pax-ENV" ]] && options+=("Pax-ENV (vault only)")
+    options+=("Imperium-ENV")
+    [[ -d "${CIVIC_ROOT}/Pax-ENV" ]] && options+=("Pax-ENV")
 
     # Worktree creation options
     options+=("+ New Token-OS worktree")
@@ -59,13 +102,13 @@ select_target() {
             [[ -d "$wt/.git" || -f "$wt/.git" ]] || continue
             local branch
             branch=$(basename "$wt")
-            options+=("$wt ($project_name/$branch)")
+            options+=("$project_name/$branch")
         done
     done
 
     # NAS project dirs (Token-OS, askCivic source)
     [[ -d "${IMPERIUM_ROOT}/Token-OS" ]] && options+=("${IMPERIUM_ROOT}/Token-OS (NAS)")
-    [[ -d "/Volumes/Civic/askCivic" ]] && options+=("/Volumes/Civic/askCivic (NAS)")
+    [[ -d "${CIVIC_ROOT}/askCivic" ]] && options+=("${CIVIC_ROOT}/askCivic (NAS)")
 
     # Recent working dirs from token-api
     local api_url="${TOKEN_API_URL:-http://localhost:7777}"
@@ -92,13 +135,15 @@ except: pass
     done <<< "$recent_dirs"
 
     local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Target > " \
         --header="Where should the agent work? (transplant target)" \
         --height=~20 \
         --layout=reverse \
         --no-info \
-        --cycle) || { echo ""; return; }
+        --cycle); then
+        return 130
+    fi
 
     echo "$selected"
 }
@@ -129,57 +174,182 @@ create_worktree() {
 }
 
 # =============================================================================
-# Step 2: Persona selector
+# Persona command mapping
 # =============================================================================
-select_persona() {
-    local options=("None (vanilla claude)")
+map_persona_for_vault() {
+    local persona="$1"
+    local vault="$2"
 
-    if [[ -f "$DB_PATH" ]] && command -v sqlite3 &>/dev/null; then
-        while IFS=$'\t' read -r name title; do
-            options+=("$name — $title")
-        done < <(sqlite3 -separator $'\t' "$DB_PATH" "SELECT name, title FROM primarchs ORDER BY name;" 2>/dev/null)
+    [[ -n "$persona" ]] || return 0
+
+    case "$vault" in
+        *Pax-ENV*)
+            case "$persona" in
+                guilliman)   echo "codifier" ;;
+                sanguinius)  echo "design" ;;
+                dorn)        echo "security" ;;
+                inquisitor)  echo "inquisitor" ;;
+                *)           echo "$persona" ;;
+            esac
+            ;;
+        *)
+            echo "$persona"
+            ;;
+    esac
+}
+
+# =============================================================================
+# Step 2: Persona / engine selector
+# =============================================================================
+select_persona_engine() {
+    local engine="${1:-claude}"
+    local vault="${2:-}"
+
+    while true; do
+        local default_label="Astartes"
+        [[ "$engine" == "codex" ]] && default_label="Sisters of Battle"
+
+        local options=("$default_label")
+
+        if [[ "$vault" == *Pax-ENV* ]]; then
+            options+=(
+                "Inquisitor — critical execution"
+                "Guilliman — codifier"
+                "Sanguinius — design"
+                "Dorn — security"
+            )
+        elif [[ -f "$DB_PATH" ]] && command -v sqlite3 &>/dev/null; then
+            while IFS=$'\t' read -r name title; do
+                options+=("$name — $title")
+            done < <(sqlite3 -separator $'\t' "$DB_PATH" "
+                SELECT name, title
+                FROM primarchs
+                WHERE name IN (
+                    'custodes',
+                    'inquisitor',
+                    'fabricator-general',
+                    'guilliman',
+                    'sanguinius',
+                    'perturabo',
+                    'dorn'
+                )
+                ORDER BY CASE name
+                    WHEN 'custodes' THEN 1
+                    WHEN 'inquisitor' THEN 2
+                    WHEN 'fabricator-general' THEN 3
+                    WHEN 'guilliman' THEN 4
+                    WHEN 'sanguinius' THEN 5
+                    WHEN 'perturabo' THEN 6
+                    WHEN 'dorn' THEN 7
+                    ELSE 99
+                END;
+            " 2>/dev/null)
+        else
+            options+=(
+                "custodes — Adeptus Custodes"
+                "fabricator-general — The Fabricator-General"
+                "inquisitor — Inquisitor Codex"
+                "guilliman — Guilliman, The Codifier"
+                "sanguinius — Sanguinius, The Angel"
+                "dorn — Dorn, The Imperial Fist"
+            )
+        fi
+
+        local result key selected
+        if ! result=$(printf '%s\n' "${options[@]}" | fzf \
+            --expect=tab \
+            --prompt="Persona > " \
+            --header="Tab swaps Astartes / Sisters of Battle" \
+            --height=~10 \
+            --layout=reverse \
+            --no-info \
+            --cycle); then
+            return 130
+        fi
+
+        if [[ "$result" == *$'\n'* ]]; then
+            key="${result%%$'\n'*}"
+            selected="${result#*$'\n'}"
+        else
+            key=""
+            selected="$result"
+        fi
+
+        if [[ "$key" == "tab" ]]; then
+            if [[ "$engine" == "codex" ]]; then
+                engine="claude"
+            else
+                engine="codex"
+            fi
+            continue
+        fi
+
+        case "$selected" in
+            "Sisters of Battle") echo "codex"$'\t'""$'\t'"sisters-of-battle"; return ;;
+            "Astartes")          echo "claude"$'\t'""$'\t'""; return ;;
+            Inquisitor*|inquisitor*) echo "codex"$'\t'"Inquisitor"$'\t'"inquisitor"; return ;;
+            Guilliman*)          echo "claude"$'\t'"Guilliman"$'\t'"guilliman"; return ;;
+            Sanguinius*)         echo "claude"$'\t'"Sanguinius"$'\t'"sanguinius"; return ;;
+            Dorn*)               echo "claude"$'\t'"Dorn"$'\t'"dorn"; return ;;
+            *)
+                local persona display
+                persona="${selected%% — *}"
+                display="$persona"
+                [[ -n "$persona" ]] || persona=""
+                echo "claude"$'\t'"$display"$'\t'"$persona"
+                return
+                ;;
+        esac
+    done
+}
+
+initial_default_engine() {
+    local engine="claude"
+    if [[ -f "$DEFAULT_ENGINE_STATE" ]]; then
+        engine="$(<"$DEFAULT_ENGINE_STATE")"
     fi
+    case "$engine" in
+        claude|codex) echo "$engine" ;;
+        *)            echo "claude" ;;
+    esac
+}
 
-    local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
-        --prompt="Persona > " \
-        --header="Select persona (or None for vanilla)" \
-        --height=~15 \
-        --layout=reverse \
-        --no-info \
-        --cycle) || { echo ""; return; }
-
-    if [[ "$selected" == "None"* ]]; then
-        echo ""
+record_next_default_engine() {
+    local selected_engine="$1"
+    mkdir -p "$(dirname "$DEFAULT_ENGINE_STATE")"
+    if [[ "$selected_engine" == "codex" ]]; then
+        printf 'claude\n' > "$DEFAULT_ENGINE_STATE"
     else
-        echo "$selected" | cut -d' ' -f1
+        printf 'codex\n' > "$DEFAULT_ENGINE_STATE"
     fi
 }
 
 # =============================================================================
-# Step 3: Mode selector
+# Step 4: Mode selector (Claude only)
 # =============================================================================
 select_mode() {
     local options=(
-        "Normal — standard interactive session"
+        "Golden Throne — default, zealotry 5 persistence"
         "Sync — synchronous session with Emperor present"
-        "Golden Throne — zealotry 5, maximum persistence"
+        "No GT — one-off session, zealotry 3"
     )
 
     local selected
-    selected=$(printf '%s\n' "${options[@]}" | fzf \
+    if ! selected=$(printf '%s\n' "${options[@]}" | fzf \
         --prompt="Mode > " \
-        --header="Select launch mode" \
+        --header="Golden Throne is the default lane; choose No GT to opt out" \
         --height=~8 \
         --layout=reverse \
         --no-info \
-        --cycle) || { echo "normal"; return; }
+        --cycle); then
+        return 130
+    fi
 
     case "$selected" in
-        Normal*)          echo "normal" ;;
+        "No GT"*)         echo "no_gt" ;;
         Sync*)            echo "sync" ;;
         "Golden Throne"*) echo "throne" ;;
-        *)                echo "normal" ;;
+        *)                echo "throne" ;;
     esac
 }
 
@@ -191,7 +361,7 @@ resolve_vault() {
     # Pax-ENV or askCivic targets launch from Pax-ENV
     case "$target" in
         *Pax-ENV*|*askCivic*|*/Civic/*)
-            echo "${IMPERIUM_ROOT}/Pax-ENV"
+            echo "${CIVIC_ROOT}/Pax-ENV"
             ;;
         *)
             echo "${IMPERIUM_ROOT}/Imperium-ENV"
@@ -203,26 +373,26 @@ resolve_vault() {
 # Main
 # =============================================================================
 
-echo -e "${CYAN}${BOLD}Claude Launcher${NC}"
+clear
+echo -e "${CYAN}${BOLD}Agent Launcher${NC}"
 echo ""
 
 # Step 1: Transplant target
-SELECTED=$(select_target)
-if [[ -z "$SELECTED" ]]; then
+if ! SELECTED=$(select_target); then
     echo "Cancelled."
-    exit 0
+    exit 130
 fi
 
 # Handle special selections
 TRANSPLANT_DIR=""
 case "$SELECTED" in
-    "Imperium-ENV (vault only)")
+    "Imperium-ENV")
         TRANSPLANT_DIR=""  # No transplant — stay in vault
         LAUNCH_VAULT="${IMPERIUM_ROOT}/Imperium-ENV"
         ;;
-    "Pax-ENV (vault only)")
+    "Pax-ENV")
         TRANSPLANT_DIR=""
-        LAUNCH_VAULT="${IMPERIUM_ROOT}/Pax-ENV"
+        LAUNCH_VAULT="${CIVIC_ROOT}/Pax-ENV"
         ;;
     "+ New Token-OS worktree")
         TRANSPLANT_DIR=$(create_worktree "Token-OS") || exit 1
@@ -230,45 +400,127 @@ case "$SELECTED" in
         ;;
     "+ New askCivic worktree")
         TRANSPLANT_DIR=$(create_worktree "askCivic") || exit 1
-        LAUNCH_VAULT="${IMPERIUM_ROOT}/Pax-ENV"
+        LAUNCH_VAULT="${CIVIC_ROOT}/Pax-ENV"
         ;;
     *)
-        # Extract path from "path (label)" format
-        TRANSPLANT_DIR=$(echo "$SELECTED" | sed 's/ ([^)]*) *$//')
+        if [[ "$SELECTED" == */* && "$SELECTED" != /* ]]; then
+            TRANSPLANT_DIR="$HOME/worktrees/$SELECTED"
+        else
+            TRANSPLANT_DIR=$(echo "$SELECTED" | sed 's/ ([^)]*) *$//')
+        fi
         LAUNCH_VAULT=$(resolve_vault "$SELECTED")
         ;;
 esac
 
-# Step 2: Persona
-PERSONA=$(select_persona)
+# Step 2: Persona / engine
+DEFAULT_ENGINE=$(initial_default_engine)
+if ! PERSONA_RESULT=$(select_persona_engine "$DEFAULT_ENGINE" "$LAUNCH_VAULT"); then
+    echo "Cancelled."
+    exit 130
+fi
+IFS=$'\t' read -r ENGINE PERSONA_DISPLAY PERSONA <<< "$PERSONA_RESULT"
+record_next_default_engine "$ENGINE"
 
+if [[ "$ENGINE" == "codex" ]]; then
+    # Codex path — no persona/mode, dispatch directly to target dir
+    CODEX_DIR="${TRANSPLANT_DIR:-$LAUNCH_VAULT}"
+    CODEX_PROMPT="${INITIAL_PROMPT}"
+    CODEX_DISPATCH_ARGS=("--launcher" "claude-launcher")
+    if ! $GT_DEFAULT; then
+        CODEX_DISPATCH_ARGS+=("--no-gt")
+    fi
+    if [[ -n "$PERSONA" ]]; then
+        CODEX_DISPATCH_ARGS+=("--profile" "$PERSONA")
+    fi
+
+    CODEX_LANE="golden_throne"
+    $GT_DEFAULT || CODEX_LANE="one_off"
+    echo ""
+    echo -e "${DIM}Launching:${NC}"
+    echo -e "  ${DIM}engine:${NC}    codex"
+    echo -e "  ${DIM}lane:${NC}      $CODEX_LANE"
+    echo -e "  ${DIM}gt_mode:${NC}   $($GT_DEFAULT && echo on || echo off)"
+    echo -e "  ${DIM}dir:${NC}       $CODEX_DIR"
+    [[ -n "$PERSONA_DISPLAY" ]] && echo -e "  ${DIM}persona:${NC}   $PERSONA_DISPLAY"
+    [[ -n "$PERSONA" ]] && echo -e "  ${DIM}profile:${NC}   $PERSONA"
+    [[ -n "$CODEX_PROMPT" ]] && echo -e "  ${DIM}prompt:${NC}    yes"
+    echo ""
+
+    clear
+    if $DRY_RUN; then
+        echo -e "${CYAN}${BOLD}codex-dispatch (dry run)${NC}"
+        echo -e "  ${DIM}dir:${NC}         $CODEX_DIR"
+        echo -e "  ${DIM}launcher:${NC}    claude-launcher"
+        echo -e "  ${DIM}lane:${NC}        $CODEX_LANE"
+        echo -e "  ${DIM}gt_mode:${NC}     $($GT_DEFAULT && echo on || echo off)"
+        [[ -n "$PERSONA" ]] && echo -e "  ${DIM}profile:${NC}     $PERSONA"
+        if [[ -n "$CODEX_PROMPT" ]]; then
+            echo -e "  ${DIM}prompt:${NC}"
+            echo "$CODEX_PROMPT" | sed 's/^/    /'
+        fi
+        exit 0
+    fi
+    exec "$CODEX_DISPATCH_BIN" "${CODEX_DISPATCH_ARGS[@]}" "$CODEX_DIR" "$CODEX_PROMPT"
+fi
+
+# Claude path — continue with mode selector
 # Step 3: Mode
-MODE=$(select_mode)
+if $GT_DEFAULT; then
+    if ! MODE=$(select_mode); then
+        echo "Cancelled."
+        exit 130
+    fi
+else
+    MODE="no_gt"
+fi
 
 # Build dispatch args — launch dir is always the vault
 DISPATCH_ARGS=("--dir" "$LAUNCH_VAULT")
 
 if [[ -n "$TRANSPLANT_DIR" ]]; then
-    DISPATCH_ARGS+=("--prompt" "Transplant to ${TRANSPLANT_DIR} and begin work.")
+    TRANSPLANT_PROMPT="Transplant to ${TRANSPLANT_DIR} and begin work."
+    if [[ -n "$INITIAL_PROMPT" ]]; then
+        TRANSPLANT_PROMPT="${TRANSPLANT_PROMPT}
+
+${INITIAL_PROMPT}"
+    fi
+    DISPATCH_ARGS+=("--prompt" "$TRANSPLANT_PROMPT")
+elif [[ -n "$INITIAL_PROMPT" ]]; then
+    DISPATCH_ARGS+=("--prompt" "$INITIAL_PROMPT")
 fi
 
-if [[ -n "$PERSONA" ]]; then
-    DISPATCH_ARGS+=("--primarch" "$PERSONA")
+PERSONA_COMMAND="$(map_persona_for_vault "$PERSONA" "$LAUNCH_VAULT")"
+if [[ -n "$PERSONA_COMMAND" ]]; then
+    DISPATCH_ARGS+=("--primarch" "$PERSONA_COMMAND")
 fi
 
 case "$MODE" in
     sync)   DISPATCH_ARGS+=("--sync") ;;
-    throne) DISPATCH_ARGS+=("--zealotry" "5" "--sync") ;;
+    throne) DISPATCH_ARGS+=("--zealotry" "5") ;;
+    no_gt)  DISPATCH_ARGS+=("--no-gt") ;;
+esac
+
+case "$MODE" in
+    sync)   LANE="sync"; GT_LABEL="off" ;;
+    no_gt)  LANE="one_off"; GT_LABEL="off" ;;
+    *)      LANE="golden_throne"; GT_LABEL="on" ;;
 esac
 
 # Summary
 echo ""
 echo -e "${DIM}Launching:${NC}"
+echo -e "  ${DIM}engine:${NC}    claude"
 echo -e "  ${DIM}vault:${NC}     $LAUNCH_VAULT"
 [[ -n "$TRANSPLANT_DIR" ]] && echo -e "  ${DIM}target:${NC}    $TRANSPLANT_DIR"
-[[ -n "$PERSONA" ]]        && echo -e "  ${DIM}persona:${NC}   $PERSONA"
-echo -e "  ${DIM}mode:${NC}      $MODE"
+[[ -n "$PERSONA_DISPLAY" ]] && echo -e "  ${DIM}persona:${NC}   $PERSONA_DISPLAY"
+[[ "$PERSONA_COMMAND" != "$PERSONA" && -n "$PERSONA_COMMAND" ]] && echo -e "  ${DIM}persona file:${NC} $PERSONA_COMMAND"
+echo -e "  ${DIM}lane:${NC}      $LANE"
+echo -e "  ${DIM}gt_mode:${NC}   $GT_LABEL"
+[[ -n "$INITIAL_PROMPT" ]] && echo -e "  ${DIM}prompt:${NC}    yes"
 echo ""
 
 # Dispatch
+if $DRY_RUN; then
+    DISPATCH_ARGS+=("--dry-run")
+fi
 exec "$DISPATCH_BIN" "${DISPATCH_ARGS[@]}"

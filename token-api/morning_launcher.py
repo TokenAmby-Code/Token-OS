@@ -3,6 +3,7 @@
 
 Called by cron at wakeup time. Delegates entirely to morning_session.run_morning_session().
 """
+
 import json
 import os
 import sys

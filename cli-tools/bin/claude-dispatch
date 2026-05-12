@@ -13,6 +13,7 @@
 #   --dir <path>           Working directory (default: pwd)
 #   --primarch <name>      Persona to launch as
 #   --zealotry <1-5>       Golden Throne persistence level
+#   --no-gt               Opt out of Golden Throne mode (one-off lane)
 #   --sync                 Enable sync session mode
 #   --session-doc <path>   Session doc (vault-dispatch style briefing)
 #   --prompt <text>        Initial prompt to pipe in
@@ -23,6 +24,7 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+CLAUDE_WRAPPER_BIN="$(dirname "$(readlink -f "$0")")/../scripts/claude-wrapper.sh"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -37,6 +39,7 @@ NC='\033[0m'
 WORK_DIR=""
 PRIMARCH=""
 ZEALOTRY=""
+GT_MODE=true
 SYNC=false
 SESSION_DOC=""
 PROMPT=""
@@ -49,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --dir)        WORK_DIR="$2"; shift 2 ;;
         --primarch)   PRIMARCH="$2"; shift 2 ;;
         --zealotry)   ZEALOTRY="$2"; shift 2 ;;
+        --no-gt)      GT_MODE=false; shift ;;
+        --gt)         GT_MODE=true; shift ;;
         --sync)       SYNC=true; shift ;;
         --session-doc) SESSION_DOC="$2"; shift 2 ;;
         --prompt)     PROMPT="$2"; shift 2 ;;
@@ -69,6 +74,28 @@ if [[ ! -d "$WORK_DIR" ]]; then
     exit 1
 fi
 WORK_DIR=$(cd "$WORK_DIR" && pwd)
+
+# --- Commitment lane ---
+if $SYNC; then
+    INSTANCE_TYPE="sync"
+elif $GT_MODE; then
+    INSTANCE_TYPE="golden_throne"
+else
+    INSTANCE_TYPE="one_off"
+fi
+
+if [[ -z "$ZEALOTRY" ]]; then
+    if $GT_MODE; then
+        ZEALOTRY=5
+    else
+        ZEALOTRY=3
+    fi
+fi
+
+DISPATCH_ENV=(
+    "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
+    "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
+)
 
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV"
@@ -132,7 +159,9 @@ if $DRY_RUN; then
     echo -e "${CYAN}${BOLD}claude-dispatch (dry run)${NC}"
     echo -e "  ${DIM}dir:${NC}         $WORK_DIR"
     [[ -n "$PRIMARCH" ]]    && echo -e "  ${DIM}primarch:${NC}    $PRIMARCH"
-    [[ -n "$ZEALOTRY" ]]    && echo -e "  ${DIM}zealotry:${NC}    $ZEALOTRY"
+    echo -e "  ${DIM}lane:${NC}        $INSTANCE_TYPE"
+    echo -e "  ${DIM}gt_mode:${NC}     $($GT_MODE && echo on || echo off)"
+    echo -e "  ${DIM}zealotry:${NC}    $ZEALOTRY"
     $SYNC                   && echo -e "  ${DIM}sync:${NC}        yes"
     [[ -n "$SESSION_DOC" ]] && echo -e "  ${DIM}session-doc:${NC} $SESSION_DOC"
     [[ -n "$TARGET_PANE" ]] && echo -e "  ${DIM}pane:${NC}        $TARGET_PANE"
@@ -144,7 +173,7 @@ if $DRY_RUN; then
     exit 0
 fi
 
-# --- Zealotry registration (background) ---
+# --- Commitment lane registration (background backstop) ---
 if [[ -n "$ZEALOTRY" ]]; then
     (
         sleep 8
@@ -155,9 +184,9 @@ if [[ -n "$ZEALOTRY" ]]; then
                 jq -r --arg dir "$WORK_DIR" \
                 '.[] | select(.working_dir == $dir and (.stopped_at == null)) | .id' 2>/dev/null | tail -1)
             if [[ -n "$instance_id" ]]; then
-                curl -s -X PATCH "${API_URL}/api/instances/${instance_id}" \
+                curl -s -X PATCH "${API_URL}/api/instances/${instance_id}/type" \
                     -H "Content-Type: application/json" \
-                    -d "{\"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
+                    -d "{\"instance_type\": \"${INSTANCE_TYPE}\", \"zealotry\": $ZEALOTRY}" >/dev/null 2>&1 || true
             fi
         fi
     ) &
@@ -165,22 +194,24 @@ if [[ -n "$ZEALOTRY" ]]; then
 fi
 
 # --- Execute ---
+RESOLVED_PANE="${TARGET_PANE:-${TMUX_PANE:-}}"
+QUOTED_RESOLVED_PANE="$(printf '%q' "$RESOLVED_PANE")"
+
 if [[ -n "$TARGET_PANE" ]]; then
     # Remote pane dispatch via tmux send-keys
-    # Write prompt to temp file to avoid shell escaping issues
+    ENV_PREFIX=$(printf '%q ' "${DISPATCH_ENV[@]}")
     if [[ -n "$FULL_PROMPT" ]]; then
-        PROMPT_FILE="/tmp/claude-dispatch-$$.md"
-        printf '%s' "$FULL_PROMPT" > "$PROMPT_FILE"
+        PROMPT_ARG="$(printf '%q' "$FULL_PROMPT")"
         if [[ -n "$PRIMARCH" ]]; then
-            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | primarch ${PRIMARCH}"
+            CMD="cd '${WORK_DIR}' && ${ENV_PREFIX}TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} primarch ${PRIMARCH} ${PROMPT_ARG}"
         else
-            CMD="cd '${WORK_DIR}' && cat '${PROMPT_FILE}' | claude --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && ${ENV_PREFIX}TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions ${PROMPT_ARG}"
         fi
     else
         if [[ -n "$PRIMARCH" ]]; then
-            CMD="cd '${WORK_DIR}' && primarch ${PRIMARCH}"
+            CMD="cd '${WORK_DIR}' && ${ENV_PREFIX}TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} primarch ${PRIMARCH}"
         else
-            CMD="cd '${WORK_DIR}' && claude --dangerously-skip-permissions"
+            CMD="cd '${WORK_DIR}' && ${ENV_PREFIX}TOKEN_API_DISPATCH_RESOLVED_PANE=${QUOTED_RESOLVED_PANE} TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude '${CLAUDE_WRAPPER_BIN}' --dangerously-skip-permissions"
         fi
     fi
 
@@ -190,16 +221,21 @@ if [[ -n "$TARGET_PANE" ]]; then
     echo -e "${GREEN}+${NC} Dispatched to pane $TARGET_PANE"
 else
     # Local shell dispatch — exec into claude
+    clear
     cd "$WORK_DIR"
 
     if [[ -n "$FULL_PROMPT" ]]; then
-        # Pipe prompt as first message
+        # Claude Code 2.x expects an initial prompt as a positional argument.
         if [[ -n "$PRIMARCH" ]]; then
-            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+            exec env "${DISPATCH_ENV[@]}" TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}" "$FULL_PROMPT"
         else
-            echo "$FULL_PROMPT" | exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+            exec env "${DISPATCH_ENV[@]}" TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}" "$FULL_PROMPT"
         fi
     else
-        exec "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        if [[ -n "$PRIMARCH" ]]; then
+            exec env "${DISPATCH_ENV[@]}" TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" "$LAUNCH_BIN" "${LAUNCH_ARGS[@]}"
+        else
+            exec env "${DISPATCH_ENV[@]}" TOKEN_API_DISPATCH_RESOLVED_PANE="$RESOLVED_PANE" TOKEN_API_LAUNCHER=claude-dispatch TOKEN_API_ENGINE=claude "$CLAUDE_WRAPPER_BIN" "${LAUNCH_ARGS[@]}"
+        fi
     fi
 fi

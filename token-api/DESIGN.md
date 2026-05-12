@@ -423,14 +423,40 @@ CREATE TABLE claude_instances (
     id TEXT PRIMARY KEY,
     session_id TEXT UNIQUE NOT NULL,
     tab_name TEXT,
+    working_dir TEXT,
     origin_type TEXT NOT NULL,     -- 'local' or 'ssh'
     source_ip TEXT,
-    device_id TEXT NOT NULL,       -- 'desktop', 'pixel-phone', etc.
+    device_id TEXT NOT NULL,       -- 'Mac-Mini', 'Token-S24', etc.
     profile_name TEXT,
     tts_voice TEXT,
     notification_sound TEXT,
+    primarch TEXT,
     pid INTEGER,
-    status TEXT DEFAULT 'active',  -- 'active', 'stopped'
+    status TEXT DEFAULT 'idle',    -- 'idle', 'processing', 'stopped'
+    is_subagent INTEGER DEFAULT 0,
+    tmux_pane TEXT,
+    input_lock TEXT,
+    legion TEXT DEFAULT 'astartes',
+    synced INTEGER DEFAULT 0,
+    session_doc_id INTEGER,
+    session_doc_policy TEXT,
+    continuity_binding_source TEXT,
+    wrapper_launch_id TEXT,
+    dispatch_target TEXT,
+    dispatch_window TEXT,
+    dispatch_mode TEXT,
+    dispatch_slot TEXT,
+    dispatch_session_doc_path TEXT,
+    target_working_dir TEXT,
+    launch_mode TEXT,
+    transplant_expected INTEGER DEFAULT 0,
+    workflow_state TEXT,
+    workflow_updated_at TIMESTAMP,
+    workflow_blocked_reason TEXT,
+    stop_allowed INTEGER DEFAULT 1,
+    next_required_action TEXT,
+    next_action_owner TEXT,
+    instance_type TEXT DEFAULT 'one_off',
     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     stopped_at TIMESTAMP
@@ -438,7 +464,73 @@ CREATE TABLE claude_instances (
 
 CREATE INDEX idx_instances_status ON claude_instances(status);
 CREATE INDEX idx_instances_device ON claude_instances(device_id);
+CREATE INDEX idx_instances_legion_synced ON claude_instances(legion, synced, status);
 ```
+
+### workflow_events
+```sql
+CREATE TABLE workflow_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    workflow_state TEXT,
+    event_type TEXT NOT NULL,
+    event_owner TEXT,
+    details_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+);
+
+CREATE INDEX idx_workflow_events_instance_time ON workflow_events(instance_id, created_at DESC);
+CREATE INDEX idx_workflow_events_type_time ON workflow_events(event_type, created_at DESC);
+```
+
+### instance_mutations
+```sql
+CREATE TABLE instance_mutations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    mutation_type TEXT NOT NULL,
+    write_source TEXT NOT NULL,
+    write_txn_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    service_version TEXT,
+    wrapper_launch_id TEXT,
+    field_names_json TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+);
+
+CREATE INDEX idx_instance_mutations_instance_time ON instance_mutations(instance_id, created_at DESC);
+CREATE INDEX idx_instance_mutations_write_txn ON instance_mutations(write_txn_id);
+CREATE INDEX idx_instance_mutations_type_time ON instance_mutations(mutation_type, created_at DESC);
+```
+
+### Provenance And Reconciliation
+
+The `claude_instances` row remains the live source of truth, but sanctioned writes
+now append a compact provenance record into `instance_mutations`.
+
+Contract:
+- `write_source`: `hooks`, `api`, `system_worker`, `migration`, `exceptional_direct`
+- `actor`: request or subsystem actor such as `SessionStart`, `SessionEnd`, `assign-doc`
+- `write_txn_id`: UUID per sanctioned write
+- `before_json` / `after_json`: changed-field subset only, not full row dumps
+
+Reconciliation is read-only in v1 and uses:
+- `GET /api/instances/{id}/provenance`
+- `GET /api/instances/{id}/reconciliation`
+- `GET /api/reconciliation/instances`
+
+Statuses:
+- `clean`
+- `pending_projection`
+- `unprovenanced_write`
+- `state_drift`
+- `projection_drift`
+
+Suspicious reconciliation results emit `instance_reconciliation_drift` into `events`.
 
 ### devices
 ```sql
@@ -470,15 +562,9 @@ CREATE INDEX idx_events_time ON events(created_at DESC);
 
 ---
 
-## Next Steps
+## Current Gaps
 
-1. [ ] Create FastAPI project structure in `/mnt/imperium/Token-OS/token-api/`
-2. [ ] Initialize SQLite schema (extend agents.db or create token-api.db)
-3. [ ] Implement instance registration endpoints with SSH detection
-4. [ ] Implement profile assignment from pool
-5. [ ] Create TUI dashboard
-6. [ ] Update Claude Code hooks to POST to Token-API
-7. [ ] Port notification system from mesh-pipe
-8. [ ] Port productivity/mode endpoints
-9. [ ] Test with desktop + phone
-10. [ ] Migrate remaining mesh-pipe features
+1. Sanctioned writes currently cover the first migration wave only. Some cleanup and system-worker paths still write `claude_instances` directly.
+2. Reconciliation is detect-and-report only. It does not replay tmux projection or heal row drift.
+3. The TUI does not yet expose provenance/reconciliation detail inline, so operators still need the API or SQL for inspection.
+4. The instance layer still lives in the monolith; `instance_mutation.py` is a bridge, not a full extracted `agent_instance_service`.

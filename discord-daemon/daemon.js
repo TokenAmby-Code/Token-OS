@@ -46,6 +46,26 @@ function createLogger(level = 'info') {
   };
 }
 
+const earlyLogger = createLogger('debug');
+process.on('beforeExit', (code) => {
+  earlyLogger.warn(`Process beforeExit code=${code}`);
+});
+process.on('exit', (code) => {
+  earlyLogger.warn(`Process exit code=${code}`);
+});
+process.on('uncaughtException', (err) => {
+  earlyLogger.error(`Uncaught exception: ${err.stack || err.message}`);
+  process.exitCode = 1;
+});
+process.on('unhandledRejection', (reason) => {
+  const message = reason?.stack || reason?.message || String(reason);
+  earlyLogger.error(`Unhandled rejection: ${message}`);
+  process.exitCode = 1;
+});
+process.on('SIGHUP', () => {
+  earlyLogger.warn('Received SIGHUP');
+});
+
 // --- Main ---
 async function main() {
   const config = loadConfig();
@@ -71,13 +91,22 @@ async function main() {
   voiceManager.setTranscriptionCallback((userId, pcmBuffer, filepath, botName) => {
     return transcriber.handleAudio(userId, pcmBuffer, filepath, botName);
   });
+  voiceManager.setAudioFrameCallback((userId, pcmChunk, botName) => {
+    return transcriber.handleAudioFrame?.(userId, pcmChunk, botName);
+  });
+  voiceManager.setAudioEndCallback((userId, botName) => {
+    return transcriber.closeUser?.(userId, botName);
+  });
+  voiceManager.setAudioCommitCallback((userId, botName, meta) => {
+    return transcriber.commitUser?.(userId, botName, meta);
+  });
 
   // Forward transcription results to Token API
   transcriber.onTranscription(async (result) => {
     const botLabel = result.botName || 'voice';
     logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);
     try {
-      await fetch(`http://127.0.0.1:${config.token_api_port}/api/discord/message`, {
+      const resp = await fetch(`http://127.0.0.1:${config.token_api_port}/api/discord/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -99,8 +128,12 @@ async function main() {
           bot_name: botLabel,
         }),
       });
-    } catch {
-      // Token API might not be running
+      logger.info(`Transcription [${botLabel}]: Token API ack ${resp.status}`);
+      if (!resp.ok) {
+        logger.warn(`Transcription [${botLabel}]: Token API response ${await resp.text()}`);
+      }
+    } catch (err) {
+      logger.warn(`Transcription [${botLabel}]: Token API forward failed: ${err.message}`);
     }
   });
 
@@ -162,6 +195,8 @@ async function main() {
     await client.start();
     logger.info(`Bot '${name}' connected`);
   }
+
+  await voiceManager.reconcileOperatorVoiceState();
 
   // Register slash commands on Custodes bot (/task, /note)
   const custodes = botClients['custodes'];

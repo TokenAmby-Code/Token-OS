@@ -3,42 +3,25 @@
 Uses a temporary SQLite database via TOKEN_API_DB env var.
 """
 
-import asyncio
-import os
-import tempfile
 import uuid
-from pathlib import Path
 
 import pytest
-import pytest_asyncio
-import aiosqlite
 
-# Set test DB before importing main (DB_PATH is read at import time)
-_test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_test_db.close()
-os.environ["TOKEN_API_DB"] = _test_db.name
-
-from main import (
-    PROFILES,
-    FALLBACK_VOICES,
-    ULTIMATE_FALLBACK,
-    get_next_available_profile,
-    DB_PATH,
-)
-from init_db import init_database
+PROFILES = []
+FALLBACK_VOICES = []
+ULTIMATE_FALLBACK = {}
+get_next_available_profile = None
+DB_PATH = None
 
 
 @pytest.fixture(autouse=True)
-def _init_db():
-    """Initialize a fresh test database for each test."""
-    # Wipe and recreate
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
-    init_database()
-    yield
-    # Cleanup after test
-    if Path(_test_db.name).exists():
-        Path(_test_db.name).unlink()
+def _bind_main_exports(app_env):
+    global PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK, get_next_available_profile, DB_PATH
+    PROFILES = app_env.main.PROFILES
+    FALLBACK_VOICES = app_env.main.FALLBACK_VOICES
+    ULTIMATE_FALLBACK = app_env.main.ULTIMATE_FALLBACK
+    get_next_available_profile = app_env.main.get_next_available_profile
+    DB_PATH = app_env.main.DB_PATH
 
 
 # ============ Unit tests for get_next_available_profile ============
@@ -136,26 +119,34 @@ class TestVoiceAssignmentAPI:
     """Test voice assignment through the full API registration flow."""
 
     @pytest.fixture
-    def client(self):
+    def client(self, app_env, monkeypatch):
         """Create a test client for the FastAPI app."""
-        from main import app
+
+        async def _noop_push(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(app_env.main, "push_phone_widget_async", _noop_push)
         from fastapi.testclient import TestClient
-        return TestClient(app)
+
+        return TestClient(app_env.main.app)
 
     def _register(self, client, name: str) -> dict:
         """Helper to register an instance and return the response."""
-        resp = client.post("/api/instances/register", json={
-            "instance_id": str(uuid.uuid4()),
-            "tab_name": name,
-            "working_dir": f"/tmp/test-{name}",
-        })
+        resp = client.post(
+            "/api/instances/register",
+            json={
+                "instance_id": str(uuid.uuid4()),
+                "tab_name": name,
+                "working_dir": f"/tmp/test-{name}",
+            },
+        )
         assert resp.status_code == 200, f"Registration failed: {resp.text}"
         return resp.json()
 
-    def test_9_unique_primary_voices(self, client):
-        """Registering 9 instances should produce 9 unique foreign-accent voices."""
+    def test_primary_pool_assigns_unique_voices(self, client):
+        """Registering one instance per primary voice should stay within the primary pool."""
         voices = set()
-        for i in range(9):
+        for i in range(len(PROFILES)):
             data = self._register(client, f"inst-{i}")
             voice = data["profile"]["tts_voice"]
             assert voice not in voices, f"Duplicate voice: {voice}"
@@ -164,34 +155,35 @@ class TestVoiceAssignmentAPI:
         primary_voices = {p["wsl_voice"] for p in PROFILES}
         assert voices == primary_voices
 
-    def test_10th_instance_gets_fallback(self, client):
-        """The 10th instance should get a fallback voice (David/Zira/Mark)."""
-        for i in range(9):
+    def test_next_instance_after_primary_pool_gets_fallback(self, client):
+        """The first registration after the primary pool is exhausted should use a fallback voice."""
+        for i in range(len(PROFILES)):
             self._register(client, f"inst-{i}")
 
-        data = self._register(client, "inst-9-fallback")
+        data = self._register(client, "inst-fallback")
         voice = data["profile"]["tts_voice"]
         fallback_voices = {fb["wsl_voice"] for fb in FALLBACK_VOICES}
         assert voice in fallback_voices, f"Expected fallback, got: {voice}"
 
-    def test_13th_instance_gets_ultimate_fallback(self, client):
-        """The 13th instance should get the ultimate fallback (David duplicate)."""
-        for i in range(12):
+    def test_exhausted_pool_gets_ultimate_fallback(self, client):
+        """After primary and fallback pools are full, the next registration uses the ultimate fallback."""
+        total_before_ultimate = len(PROFILES) + len(FALLBACK_VOICES)
+        for i in range(total_before_ultimate):
             self._register(client, f"inst-{i}")
 
-        data = self._register(client, "inst-12-ultimate")
+        data = self._register(client, "inst-ultimate")
         voice = data["profile"]["tts_voice"]
         assert voice == "Microsoft David"
 
     def test_stopped_instance_releases_voice(self, client):
         """Stopping an instance should free its voice slot."""
         ids = []
-        for i in range(9):
+        for i in range(len(PROFILES)):
             data = self._register(client, f"inst-{i}")
             ids.append(data)
 
-        # All primary voices taken — 10th would get fallback
-        data_10 = self._register(client, "inst-9-before-stop")
+        # All primary voices taken — next registration should get fallback
+        data_10 = self._register(client, "inst-before-stop")
         fallback_voices = {fb["wsl_voice"] for fb in FALLBACK_VOICES}
         assert data_10["profile"]["tts_voice"] in fallback_voices
 

@@ -3,7 +3,7 @@
 # TAGS: instance
 # AUDIENCE: agent
 #
-# Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
+# Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]
 #
 # Examples:
 #   instance-name "auth-refactor"
@@ -15,19 +15,21 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+SOMNIUM_SELECTION_PATH="${HOME}/.claude/tui-state/somnium.json"
 
 # Help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
 Instance Name - Rename current session in Token-API registry
 
-Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]
+Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]
 
 Sets the display name for this Claude Code session in the Token-API
 registry dashboard. The name helps identify what you're working on.
 
 Options:
   --id <id>          Explicit instance ID (for ambiguous cases)
+  --selected         Use the instance selected in the Somnium TUI
   --no-ui            Skip Claude Code /rename and /color (for headless/cron)
   --session          Create a session doc named after the instance and assign it
   --session <title>  Find existing session doc by title (fuzzy) and assign it
@@ -54,6 +56,7 @@ fi
 # Parse arguments
 NAME=""
 EXPLICIT_ID=""
+USE_SELECTED=0
 SESSION_FLAG=""
 SESSION_ID=""
 SESSION_PATH=""
@@ -63,6 +66,10 @@ while [[ $# -gt 0 ]]; do
         --id)
             EXPLICIT_ID="$2"
             shift 2
+            ;;
+        --selected)
+            USE_SELECTED=1
+            shift
             ;;
         --no-ui)
             NO_UI=1
@@ -94,18 +101,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Require name
+# Require and validate name. Agents invoke this as `instance-name '<slug>'`.
 if [[ -z "$NAME" ]]; then
-    echo "Usage: instance-name <name> [--id <instance-id>] [--session [title]] [--session-id N] [--path dir]" >&2
-    exit 1
+    echo "Usage: instance-name <name> [--id <instance-id>] [--selected] [--session [title]] [--session-id N] [--path dir]" >&2
+    exit 2
 fi
 
-# Enforce kebab-case: strip artifacts, lowercase, collapse to 2-4 words
-NAME="${NAME#✳ }"
-NAME="${NAME#✳}"
-NAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 -]//g' | tr -s ' ' '-' | sed 's/^-//;s/-$//')
-# Truncate to max 4 hyphen-separated words
+RAW_NAME="$NAME"
+RAW_NAME="${RAW_NAME#✳ }"
+RAW_NAME="${RAW_NAME#✳}"
+RAW_NAME="$(printf '%s' "$RAW_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+if [[ -z "$RAW_NAME" ]]; then
+    echo "Error: name cannot be empty" >&2
+    exit 2
+fi
+if [[ ${#RAW_NAME} -gt 40 ]]; then
+    echo "Error: name must be 40 characters or fewer" >&2
+    exit 2
+fi
+if [[ "$RAW_NAME" =~ ^Claude[[:space:]][0-9]{2}:[0-9]{2}$ ]]; then
+    echo "Error: name cannot be a placeholder like 'Claude HH:MM'" >&2
+    exit 2
+fi
+
+# Preserve historical kebab-case behavior for the display slug.
+NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 -]//g' | tr -s ' ' '-' | sed 's/^-//;s/-$//')
 NAME=$(echo "$NAME" | cut -d- -f1-4)
+if [[ -z "$NAME" ]]; then
+    echo "Error: name cannot be empty after normalization" >&2
+    exit 2
+fi
+if [[ ${#NAME} -gt 40 ]]; then
+    echo "Error: normalized name must be 40 characters or fewer" >&2
+    exit 2
+fi
 
 # Find parent claude process PID by walking up the process tree
 _find_claude_pid() {
@@ -123,26 +152,46 @@ _find_claude_pid() {
     return 1
 }
 
-# Resolve instance via Token-API (server handles PID → CWD fallback)
+# Resolve and rename. Default path is pane-scoped via $TMUX_PANE so the agent
+# does not need to know its instance id. Explicit/selected legacy modes remain.
 if [[ -n "$EXPLICIT_ID" ]]; then
     INSTANCE_ID="$EXPLICIT_ID"
+elif [[ "$USE_SELECTED" == "1" ]]; then
+    if [[ ! -f "$SOMNIUM_SELECTION_PATH" ]]; then
+        echo "Error: No Somnium selection state found at $SOMNIUM_SELECTION_PATH" >&2
+        exit 1
+    fi
+    INSTANCE_ID=$(jq -r '.selected_instance_id // empty' "$SOMNIUM_SELECTION_PATH" 2>/dev/null || true)
+    if [[ -z "$INSTANCE_ID" ]]; then
+        ACTIVE_TABLE=$(jq -r '.active_table // "unknown"' "$SOMNIUM_SELECTION_PATH" 2>/dev/null || echo unknown)
+        echo "Error: Somnium selection has no instance (active_table=$ACTIVE_TABLE)" >&2
+        exit 1
+    fi
 else
-    CLAUDE_PID=$(_find_claude_pid 2>/dev/null || true)
-    QUERY="cwd=$(pwd)"
-    [[ -n "$CLAUDE_PID" ]] && QUERY="pid=${CLAUDE_PID}&${QUERY}"
-    RESOLVED=$(curl -s --connect-timeout 3 "$API_URL/api/instances/resolve?${QUERY}" 2>/dev/null || true)
-    INSTANCE_ID=$(echo "$RESOLVED" | jq -r '.id // empty' 2>/dev/null || true)
+    TMUX_PANE_ID="${TMUX_PANE:-}"
+    if [[ -z "$TMUX_PANE_ID" ]]; then
+        echo "Error: TMUX_PANE is not set; run this inside an active tmux pane" >&2
+        exit 2
+    fi
+    RESPONSE=$(jq -n --arg tmux_pane "$TMUX_PANE_ID" --arg tab_name "$NAME" \
+        '{tmux_pane: $tmux_pane, tab_name: $tab_name}' \
+        | curl -s -X POST "$API_URL/api/instance/rename" \
+            -H "Content-Type: application/json" \
+            --data-binary @- 2>/dev/null || true)
+    INSTANCE_ID=$(echo "$RESPONSE" | jq -r '.instance_id // empty' 2>/dev/null || true)
 fi
 
-if [[ -z "$INSTANCE_ID" ]]; then
-    echo "Error: No active instance found. Use --id to specify explicitly." >&2
-    exit 1
-fi
+if [[ -n "$EXPLICIT_ID" || "$USE_SELECTED" == "1" ]]; then
+    if [[ -z "$INSTANCE_ID" ]]; then
+        echo "Error: No active instance found. Use --id to specify explicitly." >&2
+        exit 1
+    fi
 
-# Rename
-RESPONSE=$(curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
-    -H "Content-Type: application/json" \
-    -d "{\"tab_name\": \"$NAME\"}" 2>/dev/null || true)
+    RESPONSE=$(jq -n --arg tab_name "$NAME" '{tab_name: $tab_name}' \
+        | curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
+            -H "Content-Type: application/json" \
+            --data-binary @- 2>/dev/null || true)
+fi
 
 if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
     echo "Renamed to: $NAME"

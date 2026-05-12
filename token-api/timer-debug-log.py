@@ -2,8 +2,8 @@
 """Log TUI timer prediction vs authoritative API state every 0.5s for pattern analysis."""
 
 import json
-import time
 import sqlite3
+import time
 import urllib.request
 
 DB_PATH = "/home/token/.claude/agents.db"
@@ -91,9 +91,10 @@ def fmt(ms):
 
 
 def main():
-    import sys
+
     def p(s):
         print(s, flush=True)
+
     p("tick | db_break   | api_break  | predicted  | db_drift | api_drift | mode")
     p("-----+-----------+------------+------------+----------+-----------+------")
 

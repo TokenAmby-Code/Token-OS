@@ -4,15 +4,15 @@
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
+
+from rich import box
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.live import Live
-from rich import box
-import time
 
 console = Console()
 
@@ -32,6 +32,7 @@ VOICES = [
     ("Microsoft Linda", "CA", "F"),
 ]
 
+
 @dataclass
 class VoiceConfig:
     name: str
@@ -43,7 +44,9 @@ class VoiceConfig:
 
 def speak_tts(message: str, voice: str, rate: int) -> bool:
     """Speak text using Windows SAPI."""
-    escaped = message.replace("\\", "\\\\").replace("'", "''").replace("$", "\\$").replace("`", "\\`")
+    escaped = (
+        message.replace("\\", "\\\\").replace("'", "''").replace("$", "\\$").replace("`", "\\`")
+    )
     ps_script = f"""
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
@@ -56,7 +59,7 @@ $synth.Speak('{escaped}')
             ["powershell.exe"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
         process.communicate(input=ps_script.encode(), timeout=30)
         return process.returncode == 0
@@ -65,7 +68,9 @@ $synth.Speak('{escaped}')
         return False
 
 
-def create_voice_table(voices: list[VoiceConfig], selected_idx: int, editing_rate: int | None = None) -> Table:
+def create_voice_table(
+    voices: list[VoiceConfig], selected_idx: int, editing_rate: int | None = None
+) -> Table:
     """Create the voice selection table."""
     table = Table(box=box.ROUNDED, expand=True, title="Available Voices")
 
@@ -101,7 +106,7 @@ def create_voice_table(voices: list[VoiceConfig], selected_idx: int, editing_rat
             gender_icon,
             rate_str,
             "[dim]Enter[/dim]" if is_selected else "",
-            style=style
+            style=style,
         )
 
     return table
@@ -177,7 +182,16 @@ def generate_profile_code(voices: list[VoiceConfig]) -> str:
         return "# No voices selected"
 
     sounds = ["chimes.wav", "notify.wav", "ding.wav", "tada.wav", "chord.wav", "recycle.wav"]
-    colors = ["#0099ff", "#00cc66", "#ff9900", "#cc66ff", "#ff6666", "#66cccc", "#ffcc00", "#cc99ff"]
+    colors = [
+        "#0099ff",
+        "#00cc66",
+        "#ff9900",
+        "#cc66ff",
+        "#ff6666",
+        "#66cccc",
+        "#ffcc00",
+        "#cc99ff",
+    ]
 
     lines = ["# Profile pool for voice/sound assignment"]
     lines.append("# WSL voices via Windows SAPI, Mac voices via macOS `say` (fallback)")
@@ -188,7 +202,7 @@ def generate_profile_code(voices: list[VoiceConfig]) -> str:
         color = colors[i % len(colors)]
         mac_voice = MAC_VOICE_PAIRS.get(v.name, "Daniel")
         lines.append(
-            f'    {{"name": "profile_{i+1}", "wsl_voice": "{v.name}", "wsl_rate": {v.rate}, '
+            f'    {{"name": "profile_{i + 1}", "wsl_voice": "{v.name}", "wsl_rate": {v.rate}, '
             f'"mac_voice": "{mac_voice}", "notification_sound": "{sound}", "color": "{color}"}},'
         )
 
@@ -207,14 +221,18 @@ def read_char() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         # Handle escape sequences
-        if ch == '\x1b':
+        if ch == "\x1b":
             ch2 = sys.stdin.read(1)
-            if ch2 == '[':
+            if ch2 == "[":
                 ch3 = sys.stdin.read(1)
-                if ch3 == 'A': return 'UP'
-                if ch3 == 'B': return 'DOWN'
-                if ch3 == 'C': return 'RIGHT'
-                if ch3 == 'D': return 'LEFT'
+                if ch3 == "A":
+                    return "UP"
+                if ch3 == "B":
+                    return "DOWN"
+                if ch3 == "C":
+                    return "RIGHT"
+                if ch3 == "D":
+                    return "LEFT"
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -232,16 +250,16 @@ def read_line(prompt: str = "") -> str:
         line = ""
         while True:
             ch = sys.stdin.read(1)
-            if ch in ('\r', '\n'):
+            if ch in ("\r", "\n"):
                 return line
-            elif ch == '\x7f':  # Backspace
+            elif ch == "\x7f":  # Backspace
                 if line:
                     line = line[:-1]
-                    sys.stdout.write('\b \b')
+                    sys.stdout.write("\b \b")
                     sys.stdout.flush()
-            elif ch == '\x1b':  # Escape - cancel
+            elif ch == "\x1b":  # Escape - cancel
                 return None
-            elif ch >= ' ':
+            elif ch >= " ":
                 line += ch
                 sys.stdout.write(ch)
                 sys.stdout.flush()
@@ -264,30 +282,23 @@ def main():
         # Build layout
         layout = Layout()
         layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="main"),
-            Layout(name="status", size=3)
+            Layout(name="header", size=3), Layout(name="main"), Layout(name="status", size=3)
         )
 
-        layout["main"].split_row(
-            Layout(name="voices", ratio=2),
-            Layout(name="sidebar", ratio=1)
-        )
+        layout["main"].split_row(Layout(name="voices", ratio=2), Layout(name="sidebar", ratio=1))
 
-        layout["sidebar"].split_column(
-            Layout(name="help"),
-            Layout(name="test_text", size=6)
-        )
+        layout["sidebar"].split_column(Layout(name="help"), Layout(name="test_text", size=6))
 
         # Render panels
-        layout["header"].update(Panel(
-            Text.from_markup("[bold cyan]TTS Studio[/bold cyan] - Voice Testing & Selection"),
-            border_style="cyan"
-        ))
-        layout["voices"].update(Panel(
-            create_voice_table(voices, selected_idx, editing_rate),
-            border_style="green"
-        ))
+        layout["header"].update(
+            Panel(
+                Text.from_markup("[bold cyan]TTS Studio[/bold cyan] - Voice Testing & Selection"),
+                border_style="cyan",
+            )
+        )
+        layout["voices"].update(
+            Panel(create_voice_table(voices, selected_idx, editing_rate), border_style="green")
+        )
         layout["help"].update(create_help_panel())
         layout["test_text"].update(create_test_text_panel(test_text, editing_text))
         layout["status"].update(create_status_panel(voices, status_message))
@@ -308,7 +319,7 @@ def main():
             continue
 
         if editing_rate is not None:
-            console.print(f"[yellow]Enter rate (-10 to 10):[/yellow] ", end="")
+            console.print("[yellow]Enter rate (-10 to 10):[/yellow] ", end="")
             rate_str = read_line()
             if rate_str is not None:
                 try:
@@ -321,34 +332,34 @@ def main():
 
         key = read_char()
 
-        if key in ('q', '\x03'):  # q or Ctrl+C
+        if key in ("q", "\x03"):  # q or Ctrl+C
             break
 
-        elif key in ('UP', 'k'):
+        elif key in ("UP", "k"):
             selected_idx = (selected_idx - 1) % len(voices)
 
-        elif key in ('DOWN', 'j'):
+        elif key in ("DOWN", "j"):
             selected_idx = (selected_idx + 1) % len(voices)
 
-        elif key == ' ':  # Toggle selection
+        elif key == " ":  # Toggle selection
             voices[selected_idx].selected = not voices[selected_idx].selected
 
-        elif key in ('LEFT', 'h'):
+        elif key in ("LEFT", "h"):
             voices[selected_idx].rate = max(-10, voices[selected_idx].rate - 1)
 
-        elif key in ('RIGHT', 'l'):
+        elif key in ("RIGHT", "l"):
             voices[selected_idx].rate = min(10, voices[selected_idx].rate + 1)
 
-        elif key == '0':
+        elif key == "0":
             voices[selected_idx].rate = 0
 
-        elif key == 'r':
+        elif key == "r":
             editing_rate = voices[selected_idx].rate
 
-        elif key == 'e':
+        elif key == "e":
             editing_text = True
 
-        elif key in ('t', '\r', '\n'):  # Test current voice
+        elif key in ("t", "\r", "\n"):  # Test current voice
             v = voices[selected_idx]
             status_message = f"Testing {v.name.replace('Microsoft ', '')} at rate {v.rate}..."
             console.clear()
@@ -356,13 +367,15 @@ def main():
             speak_tts(test_text, v.name, v.rate)
             status_message = f"Played: {v.name.replace('Microsoft ', '')}"
 
-        elif key == 'T':  # Test all selected
+        elif key == "T":  # Test all selected
             selected = [v for v in voices if v.selected]
             if not selected:
                 status_message = "No voices selected"
             else:
                 for i, v in enumerate(selected):
-                    status_message = f"Testing {i+1}/{len(selected)}: {v.name.replace('Microsoft ', '')}..."
+                    status_message = (
+                        f"Testing {i + 1}/{len(selected)}: {v.name.replace('Microsoft ', '')}..."
+                    )
                     # Quick refresh
                     console.clear()
                     layout["status"].update(create_status_panel(voices, status_message))
@@ -371,7 +384,7 @@ def main():
                     time.sleep(0.5)
                 status_message = f"Tested {len(selected)} voices"
 
-        elif key == 's':  # Save to main.py
+        elif key == "s":  # Save to main.py
             selected = [v for v in voices if v.selected]
             if not selected:
                 status_message = "No voices selected to save"
@@ -381,18 +394,23 @@ def main():
                 console.print(Panel(code, title="Generated PROFILES", border_style="yellow"))
                 console.print("\n[yellow]Save this to main.py? (y/n)[/yellow] ", end="")
                 confirm = read_char()
-                if confirm.lower() == 'y':
+                if confirm.lower() == "y":
                     # Actually update main.py
                     try:
-                        _token_os = os.environ.get("TOKEN_OS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                        _token_os = os.environ.get(
+                            "TOKEN_OS", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        )
                         main_py_path = os.path.join(_token_os, "token-api", "main.py")
 
-                        with open(main_py_path, "r") as f:
+                        with open(main_py_path) as f:
                             content = f.read()
 
                         # Find and replace PROFILES block
                         import re
-                        pattern = r'# Profile pool for voice/sound assignment\n.*?PROFILES = \[.*?\]'
+
+                        pattern = (
+                            r"# Profile pool for voice/sound assignment\n.*?PROFILES = \[.*?\]"
+                        )
                         new_content = re.sub(pattern, code, content, flags=re.DOTALL)
 
                         with open(main_py_path, "w") as f:

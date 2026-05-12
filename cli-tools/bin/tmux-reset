@@ -20,11 +20,10 @@ SESSION=$(tmux display-message -p '#{session_name}')
 WINDOW=$(tmux display-message -p '#{window_index}')
 WINDOW_NAME=$(tmux display-message -p '#{window_name}')
 TARGET="${SESSION}:${WINDOW}"
+WINDOW_BASE="${WINDOW_NAME%%(*}"
 
-# Detect layout origin
-LAYOUT_ORIGIN=$(tmux show-options -wv -t "$TARGET" @LAYOUT_ORIGIN 2>/dev/null || echo "")
-if [[ -z "$LAYOUT_ORIGIN" ]]; then
-    echo "Error: no @LAYOUT_ORIGIN set on this window — not a workspace window?" >&2
+if [[ "$WINDOW_BASE" != "palace" && "$WINDOW_BASE" != "somnium" ]]; then
+    echo "Error: tmux-reset supports the palace and somnium grid windows (got '$WINDOW_BASE')" >&2
     exit 1
 fi
 
@@ -70,12 +69,8 @@ do_reset() {
         tmux kill-pane -t "$pid"
     done <<< "$panes"
 
-    # The surviving pane is now pane 1 — rebuild the layout
-    if [[ "$LAYOUT_ORIGIN" == "wsl" ]]; then
-        tmux-workspace --window-reset "$WINDOW_NAME"
-    elif [[ "$LAYOUT_ORIGIN" == "mac" ]]; then
-        tmux-workspace --palace-reset "$WINDOW_NAME"
-    fi
+    # The surviving pane is now pane 1 — rebuild the layout via tmuxctl.
+    tx restart-page
 
     # Clear expanded state after rebuild
     tmux set-option -w -t "$TARGET" @GRID_EXPANDED "none"

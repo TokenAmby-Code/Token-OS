@@ -19,6 +19,7 @@
 #   obsidian vault=<name> orphans
 #   obsidian vault=<name> move path="<old>.md" to="<new>.md"
 #   obsidian vault=<name> daily:read
+#   obsidian vault=<name> open path="<note>.md"
 
 set -euo pipefail
 
@@ -325,6 +326,30 @@ cmd_daily_read() {
   cmd_read
 }
 
+# Open a note in the Obsidian app. Mac uses the obsidian:// URI scheme
+# (launches the app or focuses the already-open window). Linux/VPS have no
+# Obsidian app, so this errors. WSL is handled above by the Obsidian.exe proxy.
+cmd_open() {
+  if [[ -z "$PARAM_path" ]]; then
+    echo "Error: path= is required" >&2
+    return 1
+  fi
+  local rel="${PARAM_path%.md}"
+  local uri
+  uri=$(python3 -c "
+import sys, urllib.parse
+vault = urllib.parse.quote(sys.argv[1])
+path  = urllib.parse.quote(sys.argv[2])
+print(f'obsidian://open?vault={vault}&file={path}')
+" "$VAULT_NAME" "$rel")
+
+  case "$PLATFORM" in
+    macos) open "$uri" ;;
+    linux) echo "Error: obsidian open not supported on $PLATFORM (no app)" >&2; return 1 ;;
+    *)     echo "Error: obsidian open not implemented for $PLATFORM" >&2; return 1 ;;
+  esac
+}
+
 # --- Dispatch ---
 case "$COMMAND" in
   read)           cmd_read ;;
@@ -338,12 +363,13 @@ case "$COMMAND" in
   orphans)        cmd_orphans ;;
   move)           cmd_move ;;
   daily:read)     cmd_daily_read ;;
+  open)           cmd_open ;;
   ""|help|-h|--help)
     awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
     ;;
   *)
     echo "Error: unknown command '$COMMAND'" >&2
-    echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read" >&2
+    echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read, open" >&2
     exit 1
     ;;
 esac

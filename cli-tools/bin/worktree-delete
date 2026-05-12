@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/worktree-ports.sh" 2>/dev/null || true
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -71,17 +74,17 @@ EOF
     exit 0
 }
 
-log_info() { echo -e "${BLUE}→${NC} $1"; }
-log_success() { echo -e "${GREEN}✓${NC} $1"; }
-log_warn() { echo -e "${YELLOW}!${NC} $1"; }
-log_error() { echo -e "${RED}✗${NC} $1"; }
+log_info() { echo -e "${BLUE}→${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}✓${NC} $1" >&2; }
+log_warn() { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error() { echo -e "${RED}✗${NC} $1" >&2; }
 
 load_config() {
     local project="${1:-askCivic}"
     local config="$HOME/.config/worktrees/${project}.conf"
     if [[ ! -f "$config" ]]; then
         log_error "Project config not found: $config"
-        echo "  Create it with: worktree-setup --init $project"
+        echo "  Create it with: worktree-setup --init $project" >&2
         exit 1
     fi
     # shellcheck disable=SC1090
@@ -211,6 +214,13 @@ if [[ -d "$WORKTREE_DIR" ]]; then
         log_success "Claude session terminated"
         # Clean up session PID cache
         rm -f "${HOME}/.claude/session-pids/${GHOST_PID}" 2>/dev/null || true
+    fi
+fi
+
+# Free the port assigned to this worktree (kills bound process).
+if command -v free_port &>/dev/null; then
+    if FREED=$(free_port "$WORKTREE_DIR" 2>/dev/null) && [[ -n "$FREED" ]]; then
+        log_success "Freed port $FREED (returned to pool)"
     fi
 fi
 

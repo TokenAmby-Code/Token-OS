@@ -19,8 +19,8 @@ import sys
 from pathlib import Path
 
 from cli_tools.db_query.query_runner import (
-    ENVIRONMENTS,
     ENV_ALIASES,
+    ENVIRONMENTS,
     get_env_config,
     get_password,
     normalize_env,
@@ -122,9 +122,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     # Run verification if requested and migration succeeded
     if verify_sql and result.success and not args.dry_run:
         print("\n  Running verification query...")
-        rows = asyncio.run(
-            run_verify_query(env_config, verify_sql, password, use_connector=True)
-        )
+        rows = asyncio.run(run_verify_query(env_config, verify_sql, password, use_connector=True))
         if rows:
             result.messages.append(f"Verification: {len(rows)} row(s) found")
             for row in rows:

@@ -11,8 +11,8 @@ import platform
 import shlex
 import shutil
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Mapping, Sequence
 
 
 def detect_terminal_emulator() -> str | None:
@@ -155,7 +155,9 @@ def _build_shell_command(command: Sequence[str], working_dir: Path) -> str:
     return f"cd {quoted_cwd} && {shlex.join(list(command))}; exec bash"
 
 
-def _build_wsl_shell_command(command: Sequence[str], working_dir: Path, keep_open: bool = True) -> str:
+def _build_wsl_shell_command(
+    command: Sequence[str], working_dir: Path, keep_open: bool = True
+) -> str:
     wsl_path = _normalize_wsl_unc_path(str(working_dir))
 
     quoted_cwd = shlex.quote(wsl_path)
@@ -282,7 +284,7 @@ def _is_wsl() -> bool:
     if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
         return True
     try:
-        with open("/proc/sys/kernel/osrelease", "r", encoding="utf-8") as handle:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as handle:
             data = handle.read().lower()
             return "microsoft" in data or "wsl" in data
     except OSError:

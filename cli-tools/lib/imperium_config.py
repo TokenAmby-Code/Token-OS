@@ -19,6 +19,7 @@ import sys
 # MACHINE IDENTITY
 # ============================================================
 
+
 def _detect_machine() -> str:
     """Detect machine from env or platform. Matches nas-path.sh logic."""
     env = os.environ.get("IMPERIUM_MACHINE")
@@ -31,6 +32,7 @@ def _detect_machine() -> str:
     if os.path.isdir("/data/data/com.termux"):
         return "phone"
     return "linux"
+
 
 MACHINE = _detect_machine()
 
@@ -76,6 +78,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
 # ============================================================
 # LOOKUP
 # ============================================================
+
 
 def cfg(key: str, machine: str | None = None) -> str:
     """Look up a config value. Defaults to current machine."""

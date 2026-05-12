@@ -155,13 +155,90 @@ api-ping() {
 # Primarch dispatch: uses _primarch_launch (mac .zsh_aliases) or primarch binary (WSL cli-tools)
 # Smart resume: queries token-api if session not found locally
 
+_resolve_codex_dispatch_bin() {
+    local candidate=""
+
+    candidate="$(command -v codex-dispatch 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    for candidate in \
+        "${CLI_TOOLS:-}/bin/codex-dispatch" \
+        "${TOKEN_OS:-}/cli-tools/bin/codex-dispatch" \
+        "${IMPERIUM:-}/Token-OS/cli-tools/bin/codex-dispatch" \
+        "/Volumes/Imperium/Token-OS/cli-tools/bin/codex-dispatch" \
+        "/mnt/imperium/Token-OS/cli-tools/bin/codex-dispatch"
+    do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        echo "$candidate"
+        return 0
+    done
+
+    return 1
+}
+
+_resolve_claude_wrapper_bin() {
+    local candidate=""
+
+    candidate="$(command -v claude-wrapper.sh 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    for candidate in \
+        "${CLI_TOOLS:-}/scripts/claude-wrapper.sh" \
+        "${TOKEN_OS:-}/cli-tools/scripts/claude-wrapper.sh" \
+        "${IMPERIUM:-}/Token-OS/cli-tools/scripts/claude-wrapper.sh" \
+        "/Volumes/Imperium/Token-OS/cli-tools/scripts/claude-wrapper.sh" \
+        "/mnt/imperium/Token-OS/cli-tools/scripts/claude-wrapper.sh"
+    do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        echo "$candidate"
+        return 0
+    done
+
+    return 1
+}
+
+_codex_launch() {
+    local codex_dispatch_bin=""
+    codex_dispatch_bin="$(_resolve_codex_dispatch_bin)" || {
+        echo "codex-dispatch not found" >&2
+        return 1
+    }
+
+    clear
+    "$codex_dispatch_bin" --launcher "shell-aliases" "$PWD" "$@"
+}
+
+_claude_launch() {
+    local claude_wrapper_bin=""
+    claude_wrapper_bin="$(_resolve_claude_wrapper_bin)" || {
+        echo "claude-wrapper.sh not found" >&2
+        return 1
+    }
+
+    clear
+    TOKEN_API_LAUNCHER="${TOKEN_API_LAUNCHER:-shell-aliases}" \
+    TOKEN_API_ENGINE="${TOKEN_API_ENGINE:-claude}" \
+    "$claude_wrapper_bin" --dangerously-skip-permissions "$@"
+}
+
 claude() {
     local primarch=""
     local args=()
     local resume_id=""
+    local use_codex=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --codex)
+                use_codex=true
+                shift
+                ;;
             --primarch|-P)
                 primarch="$2"
                 shift 2
@@ -182,6 +259,15 @@ claude() {
                 ;;
         esac
     done
+
+    if $use_codex; then
+        if [[ -n "$primarch" ]]; then
+            echo "--codex cannot be combined with --primarch" >&2
+            return 1
+        fi
+        _codex_launch "${args[@]}"
+        return
+    fi
 
     # Primarch dispatch — try inline launcher (mac), then CLI binary (WSL)
     if [[ -n "$primarch" ]]; then
@@ -228,7 +314,7 @@ claude() {
         cd "$IMPERIUM/Imperium-ENV"
     fi
 
-    clear && ~/.local/bin/claude --dangerously-skip-permissions "${args[@]}" 2> >(grep -v 'Overriding existing handler for signal' >&2)
+    _claude_launch "${args[@]}"
 }
 
 # cdc — cd + clear + claude
@@ -236,6 +322,8 @@ cdc() {
     local dir="" primarch="" claude_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --codex)
+                claude_args+=("$1"); shift ;;
             -r|--resume|--continue|--haiku)
                 claude_args+=("$1"); shift ;;
             -p|--primarch)
@@ -265,14 +353,26 @@ cc() {
 _c_cleared=true
 c() {
     if [[ $# -gt 0 ]]; then
+        case "$1" in
+            --prompt|--prompt-file)
+                if command -v claude-launcher &>/dev/null; then
+                    claude-launcher "$@"
+                    return
+                fi
+                ;;
+        esac
         claude "$@"
         return
     fi
-    # At $HOME with no args: open interactive launcher
-    if [[ "$PWD" == "$HOME" ]] && command -v claude-launcher &>/dev/null; then
+
+    # First clean invocation opens the launcher from any directory. The launcher
+    # places the current directory at the top of the target list when relevant.
+    if $_c_cleared && command -v claude-launcher &>/dev/null; then
+        _c_cleared=false
         claude-launcher
         return
     fi
+
     if $_c_cleared; then
         _c_cleared=false
         claude
@@ -280,4 +380,9 @@ c() {
         _c_cleared=true
         clear
     fi
+}
+
+TRAPINT() {
+    _c_cleared=false
+    return 128
 }

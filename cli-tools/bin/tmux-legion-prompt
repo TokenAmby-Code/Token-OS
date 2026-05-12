@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# tmux-legion-prompt — Capture a prompt, open a fresh legion pane, and launch via c
+# TAGS: tmux, legion, launcher, prompt
+# AUDIENCE: human
+
+set -euo pipefail
+
+SESSION="${TMUX_LEGION_PROMPT_SESSION:-main}"
+WINDOW="${TMUX_LEGION_PROMPT_WINDOW:-legion}"
+
+log() { printf '%s\n' "$*" >&2; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  tmux-legion-prompt
+  tmux-legion-prompt --prompt "text"
+  tmux-legion-prompt --prompt-file /path/to/prompt
+  tmux-legion-prompt --dry-run --prompt "text"
+
+Opens or uses a prompt, creates a new managed main:legion pane, then sends:
+  cd ~ && c --prompt-file <prompt-file>
+EOF
+}
+
+PROMPT_TEXT=""
+PROMPT_FILE=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prompt)
+            PROMPT_TEXT="$2"
+            shift 2
+            ;;
+        --prompt-file)
+            PROMPT_FILE="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            log "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -n "$PROMPT_FILE" ]]; then
+    if [[ ! -f "$PROMPT_FILE" ]]; then
+        log "Prompt file not found: $PROMPT_FILE"
+        exit 1
+    fi
+elif [[ -n "$PROMPT_TEXT" ]]; then
+    PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/tmux-legion-prompt.XXXXXX")"
+    printf '%s\n' "$PROMPT_TEXT" > "$PROMPT_FILE"
+else
+    PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/tmux-legion-prompt.XXXXXX")"
+    clear
+    IFS= read -r PROMPT_TEXT || exit 130
+    printf '%s\n' "$PROMPT_TEXT" > "$PROMPT_FILE"
+fi
+
+if ! grep -vE '^[[:space:]]*$' "$PROMPT_FILE" >/dev/null; then
+    log "No prompt entered; cancelled."
+    exit 130
+fi
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    log "tmux session not found: $SESSION"
+    exit 1
+fi
+
+if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qE "^${WINDOW}(\([0-9]*\))?$"; then
+    tmux new-window -t "$SESSION" -n "$WINDOW" -d -c "$HOME"
+fi
+
+LEGION_TARGET="${SESSION}:${WINDOW}"
+LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+
+if $DRY_RUN; then
+    log "DRY RUN"
+    log "session: $SESSION"
+    log "window:  $WINDOW"
+    log "prompt:  $PROMPT_FILE"
+    log "command: cd ~ && c --prompt-file '$PROMPT_FILE'"
+    log "layout:  tmuxctl stack add legion + legion focus-selected"
+    exit 0
+fi
+
+PANE_ID="$(PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli stack add legion --session "$SESSION" --cwd "$HOME")"
+tmux select-window -t "$LEGION_TARGET"
+tmux select-pane -t "$PANE_ID"
+PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli legion focus-selected --pane "$PANE_ID" >/dev/null 2>&1 || true
+
+printf -v PROMPT_FILE_Q '%q' "$PROMPT_FILE"
+LAUNCH_CMD="cd ~ && c --prompt-file ${PROMPT_FILE_Q}"
+
+sleep 0.5
+tmux send-keys -t "$PANE_ID" "$LAUNCH_CMD" Enter
+tmux display-message "Legion prompt launched in ${PANE_ID}"

@@ -13,18 +13,18 @@ Does NOT own:
 - Phone/Pavlok enforcement (stays in main.py)
 """
 
-import re
-import sys
-import json
-import time
 import asyncio
 import functools
+import hashlib
+import json
 import logging
+import re
 import subprocess
+import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Deque
 from urllib.parse import quote
 
 import aiosqlite
@@ -32,18 +32,22 @@ import requests
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from instance_mutation import sanctioned_update_instance
 from shared import (
     DB_PATH,
-    log_event,
-    PROFILES,
-    FALLBACK_VOICES,
-    get_next_available_profile,
     DESKTOP_CONFIG,
-    TTS_BACKEND,
-    TTS_GLOBAL_MODE,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
+    FALLBACK_VOICES,
+    PROFILES,
+    TTS_BACKEND,
+    TTS_GLOBAL_MODE,
+    ULTIMATE_FALLBACK,
+    get_next_available_profile,
+    get_quiet_hours_status,
+    is_phone_reachable,
     is_satellite_tts_available,
+    log_event,
 )
 
 logger = logging.getLogger("token_api")
@@ -70,28 +74,38 @@ def init_deps(*, send_to_phone=None):
 
 # ============ Pydantic Models ============
 
+
 class NotifyRequest(BaseModel):
     message: str
-    device_id: Optional[str] = None  # If None, notify based on active instances
-    instance_id: Optional[str] = None  # Notify specific instance's device
-    voice: Optional[str] = None  # Override TTS voice
-    sound: Optional[str] = None  # Override sound file
+    device_id: str | None = None  # If None, notify based on active instances
+    instance_id: str | None = None  # Notify specific instance's device
+    voice: str | None = None  # Override TTS voice
+    sound: str | None = None  # Override sound file
 
 
 class TTSRequest(BaseModel):
     message: str
-    voice: Optional[str] = None
+    voice: str | None = None
     rate: int = 0  # -10 to 10, 0 is normal speed
-    instance_id: Optional[str] = None  # Track which instance triggered TTS
+    instance_id: str | None = None  # Track which instance triggered TTS
 
 
 class SoundRequest(BaseModel):
-    sound_file: Optional[str] = None  # Path to sound file
+    sound_file: str | None = None  # Path to sound file
 
 
 class QueueTTSRequest(BaseModel):
     instance_id: str
     message: str
+    queue_target: str = "pause"  # "hot" or "pause"
+
+
+class PromoteRequest(BaseModel):
+    instance_id: str | None = None  # If set, promote that instance's items
+
+
+class PlayPaneRequest(BaseModel):
+    instance_id: str  # Promote all items from this instance to hot queue
 
 
 # ============ TTS/Notification System ============
@@ -115,11 +129,7 @@ def play_sound(sound_file: str = None) -> dict:
     sound_path = SOUND_MAP.get(sound_name, SOUND_MAP["chimes.wav"])
 
     try:
-        result = subprocess.run(
-            ["afplay", sound_path],
-            capture_output=True,
-            timeout=10
-        )
+        result = subprocess.run(["afplay", sound_path], capture_output=True, timeout=10)
         if result.returncode == 0:
             return {"success": True, "method": "afplay", "file": sound_path}
         return {"success": False, "error": f"afplay failed: {result.stderr.decode()[:100]}"}
@@ -136,66 +146,66 @@ def clean_markdown_for_tts(text: str) -> str:
     like table separators ("pipe dash dash dash") or headers ("hash hash").
     """
     # Unicode arrows/symbols that TTS mispronounces
-    text = text.replace('\u2192', ' to ')
-    text = text.replace('\u2190', ' from ')
-    text = text.replace('\u2194', ' both ways ')
-    text = text.replace('\u21d2', ' implies ')
-    text = text.replace('\u21d0', ' implied by ')
-    text = text.replace('\u279c', ' to ')
-    text = text.replace('\u2794', ' to ')
-    text = text.replace('\u2022', ',')  # Bullet point
-    text = text.replace('\u2026', '...')  # Ellipsis
-    text = text.replace('\u2014', ', ')  # Em dash
-    text = text.replace('\u2013', ', ')  # En dash
+    text = text.replace("\u2192", " to ")
+    text = text.replace("\u2190", " from ")
+    text = text.replace("\u2194", " both ways ")
+    text = text.replace("\u21d2", " implies ")
+    text = text.replace("\u21d0", " implied by ")
+    text = text.replace("\u279c", " to ")
+    text = text.replace("\u2794", " to ")
+    text = text.replace("\u2022", ",")  # Bullet point
+    text = text.replace("\u2026", "...")  # Ellipsis
+    text = text.replace("\u2014", ", ")  # Em dash
+    text = text.replace("\u2013", ", ")  # En dash
 
     # Remove backslashes that might be read aloud
-    text = text.replace('\\', ' ')
+    text = text.replace("\\", " ")
 
     # Path compression - replace long paths with friendly names
     path_replacements = [
-        ('~/.claude/', ''),
-        ('~/', ''),
+        ("~/.claude/", ""),
+        ("~/", ""),
     ]
     for path, replacement in path_replacements:
         text = text.replace(path, replacement)
 
     # Table separators: |---|---| or |:---:|:---:| → remove entirely
-    text = re.sub(r'\|[-:]+\|[-:|\s]+', '', text)  # Table separator rows
+    text = re.sub(r"\|[-:]+\|[-:|\s]+", "", text)  # Table separator rows
 
     # Remove remaining markdown separators (---) on their own line
-    text = re.sub(r'^-{3,}$', '', text, flags=re.MULTILINE)  # Horizontal rules
+    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)  # Horizontal rules
 
     # Headers: ## Title → Title (strip # sequences followed by space)
-    text = re.sub(r'#{1,6}\s+', '', text)
+    text = re.sub(r"#{1,6}\s+", "", text)
 
     # Bold/italic: **text** or *text* or __text__ or _text_ → text
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # Bold
-    text = re.sub(r'\*(.+?)\*', r'\1', text)       # Italic
-    text = re.sub(r'__(.+?)__', r'\1', text)       # Bold alt
-    text = re.sub(r'_(.+?)_', r'\1', text)         # Italic alt
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # Bold
+    text = re.sub(r"\*(.+?)\*", r"\1", text)  # Italic
+    text = re.sub(r"__(.+?)__", r"\1", text)  # Bold alt
+    text = re.sub(r"_(.+?)_", r"\1", text)  # Italic alt
 
     # Code blocks: ```...``` → [code block]
-    text = re.sub(r'```[\s\S]*?```', '[code block]', text)
+    text = re.sub(r"```[\s\S]*?```", "[code block]", text)
 
     # Inline code: `code` → code
-    text = re.sub(r'`([^`]+)`', r'\1', text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
 
     # Links: [text](url) → text
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
 
     # Bullet points: - item or * item → item
-    text = re.sub(r'^[\-\*]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r"^[\-\*]\s+", "", text, flags=re.MULTILINE)
 
     # Numbered lists: 1. item → item
-    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
 
     # Table pipes: | cell | cell | → cell, cell
-    text = re.sub(r'\|', ', ', text)
+    text = re.sub(r"\|", ", ", text)
 
     # Clean up multiple spaces/newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r'  +', ' ', text)
-    text = re.sub(r', ,', ',', text)  # Clean double commas from empty cells
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"  +", " ", text)
+    text = re.sub(r", ,", ",", text)  # Clean double commas from empty cells
 
     return text.strip()
 
@@ -218,7 +228,7 @@ def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
         process = subprocess.Popen(
             ["say", "-v", voice, "-r", str(wpm), message],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
         tts_current_process = process
         process.wait(timeout=300)
@@ -261,14 +271,42 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
         resp = requests.post(
             f"http://{host}:{port}{endpoint}",
             json=payload,
-            timeout=300  # Long timeout — blocks until speech/playback done
+            timeout=300,  # Long timeout — blocks until speech/playback done
         )
         TTS_BACKEND["current"] = None
 
         if resp.status_code == 200:
             data = resp.json()
             method = "skipped" if data.get("skipped") else data.get("method", "wsl_sapi")
-            return {"success": data.get("success", False), "method": method, "voice": voice, "message": message[:50]}
+            expected_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            rendered_hash = data.get("rendered_hash")
+            if data.get("success") and not data.get("skipped") and not rendered_hash:
+                return {
+                    "success": False,
+                    "error": "satellite_missing_text_integrity_ack",
+                    "method": method,
+                    "voice": voice,
+                    "message_chars": len(message),
+                }
+            if data.get("success") and rendered_hash and rendered_hash != expected_hash:
+                return {
+                    "success": False,
+                    "error": "satellite_text_integrity_check_failed",
+                    "method": method,
+                    "voice": voice,
+                    "message_chars": len(message),
+                    "rendered_chars": data.get("rendered_chars"),
+                }
+            return {
+                "success": data.get("success", False),
+                "method": method,
+                "voice": voice,
+                "message": message[:50],
+                "message_chars": len(message),
+                "rendered_chars": data.get("rendered_chars"),
+                "rendered_hash": rendered_hash,
+                "transport": data.get("transport"),
+            }
         elif resp.status_code == 409:
             return {"success": False, "error": "satellite_busy"}
         else:
@@ -293,7 +331,7 @@ def _get_discord_voice_bot() -> str | None:
     """
     now = time.time()
     cache = _get_discord_voice_bot
-    if hasattr(cache, '_result') and now - cache._checked < 5:
+    if hasattr(cache, "_result") and now - cache._checked < 5:
         return cache._result
 
     try:
@@ -328,7 +366,13 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
         if resp.status_code == 200:
             data = resp.json()
             if data.get("played"):
-                return {"success": True, "method": "discord_voice", "bot": bot_name, "voice": mac_voice, "message": message[:50]}
+                return {
+                    "success": True,
+                    "method": "discord_voice",
+                    "bot": bot_name,
+                    "voice": mac_voice,
+                    "message": message[:50],
+                }
         return {"success": False, "error": f"Discord TTS returned {resp.status_code}"}
     except requests.Timeout:
         return {"success": False, "error": "discord_tts_timeout"}
@@ -337,14 +381,74 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
         return {"success": False, "error": str(e)}
 
 
-def speak_tts(message: str, voice: str = None, rate: int = 0,
-              instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None,
-              use_file_playback: bool = False) -> dict:
-    """Route TTS to Discord voice (if operator in VC), WSL satellite, or Mac fallback.
+def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
+    """Determine which device should receive TTS output.
 
-    Priority: Discord voice > WSL satellite > Mac local.
-    Discord override is automatic — if operator is in any voice channel, TTS plays there.
-    This makes TTS device-agnostic: audio follows the listener, not the machine.
+    Priority cascade:
+    1. Discord voice — if any bot is connected to a VC
+    2. Geofence — if user is away from home, phone only (skip WSL/Mac)
+    3. WSL satellite — if satellite is healthy
+    4. Phone — if reachable
+    5. Mac — last resort, local speakers
+
+    Returns:
+        {"device": "discord"|"wsl"|"phone"|"mac", "reason": str, "discord_bot": str|None}
+    """
+    # 1. Discord voice channel — operator in VC means audio goes there
+    discord_bot = _get_discord_voice_bot()
+    if discord_bot:
+        return {
+            "device": "discord",
+            "reason": "operator in voice channel",
+            "discord_bot": discord_bot,
+        }
+
+    # 2. Geofence — away from home means phone-only
+    location_zone = DESKTOP_STATE.get("location_zone")
+    if location_zone is not None and location_zone != "home":
+        # User is at gym, campus, or other known zone — phone is the only option
+        if is_phone_reachable():
+            return {"device": "phone", "reason": f"geofence: {location_zone}", "discord_bot": None}
+        # Phone unreachable while away — Mac as last resort (shouldn't happen often)
+        return {
+            "device": "mac",
+            "reason": f"geofence: {location_zone}, phone unreachable",
+            "discord_bot": None,
+        }
+
+    # 3. WSL satellite — best audio quality when at home.
+    # Route to WSL whenever the satellite is healthy; speak_tts() will
+    # substitute a default voice if the caller didn't provide one. Gating
+    # on wsl_voice here used to silently demote every voice-less call
+    # (e.g. /api/notify/tts) to phone, contradicting the "WSL first" doctrine.
+    if is_satellite_tts_available():
+        return {"device": "wsl", "reason": "satellite healthy", "discord_bot": None}
+
+    # 4. Phone — reachable as secondary home device
+    if is_phone_reachable():
+        return {
+            "device": "phone",
+            "reason": "wsl unavailable, phone reachable",
+            "discord_bot": None,
+        }
+
+    # 5. Mac — local speakers as last resort
+    return {"device": "mac", "reason": "last resort, local speakers", "discord_bot": None}
+
+
+def speak_tts(
+    message: str,
+    voice: str = None,
+    rate: int = 0,
+    instance_id: str = None,
+    wsl_voice: str = None,
+    wsl_rate: int = None,
+    use_file_playback: bool = False,
+) -> dict:
+    """Route TTS to the best available device via resolve_tts_device().
+
+    Dispatches to speak_tts_discord(), speak_tts_wsl(), speak_tts_mac(), or phone
+    notification based on the resolved device. Falls through on failure.
 
     Args:
         message: Text to speak
@@ -361,59 +465,133 @@ def speak_tts(message: str, voice: str = None, rate: int = 0,
     # Clean markdown syntax for natural TTS output
     message = clean_markdown_for_tts(message)
 
-    # Discord voice override: if operator is in a VC, route all TTS there
-    discord_bot = _get_discord_voice_bot()
-    if discord_bot:
-        result = speak_tts_discord(message, discord_bot, voice, rate)
+    routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
+    device = routing["device"]
+    logger.info(f"TTS: Routing to {device} ({routing['reason']})")
+
+    # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
+    # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
+    if device == "wsl" and not wsl_voice:
+        wsl_voice = ULTIMATE_FALLBACK["wsl_voice"]
+        if wsl_rate is None:
+            wsl_rate = ULTIMATE_FALLBACK.get("wsl_rate", 0)
+
+    # Dispatch with fallthrough on failure
+    if device == "discord":
+        result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
             return result
-        logger.info(f"TTS: Discord failed ({result.get('error')}), falling back to local")
+        logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
+        # Re-resolve skipping discord — try WSL/phone/mac
+        if is_satellite_tts_available():
+            fallthrough_voice = wsl_voice or ULTIMATE_FALLBACK["wsl_voice"]
+            fallthrough_rate = (
+                wsl_rate if wsl_rate is not None else ULTIMATE_FALLBACK.get("wsl_rate", 0)
+            )
+            result = speak_tts_wsl(
+                message, fallthrough_voice, fallthrough_rate, use_file_playback=use_file_playback
+            )
+            if result.get("success"):
+                return result
+        if is_phone_reachable() and _send_to_phone:
+            result = _send_to_phone("/notify", {"tts_text": message})
+            if result.get("success"):
+                return result
+        return speak_tts_mac(message, voice, rate)
 
-    # Try WSL first if voice available and satellite is up
-    if wsl_voice and is_satellite_tts_available():
-        result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0,
-                               use_file_playback=use_file_playback)
+    if device == "wsl":
+        result = speak_tts_wsl(
+            message,
+            wsl_voice,
+            wsl_rate if wsl_rate is not None else 0,
+            use_file_playback=use_file_playback,
+        )
         if result.get("success"):
             return result
-        # Any WSL failure → fallback to Mac
-        logger.info(f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})")
+        logger.info(
+            f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})"
+        )
+        return speak_tts_mac(message, voice, rate)
 
+    if device == "phone":
+        if _send_to_phone:
+            result = _send_to_phone("/notify", {"tts_text": message})
+            if result.get("success"):
+                return result
+            logger.info(f"TTS: Phone failed ({result.get('error')}), falling back to Mac")
+        return speak_tts_mac(message, voice, rate)
+
+    # device == "mac" (or unknown)
     return speak_tts_mac(message, voice, rate)
 
 
 # ============ TTS Queue System ============
 # Ensures TTS messages don't overlap - each plays sequentially
 
+
 @dataclass
 class TTSQueueItem:
     """Item in the TTS queue."""
+
     instance_id: str
     message: str
     voice: str
     sound: str
     tab_name: str
+    queue_target: str = "pause"  # "hot" or "pause"
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
+    tmux_pane: str | None = None  # pane ID for @TTS_STATE tracking
 
-# Global TTS queue state
-tts_queue: Deque[TTSQueueItem] = deque()
-tts_current: Optional[TTSQueueItem] = None
-tts_current_process: Optional[subprocess.Popen] = None  # Current TTS/sound process for skip support
+
+# Global TTS queue state — two-queue model
+# Hot queue: auto-plays immediately (VC/sync sessions, promoted items)
+# Pause queue: accumulates silently, requires explicit promote to play
+hot_queue: deque[TTSQueueItem] = deque()
+pause_queue: deque[TTSQueueItem] = deque()
+tts_current: TTSQueueItem | None = None
+tts_current_process: subprocess.Popen | None = None  # Current TTS/sound process for skip support
 tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. actual failure)
 tts_queue_lock = asyncio.Lock()
-tts_worker_task: Optional[asyncio.Task] = None
+tts_worker_task: asyncio.Task | None = None
+
+
+def _set_tts_state(pane_id: str | None, state: str):
+    """Set @TTS_STATE on a tmux pane. Fire-and-forget."""
+    if not pane_id:
+        return
+    try:
+        if state:
+            subprocess.run(
+                ["tmux", "set-option", "-p", "-t", pane_id, "@TTS_STATE", state],
+                capture_output=True,
+                timeout=2,
+            )
+        else:
+            subprocess.run(
+                ["tmux", "set-option", "-p", "-u", "-t", pane_id, "@TTS_STATE"],
+                capture_output=True,
+                timeout=2,
+            )
+    except Exception:
+        pass  # fire and forget
 
 
 async def tts_queue_worker():
-    """Background worker that processes TTS queue sequentially."""
+    """Background worker that processes TTS hot queue sequentially.
+
+    Only drains from hot_queue. Pause queue items must be promoted to hot
+    queue via /api/tts/queue/promote or /api/tts/queue/play-pane before
+    they will play.
+    """
     global tts_current
 
     while True:
         try:
-            # Wait for items in queue
+            # Wait for items in hot queue
             async with tts_queue_lock:
-                if tts_queue:
-                    tts_current = tts_queue.popleft()
+                if hot_queue:
+                    tts_current = hot_queue.popleft()
                 else:
                     tts_current = None
 
@@ -425,9 +603,12 @@ async def tts_queue_worker():
                     details={
                         "message": tts_current.message[:100],
                         "voice": tts_current.voice,
-                        "tab_name": tts_current.tab_name
-                    }
+                        "tab_name": tts_current.tab_name,
+                    },
                 )
+
+                # Set @TTS_STATE on source pane
+                _set_tts_state(tts_current.tmux_pane, "speaking")
 
                 # Play notification sound first (run in executor to not block event loop)
                 sound_result = None
@@ -453,14 +634,22 @@ async def tts_queue_worker():
 
                     # Speak the message (run in executor to allow skip API to interrupt)
                     # Queue items use file-based playback for transport controls (pause/resume/speed)
-                    logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice}, file_playback=True)")
+                    logger.info(
+                        f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice}, file_playback=True)"
+                    )
                     loop = asyncio.get_event_loop()
                     tts_result = await loop.run_in_executor(
-                        None, functools.partial(
-                            speak_tts, tts_current.message, mac_voice,
-                            0, tts_current.instance_id, wsl_voice, wsl_rate,
-                            use_file_playback=True
-                        )
+                        None,
+                        functools.partial(
+                            speak_tts,
+                            tts_current.message,
+                            mac_voice,
+                            0,
+                            tts_current.instance_id,
+                            wsl_voice,
+                            wsl_rate,
+                            use_file_playback=True,
+                        ),
                     )
                     logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
@@ -473,8 +662,8 @@ async def tts_queue_worker():
                                 instance_id=tts_current.instance_id,
                                 details={
                                     "message": tts_current.message[:50],
-                                    "voice": tts_current.voice
-                                }
+                                    "voice": tts_current.voice,
+                                },
                             )
                         else:
                             await log_event(
@@ -482,11 +671,13 @@ async def tts_queue_worker():
                                 instance_id=tts_current.instance_id,
                                 details={
                                     "message": tts_current.message[:50],
-                                    "voice": tts_current.voice
-                                }
+                                    "voice": tts_current.voice,
+                                },
                             )
                     else:
-                        logger.error(f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}")
+                        logger.error(
+                            f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}"
+                        )
                         await log_event(
                             "tts_failed",
                             instance_id=tts_current.instance_id,
@@ -494,12 +685,14 @@ async def tts_queue_worker():
                                 "message": tts_current.message[:50],
                                 "voice": tts_current.voice,
                                 "error": tts_result.get("error", "Unknown error"),
-                                "sound_result": sound_result
-                            }
+                                "sound_result": sound_result,
+                            },
                         )
                 else:
                     logger.info(f"TTS worker: muted mode, sound only for {tts_current.instance_id}")
 
+                # Clear @TTS_STATE on source pane
+                _set_tts_state(tts_current.tmux_pane, "")
                 tts_current = None
                 await asyncio.sleep(0.5)  # Brief pause between items
             else:
@@ -513,14 +706,21 @@ async def tts_queue_worker():
 
 # ============ TTS Helpers ============
 
-def _is_quiet_hours() -> bool:
-    """Return True if current time is in quiet hours (11 PM - 9 AM). No TTS during sleep."""
-    hour = datetime.now().hour
-    return hour >= 23 or hour < 9
+
+def _is_quiet_hours(now: datetime | None = None) -> bool:
+    """Return True when TTS/sound should be suppressed for quiet hours."""
+    return bool(get_quiet_hours_status(now).get("active"))
 
 
-async def queue_tts(instance_id: str, message: str) -> dict:
-    """Queue a TTS message for an instance, using their profile's voice/sound."""
+async def queue_tts(instance_id: str, message: str, queue_target: str = "pause") -> dict:
+    """Queue a TTS message for an instance, using their profile's voice/sound.
+
+    Args:
+        instance_id: The instance ID that triggered TTS.
+        message: The text to speak.
+        queue_target: "hot" for immediate playback (VC/sync sessions),
+                      "pause" for silent accumulation (default).
+    """
     # Silence TTS during quiet hours (11 PM - 9 AM)
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
@@ -535,8 +735,8 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT tab_name, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
-            (instance_id,)
+            "SELECT tab_name, tts_voice, notification_sound, tts_mode, tmux_pane FROM claude_instances WHERE id = ?",
+            (instance_id,),
         )
         row = await cursor.fetchone()
 
@@ -546,12 +746,15 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     voice = row["tts_voice"] or "Microsoft David"
     sound = row["notification_sound"] or "chimes.wav"
     tab_name = row["tab_name"] or instance_id
+    tmux_pane = row["tmux_pane"] if "tmux_pane" in row.keys() else None
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
-    # voice-chat behaves like verbose for TTS purposes
-    if instance_mode == "voice-chat":
+    # voice-chat forces hot queue — it's an active session
+    is_voice_chat = instance_mode == "voice-chat"
+    if is_voice_chat:
         instance_mode = "verbose"
+        queue_target = "hot"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose
     mode_rank = {"verbose": 0, "muted": 1, "silent": 2}
@@ -568,7 +771,9 @@ async def queue_tts(instance_id: str, message: str) -> dict:
             message="",  # Empty message = no speech
             voice=voice,
             sound=sound,
-            tab_name=tab_name
+            tab_name=tab_name,
+            queue_target=queue_target,
+            tmux_pane=tmux_pane,
         )
     else:
         item = TTSQueueItem(
@@ -576,12 +781,18 @@ async def queue_tts(instance_id: str, message: str) -> dict:
             message=message,
             voice=voice,
             sound=sound,
-            tab_name=tab_name
+            tab_name=tab_name,
+            queue_target=queue_target,
+            tmux_pane=tmux_pane,
         )
 
     async with tts_queue_lock:
-        tts_queue.append(item)
-        position = len(tts_queue)
+        if queue_target == "hot":
+            hot_queue.append(item)
+            position = len(hot_queue)
+        else:
+            pause_queue.append(item)
+            position = len(pause_queue)
 
     # Log queued event
     await log_event(
@@ -590,44 +801,66 @@ async def queue_tts(instance_id: str, message: str) -> dict:
         details={
             "message": message[:100],
             "voice": voice,
-            "position": position
-        }
+            "position": position,
+            "queue": queue_target,
+        },
     )
+
+    # Chime notification for pause queue arrivals so user knows something landed
+    if queue_target == "pause":
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, play_sound, "chimes.wav")
+        except Exception:
+            pass
 
     return {
         "success": True,
         "queued": True,
         "position": position,
+        "queue": queue_target,
         "voice": voice,
-        "sound": sound
+        "sound": sound,
+    }
+
+
+def _queue_item_to_dict(item: TTSQueueItem) -> dict:
+    """Serialize a TTSQueueItem for API responses."""
+    return {
+        "instance_id": item.instance_id,
+        "tab_name": item.tab_name,
+        "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
+        "voice": item.voice,
+        "queue": item.queue_target,
+        "queued_at": item.queued_at.isoformat(),
     }
 
 
 def get_tts_queue_status() -> dict:
     """Get current TTS queue status for dashboard."""
-    queue_list = []
-    for item in tts_queue:
-        queue_list.append({
-            "instance_id": item.instance_id,
-            "tab_name": item.tab_name,
-            "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
-            "voice": item.voice,
-            "queued_at": item.queued_at.isoformat()
-        })
+    hot_list = [_queue_item_to_dict(item) for item in hot_queue]
+    pause_list = [_queue_item_to_dict(item) for item in pause_queue]
 
     current = None
     if tts_current:
         current = {
             "instance_id": tts_current.instance_id,
             "tab_name": tts_current.tab_name,
-            "message": tts_current.message[:50] + "..." if len(tts_current.message) > 50 else tts_current.message,
-            "voice": tts_current.voice
+            "message": tts_current.message[:50] + "..."
+            if len(tts_current.message) > 50
+            else tts_current.message,
+            "voice": tts_current.voice,
         }
 
     return {
         "current": current,
-        "queue": queue_list,
-        "queue_length": len(queue_list),
+        "hot_queue": hot_list,
+        "hot_queue_length": len(hot_list),
+        "pause_queue": pause_list,
+        "pause_queue_length": len(pause_list),
+        # Backward compat: "queue" = combined, "queue_length" = total
+        "queue": hot_list + pause_list,
+        "queue_length": len(hot_list) + len(pause_list),
         "backend": TTS_BACKEND["current"],
         "satellite_available": TTS_BACKEND["satellite_available"],
         "global_mode": TTS_GLOBAL_MODE["mode"],
@@ -660,8 +893,9 @@ async def skip_tts(clear_queue: bool = False) -> dict:
         port = DESKTOP_CONFIG["port"]
         try:
             # First try stopping file playback (WMP)
-            resp = requests.post(f"http://{host}:{port}/tts/control",
-                                 json={"command": "stop"}, timeout=3)
+            resp = requests.post(
+                f"http://{host}:{port}/tts/control", json={"command": "stop"}, timeout=3
+            )
             if resp.status_code == 200:
                 result["skipped"] = True
                 logger.info("TTS skip routed to WSL satellite (file playback stop)")
@@ -688,13 +922,19 @@ async def skip_tts(clear_queue: bool = False) -> dict:
 
     # else: nothing playing, no-op
 
-    # Clear queue if requested
+    # Clear both queues if requested
     if clear_queue:
         async with tts_queue_lock:
-            result["cleared"] = len(tts_queue)
-            tts_queue.clear()
-            if result["cleared"] > 0:
-                logger.info(f"Cleared {result['cleared']} items from TTS queue")
+            cleared = len(hot_queue) + len(pause_queue)
+            hot_queue.clear()
+            pause_queue.clear()
+            result["cleared"] = cleared
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} items from TTS queues (hot + pause)")
+
+    # Clear @TTS_STATE if we skipped the current item
+    if result["skipped"] and tts_current:
+        _set_tts_state(tts_current.tmux_pane, "")
 
     return result
 
@@ -709,7 +949,7 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
         "type": "notification",
         "message": message,
         "timestamp": datetime.now().isoformat(),
-        **(data or {})
+        **(data or {}),
     }
 
     # Append message as query param so MacroDroid {http_query_string} picks it up
@@ -719,16 +959,21 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
     try:
         result = subprocess.run(
             [
-                "curl", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "-d", json.dumps(payload),
-                "--connect-timeout", "5",
+                "curl",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps(payload),
+                "--connect-timeout",
+                "5",
                 "-s",
-                url_with_params
+                url_with_params,
             ],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
         )
 
         if result.returncode == 0:
@@ -739,6 +984,32 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
 
 
 # ============ TTS Endpoints ============
+
+
+@router.get("/api/tts/routing")
+async def get_tts_routing():
+    """Return the current TTS routing target and reasoning.
+
+    Useful for debugging and TUI display — shows which device would
+    receive TTS right now and why.
+    """
+    routing = resolve_tts_device()
+    location_zone = DESKTOP_STATE.get("location_zone")
+    in_meeting = DESKTOP_STATE.get("in_meeting", False)
+    global_mode = TTS_GLOBAL_MODE.get("mode", "verbose")
+
+    return {
+        "routing": routing,
+        "context": {
+            "location_zone": location_zone,
+            "in_meeting": in_meeting,
+            "global_mode": global_mode,
+            "satellite_available": is_satellite_tts_available(),
+            "phone_reachable": is_phone_reachable(),
+            "discord_vc_active": routing["device"] == "discord",
+        },
+    }
+
 
 @router.post("/api/notify")
 async def send_notification(request: NotifyRequest):
@@ -753,8 +1024,7 @@ async def send_notification(request: NotifyRequest):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT device_id FROM claude_instances WHERE id = ?",
-                (request.instance_id,)
+                "SELECT device_id FROM claude_instances WHERE id = ?", (request.instance_id,)
             )
             row = await cursor.fetchone()
             if row:
@@ -766,10 +1036,7 @@ async def send_notification(request: NotifyRequest):
     # Get device config
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM devices WHERE id = ?",
-            (device_id,)
-        )
+        cursor = await db.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
         device = await cursor.fetchone()
 
     if not device:
@@ -790,7 +1057,7 @@ async def send_notification(request: NotifyRequest):
                 "tts_starting",
                 instance_id=request.instance_id,
                 device_id=device_id,
-                details={"message": request.message[:100], "voice": request.voice or "default"}
+                details={"message": request.message[:100], "voice": request.voice or "default"},
             )
             results["sound"] = play_sound(request.sound)
             results["tts"] = speak_tts(request.message, request.voice)
@@ -810,14 +1077,10 @@ async def send_notification(request: NotifyRequest):
     await log_event(
         "notification_sent",
         device_id=device_id,
-        details={"message": request.message[:100], "results": results}
+        details={"message": request.message[:100], "results": results},
     )
 
-    return {
-        "device_id": device_id,
-        "method": method,
-        "results": results
-    }
+    return {"device_id": device_id, "method": method, "results": results}
 
 
 @router.post("/api/notify/tts")
@@ -839,8 +1102,7 @@ async def notify_tts(request: TTSRequest):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE id = ?",
-                (request.instance_id,)
+                "SELECT tts_voice FROM claude_instances WHERE id = ?", (request.instance_id,)
             )
             row = await cursor.fetchone()
         if row and row["tts_voice"]:
@@ -856,23 +1118,29 @@ async def notify_tts(request: TTSRequest):
     await log_event(
         "tts_starting",
         instance_id=request.instance_id,
-        details={"message": request.message[:100], "voice": wsl_voice or voice or "default"}
+        details={"message": request.message[:100], "voice": wsl_voice or voice or "default"},
     )
 
     # Run in executor to allow skip API to interrupt
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
-        None, functools.partial(
-            speak_tts, request.message, voice, request.rate,
-            request.instance_id, wsl_voice, wsl_rate
-        )
+        None,
+        functools.partial(
+            speak_tts,
+            request.message,
+            voice,
+            request.rate,
+            request.instance_id,
+            wsl_voice,
+            wsl_rate,
+        ),
     )
 
     # Log TTS result
     await log_event(
         "tts_completed",
         instance_id=request.instance_id,
-        details={"message": request.message[:50], "success": result.get("success", False)}
+        details={"message": request.message[:50], "success": result.get("success", False)},
     )
 
     return result
@@ -887,10 +1155,7 @@ async def notify_sound(request: SoundRequest):
 
     result = play_sound(request.sound_file)
 
-    await log_event(
-        "sound_played",
-        details={"file": request.sound_file, "result": result}
-    )
+    await log_event("sound_played", details={"file": request.sound_file, "result": result})
 
     return result
 
@@ -902,13 +1167,63 @@ async def queue_tts_message(request: QueueTTSRequest):
     Messages are played sequentially - if another TTS is playing, this will queue.
     Returns the queue position.
     """
-    return await queue_tts(request.instance_id, request.message)
+    return await queue_tts(request.instance_id, request.message, queue_target=request.queue_target)
 
 
 @router.get("/api/notify/queue/status")
 async def get_queue_status():
     """Get current TTS queue status."""
     return get_tts_queue_status()
+
+
+@router.post("/api/tts/queue/promote")
+async def promote_from_pause(request: PromoteRequest):
+    """Move item(s) from pause queue to the front of hot queue.
+
+    Body: {} → promotes the next item.
+    Body: {"instance_id": "xxx"} → promotes all items from that instance.
+    """
+    promoted = 0
+    async with tts_queue_lock:
+        if not pause_queue:
+            return {"success": True, "promoted": 0, "reason": "pause_queue_empty"}
+
+        if request.instance_id:
+            # Promote all items from this instance
+            to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
+            for item in to_promote:
+                pause_queue.remove(item)
+                item.queue_target = "hot"
+                hot_queue.appendleft(item)
+                promoted += 1
+        else:
+            # Promote the next (oldest) item
+            item = pause_queue.popleft()
+            item.queue_target = "hot"
+            hot_queue.appendleft(item)
+            promoted = 1
+
+    logger.info(f"Promoted {promoted} item(s) from pause to hot queue")
+    return {"success": True, "promoted": promoted}
+
+
+@router.post("/api/tts/queue/play-pane")
+async def play_pane(request: PlayPaneRequest):
+    """Promote all items from a specific instance to the front of hot queue.
+
+    Equivalent to promote with instance_id, provided as a convenience endpoint.
+    """
+    promoted = 0
+    async with tts_queue_lock:
+        to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
+        for item in to_promote:
+            pause_queue.remove(item)
+            item.queue_target = "hot"
+            hot_queue.appendleft(item)
+            promoted += 1
+
+    logger.info(f"play-pane: Promoted {promoted} item(s) for {request.instance_id} to hot queue")
+    return {"success": True, "promoted": promoted, "instance_id": request.instance_id}
 
 
 @router.post("/api/tts/skip")
@@ -940,11 +1255,19 @@ async def set_global_tts_mode(request: Request):
     # Update all active instances to match
     async with aiosqlite.connect(DB_PATH) as db:
         if mode == "silent":
-            # Release all voice slots for non-subagent active instances
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE status IN ('processing', 'idle') AND is_subagent = 0",
-                (mode,)
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
             )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={"tts_mode": mode, "tts_voice": None, "notification_sound": None},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
+                )
         elif mode == "verbose" and old_mode == "silent":
             # Re-assign voices to all active instances that lost theirs
             cursor = await db.execute(
@@ -954,17 +1277,33 @@ async def set_global_tts_mode(request: Request):
             used_voices = set()
             for row in rows:
                 profile, _ = get_next_available_profile(used_voices)
-                await db.execute(
-                    "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
-                    (mode, profile["wsl_voice"], profile["notification_sound"], row[0])
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={
+                        "tts_mode": mode,
+                        "tts_voice": profile["wsl_voice"],
+                        "notification_sound": profile["notification_sound"],
+                    },
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
                 )
                 used_voices.add(profile["wsl_voice"])
         else:
-            # muted or verbose (voices already assigned)
-            await db.execute(
-                "UPDATE claude_instances SET tts_mode = ? WHERE status IN ('processing', 'idle') AND is_subagent = 0",
-                (mode,)
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
             )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=row[0],
+                    updates={"tts_mode": mode},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="tts-global-mode",
+                )
         await db.commit()
 
     await log_event("tts_global_mode_changed", details={"mode": mode, "old_mode": old_mode})
@@ -977,8 +1316,4 @@ async def test_notification():
     sound_result = play_sound()
     tts_result = speak_tts("Token API notification test")
 
-    return {
-        "sound": sound_result,
-        "tts": tts_result,
-        "message": "Test notification sent"
-    }
+    return {"sound": sound_result, "tts": tts_result, "message": "Test notification sent"}

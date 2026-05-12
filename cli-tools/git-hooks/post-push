@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# post-push — local git hook installed per-worktree by worktree-setup.
+#
+# Git does not natively fire a post-push hook, so this script is invoked
+# explicitly by a wrapper alias. To install:
+#   - worktree-setup writes this file to .git/hooks/post-push (chmod +x)
+#   - shell wrapper (alias gp='git push "$@" && .git/hooks/post-push') runs it
+#     after a successful push, OR a `pre-push` hook in the same dir invokes it
+#     in its exit trap.
+#
+# Behavior:
+#   - Sources .worktree.env to learn $PORT (and optional $DEV_CMD)
+#   - Hot-restarts the local dev server bound to that port
+#   - Verifies a /health probe returns 2xx within a timeout
+#
+# Designed to fail loudly but never block the push (push already happened).
+
+set -uo pipefail
+
+WORKTREE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+[[ -z "$WORKTREE_ROOT" ]] && { echo "post-push: not in a git worktree, skipping"; exit 0; }
+
+ENV_FILE="$WORKTREE_ROOT/.worktree.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "post-push: no .worktree.env in $WORKTREE_ROOT — skipping"
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+if [[ -z "${PORT:-}" ]]; then
+    echo "post-push: PORT not set in $ENV_FILE — skipping"
+    exit 0
+fi
+
+# Default dev command per project — override by setting DEV_CMD in .worktree.env.
+DEV_CMD="${DEV_CMD:-}"
+if [[ -z "$DEV_CMD" ]]; then
+    if [[ -f "$WORKTREE_ROOT/token-api/main.py" ]]; then
+        DEV_CMD="cd token-api && uv run uvicorn main:app --host 127.0.0.1 --port \$PORT --reload"
+    elif [[ -f "$WORKTREE_ROOT/package.json" ]]; then
+        DEV_CMD="npm run dev -- --port \$PORT"
+    else
+        echo "post-push: no DEV_CMD configured and no default detected — skipping"
+        exit 0
+    fi
+fi
+
+LOG_FILE="$WORKTREE_ROOT/.worktree-dev.log"
+PID_FILE="$WORKTREE_ROOT/.worktree-dev.pid"
+
+# Stop existing server if any.
+if [[ -f "$PID_FILE" ]]; then
+    OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "post-push: stopping previous dev server (pid $OLD_PID)"
+        kill -INT "$OLD_PID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$OLD_PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+fi
+
+# Also reap anything else still bound to the port.
+if command -v lsof &>/dev/null; then
+    STRAY=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    [[ -n "$STRAY" ]] && kill -KILL $STRAY 2>/dev/null || true
+fi
+
+echo "post-push: starting dev server on :$PORT"
+cd "$WORKTREE_ROOT"
+PORT="$PORT" nohup bash -c "$DEV_CMD" >"$LOG_FILE" 2>&1 &
+NEW_PID=$!
+echo "$NEW_PID" > "$PID_FILE"
+echo "post-push: dev server pid=$NEW_PID, log=$LOG_FILE"
+
+# Health probe (best-effort).
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null \
+        || curl -fsS -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
+        echo "post-push: dev server healthy on :$PORT"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "post-push: dev server didn't respond within 10s — check $LOG_FILE"
+exit 0  # never block the push
