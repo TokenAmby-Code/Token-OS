@@ -203,18 +203,34 @@ def focus_selected(adapter: TmuxAdapter, pane: str) -> str:
     if selected.role == spec.orchestrator_role:
         return f"noop legion focus {pane}: custodes"
 
-    return enforce_stack_layout(adapter, target, focused_pane=pane)
+    return enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
 
 
-def enforce_legion_layout(adapter: TmuxAdapter, target: str, *, focused_pane: str = "") -> str:
-    return enforce_stack_layout(adapter, target, focused_pane=focused_pane)
+def enforce_legion_layout(
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    focused_pane: str = "",
+    focus: bool = False,
+) -> str:
+    return enforce_stack_layout(adapter, target, focused_pane=focused_pane, focus=focus)
 
 
-def enforce_stack_layout(adapter: TmuxAdapter, target: str, *, focused_pane: str = "") -> str:
+def enforce_stack_layout(
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    focused_pane: str = "",
+    focus: bool = False,
+    admit: bool = False,
+    kill_pending_clear: bool = False,
+) -> str:
     window_name = _show(adapter, target, "#{window_name}")
     spec = _stack_spec_for_window(window_name)
     if spec is None:
         return f"noop stack layout {target}: unsupported window {window_name}"
+    if adapter.show_window_option(target, "@LEGION_FOCUS_GUARD") == "true":
+        return f"noop stack layout {target}: guarded"
 
     panes = _legion_panes(adapter, target)
     if not panes:
@@ -262,7 +278,21 @@ def enforce_stack_layout(adapter: TmuxAdapter, target: str, *, focused_pane: str
             *LEGACY_WORKER_ROLES,
         } or worker.pane_type not in {spec.worker_type, "legion"}:
             _tag_worker(adapter, worker.pane_id, spec)
-        if worker.clear and not worker.pending:
+        if admit and worker.clear:
+            _set_pane_option(adapter, worker.pane_id, "@STACK_PENDING", "true")
+            worker = LegionPane(
+                worker.pane_id,
+                spec.worker_role,
+                spec.worker_type,
+                worker.active,
+                worker.left,
+                worker.top,
+                worker.width,
+                worker.height,
+                worker.command,
+                True,
+            )
+        if worker.clear and not (worker.pending and not kill_pending_clear):
             adapter.run("kill-pane", "-t", worker.pane_id, allow_failure=True)
         elif not worker.clear and worker.pending:
             _clear_pending(adapter, worker.pane_id)
@@ -275,30 +305,22 @@ def enforce_stack_layout(adapter: TmuxAdapter, target: str, *, focused_pane: str
         _tag_orchestrator(adapter, orchestrator.pane_id, spec)
         return f"normalized {spec.base} layout {target}: orchestrator only"
 
-    if not focused_pane:
-        active = next((pane for pane in workers if pane.active), None)
-        focused_pane = active.pane_id if active else workers[0].pane_id
-
-    if focused_pane == orchestrator.pane_id:
-        focused_pane = workers[0].pane_id
-    if focused_pane not in {pane.pane_id for pane in workers}:
-        active = next((pane for pane in workers if pane.active), None)
-        focused_pane = active.pane_id if active else workers[0].pane_id
-
     win_w = int(_show(adapter, target, "#{window_width}") or "0")
     win_h = int(_show(adapter, target, "#{window_height}") or "0")
     orchestrator_w = max(1, (win_w * spec.orchestrator_ratio) // 100)
-    collapsed = [pane for pane in workers if pane.pane_id != focused_pane]
-    expanded_h = max(
-        LEGION_COLLAPSED_HEIGHT, win_h - (len(collapsed) * (LEGION_COLLAPSED_HEIGHT + 1))
-    )
+    worker_ids = {pane.pane_id for pane in workers}
+    stored_focus = adapter.show_window_option(target, "@LEGION_FOCUSED_PANE")
+    effective_focus = ""
+    if focus and focused_pane in worker_ids:
+        effective_focus = focused_pane
+    elif stored_focus in worker_ids:
+        effective_focus = stored_focus
 
     _set_window_option(adapter, target, "@LEGION_FOCUS_GUARD", "true")
     try:
         _tag_orchestrator(adapter, orchestrator.pane_id, spec)
         for worker in workers:
             _tag_worker(adapter, worker.pane_id, spec)
-        adapter.run("select-pane", "-t", orchestrator.pane_id, allow_failure=True)
         adapter.run(
             "set-window-option",
             "-t",
@@ -312,22 +334,32 @@ def enforce_stack_layout(adapter: TmuxAdapter, target: str, *, focused_pane: str
             "resize-pane", "-t", orchestrator.pane_id, "-x", str(orchestrator_w), allow_failure=True
         )
 
-        for worker in collapsed:
-            adapter.run(
-                "resize-pane",
-                "-t",
-                worker.pane_id,
-                "-y",
-                str(LEGION_COLLAPSED_HEIGHT),
-                allow_failure=True,
+        if effective_focus:
+            collapsed = [pane for pane in workers if pane.pane_id != effective_focus]
+            expanded_h = max(
+                LEGION_COLLAPSED_HEIGHT,
+                win_h - (len(collapsed) * (LEGION_COLLAPSED_HEIGHT + 1)),
             )
-        adapter.run("resize-pane", "-t", focused_pane, "-y", str(expanded_h), allow_failure=True)
-        adapter.run("select-pane", "-t", focused_pane, allow_failure=True)
-        _set_window_option(adapter, target, "@LEGION_FOCUSED_PANE", focused_pane)
+            for worker in collapsed:
+                adapter.run(
+                    "resize-pane",
+                    "-t",
+                    worker.pane_id,
+                    "-y",
+                    str(LEGION_COLLAPSED_HEIGHT),
+                    allow_failure=True,
+                )
+            adapter.run(
+                "resize-pane", "-t", effective_focus, "-y", str(expanded_h), allow_failure=True
+            )
+            if focus and focused_pane in worker_ids:
+                _set_window_option(adapter, target, "@LEGION_FOCUSED_PANE", focused_pane)
     finally:
         _set_window_option(adapter, target, "@LEGION_FOCUS_GUARD", "false")
 
-    return f"focused {spec.base} {focused_pane} in {target}"
+    if focus and focused_pane in worker_ids:
+        return f"focused {spec.base} {focused_pane} in {target}"
+    return f"normalized {spec.base} layout {target}"
 
 
 def add_orchestrator_stack_pane(
@@ -361,44 +393,48 @@ def add_orchestrator_stack_pane(
             first, spec.orchestrator_role, spec.orchestrator_type, False, 0, 0, 0, 0, "zsh"
         )
 
-    if not workers:
-        win_w = int(_show(adapter, target, "#{window_width}") or "240")
-        right_w = max(1, win_w - ((win_w * spec.orchestrator_ratio) // 100) - 1)
-        pane = adapter.run(
-            "split-window",
-            "-h",
-            "-t",
-            orchestrator.pane_id,
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-l",
-            str(right_w),
-            "-c",
-            cwd,
-        ).strip()
-    else:
-        focus = adapter.show_window_option(target, "@LEGION_FOCUSED_PANE") or workers[0].pane_id
-        pane = adapter.run(
-            "split-window",
-            "-v",
-            "-t",
-            focus,
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-l",
-            str(LEGION_COLLAPSED_HEIGHT),
-            "-c",
-            cwd,
-        ).strip()
+    _set_window_option(adapter, target, "@LEGION_FOCUS_GUARD", "true")
+    try:
+        if not workers:
+            win_w = int(_show(adapter, target, "#{window_width}") or "240")
+            right_w = max(1, win_w - ((win_w * spec.orchestrator_ratio) // 100) - 1)
+            pane = adapter.run(
+                "split-window",
+                "-h",
+                "-t",
+                orchestrator.pane_id,
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-l",
+                str(right_w),
+                "-c",
+                cwd,
+            ).strip()
+        else:
+            focus = adapter.show_window_option(target, "@LEGION_FOCUSED_PANE") or workers[0].pane_id
+            pane = adapter.run(
+                "split-window",
+                "-v",
+                "-t",
+                focus,
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-l",
+                str(LEGION_COLLAPSED_HEIGHT),
+                "-c",
+                cwd,
+            ).strip()
+    finally:
+        _set_window_option(adapter, target, "@LEGION_FOCUS_GUARD", "false")
 
     _tag_worker(adapter, pane, spec)
     _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
     adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
-    enforce_stack_layout(adapter, target, focused_pane=pane)
+    enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
     return pane
 
 

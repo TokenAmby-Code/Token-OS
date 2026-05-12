@@ -4,8 +4,9 @@
 Triggered by POST /api/morning/start (from phone macro after alarm dismiss)
 or directly via `python3 morning_launcher.py` (cron).
 
-Gathers context, builds the Custodes prompt inline, creates a pane in main:legion,
-and launches an interactive Claude session via `primarch custodes`. The session
+Gathers context, builds the Custodes prompt inline, resolves the managed
+main:legion Custodes orchestrator pane, and launches an interactive Claude
+session via `primarch custodes`. The session
 self-registers as legion=custodes, instance_type=sync via the SessionStart hook.
 
 The launcher exits after launch — the Claude session is autonomous from there.
@@ -419,78 +420,36 @@ def ensure_daily_notes():
 
 
 def create_legion_pane() -> str | None:
-    """Create a new pane in main:legion, auto-creating the window if needed.
+    """Return the managed Custodes orchestrator pane in main:legion.
 
-    Returns the pane_id or None on failure.
+    Morning launch is not a worker dispatch and must not create duplicate
+    Custodes panes. The legion page invariant is owned by tmuxctl; this launcher
+    only resolves the fixed orchestrator target.
     """
-    # Check if legion window exists
-    result = subprocess.run(
-        ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-
-    if result.returncode != 0:
-        # Create legion window
-        subprocess.run(
-            [
-                "tmux",
-                "new-window",
-                "-t",
-                TMUX_SESSION,
-                "-n",
-                "legion",
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        # The new-window itself created a pane — get it
-        result = subprocess.run(
-            ["tmux", "list-panes", "-t", f"{TMUX_SESSION}:legion", "-F", "#{pane_id}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            print("Error: could not create legion window")
-            return None
-        pane_id = result.stdout.strip().split("\n")[0]
-        # Check if this pane is idle (it should be — just created)
-        cmd_result = subprocess.run(
-            ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_command}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if cmd_result.stdout.strip() in ("bash", "zsh", "sh"):
-            return pane_id
-
-    # Legion window exists — split a new pane into it
-    result = subprocess.run(
-        ["tmux", "split-window", "-t", f"{TMUX_SESSION}:legion", "-d", "-P", "-F", "#{pane_id}"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if result.returncode != 0:
-        print(f"Error: could not split pane in legion: {result.stderr}")
-        return None
-
-    pane_id = result.stdout.strip()
-
-    # Re-tile legion
+    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     subprocess.run(
-        ["tmux", "select-layout", "-t", f"{TMUX_SESSION}:legion", "tiled"],
+        [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
         capture_output=True,
+        text=True,
         timeout=5,
     )
-
+    result = subprocess.run(
+        [str(tmuxctl), "resolve-pane", "legion:custodes"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        print(f"Error: could not resolve legion:custodes: {result.stderr}")
+        return None
+    pane_id = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("pane_id: "):
+            pane_id = line.split(": ", 1)[1].strip()
+            break
+    if not pane_id:
+        print("Error: tmuxctl resolve-pane did not return a pane_id for legion:custodes")
+        return None
     return pane_id
 
 

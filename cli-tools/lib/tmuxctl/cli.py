@@ -102,18 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
     stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
     stack_add.add_argument("--cwd", default=None)
     stack_add.add_argument("--session", default="main")
+    stack_dispatch = stack_subparsers.add_parser("dispatch")
+    stack_dispatch.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_dispatch.add_argument("--cwd", default=None)
+    stack_dispatch.add_argument("--session", default="main")
+    stack_dispatch.add_argument("--command", dest="launch_command", required=True)
+    stack_dispatch.add_argument("--no-focus", action="store_true")
+    stack_dispatch.add_argument("--settle", type=float, default=0.5)
     stack_enforce = stack_subparsers.add_parser("enforce")
     stack_enforce.add_argument("--pane", default="current")
     stack_enforce.add_argument("--window", default="")
-
-    legion_parser = subparsers.add_parser("legion")
-    legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
-
-    legion_focus = legion_subparsers.add_parser("focus-selected")
-    legion_focus.add_argument("--pane", default="current")
-
-    legion_enforce = legion_subparsers.add_parser("enforce")
-    legion_enforce.add_argument("--pane", default="current")
+    stack_enforce.add_argument("--focus", action="store_true")
+    stack_enforce.add_argument("--admit", action="store_true")
+    stack_enforce.add_argument("--kill-pending-clear", action="store_true")
 
     legion_parser = subparsers.add_parser("legion")
     legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
@@ -228,6 +229,20 @@ def main(argv: list[str] | None = None) -> int:
                 pane_id = add_stack_pane(control.adapter, args.session, args.base, cwd=args.cwd)
                 print(pane_id)
                 return 0
+            if args.stack_command == "dispatch":
+                from .stack import dispatch_stack_command
+
+                pane_id = dispatch_stack_command(
+                    control.adapter,
+                    args.session,
+                    args.base,
+                    args.launch_command,
+                    cwd=args.cwd,
+                    focus=not args.no_focus,
+                    settle_seconds=args.settle,
+                )
+                print(pane_id)
+                return 0
             if args.stack_command == "enforce":
                 from .legion import enforce_stack_layout
 
@@ -241,7 +256,16 @@ def main(argv: list[str] | None = None) -> int:
                     target = control.adapter.run(
                         "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                     ).strip()
-                print(enforce_stack_layout(control.adapter, target, focused_pane=pane))
+                print(
+                    enforce_stack_layout(
+                        control.adapter,
+                        target,
+                        focused_pane=pane,
+                        focus=args.focus,
+                        admit=args.admit,
+                        kill_pending_clear=args.kill_pending_clear,
+                    )
+                )
                 return 0
 
         if args.command == "legion":
@@ -259,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                 target = control.adapter.run(
                     "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                 ).strip()
-                print(enforce_legion_layout(control.adapter, target, focused_pane=pane))
+                print(enforce_legion_layout(control.adapter, target, focused_pane=pane, focus=True))
                 return 0
 
         if args.command == "legion":

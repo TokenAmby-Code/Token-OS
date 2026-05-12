@@ -91,18 +91,18 @@ if $DRY_RUN; then
     log "window:  $WINDOW"
     log "prompt:  $PROMPT_FILE"
     log "command: cd ~ && c --prompt-file '$PROMPT_FILE'"
-    log "layout:  tmuxctl stack add legion + legion focus-selected"
+    log "layout:  tmuxctl stack dispatch legion"
     exit 0
 fi
-
-PANE_ID="$(PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli stack add legion --session "$SESSION" --cwd "$HOME")"
-tmux select-window -t "$LEGION_TARGET"
-tmux select-pane -t "$PANE_ID"
-PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli legion focus-selected --pane "$PANE_ID" >/dev/null 2>&1 || true
 
 printf -v PROMPT_FILE_Q '%q' "$PROMPT_FILE"
 LAUNCH_CMD="cd ~ && c --prompt-file ${PROMPT_FILE_Q}"
 
-sleep 0.5
-tmux send-keys -t "$PANE_ID" "$LAUNCH_CMD" Enter
+PANE_ID="$(
+    PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli stack dispatch legion \
+            --session "$SESSION" \
+            --cwd "$HOME" \
+            --command "$LAUNCH_CMD"
+)"
 tmux display-message "Legion prompt launched in ${PANE_ID}"

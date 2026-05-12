@@ -169,20 +169,19 @@ resolve_named_dispatch_target() {
     echo "$resolved"
 }
 
-# Create a new pane in a stack window via the tmuxctl Python wrapper.
-# Returns the new pane ID. Auto-spills into <window>-2, <window>-3, ... when the
-# canonical window can't accept another split (geometric "no space"). The Python
-# module is the single source of truth for stack semantics; do not re-implement
-# split logic here. See cli-tools/lib/tmuxctl/stack.py.
+# Create a new pane in a stack window via tmuxctl.
+# Returns the new pane ID. tmuxctl is the single source of truth for managed
+# stack semantics: legion/mechanicus keep the orchestrator at left and file all
+# other panes into the right worker stack. Do not re-implement split/layout logic
+# in shell entry points. See cli-tools/lib/tmuxctl/stack.py and legion.py.
 create_stack_pane() {
     local window="${1:-legion}"
-    local lib_dir
-    lib_dir="$(dirname "$(readlink -f "$0")")/../lib"
+    local tmuxctl_bin
+    tmuxctl_bin="$(dirname "$(readlink -f "$0")")/tmuxctl"
     local new_pane
     local err_log
     err_log=$(mktemp -t vault-dispatch-stack.XXXXXX)
-    if ! new_pane=$(PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-            python3 -m tmuxctl.cli stack add "$window" --cwd "$HOME" 2>"$err_log"); then
+    if ! new_pane=$("$tmuxctl_bin" stack add "$window" --cwd "$HOME" 2>"$err_log"); then
         log_error "tmuxctl stack add $window failed: $(<"$err_log")"
         rm -f "$err_log"
         return 1
@@ -512,6 +511,8 @@ fi
 #   kreig:new
 #   palace:<slot>
 #   somnium:<slot>
+# Stack targets always allocate through `tmuxctl stack add`; direct tmux splits
+# are intentionally not a dispatch API.
 if [[ -n "$TARGET_WINDOW" && "$DISPATCH_TARGET" == "legion:new" ]]; then
     DISPATCH_TARGET="${TARGET_WINDOW}:new"
 fi
