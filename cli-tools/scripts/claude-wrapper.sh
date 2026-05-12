@@ -116,13 +116,6 @@ if $PRINT_MODE; then
     exit 1
   fi
 
-  pane_id="$(
-    tmux split-window -t "$DISPATCH_TARGET_WINDOW" -d -P -F '#{pane_id}' -c "$WORKING_DIR" 2>/dev/null
-  )" || {
-    echo "failed to create legion pane at $DISPATCH_TARGET_WINDOW" >&2
-    exit 1
-  }
-
   quoted_wrapper="$(printf '%q' "$0")"
   quoted_workdir="$(printf '%q' "$WORKING_DIR")"
   quoted_launcher="$(printf '%q' "$LAUNCHER")"
@@ -134,9 +127,31 @@ if $PRINT_MODE; then
     cmd+=" $(printf '%q' "$arg")"
   done
 
-  tmux send-keys -t "$pane_id" "clear" Enter
-  sleep 0.2
-  tmux send-keys -t "$pane_id" "$cmd" Enter
+  dispatch_session="main"
+  dispatch_base="$DISPATCH_TARGET_WINDOW"
+  if [[ "$dispatch_base" == *:* ]]; then
+    dispatch_session="${dispatch_base%%:*}"
+    dispatch_base="${dispatch_base#*:}"
+  fi
+  dispatch_base="${dispatch_base%%(*}"
+  case "$dispatch_base" in
+    legion|mechanicus|mars|kreig) ;;
+    *)
+      echo "claude -p redirect target must be a managed stack window, got: $DISPATCH_TARGET_WINDOW" >&2
+      exit 1
+      ;;
+  esac
+
+  tmuxctl_bin="$(cd "$(dirname "$0")/../bin" && pwd)/tmuxctl"
+  pane_id="$(
+    "$tmuxctl_bin" stack dispatch "$dispatch_base" \
+      --session "$dispatch_session" \
+      --cwd "$WORKING_DIR" \
+      --command "$cmd" 2>/dev/null
+  )" || {
+    echo "failed to dispatch print-mode agent to $DISPATCH_TARGET_WINDOW" >&2
+    exit 1
+  }
   echo "redirected claude -p to $pane_id"
   exit 0
 fi

@@ -42,6 +42,11 @@ test "hello" --dry-run    # Show payload
 
 See `test --help` for full documentation.
 
+
+### Managed tmux stack dispatch (`tmuxctl stack`)
+
+`tmuxctl` is the single pane-backed dispatch primitive for managed stack pages. Use `tmuxctl stack add legion` to allocate a typed worker pane, or `tmuxctl stack dispatch legion --command ...` to allocate and launch in one step. Entry points such as `vault-dispatch`, Prefix+Space (`tmux-legion-prompt`), Golden Throne resume fallback, `work-loop`, and pane demotion route through this tmuxctl stack code instead of raw `tmux split-window`. See `cli-tools/docs/managed-stack-dispatch.md`.
+
 ### Subagents (`subagent`)
 
 Launch Codex sub-agents in dedicated terminal windows with repo-scoped logging. The command mirrors the `cli codex` implementation from ProcurementAgentAI and works from any repository.

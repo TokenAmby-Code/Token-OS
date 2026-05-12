@@ -5001,105 +5001,36 @@ def _golden_throne_banner_text(tab_name: str | None, human_pane_surface: str) ->
 
 
 async def _get_or_create_backrooms_pane() -> str:
-    """Split a new pane in the backrooms window for an autonomous session.
+    """Allocate a managed legion worker pane for an autonomous resume.
 
-    Each resume gets its own pane — backrooms is a dynamic process stack,
-    not a shared resource. Creates the backrooms window if it doesn't exist.
+    Historical name retained for tests/callers during migration. The backrooms
+    window is no longer a dispatch target; pane allocation is delegated to the
+    typed tmuxctl stack primitive so Custodes remains the left orchestrator and
+    all autonomous resume panes file into the right-side legion worker stack.
     """
-    # Check if backrooms window exists
+    tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
     proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "list-panes",
-        "-t",
-        "main:backrooms",
-        "-F",
-        "#{pane_id}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    if proc.returncode == 0 and stdout.decode().strip():
-        # Window exists — split a new pane into it
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "split-window",
-            "-t",
-            "main:backrooms",
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_split, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0 and stdout_split.decode().strip():
-            pane_id = stdout_split.decode().strip()
-            await asyncio.create_subprocess_exec(
-                "tmux",
-                "set-option",
-                "-p",
-                "-t",
-                pane_id,
-                "@PANE_TYPE",
-                "backrooms",
-            )
-            logger.info(f"Golden Throne: split new backrooms pane {pane_id}")
-            return pane_id
-        # split failed (too many panes?) — fall through to use first existing
-        pane_id = stdout.decode().strip().split("\n")[0]
-        if not pane_id:
-            raise RuntimeError("backrooms pane lookup returned empty pane id")
-        logger.warning("Golden Throne: split-window failed, reusing existing backrooms pane")
-        return pane_id
-
-    # Create backrooms window (detached so it doesn't steal focus)
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "new-window",
-        "-t",
+        str(tmuxctl),
+        "stack",
+        "add",
+        "legion",
+        "--session",
         "main",
-        "-n",
-        "backrooms",
-        "-d",
+        "--cwd",
+        str(Path.home()),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"failed to create backrooms window: {stderr.decode(errors='replace').strip()}"
+            f"failed to allocate managed legion worker pane: "
+            f"{stderr.decode(errors='replace').strip()}"
         )
-
-    # Tag it and get the pane ID
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "list-panes",
-        "-t",
-        "main:backrooms",
-        "-F",
-        "#{pane_id}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    if proc.returncode != 0:
-        raise RuntimeError("failed to list backrooms panes after window creation")
-    pane_id = stdout.decode().strip().split("\n")[0]
+    pane_id = stdout.decode().strip().splitlines()[0] if stdout.decode().strip() else ""
     if not pane_id:
-        raise RuntimeError("backrooms window created without a pane id")
-
-    # Tag pane type
-    await asyncio.create_subprocess_exec(
-        "tmux",
-        "set-option",
-        "-p",
-        "-t",
-        pane_id,
-        "@PANE_TYPE",
-        "backrooms",
-    )
-    logger.info(f"Golden Throne: created backrooms window (pane {pane_id})")
+        raise RuntimeError("managed legion worker allocation returned empty pane id")
+    logger.info(f"Golden Throne: allocated managed legion worker pane {pane_id}")
     return pane_id
 
 
@@ -5352,16 +5283,16 @@ async def golden_throne_followup(session_id: str):
                 )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Agent not running — resume in backrooms with SOP prompt
+            # Agent not running — resume in a managed legion worker pane with SOP prompt
             try:
-                backrooms_pane = await _get_or_create_backrooms_pane()
+                resume_pane = await _get_or_create_backrooms_pane()
                 # Write SOP to temp file (avoids shell escaping issues)
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
                 resume_cmd = _agent_resume_command(engine, session_id, working_dir, sop_file)
                 queued = await enqueue_pane_write(
                     instance_id=session_id,
-                    tmux_pane=backrooms_pane,
+                    tmux_pane=resume_pane,
                     source="golden_throne",
                     purpose="followup",
                     payload=resume_cmd,
@@ -5371,8 +5302,8 @@ async def golden_throne_followup(session_id: str):
                 dispatch_details.update(
                     {
                         "transport": "resume",
-                        "target_pane": backrooms_pane,
-                        "backrooms_pane": backrooms_pane,
+                        "target_pane": resume_pane,
+                        "legion_worker_pane": resume_pane,
                         "resume_command": resume_cmd,
                         "returncode": queue_result.get("returncode"),
                         "stdout": queue_result.get("stdout", ""),
@@ -5380,13 +5311,13 @@ async def golden_throne_followup(session_id: str):
                         "queue_id": queued["id"],
                         "queue_status": queue_result.get("status"),
                         "defer_reason": queue_result.get("reason"),
-                        "tmux_pane_exists": await _tmux_pane_exists(backrooms_pane),
+                        "tmux_pane_exists": await _tmux_pane_exists(resume_pane),
                     }
                 )
                 if queue_result.get("status") == PANE_WRITE_SENT:
                     logger.info(
-                        f"Golden Throne: resumed {session_id[:12]} in backrooms "
-                        f"pane={backrooms_pane} via {engine} resume"
+                        f"Golden Throne: resumed {session_id[:12]} in managed legion worker "
+                        f"pane={resume_pane} via {engine} resume"
                     )
                 elif queue_result.get("reason") == "dispatch_deferred":
                     logger.info(
