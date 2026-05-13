@@ -319,31 +319,36 @@ claude() {
 
 # cdc — cd + clear + dispatch
 cdc() {
-    local dir="${1:-}"
-    if [[ -n "$dir" ]]; then
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        local dir="$1"
         shift
-        cd "$dir" || return 1
+        cd "$dir" >/dev/null || return 1
     fi
+
     clear
-    dispatch "$@"
+    if [[ $# -eq 0 ]]; then
+        TOKEN_API_DISPATCH_ORIGIN=cdc dispatch --interactive
+    else
+        TOKEN_API_DISPATCH_ORIGIN=cdc dispatch "$@"
+    fi
 }
 
 # cc — clear + dispatch
 cc() {
     clear
     if [[ $# -eq 0 ]]; then
-        dispatch --interactive
+        TOKEN_API_DISPATCH_ORIGIN=cc dispatch --interactive
     else
-        dispatch "$@"
+        TOKEN_API_DISPATCH_ORIGIN=cc dispatch "$@"
     fi
 }
 
 # c — dispatch launcher
 c() {
     if [[ $# -eq 0 ]]; then
-        dispatch --interactive
+        TOKEN_API_DISPATCH_ORIGIN=c dispatch --interactive
     else
-        dispatch "$@"
+        TOKEN_API_DISPATCH_ORIGIN=c dispatch "$@"
     fi
 }
 

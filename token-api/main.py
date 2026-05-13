@@ -95,6 +95,7 @@ from schedule import router as schedule_router
 from session_doc_helpers import (
     _update_doc_agents_list,
     create_session_doc_file,
+    read_frontmatter,
     update_frontmatter,
     update_victory_frontmatter,
 )
@@ -12644,6 +12645,345 @@ Rules:
 # ============ Aspirant Pipeline (Inbox) ============
 
 
+def _safe_filename_slug(value: str, fallback: str = "untitled") -> str:
+    slug = re.sub(r"[^\w\s-]", "", value).strip().lower()
+    slug = re.sub(r"\s+", "-", slug)
+    return (slug or fallback)[:80]
+
+
+def _resolve_aspirant_note_path(note_path: str) -> tuple[Path, str]:
+    """Return (absolute_file_path, vault_relative_path) for an aspirant note."""
+    raw = Path(note_path)
+    full_path = raw if raw.is_absolute() else OBSIDIAN_VAULT_PATH / note_path
+    try:
+        relative = str(full_path.relative_to(OBSIDIAN_VAULT_PATH))
+    except ValueError:
+        relative = note_path
+    return full_path, relative
+
+
+def _extract_gene_seed_from_content(content: str) -> str:
+    """Extract the > [!dna] Gene-Seed callout, falling back to body text."""
+    lines = content.splitlines()
+    gene_seed_lines: list[str] = []
+    in_gene_seed = False
+    for line in lines:
+        if "> [!dna]" in line and "Gene-Seed" in line:
+            in_gene_seed = True
+            continue
+        if not in_gene_seed:
+            continue
+        if line.startswith("> "):
+            gene_seed_lines.append(line[2:])
+        elif line.strip() == ">":
+            gene_seed_lines.append("")
+        else:
+            break
+
+    gene_seed = "\n".join(gene_seed_lines).strip()
+    if gene_seed:
+        return gene_seed
+
+    # Fallback: strip frontmatter and headings from simple manually-created notes.
+    if content.startswith("---"):
+        end_fm = content.find("\n---", 3)
+        if end_fm != -1:
+            content = content[end_fm + 4 :].lstrip()
+    return content.strip()
+
+
+def _build_aspirant_system_prompt(note_path: str) -> str:
+    return f"""You are a full aspirant implantation/trials session, not a one-shot summarizer.
+
+Operational contract:
+- On startup, load vault context from your linked session document. If the vault-mind skill is available, invoke/use it; otherwise read the linked session doc directly.
+- Read the aspirant note at `{note_path}` before acting.
+- Treat the Gene-Seed section as authoritative intent. Preserve it; do not rewrite it away or let later context override it.
+- Use Obsidian context actively: `obsidian vault=Imperium-ENV read`, `search`, `search:context`, and `backlinks` as needed.
+- Perform concrete implantation/trials work: find related vault notes, identify useful research/context, challenge assumptions, and write the useful output back to the aspirant note.
+- Append your work to the aspirant note under clear `## Implantation` / `## Trials` sections or a concise continuation if those sections already exist.
+- Ask for Emperor direction only when the Gene-Seed is genuinely ambiguous or blocked by a decision only the user can make.
+- Keep changes surgical and auditable. Do not deploy/promote the note unless explicitly instructed."""
+
+
+def _build_aspirant_initial_prompt(
+    *,
+    title: str,
+    note_path: str,
+    note_type: str,
+    source: str,
+    thread_id: str | None,
+    session_doc_path: Path,
+    gene_seed: str,
+) -> str:
+    thread_line = f"- Source/thread id: {source} / {thread_id}" if thread_id else f"- Source: {source}"
+    return f"""# Aspirant Session Launch
+
+You are being launched as a managed legion aspirant session.
+
+## Metadata
+- Title: {title}
+- Aspirant note: `{note_path}`
+- Note type: {note_type}
+{thread_line}
+- Linked session doc: `{session_doc_path}`
+
+## Gene-Seed (authoritative)
+```markdown
+{gene_seed or "(empty)"}
+```
+
+## First actions
+1. Read the linked session doc.
+2. Read the aspirant note at `{note_path}`.
+3. Load relevant vault context with Obsidian search/read/backlinks.
+4. Begin implantation/trials work and append concrete results back to the aspirant note.
+
+Do not use the old automatic MiniMax/Sonnet pipeline. This is a full managed session."""
+
+
+async def _create_aspirant_session_doc(
+    *, title: str, note_path: str, note_type: str, source: str, launch_id: str, gene_seed: str
+) -> tuple[int, Path]:
+    sessions_dir = OBSIDIAN_VAULT_PATH / "Terra" / "Sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = _safe_filename_slug(f"aspirant-{title}", fallback="aspirant")
+    session_doc_path = sessions_dir / f"{today}-{slug}-{launch_id[:8]}.md"
+
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?)""",
+            (f"Aspirant: {title}", str(session_doc_path), "aspirants", now, now),
+        )
+        doc_id = cursor.lastrowid
+        await db.commit()
+
+    content = f"""---
+session_doc_id: {doc_id}
+created: {today}
+agents: []
+instance_ids: []
+status: active
+type: session
+project: aspirants
+aspirant_note: "{note_path}"
+aspirant_launch_id: "{launch_id}"
+aspirant_type: "{note_type}"
+aspirant_source: "{source}"
+victory: pending
+victory_conditions:
+  - Read the aspirant note and preserve the gene-seed as authoritative intent.
+  - Append concrete implantation/trials work back to the aspirant note.
+---
+
+# Session: Aspirant — {title}
+
+## Aspirant
+
+- Note: [[{note_path.replace(".md", "")}]]
+- Type: `{note_type}`
+- Source: `{source}`
+- Launch ID: `{launch_id}`
+
+## Gene-Seed
+
+```markdown
+{gene_seed or "(empty)"}
+```
+
+## Plan
+
+1. Read this session doc.
+2. Read the aspirant note.
+3. Gather vault context with Obsidian search/read/backlinks.
+4. Append implantation/trials output to the aspirant note.
+
+## Activity Log
+
+"""
+    session_doc_path.write_text(content, encoding="utf-8")
+    return doc_id, session_doc_path
+
+
+async def _write_temp_text_file(prefix: str, content: str) -> str:
+    def _write() -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=prefix, suffix=".md", delete=False
+        ) as f:
+            f.write(content)
+            return f.name
+
+    return await asyncio.to_thread(_write)
+
+
+async def _set_aspirant_properties(note_file: Path, updates: dict[str, str]) -> None:
+    await asyncio.to_thread(update_frontmatter, note_file, updates)
+
+
+async def launch_aspirant_session(
+    *, note_path: str, title: str, note_type: str, source: str
+) -> dict:
+    """Launch a managed Claude legion session for an aspirant note, idempotently."""
+    note_file, vault_note_path = _resolve_aspirant_note_path(note_path)
+    if not note_file.exists():
+        raise HTTPException(status_code=404, detail=f"Aspirant note not found: {note_path}")
+
+    fm, _body = await asyncio.to_thread(read_frontmatter, note_file)
+    existing_launch_id = str(fm.get("aspirant_launch_id") or "").strip()
+    existing_status = str(fm.get("aspirant_session_status") or "").strip()
+    if existing_launch_id and existing_status in {"launching", "launched"}:
+        return {
+            "launched": False,
+            "duplicate": True,
+            "path": vault_note_path,
+            "aspirant_launch_id": existing_launch_id,
+            "aspirant_session_status": existing_status,
+            "session_doc": fm.get("aspirant_session_doc"),
+        }
+
+    raw_content = await asyncio.to_thread(note_file.read_text, encoding="utf-8")
+    gene_seed = _extract_gene_seed_from_content(raw_content)
+    thread_id = str(fm.get("thread_id") or "").strip() or None
+    launch_id = str(uuid.uuid4())
+
+    await _set_aspirant_properties(
+        note_file,
+        {
+            "aspirant_launch_id": launch_id,
+            "aspirant_session_status": "launching",
+            "aspirant_launcher": "dispatch",
+            "aspirant_dispatch_target": "legion:new",
+            "aspirant_session_started_at": datetime.now().isoformat(),
+        },
+    )
+
+    try:
+        session_doc_id, session_doc_path = await _create_aspirant_session_doc(
+            title=title,
+            note_path=vault_note_path,
+            note_type=note_type,
+            source=source,
+            launch_id=launch_id,
+            gene_seed=gene_seed,
+        )
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_doc_id": str(session_doc_id),
+                "aspirant_session_doc": str(session_doc_path),
+            },
+        )
+
+        system_prompt = _build_aspirant_system_prompt(vault_note_path)
+        initial_prompt = _build_aspirant_initial_prompt(
+            title=title,
+            note_path=vault_note_path,
+            note_type=note_type,
+            source=source,
+            thread_id=thread_id,
+            session_doc_path=session_doc_path,
+            gene_seed=gene_seed,
+        )
+        system_prompt_file = await _write_temp_text_file("aspirant-system-", system_prompt)
+        prompt_file = await _write_temp_text_file("aspirant-prompt-", initial_prompt)
+
+        dispatch_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "dispatch"
+        env = {
+            **os.environ,
+            "TOKEN_API_WRAPPER_LAUNCH_ID": launch_id,
+            "PATH": ":".join(
+                [
+                    str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                    str(Path.home() / ".local" / "bin"),
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    os.environ.get("PATH", ""),
+                ]
+            ),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            str(dispatch_bin),
+            "--target",
+            "legion:new",
+            "--dir",
+            str(OBSIDIAN_VAULT_PATH),
+            "--session-doc",
+            str(session_doc_path),
+            "--system-prompt-file",
+            system_prompt_file,
+            "--prompt-file",
+            prompt_file,
+            "--gt",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            err_text = stderr.decode("utf-8", errors="replace").strip() or stdout.decode(
+                "utf-8", errors="replace"
+            ).strip()
+            raise RuntimeError(f"dispatch failed ({proc.returncode}): {err_text}")
+
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_status": "launched",
+                "aspirant_session_launched_at": datetime.now().isoformat(),
+            },
+        )
+        await log_event(
+            "aspirant_session_launched",
+            device_id="obsidian",
+            details={
+                "path": vault_note_path,
+                "title": title,
+                "type": note_type,
+                "source": source,
+                "launch_id": launch_id,
+                "session_doc_id": session_doc_id,
+                "session_doc_path": str(session_doc_path),
+                "dispatch_target": "legion:new",
+            },
+        )
+        return {
+            "launched": True,
+            "duplicate": False,
+            "path": vault_note_path,
+            "aspirant_launch_id": launch_id,
+            "aspirant_session_status": "launched",
+            "session_doc_id": session_doc_id,
+            "session_doc": str(session_doc_path),
+        }
+    except Exception as e:
+        error_text = str(e)
+        logger.error(f"Aspirant launch failed for '{title}' ({vault_note_path}): {error_text}")
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_status": "failed",
+                "aspirant_session_failed_at": datetime.now().isoformat(),
+                "aspirant_launch_error": error_text[:500],
+            },
+        )
+        await log_event(
+            "aspirant_session_launch_failed",
+            device_id="obsidian",
+            details={
+                "path": vault_note_path,
+                "title": title,
+                "type": note_type,
+                "source": source,
+                "launch_id": launch_id,
+                "error": error_text[:500],
+            },
+        )
+        raise HTTPException(status_code=500, detail=error_text)
+
+
 @app.post("/api/inbox/notify")
 async def inbox_notify(request: InboxNotifyRequest):
     """Gene-seed: receive birth notification for a new inbox note."""
@@ -12658,19 +12998,17 @@ async def inbox_notify(request: InboxNotifyRequest):
         },
     )
     logger.info(f"Inbox: new {request.type} note '{request.title}' from {request.source}")
-    asyncio.create_task(
-        run_implantation(
-            note_path=request.path,
-            title=request.title,
-            note_type=request.type,
-            source=request.source,
-        )
+    launch_result = await launch_aspirant_session(
+        note_path=request.path,
+        title=request.title,
+        note_type=request.type,
+        source=request.source,
     )
     return {
         "received": True,
         "path": request.path,
         "type": request.type,
-        "implantation": "dispatched",
+        "aspirant_session": launch_result,
     }
 
 
@@ -12779,14 +13117,11 @@ async def inbox_create(request: InboxCreateRequest):
     except Exception as e:
         logger.warning(f"Inbox: thread creation failed for '{safe_title}': {e}")
 
-    # Self-notify (same pipeline as Templater-created notes)
-    await inbox_notify(
-        InboxNotifyRequest(
-            path=note_path,
-            title=safe_title,
-            type=request.type,
-            source=request.source,
-        )
+    launch_result = await launch_aspirant_session(
+        note_path=note_path,
+        title=safe_title,
+        note_type=request.type,
+        source=request.source,
     )
 
     obsidian_uri = f"obsidian://open?vault=Imperium-ENV&file={note_path.replace(' ', '%20')}"
@@ -12798,6 +13133,7 @@ async def inbox_create(request: InboxCreateRequest):
         "title": safe_title,
         "obsidian_uri": obsidian_uri,
         "thread_id": thread_id,
+        "aspirant_session": launch_result,
     }
 
 

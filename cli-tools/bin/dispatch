@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dispatch - Canonical launcher for new agent sessions
+# dispatch - Canonical launcher for new/resumed agent sessions
 # TAGS: instance, dispatch, launcher
 # AUDIENCE: human, agent
 
@@ -11,19 +11,32 @@ source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 usage() {
   cat <<'USAGE'
-dispatch — canonical launcher for new agent sessions
+dispatch — canonical launcher for new or resumed agent sessions
 
 Usage:
   dispatch [options]
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
+  --id <session_id>            Resume an existing agent session by session_id
+  --aspirant                  Create an aspirant instead of launching directly
+  --aspirant-kind <kind>      dispatch, deploy_p, or deploy_d (with --aspirant)
+  --kind <kind>               Compatibility alias for --aspirant-kind; requires --aspirant
+  --direct                    Force direct launch; disable auto-aspirant policy
+  --session-domain <domain>   Aspirant session-doc domain hint: terra or mars
   --persona <name>             Persona name (Claude/primarch backend)
   --dir <path>                 Working directory (default: cwd)
+  --title <text>               Aspirant title metadata
+  --objective <text>           Aspirant objective metadata
+  --victory-condition <text>  Aspirant victory condition; may repeat
+  --source <name>             Aspirant source metadata (default: dispatch)
   --session-doc <path>         Session doc path to bind at SessionStart
   --prompt <text>              Initial prompt
   --prompt-file <path>         Read initial prompt from file
+  --system-prompt <text>       Append a Claude system prompt
+  --system-prompt-file <path>  Read appended Claude system prompt from file
   --target <target>            legion:new, mechanicus:new, or a tmux pane id
+  --pane <tmux-pane-id>        Alias for --target; with --id, pane to resume into
   --gt | --no-gt               Golden Throne lane toggle (default: --gt)
   --zealotry <1-10>            Golden Throne zealotry (default: 5 with --gt, 3 with --no-gt)
   --sync                       Sync-session lane
@@ -41,11 +54,27 @@ err() { echo "dispatch: $*" >&2; }
 quote() { printf '%q' "$1"; }
 
 ENGINE="claude"
+ENGINE_EXPLICIT=false
+RESUME_ID=""
+RESUME_ROW_FOUND=false
+ASPIRANT=false
+ASPIRANT_KIND="dispatch"
+KIND_ALIAS_USED=false
+DIRECT=false
+SESSION_DOMAIN=""
 PERSONA=""
 WORK_DIR="$(pwd)"
+WORK_DIR_EXPLICIT=false
+TITLE=""
+OBJECTIVE=""
+VICTORY_CONDITIONS=()
+ASPIRANT_SOURCE="dispatch"
 SESSION_DOC=""
 PROMPT=""
 PROMPT_FILE=""
+SYSTEM_PROMPT=""
+SYSTEM_PROMPT_FILE=""
+SYSTEM_PROMPT_INLINE_USED=false
 TARGET=""
 GT_MODE=true
 ZEALOTRY=""
@@ -56,15 +85,28 @@ WITH_MCP=""
 DISCORD_CHANNEL=""
 DRY_RUN=false
 INTERACTIVE=false
+DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --engine) ENGINE="${2:-}"; shift 2 ;;
+    --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
+    --id) RESUME_ID="${2:-}"; shift 2 ;;
+    --aspirant) ASPIRANT=true; shift ;;
+    --aspirant-kind) ASPIRANT_KIND="${2:-}"; shift 2 ;;
+    --kind) ASPIRANT_KIND="${2:-}"; KIND_ALIAS_USED=true; shift 2 ;;
+    --direct) DIRECT=true; shift ;;
+    --session-domain) SESSION_DOMAIN="${2:-}"; shift 2 ;;
     --persona|--primarch) PERSONA="${2:-}"; shift 2 ;;
-    --dir|-C) WORK_DIR="${2:-}"; shift 2 ;;
+    --dir|-C) WORK_DIR="${2:-}"; WORK_DIR_EXPLICIT=true; shift 2 ;;
+    --title) TITLE="${2:-}"; shift 2 ;;
+    --objective) OBJECTIVE="${2:-}"; shift 2 ;;
+    --victory-condition|--victory-conditions) VICTORY_CONDITIONS+=("${2:-}"); shift 2 ;;
+    --source) ASPIRANT_SOURCE="${2:-}"; shift 2 ;;
     --session-doc) SESSION_DOC="${2:-}"; shift 2 ;;
     --prompt) PROMPT="${2:-}"; shift 2 ;;
     --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --system-prompt) SYSTEM_PROMPT="${2:-}"; SYSTEM_PROMPT_INLINE_USED=true; shift 2 ;;
+    --system-prompt-file) SYSTEM_PROMPT_FILE="${2:-}"; shift 2 ;;
     --target|--pane) TARGET="${2:-}"; shift 2 ;;
     --gt) GT_MODE=true; shift ;;
     --no-gt) GT_MODE=false; shift ;;
@@ -86,6 +128,339 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+expand_path() {
+  local path="$1"
+  if [[ "$path" == "~" ]]; then
+    path="$HOME"
+  elif [[ "$path" == ~/* ]]; then
+    path="$HOME/${path#~/}"
+  fi
+  printf '%s' "$path"
+}
+
+sqlite_query() {
+  local sql="$1"
+  [[ -f "$DB_PATH" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -readonly -separator $'\t' "$DB_PATH" "$sql" 2>/dev/null || true
+}
+
+sqlite_query_usv() {
+  local sql="$1"
+  [[ -f "$DB_PATH" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -readonly -separator $'\x1f' "$DB_PATH" "$sql" 2>/dev/null || true
+}
+
+sql_literal() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+infer_engine() {
+  local engine="$1" launcher="$2"
+  if [[ -n "$engine" ]]; then
+    printf '%s' "$engine"
+  elif [[ "$launcher" == *codex* ]]; then
+    printf 'codex'
+  else
+    printf 'claude'
+  fi
+}
+
+dedupe_tsv() {
+  awk -F '\t' 'NF && !seen[$1]++'
+}
+
+compact_path() {
+  local path="$1"
+  path="${path/#$HOME/~}"
+  printf '%s' "$path"
+}
+
+directory_candidates() {
+  local current
+  current="$(expand_path "$WORK_DIR")"
+  printf '%s\tcurrent: %s\n' "$current" "$(compact_path "$current")"
+
+  local path label
+  for path in \
+    "/Volumes/Imperium/Imperium-ENV" \
+    "/Volumes/Civic/Pax-ENV" \
+    "/Volumes/Imperium/Token-OS" \
+    "$HOME/worktrees/askCivic" \
+    "/Volumes/Civic/askcivic.git"
+  do
+    [[ -d "$path" ]] || continue
+    label="$(basename "$path")"
+    printf '%s\t%s\n' "$path" "$label"
+  done
+
+  sqlite_query "
+    SELECT DISTINCT working_dir, COALESCE(MAX(last_activity), '')
+    FROM claude_instances
+    WHERE working_dir IS NOT NULL AND working_dir != ''
+    GROUP BY working_dir
+    ORDER BY MAX(last_activity) DESC
+    LIMIT 40;
+  " | while IFS=$'\t' read -r path _ts; do
+    [[ -n "$path" && -d "$path" ]] || continue
+    printf '%s\trecent: %s\n' "$path" "$(compact_path "$path")"
+  done
+}
+
+session_doc_candidates() {
+  printf '__none__\tnew session doc\n'
+  sqlite_query "
+    SELECT file_path,
+           COALESCE(title, ''),
+           COALESCE(project, ''),
+           COALESCE(status, ''),
+           COALESCE(updated_at, '')
+    FROM session_documents
+    WHERE file_path IS NOT NULL AND file_path != ''
+    ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC
+    LIMIT 80;
+  " | while IFS=$'\t' read -r file_path title project status updated_at; do
+    [[ -n "$file_path" ]] || continue
+    local label="${title:-$(basename "$file_path")}" meta="${status:-unknown}"
+    [[ -n "$project" ]] && meta+="/${project}"
+    [[ -n "$updated_at" ]] && meta+=" ${updated_at%%.*}"
+    printf '%s\t%s — %s — %s\n' "$file_path" "$label" "$meta" "$(compact_path "$file_path")"
+  done
+}
+
+persona_candidates() {
+  if [[ -n "$PERSONA" ]]; then
+    printf '%s\tcurrent persona: %s\n' "$PERSONA" "$PERSONA"
+  elif [[ "$ENGINE" == "codex" ]]; then
+    printf '__sisters_of_battle__\tSisters of Battle — Codex\n'
+    printf '__astartes__\tAstartes — Claude\n'
+  else
+    printf '__astartes__\tAstartes — Claude\n'
+    printf '__sisters_of_battle__\tSisters of Battle — Codex\n'
+  fi
+
+  sqlite_query "
+    SELECT name, COALESCE(title, ''), COALESCE(launcher_group, ''), COALESCE(launcher_rank, 100)
+    FROM primarchs
+    WHERE COALESCE(launcher_hidden, 0) = 0
+    ORDER BY CASE COALESCE(launcher_group, '') WHEN 'common' THEN 0 WHEN 'default' THEN 1 ELSE 2 END,
+             COALESCE(launcher_rank, 100), name;
+  " | while IFS=$'\t' read -r name title group rank; do
+    [[ -n "$name" ]] || continue
+    printf '%s\t%s%s\n' "$name" "$name" "${title:+ — $title}"
+  done
+}
+
+mode_candidates() {
+  local default_mode="$1"
+  case "$default_mode" in
+    golden_throne) printf 'golden_throne\tGolden Throne (--gt, zealotry 5)\n' ;;
+    sync)          printf 'sync\tSync session (--sync, zealotry 5)\n' ;;
+    one_off)       printf 'one_off\tOne-off (--no-gt, zealotry 3)\n' ;;
+  esac
+  [[ "$default_mode" != "golden_throne" ]] && printf 'golden_throne\tGolden Throne (--gt, zealotry 5)\n'
+  [[ "$default_mode" != "sync" ]] && printf 'sync\tSync session (--sync, zealotry 5)\n'
+  [[ "$default_mode" != "one_off" ]] && printf 'one_off\tOne-off (--no-gt, zealotry 3)\n'
+}
+
+interactive_override_for() {
+  case "$1" in
+    dir) printf '%s' "${DISPATCH_INTERACTIVE_DIR:-}" ;;
+    session_doc) printf '%s' "${DISPATCH_INTERACTIVE_SESSION_DOC:-}" ;;
+    persona) printf '%s' "${DISPATCH_INTERACTIVE_PERSONA:-}" ;;
+    mode) printf '%s' "${DISPATCH_INTERACTIVE_MODE:-}" ;;
+  esac
+}
+
+pick_fzf_value() {
+  local key="$1" prompt="$2" default_value="$3" input selection override
+  input="$(cat)"
+  override="$(interactive_override_for "$key")"
+  if [[ -n "$override" ]]; then
+    case "$override" in none|NONE|__none__) printf '__none__';; *) printf '%s' "$override";; esac
+    return 0
+  fi
+
+  if [[ ! -t 2 || ! -r /dev/tty ]]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+
+  command -v fzf >/dev/null 2>&1 || { err "fzf is required for --interactive"; exit 69; }
+  selection="$(printf '%s\n' "$input" | fzf --height=40% --reverse --cycle --bind='tab:down,btab:up' --delimiter=$'\t' --with-nth=2.. --prompt="$prompt" || true)"
+  [[ -n "$selection" ]] || { err "interactive selection cancelled"; exit 130; }
+  printf '%s' "${selection%%$'\t'*}"
+}
+
+run_interactive_selection() {
+  local selected default_mode
+
+  WORK_DIR="$(expand_path "$WORK_DIR")"
+  selected="$(directory_candidates | dedupe_tsv | pick_fzf_value dir 'dir> ' "$WORK_DIR")"
+  [[ -n "$selected" ]] && WORK_DIR="$selected"
+
+  selected="$(session_doc_candidates | dedupe_tsv | pick_fzf_value session_doc 'session-doc> ' "${SESSION_DOC:-__none__}")"
+  if [[ "$selected" == "__none__" || "$selected" == "none" ]]; then SESSION_DOC=""; else SESSION_DOC="$selected"; fi
+
+  local default_persona
+  if [[ -n "$PERSONA" ]]; then
+    default_persona="$PERSONA"
+  elif [[ "$ENGINE" == "codex" ]]; then
+    default_persona="__sisters_of_battle__"
+  else
+    default_persona="__astartes__"
+  fi
+  selected="$(persona_candidates | dedupe_tsv | pick_fzf_value persona 'persona> ' "$default_persona")"
+  case "$selected" in
+    __astartes__|astartes)
+      PERSONA=""
+      ENGINE="claude"
+      ;;
+    __sisters_of_battle__|sisters|sisters-of-battle|sisters_of_battle)
+      PERSONA=""
+      ENGINE="codex"
+      ;;
+    __none__|none)
+      PERSONA=""
+      ;;
+    *)
+      PERSONA="$selected"
+      ENGINE="claude"
+      ;;
+  esac
+
+  if $SYNC; then default_mode="sync"; elif $GT_MODE; then default_mode="golden_throne"; else default_mode="one_off"; fi
+  selected="$(mode_candidates "$default_mode" | dedupe_tsv | pick_fzf_value mode 'mode> ' "$default_mode")"
+  case "$selected" in
+    golden_throne) GT_MODE=true;  SYNC=false ;;
+    sync)          GT_MODE=true;  SYNC=true ;;
+    one_off)       GT_MODE=false; SYNC=false ;;
+    *) err "unknown interactive mode: $selected"; exit 64 ;;
+  esac
+
+}
+
+if $INTERACTIVE; then
+  run_interactive_selection
+fi
+
+if $KIND_ALIAS_USED && ! $ASPIRANT; then
+  err "--kind is only valid as an alias for --aspirant-kind when --aspirant is set"
+  exit 64
+fi
+case "$ASPIRANT_KIND" in
+  dispatch|deploy_p|deploy_d) ;;
+  *) err "--aspirant-kind must be dispatch, deploy_p, or deploy_d"; exit 64 ;;
+esac
+case "$SESSION_DOMAIN" in
+  ""|terra|mars) ;;
+  *) err "--session-domain must be terra or mars"; exit 64 ;;
+esac
+if $ASPIRANT && $DIRECT; then
+  err "--aspirant and --direct are mutually exclusive"
+  exit 64
+fi
+
+auto_aspirant_policy_applies() {
+  $DIRECT && return 1
+  [[ -n "$RESUME_ID" ]] && return 1
+  [[ -n "${TOKEN_API_INTERNAL_DISPATCH:-}" ]] && return 1
+  [[ -n "${TOKEN_API_ASPIRANT_PIPELINE:-}" ]] && return 1
+  [[ -n "$PERSONA" ]] && return 1
+
+  local origin="${TOKEN_API_DISPATCH_ORIGIN:-${DISPATCH_ORIGIN:-}}"
+  case "$origin" in
+    c|cc|cdc|human:c|human:cc|human:cdc) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! $ASPIRANT && auto_aspirant_policy_applies; then
+  ASPIRANT=true
+  ASPIRANT_KIND="dispatch"
+fi
+
+RESUME_INSTANCE_TYPE=""
+RESUME_LAUNCHER=""
+RESUME_PRIMARCH=""
+RESUME_PARENT_INSTANCE_ID=""
+RESUME_DISPATCH_TARGET=""
+RESUME_DISPATCH_WINDOW=""
+RESUME_DISPATCH_MODE=""
+RESUME_DISPATCH_SLOT=""
+RESUME_LAUNCH_MODE=""
+RESUME_TMUX_PANE=""
+RESUME_DISCORD_HOSTED=""
+RESUME_DISCORD_CHANNEL=""
+RESUME_DISCORD_BOT=""
+
+resolve_resume_id() {
+  local sid_sql row
+  sid_sql="$(sql_literal "$RESUME_ID")"
+  row="$(sqlite_query_usv "
+    SELECT
+      COALESCE(ci.engine, ''),
+      COALESCE(ci.launcher, ''),
+      COALESCE(ci.target_working_dir, ''),
+      COALESCE(ci.working_dir, ''),
+      COALESCE(ci.dispatch_session_doc_path, ''),
+      COALESCE(sd.file_path, ''),
+      COALESCE(ci.instance_type, ''),
+      COALESCE(ci.zealotry, ''),
+      COALESCE(ci.dispatch_target, ''),
+      COALESCE(ci.dispatch_window, ''),
+      COALESCE(ci.dispatch_mode, ''),
+      COALESCE(ci.dispatch_slot, ''),
+      COALESCE(ci.launch_mode, ''),
+      COALESCE(ci.tmux_pane, ''),
+      COALESCE(ci.primarch, ''),
+      COALESCE(ci.parent_instance_id, ''),
+      COALESCE(ci.discord_hosted, ''),
+      COALESCE(ci.discord_channel, ''),
+      COALESCE(ci.discord_bot, '')
+    FROM claude_instances ci
+    LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+    WHERE ci.session_id = '${sid_sql}'
+    ORDER BY ci.last_activity DESC
+    LIMIT 1;
+  ")"
+
+  if [[ -z "$row" ]]; then
+    if ! $ENGINE_EXPLICIT || ! $WORK_DIR_EXPLICIT; then
+      err "--id ${RESUME_ID} was not found in Token-API DB; pass explicit --engine and --dir to resume without DB metadata"
+      exit 66
+    fi
+    RESUME_ROW_FOUND=false
+    return 0
+  fi
+
+  RESUME_ROW_FOUND=true
+  local row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry
+  IFS=$'\x1f' read -r row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry \
+    RESUME_DISPATCH_TARGET RESUME_DISPATCH_WINDOW RESUME_DISPATCH_MODE RESUME_DISPATCH_SLOT RESUME_LAUNCH_MODE \
+    RESUME_TMUX_PANE RESUME_PRIMARCH RESUME_PARENT_INSTANCE_ID RESUME_DISCORD_HOSTED RESUME_DISCORD_CHANNEL RESUME_DISCORD_BOT <<< "$row"
+
+  ENGINE="$(infer_engine "$row_engine" "$row_launcher")"
+  RESUME_LAUNCHER="$row_launcher"
+  [[ -n "$row_target_dir" ]] && WORK_DIR="$row_target_dir"
+  [[ -z "$row_target_dir" && -n "$row_work_dir" ]] && WORK_DIR="$row_work_dir"
+  [[ -n "$row_dispatch_doc" ]] && SESSION_DOC="$row_dispatch_doc"
+  [[ -z "$row_dispatch_doc" && -n "$row_doc_path" ]] && SESSION_DOC="$row_doc_path"
+  RESUME_INSTANCE_TYPE="$row_type"
+  [[ -n "$row_zealotry" ]] && ZEALOTRY="$row_zealotry"
+
+  case "$RESUME_INSTANCE_TYPE" in
+    sync) SYNC=true; GT_MODE=true ;;
+    golden_throne) SYNC=false; GT_MODE=true ;;
+    one_off) SYNC=false; GT_MODE=false ;;
+  esac
+}
+
+if [[ -n "$RESUME_ID" ]]; then
+  resolve_resume_id
+fi
+
 case "$ENGINE" in
   claude|codex) ;;
   *) err "--engine must be claude or codex"; exit 64 ;;
@@ -96,12 +471,41 @@ if [[ -n "$PROMPT_FILE" ]]; then
   FILE_PROMPT="$(cat "$PROMPT_FILE")"
   if [[ -n "$PROMPT" ]]; then PROMPT="${PROMPT}"$'\n\n'"${FILE_PROMPT}"; else PROMPT="$FILE_PROMPT"; fi
 fi
+if [[ -n "$SYSTEM_PROMPT_FILE" ]]; then
+  [[ -f "$SYSTEM_PROMPT_FILE" ]] || { err "system prompt file not found: $SYSTEM_PROMPT_FILE"; exit 66; }
+  FILE_SYSTEM_PROMPT="$(cat "$SYSTEM_PROMPT_FILE")"
+  if [[ -n "$SYSTEM_PROMPT" ]]; then SYSTEM_PROMPT="${SYSTEM_PROMPT}"$'\n\n'"${FILE_SYSTEM_PROMPT}"; else SYSTEM_PROMPT="$FILE_SYSTEM_PROMPT"; fi
+fi
+if [[ -z "$OBJECTIVE" && -n "$PROMPT" ]]; then
+  OBJECTIVE="$PROMPT"
+fi
+if [[ -z "$TITLE" && -n "$OBJECTIVE" ]]; then
+  TITLE="$(printf '%s' "$OBJECTIVE" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-80)"
+fi
+[[ -z "$TITLE" ]] && TITLE="Dispatch aspirant"
+
+if [[ -n "$SYSTEM_PROMPT" && "$ENGINE" == "codex" ]]; then
+  err "--system-prompt/--system-prompt-file are not supported for --engine codex"
+  exit 64
+fi
+if $ASPIRANT && $SYSTEM_PROMPT_INLINE_USED; then
+  err "--system-prompt text is not supported with --aspirant yet; use --system-prompt-file"
+  exit 64
+fi
+if [[ -n "$SYSTEM_PROMPT" && -n "$PERSONA" && "$ASPIRANT" != true ]]; then
+  err "--system-prompt/--system-prompt-file are only supported for direct Claude wrapper launches, not --persona"
+  exit 64
+fi
 
 WORK_DIR="$(eval echo "$WORK_DIR")"
-[[ -d "$WORK_DIR" ]] || { err "working directory does not exist: $WORK_DIR"; exit 65; }
-WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+if ! $ASPIRANT || [[ "$ASPIRANT_KIND" == "dispatch" ]]; then
+  [[ -d "$WORK_DIR" ]] || { err "working directory does not exist: $WORK_DIR"; exit 65; }
+  WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+fi
 
-if $SYNC; then
+if [[ -n "$RESUME_INSTANCE_TYPE" ]]; then
+  INSTANCE_TYPE="$RESUME_INSTANCE_TYPE"
+elif $SYNC; then
   INSTANCE_TYPE="sync"
 elif $GT_MODE; then
   INSTANCE_TYPE="golden_throne"
@@ -114,6 +518,59 @@ fi
 if ! [[ "$ZEALOTRY" =~ ^[0-9]+$ ]] || (( ZEALOTRY < 1 || ZEALOTRY > 10 )); then
   err "--zealotry must be an integer from 1 to 10"
   exit 64
+fi
+
+build_aspirant_create_command() {
+  local -a args
+  args=(aspirant-create --kind "$ASPIRANT_KIND" --title "$TITLE" --objective "$OBJECTIVE" --source "$ASPIRANT_SOURCE")
+  [[ -n "$SESSION_DOMAIN" ]] && args+=(--session-domain "$SESSION_DOMAIN")
+  if [[ "$ASPIRANT_KIND" == "dispatch" ]]; then
+    args+=(--engine "$ENGINE" --dir "$WORK_DIR" --zealotry "$ZEALOTRY")
+    [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
+    [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
+    [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
+    [[ -n "$SYSTEM_PROMPT_FILE" ]] && args+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
+    [[ -n "$PROMPT_FILE" ]] && args+=(--prompt-file "$PROMPT_FILE")
+    local vc
+    if ((${#VICTORY_CONDITIONS[@]})); then
+      for vc in "${VICTORY_CONDITIONS[@]}"; do
+        args+=(--victory-condition "$vc")
+      done
+    fi
+  fi
+  local a
+  for a in "${args[@]}"; do printf '%q ' "$a"; done
+}
+
+if $ASPIRANT; then
+  if [[ -z "$OBJECTIVE" ]]; then
+    err "--aspirant requires --objective or prompt text"
+    exit 64
+  fi
+  ASPIRANT_CREATE_COMMAND="$(build_aspirant_create_command)"
+  if $DRY_RUN; then
+    cat <<EOF_ASPIRANT_DRY
+dispatch aspirant dry-run
+  aspirant_kind:  $ASPIRANT_KIND
+  title:          $TITLE
+  objective:      $OBJECTIVE
+  source:         $ASPIRANT_SOURCE
+  engine:         $ENGINE
+  dir:            $WORK_DIR
+  target:         ${TARGET:-none}
+  persona:        ${PERSONA:-none}
+  zealotry:       $ZEALOTRY
+  session_domain: ${SESSION_DOMAIN:-default}
+  delegate_command:
+    $ASPIRANT_CREATE_COMMAND
+EOF_ASPIRANT_DRY
+    exit 0
+  fi
+  if ! command -v aspirant-create >/dev/null 2>&1; then
+    err "aspirant backend not installed; explicit --direct to bypass"
+    exit 69
+  fi
+  exec bash -lc "$ASPIRANT_CREATE_COMMAND"
 fi
 
 DISPATCH_WINDOW=""
@@ -133,6 +590,24 @@ if [[ -n "$TARGET" ]]; then
     fi
   else
     LAUNCH_MODE="tmux_target"
+  fi
+fi
+if [[ -n "$RESUME_ID" ]]; then
+  [[ -n "$RESUME_DISPATCH_TARGET" && -z "$TARGET" ]] && RESOLVED_TARGET="$RESUME_DISPATCH_TARGET"
+  [[ -n "$RESUME_DISPATCH_WINDOW" ]] && DISPATCH_WINDOW="$RESUME_DISPATCH_WINDOW"
+  [[ -n "$RESUME_DISPATCH_MODE" ]] && DISPATCH_MODE="$RESUME_DISPATCH_MODE"
+  [[ -n "$RESUME_DISPATCH_SLOT" ]] && DISPATCH_SLOT="$RESUME_DISPATCH_SLOT"
+  [[ -n "$RESUME_LAUNCH_MODE" ]] && LAUNCH_MODE="$RESUME_LAUNCH_MODE"
+  if [[ -n "$TARGET" ]]; then
+    if [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
+      LAUNCH_MODE="direct"
+    else
+      LAUNCH_MODE="tmux_target"
+    fi
+  elif [[ -n "${TMUX_PANE:-}" ]]; then
+    RESOLVED_TARGET="${TMUX_PANE}"
+  elif [[ -n "$RESUME_TMUX_PANE" && -z "$RESOLVED_TARGET" ]]; then
+    RESOLVED_TARGET="$RESUME_TMUX_PANE"
   fi
 fi
 
@@ -182,6 +657,19 @@ if [[ -n "$DISCORD_CHANNEL" ]]; then
     "TOKEN_API_DISCORD_BOT=${DISCORD_BOT}"
   )
 fi
+if [[ -n "$RESUME_PRIMARCH" ]]; then
+  COMMON_ENV+=("TOKEN_API_PRIMARCH=${RESUME_PRIMARCH}")
+fi
+if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "${TOKEN_API_PARENT_INSTANCE_ID:-}" ]]; then
+  COMMON_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${RESUME_PARENT_INSTANCE_ID}")
+fi
+if [[ -n "$RESUME_DISCORD_CHANNEL" && -z "$DISCORD_CHANNEL" ]]; then
+  COMMON_ENV+=(
+    "TOKEN_API_DISCORD_HOSTED=${RESUME_DISCORD_HOSTED:-1}"
+    "TOKEN_API_DISCORD_CHANNEL=${RESUME_DISCORD_CHANNEL}"
+    "TOKEN_API_DISCORD_BOT=${RESUME_DISCORD_BOT}"
+  )
+fi
 
 build_agent_command() {
   local -a cmd envs
@@ -189,7 +677,16 @@ build_agent_command() {
   if [[ -n "${RESOLVED_TARGET:-}" && "$RESOLVED_TARGET" != *:* ]]; then
     envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TARGET}" "TMUX_PANE=${RESOLVED_TARGET}")
   fi
-  if [[ "$ENGINE" == "codex" ]]; then
+  if [[ -n "$RESUME_ID" ]]; then
+    if [[ "$ENGINE" == "codex" ]]; then
+      cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY" --resume-session "$RESUME_ID")
+      $GT_MODE || cmd+=(--no-gt)
+      cmd+=(-- "$WORK_DIR" "${PROMPT:-}")
+    else
+      cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions --resume "$RESUME_ID")
+      [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
+    fi
+  elif [[ "$ENGINE" == "codex" ]]; then
     cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY")
     $GT_MODE || cmd+=(--no-gt)
     cmd+=(-- "$WORK_DIR" "${PROMPT:-}")
@@ -198,6 +695,7 @@ build_agent_command() {
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   else
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+    [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
   printf 'cd %q && env TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
@@ -209,21 +707,41 @@ build_agent_command() {
 
 FINAL_COMMAND="$(build_agent_command)"
 
-if $INTERACTIVE; then
-  if [[ -t 0 && -t 1 ]]; then
-    echo "dispatch interactive"
-    read -r -p "Engine [claude/codex] (${ENGINE}): " input_engine || true
-    [[ -n "${input_engine:-}" ]] && ENGINE="$input_engine"
-    read -r -p "Directory (${WORK_DIR}): " input_dir || true
-    [[ -n "${input_dir:-}" ]] && WORK_DIR="$input_dir"
-    read -r -p "Prompt (optional): " input_prompt || true
-    [[ -n "${input_prompt:-}" ]] && PROMPT="$input_prompt"
-    next_args=(--engine "$ENGINE" --dir "$WORK_DIR")
-    [[ -n "$PROMPT" ]] && next_args+=(--prompt "$PROMPT")
-    exec "$0" "${next_args[@]}"
+build_dispatch_command() {
+  local -a args
+  if [[ -n "$RESUME_ID" ]]; then
+    args=(dispatch --id "$RESUME_ID")
+    [[ -n "$TARGET" ]] && args+=(--pane "$TARGET")
+    [[ "$RESUME_ROW_FOUND" != true ]] && args+=(--engine "$ENGINE" --dir "$WORK_DIR")
+    local a
+    for a in "${args[@]}"; do printf '%q ' "$a"; done
+    return
   else
-    # Non-interactive shell function calls should still launch the default agent.
-    :
+    args=(dispatch --engine "$ENGINE" --dir "$WORK_DIR")
+  fi
+  [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
+  if [[ -z "$RESUME_ID" ]]; then
+    [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
+    [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
+  fi
+  if $SYNC; then args+=(--sync); elif $GT_MODE; then args+=(--gt); else args+=(--no-gt); fi
+  args+=(--zealotry "$ZEALOTRY")
+  $WITH_BROWSER && args+=(--with-browser)
+  $WITH_DESKTOP && args+=(--with-desktop)
+  [[ -n "$WITH_MCP" ]] && args+=(--with-mcp "$WITH_MCP")
+  [[ -n "$DISCORD_CHANNEL" ]] && args+=(--discord "$DISCORD_CHANNEL")
+  [[ -n "$SYSTEM_PROMPT" ]] && args+=(--system-prompt "$SYSTEM_PROMPT")
+  [[ -n "$PROMPT" ]] && args+=(--prompt "$PROMPT")
+  for a in "${args[@]}"; do printf '%q ' "$a"; done
+}
+
+RESOLVED_DISPATCH_COMMAND="$(build_dispatch_command)"
+PERSONA_DISPLAY="$PERSONA"
+if [[ -z "$PERSONA_DISPLAY" ]]; then
+  if [[ "$ENGINE" == "codex" ]]; then
+    PERSONA_DISPLAY="Sisters of Battle"
+  else
+    PERSONA_DISPLAY="astartes"
   fi
 fi
 
@@ -231,19 +749,24 @@ if $DRY_RUN; then
   cat <<EOF_DRY
 dispatch dry-run
   engine:          $ENGINE
+  resume_id:       ${RESUME_ID:-none}
+  resume_db:       $RESUME_ROW_FOUND
   dir:             $WORK_DIR
   target:          ${TARGET:-current}
   resolved_target: ${RESOLVED_TARGET:-current}
-  persona:         ${PERSONA:-none}
+  persona:         $PERSONA_DISPLAY
   instance_type:   $INSTANCE_TYPE
   zealotry:        $ZEALOTRY
   sync:            $SYNC
-  session_doc:     ${SESSION_DOC:-none}
+  session_doc:     ${SESSION_DOC:-new session doc}
+  system_prompt:   $([[ -n "$SYSTEM_PROMPT" ]] && echo provided || echo none)
   mcp:             $MCP_DECISION
   discord:         ${DISCORD_CHANNEL:-none}${DISCORD_CHANNEL:+ (bot: $DISCORD_BOT)}
   launch_env:
 EOF_DRY
   for e in "${COMMON_ENV[@]}"; do echo "    $e"; done
+  echo "  dispatch_command:"
+  echo "    $RESOLVED_DISPATCH_COMMAND"
   echo "  final_command:"
   echo "    $FINAL_COMMAND"
   exit 0
