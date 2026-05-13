@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # codex-dispatch — Launch Codex with Token-API session tracking and dispatch metadata
+# AUDIENCE: deprecated
 
 set -euo pipefail
+
+if [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" != "1" ]]; then
+  echo "codex-dispatch has been retired. Use: dispatch --engine codex" >&2
+  exit 64
+fi
+
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
@@ -12,7 +19,7 @@ elif [[ -n "${IMPERIUM:-}" && -f "$IMPERIUM/Token-OS/cli-tools/lib/nas-path.sh" 
   source "$IMPERIUM/Token-OS/cli-tools/lib/nas-path.sh"
 fi
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 SESSION_DOC=""
 DISPATCH_TARGET=""
@@ -27,6 +34,7 @@ LAUNCHER="codex-dispatch"
 CODEX_PROFILE=""
 GT_MODE=true
 ZEALOTRY=""
+RESUME_SESSION_ID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --launcher) LAUNCHER="$2"; shift 2 ;;
     --profile) CODEX_PROFILE="$2"; shift 2 ;;
     --zealotry) ZEALOTRY="$2"; shift 2 ;;
+    --resume-session) RESUME_SESSION_ID="$2"; shift 2 ;;
     --no-gt) GT_MODE=false; shift ;;
     --gt) GT_MODE=true; shift ;;
     --) shift; break ;;
@@ -51,7 +60,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: codex-dispatch [dispatch-options] <working-dir> <prompt>" >&2
+  echo "Usage: codex-dispatch [dispatch-options] [--resume-session ID] <working-dir> <prompt>" >&2
   exit 64
 fi
 
@@ -73,7 +82,8 @@ else
   ZEALOTRY="${ZEALOTRY:-3}"
 fi
 
-if ! command -v codex >/dev/null 2>&1; then
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+if [[ -z "$CODEX_BIN" ]]; then
   echo "Error: codex not found in PATH" >&2
   exit 66
 fi
@@ -102,10 +112,17 @@ build_env_object() {
   local env_obj="{}"
   [[ -n "${SSH_CLIENT:-}" ]]          && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
   [[ -n "${TMUX:-}" ]]               && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
-  [[ -n "${TMUX_PANE:-}" ]]          && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX_PANE" '. + {TMUX_PANE: $v}')
+  [[ -n "${RESOLVED_TMUX_PANE:-${TMUX_PANE:-}}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "${RESOLVED_TMUX_PANE:-${TMUX_PANE:-}}" '. + {TMUX_PANE: $v}')
   [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
   [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_CODEX_PROFILE" '. + {TOKEN_API_CODEX_PROFILE: $v}')
   [[ -n "${TOKEN_API_PARENT_INSTANCE_ID:-${PARENT_INSTANCE_ID:-}}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "${TOKEN_API_PARENT_INSTANCE_ID:-$PARENT_INSTANCE_ID}" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_MCP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP" '. + {TOKEN_API_DISPATCH_MCP: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_BROWSER" '. + {TOKEN_API_DISPATCH_WITH_BROWSER: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_DESKTOP" '. + {TOKEN_API_DISPATCH_WITH_DESKTOP: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP_LIST" '. + {TOKEN_API_DISPATCH_MCP_LIST: $v}')
+  [[ -n "${TOKEN_API_DISCORD_HOSTED:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_HOSTED" '. + {TOKEN_API_DISCORD_HOSTED: $v}')
+  [[ -n "${TOKEN_API_DISCORD_CHANNEL:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_CHANNEL" '. + {TOKEN_API_DISCORD_CHANNEL: $v}')
+  [[ -n "${TOKEN_API_DISCORD_BOT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_BOT" '. + {TOKEN_API_DISCORD_BOT: $v}')
   echo "$env_obj"
 }
 
@@ -206,9 +223,17 @@ CODEX_ENV=(
   "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
   "TOKEN_API_TRANSPLANT_EXPECTED=${TRANSPLANT_EXPECTED}"
   "TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TMUX_PANE}"
+  "TMUX_PANE=${RESOLVED_TMUX_PANE:-${TMUX_PANE:-}}"
   "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
   "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
   "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
+  "TOKEN_API_DISPATCH_MCP=${TOKEN_API_DISPATCH_MCP:-}"
+  "TOKEN_API_DISPATCH_WITH_BROWSER=${TOKEN_API_DISPATCH_WITH_BROWSER:-}"
+  "TOKEN_API_DISPATCH_WITH_DESKTOP=${TOKEN_API_DISPATCH_WITH_DESKTOP:-}"
+  "TOKEN_API_DISPATCH_MCP_LIST=${TOKEN_API_DISPATCH_MCP_LIST:-}"
+  "TOKEN_API_DISCORD_HOSTED=${TOKEN_API_DISCORD_HOSTED:-}"
+  "TOKEN_API_DISCORD_CHANNEL=${TOKEN_API_DISCORD_CHANNEL:-}"
+  "TOKEN_API_DISCORD_BOT=${TOKEN_API_DISCORD_BOT:-}"
 )
 
 CODEX_PROFILE_ARGS=()
@@ -218,7 +243,9 @@ fi
 
 if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
   OUTPUT_FILE="/tmp/codex-${SESSION_ID}.md"
-  env "${CODEX_ENV[@]}" codex exec ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
+  env "${CODEX_ENV[@]}" "$CODEX_BIN" exec ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG --json -o "$OUTPUT_FILE"
+elif [[ -n "$RESUME_SESSION_ID" ]]; then
+  env "${CODEX_ENV[@]}" "$CODEX_BIN" resume -C "$WORKING_DIR" $BYPASS_FLAG ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$RESUME_SESSION_ID" "$PROMPT"
 else
-  env "${CODEX_ENV[@]}" codex ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
+  env "${CODEX_ENV[@]}" "$CODEX_BIN" ${CODEX_PROFILE_ARGS[@]+"${CODEX_PROFILE_ARGS[@]}"} "$PROMPT" -C "$WORKING_DIR" $BYPASS_FLAG
 fi

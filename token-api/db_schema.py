@@ -40,6 +40,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 tts_voice TEXT,
                 notification_sound TEXT,
                 primarch TEXT,
+                pane_label TEXT,
                 pid INTEGER,
                 status TEXT DEFAULT 'idle',
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -59,7 +60,20 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ("tts_mode", "ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'"),
             ("session_doc_id", "ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER"),
             ("zealotry", "ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4"),
+            (
+                "gt_resume_count",
+                "ALTER TABLE claude_instances ADD COLUMN gt_resume_count INTEGER DEFAULT 0",
+            ),
+            (
+                "gt_resume_window_started_at",
+                "ALTER TABLE claude_instances ADD COLUMN gt_resume_window_started_at TIMESTAMP",
+            ),
+            (
+                "gt_last_resume_at",
+                "ALTER TABLE claude_instances ADD COLUMN gt_last_resume_at TIMESTAMP",
+            ),
             ("tmux_pane", "ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT"),
+            ("pane_label", "ALTER TABLE claude_instances ADD COLUMN pane_label TEXT"),
             ("primarch", "ALTER TABLE claude_instances ADD COLUMN primarch TEXT"),
             ("victory_at", "ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP"),
             ("victory_reason", "ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT"),
@@ -75,6 +89,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0",
             ),
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
+            ("discord_bot", "ALTER TABLE claude_instances ADD COLUMN discord_bot TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
             (
                 "instance_type",
@@ -150,7 +165,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
 
         # Drop dead columns (phase 1 DB thinning)
         dead_columns = {
-            "pane_label",
             "pre_stop_status",
             "retrigger_count",
             "spawner",
@@ -249,6 +263,58 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_expected_ack_source_instance
             ON expected_acknowledgements(source, instance_id, status)
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pane_write_queue (
+                id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                tmux_pane TEXT NOT NULL,
+                source TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                attempted_at TIMESTAMP,
+                sent_at TIMESTAMP,
+                cancelled_at TIMESTAMP,
+                last_error TEXT,
+                last_result_json TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pane_write_queue_pending
+            ON pane_write_queue(status, created_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pane_write_queue_instance_source
+            ON pane_write_queue(instance_id, source, status)
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_polls (
+                poll_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (poll_id, instance_id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_poll
+            ON pending_polls(poll_id, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_instance
+            ON pending_polls(instance_id, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_polls_expires
+            ON pending_polls(expires_at)
         """)
 
         await db.execute("""
@@ -364,6 +430,17 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 state_json TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS day_state (
+                date TEXT PRIMARY KEY,
+                day_started_at TEXT,
+                source TEXT,
+                details_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -812,6 +889,14 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "cron",
                 "0 3 * * *",
                 1,
+            ),
+            (
+                "day_start_schedule_fallback",
+                "Day Start Schedule Fallback",
+                "Fire the unified day-start hook at the default wake anchor if not already fired",
+                "cron",
+                "30 8 * * *",
+                0,
             ),
         ]
         for task_id, name, description, task_type, schedule, max_retries in scheduled_task_seed:

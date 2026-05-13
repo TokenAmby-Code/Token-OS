@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# dispatch - Canonical launcher for new agent sessions
+# TAGS: instance, dispatch, launcher
+# AUDIENCE: human, agent
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+usage() {
+  cat <<'USAGE'
+dispatch — canonical launcher for new agent sessions
+
+Usage:
+  dispatch [options]
+
+Options:
+  --engine claude|codex        Agent engine (default: claude)
+  --persona <name>             Persona name (Claude/primarch backend)
+  --dir <path>                 Working directory (default: cwd)
+  --session-doc <path>         Session doc path to bind at SessionStart
+  --prompt <text>              Initial prompt
+  --prompt-file <path>         Read initial prompt from file
+  --target <target>            legion:new, mechanicus:new, or a tmux pane id
+  --gt | --no-gt               Golden Throne lane toggle (default: --gt)
+  --zealotry <1-10>            Golden Throne zealotry (default: 5 with --gt, 3 with --no-gt)
+  --sync                       Sync-session lane
+  --with-browser               Request browser MCP/profile metadata
+  --with-desktop               Request desktop MCP/profile metadata
+  --with-mcp <list>            Comma-separated MCP request metadata
+  --discord <id>               Discord thread/channel id hosted by this launch
+  --dry-run                    Resolve and print without mutating state
+  --interactive                Minimal interactive launcher
+  --help, -h                   Show this help
+USAGE
+}
+
+err() { echo "dispatch: $*" >&2; }
+quote() { printf '%q' "$1"; }
+
+ENGINE="claude"
+PERSONA=""
+WORK_DIR="$(pwd)"
+SESSION_DOC=""
+PROMPT=""
+PROMPT_FILE=""
+TARGET=""
+GT_MODE=true
+ZEALOTRY=""
+SYNC=false
+WITH_BROWSER=false
+WITH_DESKTOP=false
+WITH_MCP=""
+DISCORD_CHANNEL=""
+DRY_RUN=false
+INTERACTIVE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --engine) ENGINE="${2:-}"; shift 2 ;;
+    --persona|--primarch) PERSONA="${2:-}"; shift 2 ;;
+    --dir|-C) WORK_DIR="${2:-}"; shift 2 ;;
+    --session-doc) SESSION_DOC="${2:-}"; shift 2 ;;
+    --prompt) PROMPT="${2:-}"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --target|--pane) TARGET="${2:-}"; shift 2 ;;
+    --gt) GT_MODE=true; shift ;;
+    --no-gt) GT_MODE=false; shift ;;
+    --zealotry) ZEALOTRY="${2:-}"; shift 2 ;;
+    --sync) SYNC=true; shift ;;
+    --with-browser) WITH_BROWSER=true; shift ;;
+    --with-desktop) WITH_DESKTOP=true; shift ;;
+    --with-mcp) WITH_MCP="${2:-}"; shift 2 ;;
+    --discord) DISCORD_CHANNEL="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --interactive) INTERACTIVE=true; shift ;;
+    --help|-h) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) err "unknown option: $1"; usage >&2; exit 64 ;;
+    *)
+      if [[ -z "$PROMPT" ]]; then PROMPT="$1"; else PROMPT+=$' '"$1"; fi
+      shift
+      ;;
+  esac
+done
+
+case "$ENGINE" in
+  claude|codex) ;;
+  *) err "--engine must be claude or codex"; exit 64 ;;
+esac
+
+if [[ -n "$PROMPT_FILE" ]]; then
+  [[ -f "$PROMPT_FILE" ]] || { err "prompt file not found: $PROMPT_FILE"; exit 66; }
+  FILE_PROMPT="$(cat "$PROMPT_FILE")"
+  if [[ -n "$PROMPT" ]]; then PROMPT="${PROMPT}"$'\n\n'"${FILE_PROMPT}"; else PROMPT="$FILE_PROMPT"; fi
+fi
+
+WORK_DIR="$(eval echo "$WORK_DIR")"
+[[ -d "$WORK_DIR" ]] || { err "working directory does not exist: $WORK_DIR"; exit 65; }
+WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+if $SYNC; then
+  INSTANCE_TYPE="sync"
+elif $GT_MODE; then
+  INSTANCE_TYPE="golden_throne"
+else
+  INSTANCE_TYPE="one_off"
+fi
+if [[ -z "$ZEALOTRY" ]]; then
+  if $GT_MODE; then ZEALOTRY=5; else ZEALOTRY=3; fi
+fi
+if ! [[ "$ZEALOTRY" =~ ^[0-9]+$ ]] || (( ZEALOTRY < 1 || ZEALOTRY > 10 )); then
+  err "--zealotry must be an integer from 1 to 10"
+  exit 64
+fi
+
+DISPATCH_WINDOW=""
+DISPATCH_MODE=""
+DISPATCH_SLOT=""
+RESOLVED_TARGET="$TARGET"
+LAUNCH_MODE="direct"
+if [[ -n "$TARGET" ]]; then
+  if [[ "$TARGET" == *:* ]]; then
+    DISPATCH_WINDOW="${TARGET%%:*}"
+    DISPATCH_SLOT="${TARGET#*:}"
+    DISPATCH_MODE="$DISPATCH_SLOT"
+    if [[ "$DISPATCH_SLOT" == "new" ]]; then
+      LAUNCH_MODE="tmux_stack_new"
+    else
+      LAUNCH_MODE="tmux_target"
+    fi
+  else
+    LAUNCH_MODE="tmux_target"
+  fi
+fi
+
+DISCORD_BOT=""
+if [[ -n "$DISCORD_CHANNEL" ]]; then
+  PERSONA_LOWER="$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')"
+  case "$PERSONA_LOWER" in
+    custodes) DISCORD_BOT="custodes" ;;
+    inquisitor|inquisition) DISCORD_BOT="inquisition" ;;
+    *) DISCORD_BOT="mechanicus" ;;
+  esac
+fi
+
+MCP_DECISION="default"
+MCP_REQUESTS=()
+$WITH_BROWSER && MCP_REQUESTS+=("browser")
+$WITH_DESKTOP && MCP_REQUESTS+=("desktop")
+[[ -n "$WITH_MCP" ]] && MCP_REQUESTS+=("$WITH_MCP")
+if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
+  MCP_DECISION="requested: $(IFS=,; echo "${MCP_REQUESTS[*]}")"
+fi
+
+WRAPPER_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+COMMON_ENV=(
+  "TOKEN_API_LAUNCHER=dispatch"
+  "TOKEN_API_ENGINE=${ENGINE}"
+  "TOKEN_API_WRAPPER_LAUNCH_ID=${WRAPPER_ID}"
+  "TOKEN_API_DISPATCH_TARGET=${TARGET}"
+  "TOKEN_API_DISPATCH_WINDOW=${DISPATCH_WINDOW}"
+  "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
+  "TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}"
+  "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${SESSION_DOC}"
+  "TOKEN_API_TARGET_WORKING_DIR=${WORK_DIR}"
+  "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
+  "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
+  "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
+  "TOKEN_API_PARENT_INSTANCE_ID=${TOKEN_API_PARENT_INSTANCE_ID:-}"
+  "TOKEN_API_DISPATCH_MCP=${MCP_DECISION}"
+  "TOKEN_API_DISPATCH_WITH_BROWSER=${WITH_BROWSER}"
+  "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
+  "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
+)
+if [[ -n "$DISCORD_CHANNEL" ]]; then
+  COMMON_ENV+=(
+    "TOKEN_API_DISCORD_HOSTED=1"
+    "TOKEN_API_DISCORD_CHANNEL=${DISCORD_CHANNEL}"
+    "TOKEN_API_DISCORD_BOT=${DISCORD_BOT}"
+  )
+fi
+
+build_agent_command() {
+  local -a cmd envs
+  envs=("${COMMON_ENV[@]}")
+  if [[ -n "${RESOLVED_TARGET:-}" && "$RESOLVED_TARGET" != *:* ]]; then
+    envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TARGET}" "TMUX_PANE=${RESOLVED_TARGET}")
+  fi
+  if [[ "$ENGINE" == "codex" ]]; then
+    cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY")
+    $GT_MODE || cmd+=(--no-gt)
+    cmd+=(-- "$WORK_DIR" "${PROMPT:-}")
+  elif [[ -n "$PERSONA" ]]; then
+    cmd=("${SCRIPT_DIR}/primarch" "$PERSONA")
+    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+  else
+    cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+  fi
+  printf 'cd %q && env TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  local e
+  for e in "${envs[@]}"; do printf ' %q' "$e"; done
+  local a
+  for a in "${cmd[@]}"; do printf ' %q' "$a"; done
+}
+
+FINAL_COMMAND="$(build_agent_command)"
+
+if $INTERACTIVE; then
+  if [[ -t 0 && -t 1 ]]; then
+    echo "dispatch interactive"
+    read -r -p "Engine [claude/codex] (${ENGINE}): " input_engine || true
+    [[ -n "${input_engine:-}" ]] && ENGINE="$input_engine"
+    read -r -p "Directory (${WORK_DIR}): " input_dir || true
+    [[ -n "${input_dir:-}" ]] && WORK_DIR="$input_dir"
+    read -r -p "Prompt (optional): " input_prompt || true
+    [[ -n "${input_prompt:-}" ]] && PROMPT="$input_prompt"
+    next_args=(--engine "$ENGINE" --dir "$WORK_DIR")
+    [[ -n "$PROMPT" ]] && next_args+=(--prompt "$PROMPT")
+    exec "$0" "${next_args[@]}"
+  else
+    # Non-interactive shell function calls should still launch the default agent.
+    :
+  fi
+fi
+
+if $DRY_RUN; then
+  cat <<EOF_DRY
+dispatch dry-run
+  engine:          $ENGINE
+  dir:             $WORK_DIR
+  target:          ${TARGET:-current}
+  resolved_target: ${RESOLVED_TARGET:-current}
+  persona:         ${PERSONA:-none}
+  instance_type:   $INSTANCE_TYPE
+  zealotry:        $ZEALOTRY
+  sync:            $SYNC
+  session_doc:     ${SESSION_DOC:-none}
+  mcp:             $MCP_DECISION
+  discord:         ${DISCORD_CHANNEL:-none}${DISCORD_CHANNEL:+ (bot: $DISCORD_BOT)}
+  launch_env:
+EOF_DRY
+  for e in "${COMMON_ENV[@]}"; do echo "    $e"; done
+  echo "  final_command:"
+  echo "    $FINAL_COMMAND"
+  exit 0
+fi
+
+if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
+  if ! command -v tmuxctl >/dev/null 2>&1; then
+    err "tmuxctl is required for target $TARGET"
+    exit 69
+  fi
+  session="main"
+  stack="$DISPATCH_WINDOW"
+  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "$FINAL_COMMAND")"
+  echo "dispatched $ENGINE to $pane_id"
+  exit 0
+fi
+
+if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    err "tmux is required for target $TARGET"
+    exit 69
+  fi
+  tmux send-keys -t "$TARGET" "clear" Enter
+  sleep 0.2
+  tmux send-keys -t "$TARGET" "$FINAL_COMMAND" Enter
+  echo "dispatched $ENGINE to $TARGET"
+  exit 0
+fi
+
+exec bash -lc "$FINAL_COMMAND"

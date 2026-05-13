@@ -1,44 +1,14 @@
 #!/usr/bin/env bash
-# Inquisitor Launcher — Spawn a task-scoped Inquisitor Claude session
-# TAGS: inquisitor, persona, execution
-# AUDIENCE: user
-#
-# Usage: inquisitor "task description"
-# Born with a command. Dies with a report.
-
+# inquisitor - retired launcher alias
+# TAGS: deprecated
+# AUDIENCE: deprecated
 set -euo pipefail
-
-[[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -eq 0 ]] && {
-    echo "Usage: inquisitor \"task description\""
-    echo ""
-    echo "Spawns a task-scoped Inquisitor. Born with a command, dies with a report."
-    echo ""
-    echo "Examples:"
-    echo "  inquisitor \"audit the cron fleet for stuck jobs\""
-    echo "  inquisitor \"find and fix the TUI subagent display bug\""
-    exit 0
-}
-
-TASK="$*"
-PERSONA_FILE="${HOME}/Imperium-ENV/Personas/Inquisition.md"
-
-# Load persona body (strip YAML frontmatter)
-PERSONA=""
-if [[ -f "$PERSONA_FILE" ]]; then
-    PERSONA=$(python3 -c "
-content = open('$PERSONA_FILE').read()
-parts = content.split('---', 2)
-print(parts[2].strip() if len(parts) >= 3 else content)
-" 2>/dev/null) || true
-fi
-
-FALLBACK_PERSONA="You are an Inquisitor — the Emperor's execution arm. Born with a command. Die with a report. Validate all sub-agent output aggressively. No untested code. No frankenmerge. Report with metrics: agents dispatched, discarded, integrated."
-SYSTEM_PROMPT="${PERSONA:-$FALLBACK_PERSONA}"
-
-# In a legion tmux pane, run interactive (so pane stays alive for follow-ups).
-# Outside tmux or in a subshell, use -p for headless one-shot.
-if [[ -n "${TMUX:-}" ]] && tmux display-message -p '#{window_name}' 2>/dev/null | grep -qE '^(grid|legion)'; then
-    exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" "$TASK"
-else
-    exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" -p "$TASK"
-fi
+case "inquisitor" in
+  claude-dispatch) replacement='dispatch --engine claude' ;;
+  vault-dispatch) replacement='dispatch --session-doc <path> --dir <path>' ;;
+  claude-launcher) replacement='dispatch --interactive' ;;
+  inquisitor) replacement='dispatch --persona inquisition --prompt <task>' ;;
+  subagent) replacement='dispatch --prompt <task>' ;;
+esac
+echo "inquisitor has been retired. Use: $replacement" >&2
+exit 64

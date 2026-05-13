@@ -317,68 +317,33 @@ claude() {
     _claude_launch "${args[@]}"
 }
 
-# cdc — cd + clear + claude
+# cdc — cd + clear + dispatch
 cdc() {
-    local dir="" primarch="" claude_args=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --codex)
-                claude_args+=("$1"); shift ;;
-            -r|--resume|--continue|--haiku)
-                claude_args+=("$1"); shift ;;
-            -p|--primarch)
-                primarch="$2"; shift 2 ;;
-            *)
-                if [[ -z "$dir" ]]; then dir="$1"; else claude_args+=("$1"); fi
-                shift ;;
-        esac
-    done
-    [[ -n "$dir" ]] && { cd "$dir" || return 1; }
-    clear
-    if [[ -n "$primarch" ]]; then
-        claude --primarch "$primarch" "${claude_args[@]}"
-    else
-        claude "${claude_args[@]}"
+    local dir="${1:-}"
+    if [[ -n "$dir" ]]; then
+        shift
+        cd "$dir" || return 1
     fi
+    clear
+    dispatch "$@"
 }
 
-# cc — clear + claude (always routes args to claude)
+# cc — clear + dispatch
 cc() {
     clear
-    claude "$@"
+    if [[ $# -eq 0 ]]; then
+        dispatch --interactive
+    else
+        dispatch "$@"
+    fi
 }
 
-# c — smart toggle: clear if dirty, claude if already clear
-# Args always passthrough to claude. From ~, opens launcher.
-_c_cleared=true
+# c — dispatch launcher
 c() {
-    if [[ $# -gt 0 ]]; then
-        case "$1" in
-            --prompt|--prompt-file)
-                if command -v claude-launcher &>/dev/null; then
-                    claude-launcher "$@"
-                    return
-                fi
-                ;;
-        esac
-        claude "$@"
-        return
-    fi
-
-    # First clean invocation opens the launcher from any directory. The launcher
-    # places the current directory at the top of the target list when relevant.
-    if $_c_cleared && command -v claude-launcher &>/dev/null; then
-        _c_cleared=false
-        claude-launcher
-        return
-    fi
-
-    if $_c_cleared; then
-        _c_cleared=false
-        claude
+    if [[ $# -eq 0 ]]; then
+        dispatch --interactive
     else
-        _c_cleared=true
-        clear
+        dispatch "$@"
     fi
 }
 

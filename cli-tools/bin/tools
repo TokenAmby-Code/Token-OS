@@ -14,6 +14,7 @@ SHOW_TAGS=false
 DIR_MODE=false
 DIR_PATH=""
 FILTER_TAG=""
+PERSONA=""            # when set, restrict to tools whose PERSONAS: header lists this name
 
 # --- Usage ---
 usage() {
@@ -26,6 +27,7 @@ Usage:
   tools <query>               Fuzzy name search, then AI fallback
   tools --tags                 List all available tags with counts
   tools --agent --dir <path>   Output tools for directory's tag set
+  tools --persona <name>       Restrict to tools tagged for this persona
   tools --human                Enable interactive mode (AI fallback + tool creation)
   tools --help                 This help message
 
@@ -34,13 +36,16 @@ Header format expected in each tool (first 20 lines):
   # tool-name - One sentence description
   # TAGS: git, pr, workflow
   # AUDIENCE: human, agent
+  # PERSONAS: custodes, mechanicus       (optional; if absent, persona filter excludes the tool)
 
 Options:
-  --human        Enable interactive mode
-  --agent        Force agent mode (default)
-  --tags         List all tags with tool counts
-  --dir <path>   Show tools relevant to a directory (uses directory-tags.yaml)
-  --help, -h     Show this help
+  --human          Enable interactive mode
+  --agent          Force agent mode (default)
+  --tags           List all tags with tool counts
+  --dir <path>     Show tools relevant to a directory (uses directory-tags.yaml)
+  --persona <name> Restrict to tools whose PERSONAS: header includes <name>.
+                   Tools without a PERSONAS: header are hidden when this flag is set.
+  --help, -h       Show this help
 EOF
     exit 0
 }
@@ -61,6 +66,14 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        --persona)
+            PERSONA="${2:-}"
+            if [[ -z "$PERSONA" ]]; then
+                echo "Error: --persona requires a name argument" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
         --) shift; break ;;
         -*) echo "Unknown option: $1" >&2; exit 1 ;;
         *) FILTER_TAG="$1"; shift ;;
@@ -73,6 +86,7 @@ declare -a TOOL_NAMES=()
 declare -a TOOL_DESCS=()
 declare -a TOOL_TAGS=()
 declare -a TOOL_AUDIENCES=()
+declare -a TOOL_PERSONAS=()
 
 scan_tools() {
     # Clear arrays in case of repeated calls
@@ -80,6 +94,7 @@ scan_tools() {
     TOOL_DESCS=()
     TOOL_TAGS=()
     TOOL_AUDIENCES=()
+    TOOL_PERSONAS=()
 
     for filepath in "$BIN_DIR"/*; do
         # Skip directories, non-executable, archive/, and self
@@ -90,7 +105,7 @@ scan_tools() {
         [[ "$name" == "tools" ]] && continue
 
         # Read first 20 lines
-        local desc="" tags="" audience=""
+        local desc="" tags="" audience="" personas=""
         local line_num=0
         while IFS= read -r line && (( line_num < 20 )); do
             (( line_num++ )) || true
@@ -118,6 +133,12 @@ scan_tools() {
                 audience="${BASH_REMATCH[1]}"
                 audience="$(echo "$audience" | sed 's/[[:space:]]*,[[:space:]]*/,/g')"
             fi
+
+            # Personas line — optional; only filtered when --persona is passed
+            if [[ "$line" =~ ^#[[:space:]]*PERSONAS:[[:space:]]*(.*) ]]; then
+                personas="${BASH_REMATCH[1]}"
+                personas="$(echo "$personas" | sed 's/[[:space:]]*,[[:space:]]*/,/g')"
+            fi
         done < "$filepath"
 
         # Fallback: extract description from comment on line 2 if not matched
@@ -136,7 +157,21 @@ scan_tools() {
         TOOL_DESCS+=("${desc:-No description}")
         TOOL_TAGS+=("${tags:-}")
         TOOL_AUDIENCES+=("${audience:-}")
+        TOOL_PERSONAS+=("${personas:-}")
     done
+}
+
+# --- Helper: check if tool is visible to the active persona ---
+# Returns 0 (visible) when:
+#   - $PERSONA is empty (no persona filter active)
+#   - the tool's PERSONAS: header contains $PERSONA
+# Returns 1 (hidden) when $PERSONA is set but the tool has no PERSONAS: line
+# or the line does not contain $PERSONA. Strict opt-in by design.
+is_persona_visible() {
+    local tool_personas="$1"
+    [[ -z "$PERSONA" ]] && return 0
+    [[ -z "$tool_personas" ]] && return 1
+    has_tag "$tool_personas" "$PERSONA"
 }
 
 # --- Helper: get primary tag (first tag) ---
@@ -303,6 +338,11 @@ show_dir_tools() {
             fi
         fi
 
+        # Persona gate: when --persona is set, require explicit opt-in.
+        if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+            continue
+        fi
+
         if $is_all; then
             match_names+=("${TOOL_NAMES[$i]}")
             match_descs+=("${TOOL_DESCS[$i]}")
@@ -343,28 +383,44 @@ show_dir_tools() {
 show_all_grouped() {
     scan_tools
 
-    # Collect unique primary tags
-    declare -A groups  # tag -> indices (space-separated)
-    for i in "${!TOOL_NAMES[@]}"; do
-        local ptag
-        ptag="$(primary_tag "${TOOL_TAGS[$i]}")"
-        groups[$ptag]="${groups[$ptag]+${groups[$ptag]}} $i"
-    done
-
-    # Sort tags
     local sorted_tags
-    sorted_tags="$(printf '%s\n' "${!groups[@]}" | sort)"
+    sorted_tags="$({
+        for i in "${!TOOL_NAMES[@]}"; do
+            if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+                continue
+            fi
+            if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+                continue
+            fi
+            primary_tag "${TOOL_TAGS[$i]}"
+        done
+    } | sort -u)"
 
-    # Compute global max name width
-    local width
-    width="$(max_name_width "${TOOL_NAMES[@]}")"
+    local width visible_names=()
+    for i in "${!TOOL_NAMES[@]}"; do
+        if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+            continue
+        fi
+        if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+            continue
+        fi
+        visible_names+=("${TOOL_NAMES[$i]}")
+    done
+    width="$(max_name_width "${visible_names[@]}")"
 
     printf "\n"
     while IFS= read -r tag; do
         [[ -z "$tag" ]] && continue
         printf "  %s:\n" "$tag"
-        for i in ${groups[$tag]}; do
-            printf "    %-${width}s  %s\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCS[$i]}"
+        for i in "${!TOOL_NAMES[@]}"; do
+            if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+                continue
+            fi
+            if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+                continue
+            fi
+            [[ "$(primary_tag "${TOOL_TAGS[$i]}")" == "$tag" ]] || continue
+            printf "    %-"$width"s  %s\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCS[$i]}"
         done
         printf "\n"
     done <<< "$sorted_tags"
@@ -375,9 +431,14 @@ show_by_tag() {
     local filter="$1"
     scan_tools
 
-    # Check if filter matches any tag
     local found=false
     for i in "${!TOOL_NAMES[@]}"; do
+        if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+            continue
+        fi
+        if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+            continue
+        fi
         if has_tag "${TOOL_TAGS[$i]}" "$filter"; then
             found=true
             break
@@ -388,41 +449,65 @@ show_by_tag() {
         return 1
     fi
 
-    # Collect matching tools, sub-grouped by their OTHER tags
-    declare -A subgroups  # other_tag -> indices
+    local sorted_subs
+    sorted_subs="$({
+        for i in "${!TOOL_NAMES[@]}"; do
+            if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+                continue
+            fi
+            if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+                continue
+            fi
+            has_tag "${TOOL_TAGS[$i]}" "$filter" || continue
+            local secondary=""
+            IFS=',' read -ra _stag_arr <<< "${TOOL_TAGS[$i]}"
+            for t in "${_stag_arr[@]}"; do
+                if [[ "$t" != "$filter" ]]; then
+                    secondary="$t"
+                    break
+                fi
+            done
+            [[ -n "$secondary" ]] || secondary="$filter"
+            echo "$secondary"
+        done
+    } | sort -u)"
+
+    local width visible_names=()
     for i in "${!TOOL_NAMES[@]}"; do
-        if ! has_tag "${TOOL_TAGS[$i]}" "$filter"; then
+        if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
             continue
         fi
-
-        # Find a secondary tag (first tag that isn't the filter)
-        local secondary=""
-        IFS=',' read -ra _stag_arr <<< "${TOOL_TAGS[$i]}"
-        for t in "${_stag_arr[@]}"; do
-            if [[ "$t" != "$filter" ]]; then
-                secondary="$t"
-                break
-            fi
-        done
-        if [[ -z "$secondary" ]]; then
-            secondary="$filter"
+        if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+            continue
         fi
-
-        subgroups[$secondary]="${subgroups[$secondary]+${subgroups[$secondary]}} $i"
+        has_tag "${TOOL_TAGS[$i]}" "$filter" || continue
+        visible_names+=("${TOOL_NAMES[$i]}")
     done
-
-    local sorted_subs
-    sorted_subs="$(printf '%s\n' "${!subgroups[@]}" | sort)"
-
-    local width
-    width="$(max_name_width "${TOOL_NAMES[@]}")"
+    width="$(max_name_width "${visible_names[@]}")"
 
     printf "\n"
     while IFS= read -r stag; do
         [[ -z "$stag" ]] && continue
         printf "  %s:\n" "$stag"
-        for i in ${subgroups[$stag]}; do
-            printf "    %-${width}s  %s\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCS[$i]}"
+        for i in "${!TOOL_NAMES[@]}"; do
+            if [[ "$MODE" == "agent" ]] && ! is_agent_visible "${TOOL_AUDIENCES[$i]}"; then
+                continue
+            fi
+            if ! is_persona_visible "${TOOL_PERSONAS[$i]}"; then
+                continue
+            fi
+            has_tag "${TOOL_TAGS[$i]}" "$filter" || continue
+            local secondary=""
+            IFS=',' read -ra _stag_arr <<< "${TOOL_TAGS[$i]}"
+            for t in "${_stag_arr[@]}"; do
+                if [[ "$t" != "$filter" ]]; then
+                    secondary="$t"
+                    break
+                fi
+            done
+            [[ -n "$secondary" ]] || secondary="$filter"
+            [[ "$secondary" == "$stag" ]] || continue
+            printf "    %-"$width"s  %s\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCS[$i]}"
         done
         printf "\n"
     done <<< "$sorted_subs"

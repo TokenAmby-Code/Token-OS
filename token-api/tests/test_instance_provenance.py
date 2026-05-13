@@ -1,6 +1,7 @@
 """Tests for instance provenance logging and reconciliation surfaces."""
 
 import sqlite3
+import sys
 import uuid
 
 import pytest
@@ -68,6 +69,124 @@ class TestProvenance:
         assert rows[0]["mutation_type"] == "instance_registered"
         assert rows[0]["write_source"] == "hooks"
         assert rows[0]["actor"] == "SessionStart"
+
+    def test_session_start_reactivates_existing_stopped_codex_row(
+        self, client, app_env, monkeypatch
+    ):
+        instance_id = str(uuid.uuid4())
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, synced, tmux_pane, pane_label, engine, stopped_at,
+                registered_at, last_activity)
+               VALUES (?, ?, 'stale codex', '/tmp/old', 'local', 'Mac-Mini',
+                       'stopped', 0, '%old', 'somnium:NW', 'codex',
+                       '2026-01-01T00:00:00',
+                       '2026-01-01T00:00:00', '2026-01-01T00:00:00')""",
+            (instance_id, str(uuid.uuid4())),
+        )
+        conn.commit()
+        conn.close()
+
+        async def pane_label(pane):
+            assert pane == "%new"
+            return "somnium:NE"
+
+        monkeypatch.setattr(sys.modules["routes.hooks"], "_tmux_pane_label", pane_label)
+
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": instance_id,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "pid": 4242,
+                "tmux_pane": "%new",
+                "env": {
+                    "TOKEN_API_ENGINE": "codex",
+                    "TOKEN_API_LAUNCHER": "codex-dispatch",
+                    "TOKEN_API_WRAPPER_LAUNCH_ID": "bridge-1",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["action"] == "reregistered"
+
+        conn = _db(app_env)
+        row = conn.execute(
+            """SELECT status, stopped_at, tmux_pane, pane_label, working_dir,
+                      pid, engine, launcher, wrapper_launch_id
+               FROM claude_instances WHERE id = ?""",
+            (instance_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "idle"
+        assert row["stopped_at"] is None
+        assert row["tmux_pane"] == "%new"
+        assert row["pane_label"] == "somnium:NE"
+        assert row["working_dir"] == "/Volumes/Imperium/Imperium-ENV"
+        assert row["pid"] == 4242
+        assert row["engine"] == "codex"
+        assert row["launcher"] == "codex-dispatch"
+        assert row["wrapper_launch_id"] == "bridge-1"
+
+
+    def test_session_start_records_dispatch_discord_metadata(self, client, app_env):
+        instance_id = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": instance_id,
+                "cwd": "/tmp/dispatch-meta",
+                "pid": 777,
+                "env": {
+                    "TOKEN_API_LAUNCHER": "dispatch",
+                    "TOKEN_API_ENGINE": "codex",
+                    "TOKEN_API_WRAPPER_LAUNCH_ID": "dispatch-bridge-1",
+                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                    "TOKEN_API_DISPATCH_WINDOW": "legion",
+                    "TOKEN_API_DISPATCH_MODE": "new",
+                    "TOKEN_API_DISPATCH_SLOT": "new",
+                    "TOKEN_API_DISPATCH_SESSION_DOC_PATH": "Mars/Sessions/test.md",
+                    "TOKEN_API_TARGET_WORKING_DIR": "/tmp/dispatch-meta",
+                    "TOKEN_API_LAUNCH_MODE": "tmux_stack_new",
+                    "TOKEN_API_INSTANCE_TYPE": "golden_throne",
+                    "TOKEN_API_ZEALOTRY": "7",
+                    "TOKEN_API_DISCORD_HOSTED": "1",
+                    "TOKEN_API_DISCORD_CHANNEL": "1234567890",
+                    "TOKEN_API_DISCORD_BOT": "mechanicus",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        conn = _db(app_env)
+        row = conn.execute(
+            """SELECT launcher, engine, wrapper_launch_id, dispatch_target,
+                      dispatch_window, dispatch_mode, dispatch_slot,
+                      dispatch_session_doc_path, target_working_dir, launch_mode,
+                      instance_type, zealotry, discord_hosted, discord_channel, discord_bot
+               FROM claude_instances WHERE id = ?""",
+            (instance_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["launcher"] == "dispatch"
+        assert row["engine"] == "codex"
+        assert row["wrapper_launch_id"] == "dispatch-bridge-1"
+        assert row["dispatch_target"] == "legion:new"
+        assert row["dispatch_window"] == "legion"
+        assert row["dispatch_mode"] == "new"
+        assert row["dispatch_slot"] == "new"
+        assert row["dispatch_session_doc_path"] == "Mars/Sessions/test.md"
+        assert row["target_working_dir"] == "/tmp/dispatch-meta"
+        assert row["launch_mode"] == "tmux_stack_new"
+        assert row["instance_type"] == "golden_throne"
+        assert row["zealotry"] == 7
+        assert row["discord_hosted"] == 1
+        assert row["discord_channel"] == "1234567890"
+        assert row["discord_bot"] == "mechanicus"
 
     def test_manual_assign_doc_writes_continuity_mutation(self, client, app_env):
         instance_id = _session_start(client)
