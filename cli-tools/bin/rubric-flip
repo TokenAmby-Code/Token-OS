@@ -99,12 +99,23 @@ def parse_args(argv: list[str]) -> dict:
             print(__doc__)
             sys.exit(0)
         elif a == "--doc-id":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --doc-id expects an integer value.")
             i += 1
-            args["doc_id"] = int(argv[i])
+            try:
+                args["doc_id"] = int(argv[i])
+            except ValueError:
+                raise SystemExit(
+                    f"Error: --doc-id expects an integer, got {argv[i]!r}."
+                )
         elif a == "--rubric-key":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --rubric-key expects a value.")
             i += 1
             args["rubric_key"] = argv[i]
         elif a == "--extra":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --extra expects K=V.")
             i += 1
             spec = argv[i]
             if "=" not in spec:
@@ -120,6 +131,10 @@ def parse_args(argv: list[str]) -> dict:
         i += 1
     if len(positionals) < 1:
         raise SystemExit("Error: <key> required. See --help.")
+    if len(positionals) > 2:
+        raise SystemExit(
+            f"Error: Too many positional args ({len(positionals)}); expected <key> [<value>]."
+        )
     args["key"] = positionals[0]
     args["value"] = parse_value(positionals[1]) if len(positionals) > 1 else True
     return args

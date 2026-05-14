@@ -99,7 +99,12 @@ def parse_args(argv: list[str]) -> dict:
             i += 1
             if i >= len(argv):
                 raise SystemExit("Error: --doc-id requires a value")
-            args["doc_id"] = int(argv[i])
+            try:
+                args["doc_id"] = int(argv[i])
+            except ValueError:
+                raise SystemExit(
+                    f"Error: --doc-id must be an integer, got {argv[i]!r}."
+                )
         elif a == "--instance-id":
             i += 1
             if i >= len(argv):
