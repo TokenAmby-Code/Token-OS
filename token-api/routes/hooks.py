@@ -39,6 +39,7 @@ from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavl
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
+    bump_session_doc_up_to_date,
     read_frontmatter,
     resolve_session_doc_for_start,
     update_frontmatter,
@@ -203,6 +204,63 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     except Exception as exc:
         logger.debug(f"Hook: pane label lookup failed for {tmux_pane}: {exc}")
     return None
+
+
+async def _resolve_session_doc_path(db, instance_id: str) -> Path | None:
+    """Find the session-doc file_path for an instance. Returns None when unlinked."""
+    cursor = await db.execute(
+        """
+        SELECT sd.file_path
+        FROM claude_instances ci
+        LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+        WHERE ci.id = ?
+        """,
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row or not row[0]:
+        return None
+    return Path(row[0])
+
+
+async def _flip_session_doc_up_to_date(instance_id: str, value: bool, source: str) -> None:
+    """Best-effort flip of the session_doc_up_to_date inverse flag.
+
+    Per feedback_close_more_than_open / accountability spec: UserPromptSubmit
+    sets False each turn; a Write/Edit on the doc flips back True. Silent
+    guard — agents that end a turn without touching their doc trip GT.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            fp = await _resolve_session_doc_path(db, instance_id)
+        if fp is None or not fp.exists():
+            return
+        await asyncio.to_thread(bump_session_doc_up_to_date, fp, value)
+    except Exception as exc:
+        logger.debug(
+            f"session_doc_up_to_date flip skipped for {instance_id[:12]} "
+            f"({source}, target={value}): {exc}"
+        )
+
+
+_DOC_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+
+def _tool_target_paths(payload: dict) -> list[str]:
+    """Extract candidate file paths the agent just wrote to from a PostToolUse payload."""
+    paths: list[str] = []
+    tool_input = payload.get("tool_input") or {}
+    if isinstance(tool_input, dict):
+        for key in ("file_path", "notebook_path", "path"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                paths.append(value)
+    tool_response = payload.get("tool_response") or {}
+    if isinstance(tool_response, dict):
+        value = tool_response.get("filePath") or tool_response.get("file_path")
+        if isinstance(value, str) and value:
+            paths.append(value)
+    return paths
 
 
 async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) -> bool:
@@ -1728,6 +1786,11 @@ async def handle_prompt_submit(payload: dict) -> dict:
     except Exception:
         pass
 
+    # Session-doc accountability: each new user turn marks the doc stale.
+    # If the agent ends this turn without touching its session doc, the next
+    # GT cycle picks up `session_doc_up_to_date: false` and pings on it.
+    await _flip_session_doc_up_to_date(session_id, False, source="prompt_submit")
+
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
     response = {
         "success": True,
@@ -1772,6 +1835,30 @@ async def handle_post_tool_use(payload: dict) -> dict:
             reason="answered",
             answer=_askq_extract_answer(payload),
         )
+
+    # Session-doc accountability: doc-touch flip runs BEFORE the debounce so a
+    # Write/Edit that immediately follows another tool call still flips the
+    # flag (which is the entire signal the GT engine relies on).
+    if tool_name in _DOC_WRITE_TOOLS:
+        target_paths = _tool_target_paths(payload)
+        if target_paths:
+            try:
+                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+                    doc_path = await _resolve_session_doc_path(db, session_id)
+                if doc_path is not None:
+                    resolved_doc = doc_path.resolve() if doc_path.exists() else doc_path
+                    for tp in target_paths:
+                        try:
+                            tp_resolved = Path(tp).resolve()
+                        except Exception:
+                            tp_resolved = Path(tp)
+                        if tp_resolved == resolved_doc or Path(tp) == doc_path:
+                            await _flip_session_doc_up_to_date(
+                                session_id, True, source=f"post_tool_use:{tool_name}"
+                            )
+                            break
+            except Exception as exc:
+                logger.debug(f"PostToolUse doc-up-to-date check skipped: {exc}")
 
     # Debounce: only update every 2 seconds per session
     current_time = time.time()
