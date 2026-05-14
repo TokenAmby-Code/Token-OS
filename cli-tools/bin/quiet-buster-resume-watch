@@ -87,9 +87,8 @@ prompt="A quiet-mode state buster fired tonight (${hit}). Resume the quiet-hours
 
 printf -v workdir_q '%q' "$WORKDIR"
 printf -v thread_q '%q' "$THREAD_ID"
-printf -v prompt_q '%q' "$prompt"
-
-cmd="cd ${workdir_q} && codex resume -C ${workdir_q} --dangerously-bypass-approvals-and-sandbox ${thread_q} ${prompt_q}"
+printf -v pane_q '%q' "$pane_id"
+cmd="cd ${workdir_q} && dispatch --id ${thread_q} --pane ${pane_q}"
 
 sleep 0.5
 tmux send-keys -t "$pane_id" "$cmd" Enter

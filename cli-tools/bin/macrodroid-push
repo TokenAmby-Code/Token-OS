@@ -1,12 +1,12 @@
 #!/bin/bash
-# macrodroid-push - Push .macro files to phone via sshp (Tailscale SSH)
+# macrodroid-push - Validate and push official MacroDroid .macro JSON to phone
 # TAGS: mobile, macrodroid
 # AUDIENCE: human, agent
 #
 # Usage:
-#   macrodroid-push <macro-file>              # Push to default location
-#   macrodroid-push <macro-file> <dest-dir>   # Push to custom location
-#   macrodroid-gen spec.yaml | macrodroid-push -  # Pipe from generator
+#   macrodroid-push <macro-file>              # Validate and push to default location
+#   macrodroid-push <macro-file> <dest-dir>   # Validate and push to custom location
+#   macrodroid-gen --empty "Example" | macrodroid-push - example.macro
 
 set -e
 
@@ -20,16 +20,16 @@ DEFAULT_DEST="~/macros"
 
 usage() {
     cat << 'EOF'
-macrodroid-push - Push .macro files to phone via Tailscale SSH
+macrodroid-push - Validate and push official MacroDroid .macro JSON to phone via Tailscale SSH
 
 Usage:
-    macrodroid-push <macro-file>              # Push to default location
-    macrodroid-push <macro-file> <dest-dir>   # Push to custom location
-    macrodroid-push -                         # Read from stdin (pipe)
+    macrodroid-push <macro-file>              # Validate and push to default location
+    macrodroid-push <macro-file> <dest-dir>   # Validate and push to custom location
+    macrodroid-push - output.macro            # Read official .macro JSON from stdin
 
 Examples:
     macrodroid-push my-macro.macro
-    macrodroid-gen spec.yaml | macrodroid-push - my-notification.macro
+    macrodroid-gen --http-endpoint heartbeat --name Heartbeat | macrodroid-push - heartbeat.macro
 
 Environment:
     PHONE_TAILSCALE_IP  Phone IP (default: 100.102.92.24)
@@ -52,7 +52,7 @@ DEST_DIR="${2:-$DEFAULT_DEST}"
 if [[ "$SOURCE" == "-" ]]; then
     if [[ $# -lt 2 ]]; then
         echo "Error: When reading from stdin, provide output filename" >&2
-        echo "Usage: macrodroid-gen spec.yaml | macrodroid-push - output.macro" >&2
+        echo "Usage: macrodroid-gen --empty "Example" | macrodroid-push - output.macro" >&2
         exit 1
     fi
     FILENAME="$2"
@@ -71,6 +71,22 @@ fi
 if [[ ! -f "$SOURCE" ]]; then
     echo "Error: File not found: $SOURCE" >&2
     exit 1
+fi
+
+# Validate official MacroDroid .macro JSON when possible. Warnings do not block
+# because existing exported macros may contain legacy class names, but invalid JSON
+# or malformed wrapper structure should not be pushed for import.
+if command -v macrodroid-validate >/dev/null 2>&1; then
+    echo "Validating MacroDroid JSON..."
+    if ! macrodroid-validate --quiet "$SOURCE"; then
+        echo "Error: official MacroDroid validation failed; not pushing invalid .macro JSON" >&2
+        exit 1
+    fi
+else
+    python3 -m json.tool "$SOURCE" >/dev/null || {
+        echo "Error: Invalid JSON; not pushing" >&2
+        exit 1
+    }
 fi
 
 # Wake phone sshd via MacroDroid HTTP endpoint if SSH fails

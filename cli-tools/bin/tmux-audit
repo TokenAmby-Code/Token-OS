@@ -8,7 +8,7 @@
 # fallback. Each assertion is a self-contained function.
 #
 # Assertions:
-#   backburner  — No idle shells in backburner windows; typed backstop management
+#   backburner  — No extra idle shells in stack windows
 #   grid        — Palace (6 panes) and somnium (5 panes) grids have expected pane counts
 #   tui         — TUI monitor panes are alive, not dead/stuck
 #   layout      — Pane proportions haven't drifted
@@ -66,8 +66,9 @@ fi
 
 # ============================================================
 # ASSERTION: backburner
-# No idle shells in backburner windows. Legion backstop is gated on
-# Custodes being active outside legion; mechanicus keeps a normal sentinel.
+# No extra idle shells in stack windows. The first legion/mechanicus panes are
+# orchestrator slots, not synthetic backstops; when promoted, those slots should
+# be occupied by tombstones.
 # ============================================================
 assert_backburner() {
     local IDLE_SHELLS="bash zsh sh fish"
@@ -80,53 +81,17 @@ assert_backburner() {
         return 1
     }
 
-    custodes_active_outside_legion() {
-        local db_path="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
-        [[ -f "$db_path" ]] || return 1
-
-        local panes pane win win_base
-        panes=$(sqlite3 "$db_path" "
-            SELECT tmux_pane
-            FROM claude_instances
-            WHERE legion = 'custodes'
-              AND status IN ('idle', 'processing')
-              AND COALESCE(tmux_pane, '') != ''
-            ORDER BY last_activity DESC
-            LIMIT 10;
-        " 2>/dev/null || true)
-
-        while IFS= read -r pane; do
-            [[ -z "$pane" ]] && continue
-            win=$(tmux display-message -p -t "$pane" '#{window_name}' 2>/dev/null || true)
-            [[ -z "$win" ]] && continue
-            win_base="${win%%(*}"
-            if [[ "$win_base" != "legion" ]]; then
-                return 0
-            fi
-        done <<< "$panes"
-
-        return 1
-    }
-
     for win in legion mechanicus mars kreig; do
-        local allow_backstop=true
-        if [[ "$win" == "legion" ]]; then
-            allow_backstop=false
-            if custodes_active_outside_legion; then
-                allow_backstop=true
-            fi
-        fi
-
         local pane_data
         pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
-            -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}' 2>/dev/null) || continue
+            -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}	#{@PANE_ID}' 2>/dev/null) || continue
 
-        local idle_panes=() backstop_panes=() real_panes=()
+        local idle_panes=() real_panes=()
 
-        while IFS=$'\t' read -r pid cmd ptype; do
+        while IFS=$'\t' read -r pid cmd ptype pane_label; do
             [[ -z "$pid" ]] && continue
-            if [[ "$ptype" == "backstop" ]]; then
-                backstop_panes+=("$pid")
+            if [[ "$ptype" == "tombstone" ]]; then
+                real_panes+=("$pid")
             elif is_idle_shell "$cmd"; then
                 idle_panes+=("$pid")
             else
@@ -134,37 +99,13 @@ assert_backburner() {
             fi
         done <<< "$pane_data"
 
-        local total=$(( ${#idle_panes[@]} + ${#backstop_panes[@]} + ${#real_panes[@]} ))
+        local total=$(( ${#idle_panes[@]} + ${#real_panes[@]} ))
         local changed=false
 
-        # Legion backstop is only meaningful when Custodes is active elsewhere.
-        if [[ "$allow_backstop" != "true" && ${#backstop_panes[@]} -gt 0 ]]; then
-            for pid in "${backstop_panes[@]}"; do
-                tmux kill-pane -t "$pid" 2>/dev/null || true
-                (( total-- )) || true
-            done
-            backstop_panes=()
-            changed=true
-        fi
-
-        # Real work present + backstop → cull backstop
-        if [[ ${#real_panes[@]} -gt 0 && ${#backstop_panes[@]} -gt 0 ]]; then
-            for pid in "${backstop_panes[@]}"; do
-                tmux kill-pane -t "$pid" 2>/dev/null || true
-                (( total-- )) || true
-            done
-            backstop_panes=()
-            changed=true
-        fi
-
-        # Kill idle shells; convert last-standing to backstop
+        # Preserve the final pane in a stack window; it is the orchestrator slot
+        # or its tombstone. Cull only surplus idle shells.
         for pid in "${idle_panes[@]}"; do
-            if [[ "$allow_backstop" == "true" && $total -le 1 && ${#backstop_panes[@]} -eq 0 ]]; then
-                tmux respawn-pane -k -t "$pid" "tmux-backstop" 2>/dev/null || true
-                backstop_panes+=("$pid")
-                changed=true
-                continue
-            fi
+            [[ $total -le 1 ]] && continue
             tmux kill-pane -t "$pid" 2>/dev/null || true
             (( total-- )) || true
             changed=true
@@ -179,13 +120,13 @@ assert_backburner() {
 # ============================================================
 # ASSERTION: grid
 # Palace and somnium grids each have their expected pane count.
-#   palace  → 6 panes (2 sides + 2x2 grid)
-#   somnium → 5 panes (2x2 grid + right TUI column)
+#   palace  → 4 panes (W | N/S | E)
+#   somnium → 5 panes (W | N/NE/S/SE)
 # ============================================================
 assert_grid() {
     local win expected actual focused
     declare -A expected_for=(
-        [palace]=6
+        [palace]=4
         [somnium]=5
     )
 
@@ -193,10 +134,14 @@ assert_grid() {
         tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null || continue
         expected="${expected_for[$win]}"
 
-        focused=$(tmux show-options -wv -t "${SESSION}:${win}" @FOCUSED 2>/dev/null || echo "false")
+        focused=$(tmux show-options -wv -t "${SESSION}:${win}" @FOCUS_GRID_ACTIVE 2>/dev/null || echo "false")
         if [[ "$focused" == "true" ]]; then
-            # Focused mode kills the side column(s); only the 2x2 grid remains.
-            expected=4
+            # Grid focus stashes only grid siblings; side/tall panes remain visible.
+            if [[ "$win" == "palace" ]]; then
+                expected=3
+            else
+                expected=2
+            fi
         fi
 
         actual=$(tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null | wc -l | tr -d ' ')

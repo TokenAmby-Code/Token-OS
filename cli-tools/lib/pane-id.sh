@@ -64,8 +64,7 @@ pane_resolve() {
     local resolved
     id="$(pane_canonical_id "$id")"
     resolved=$(PYTHONPATH="${_TMUX_STATE_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli resolve-pane "$id" 2>/dev/null \
-        | awk -F': ' '$1 == "pane_id" { print $2; exit }' || true)
+        python3 -m tmuxctl.cli resolve-pane --format id "$id" 2>/dev/null || true)
     if [[ -n "$resolved" ]]; then
         echo "$resolved"
         return 0

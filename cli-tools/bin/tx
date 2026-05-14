@@ -30,6 +30,7 @@
 #   tx mechanicus "prompt" # Dispatch background task (aliases: tx mech, tx mars)
 #   tx legion bump        # Bump current pane to legion window
 #   tx legion recall      # Recall pane from legion to somnium
+#   tx legion focus       # Enforce focused regiment layout
 #   tx help               # Show this help
 
 set -euo pipefail
@@ -50,9 +51,9 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-log_info()    { echo -e "${CYAN}▸${RESET} $*"; }
-log_success() { echo -e "${GREEN}✓${RESET} $*"; }
-log_warn()    { echo -e "${YELLOW}▸${RESET} $*"; }
+log_info()    { echo -e "${CYAN}▸${RESET} $*" >&2; }
+log_success() { echo -e "${GREEN}✓${RESET} $*" >&2; }
+log_warn()    { echo -e "${YELLOW}▸${RESET} $*" >&2; }
 log_error()   { echo -e "${RED}✗${RESET} $*" >&2; }
 
 SESSION_NAME="main"
@@ -73,8 +74,23 @@ is_workspace_flag() {
 # --- Check if inside tmux ---
 in_tmux() { [[ -n "${TMUX:-}" ]]; }
 
+tmuxctl_python() {
+    local candidate
+    for candidate in "${TMUXCTL_PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3; do
+        [[ -n "$candidate" ]] || continue
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'from datetime import UTC' >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    log_error "tmuxctl requires Python 3.11+ (datetime.UTC unavailable)"
+    return 1
+}
+
 run_tmuxctl() {
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli "$@"
+    local py
+    py=$(tmuxctl_python)
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m tmuxctl.cli "$@"
 }
 
 # --- Help ---
@@ -104,6 +120,7 @@ LAYOUT
   tx unfocus   restore sides
   tx expand    toggle pane size
   tx inspect   inspect typed state
+  tx resolve ID resolve pane id (1:N, palace:N)
     restart-plan   inspect restart registry/restore plan
   tx doctor    diagnose drift
   tx normalize reserved Python path
@@ -124,6 +141,7 @@ MECHANICUS
 LEGION
   tx legion bump    move pane out
   tx legion recall  bring pane back
+  tx legion focus   expand selected regiment
   tx legion status  list reservists
   tx legion cleanup kill dead
 
@@ -159,6 +177,7 @@ Layout:
   tx unfocus          restore side columns
   tx expand           toggle pane expand/retract
   tx inspect          inspect typed workspace state
+  tx resolve ID       resolve stable pane id to live %pane
     restart-plan      inspect restart registry/restore plan
   tx doctor           diagnose managed workspace drift
   tx normalize        reserved Python normalize path
@@ -180,6 +199,7 @@ Mechanicus:
 Legion:
   tx legion bump [--pane %id]   move pane to legion (default: current)
   tx legion recall [--pane %id] move pane back to somnium
+  tx legion focus [--pane %id]  expand selected regiment
   tx legion status              list all legion panes
   tx legion cleanup             kill dead panes
     --all                       kill ALL panes (including running)
@@ -602,9 +622,27 @@ for p in data['panes']:
             log_success "Cleaned up: ${killed} killed, ${surviving} surviving"
             ;;
 
+        focus)
+            local target_pane=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --pane) target_pane="$2"; shift 2 ;;
+                    *)      shift ;;
+                esac
+            done
+            if [[ -z "$target_pane" ]]; then
+                if ! in_tmux; then
+                    log_error "Must be inside tmux or specify --pane"
+                    return 1
+                fi
+                target_pane=$(tmux display-message -p '#{pane_id}')
+            fi
+            run_tmuxctl legion focus-selected --pane "$target_pane"
+            ;;
+
         *)
             log_error "Unknown legion subcommand: ${subcmd}"
-            echo -e "  Use: ${BOLD}tx legion bump|recall|status|cleanup${RESET}"
+            echo -e "  Use: ${BOLD}tx legion bump|recall|focus|status|cleanup${RESET}" >&2
             return 1
             ;;
     esac
@@ -660,12 +698,12 @@ shift
 if is_workspace_flag "$CMD"; then
     log_warn "'${CMD}' is not a tx flag."
     case "$CMD" in
-        --focus)        echo -e "  Use: ${BOLD}tx focus${RESET}"; exit 1 ;;
-        --unfocus)      echo -e "  Use: ${BOLD}tx unfocus${RESET}"; exit 1 ;;
-        --toggle-focus) echo -e "  Use: ${BOLD}tx toggle-focus${RESET}"; exit 1 ;;
-        --attach)       echo -e "  Use: ${BOLD}tx start${RESET}"; exit 1 ;;
-        --portable)     echo -e "  Use: ${BOLD}tx portable${RESET}  (deprecated)"; exit 1 ;;
-        *)              echo -e "  See: ${BOLD}tx help${RESET}"; exit 1 ;;
+        --focus)        echo -e "  Use: ${BOLD}tx focus${RESET}" >&2; exit 1 ;;
+        --unfocus)      echo -e "  Use: ${BOLD}tx unfocus${RESET}" >&2; exit 1 ;;
+        --toggle-focus) echo -e "  Use: ${BOLD}tx toggle-focus${RESET}" >&2; exit 1 ;;
+        --attach)       echo -e "  Use: ${BOLD}tx start${RESET}" >&2; exit 1 ;;
+        --portable)     echo -e "  Use: ${BOLD}tx portable${RESET}  (deprecated)" >&2; exit 1 ;;
+        *)              echo -e "  See: ${BOLD}tx help${RESET}" >&2; exit 1 ;;
     esac
 fi
 
@@ -691,7 +729,7 @@ case "$CMD" in
         case "${1:-}" in
             --pane|--page)
                 log_error "restart is reserved for full session rebuilds"
-                echo -e "  Use: ${BOLD}tx restart-pane${RESET} or ${BOLD}tx restart-page${RESET}"
+                echo -e "  Use: ${BOLD}tx restart-pane${RESET} or ${BOLD}tx restart-page${RESET}" >&2
                 exit 1
                 ;;
             *)
@@ -728,14 +766,14 @@ case "$CMD" in
             log_error "Must be inside tmux to toggle focus."
             exit 1
         fi
-        exec tmux-focus focus
+        exec tmux-focus focus-grid
         ;;
     unfocus)
         if ! in_tmux; then
             log_error "Must be inside tmux to toggle unfocus."
             exit 1
         fi
-        exec tmux-focus unfocus
+        exec tmux-focus unfocus-grid
         ;;
     toggle-focus)
         if ! in_tmux; then
@@ -750,6 +788,13 @@ case "$CMD" in
     inspect)
         run_tmuxctl inspect "$@"
         ;;
+    resolve|resolve-pane)
+        if [[ $# -eq 0 ]]; then
+            log_error "Usage: tx resolve <pane-id>"
+            exit 1
+        fi
+        run_tmuxctl resolve-pane --format id "$1"
+        ;;
     doctor)
         run_tmuxctl doctor "$@"
         ;;
@@ -759,7 +804,7 @@ case "$CMD" in
     resurrect)
         exec tmux-resurrect "$@"
         ;;
-    mechanicus|mech|mars|kreig|kr|backrooms|br)
+    mechanicus|mech|mars|kreig|kr)
         cmd_mechanicus "$@"
         ;;
     legion)

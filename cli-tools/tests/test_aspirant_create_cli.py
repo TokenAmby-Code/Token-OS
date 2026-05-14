@@ -4,8 +4,8 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-ASPIRANT_CREATE = ROOT / "cli-tools" / "bin" / "aspirant-create"
 DISPATCH = ROOT / "cli-tools" / "bin" / "dispatch"
+ASPIRANT_CREATE_MODULE = ["python3", "-m", "aspirant_create"]
 
 
 def env_for(tmp_path):
@@ -14,6 +14,7 @@ def env_for(tmp_path):
     env = os.environ.copy()
     env["IMPERIUM"] = str(tmp_path)
     env["PATH"] = f"{ROOT / 'cli-tools' / 'bin'}:{env.get('PATH', '')}"
+    env["PYTHONPATH"] = f"{ROOT / 'cli-tools' / 'lib'}:{env.get('PYTHONPATH', '')}"
     return env, vault
 
 
@@ -21,7 +22,7 @@ def test_aspirant_create_deploy_p_creates_prescriptive_note(tmp_path):
     env, vault = env_for(tmp_path)
     result = subprocess.run(
         [
-            str(ASPIRANT_CREATE),
+            *ASPIRANT_CREATE_MODULE,
             "--json",
             "--kind",
             "deploy_p",
@@ -53,7 +54,7 @@ def test_aspirant_create_deploy_d_creates_descriptive_note(tmp_path):
     env, vault = env_for(tmp_path)
     result = subprocess.run(
         [
-            str(ASPIRANT_CREATE),
+            *ASPIRANT_CREATE_MODULE,
             "--json",
             "--kind",
             "deploy_d",
@@ -77,11 +78,11 @@ def test_aspirant_create_deploy_d_creates_descriptive_note(tmp_path):
     assert "deployment_target: Terra/Ultramar" in text
 
 
-def test_aspirant_create_dispatch_creates_mars_session_doc_when_ready(tmp_path):
+def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(tmp_path):
     env, vault = env_for(tmp_path)
     result = subprocess.run(
         [
-            str(ASPIRANT_CREATE),
+            *ASPIRANT_CREATE_MODULE,
             "--json",
             "--kind",
             "dispatch",
@@ -110,21 +111,54 @@ def test_aspirant_create_dispatch_creates_mars_session_doc_when_ready(tmp_path):
 
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data["status"] == "dispatch_ready"
-    assert data["dispatch_ready"] is True
+    assert data["status"] == "aspirant_trials"
+    assert data["dispatch_schema_complete"] is True
+    assert data["dispatch_ready"] is False
+    assert data["trials_verdict"] == "pending"
+    assert data["operator_approved_dispatch"] is False
     assert data["session_doc"].startswith("Mars/Sessions/")
     session_doc = vault / data["session_doc"]
     session_text = session_doc.read_text(encoding="utf-8")
-    assert "status: dispatch_ready" in session_text
+    note_text = (vault / data["note_path"]).read_text(encoding="utf-8")
+    assert "status: aspirant_trials" in session_text
+    assert "type: session" in session_text
+    assert "aspirant: true" in session_text
+    assert "aspirant_kind: dispatch" in session_text
+    assert "aspirant_persona: aspirant" in session_text
+    assert "aspirant_note: " in session_text
+    assert "dispatch_schema_complete: true" in session_text
+    assert "dispatch_ready: false" in session_text
+    assert "trials_verdict: pending" in session_text
+    assert "operator_approved_dispatch: false" in session_text
+    assert "open_questions: {}" in session_text
+    assert "engine: \"claude\"" in session_text
     assert "persona: \"vulkan\"" in session_text
+    assert f"target_working_dir: {json.dumps(str(ROOT))}" in session_text
     assert "dispatch_target: \"legion:new\"" in session_text
+    assert "zealotry: 4" in session_text
+    assert "victory_conditions:" in session_text
+    assert "  - \"Tests pass\"" in session_text
+    assert "## Dispatch Boundary" in session_text
+    assert "no downstream agent has been launched" in session_text
+    assert "aspirant_persona: aspirant" in note_text
+    assert "dispatch_boundary: true" in note_text
+    assert "dispatch_schema_complete: true" in note_text
+    assert "dispatch_ready: false" in note_text
+    assert "dispatch_blocked_reason: \"pending_aspirant_trials\"" in note_text
+    assert "trials_verdict: pending" in note_text
+    assert "operator_approved_dispatch: false" in note_text
+    assert "open_questions: {}" in note_text
+    prompt_line = next(line for line in session_text.splitlines() if line.startswith("aspirant_persona_prompt: "))
+    prompt_path = Path(json.loads(prompt_line.split(": ", 1)[1]))
+    assert prompt_path.is_absolute()
+    assert prompt_path.exists()
 
 
 def test_aspirant_create_dispatch_incomplete_stays_intake(tmp_path):
     env, vault = env_for(tmp_path)
     result = subprocess.run(
         [
-            str(ASPIRANT_CREATE),
+            *ASPIRANT_CREATE_MODULE,
             "--json",
             "--kind",
             "dispatch",
@@ -149,10 +183,24 @@ def test_aspirant_create_dispatch_incomplete_stays_intake(tmp_path):
     assert data["dispatch_ready"] is False
     assert "persona" in data["dispatch_blocked_reason"]
     text = (vault / data["note_path"]).read_text(encoding="utf-8")
+    assert "status: aspirant_intake" in text
+    assert "dispatch_schema_complete: false" in text
     assert "dispatch_ready: false" in text
+    assert "dispatch_blocked_reason: \"missing persona, dispatch_target, victory_conditions\"" in text
+    assert "trials_verdict: pending" in text
+    assert "operator_approved_dispatch: false" in text
+    assert "open_questions: {}" in text
+    assert "aspirant_persona: aspirant" in text
+    session_text = (vault / data["session_doc"]).read_text(encoding="utf-8")
+    assert "status: aspirant_intake" in session_text
+    assert "dispatch_schema_complete: false" in session_text
+    assert "dispatch_ready: false" in session_text
+    assert "operator_approved_dispatch: false" in session_text
+    assert "open_questions: {}" in session_text
+    assert "aspirant_persona_prompt: " in session_text
 
 
-def test_dispatch_delegation_dry_run_points_at_aspirant_create(tmp_path):
+def test_dispatch_delegation_dry_run_uses_internal_creation_surface(tmp_path):
     env, _vault = env_for(tmp_path)
     result = subprocess.run(
         [
@@ -172,4 +220,42 @@ def test_dispatch_delegation_dry_run_points_at_aspirant_create(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "dispatch aspirant dry-run" in result.stdout
-    assert "aspirant-create --kind deploy_d" in result.stdout
+    assert "internal_action: create aspirant note/session" in result.stdout
+    assert "aspirant-create" not in result.stdout
+
+
+def test_dispatch_aspirant_dispatch_dry_run_delegates_without_launch(tmp_path):
+    env, _vault = env_for(tmp_path)
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--aspirant",
+            "--aspirant-kind",
+            "dispatch",
+            "--engine",
+            "codex",
+            "--persona",
+            "aspirant",
+            "--dir",
+            str(ROOT),
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Boundary verified",
+            "Prepare dispatch but do not launch",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatch aspirant dry-run" in result.stdout
+    assert "aspirant_kind:  dispatch" in result.stdout
+    assert "internal_action: create aspirant note/session" in result.stdout
+    assert "dispatch_ready:  false" in result.stdout
+    assert "trials_verdict:  pending" in result.stdout
+    assert "aspirant-create" not in result.stdout

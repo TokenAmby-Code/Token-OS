@@ -24,11 +24,8 @@ else
 fi
 
 case "$AGENT" in
-    claude)
-        [[ -n "$SESSION_ID" ]] && RESUME_CMD="claude --resume ${SESSION_ID}" || RESUME_CMD=""
-        ;;
-    codex)
-        [[ -n "$SESSION_ID" ]] && RESUME_CMD="codex resume ${SESSION_ID}" || RESUME_CMD="codex resume --last"
+    claude|codex)
+        [[ -n "$SESSION_ID" ]] && RESUME_CMD="dispatch --id ${SESSION_ID} --pane ${PANE}" || RESUME_CMD=""
         ;;
     *)
         RESUME_CMD=""

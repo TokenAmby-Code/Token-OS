@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
 import time
+from pathlib import Path
 
 
 class TmuxError(RuntimeError):
@@ -10,25 +14,128 @@ class TmuxError(RuntimeError):
 
 DEFAULT_SUBMIT_SETTLE_SECONDS = 0.3
 
+_PANE_TARGET_COMMANDS = {
+    "break-pane",
+    "capture-pane",
+    "display-message",
+    "join-pane",
+    "kill-pane",
+    "move-pane",
+    "pipe-pane",
+    "respawn-pane",
+    "resize-pane",
+    "select-pane",
+    "send-keys",
+    "split-window",
+    "swap-pane",
+}
+_PANE_OPTION_COMMANDS = {"set-option", "set", "show-options", "show"}
+_PANE_TARGET_FLAGS = {"-t", "-s"}
+_SLOT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _tmux_binary() -> str:
+    """Return the real tmux binary, not the optional Imperium wrapper."""
+    for env_name in ("IMPERIUM_TMUX_BIN", "REAL_TMUX", "TMUX_BIN"):
+        candidate = os.environ.get(env_name)
+        if candidate:
+            return candidate
+
+    wrapper = Path(__file__).resolve().parents[2] / "bin" / "tmux"
+    for candidate in shutil.which("tmux", mode=os.F_OK | os.X_OK, path=os.environ.get("PATH")) or "", \
+        "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux", "/bin/tmux":
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).resolve() == wrapper.resolve():
+                continue
+        except OSError:
+            pass
+        return candidate
+    return "tmux"
+
+
+def _looks_like_custom_pane_target(target: str) -> bool:
+    if not target or target.startswith("%"):
+        return False
+    if target in {"current", "!", "{last}", "{next}", "{previous}"}:
+        return False
+    if ":" not in target:
+        return False
+    _, slot = target.rsplit(":", 1)
+    if not slot or slot.isdigit():
+        return False
+    return bool(_SLOT_RE.match(slot))
+
+
+def _command_has_pane_option_scope(args: tuple[str, ...]) -> bool:
+    if not args:
+        return False
+    command = args[0]
+    if command in _PANE_TARGET_COMMANDS:
+        return True
+    if command not in _PANE_OPTION_COMMANDS:
+        return False
+    # tmux show-options/set-option only targets a pane when -p is supplied;
+    # tmux permits clustered forms like -pv and -pu.
+    return any(arg.startswith("-") and "p" in arg for arg in args[1:])
+
 
 class TmuxAdapter:
-    """Small wrapper around raw tmux commands."""
+    """Small wrapper around raw tmux commands.
+
+    The adapter is the lowest Python tmux boundary. Pane-scoped target flags are
+    resolved through tmuxctl before subprocess execution, so callers can pass
+    stable custom ids (``1:N``, ``1:NW``, ``palace:N``, ``legion:custodes``) in
+    place of volatile ``%N`` pane ids.
+    """
+
+    def __init__(self, tmux_binary: str | None = None) -> None:
+        self.tmux_binary = tmux_binary or _tmux_binary()
+        self._resolving_targets = False
+
+    def _resolve_pane_target_arg(self, target: str) -> str:
+        if not _looks_like_custom_pane_target(target):
+            return target
+        if self._resolving_targets:
+            return target
+        self._resolving_targets = True
+        try:
+            from .resolver import resolve_pane
+
+            return resolve_pane(self, target).pane_id
+        finally:
+            self._resolving_targets = False
+
+    def _resolve_tmux_args(self, args: tuple[str, ...]) -> list[str]:
+        if not _command_has_pane_option_scope(args):
+            return list(args)
+        resolved = list(args)
+        idx = 1
+        while idx < len(resolved) - 1:
+            if resolved[idx] in _PANE_TARGET_FLAGS:
+                resolved[idx + 1] = self._resolve_pane_target_arg(resolved[idx + 1])
+                idx += 2
+                continue
+            idx += 1
+        return resolved
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
+        resolved_args = self._resolve_tmux_args(tuple(args))
         proc = subprocess.run(
-            ["tmux", *args],
+            [self.tmux_binary, *resolved_args],
             text=True,
             capture_output=True,
             check=False,
         )
         if proc.returncode != 0 and not allow_failure:
             stderr = proc.stderr.strip()
-            raise TmuxError(stderr or f"tmux {' '.join(args)} failed")
+            raise TmuxError(stderr or f"tmux {' '.join(resolved_args)} failed")
         return proc.stdout
 
     def has_session(self, session_name: str) -> bool:
         proc = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
+            [self.tmux_binary, "has-session", "-t", session_name],
             text=True,
             capture_output=True,
             check=False,

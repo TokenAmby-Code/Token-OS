@@ -46,6 +46,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       lastDeltaAt: null,
       resampleRemainder: Buffer.alloc(0),
       pendingAudio: [],
+      pendingCommitMeta: null,
       cleanupTimer: null,
     };
 
@@ -99,6 +100,11 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         logger.info(`Realtime demo [${botName}]: session.updated acknowledged`);
         session.ready = true;
         flushPendingAudio(session);
+        if (session.pendingCommitMeta) {
+          const meta = session.pendingCommitMeta;
+          session.pendingCommitMeta = null;
+          commitUser(userId, botName, meta);
+        }
         return;
       }
 
@@ -240,7 +246,18 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
   function commitUser(userId, botName, meta = {}) {
     const session = sessions.get(keyFor(botName, userId));
-    if (!session || session.closed || !session.ready) return false;
+    if (!session || session.closed) return false;
+    if (!session.ready) {
+      if (session.pendingAudio.length > 0 || session.appendedFrames > 0) {
+        session.pendingCommitMeta = meta;
+        logger.info(
+          `Realtime demo [${botName}]: queued commit until ready for user ${userId} ` +
+          `(pending=${session.pendingAudio.length}, reason=${meta.reason || 'manual'})`
+        );
+        return true;
+      }
+      return false;
+    }
     if (session.appendedFrames === 0) return false;
     logger.info(
       `Realtime demo [${botName}]: committing audio for user ${userId} ` +

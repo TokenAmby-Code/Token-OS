@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from .api import RegistryError
@@ -59,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve_parser = subparsers.add_parser("resolve-pane")
     resolve_parser.add_argument("target")
+    resolve_parser.add_argument("--format", choices=["full", "id", "json"], default="full")
 
     send_text_parser = subparsers.add_parser("send-text")
     send_text_parser.add_argument("--pane", required=True)
@@ -177,7 +179,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "resolve-pane":
-            print(control.resolve_pane(args.target))
+            resolved = control.resolve_pane_resolution(args.target)
+            if args.format == "id":
+                print(resolved.pane_id)
+            elif args.format == "json":
+                print(json.dumps({
+                    "requested": resolved.requested,
+                    "pane_id": resolved.pane_id,
+                    "role": resolved.pane_role,
+                    "kind": resolved.pane_kind.value,
+                    "chain": list(resolved.chain),
+                }))
+            else:
+                print(control.format_pane_resolution(resolved))
             return 0
 
         if args.command == "send-text":

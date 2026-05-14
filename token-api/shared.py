@@ -12,14 +12,16 @@ import json
 import logging
 import os
 import random
+import sqlite3
+import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import aiosqlite
-
 logger = logging.getLogger("token_api")
+_LOG_EVENT_WRITE_LOCK = threading.Lock()
 
 # ============ Configuration ============
 
@@ -36,34 +38,219 @@ STASH_MAX_AGE_HOURS = 24
 QUIET_HOURS_START = int(os.environ.get("TOKEN_API_QUIET_START_HOUR", "23"))
 QUIET_HOURS_END = int(os.environ.get("TOKEN_API_QUIET_END_HOUR", "9"))
 QUIET_HOURS_TIMEZONE = os.environ.get("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
+_DAY_STATE_CACHE_TTL_SECONDS = 60.0
+_DAY_STATE_CACHE: dict[str, object] = {"date": None, "value": None, "monotonic": 0.0}
 
 
-def get_quiet_hours_status(now: datetime | None = None) -> dict:
-    """Return the canonical quiet-hours decision and context."""
+def _in_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+async def _refresh_day_state_cache(date_str: str) -> None:
+    await asyncio.to_thread(get_day_state_sync, date_str)
+
+
+def quiet_hours_local_now(now: datetime | None = None) -> datetime:
+    """Return ``now`` normalized to the quiet-hours timezone."""
     tz = ZoneInfo(QUIET_HOURS_TIMEZONE)
     local_now = now or datetime.now(tz)
     if local_now.tzinfo is None:
-        local_now = local_now.replace(tzinfo=tz)
-    else:
-        local_now = local_now.astimezone(tz)
+        return local_now.replace(tzinfo=tz)
+    return local_now.astimezone(tz)
 
+
+def _quiet_hour_window_active(local_now: datetime) -> tuple[bool, str]:
+    """Return whether the configured hour window is active and which segment fired."""
     start = QUIET_HOURS_START
     end = QUIET_HOURS_END
     hour_float = local_now.hour + local_now.minute / 60 + local_now.second / 3600
+
     if start == end:
-        active = True
-    elif start < end:
+        return True, "all_day"
+    if start < end:
         active = start <= hour_float < end
+        return active, "same_day" if active else "outside"
+
+    if hour_float >= start:
+        return True, "night_start"
+    if hour_float < end:
+        return True, "morning_latch"
+    return False, "outside"
+
+
+def ensure_day_state_table_sync(db_path: Path | None = None) -> None:
+    """Create the day-state table used by the day-start hook if needed."""
+    path = db_path or DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS day_state (
+                date TEXT PRIMARY KEY,
+                day_started_at TEXT,
+                source TEXT,
+                details_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+
+
+async def ensure_day_state_table(db_path: Path | None = None) -> None:
+    """Async wrapper for creating the day-state table."""
+    await asyncio.to_thread(ensure_day_state_table_sync, db_path)
+
+
+def get_day_state_sync(date_str: str | None = None, db_path: Path | None = None) -> dict | None:
+    """Return the persisted day-state row for ``date_str`` (local date by default)."""
+    local_date = date_str or quiet_hours_local_now().date().isoformat()
+    try:
+        ensure_day_state_table_sync(db_path)
+        with sqlite3.connect(db_path or DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM day_state WHERE date = ?", (local_date,)).fetchone()
+        result = dict(row) if row else None
+        if db_path is None:
+            _DAY_STATE_CACHE.update(
+                {"date": local_date, "value": result, "monotonic": time.monotonic()}
+            )
+        return result
+    except Exception as exc:
+        logger.warning("day_state read failed: %s", exc)
+        return None
+
+
+async def get_day_state(date_str: str | None = None, db_path: Path | None = None) -> dict | None:
+    """Async wrapper for reading the day-state row."""
+    return await asyncio.to_thread(get_day_state_sync, date_str, db_path)
+
+
+def set_day_started_at_sync(
+    *,
+    source: str = "manual",
+    at: datetime | None = None,
+    details: dict | None = None,
+    force: bool = False,
+    db_path: Path | None = None,
+) -> dict:
+    """Persist the local day's day-start timestamp and return the resulting state."""
+    local_at = quiet_hours_local_now(at)
+    date_str = local_at.date().isoformat()
+    timestamp = local_at.isoformat()
+    details_json = json.dumps(details or {}, sort_keys=True)
+
+    ensure_day_state_table_sync(db_path)
+    with sqlite3.connect(db_path or DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        existing = conn.execute("SELECT * FROM day_state WHERE date = ?", (date_str,)).fetchone()
+        if existing and existing["day_started_at"] and not force:
+            row = dict(existing)
+            row["already_started"] = True
+            row["updated"] = False
+            return row
+
+        if existing:
+            conn.execute(
+                """
+                UPDATE day_state
+                SET day_started_at = ?, source = ?, details_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE date = ?
+                """,
+                (timestamp, source, details_json, date_str),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO day_state (date, day_started_at, source, details_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (date_str, timestamp, source, details_json),
+            )
+        conn.commit()
+        row = conn.execute("SELECT * FROM day_state WHERE date = ?", (date_str,)).fetchone()
+
+    result = dict(row)
+    result["already_started"] = False
+    result["updated"] = True
+    return result
+
+
+async def set_day_started_at(
+    *,
+    source: str = "manual",
+    at: datetime | None = None,
+    details: dict | None = None,
+    force: bool = False,
+    db_path: Path | None = None,
+) -> dict:
+    """Async wrapper for persisting day-start state."""
+    return await asyncio.to_thread(
+        set_day_started_at_sync,
+        source=source,
+        at=at,
+        details=details,
+        force=force,
+        db_path=db_path,
+    )
+
+
+def get_quiet_hours_status(now: datetime | None = None) -> dict:
+    """Return the canonical quiet-hours decision and context.
+
+    The 23:00 sleep-start gate remains hour based. The morning end is event
+    driven: once ``day_state.day_started_at`` exists for the local date, the
+    morning quiet-hours latch is released before the configured fallback end.
+    """
+    local_now = quiet_hours_local_now(now)
+    active, segment = _quiet_hour_window_active(local_now)
+    day_state = None
+    local_date = local_now.date().isoformat()
+    cached_at = float(_DAY_STATE_CACHE.get("monotonic") or 0.0)
+    if (
+        _DAY_STATE_CACHE.get("date") == local_date
+        and time.monotonic() - cached_at <= _DAY_STATE_CACHE_TTL_SECONDS
+    ):
+        day_state = _DAY_STATE_CACHE.get("value")
+    elif _in_running_event_loop():
+        # This function is used by many async hot paths (hooks, timer reads,
+        # Golden Throne scheduling). Never perform synchronous SQLite on the
+        # event loop; return the last known state and refresh in the background.
+        if _DAY_STATE_CACHE.get("date") == local_date:
+            day_state = _DAY_STATE_CACHE.get("value")
+        try:
+            asyncio.create_task(_refresh_day_state_cache(local_date))
+        except RuntimeError:
+            pass
     else:
-        active = hour_float >= start or hour_float < end
+        day_state = get_day_state_sync(local_date)
+    day_started_at = day_state.get("day_started_at") if day_state else None
+
+    if active and segment == "morning_latch" and day_started_at:
+        active = False
+        reason = "day_started"
+    elif active:
+        reason = "quiet_hours"
+    else:
+        reason = "outside_quiet_hours"
 
     return {
         "active": active,
-        "reason": "quiet_hours" if active else "outside_quiet_hours",
-        "quiet_start": start,
-        "quiet_end": end,
+        "reason": reason,
+        "quiet_start": QUIET_HOURS_START,
+        "quiet_end": QUIET_HOURS_END,
         "timezone": QUIET_HOURS_TIMEZONE,
         "local_time": local_now.isoformat(),
+        "day_started_at": day_started_at,
+        "day_state_date": local_now.date().isoformat(),
+        "quiet_segment": segment,
     }
 
 
@@ -243,52 +430,71 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+async def _run_subprocess_offloop(
+    args: list[str] | tuple[str, ...],
+    *,
+    timeout: float | None = None,
+    stdout=None,
+    stderr=None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run short tmux resolver subprocesses without forking on the event loop."""
+    return await asyncio.to_thread(
+        subprocess.run,
+        list(args),
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        timeout=timeout,
+        check=False,
+    )
+
+
+async def _resolve_tmux_pane_direct(tmux_pane: str) -> str | None:
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=1,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    pane_id = proc.stdout.decode(errors="ignore").strip()
+    return pane_id or None
+
+
 async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
-    """Return the live %pane id for a tmux target, following tombstones when present."""
+    """Return the live %pane id for a tmux target, following tombstones when present.
+
+    Deliberately uncached: tmux %pane ids are volatile descriptors. Token-API
+    callers must treat this resolver as a runtime dependency instead of storing
+    resolver output as authoritative state.
+    """
     if not tmux_pane:
         return None
+    cli_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmux-resolve-pane"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python3",
-            "-m",
-            "tmuxctl.cli",
-            "resolve-pane",
-            tmux_pane,
+        proc = await _run_subprocess_offloop(
+            (str(cli_bin), "--format", "id", tmux_pane),
             env={
                 **os.environ,
                 "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            timeout=3,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
         if proc.returncode == 0:
-            for line in stdout.decode(errors="ignore").splitlines():
-                if line.startswith("pane_id: "):
-                    pane_id = line.split(": ", 1)[1].strip()
-                    if pane_id:
-                        return pane_id
+            pane_id = proc.stdout.decode(errors="ignore").strip()
+            if pane_id:
+                return pane_id
     except Exception:
         pass
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "display-message",
-            "-t",
-            tmux_pane,
-            "-p",
-            "#{pane_id}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    pane_id = stdout.decode(errors="ignore").strip()
-    return pane_id or None
+    return await _resolve_tmux_pane_direct(tmux_pane)
 
 
 async def tmux_pane_exists(tmux_pane: str | None) -> bool:
@@ -527,30 +733,52 @@ DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 # ============ Event Logging ============
 
 
+def _log_event_sync_insert(
+    event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
+) -> None:
+    """Serialize event writes in a worker thread.
+
+    `log_event()` is called by hook/heartbeat hot paths. Letting each call open
+    its own aiosqlite worker creates write-lock storms under hook bursts; doing
+    the sqlite write behind one process-local lock keeps the asyncio loop free
+    and prevents the aiosqlite worker/thread pileup that was timing endpoints.
+    """
+    details_json = json.dumps(details, default=str) if details else None
+    with _LOG_EVENT_WRITE_LOCK:
+        for attempt in range(3):
+            try:
+                with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute(
+                        """INSERT INTO events (event_type, instance_id, device_id, details)
+                           VALUES (?, ?, ?, ?)""",
+                        (event_type, instance_id, device_id, details_json),
+                    )
+                    conn.commit()
+                    return
+            except sqlite3.OperationalError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
+
 async def log_event(
     event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
 ):
     """Log an event to the events table."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO events (event_type, instance_id, device_id, details)
-               VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None),
-        )
-        await db.commit()
+    try:
+        await asyncio.to_thread(_log_event_sync_insert, event_type, instance_id, device_id, details)
+    except Exception as exc:
+        # Event logs are telemetry. Do not let a transient SQLite lock take down
+        # hook/HTTP hot paths or trigger recursive hook_error logging.
+        logger.warning("event log dropped (%s): %s", event_type, exc)
 
 
 async def log_event_sync(
     event_type: str, instance_id: str = None, device_id: str = None, details: dict = None
 ):
     """Synchronous wrapper for logging events (for use in sync functions)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO events (event_type, instance_id, device_id, details)
-               VALUES (?, ?, ?, ?)""",
-            (event_type, instance_id, device_id, json.dumps(details) if details else None),
-        )
-        await db.commit()
+    await log_event(event_type, instance_id, device_id, details)
 
 
 async def append_workflow_event(
@@ -587,6 +815,19 @@ scheduler = None  # apscheduler.schedulers.asyncio.AsyncIOScheduler
 # ============ Timer Analytics ============
 
 
+def _serialize_timer_shift_details(details):
+    """Return a SQLite-safe value for timer_shifts.details."""
+    if details is None:
+        return None
+    if isinstance(details, str):
+        return details
+    if isinstance(details, (dict, list, tuple)):
+        return json.dumps(details, sort_keys=True, default=str)
+    if isinstance(details, (bool, int, float)):
+        return json.dumps(details)
+    return str(details)
+
+
 def _sync_log_shift(
     old_mode, new_mode: str, trigger: str, source: str, phone_app=None, details=None
 ):
@@ -617,7 +858,7 @@ def _sync_log_shift(
             timer_engine.total_work_time_ms,
             active_instances,
             phone_app,
-            details,
+            _serialize_timer_shift_details(details),
         ),
     )
     conn.commit()

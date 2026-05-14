@@ -8,7 +8,7 @@
 #   tmux-resurrect restore    — Resume instances from snapshot into current workspace
 #
 # Snapshot captures: session_id, working_dir, @PANE_ID, primarch, instance_type
-# Restore maps @PANE_ID → new tmux pane target, runs `claude --resume` in each.
+# Restore maps @PANE_ID → new tmux pane target, runs `dispatch --id` in each.
 
 set -euo pipefail
 
@@ -61,12 +61,13 @@ for inst in instances:
     if not pane:
         continue
     result.append({
-        'session_id': inst.get('id', ''),
+        'session_id': inst.get('session_id', '') or inst.get('id', ''),
         'working_dir': inst.get('working_dir', '') or '',
         'tmux_pane': pane,
         'pane_label': inst.get('pane_label', '') or '',
         'primarch': inst.get('primarch', '') or '',
         'instance_type': inst.get('instance_type', '') or 'one_off',
+        'engine': inst.get('engine', '') or 'claude',
         'tab_name': inst.get('tab_name', '') or '',
         'legion': inst.get('legion', '') or '',
         'zealotry': inst.get('zealotry', 4),
@@ -178,10 +179,11 @@ for inst in instances:
         was_processing = status == 'processing'
 
     result.append({
-        'session_id': inst.get('id', ''),
+        'session_id': inst.get('session_id', '') or inst.get('id', ''),
         'working_dir': inst.get('working_dir', '') or '',
         'pane_label': label,
         'tab_name': inst.get('tab_name', '') or '',
+        'engine': inst.get('engine', '') or 'claude',
         'was_processing': was_processing,
         'last_activity': inst.get('last_activity', '') or '',
     })
@@ -215,8 +217,9 @@ for inst in json.loads(sys.stdin.read()):
     wd = inst['working_dir'] or '\$HOME'
     label = inst['pane_label']
     proc = '1' if inst.get('was_processing') else '0'
-    print(f'{sid}\t{wd}\t{label}\t{proc}')
-" <<< "$restore_list" | while IFS=$'\t' read -r session_id working_dir pane_label was_processing; do
+    engine = inst.get('engine') or 'claude'
+    print(f'{sid}\t{wd}\t{label}\t{proc}\t{engine}')
+" <<< "$restore_list" | while IFS=$'\t' read -r session_id working_dir pane_label was_processing engine; do
         local target=""
 
         if [[ -n "$pane_label" ]]; then
@@ -228,11 +231,11 @@ for inst in json.loads(sys.stdin.read()):
             continue
         fi
 
-        # Check pane is idle (not already running claude)
+        # Check pane is idle (not already running an agent)
         local cmd
         cmd=$(tmux display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
-        if [[ "$cmd" == *claude* ]]; then
-            echo "  skip: ${pane_label} — claude already running" >&2
+        if [[ "$cmd" == *claude* || "$cmd" == *codex* || "$cmd" == *node* ]]; then
+            echo "  skip: ${pane_label} — agent already running (${cmd})" >&2
             continue
         fi
 
@@ -244,7 +247,9 @@ for inst in json.loads(sys.stdin.read()):
         else
             echo "  ${pane_label} (${target}) ← session ${session_id:0:8}..."
         fi
-        tmux send-keys -t "$target" "cd '${working_dir}' && claude --resume '${session_id}'" Enter
+        local launch_cmd
+        printf -v launch_cmd 'cd %q && dispatch --id %q --pane %q' "$working_dir" "$session_id" "$target"
+        tmux send-keys -t "$target" "$launch_cmd" Enter
         sleep 1.5  # Give claude time to start or fail
 
         # Validate: check if resume actually worked
@@ -294,9 +299,10 @@ for inst in json.load(open('$SNAPSHOT_FILE')):
     pane_id = inst.get('pane_id', '') or inst.get('pane_label', '')
     window = inst.get('window', '')
     proc = '1' if inst.get('was_processing') else '0'
+    engine = inst.get('engine') or 'claude'
     if sid:
-        print(f'{sid}\t{wd}\t{pane_id}\t{window}\t{proc}')
-" | while IFS=$'\t' read -r session_id working_dir pane_id window was_processing; do
+        print(f'{sid}\t{wd}\t{pane_id}\t{window}\t{proc}\t{engine}')
+" | while IFS=$'\t' read -r session_id working_dir pane_id window was_processing engine; do
         local target=""
 
         if [[ -n "$pane_id" ]]; then
@@ -325,8 +331,8 @@ for inst in json.load(open('$SNAPSHOT_FILE')):
 
         local cmd
         cmd=$(tmux display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
-        if [[ "$cmd" == *claude* ]]; then
-            echo "  skip: ${pane_id:-$target} — claude already running" >&2
+        if [[ "$cmd" == *claude* || "$cmd" == *codex* || "$cmd" == *node* ]]; then
+            echo "  skip: ${pane_id:-$target} — agent already running (${cmd})" >&2
             continue
         fi
 
@@ -341,7 +347,9 @@ for inst in json.load(open('$SNAPSHOT_FILE')):
         else
             echo "  ${label} (${target}) ← session ${session_id:0:8}..."
         fi
-        tmux send-keys -t "$target" "cd '${working_dir}' && claude --resume '${session_id}'" Enter
+        local launch_cmd
+        printf -v launch_cmd 'cd %q && dispatch --id %q --pane %q' "$working_dir" "$session_id" "$target"
+        tmux send-keys -t "$target" "$launch_cmd" Enter
         sleep 1.5
 
         # Validate: check if resume actually worked

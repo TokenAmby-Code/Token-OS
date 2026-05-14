@@ -30,11 +30,11 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}>${NC} $1"; }
-log_success() { echo -e "${GREEN}+${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
-log_error()   { echo -e "${RED}x${NC} $1"; }
-log_dry()     { echo -e "${CYAN}~${NC} $1"; }
+log_info()    { echo -e "${BLUE}>${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}+${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1" >&2; }
+log_error()   { echo -e "${RED}x${NC} $1" >&2; }
+log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 
 # --- Host mapping (reuses ssh-connect aliases) ---
 host_to_ssh() {
@@ -181,17 +181,8 @@ kill_local_claude() {
 # Build a fallback command that restores the original session in its original directory
 build_fallback_cmd() {
     local source_dir="$1" session_id="$2" primarch_name="$3"
-    local claude_bin
-    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
-        claude_bin="claude"
-    else
-        claude_bin="\$HOME/.local/bin/claude"
-    fi
-    if [[ -n "$primarch_name" ]]; then
-        echo "cd '${source_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
-    else
-        echo "cd '${source_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
-    fi
+    local _primarch_name="$primarch_name"
+    echo "cd '${source_dir}' && dispatch --id '${session_id}'"
 }
 
 # --- Recovery logging ---
@@ -497,23 +488,8 @@ write_transplant_handoff() {
 build_restart_cmd() {
     local target_dir="$1" session_id="$2" primarch_name="$3" resume_prompt="$4"
     local claude_bin
-    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
-        claude_bin="claude"
-    else
-        claude_bin="\$HOME/.local/bin/claude"
-    fi
-
-    local prompt_arg=""
-    if [[ -n "$resume_prompt" ]]; then
-        # Positional prompt arg goes after all flags (NOT -p, which is --print mode)
-        prompt_arg=" '${resume_prompt}'"
-    fi
-
-    if [[ -n "$primarch_name" ]]; then
-        echo "cd '${target_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue${prompt_arg}"
-    else
-        echo "cd '${target_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue${prompt_arg}"
-    fi
+    local _primarch_name="$primarch_name" _resume_prompt="$resume_prompt"
+    echo "cd '${target_dir}' && dispatch --id '${session_id}'"
 }
 
 # --- Parse args ---
@@ -595,7 +571,7 @@ PLAN_FILE="${HOME}/.claude/transplant-pending/plan"
 if $EXECUTE_PLAN; then
     if [[ ! -f "$PLAN_FILE" ]]; then
         log_error "No pending plan found at $PLAN_FILE"
-        echo "  Use 'transplant --plan <target-dir>' first"
+        echo "  Use 'transplant --plan <target-dir>' first" >&2
         exit 1
     fi
     # Re-invoke transplant with the saved args (strips --plan, adds nothing extra)
@@ -780,7 +756,7 @@ if tmux display-message -p '#{session_name}' &>/dev/null; then
 elif [[ -z "$REMOTE_HOST" ]] || $RELAY_MODE; then
     log_error "Not in tmux — transplant requires tmux (except headless remote)"
     echo ""
-    echo "  Manual: cd '$TARGET_DIR' && claude --resume --continue"
+    echo "  Manual: cd '$TARGET_DIR' && dispatch --id '<session_id>'"
     exit 1
 else
     log_warn "No tmux (OK for headless remote)"
@@ -813,8 +789,8 @@ fi
 
 if [[ -z "$session_id" ]]; then
     log_error "No session ID found"
-    echo "  Cache dir: ${HOME}/.claude/session-pids/"
-    echo "  Source project dir: $source_project_dir"
+    echo "  Cache dir: ${HOME}/.claude/session-pids/" >&2
+    echo "  Source project dir: $source_project_dir" >&2
     exit 1
 fi
 log_success "Session ID: ${session_id:0:12}..."
@@ -857,7 +833,7 @@ if $PRIMARCH_MODE && [[ -z "$PRIMARCH_NAME" ]]; then
         log_success "Primarch from env: $PRIMARCH_NAME"
     else
         log_error "No primarch name given and none found in instance DB or env"
-        echo "  Usage: transplant --primarch <name> <target-dir>"
+        echo "  Usage: transplant --primarch <name> <target-dir>" >&2
         exit 1
     fi
 elif ! $PRIMARCH_MODE && [[ -n "$old_primarch" ]]; then
@@ -878,7 +854,7 @@ if [[ -z "$pane_target" && -z "$REMOTE_HOST" ]] || [[ -z "$pane_target" && $RELA
         : # headless remote doesn't need a pane
     else
         log_error "Could not identify tmux pane"
-        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --continue"
+        echo "  Fallback: cd '$TARGET_DIR' && dispatch --id '$session_id'" >&2
         exit 1
     fi
 fi
@@ -1029,15 +1005,9 @@ if [[ -n "$REMOTE_HOST" ]]; then
         log_info "Relay mode: local pane will SSH into $REMOTE_HOST..."
         echo ""
 
-        # Build relay restart command (ssh wrapping the remote claude command)
+        # Build relay restart command (ssh wrapping the remote dispatch command)
         remote_cmd=""
-        remote_prompt=""
-        [[ -n "$RESUME_PROMPT" ]] && remote_prompt=" '${RESUME_PROMPT}'"
-        if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_cmd="cd '$TARGET_DIR' && primarch $PRIMARCH_NAME --resume '$session_id' --continue${remote_prompt}"
-        else
-            remote_cmd="cd '$TARGET_DIR' && \\\$HOME/.local/bin/claude --resume '$session_id' --continue${remote_prompt}"
-        fi
+        remote_cmd="cd '$TARGET_DIR' && dispatch --id '$session_id'"
         relay_restart_cmd="ssh -t $ssh_target \"$remote_cmd\""
 
         # Build fallback for recovery
@@ -1064,13 +1034,7 @@ RELAY_EOF
         log_info "Spawning headless Claude on $REMOTE_HOST..."
         local_remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
         remote_launch=""
-        headless_prompt=""
-        [[ -n "$RESUME_PROMPT" ]] && headless_prompt=" '${RESUME_PROMPT}'"
-        if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_launch="primarch $PRIMARCH_NAME --resume '$session_id' --continue${headless_prompt}"
-        else
-            remote_launch="\$HOME/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --continue${headless_prompt}"
-        fi
+        remote_launch="dispatch --id '$session_id'"
         ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup $remote_launch > $local_remote_log 2>&1 &"
         log_success "Remote agent spawned"
 

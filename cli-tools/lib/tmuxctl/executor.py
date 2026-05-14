@@ -15,8 +15,10 @@ from .models import (
     WorkspaceSnapshot,
 )
 from .normalize import normalize_window
+from .revert import cleanup_transient_windows, is_transient_window_name
 from .snapshot import build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
+from .tombstone import install_tombstone
 
 RESUME_FAILURE_PATTERNS = ("no conversation found", "error", "not found", "enoent")
 CONTINUATION_PROMPT = "continue where you left off"
@@ -113,6 +115,11 @@ class RestartExecutor:
                 )
                 continue
 
+            if resume.tombstone_role and resume.tombstone_role != resume.pane_label:
+                source_pane_id = pane_by_label.get(resume.tombstone_role, "")
+                if source_pane_id and source_pane_id != target_pane_id:
+                    self._install_tombstone(source_pane_id, resume.tombstone_role, target_pane_id)
+
             command = self.adapter.run(
                 "display-message",
                 "-t",
@@ -137,7 +144,7 @@ class RestartExecutor:
             localized_dir = self._localize_path(resume.working_dir)
             self.adapter.send_keys(
                 target_pane_id,
-                f"cd {shlex.quote(localized_dir or '$HOME')} && claude --resume {shlex.quote(resume.instance_id)}",
+                f"cd {shlex.quote(localized_dir or '$HOME')} && dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(target_pane_id)}",
                 "Enter",
             )
             time.sleep(1.5)
@@ -160,7 +167,7 @@ class RestartExecutor:
 
             if resume.disposition.value == "resume_and_continue":
                 time.sleep(2.0)
-                self.adapter.send_keys(target_pane_id, CONTINUATION_PROMPT, "Enter")
+                self.adapter.send_text_then_submit(target_pane_id, CONTINUATION_PROMPT)
             resume_results.append(
                 ResumeResult(
                     instance_id=resume.instance_id,
@@ -234,6 +241,9 @@ class RestartExecutor:
                 return imperium + path[len(prefix) :]
         return path
 
+    def _install_tombstone(self, pane_id: str, source_role: str, target_pane_id: str) -> None:
+        install_tombstone(self.adapter, pane_id, source_role, target_pane_id)
+
     def _verify(
         self,
         plan: RestartPlan,
@@ -249,8 +259,7 @@ class RestartExecutor:
             if not result.success:
                 violations.append(f"resume failed for {result.pane_label}: {result.message}")
         for window in rebuilt.windows:
-            base = window.window_name.split("(", 1)[0]
-            if base.startswith("_stash_") or base.startswith("_fstash_"):
+            if is_transient_window_name(window.window_name):
                 violations.append(f"transient stash window survived rebuild: {window.window_name}")
             for warning in window.warnings:
                 if "missing" in warning or "duplicate" in warning:
@@ -258,16 +267,7 @@ class RestartExecutor:
         return violations
 
     def _clear_transient_windows(self, session_name: str) -> None:
-        for record in self.adapter.list_windows(session_name):
-            window_name = record["window_name"]
-            base = window_name.split("(", 1)[0]
-            if base.startswith("_stash_") or base.startswith("_fstash_"):
-                self.adapter.run(
-                    "kill-window",
-                    "-t",
-                    f"{session_name}:{window_name}",
-                    allow_failure=True,
-                )
+        cleanup_transient_windows(self.adapter, session_name)
 
     def _planned_actions(self, plan: RestartPlan) -> list[RestartAction]:
         actions: list[RestartAction] = []

@@ -1,6 +1,6 @@
 # Startup Audit (All Devices)
 
-> Last updated: 2026-02-22
+> Last updated: 2026-05-08
 
 Central reference for all custom startup automations across devices.
 
@@ -49,15 +49,15 @@ womp            1       ← wake on LAN
 
 | # | Task Name | RunLevel | Delay | What It Does |
 |---|-----------|----------|-------|-------------|
-| 1 | ~~**WSL Keep-Alive**~~ | Limited | 5s | **DISABLED 2026-02-19** — `wsl.exe -d Ubuntu -- bash -lc "exec sleep infinity"` — kept WSL alive but opened a visible cmd.exe/conhost window. Redundant now that MonitorLauncher (task #9) keeps WSL running via Windows Terminal |
-| 2 | **Deskflow** | Limited | 3s | Starts Deskflow KVM minimized, waits 10s, then curls Mac token-api (`POST http://100.95.109.23:7777/api/kvm/start`) to signal KVM is ready |
-| 3 | **ahk_init** | Limited | — | Runs `script-compiler.ahk` — the main AHK suite (see AHK Architecture below) |
-| 4 | **ahk_admin** | Highest | — | Runs `ring-remap.ahk` — Bluetooth ring button remapping via AutoHotInterception (needs admin for driver access) |
-| 5 | **AHK startup mode** | Limited | — | Runs `startup-launcher.ahk` — 10-second quick app launcher (V=Vivaldi, S=Spotify, etc.) |
-| 6 | **fast_task** | Highest | — | Starts Fast! app (`C:\Program Files (x86)\Fast!\fast!.exe`) |
-| 7 | **Dual Monitor Tools** | Limited | — | Starts DMT.exe for multi-monitor management |
-| 8 | **Autorun for colby** | Limited | 3s | Starts PowerToys |
-| 9 | **MonitorLauncher** | Limited | 15s | Runs `monitor-launcher.ahk` — launches Windows Terminal with `monitor` TUI on leftmost monitor. Creates grouped session `monitor` for independent window viewing. TUI runs via `tui-pane-guard` with auto-restart lifecycle. |
+| 1 | **ahk_boot** | Limited | — | Runs local `startup.ahk` bootstrap — launches Windows Terminal `monitor`, kicks DeskFlow's phased recovery through local `token-satellite`, launches **Bluetooth Audio Receiver**, and exposes 10-second startup hotkeys |
+| 2 | **ahk_init** | Limited | — | Runs `script-compiler.ahk` through `ahk-nas-wait.bat` — the main NAS-backed AHK suite (see AHK Architecture below) |
+| 3 | **ahk_admin** | Highest | 60s | Runs `ring-remap.ahk` through `ahk-nas-wait.bat` — Bluetooth ring button remapping via AutoHotInterception (needs admin for driver access) |
+| 4 | ~~**Deskflow**~~ | Limited | 3s | **DISABLED** — legacy direct DeskFlow launch task. Superseded by `token-satellite` watchdog plus `ahk_boot`'s phased `/kvm/control` kick |
+| 5 | ~~**AHK startup mode**~~ | Limited | — | **DISABLED** — folded into `ahk_boot` |
+| 6 | ~~**MonitorLauncher**~~ | Limited | 15s | **DISABLED** — folded into `ahk_boot` |
+| 7 | **fast_task** | Highest | — | Starts Fast! app (`C:\Program Files (x86)\Fast!\fast!.exe`) |
+| 8 | **Dual Monitor Tools** | Limited | — | Starts DMT.exe for multi-monitor management |
+| 9 | **Autorun for colby** | Limited | 3s | Starts PowerToys |
 
 ### On-Demand Only (No Logon Trigger)
 
@@ -91,20 +91,22 @@ These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or 
 
 ## AHK Script Architecture
 
-All AHK scripts live at `/Volumes/Imperium/Scripts/ahk/` (accessed from Windows via `\\Token-NAS\Imperium\Scripts\ahk\`).
+Source-of-truth AHK scripts live in this repo at `Token-OS/ahk/`. `Setup-StartupTasks.ps1` copies the boot-critical launcher locally so it still runs before the NAS is mounted. The main long-lived suite still launches from the NAS through `ahk-nas-wait.bat`.
 
 ```
+startup.ahk                  <- ahk_boot task (copied local at setup time)
+ahk-nas-wait.bat            <- local wrapper used by ahk_init / ahk_admin
 script-compiler.ahk          <- ahk_init task (main entry point)
   #Include audio-monitor.ahk    Audio device monitoring
   #Include discord-ipc-mute.ahk Discord mute via IPC
   #Include hotkeys.ahk           Global hotkeys
 
 ring-remap.ahk               <- ahk_admin task (standalone, needs admin)
-startup-launcher.ahk          <- AHK startup mode task (standalone)
-monitor-launcher.ahk          <- MonitorLauncher task (standalone, 15s delay)
+startup-launcher.ahk          <- historical standalone startup hotkeys (folded into startup.ahk)
+monitor-launcher.ahk          <- historical standalone monitor launcher (folded into startup.ahk)
 ```
 
-> **Note**: Old copies exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` — these are superseded by `/Volumes/Imperium/Scripts/ahk/` but kept for historical reference in the Obsidian vault.
+> **Note**: Old copies still exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` and under local ad-hoc Windows paths. Treat `Token-OS/ahk/` plus `Powershell/Setup-StartupTasks.ps1` as the canonical source.
 
 ---
 
@@ -118,16 +120,20 @@ Not managed by us. Includes: Steam, Discord, Docker Desktop, Spotify, Figma Agen
 
 1. Windows logon
 2. Task Scheduler fires all logon-triggered tasks (with respective delays)
-3. **Deskflow** (3s delay) starts KVM, then notifies Mac token-api after 10s
-4. AHK scripts, PowerToys, DMT, Fast! all start in parallel
-5. **MonitorLauncher** (15s delay) opens Windows Terminal with `monitor` TUI on leftmost screen — creates grouped session `monitor` on `main` for independent window viewing. TUI auto-restarts on crash via `tui-pane-guard`. This starts WSL Ubuntu and triggers systemd
-6. systemd starts **token-satellite** on `:7777`
+3. **ahk_boot** starts immediately and opens Windows Terminal with `monitor` on the leftmost screen — this starts WSL Ubuntu and triggers systemd
+4. WSL systemd starts **token-satellite** on `:7777`
+5. `startup.ahk` waits for `token-satellite` health, then calls `POST /kvm/control {"action":"reload"}` to kick DeskFlow's phased recovery ladder instead of launching the old task directly
+6. `startup.ahk` launches **Bluetooth Audio Receiver** so the phone can route audio through the PC
+7. `ahk_init`, `ahk_admin`, PowerToys, DMT, and Fast! start on their respective schedules
 
 ---
 
 ## How to Add New Startup Items
 
 **Preferred method: Task Scheduler** — all custom startup items should use Task Scheduler for consistency.
+
+**Canonical setup script:** `Powershell/Setup-StartupTasks.ps1`
+This script copies the boot-critical startup assets local (`%USERPROFILE%\startup.ahk`, `%USERPROFILE%\ahk-nas-wait.bat`, `%USERPROFILE%\Imperium-Startup\*.ps1`) and then re-registers the managed tasks. It also disables the obsolete standalone `Deskflow`, `AHK startup mode`, and `MonitorLauncher` tasks.
 
 ### Create via PowerShell
 ```powershell

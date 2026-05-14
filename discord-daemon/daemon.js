@@ -64,6 +64,7 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('SIGHUP', () => {
   earlyLogger.warn('Received SIGHUP');
+  process.exit(0);
 });
 
 // --- Main ---
@@ -192,8 +193,13 @@ async function main() {
 
   // Start all bot clients (mechanicus first as it's the listener)
   for (const [name, client] of Object.entries(botClients)) {
-    await client.start();
-    logger.info(`Bot '${name}' connected`);
+    try {
+      await client.start();
+      logger.info(`Bot '${name}' connected`);
+    } catch (err) {
+      logger.warn(`Bot '${name}' failed to connect: ${err.message}`);
+      delete botClients[name];
+    }
   }
 
   await voiceManager.reconcileOperatorVoiceState();
@@ -322,6 +328,9 @@ async function main() {
   // Keep alive
   process.on('uncaughtException', (err) => {
     logger.error(`Uncaught exception: ${err.message}\n${err.stack}`);
+    if (err?.code === 'EADDRINUSE') {
+      process.exit(1);
+    }
     // Don't crash — discord.js should handle reconnection
   });
 

@@ -203,7 +203,9 @@ agents-db query "SELECT json_extract(details, '$.channel_name') as channel, json
 
 ## Timer State Machine (v2 — Layered Composite Model)
 
-Three independent layers compose into 6 effective modes:
+Inputs are signals, not output modes. Productivity detections and distraction detections contribute to internal layer state; the server derives the public timer mode from that composite. Phone, desktop, work-action, process, and geofence observations should not directly assert final modes such as `working`, `multitasking`, or `break`.
+
+Three independent layers currently compose into 6 effective modes:
 
 ### Layers
 
@@ -238,6 +240,9 @@ Three independent layers compose into 6 effective modes:
 ### Key Rules
 
 - **DISTRACTED requires productivity** — only scrolling/gaming trigger it after 10min. Video stays MULTITASKING.
+- **Phone foreground is a distraction contribution** — it may move the derived activity layer to `distraction`, but it must not create `trigger=phone_app` shifts or assert `work_gaming`.
+- **Productivity remains server-derived** — active Claude/Codex instances and work-action calls drive `Productivity`; phone apps have no authority to mark work active.
+- **Location is a modifier** — geofence state can apply exemptions/bounties/manual context, but it should feed the composite state rather than bypassing derivation.
 - **Parameterized idle timeout**: 2hr from WORKING, 2min from MULTITASKING.
 - **Gym bounty**: +30 min break on gym exit (`apply_gym_bounty()`).
 - **Daily reset**: 7 AM (CronTrigger hour=7).
@@ -271,7 +276,7 @@ GET    /api/timer/shifts              # Today's shift analytics
 ### Integration Points (main.py)
 
 - **Desktop detection** (`handle_desktop_detection`): silence/music → `set_activity(WORKING)`, video/scrolling/gaming → `set_activity(DISTRACTION)`
-- **Phone activity** (`handle_phone_activity`): same activity-layer mapping
+- **Phone activity** (`handle_phone_activity`): open events for distraction apps contribute `Activity.DISTRACTION` and log `phone_distraction_observed`; close/stale events should remove or age out that contribution, not assert work by themselves
 - **Timer worker** (every 10s): polls DB for processing instances → `set_productivity()`
 - **Hook handlers** (`prompt_submit`, `post_tool_use`): → `set_productivity(True)`
 - **Location events**: gym exit → `apply_gym_bounty()`, gym/campus → `idle_timeout_exempt`

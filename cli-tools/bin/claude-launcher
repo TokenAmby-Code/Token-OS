@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# claude-launcher - retired launcher alias
-# TAGS: deprecated
-# AUDIENCE: deprecated
+# claude-launcher - human UI compatibility route
+# TAGS: launcher, dispatch, compatibility
+# AUDIENCE: human
 set -euo pipefail
-case "claude-launcher" in
-  claude-dispatch) replacement='dispatch --engine claude' ;;
-  vault-dispatch) replacement='dispatch --session-doc <path> --dir <path>' ;;
-  claude-launcher) replacement='dispatch --interactive' ;;
-  inquisitor) replacement='dispatch --persona inquisition --prompt <task>' ;;
-  subagent) replacement='dispatch --prompt <task>' ;;
-esac
-echo "claude-launcher has been retired. Use: $replacement" >&2
-exit 64
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "${SCRIPT_DIR}/dispatch" --interactive "$@"

@@ -79,6 +79,16 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/naming-nudge.sh",
+            "async": true
+          }
+        ]
       }
     ],
     "PreToolUse": [

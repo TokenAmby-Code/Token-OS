@@ -434,7 +434,7 @@ def create_legion_pane() -> str | None:
         timeout=5,
     )
     result = subprocess.run(
-        [str(tmuxctl), "resolve-pane", "legion:custodes"],
+        [str(tmuxctl), "resolve-pane", "--format", "id", "legion:custodes"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -442,11 +442,7 @@ def create_legion_pane() -> str | None:
     if result.returncode != 0:
         print(f"Error: could not resolve legion:custodes: {result.stderr}")
         return None
-    pane_id = ""
-    for line in result.stdout.splitlines():
-        if line.startswith("pane_id: "):
-            pane_id = line.split(": ", 1)[1].strip()
-            break
+    pane_id = result.stdout.strip()
     if not pane_id:
         print("Error: tmuxctl resolve-pane did not return a pane_id for legion:custodes")
         return None

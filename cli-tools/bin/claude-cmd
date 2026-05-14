@@ -22,8 +22,7 @@ API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 tmuxctl_resolve_pane() {
     local target="$1"
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli resolve-pane "$target" 2>/dev/null \
-        | awk -F': ' '$1 == "pane_id" { print $2; exit }'
+    "${_LIB_DIR}/../bin/tmux-resolve-pane" --format id "$target" 2>/dev/null
 }
 
 # --- Help ---
@@ -323,9 +322,9 @@ send_command() {
             fi
             return 1
         fi
-        tmux send-keys -t "$pane" "$cmd"
+        tmux send-keys -t "$pane" -l "$cmd"
         sleep 0.3
-        tmux send-keys -t "$pane" Enter
+        tmux send-keys -t "$pane" C-m
     fi
 
     # Hold briefly so Claude Code processes the Enter before anyone else sends

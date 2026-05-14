@@ -11,9 +11,11 @@ _MODULES_TO_RELOAD = [
     "enforcement_service",
     "routes.voice",
     "routes.tts",
+    "routes.day_start",
     "routes.hooks",
     "stop_hook",
     "init_db",
+    "temp_message",
     "main",
 ]
 

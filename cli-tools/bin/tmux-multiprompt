@@ -193,7 +193,7 @@ def resolve_targets(scope: str, pane_override: str | None = None) -> tuple[list[
 
 
 def deliver(pane: Pane, prompt: str, *, submit: bool, dry_run: bool, force: bool) -> dict:
-    if pane.reserved == "true" or pane.pane_type in {"tui", "backstop"}:
+    if pane.reserved == "true" or pane.pane_type == "tui":
         return {"pane": pane.pane_id, "state": "rejected", "reason": f"reserved/{pane.pane_type or 'unknown'} pane"}
 
     if not force and pane_has_input(pane.pane_id):

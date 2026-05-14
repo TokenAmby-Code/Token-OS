@@ -93,9 +93,9 @@ Use tasks for anything with 3+ steps or that involves multiple files.
 | `instance-name` | Session naming |
 | `transplant` | Move session to different directory/device with history preserved |
 | `worktree-setup` | Create git worktrees from NAS bare repos |
-| `vault-dispatch` | Spawn Claude in vault, brief it, transplant to work |
+| `dispatch` | Canonical Claude/Codex launcher (`--interactive`, `--target`, `--session-doc`, `--persona`) |
 | `work-loop` | Full cycle: vault → worktree → implement → PR → merge → cleanup |
-| `tx br` | Backrooms dispatch/status/cleanup (`tx backrooms`) |
+| `tmux-legion-prompt` | Quick prompt into a managed legion worker pane |
 | `cloud-logs` | Cloud Run logs |
 | `db-query` | Cloud SQL access |
 | `db-migrate` | SQL migrations |
@@ -127,9 +127,9 @@ Worktree (implementation)
 
 **For autonomous dispatch** (no human in the loop):
 ```bash
-vault-dispatch <session-doc> <working-dir> [--primarch <name>]   # one-shot
+dispatch --session-doc <session-doc> --dir <working-dir> [--persona <name>]   # one-shot
 work-loop dispatch <session-doc> [--branch <name>]               # full cycle to PR merge
-tx br "prompt"                                                     # quick backrooms task
+tmux-legion-prompt --prompt "prompt"                                 # quick legion task
 ```
 
 **Worktree configs:** `~/.config/worktrees/<project>.conf` — project auto-detected from CWD.

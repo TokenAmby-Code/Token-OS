@@ -7,7 +7,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
+CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
+# Tests and callers may intentionally point dispatch at an alternate vault root.
+[[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 
 usage() {
   cat <<'USAGE'
@@ -273,6 +276,19 @@ interactive_override_for() {
   esac
 }
 
+read_interactive_objective() {
+  local override="${DISPATCH_INTERACTIVE_OBJECTIVE:-}" objective=""
+  if [[ -n "$override" ]]; then
+    printf '%s' "$override"
+    return 0
+  fi
+  [[ -t 0 && -r /dev/tty ]] || return 0
+  printf 'objective> ' > /dev/tty
+  IFS= read -r objective < /dev/tty || true
+  [[ -n "$objective" ]] || { err "interactive aspirant objective cancelled"; exit 130; }
+  printf '%s' "$objective"
+}
+
 pick_fzf_value() {
   local key="$1" prompt="$2" default_value="$3" input selection override
   input="$(cat)"
@@ -476,6 +492,9 @@ if [[ -n "$SYSTEM_PROMPT_FILE" ]]; then
   FILE_SYSTEM_PROMPT="$(cat "$SYSTEM_PROMPT_FILE")"
   if [[ -n "$SYSTEM_PROMPT" ]]; then SYSTEM_PROMPT="${SYSTEM_PROMPT}"$'\n\n'"${FILE_SYSTEM_PROMPT}"; else SYSTEM_PROMPT="$FILE_SYSTEM_PROMPT"; fi
 fi
+if $INTERACTIVE && $ASPIRANT && [[ -z "$PROMPT" && -z "$OBJECTIVE" ]]; then
+  PROMPT="$(read_interactive_objective)"
+fi
 if [[ -z "$OBJECTIVE" && -n "$PROMPT" ]]; then
   OBJECTIVE="$PROMPT"
 fi
@@ -520,26 +539,27 @@ if ! [[ "$ZEALOTRY" =~ ^[0-9]+$ ]] || (( ZEALOTRY < 1 || ZEALOTRY > 10 )); then
   exit 64
 fi
 
-build_aspirant_create_command() {
-  local -a args
-  args=(aspirant-create --kind "$ASPIRANT_KIND" --title "$TITLE" --objective "$OBJECTIVE" --source "$ASPIRANT_SOURCE")
-  [[ -n "$SESSION_DOMAIN" ]] && args+=(--session-domain "$SESSION_DOMAIN")
+build_aspirant_create_args() {
+  ASPIRANT_CREATE_ARGS=(--kind "$ASPIRANT_KIND" --title "$TITLE" --objective "$OBJECTIVE" --source "$ASPIRANT_SOURCE")
+  [[ -n "$SESSION_DOMAIN" ]] && ASPIRANT_CREATE_ARGS+=(--session-domain "$SESSION_DOMAIN")
   if [[ "$ASPIRANT_KIND" == "dispatch" ]]; then
-    args+=(--engine "$ENGINE" --dir "$WORK_DIR" --zealotry "$ZEALOTRY")
-    [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
-    [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
-    [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
-    [[ -n "$SYSTEM_PROMPT_FILE" ]] && args+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
-    [[ -n "$PROMPT_FILE" ]] && args+=(--prompt-file "$PROMPT_FILE")
+    ASPIRANT_CREATE_ARGS+=(--engine "$ENGINE" --dir "$WORK_DIR" --zealotry "$ZEALOTRY")
+    [[ -n "$PERSONA" ]] && ASPIRANT_CREATE_ARGS+=(--persona "$PERSONA")
+    [[ -n "$TARGET" ]] && ASPIRANT_CREATE_ARGS+=(--target "$TARGET")
+    [[ -n "$SESSION_DOC" ]] && ASPIRANT_CREATE_ARGS+=(--session-doc "$SESSION_DOC")
+    [[ -n "$SYSTEM_PROMPT_FILE" ]] && ASPIRANT_CREATE_ARGS+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
+    [[ -n "$PROMPT_FILE" ]] && ASPIRANT_CREATE_ARGS+=(--prompt-file "$PROMPT_FILE")
     local vc
     if ((${#VICTORY_CONDITIONS[@]})); then
       for vc in "${VICTORY_CONDITIONS[@]}"; do
-        args+=(--victory-condition "$vc")
+        ASPIRANT_CREATE_ARGS+=(--victory-condition "$vc")
       done
     fi
   fi
-  local a
-  for a in "${args[@]}"; do printf '%q ' "$a"; done
+}
+
+run_internal_aspirant_create() {
+  PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m aspirant_create "${ASPIRANT_CREATE_ARGS[@]}"
 }
 
 if $ASPIRANT; then
@@ -547,7 +567,7 @@ if $ASPIRANT; then
     err "--aspirant requires --objective or prompt text"
     exit 64
   fi
-  ASPIRANT_CREATE_COMMAND="$(build_aspirant_create_command)"
+  build_aspirant_create_args
   if $DRY_RUN; then
     cat <<EOF_ASPIRANT_DRY
 dispatch aspirant dry-run
@@ -561,16 +581,14 @@ dispatch aspirant dry-run
   persona:        ${PERSONA:-none}
   zealotry:       $ZEALOTRY
   session_domain: ${SESSION_DOMAIN:-default}
-  delegate_command:
-    $ASPIRANT_CREATE_COMMAND
+  internal_action: create aspirant note/session via cli-tools/lib/aspirant_create.py
+  dispatch_ready:  false
+  trials_verdict:  pending
 EOF_ASPIRANT_DRY
     exit 0
   fi
-  if ! command -v aspirant-create >/dev/null 2>&1; then
-    err "aspirant backend not installed; explicit --direct to bypass"
-    exit 69
-  fi
-  exec bash -lc "$ASPIRANT_CREATE_COMMAND"
+  run_internal_aspirant_create
+  exit $?
 fi
 
 DISPATCH_WINDOW=""

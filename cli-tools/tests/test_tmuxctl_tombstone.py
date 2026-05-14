@@ -8,10 +8,11 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.audience import _window_base
+from tmuxctl import audience as audience_module
+from tmuxctl.audience import _window_base, audience_toggle
 from tmuxctl.enums import GridState, PaneKind, WindowArchetype
 from tmuxctl.models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
-from tmuxctl.resolver import resolve_pane_in_snapshot
+from tmuxctl.resolver import PaneResolution, resolve_pane_in_snapshot
 from tmuxctl.snapshot import _window_warnings
 
 
@@ -22,11 +23,12 @@ def _pane(
     kind: PaneKind = PaneKind.UNKNOWN,
     target: str = "",
     window: str = "palace",
+    window_index: int = 1,
 ) -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
         session_name="main",
-        window_index=1,
+        window_index=window_index,
         window_name=window,
         pane_index=1,
         width=100,
@@ -44,13 +46,14 @@ def _pane(
 
 
 def _workspace(*panes: PaneSnapshot) -> WorkspaceSnapshot:
+    first = panes[0]
     return WorkspaceSnapshot(
         session_name="main",
         windows=(
             WindowSnapshot(
                 session_name="main",
-                window_index=1,
-                window_name="palace",
+                window_index=first.window_index,
+                window_name=first.window_name,
                 archetype=WindowArchetype.PALACE,
                 focused=False,
                 grid_expanded="none",
@@ -94,6 +97,31 @@ def test_canonical_logical_slot_resolves_to_legacy_pane_before_mutation():
 
     assert resolved.pane_id == "%1"
 
+
+
+
+def test_positional_window_index_slot_resolves_live_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "1:N")
+
+    assert resolved.pane_id == "%1"
+
+
+def test_positional_window_index_legacy_slot_resolves_canonical_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "1:NW")
+
+    assert resolved.pane_id == "%1"
+
+
+def test_positional_window_name_slot_resolves_live_pane():
+    workspace = _workspace(_pane("%2", "somnium:SE", window="somnium"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "somnium:BR")
+
+    assert resolved.pane_id == "%2"
 
 def test_single_tombstone_resolves_to_target():
     workspace = _workspace(
@@ -174,4 +202,71 @@ def test_audience_window_warns_when_page_type_does_not_match():
         side_expanded="none",
     )
 
-    assert "audience pane role does not match window page: audience:somnium:SW" in warnings
+    assert "audience pane role does not match window page: audience:somnium:W" in warnings
+
+
+class FakeAudienceAdapter:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, ...]] = []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.commands.append(args)
+        if args[:3] == ("display-message", "-t", "%5"):
+            return "\t".join(
+                [
+                    "%5",
+                    "main",
+                    "somnium",
+                    "somnium:EE",
+                    "tui",
+                    "",
+                    "side",
+                    "false",
+                    "/Volumes/Imperium/Token-OS",
+                ]
+            )
+        return ""
+
+
+def test_tui_pane_toggle_selects_dedicated_tui_window():
+    adapter = FakeAudienceAdapter()
+
+    result = audience_toggle(adapter, "%5")
+
+    assert result == "selected main:tui"
+    assert ("select-window", "-t", "main:tui") in adapter.commands
+    assert ("select-pane", "-t", "main:tui.1") in adapter.commands
+    assert not any(command[0] == "split-window" for command in adapter.commands)
+
+
+def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
+    class FakeAdapter:
+        def show_pane_option(self, pane_id: str, option: str) -> str:
+            if pane_id == "%9" and option == "@PANE_ID":
+                return "audience:palace:NE"
+            return ""
+
+    selected: list[str] = []
+
+    monkeypatch.setattr(
+        audience_module,
+        "resolve_pane",
+        lambda _adapter, _target: PaneResolution(
+            requested="%1",
+            pane_id="%9",
+            pane_role="audience:palace:NE",
+            pane_kind=PaneKind.AUDIENCE,
+            chain=("palace:NE", "audience:palace:NE"),
+        ),
+    )
+    monkeypatch.setattr(
+        audience_module,
+        "_select_pane_for_client",
+        lambda _adapter, pane_id, client="": selected.append(pane_id),
+    )
+
+    result = audience_module.audience_jump(FakeAdapter(), "%1")
+
+    assert result == "selected palace:N via palace:NE -> palace:NE"
+    assert "%9" not in result
+    assert selected == ["%9"]
