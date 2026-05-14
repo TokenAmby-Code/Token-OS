@@ -302,6 +302,7 @@ if [[ -x "$SCRIPT_DIR/rubric-flip" ]]; then
 fi
 
 if [[ "$NO_WAIT" == "true" ]]; then
+    printf '%s\n' "$PR_URL"
     log "Review wait skipped. Run: pr-review-loop $PR_NUMBER --read"
     exit 0
 fi
