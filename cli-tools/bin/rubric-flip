@@ -121,6 +121,8 @@ def parse_args(argv: list[str]) -> dict:
             if "=" not in spec:
                 raise SystemExit(f"Error: --extra expects K=V, got {spec}")
             ek, ev = spec.split("=", 1)
+            if not ek:
+                raise SystemExit("Error: --extra expects non-empty key before '='.")
             args["extra"][ek] = parse_value(ev)
         elif a == "--quiet":
             args["quiet"] = True
