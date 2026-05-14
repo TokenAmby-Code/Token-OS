@@ -40,7 +40,10 @@ def http_get(path: str) -> dict | None:
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
+            parsed = json.loads(resp.read().decode())
+            if not isinstance(parsed, dict):
+                return {"detail": parsed}
+            return parsed
     except Exception:
         return None
 
@@ -53,13 +56,18 @@ def http_post(path: str, data: dict) -> tuple[int, dict]:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read().decode())
+            parsed = json.loads(resp.read().decode())
+            if not isinstance(parsed, dict):
+                parsed = {"detail": parsed}
+            return resp.status, parsed
     except urllib.error.HTTPError as e:
         resp_body = e.read().decode() if e.fp else ""
         try:
             parsed = json.loads(resp_body)
         except Exception:
             parsed = {"raw": resp_body}
+        if not isinstance(parsed, dict):
+            parsed = {"detail": parsed}
         return e.code, parsed
     except urllib.error.URLError:
         return 0, {}

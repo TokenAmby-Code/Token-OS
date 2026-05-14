@@ -40,7 +40,10 @@ def http_get(path: str) -> dict:
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
+            parsed = json.loads(resp.read().decode())
+            if not isinstance(parsed, dict):
+                parsed = {"detail": parsed}
+            return parsed
     except urllib.error.HTTPError as e:
         body = e.read().decode() if e.fp else ""
         raise SystemExit(f"Error: GET {path} returned {e.code}: {body}")
