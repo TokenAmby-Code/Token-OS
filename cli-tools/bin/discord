@@ -20,8 +20,8 @@
 #   thread send <thread_id> <message> [--bot <name>]    Send a message to an existing thread
 #   voice join <channel_id>            Join a voice channel
 #   voice leave                        Leave voice channel
-#   voice record                       Start recording (audio capture)
-#   voice stop                         Stop recording
+#   voice listen                       Start live voice transcription
+#   voice stop                         Stop live voice transcription
 #   voice status                       Voice connection status
 #
 # Channel aliases:
@@ -570,30 +570,35 @@ cmd_voice() {
     leave)
       post "/voice/leave" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("Left voice channel" if d.get("left") else "Not connected")'
       ;;
-    record)
-      post "/voice/record" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Recording: {d.get(\"recording\")}")'
+    listen)
+      post "/voice/listen" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Listening: {d.get(\"listening\")}")'
       ;;
     stop)
-      post "/voice/stop" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Recording stopped")'
+      post "/voice/stop" "{}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("Listening stopped")'
       ;;
     status)
       get "/voice/status" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-state = "connected" if d.get("connected") else "disconnected"
-rec = "recording" if d.get("recording") else "idle"
-print(f"Voice: {state} | {rec} | listeners: {d.get(\"activeListeners\",0)} | state: {d.get(\"connectionState\",\"?\")}")
-if d.get("channelId"):
-    print(f"Channel: {d.get(\"channelId\")}")
+def row(name, s):
+    state = "connected" if s.get("connected") else "disconnected"
+    mode = "listening" if s.get("listening") else "idle"
+    channel = s.get("channelId") or s.get("assignedChannel") or "-"
+    print(f"{name}: {state} | {mode} | streams: {s.get(\"activeListeners\",0)} | channel: {channel} | state: {s.get(\"connectionState\",\"?\")}")
+if "connected" in d:
+    row("voice", d)
+else:
+    for name, s in d.items():
+        row(name, s)
 '
       ;;
     *)
-      echo "Usage: discord voice <join|leave|record|stop|status>"
+      echo "Usage: discord voice <join|leave|listen|stop|status>"
       echo ""
       echo "  join <channel_id>   Join a voice channel"
       echo "  leave               Leave voice channel"
-      echo "  record              Start recording (capture audio)"
-      echo "  stop                Stop recording"
+      echo "  listen              Start live voice transcription"
+      echo "  stop                Stop live voice transcription"
       echo "  status              Show voice connection status"
       ;;
   esac

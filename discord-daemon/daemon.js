@@ -88,10 +88,7 @@ async function main() {
   const voiceManager = createVoiceManager(botClients, config, logger);
   const transcriber = createTranscriber(config, logger);
 
-  // Wire transcriber to voice manager (callback now receives botName)
-  voiceManager.setTranscriptionCallback((userId, pcmBuffer, filepath, botName) => {
-    return transcriber.handleAudio(userId, pcmBuffer, filepath, botName);
-  });
+  // Wire live decoded Discord PCM frames into OpenAI Realtime transcription.
   voiceManager.setAudioFrameCallback((userId, pcmChunk, botName) => {
     return transcriber.handleAudioFrame?.(userId, pcmChunk, botName);
   });
