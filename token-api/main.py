@@ -113,9 +113,20 @@ from routes.tts import (
 from routes.voice import router as voice_router
 from schedule import router as schedule_router
 from session_doc_helpers import (
+    DEFAULT_RUBRIC_KEY,
+    DEFAULT_SESSION_DOC_RUBRIC,
+    RubricStatus,
     _update_doc_agents_list,
+    bump_session_doc_up_to_date,
+    clear_rubric_notified,
     create_session_doc_file,
+    evaluate_rubric,
+    mark_rubric_acknowledged,
+    mark_rubric_notified,
+    read_frontmatter,
+    read_rubric,
     update_frontmatter,
+    update_rubric_field,
     update_victory_frontmatter,
 )
 from session_doc_helpers import update_frontmatter as _update_session_doc_frontmatter
@@ -3003,26 +3014,17 @@ async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str |
     return "stale_reused_or_empty_pane"
 
 
-def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
+def _agent_resume_command(
+    engine: str, session_id: str, working_dir: str, sop_file: str, pane: str | None = None
+) -> str:
     quoted_working_dir = shlex.quote(working_dir)
     quoted_session_id = shlex.quote(session_id)
-    quoted_sop_file = shlex.quote(sop_file)
-    if engine == "codex":
-        dispatch_bin = shlex.quote(
-            os.environ.get("CODEX_DISPATCH_BIN")
-            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
-        )
-        return (
-            f"cd {quoted_working_dir} && {dispatch_bin} "
-            f"--resume-session {quoted_session_id} "
-            f"--launcher golden-throne --launch-mode golden-throne-resume "
-            f"{quoted_working_dir} "
-            f'"$(cat {quoted_sop_file})"'
-        )
-    return (
-        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
-        f"--resume {quoted_session_id} --dangerously-skip-permissions"
-    )
+    _ = (engine, sop_file)
+    dispatch_bin = shlex.quote(os.environ.get("DISPATCH_BIN") or "dispatch")
+    cmd = f"cd {quoted_working_dir} && {dispatch_bin} --id {quoted_session_id}"
+    if pane:
+        cmd += f" --pane {shlex.quote(pane)}"
+    return cmd
 
 
 def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
@@ -3185,15 +3187,96 @@ def _golden_throne_followup_sync(instance_id: str) -> dict:
         return {"success": False, "instance_id": instance_id, "error": str(exc)}
 
 
+async def _load_instance_session_doc(instance: dict) -> dict:
+    """Resolve linked session doc metadata for an instance.
+
+    Returns dict with keys: doc_id, file_path (Path|None), doc_status. Empty
+    dict if the instance has no linked doc. Cheap — single DB read, no YAML.
+    """
+    doc_id = instance.get("session_doc_id")
+    if not doc_id:
+        return {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, file_path, status FROM session_documents WHERE id = ?",
+            (doc_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return {}
+    fp = Path(row[1]) if row[1] else None
+    return {"doc_id": row[0], "file_path": fp, "doc_status": row[2]}
+
+
+async def _read_instance_session_doc_rubric(
+    instance: dict,
+) -> tuple[RubricStatus | None, dict]:
+    """Read the rubric from the linked session doc, if any.
+
+    Returns (RubricStatus|None, doc_meta_dict). Status is None when no doc is
+    linked, the file is missing, or the read fails. Callers should treat
+    None as "no rubric" and fall back to legacy GT behavior.
+    """
+    meta = await _load_instance_session_doc(instance)
+    fp = meta.get("file_path")
+    if not fp or not fp.exists():
+        return None, meta
+    try:
+        status = await asyncio.to_thread(read_rubric, fp)
+    except Exception as exc:
+        logger.warning(f"GT: rubric read failed for {fp}: {exc}")
+        return None, meta
+    return status, meta
+
+
+def _golden_throne_rubric_state(status: RubricStatus | None) -> str:
+    """Classify a RubricStatus into one of four GT dispatch states.
+
+    Returns one of:
+      - 'legacy'         → no rubric / scalar-string rubric → fire static SOP
+      - 'incomplete'     → rubric present, conditions unmet → adaptive accountability fire
+      - 'ready_for_ack'  → rubric complete, Emperor not yet notified → notify-only
+      - 'victorious_bug' → rubric complete, Emperor notified, GT still firing → bug-event
+      - 'acknowledged'   → Emperor already acked; should never fire (skip)
+    """
+    if status is None or not status.present or status.legacy_string:
+        return "legacy"
+    if status.acknowledged_at:
+        return "acknowledged"
+    if not status.complete:
+        return "incomplete"
+    if status.notified_at:
+        return "victorious_bug"
+    return "ready_for_ack"
+
+
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
-    """Arm the one-shot Golden Throne follow-up timer for an idle instance."""
+    """Arm the one-shot Golden Throne follow-up timer for an idle instance.
+
+    The gate is the linked session doc's rubric — specifically whether the
+    Emperor has already acknowledged it. Acked docs are archived and never
+    re-fire. Pre-ack states (incomplete / ready_for_ack / victorious_bug) all
+    schedule normally; the fire callback differentiates them.
+    """
     instance_id = instance["id"]
     instance_type = instance.get("instance_type", "one_off")
     zealotry = int(instance.get("zealotry") or 4)
     if instance_type != "golden_throne":
         return {"scheduled": False, "reason": "not_golden_throne"}
-    if instance.get("victory_at"):
-        return {"scheduled": False, "reason": "victory_declared"}
+
+    status, doc_meta = await _read_instance_session_doc_rubric(instance)
+    rubric_state = _golden_throne_rubric_state(status)
+    if rubric_state == "acknowledged" or doc_meta.get("doc_status") == "archived":
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        return {
+            "scheduled": False,
+            "reason": "session_doc_acknowledged",
+            "doc_id": doc_meta.get("doc_id"),
+        }
+
     if zealotry < 4:
         try:
             scheduler.remove_job(f"golden-throne-{instance_id}")
@@ -3225,6 +3308,9 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         "engine": _agent_engine(instance),
         "quiet_hours": quiet_hours,
         "quiet_hours_shifted": quiet_hours_shifted,
+        "rubric_state": rubric_state,
+        "doc_id": doc_meta.get("doc_id"),
+        "missing_conditions": (status.missing if status else None),
     }
     if quiet_hours_shifted:
         details["original_fire_at"] = original_fire_at.isoformat()
@@ -3232,7 +3318,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
     logger.info(
         f"Golden Throne: scheduled {instance_id[:12]} zealotry={zealotry} "
         f"delay={delay_seconds}s fire_at={fire_at.isoformat()} "
-        f"quiet_hours_shifted={quiet_hours_shifted}"
+        f"quiet_hours_shifted={quiet_hours_shifted} rubric_state={rubric_state}"
     )
     return {"scheduled": True, **details}
 
@@ -3256,14 +3342,15 @@ async def recover_recent_stopped_golden_throne_timers(
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT *
-            FROM claude_instances
-            WHERE status IN ('idle', 'stopped')
-              AND instance_type = 'golden_throne'
-              AND COALESCE(zealotry, 4) >= 4
-              AND victory_at IS NULL
-              AND COALESCE(stopped_at, last_activity) IS NOT NULL
-            ORDER BY COALESCE(stopped_at, last_activity) DESC
+            SELECT ci.*
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+            WHERE ci.status IN ('idle', 'stopped')
+              AND ci.instance_type = 'golden_throne'
+              AND COALESCE(ci.zealotry, 4) >= 4
+              AND (sd.status IS NULL OR sd.status != 'archived')
+              AND COALESCE(ci.stopped_at, ci.last_activity) IS NOT NULL
+            ORDER BY COALESCE(ci.stopped_at, ci.last_activity) DESC
             """,
         )
         rows = await cursor.fetchall()
@@ -4079,6 +4166,25 @@ def _pane_is_agent_from_snapshot(
 def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
     if not tmux_pane:
         return None
+    cli_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmux-resolve-pane"
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        result = subprocess.run(
+            [str(cli_bin), "--format", "id", tmux_pane],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"],
@@ -4902,7 +5008,8 @@ def _tmux_pane_label_sync(tmux_pane: str | None) -> str | None:
     try:
         result = subprocess.run(
             ["tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=3,
             check=False,
@@ -5000,6 +5107,73 @@ def _golden_throne_banner_text(tab_name: str | None, human_pane_surface: str) ->
     return f"GT resume: {human_pane_surface}"
 
 
+def _humanize_condition_key(key: str) -> str:
+    """Turn a frontmatter condition key into a short spoken phrase."""
+    if key.startswith("legacy:"):
+        return "session"
+    return key.replace("_", " ")
+
+
+def _golden_throne_tts_text_for_rubric(
+    human_pane_surface: str, status: RubricStatus
+) -> str:
+    """Spoken GT body for an incomplete-rubric fire. ~50 char SAPI cap (see project_tts_wsl_sapi_truncation)."""
+    if not status.missing:
+        return f"Golden Throne {human_pane_surface}"
+    first = _humanize_condition_key(status.missing[0])
+    return f"GT {human_pane_surface} needs {first}"
+
+
+def _golden_throne_banner_text_for_rubric(
+    human_pane_surface: str, status: RubricStatus
+) -> str:
+    """On-screen banner for an incomplete-rubric fire."""
+    if not status.missing:
+        return f"GT {human_pane_surface}"
+    head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+    return f"GT {human_pane_surface}: missing {head}"
+
+
+def _golden_throne_ready_for_ack_tts(human_pane_surface: str) -> str:
+    """Notify-only TTS when rubric just went complete."""
+    return f"{human_pane_surface} ready for ack"
+
+
+def _golden_throne_ready_for_ack_banner(human_pane_surface: str) -> str:
+    return f"GT {human_pane_surface}: ready for victory-ack"
+
+
+def _golden_throne_victorious_bug_tts(human_pane_surface: str) -> str:
+    """TTS when GT hit a victorious instance — bug-event, ack or clear."""
+    return f"GT bug on {human_pane_surface}, ack or clear"
+
+
+def _golden_throne_victorious_bug_banner(human_pane_surface: str) -> str:
+    return f"GT bug: {human_pane_surface} victorious but unacked"
+
+
+def _golden_throne_accountability_prompt(status: RubricStatus, doc_path: Path | None) -> str:
+    """Persona instruction body injected into the agent's pane.
+
+    Names specific unmet conditions and the action ladder. Mirrors the
+    aspirant-persona dispatch-boundary framing — the rubric is the contract,
+    silently rolling over is not an option.
+    """
+    missing_list = ", ".join(f"`{m}`" for m in status.missing) or "(rubric not yet complete)"
+    doc_line = f"  {doc_path}\n\n" if doc_path else "\n"
+    return (
+        f"Golden Throne accountability check for this session doc.\n"
+        f"{doc_line}"
+        f"Unmet conditions: {missing_list}.\n"
+        f"This session is not done. Either:\n"
+        f"  1. Address the unmet condition and flip its frontmatter flag, or\n"
+        f"  2. Escalate to Emperor via /api/notify if you are blocked, or\n"
+        f"  3. Mark inapplicable conditions in `{status.rubric_key}_skip` "
+        f"(with justification in the doc body).\n\n"
+        f"Silently rolling over is not an option. The session doc is the contract."
+    )
+
+
 async def _get_or_create_legion_pane() -> str:
     """Allocate a managed legion worker pane for an autonomous resume.
 
@@ -5041,50 +5215,127 @@ async def _log_golden_throne_dispatch_failed(session_id: str, details: dict) -> 
     )
 
 
-_golden_throne_fire_times: deque[float] = deque()
+async def _golden_throne_handle_ready_for_ack(
+    instance: dict,
+    status: RubricStatus,
+    doc_meta: dict,
+    human_pane_surface: str,
+) -> dict:
+    """Notify-only Emperor ping when a session doc just went rubric-complete.
 
-
-def _golden_throne_rate_limit_delay(now: float | None = None) -> tuple[float | None, dict]:
-    """Return defer delay if Golden Throne is over its rolling fire cap.
-
-    Mirrors the Pavlok cooldown pattern: keep recent fire timestamps in memory,
-    drop expired entries at function entry, and only append when the fire is
-    allowed to proceed.
+    No send-keys to the instance — a victorious agent should not be hounded.
+    Stamp <rubric_key>_notified_at so the next GT fire knows this is the
+    second touch and escalates to a bug-event.
     """
+    session_id = instance["id"]
+    doc_path = doc_meta.get("file_path")
+    doc_id = doc_meta.get("doc_id")
+    tts_body = _golden_throne_ready_for_ack_tts(human_pane_surface)
+    banner_body = _golden_throne_ready_for_ack_banner(human_pane_surface)
+    phone_result = None
     try:
-        max_fires = int(os.getenv("GT_MAX_FIRES_PER_WINDOW", "3"))
-    except (TypeError, ValueError):
-        max_fires = 3
-    try:
-        window_seconds = int(os.getenv("GT_RATE_WINDOW_SECONDS", "60"))
-    except (TypeError, ValueError):
-        window_seconds = 60
-    max_fires = max(1, max_fires)
-    window_seconds = max(1, window_seconds)
+        phone_result = await asyncio.to_thread(
+            _send_to_phone,
+            "/notify",
+            {
+                "vibe": 30,
+                "tts_text": tts_body,
+                "banner_text": banner_body,
+            },
+        )
+    except Exception as e:
+        phone_result = {"success": False, "error": str(e)}
+        logger.warning(f"GT: ready-for-ack notify failed for {session_id[:12]}: {e}")
+    if doc_path and doc_path.exists():
+        try:
+            await asyncio.to_thread(mark_rubric_notified, doc_path)
+        except Exception as exc:
+            logger.warning(f"GT: failed to stamp notified_at on {doc_path}: {exc}")
+    await log_event(
+        "golden_throne_ready_for_ack",
+        instance_id=session_id,
+        details={
+            "doc_id": doc_id,
+            "doc_path": str(doc_path) if doc_path else None,
+            "rubric_key": status.rubric_key,
+            "phone_result": phone_result,
+            "human_pane_surface": human_pane_surface,
+        },
+    )
+    logger.info(
+        f"GT: ready-for-ack notify sent for {session_id[:12]} doc={doc_id} "
+        f"(no instance send-keys; awaiting victory-ack)"
+    )
+    return {"state": "ready_for_ack", "doc_id": doc_id, "notify_result": phone_result}
 
-    now = now if now is not None else time.time()
-    while _golden_throne_fire_times and _golden_throne_fire_times[0] <= now - window_seconds:
-        _golden_throne_fire_times.popleft()
 
-    details = {
-        "max_fires": max_fires,
-        "window_seconds": window_seconds,
-        "recent_fires": len(_golden_throne_fire_times),
-    }
+async def _golden_throne_handle_victorious_bug(
+    instance: dict,
+    status: RubricStatus,
+    doc_meta: dict,
+    human_pane_surface: str,
+) -> dict:
+    """Bug-event enforcement when GT re-fires on a complete-but-unacked rubric.
 
-    if len(_golden_throne_fire_times) >= max_fires:
-        oldest = _golden_throne_fire_times[0]
-        delay_seconds = max(0.001, window_seconds - (now - oldest))
-        details["deferred_seconds"] = delay_seconds
-        return delay_seconds, details
-
-    _golden_throne_fire_times.append(now)
-    details["recent_fires"] = len(_golden_throne_fire_times)
-    return None, details
+    Per feedback_no_warnings_only_shocks: this is an atomic Pavlok shock + TTS,
+    not a warning. A victorious instance should not be hounded; if GT touches
+    one repeatedly, that's a bug for the Emperor to fix (ack or clear), and
+    the shock is the prompt to fix it.
+    """
+    session_id = instance["id"]
+    doc_path = doc_meta.get("file_path")
+    doc_id = doc_meta.get("doc_id")
+    tts_body = _golden_throne_victorious_bug_tts(human_pane_surface)
+    banner_body = _golden_throne_victorious_bug_banner(human_pane_surface)
+    payload = _enforcement_state_payload(
+        source="golden_throne",
+        ack_source="golden_throne",
+        trigger="victorious_unacked",
+        instance_id=session_id,
+        tab_name=instance.get("tab_name"),
+        tmux_pane=instance.get("tmux_pane"),
+        pane_label=instance.get("pane_label"),
+        pane_surface=instance.get("pane_surface"),
+        human_pane_surface=human_pane_surface,
+        doc_id=doc_id,
+    )
+    await handle_custodes_state_event(
+        "enforcement_cascade_started",
+        "golden_throne",
+        instance_id=session_id,
+        severity=4,
+        payload=payload,
+    )
+    enforcement = await unified_enforce(
+        "enforce",
+        f"GT bug on victorious {human_pane_surface}",
+        source="golden_throne",
+        phone_params={
+            "zap": PAVLOK_CONFIG.get("friday_zap_value", 30),
+            "tts_text": tts_body,
+            "banner_text": banner_body,
+        },
+    )
+    await log_event(
+        "golden_throne_victorious_bug",
+        instance_id=session_id,
+        details={
+            "doc_id": doc_id,
+            "doc_path": str(doc_path) if doc_path else None,
+            "rubric_key": status.rubric_key,
+            "enforcement": enforcement,
+            "human_pane_surface": human_pane_surface,
+        },
+    )
+    logger.warning(
+        f"GT: victorious-bug event fired for {session_id[:12]} doc={doc_id} "
+        f"— Emperor must ack-or-clear"
+    )
+    return {"state": "victorious_bug", "doc_id": doc_id, "enforcement": enforcement}
 
 
 async def golden_throne_followup(session_id: str):
-    """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
+    """APScheduler callback: rubric-aware Golden Throne accountability dispatch."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
@@ -5102,9 +5353,15 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already processing, skipping")
         return
 
-    # Skip if victory was declared
-    if instance.get("victory_at"):
-        logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
+    # Resolve linked session-doc rubric (the new contract). Falls back to
+    # legacy SOP behavior for instances without a typed rubric.
+    rubric_status, doc_meta = await _read_instance_session_doc_rubric(instance)
+    rubric_state = _golden_throne_rubric_state(rubric_status)
+    instance["pane_label"] = instance.get("pane_label")  # touched below; keep slot stable
+    if rubric_state == "acknowledged":
+        logger.info(
+            f"Golden Throne: {session_id[:12]} session doc already acknowledged, skipping"
+        )
         return
 
     quiet_hours = shared.get_quiet_hours_status()
@@ -5124,36 +5381,33 @@ async def golden_throne_followup(session_id: str):
         )
         return
 
-    delay_seconds, rate_details = _golden_throne_rate_limit_delay()
-    if delay_seconds is not None:
-        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
-        scheduler.add_job(
-            golden_throne_followup,
-            DateTrigger(run_date=fire_at),
-            args=[session_id],
-            id=f"golden-throne-{session_id}",
-            replace_existing=True,
-            name=f"Golden Throne follow-up {session_id[:12]}",
-            misfire_grace_time=300,
-            jobstore="golden_throne",
+    # Resolve human-readable pane surface up-front; all three rubric paths use it.
+    tab_name = instance.get("tab_name", "session")
+    tmux_pane = instance.get("tmux_pane")
+    pane_label = await _tmux_pane_label(tmux_pane)
+    instance["pane_label"] = pane_label
+    pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
+    human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    instance["pane_surface"] = pane_surface
+    instance["human_pane_surface"] = human_pane_surface
+
+    # State machine branch BEFORE the per-instance send path.
+    # 'incomplete' falls through and uses an adaptive accountability prompt.
+    # 'ready_for_ack' and 'victorious_bug' return early — no instance send-keys.
+    if rubric_state == "ready_for_ack":
+        await _golden_throne_handle_ready_for_ack(
+            instance, rubric_status, doc_meta, human_pane_surface
         )
-        logger.info(
-            f"Golden Throne: rate limited {session_id[:12]}, deferred "
-            f"{delay_seconds:.1f}s until {fire_at.isoformat()}"
-        )
-        await log_event(
-            "gt_fire_deferred",
-            instance_id=session_id,
-            details={
-                "reason": "rate_limit",
-                "fire_at": fire_at.isoformat(),
-                **rate_details,
-            },
+        return
+    if rubric_state == "victorious_bug":
+        await _golden_throne_handle_victorious_bug(
+            instance, rubric_status, doc_meta, human_pane_surface
         )
         return
 
-    # SOP selection: custom per-instance override, then default.
-    # (Sync retrigger path removed — sync instances now self-evaluate via StopValidate.)
+    # SOP selection: custom per-instance override, then rubric-adaptive, then default.
+    # 'incomplete' state with present rubric → adaptive accountability prompt.
+    # 'legacy' state (no rubric or scalar string) → existing static SOP behavior.
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     if custom_sop_path:
@@ -5164,18 +5418,31 @@ async def golden_throne_followup(session_id: str):
         else:
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
+    elif rubric_state == "incomplete" and rubric_status is not None:
+        sop_prompt = _golden_throne_accountability_prompt(
+            rubric_status, doc_meta.get("file_path")
+        )
+        logger.info(
+            f"GT: adaptive accountability prompt for {session_id[:12]} "
+            f"missing={rubric_status.missing}"
+        )
+        # Regression case: if the rubric was previously complete (notified_at
+        # stamped) but is now incomplete, clear the stamp so the next complete
+        # state goes back through the notify-only path instead of straight to bug-event.
+        if rubric_status.notified_at and doc_meta.get("file_path"):
+            try:
+                await asyncio.to_thread(
+                    clear_rubric_notified, doc_meta["file_path"]
+                )
+                logger.info(
+                    f"GT: cleared notified_at on {doc_meta['file_path']} (rubric regressed)"
+                )
+            except Exception as exc:
+                logger.warning(f"GT: failed to clear notified_at: {exc}")
     else:
         sop_prompt = _load_golden_throne_sop()
-    tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
-    tab_name = instance.get("tab_name", "session")
     engine = _agent_engine(instance)
-    pane_label = await _tmux_pane_label(tmux_pane)
-    pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
-    human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
-    instance["pane_label"] = pane_label
-    instance["pane_surface"] = pane_surface
-    instance["human_pane_surface"] = human_pane_surface
 
     # Dispatch: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
@@ -5194,7 +5461,7 @@ async def golden_throne_followup(session_id: str):
     }
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
         # Local delivery — transport detection per Golden Throne spec:
-        # Check pane_current_command to decide send-keys vs claude --resume
+        # Check pane_current_command to decide send-keys vs generic dispatch resume.
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -5230,9 +5497,16 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                inject_prompt = (
-                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
-                )
+                if rubric_state == "incomplete" and rubric_status is not None and rubric_status.missing:
+                    first_missing = rubric_status.missing[0]
+                    inject_prompt = (
+                        f"Golden Throne accountability check: `{first_missing}` unmet. "
+                        f"Full conditions: cat {sop_file}"
+                    )
+                else:
+                    inject_prompt = (
+                        f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                    )
             try:
                 queued = await enqueue_pane_write(
                     instance_id=session_id,
@@ -5282,13 +5556,15 @@ async def golden_throne_followup(session_id: str):
                 )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Agent not running — resume in a managed legion worker pane with SOP prompt
+            # Agent not running — resume in a managed legion worker pane with SOP prompt.
             try:
                 resume_pane = await _get_or_create_legion_pane()
                 # Write SOP to temp file (avoids shell escaping issues)
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                resume_cmd = _agent_resume_command(engine, session_id, working_dir, sop_file)
+                resume_cmd = _agent_resume_command(
+                    engine, session_id, working_dir, sop_file, resume_pane
+                )
                 queued = await enqueue_pane_write(
                     instance_id=session_id,
                     tmux_pane=resume_pane,
@@ -5434,14 +5710,20 @@ async def golden_throne_followup(session_id: str):
     if instance_type != "sync":
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
+        if rubric_state == "incomplete" and rubric_status is not None:
+            tts_body = _golden_throne_tts_text_for_rubric(human_pane_surface, rubric_status)
+            banner_body = _golden_throne_banner_text_for_rubric(human_pane_surface, rubric_status)
+        else:
+            tts_body = _golden_throne_tts_text(tab_name, human_pane_surface)
+            banner_body = _golden_throne_banner_text(tab_name, human_pane_surface)
         try:
             phone_result = await asyncio.to_thread(
                 _send_to_phone,
                 "/notify",
                 {
                     "vibe": vibe_intensity,
-                    "tts_text": _golden_throne_tts_text(tab_name, human_pane_surface),
-                    "banner_text": _golden_throne_banner_text(tab_name, human_pane_surface),
+                    "tts_text": tts_body,
+                    "banner_text": banner_body,
                 },
             )
         except Exception as e:
@@ -5456,6 +5738,7 @@ async def golden_throne_followup(session_id: str):
                 "pane_surface": pane_surface,
                 "human_pane_surface": human_pane_surface,
                 "resume_count": resume_state["resume_count"],
+                "rubric_state": rubric_state,
             },
         )
 
@@ -5470,6 +5753,8 @@ async def golden_throne_followup(session_id: str):
             "followup_id": followup_id,
             "dispatch_ack": dispatch_details,
             "phone_result": phone_result,
+            "rubric_state": rubric_state,
+            "missing_conditions": (rubric_status.missing if rubric_status else None),
         },
     )
 
@@ -6553,92 +6838,119 @@ async def get_zealotry(instance_id: str):
     }
 
 
-@app.post("/api/instances/{instance_id}/victory")
-async def declare_victory(instance_id: str, request: Request):
-    """Declare victory for an instance — cancel follow-up timer, record reason, update session doc."""
-    body = await request.json()
-    reason = body.get("reason")
-    if not reason:
-        raise HTTPException(status_code=400, detail="reason is required")
-    deliverables = body.get("deliverables")  # Optional list of strings
+async def _victory_ack_core(
+    doc_id: int,
+    reason: str,
+    deliverables: list[str],
+    *,
+    force: bool = False,
+    source: str = "victory-ack",
+) -> dict:
+    """Shared core for the victory-ack flow.
 
-    deliverables = body.get("deliverables", [])
-
+    Precondition: rubric must be complete (unless force=True for legacy callers).
+    Action: stamp acknowledged_at + reason; archive the doc; cancel GT timers
+    on all linked instances; downgrade those instances to one_off. Returns a
+    summary dict; raises HTTPException(409) when precondition fails.
+    """
     now = datetime.now().isoformat()
-    session_doc_updated = False
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT id, file_path, title, status FROM session_documents WHERE id = ?",
+            (doc_id,),
         )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        tab_name = row["tab_name"] or instance_id[:12]
-        victory_surface = tab_name if _is_meaningful_tab_name(tab_name) else instance_id[:12]
-        session_doc_id = row["session_doc_id"]
+        doc_row = await cursor.fetchone()
+        if not doc_row:
+            raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+        doc_path = Path(doc_row["file_path"]) if doc_row["file_path"] else None
+        doc_title = doc_row["title"] or f"doc-{doc_id}"
+        already_archived = doc_row["status"] == "archived"
 
-        # DB write (existing behavior)
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates={
-                "victory_at": now,
-                "victory_reason": reason,
-                "instance_type": "one_off",
-                "gt_resume_count": 0,
-                "gt_resume_window_started_at": None,
-                "gt_last_resume_at": None,
-            },
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="victory",
-        )
+        rubric_status: RubricStatus | None = None
+        if doc_path and doc_path.exists():
+            try:
+                rubric_status = await asyncio.to_thread(read_rubric, doc_path)
+            except Exception as exc:
+                logger.warning(f"victory-ack: rubric read failed for {doc_path}: {exc}")
 
-        # Write victory data to session doc frontmatter
-        if session_doc_id:
-            cursor = await db.execute(
-                "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
-            )
-            doc_row = await cursor.fetchone()
-            if doc_row and doc_row[0]:
-                fm_updates = {
-                    "victory": "declared",
-                    "victory_reason": reason,
-                }
+        # Precondition: rubric must be complete (else 409). Legacy docs without
+        # a typed rubric get a pass — the Emperor can ack them freely.
+        if not force and rubric_status is not None and rubric_status.present and not rubric_status.legacy_string:
+            if not rubric_status.complete:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "rubric_incomplete",
+                        "doc_id": doc_id,
+                        "missing": rubric_status.missing,
+                        "skipped": rubric_status.skipped,
+                        "message": (
+                            "Cannot ack victory — these conditions are unmet: "
+                            + ", ".join(rubric_status.missing)
+                            + ". Address them, mark inapplicable ones in "
+                            f"{rubric_status.rubric_key}_skip, or pass force=true."
+                        ),
+                    },
+                )
+
+        # Stamp rubric ack on the session-doc frontmatter (modern path).
+        if doc_path and doc_path.exists():
+            try:
+                await asyncio.to_thread(mark_rubric_acknowledged, doc_path, reason)
                 if deliverables:
-                    fm_updates["deliverables"] = deliverables
-                _update_session_doc_frontmatter(Path(doc_row[0]), fm_updates)
+                    await asyncio.to_thread(
+                        update_frontmatter, doc_path, {"deliverables": deliverables}
+                    )
+            except Exception as exc:
+                logger.warning(f"victory-ack: frontmatter ack failed for {doc_path}: {exc}")
 
+        # Archive the doc in the DB (status transition).
+        if not already_archived:
+            await db.execute(
+                "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+                (now, doc_id),
+            )
+
+        # Resolve all instances linked to this doc; downgrade and cancel timers.
+        cursor = await db.execute(
+            "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ?",
+            (doc_id,),
+        )
+        linked_rows = await cursor.fetchall()
+        linked_instance_ids: list[str] = []
+        instance_surfaces: list[str] = []
+        for linked in linked_rows:
+            iid = linked["id"]
+            linked_instance_ids.append(iid)
+            tab = linked["tab_name"] or iid[:12]
+            instance_surfaces.append(tab if _is_meaningful_tab_name(tab) else iid[:12])
+            await sanctioned_update_instance(
+                db,
+                instance_id=iid,
+                updates={
+                    "victory_at": now,
+                    "victory_reason": reason,
+                    "instance_type": "one_off",
+                    "gt_resume_count": 0,
+                    "gt_resume_window_started_at": None,
+                    "gt_last_resume_at": None,
+                },
+                mutation_type="instance_updated",
+                write_source="api",
+                actor=source,
+            )
         await db.commit()
 
-        # Session doc frontmatter write (dual-write)
-        if session_doc_id:
-            try:
-                cursor = await db.execute(
-                    "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
-                )
-                doc_row = await cursor.fetchone()
-                if doc_row and doc_row["file_path"]:
-                    fp = Path(doc_row["file_path"])
-                    if fp.exists():
-                        await asyncio.to_thread(
-                            update_victory_frontmatter, fp, reason, now, deliverables
-                        )
-                        session_doc_updated = True
-                        logger.info(f"Victory: Updated session doc {session_doc_id} frontmatter")
-            except Exception as e:
-                logger.warning(f"Victory: Session doc frontmatter update failed: {e}")
+    timers_cancelled: list[str] = []
+    for iid in linked_instance_ids:
+        try:
+            scheduler.remove_job(f"golden-throne-{iid}")
+            timers_cancelled.append(iid)
+        except Exception:
+            pass
 
-    # Cancel pending follow-up timer
-    timer_cancelled = False
-    try:
-        scheduler.remove_job(f"golden-throne-{instance_id}")
-        timer_cancelled = True
-    except Exception:
-        pass
-
-    # Discord notification
+    victory_surface = ", ".join(instance_surfaces) or doc_title
     try:
         await asyncio.to_thread(
             subprocess.run,
@@ -6652,24 +6964,209 @@ async def declare_victory(instance_id: str, request: Request):
             capture_output=True,
         )
     except Exception as e:
-        logger.warning(f"Golden Throne: Victory Discord notify failed: {e}")
+        logger.warning(f"victory-ack: Discord notify failed: {e}")
 
-    logger.info(f"Golden Throne: VICTORY for {instance_id[:12]} — {reason}")
+    await log_event(
+        "session_doc_victory_ack",
+        details={
+            "doc_id": doc_id,
+            "doc_path": str(doc_path) if doc_path else None,
+            "reason": reason,
+            "deliverables": deliverables,
+            "linked_instance_ids": linked_instance_ids,
+            "timers_cancelled": timers_cancelled,
+            "force": force,
+            "source": source,
+            "rubric_complete": (rubric_status.complete if rubric_status else None),
+        },
+    )
+    logger.info(
+        f"victory-ack: doc {doc_id} archived (force={force}) — "
+        f"{len(linked_instance_ids)} instance(s) downgraded, "
+        f"{len(timers_cancelled)} timer(s) cancelled"
+    )
+    return {
+        "doc_id": doc_id,
+        "victory": True,
+        "archived": True,
+        "linked_instance_ids": linked_instance_ids,
+        "timers_cancelled": timers_cancelled,
+        "force": force,
+    }
+
+
+@app.post("/api/session-docs/{doc_id}/rubric-flip")
+async def session_doc_rubric_flip(doc_id: int, request: Request):
+    """Flip a single rubric field on a session doc's frontmatter.
+
+    Used by automated hook surfaces (post-push, post-pr-create, CodeRabbit
+    webhook) to record SOP completion without forcing the agent to remember.
+    Optional `extra` dict sets sibling frontmatter fields atomically — e.g.
+    pr_url alongside pr_opened.
+    """
+    body = await request.json()
+    key = body.get("key")
+    if not isinstance(key, str) or not key:
+        raise HTTPException(status_code=400, detail="key (str) is required")
+    value = body.get("value", True)
+    rubric_key = body.get("rubric_key")
+    extra = body.get("extra") or {}
+    if not isinstance(extra, dict):
+        raise HTTPException(status_code=400, detail="extra must be an object")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT file_path FROM session_documents WHERE id = ?", (doc_id,)
+        )
+        row = await cursor.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+    fp = Path(row[0])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail=f"Session doc file missing: {fp}")
+
+    try:
+        await asyncio.to_thread(update_rubric_field, fp, key, value, rubric_key)
+        if extra:
+            await asyncio.to_thread(update_frontmatter, fp, extra)
+    except Exception as exc:
+        logger.warning(f"rubric-flip: write failed for doc {doc_id} key={key}: {exc}")
+        raise HTTPException(status_code=500, detail=f"frontmatter write failed: {exc}")
+
+    await log_event(
+        "session_doc_rubric_flip",
+        details={
+            "doc_id": doc_id,
+            "rubric_key": rubric_key or DEFAULT_RUBRIC_KEY,
+            "key": key,
+            "value": value,
+            "extra": list(extra.keys()),
+        },
+    )
+    logger.info(f"rubric-flip: doc {doc_id} {rubric_key or 'victory'}.{key} = {value}")
+    return {"doc_id": doc_id, "key": key, "value": value, "extra": list(extra.keys())}
+
+
+@app.post("/api/session-docs/{doc_id}/victory-ack")
+async def victory_ack_session_doc(doc_id: int, request: Request):
+    """Emperor's final ack on a session doc.
+
+    Preconditions: the doc's victory rubric must be complete (all conditions
+    true or in victory_skip). If not, returns 409 with the missing list. Pass
+    `force: true` in the body to override (legacy/escape-hatch use only).
+
+    On success: stamps victory_acknowledged_at + victory_reason, archives the
+    doc, cancels GT timers on all linked instances, and downgrades them to
+    one_off so they never re-fire.
+    """
+    body = await request.json()
+    reason = body.get("reason") or "victory"
+    deliverables = body.get("deliverables", []) or []
+    force = bool(body.get("force"))
+    return await _victory_ack_core(
+        doc_id, reason, deliverables, force=force, source="victory-ack"
+    )
+
+
+@app.post("/api/instances/{instance_id}/victory")
+async def declare_victory(instance_id: str, request: Request):
+    """[DEPRECATED — use POST /api/session-docs/{doc_id}/victory-ack]
+
+    Legacy entry point. Resolves the instance's linked session doc and routes
+    through the new victory-ack flow with force=True (preserving the old
+    permissive semantics so this endpoint never 409s). Instances with no
+    linked doc fall back to the old DB-only path.
+    """
+    body = await request.json()
+    reason = body.get("reason")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    deliverables = body.get("deliverables", []) or []
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        session_doc_id = row["session_doc_id"]
+        tab_name = row["tab_name"] or instance_id[:12]
+
+    if session_doc_id:
+        result = await _victory_ack_core(
+            session_doc_id,
+            reason,
+            deliverables,
+            force=True,
+            source="declare_victory_legacy",
+        )
+        result["instance_id"] = instance_id
+        result["deprecated"] = "use /api/session-docs/{doc_id}/victory-ack"
+        return result
+
+    # No linked doc — legacy bare-instance path.
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "victory_at": now,
+                "victory_reason": reason,
+                "instance_type": "one_off",
+                "gt_resume_count": 0,
+                "gt_resume_window_started_at": None,
+                "gt_last_resume_at": None,
+            },
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="declare_victory_legacy",
+        )
+        await db.commit()
+
+    timer_cancelled = False
+    try:
+        scheduler.remove_job(f"golden-throne-{instance_id}")
+        timer_cancelled = True
+    except Exception:
+        pass
+
+    victory_surface = tab_name if _is_meaningful_tab_name(tab_name) else instance_id[:12]
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            [
+                "discord",
+                "send",
+                "fleet",
+                f"⚔️ **IMPERIUM VICTORIOUS** — {victory_surface}\n> {reason}",
+            ],
+            timeout=10,
+            capture_output=True,
+        )
+    except Exception as e:
+        logger.warning(f"declare_victory_legacy: Discord notify failed: {e}")
+
     await log_event(
         "golden_throne_victory",
         instance_id=instance_id,
         details={
             "reason": reason,
             "timer_cancelled": timer_cancelled,
-            "session_doc_updated": session_doc_updated,
+            "session_doc_updated": False,
             "deliverables": deliverables,
+            "legacy_path": "no_doc_linked",
         },
     )
     return {
         "instance_id": instance_id,
         "victory": True,
         "timer_cancelled": timer_cancelled,
-        "session_doc_updated": session_doc_updated,
+        "session_doc_updated": False,
+        "deprecated": "use /api/session-docs/{doc_id}/victory-ack",
     }
 
 
@@ -7835,45 +8332,45 @@ ENFORCEMENT_CASCADE = {
 
 # Level delays (seconds after previous level)
 ENFORCEMENT_LEVEL_DELAYS = {
-    1: 0,  # Immediate Pavlok + companion TTS/push
-    2: 15,  # Stronger Pavlok + companion TTS/push
-    3: 15,  # Stronger Pavlok + companion TTS/push
-    4: 10,  # Pavlok + enforcement banner/TTS
-    5: 30,  # Pavlok repeat every 30s
+    1: 0,  # Vibe — immediate after Discord fallback timeout
+    2: 15,  # Vibe + beep + TTS
+    3: 15,  # Stronger vibe + beep + TTS warning
+    4: 10,  # Spotify redirect
+    5: 30,  # Pavlok zap (repeats every 30s)
 }
 
 # v3 param mapping per cascade level
-# Pavlok is dispatched server-side first by fire_cascade_event(). These params are
-# only downstream companion phone effects and are never sent unless Pavlok fired.
+# Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
+# Static cues stay short; Custodes carries the explanatory follow-up.
+# Previous long/static cues:
+# - "Final warning. Close {app}"
+# - "Twitter open for 7 minutes. Forcing break."
+# - "Distraction timeout. Close distractions now."
+# - "Break time exhausted"
 ENFORCE_LEVEL_PARAMS = {
-    1: {
-        "endpoint": "/notify",
-        "params": {"vibe": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
-    },
+    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "close {app}"}},
     2: {
         "endpoint": "/notify",
-        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+        "params": {"vibe": 50, "beep": 30, "tts_text": "close {app}", "banner_text": "close {app}"},
     },
     3: {
         "endpoint": "/notify",
-        "params": {"vibe": 80, "beep": 50, "tts_text": "Close {app}", "banner_text": "Close {app}"},
+        "params": {
+            "vibe": 80,
+            "beep": 50,
+            "tts_text": "last call {app}",
+            "banner_text": "last call",
+        },
     },
-    4: {
-        "endpoint": "/enforce",
-        "params": {"tts_text": "Close {app}", "banner_text": "Enforcement active"},
-    },
+    4: {"endpoint": "/enforce", "params": {"banner_text": "enforcement active"}},
     5: {
         "endpoint": "/enforce",
-        "params": {
-            "zap": 50,
-            "tts_text": "Pavlok fired. Close {app}",
-            "banner_text": "Enforcement — Pavlok",
-        },
+        "params": {"zap": 50, "tts_text": "pavlok fired", "banner_text": "enforcement: Pavlok"},
     },
 }
 
 ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
-DISCORD_FALLBACK_TIMEOUT = 30  # retained for compatibility with older callers
+DISCORD_FALLBACK_TIMEOUT = 30  # 30s to wait for app_close via Discord
 
 
 # [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
@@ -8740,7 +9237,7 @@ def _sync_save_daily_score(
     conn.execute(
         """INSERT INTO timer_daily_scores (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON CONFLICT(date) DO UPDATE SET
+           ON CONFLICT(date) DO UPDATE SET 
                productivity_score = excluded.productivity_score,
                total_work_ms = excluded.total_work_ms,
                total_break_used_ms = excluded.total_break_used_ms,
@@ -8848,8 +9345,6 @@ async def timer_9am_reset():
 
 # ============ Audio Proxy State ============
 # Tracks phone audio proxy status for routing phone audio through PC
-
-AUDIO_RECEIVER_PORT = os.getenv("AUDIO_RECEIVER_PORT", "unknown")
 
 AUDIO_PROXY_STATE = {
     "phone_connected": False,
@@ -9068,45 +9563,51 @@ from routes.voice import init_deps as voice_init_deps
 voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
 
 
-def _cascade_level_endpoint_params(app_name: str, level: int) -> tuple[str, dict]:
-    """Return formatted phone endpoint/params for a cascade level."""
+def _send_enforce_to_phone(app_name: str, level: int) -> dict:
+    """Send enforcement level to phone using v3 params.
+
+    Maps cascade level to v3 endpoint + params, sends to phone.
+    Returns dict with success status.
+    """
     level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
     endpoint = level_config["endpoint"]
     params = {
         k: v.format(app=app_name) if isinstance(v, str) else v
         for k, v in level_config["params"].items()
     }
-    return endpoint, params
-
-
-def _cascade_pavlok_value(level: int, params: dict) -> int:
-    """Map cascade level to Pavlok zap intensity.
-
-    Historical lower levels carried phone vibe values. The cascade mandate is
-    shock+TTS at every level, so those values now become the zap ramp.
-    """
-    if "zap" in params:
-        return int(params["zap"])
-    if "vibe" in params:
-        return int(params["vibe"])
-    return min(100, max(10, level * 10))
-
-
-def _cascade_dispatch_result(pavlok_result: dict) -> str:
-    """Normalize send_pavlok_stimulus return shapes for cascade gating."""
-    if pavlok_result.get("success") is True:
-        return "fired"
-    if pavlok_result.get("skipped"):
-        return "skipped"
-    if pavlok_result.get("error") in {"timeout", "connection_error"}:
-        return "unreachable"
-    return "failed"
+    pavlok_result = None
+    if endpoint == "/enforce":
+        # Any mobile /enforce path must also have a server-side Pavlok path.
+        # If the phone is known offline, skip the dead mobile route entirely.
+        pavlok_result = send_pavlok_stimulus(
+            "zap",
+            params.get("zap", 30),
+            reason=f"phone_enforce_level_{level}_{app_name}",
+            respect_cooldown=False,
+        )
+        if PHONE_STATE.get("reachable") is False:
+            return {
+                "success": bool(pavlok_result.get("success")),
+                "endpoint": endpoint,
+                "phone_skipped": True,
+                "reason": "phone_known_offline",
+                "pavlok": pavlok_result,
+            }
+    phone_result = _send_to_phone(endpoint, params)
+    if pavlok_result is not None:
+        return {
+            **phone_result,
+            "endpoint": endpoint,
+            "pavlok": pavlok_result,
+            "success": bool(phone_result.get("success") or pavlok_result.get("success")),
+        }
+    return phone_result
 
 
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
 
 
-async def _send_discord_fallback(app_name: str, level: int, params_override: dict | None = None):
+async def _send_discord_fallback(app_name: str, level: int):
     """Send enforcement command to Discord #fallback via webhook.
 
     Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
@@ -9115,10 +9616,11 @@ async def _send_discord_fallback(app_name: str, level: int, params_override: dic
     notification, parses the JSON, and relays to its own localhost:7777/enforce.
     Only /phone/enforce is accepted — no arbitrary code execution.
     """
-    if params_override is None:
-        _, params = _cascade_level_endpoint_params(app_name, level)
-    else:
-        params = params_override
+    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
+    params = {
+        k: v.format(app=app_name) if isinstance(v, str) else v
+        for k, v in level_config["params"].items()
+    }
     msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
     logger.info(f"DISCORD FALLBACK: {msg}")
     try:
@@ -9164,85 +9666,17 @@ def _enforcement_state_payload(
     return payload
 
 
-async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
-    """Atomically fire one cascade event.
-
-    Pavlok dispatch is the gate. Companion phone TTS/push and Discord fallback
-    are sent only when Pavlok returns dispatch_result == "fired".
-    """
-    app_name = payload.get("app") or payload.get("app_name") or "unknown"
-    repeat = bool(payload.get("repeat"))
-    endpoint, phone_params = _cascade_level_endpoint_params(app_name, level)
-    pavlok_value = int(payload.get("pavlok_value") or _cascade_pavlok_value(level, phone_params))
-    reason = payload.get("reason") or (
-        "cascade_level_5_repeat" if repeat else f"cascade_level_{level}"
-    )
-
-    pavlok_result = await asyncio.to_thread(
-        send_pavlok_stimulus,
-        "zap",
-        pavlok_value,
-        reason,
-        False,
-    )
-    dispatch_result = _cascade_dispatch_result(pavlok_result)
-    result = {
-        "level": level,
-        "ack_id": ack_id,
-        "app": app_name,
-        "dispatch_result": dispatch_result,
-        "pavlok": pavlok_result,
-        "phone": None,
-        "discord": None,
-    }
-
-    if dispatch_result != "fired":
-        await log_event(
-            "cascade_event_skipped",
-            device_id="phone",
-            details={
-                "app": app_name,
-                "level": level,
-                "ack_id": ack_id,
-                "repeat": repeat,
-                "dispatch_result": dispatch_result,
-                "pavlok": pavlok_result,
-            },
-        )
-        logger.warning(
-            "CASCADE: skipped companion notify app=%s level=%s ack_id=%s dispatch_result=%s",
-            app_name,
-            level,
-            ack_id,
-            dispatch_result,
-        )
-        return result
-
-    # Server-side Pavlok already fired. Do not ask the phone/Discord relay to
-    # zap again; send only companion TTS/push/banner effects.
-    companion_params = dict(phone_params)
-    companion_params.pop("zap", None)
-    phone_result = await asyncio.to_thread(_send_to_phone, endpoint, companion_params)
-    result["phone"] = phone_result
-    if not phone_result.get("success"):
-        await _send_discord_fallback(app_name, level, params_override=companion_params)
-        result["discord"] = "fallback_attempted"
-
-    return result
-
-
 async def _enforcement_cascade_worker(app_name: str):
     """Background task that escalates enforcement levels until app_close or timeout.
 
     Flow:
-      1. Escalate through levels 1-5 with configured delays
-      2. Each level fires Pavlok first through fire_cascade_event()
-      3. Companion TTS/push/Discord are sent only after Pavlok fires
-      4. Level 5 repeats every 30s until close or cascade timeout
+      1. Send Discord fallback (level 0 — soft close via notification)
+      2. Wait DISCORD_FALLBACK_TIMEOUT for app_close
+      3. If still open, escalate through levels 1-5 with configured delays
+      4. Level 5 (Pavlok) repeats every 30s until close or cascade timeout
     """
     cascade = ENFORCEMENT_CASCADE
     start = time.monotonic()
-    ack_id = f"cascade:{app_name}:{int(time.time())}"
     cascade["started_at"] = start
     cascade["current_level"] = 0
 
@@ -9258,17 +9692,22 @@ async def _enforcement_cascade_worker(app_name: str):
         return
 
     print(f"CASCADE START: app={app_name}")
-    await log_event(
-        "enforcement_cascade_start",
-        device_id="phone",
-        details={"app": app_name, "ack_id": ack_id},
-    )
+    await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
     await handle_custodes_state_event(
         "enforcement_cascade_started",
         "phone",
         severity=2,
-        payload=_enforcement_state_payload(source="phone", app=app_name, ack_id=ack_id),
+        payload=_enforcement_state_payload(source="phone", app=app_name),
     )
+
+    # Level 0: Discord fallback (soft close)
+    await _send_discord_fallback(app_name, 1)
+
+    # Wait for Discord fallback to work
+    await asyncio.sleep(DISCORD_FALLBACK_TIMEOUT)
+    if not cascade["active"]:
+        print("CASCADE: app_close received during Discord fallback wait")
+        return
 
     # Escalate through levels 1-5
     for level in range(1, 6):
@@ -9289,12 +9728,7 @@ async def _enforcement_cascade_worker(app_name: str):
         await log_event(
             "enforcement_cascade_escalate",
             device_id="phone",
-            details={
-                "app": app_name,
-                "level": level,
-                "ack_id": ack_id,
-                "elapsed_s": round(elapsed),
-            },
+            details={"app": app_name, "level": level, "elapsed_s": round(elapsed)},
         )
         await handle_custodes_state_event(
             "enforcement_cascade_escalate",
@@ -9304,28 +9738,31 @@ async def _enforcement_cascade_worker(app_name: str):
                 source="phone",
                 app=app_name,
                 level=level,
-                ack_id=ack_id,
                 elapsed_s=round(elapsed),
             ),
         )
 
-        result = await fire_cascade_event(level, ack_id, {"app": app_name})
-        if result.get("dispatch_result") != "fired":
-            cascade["active"] = False
-            cascade["task"] = None
-            await log_event(
-                "enforcement_cascade_end",
-                device_id="phone",
-                details={
-                    "app": app_name,
-                    "final_level": level,
-                    "ack_id": ack_id,
-                    "elapsed_s": round(elapsed),
-                    "reason": "pavlok_not_fired",
-                    "dispatch_result": result.get("dispatch_result"),
-                },
-            )
-            return
+        # Try phone first, fall back to server-side Pavlok API, then Discord
+        result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
+        if not result["success"]:
+            # Phone unreachable — try server-side Pavlok API for levels with haptics
+            level_params = ENFORCE_LEVEL_PARAMS.get(level, {}).get("params", {})
+            if "zap" in level_params:
+                send_pavlok_stimulus(
+                    "zap",
+                    level_params["zap"],
+                    reason=f"cascade_level_{level}",
+                    respect_cooldown=False,
+                )
+            elif "vibe" in level_params:
+                send_pavlok_stimulus(
+                    "vibe",
+                    level_params["vibe"],
+                    reason=f"cascade_level_{level}",
+                    respect_cooldown=False,
+                )
+            # Discord as last resort
+            await _send_discord_fallback(app_name, level)
 
         # Wait before next level (level 5 repeats in a loop)
         if level == 5:
@@ -9334,24 +9771,12 @@ async def _enforcement_cascade_worker(app_name: str):
                 await asyncio.sleep(30)
                 if not cascade["active"]:
                     break
-                result = await fire_cascade_event(5, ack_id, {"app": app_name, "repeat": True})
-                if result.get("dispatch_result") != "fired":
-                    cascade["active"] = False
-                    cascade["task"] = None
-                    elapsed = time.monotonic() - start
-                    await log_event(
-                        "enforcement_cascade_end",
-                        device_id="phone",
-                        details={
-                            "app": app_name,
-                            "final_level": 5,
-                            "ack_id": ack_id,
-                            "elapsed_s": round(elapsed),
-                            "reason": "pavlok_not_fired",
-                            "dispatch_result": result.get("dispatch_result"),
-                        },
+                result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
+                if not result["success"]:
+                    send_pavlok_stimulus(
+                        "zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False
                     )
-                    return
+                    await _send_discord_fallback(app_name, 5)
         else:
             delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
             await asyncio.sleep(delay)
@@ -9369,7 +9794,6 @@ async def _enforcement_cascade_worker(app_name: str):
         details={
             "app": app_name,
             "final_level": cascade["current_level"],
-            "ack_id": ack_id,
             "elapsed_s": round(elapsed),
             "reason": "timeout_or_exhausted",
         },
@@ -9469,9 +9893,8 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     - If productivity is active -> distractions are allowed (earned break)
     - If productivity is NOT active -> distractions should be closed
     """
-    work_state = await get_cached_work_state()
-    productivity_active = work_state.productivity_active
-    active_count = work_state.active_instance_count
+    productivity_active = timer_engine.productivity_active
+    active_count = 0
     should_close = not productivity_active
 
     if productivity_active:
@@ -15381,6 +15804,124 @@ def _format_discord_injection(channel_name: str, content: str) -> str:
     return f"[Emperor via Discord #{channel_name}]: {clean}"
 
 
+async def _resolve_selected_tmux_pane() -> str | None:
+    """Resolve the currently selected tmux pane from the active tmux client.
+
+    This intentionally does not use the instance DB. The Imperial Guard Discord
+    bot is an operator input surface: it should target whatever pane the human
+    has selected, independent of persona/legion/engine.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "display-message",
+            "-p",
+            "#{pane_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            logger.warning(
+                f"Discord active-pane injection: tmux selected-pane resolve failed: {stderr.decode().strip()[:200]}"
+            )
+            return None
+        pane = stdout.decode().strip()
+        if not pane.startswith("%"):
+            logger.warning(f"Discord active-pane injection: invalid selected pane {pane!r}")
+            return None
+
+        # Verify the pane still exists before writing to it.
+        check = await asyncio.create_subprocess_exec(
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        check_stdout, _ = await asyncio.wait_for(check.communicate(), timeout=5)
+        if pane not in set(check_stdout.decode().splitlines()):
+            logger.warning(f"Discord active-pane injection: selected pane {pane} is not alive")
+            return None
+        return pane
+    except TimeoutError:
+        logger.warning("Discord active-pane injection: tmux selected-pane resolve timed out")
+        return None
+    except Exception as e:
+        logger.warning(f"Discord active-pane injection: tmux selected-pane resolve error: {e}")
+        return None
+
+
+async def _discord_voice_error_message(bot: str, error_msg: str):
+    """Send immediate Discord VC TTS feedback for a voice routing failure."""
+    try:
+        import functools
+
+        import requests as _req
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                _req.post,
+                f"{DISCORD_DAEMON_URL}/voice/tts",
+                json={"message": error_msg, "bot": bot, "voice": "Samantha", "rate": 200},
+                timeout=30,
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Voice error feedback TTS failed: {e}")
+
+
+async def _try_discord_active_pane_injection(message) -> bool:
+    """Inject a Discord voice transcript into the currently selected tmux pane."""
+    pane = await _resolve_selected_tmux_pane()
+    if not pane:
+        return False
+
+    formatted = _format_discord_injection("imperial_guard", message.content or "")
+
+    try:
+        tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
+        proc = await asyncio.create_subprocess_exec(
+            str(tmux_dictate),
+            "-t",
+            pane,
+            "--submit",
+            formatted,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={
+                **os.environ,
+                "PATH": ":".join(
+                    [
+                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                        str(Path.home() / ".local" / "bin"),
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        os.environ.get("PATH", ""),
+                    ]
+                ),
+            },
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            logger.info(f"Discord active-pane injection: imperial_guard → {pane}")
+            return True
+        logger.warning(
+            f"Discord active-pane injection failed for {pane} (rc={proc.returncode}): {stderr.decode()[:200]}"
+        )
+        return False
+    except TimeoutError:
+        logger.warning(f"Discord active-pane injection timed out for {pane}")
+        return False
+    except Exception as e:
+        logger.warning(f"Discord active-pane injection error for {pane}: {e}")
+        return False
+
+
 async def _discord_voice_error(legion: str, transcript: str):
     """Send a TTS error message back through Discord voice so the operator knows they weren't heard.
 
@@ -15405,24 +15946,7 @@ async def _discord_voice_error(legion: str, transcript: str):
 
     error_msg = f"Voice not received. {reason}"
     logger.warning(f"Voice error feedback [{legion}]: {error_msg} (transcript: {transcript[:60]})")
-
-    try:
-        import functools
-
-        import requests as _req
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            functools.partial(
-                _req.post,
-                f"{DISCORD_DAEMON_URL}/voice/tts",
-                json={"message": error_msg, "bot": legion, "voice": "Samantha", "rate": 200},
-                timeout=30,
-            ),
-        )
-    except Exception as e:
-        logger.error(f"Voice error feedback TTS failed: {e}")
+    await _discord_voice_error_message(legion, error_msg)
 
 
 async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
@@ -15602,6 +16126,28 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
+        if request.bot_name == "imperial_guard":
+            injected = await _try_discord_active_pane_injection(request)
+            if injected:
+                logger.info("Voice [imperial_guard] injected into selected tmux pane")
+            else:
+                logger.warning(
+                    "Voice [imperial_guard] active-pane injection failed — sending voice error feedback"
+                )
+                asyncio.create_task(
+                    _discord_voice_error_message(
+                        "imperial_guard",
+                        "Voice not received. No active tmux pane could be targeted.",
+                    )
+                )
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "active_pane": True,
+                "injected": injected,
+            }
+
         legion = request.bot_name  # "mechanicus", "custodes", etc.
         injected = await _try_discord_injection(legion, request)
         if injected:
@@ -15961,6 +16507,345 @@ Rules:
 # ============ Aspirant Pipeline (Inbox) ============
 
 
+def _safe_filename_slug(value: str, fallback: str = "untitled") -> str:
+    slug = re.sub(r"[^\w\s-]", "", value).strip().lower()
+    slug = re.sub(r"\s+", "-", slug)
+    return (slug or fallback)[:80]
+
+
+def _resolve_aspirant_note_path(note_path: str) -> tuple[Path, str]:
+    """Return (absolute_file_path, vault_relative_path) for an aspirant note."""
+    raw = Path(note_path)
+    full_path = raw if raw.is_absolute() else OBSIDIAN_VAULT_PATH / note_path
+    try:
+        relative = str(full_path.relative_to(OBSIDIAN_VAULT_PATH))
+    except ValueError:
+        relative = note_path
+    return full_path, relative
+
+
+def _extract_gene_seed_from_content(content: str) -> str:
+    """Extract the > [!dna] Gene-Seed callout, falling back to body text."""
+    lines = content.splitlines()
+    gene_seed_lines: list[str] = []
+    in_gene_seed = False
+    for line in lines:
+        if "> [!dna]" in line and "Gene-Seed" in line:
+            in_gene_seed = True
+            continue
+        if not in_gene_seed:
+            continue
+        if line.startswith("> "):
+            gene_seed_lines.append(line[2:])
+        elif line.strip() == ">":
+            gene_seed_lines.append("")
+        else:
+            break
+
+    gene_seed = "\n".join(gene_seed_lines).strip()
+    if gene_seed:
+        return gene_seed
+
+    # Fallback: strip frontmatter and headings from simple manually-created notes.
+    if content.startswith("---"):
+        end_fm = content.find("\n---", 3)
+        if end_fm != -1:
+            content = content[end_fm + 4 :].lstrip()
+    return content.strip()
+
+
+def _build_aspirant_system_prompt(note_path: str) -> str:
+    return f"""You are a full aspirant implantation/trials session, not a one-shot summarizer.
+
+Operational contract:
+- On startup, load vault context from your linked session document. If the vault-mind skill is available, invoke/use it; otherwise read the linked session doc directly.
+- Read the aspirant note at `{note_path}` before acting.
+- Treat the Gene-Seed section as authoritative intent. Preserve it; do not rewrite it away or let later context override it.
+- Use Obsidian context actively: `obsidian vault=Imperium-ENV read`, `search`, `search:context`, and `backlinks` as needed.
+- Perform concrete implantation/trials work: find related vault notes, identify useful research/context, challenge assumptions, and write the useful output back to the aspirant note.
+- Append your work to the aspirant note under clear `## Implantation` / `## Trials` sections or a concise continuation if those sections already exist.
+- Ask for Emperor direction only when the Gene-Seed is genuinely ambiguous or blocked by a decision only the user can make.
+- Keep changes surgical and auditable. Do not deploy/promote the note unless explicitly instructed."""
+
+
+def _build_aspirant_initial_prompt(
+    *,
+    title: str,
+    note_path: str,
+    note_type: str,
+    source: str,
+    thread_id: str | None,
+    session_doc_path: Path,
+    gene_seed: str,
+) -> str:
+    thread_line = f"- Source/thread id: {source} / {thread_id}" if thread_id else f"- Source: {source}"
+    return f"""# Aspirant Session Launch
+
+You are being launched as a managed legion aspirant session.
+
+## Metadata
+- Title: {title}
+- Aspirant note: `{note_path}`
+- Note type: {note_type}
+{thread_line}
+- Linked session doc: `{session_doc_path}`
+
+## Gene-Seed (authoritative)
+```markdown
+{gene_seed or "(empty)"}
+```
+
+## First actions
+1. Read the linked session doc.
+2. Read the aspirant note at `{note_path}`.
+3. Load relevant vault context with Obsidian search/read/backlinks.
+4. Begin implantation/trials work and append concrete results back to the aspirant note.
+
+Do not use the old automatic MiniMax/Sonnet pipeline. This is a full managed session."""
+
+
+async def _create_aspirant_session_doc(
+    *, title: str, note_path: str, note_type: str, source: str, launch_id: str, gene_seed: str
+) -> tuple[int, Path]:
+    sessions_dir = OBSIDIAN_VAULT_PATH / "Terra" / "Sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = _safe_filename_slug(f"aspirant-{title}", fallback="aspirant")
+    session_doc_path = sessions_dir / f"{today}-{slug}-{launch_id[:8]}.md"
+
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?)""",
+            (f"Aspirant: {title}", str(session_doc_path), "aspirants", now, now),
+        )
+        doc_id = cursor.lastrowid
+        await db.commit()
+
+    content = f"""---
+session_doc_id: {doc_id}
+created: {today}
+agents: []
+instance_ids: []
+status: active
+type: session
+project: aspirants
+aspirant_note: "{note_path}"
+aspirant_launch_id: "{launch_id}"
+aspirant_type: "{note_type}"
+aspirant_source: "{source}"
+victory: pending
+victory_conditions:
+  - Read the aspirant note and preserve the gene-seed as authoritative intent.
+  - Append concrete implantation/trials work back to the aspirant note.
+---
+
+# Session: Aspirant — {title}
+
+## Aspirant
+
+- Note: [[{note_path.replace(".md", "")}]]
+- Type: `{note_type}`
+- Source: `{source}`
+- Launch ID: `{launch_id}`
+
+## Gene-Seed
+
+```markdown
+{gene_seed or "(empty)"}
+```
+
+## Plan
+
+1. Read this session doc.
+2. Read the aspirant note.
+3. Gather vault context with Obsidian search/read/backlinks.
+4. Append implantation/trials output to the aspirant note.
+
+## Activity Log
+
+"""
+    session_doc_path.write_text(content, encoding="utf-8")
+    return doc_id, session_doc_path
+
+
+async def _write_temp_text_file(prefix: str, content: str) -> str:
+    def _write() -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=prefix, suffix=".md", delete=False
+        ) as f:
+            f.write(content)
+            return f.name
+
+    return await asyncio.to_thread(_write)
+
+
+async def _set_aspirant_properties(note_file: Path, updates: dict[str, str]) -> None:
+    await asyncio.to_thread(update_frontmatter, note_file, updates)
+
+
+async def launch_aspirant_session(
+    *, note_path: str, title: str, note_type: str, source: str
+) -> dict:
+    """Launch a managed Claude legion session for an aspirant note, idempotently."""
+    note_file, vault_note_path = _resolve_aspirant_note_path(note_path)
+    if not note_file.exists():
+        raise HTTPException(status_code=404, detail=f"Aspirant note not found: {note_path}")
+
+    fm, _body = await asyncio.to_thread(read_frontmatter, note_file)
+    existing_launch_id = str(fm.get("aspirant_launch_id") or "").strip()
+    existing_status = str(fm.get("aspirant_session_status") or "").strip()
+    if existing_launch_id and existing_status in {"launching", "launched"}:
+        return {
+            "launched": False,
+            "duplicate": True,
+            "path": vault_note_path,
+            "aspirant_launch_id": existing_launch_id,
+            "aspirant_session_status": existing_status,
+            "session_doc": fm.get("aspirant_session_doc"),
+        }
+
+    raw_content = await asyncio.to_thread(note_file.read_text, encoding="utf-8")
+    gene_seed = _extract_gene_seed_from_content(raw_content)
+    thread_id = str(fm.get("thread_id") or "").strip() or None
+    launch_id = str(uuid.uuid4())
+
+    await _set_aspirant_properties(
+        note_file,
+        {
+            "aspirant_launch_id": launch_id,
+            "aspirant_session_status": "launching",
+            "aspirant_launcher": "dispatch",
+            "aspirant_dispatch_target": "legion:new",
+            "aspirant_session_started_at": datetime.now().isoformat(),
+        },
+    )
+
+    try:
+        session_doc_id, session_doc_path = await _create_aspirant_session_doc(
+            title=title,
+            note_path=vault_note_path,
+            note_type=note_type,
+            source=source,
+            launch_id=launch_id,
+            gene_seed=gene_seed,
+        )
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_doc_id": str(session_doc_id),
+                "aspirant_session_doc": str(session_doc_path),
+            },
+        )
+
+        system_prompt = _build_aspirant_system_prompt(vault_note_path)
+        initial_prompt = _build_aspirant_initial_prompt(
+            title=title,
+            note_path=vault_note_path,
+            note_type=note_type,
+            source=source,
+            thread_id=thread_id,
+            session_doc_path=session_doc_path,
+            gene_seed=gene_seed,
+        )
+        system_prompt_file = await _write_temp_text_file("aspirant-system-", system_prompt)
+        prompt_file = await _write_temp_text_file("aspirant-prompt-", initial_prompt)
+
+        dispatch_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "dispatch"
+        env = {
+            **os.environ,
+            "TOKEN_API_WRAPPER_LAUNCH_ID": launch_id,
+            "PATH": ":".join(
+                [
+                    str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                    str(Path.home() / ".local" / "bin"),
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    os.environ.get("PATH", ""),
+                ]
+            ),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            str(dispatch_bin),
+            "--target",
+            "legion:new",
+            "--dir",
+            str(OBSIDIAN_VAULT_PATH),
+            "--session-doc",
+            str(session_doc_path),
+            "--system-prompt-file",
+            system_prompt_file,
+            "--prompt-file",
+            prompt_file,
+            "--gt",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            err_text = stderr.decode("utf-8", errors="replace").strip() or stdout.decode(
+                "utf-8", errors="replace"
+            ).strip()
+            raise RuntimeError(f"dispatch failed ({proc.returncode}): {err_text}")
+
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_status": "launched",
+                "aspirant_session_launched_at": datetime.now().isoformat(),
+            },
+        )
+        await log_event(
+            "aspirant_session_launched",
+            device_id="obsidian",
+            details={
+                "path": vault_note_path,
+                "title": title,
+                "type": note_type,
+                "source": source,
+                "launch_id": launch_id,
+                "session_doc_id": session_doc_id,
+                "session_doc_path": str(session_doc_path),
+                "dispatch_target": "legion:new",
+            },
+        )
+        return {
+            "launched": True,
+            "duplicate": False,
+            "path": vault_note_path,
+            "aspirant_launch_id": launch_id,
+            "aspirant_session_status": "launched",
+            "session_doc_id": session_doc_id,
+            "session_doc": str(session_doc_path),
+        }
+    except Exception as e:
+        error_text = str(e)
+        logger.error(f"Aspirant launch failed for '{title}' ({vault_note_path}): {error_text}")
+        await _set_aspirant_properties(
+            note_file,
+            {
+                "aspirant_session_status": "failed",
+                "aspirant_session_failed_at": datetime.now().isoformat(),
+                "aspirant_launch_error": error_text[:500],
+            },
+        )
+        await log_event(
+            "aspirant_session_launch_failed",
+            device_id="obsidian",
+            details={
+                "path": vault_note_path,
+                "title": title,
+                "type": note_type,
+                "source": source,
+                "launch_id": launch_id,
+                "error": error_text[:500],
+            },
+        )
+        raise HTTPException(status_code=500, detail=error_text)
+
+
 @app.post("/api/inbox/notify")
 async def inbox_notify(request: InboxNotifyRequest):
     """Gene-seed: receive birth notification for a new inbox note."""
@@ -15975,19 +16860,17 @@ async def inbox_notify(request: InboxNotifyRequest):
         },
     )
     logger.info(f"Inbox: new {request.type} note '{request.title}' from {request.source}")
-    asyncio.create_task(
-        run_implantation(
-            note_path=request.path,
-            title=request.title,
-            note_type=request.type,
-            source=request.source,
-        )
+    launch_result = await launch_aspirant_session(
+        note_path=request.path,
+        title=request.title,
+        note_type=request.type,
+        source=request.source,
     )
     return {
         "received": True,
         "path": request.path,
         "type": request.type,
-        "implantation": "dispatched",
+        "aspirant_session": launch_result,
     }
 
 
@@ -16096,14 +16979,11 @@ async def inbox_create(request: InboxCreateRequest):
     except Exception as e:
         logger.warning(f"Inbox: thread creation failed for '{safe_title}': {e}")
 
-    # Self-notify (same pipeline as Templater-created notes)
-    await inbox_notify(
-        InboxNotifyRequest(
-            path=note_path,
-            title=safe_title,
-            type=request.type,
-            source=request.source,
-        )
+    launch_result = await launch_aspirant_session(
+        note_path=note_path,
+        title=safe_title,
+        note_type=request.type,
+        source=request.source,
     )
 
     obsidian_uri = f"obsidian://open?vault=Imperium-ENV&file={note_path.replace(' ', '%20')}"
@@ -16115,6 +16995,7 @@ async def inbox_create(request: InboxCreateRequest):
         "title": safe_title,
         "obsidian_uri": obsidian_uri,
         "thread_id": thread_id,
+        "aspirant_session": launch_result,
     }
 
 
@@ -18455,6 +19336,14 @@ Return the complete updated document."""
             updated = "\n".join(lines)
 
         fp.write_text(updated)
+
+        # Agent-initiated merges are a "doc touched" signal — flip the inverse
+        # flag back to True so the next GT cycle sees a current doc.
+        if request.source == "agent":
+            try:
+                await asyncio.to_thread(bump_session_doc_up_to_date, fp, True)
+            except Exception as exc:
+                logger.debug(f"merge: bump session_doc_up_to_date failed: {exc}")
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
