@@ -42,8 +42,13 @@ def _tmux_binary() -> str:
             return candidate
 
     wrapper = Path(__file__).resolve().parents[2] / "bin" / "tmux"
-    for candidate in shutil.which("tmux", mode=os.F_OK | os.X_OK, path=os.environ.get("PATH")) or "", \
-        "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux", "/bin/tmux":
+    for candidate in (
+        shutil.which("tmux", mode=os.F_OK | os.X_OK, path=os.environ.get("PATH")) or "",
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+        "/bin/tmux",
+    ):
         if not candidate:
             continue
         try:

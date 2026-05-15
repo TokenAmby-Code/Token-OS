@@ -131,24 +131,26 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert "trials_verdict: pending" in session_text
     assert "operator_approved_dispatch: false" in session_text
     assert "open_questions: {}" in session_text
-    assert "engine: \"claude\"" in session_text
-    assert "persona: \"vulkan\"" in session_text
+    assert 'engine: "claude"' in session_text
+    assert 'persona: "vulkan"' in session_text
     assert f"target_working_dir: {json.dumps(str(ROOT))}" in session_text
-    assert "dispatch_target: \"legion:new\"" in session_text
+    assert 'dispatch_target: "legion:new"' in session_text
     assert "zealotry: 4" in session_text
     assert "victory_conditions:" in session_text
-    assert "  - \"Tests pass\"" in session_text
+    assert '  - "Tests pass"' in session_text
     assert "## Dispatch Boundary" in session_text
     assert "no downstream agent has been launched" in session_text
     assert "aspirant_persona: aspirant" in note_text
     assert "dispatch_boundary: true" in note_text
     assert "dispatch_schema_complete: true" in note_text
     assert "dispatch_ready: false" in note_text
-    assert "dispatch_blocked_reason: \"pending_aspirant_trials\"" in note_text
+    assert 'dispatch_blocked_reason: "pending_aspirant_trials"' in note_text
     assert "trials_verdict: pending" in note_text
     assert "operator_approved_dispatch: false" in note_text
     assert "open_questions: {}" in note_text
-    prompt_line = next(line for line in session_text.splitlines() if line.startswith("aspirant_persona_prompt: "))
+    prompt_line = next(
+        line for line in session_text.splitlines() if line.startswith("aspirant_persona_prompt: ")
+    )
     prompt_path = Path(json.loads(prompt_line.split(": ", 1)[1]))
     assert prompt_path.is_absolute()
     assert prompt_path.exists()
@@ -186,7 +188,7 @@ def test_aspirant_create_dispatch_incomplete_stays_intake(tmp_path):
     assert "status: aspirant_intake" in text
     assert "dispatch_schema_complete: false" in text
     assert "dispatch_ready: false" in text
-    assert "dispatch_blocked_reason: \"missing persona, dispatch_target, victory_conditions\"" in text
+    assert 'dispatch_blocked_reason: "missing persona, dispatch_target, victory_conditions"' in text
     assert "trials_verdict: pending" in text
     assert "operator_approved_dispatch: false" in text
     assert "open_questions: {}" in text

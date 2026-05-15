@@ -158,7 +158,16 @@ def test_dispatch_aspirant_uses_internal_backend_without_public_command(tmp_path
 def test_dispatch_auto_policy_ignores_resume(monkeypatch):
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "c")
     result = subprocess.run(
-        [str(DISPATCH), "--dry-run", "--id", "missing-session", "--engine", "claude", "--dir", str(ROOT)],
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--id",
+            "missing-session",
+            "--engine",
+            "claude",
+            "--dir",
+            str(ROOT),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -193,7 +202,7 @@ def test_human_shell_surfaces_call_dispatch_interactive_aspirants(tmp_path):
     fake_dispatch = fake_bin / "dispatch"
     fake_dispatch.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s|%s\\n' \"$TOKEN_API_DISPATCH_ORIGIN\" \"$*\" >> \"$DISPATCH_LOG\"\n",
+        'printf \'%s|%s\\n\' "$TOKEN_API_DISPATCH_ORIGIN" "$*" >> "$DISPATCH_LOG"\n',
         encoding="utf-8",
     )
     fake_dispatch.chmod(0o755)

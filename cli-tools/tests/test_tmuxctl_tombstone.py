@@ -98,8 +98,6 @@ def test_canonical_logical_slot_resolves_to_legacy_pane_before_mutation():
     assert resolved.pane_id == "%1"
 
 
-
-
 def test_positional_window_index_slot_resolves_live_pane():
     workspace = _workspace(_pane("%1", "palace:N"))
 
@@ -122,6 +120,7 @@ def test_positional_window_name_slot_resolves_live_pane():
     resolved = resolve_pane_in_snapshot(workspace, "somnium:BR")
 
     assert resolved.pane_id == "%2"
+
 
 def test_single_tombstone_resolves_to_target():
     workspace = _workspace(

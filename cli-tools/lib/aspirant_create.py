@@ -3,6 +3,7 @@
 
 This module is intentionally not exposed as a public bin command; dispatch is the public surface.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -191,7 +192,9 @@ def build_session_doc(
 ) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     persona_prompt = str(aspirant_persona_prompt_path())
-    vc = args.victory_condition or ["Aspirant identifies blocking open questions and validates dispatch metadata without launching workers."]
+    vc = args.victory_condition or [
+        "Aspirant identifies blocking open questions and validates dispatch metadata without launching workers."
+    ]
     tags = ["mars/session", "aspirant/dispatch", "system/dispatch"]
     lines = [
         "---",
@@ -257,7 +260,9 @@ def build_session_doc(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Internal aspirant creation helper. Use dispatch --aspirant publicly.")
+    p = argparse.ArgumentParser(
+        description="Internal aspirant creation helper. Use dispatch --aspirant publicly."
+    )
     p.add_argument("--kind", required=True, choices=sorted(VALID_KINDS))
     p.add_argument("--title", required=True)
     p.add_argument("--objective", required=True)
@@ -307,12 +312,16 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
             if not session_doc_path.is_absolute():
                 session_doc_path = vault / args.session_doc
         else:
-            session_dir = vault / ("Terra/Sessions" if args.session_domain == "terra" else "Mars/Sessions")
+            session_dir = vault / (
+                "Terra/Sessions" if args.session_domain == "terra" else "Mars/Sessions"
+            )
             session_doc_path = unique_path(session_dir, f"{today}-aspirant-{note_stem}-{short}")
         session_doc_rel = rel_to_vault(session_doc_path, vault)
 
     note_path.write_text(
-        build_note_content(args, note_status, dispatch_schema_is_complete, blocked_reason, session_doc_rel),
+        build_note_content(
+            args, note_status, dispatch_schema_is_complete, blocked_reason, session_doc_rel
+        ),
         encoding="utf-8",
     )
 
@@ -323,7 +332,9 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
         else:
             session_doc_path.parent.mkdir(parents=True, exist_ok=True)
             session_doc_path.write_text(
-                build_session_doc(args, note_rel, note_status, dispatch_schema_is_complete, blocked_reason),
+                build_session_doc(
+                    args, note_rel, note_status, dispatch_schema_is_complete, blocked_reason
+                ),
                 encoding="utf-8",
             )
 
@@ -333,7 +344,9 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
         "status": note_status,
         "note_path": note_rel,
         "session_doc": session_doc_rel,
-        "dispatch_schema_complete": dispatch_schema_is_complete if args.kind == "dispatch" else None,
+        "dispatch_schema_complete": dispatch_schema_is_complete
+        if args.kind == "dispatch"
+        else None,
         "dispatch_ready": False if args.kind == "dispatch" else None,
         "dispatch_blocked_reason": blocked_reason,
         "trials_verdict": "pending",
