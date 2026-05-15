@@ -79,6 +79,7 @@ from pane_surface import (
 )
 from pane_surface import (
     is_meaningful_tab_name as _is_meaningful_surface_name,
+    sanitize_human_surface as _sanitize_human_surface,
 )
 from phone_service import (
     _persist_twitter_zap_cooldown,
@@ -4866,11 +4867,10 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             ack_details.get("pane_label"),
         )
     ack_surface = (
-        ack_details.get("human_pane_surface")
-        or derived_ack_surface
-        or ack_details.get("pane_surface")
-        or ack_details.get("pane_label")
-        or ack_details.get("tmux_pane")
+        _sanitize_human_surface(ack_details.get("human_pane_surface"))
+        or _sanitize_human_surface(derived_ack_surface)
+        or _sanitize_human_surface(ack_details.get("pane_surface"))
+        or _sanitize_human_surface(ack_details.get("pane_label"))
     )
     ack_due_text = f"Ack due: {ack_surface}" if ack_surface else "Ack due"
     ack_overdue_text = f"Ack overdue: {ack_surface}" if ack_surface else "Ack overdue"
@@ -5093,11 +5093,9 @@ async def _repair_missing_pane_labels(candidates: list[dict]) -> None:
 
 
 def _golden_throne_surface(tab_name: str, tmux_pane: str | None, pane_label: str | None) -> str:
-    if pane_label and tmux_pane:
-        return f"{pane_label} ({tmux_pane})"
     if pane_label:
         return pane_label
-    if tmux_pane:
+    if tmux_pane and not str(tmux_pane).startswith("%"):
         return tmux_pane
     return tab_name
 
