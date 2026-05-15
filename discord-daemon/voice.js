@@ -59,6 +59,7 @@ export function createVoiceManager(botClients, config, logger) {
         recording: false,
         activeSubscriptions: new Map(),
         channelId: null,
+        joining: false,
         player: null,       // AudioPlayer for playback
         playing: false,      // Currently playing audio
       });
@@ -67,7 +68,7 @@ export function createVoiceManager(botClients, config, logger) {
   }
 
   function getClient(botName = 'mechanicus') {
-    return botClients[botName] || Object.values(botClients)[0];
+    return botClients[botName];
   }
 
   async function joinChannel(voiceChannelId, botName = 'mechanicus') {
@@ -75,57 +76,66 @@ export function createVoiceManager(botClients, config, logger) {
     if (!client?.client) throw new Error(`Bot '${botName}' not available`);
 
     const state = getBotState(botName);
-    const guild = await client.client.guilds.fetch(guildId);
-    const channel = await guild.channels.fetch(voiceChannelId);
-
-    if (!channel?.isVoiceBased?.()) {
-      throw new Error(`Channel ${voiceChannelId} is not a voice channel`);
+    if (state.joining) {
+      throw new Error(`Bot '${botName}' is already joining a voice channel`);
     }
+    state.joining = true;
 
-    // Destroy existing connection if any
-    if (state.connection) {
-      state.connection.destroy();
-    }
-
-    state.connection = joinVoiceChannel({
-      channelId: voiceChannelId,
-      guildId: guildId,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false, // MUST be false to receive audio
-      selfMute: false, // Unmuted to support audio playback
-    });
-
-    state.channelId = voiceChannelId;
-
-    // Wait for connection to be ready
     try {
-      await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
-      logger.info(`Voice [${botName}]: joined channel ${channel.name} (${voiceChannelId})`);
-    } catch (err) {
-      // state.connection may have been nulled by a concurrent leaveChannel during the wait
-      if (state.connection) state.connection.destroy();
-      state.connection = null;
-      state.channelId = null;
-      throw new Error(`Failed to join voice channel: ${err.message}`);
-    }
+      const guild = await client.client.guilds.fetch(guildId);
+      const channel = await guild.channels.fetch(voiceChannelId);
 
-    // Set up speaking detection for auto-subscribe
-    // Refresh bot IDs on each join (bots may have connected since last check)
-    refreshBotUserIds();
-
-    state.connection.receiver.speaking.on('start', (userId) => {
-      if (!state.recording) return;
-      if (state.activeSubscriptions.has(userId)) return;
-      // Ignore other bots to prevent ouroboros (bot transcribing its own TTS or other bots)
-      if (botUserIds.has(userId)) {
-        logger.debug(`Voice [${botName}]: ignoring bot user ${userId}`);
-        return;
+      if (!channel?.isVoiceBased?.()) {
+        throw new Error(`Channel ${voiceChannelId} is not a voice channel`);
       }
-      logger.info(`Voice [${botName}]: user ${userId} started speaking, subscribing...`);
-      subscribeToUser(botName, userId);
-    });
 
-    return { channelId: voiceChannelId, channelName: channel.name, botName };
+      // Destroy existing connection if any
+      if (state.connection) {
+        state.connection.destroy();
+      }
+
+      state.connection = joinVoiceChannel({
+        channelId: voiceChannelId,
+        guildId: guildId,
+        adapterCreator: guild.voiceAdapterCreator,
+        selfDeaf: false, // MUST be false to receive audio
+        selfMute: false, // Unmuted to support audio playback
+      });
+
+      state.channelId = voiceChannelId;
+
+      // Wait for connection to be ready
+      try {
+        await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+        logger.info(`Voice [${botName}]: joined channel ${channel.name} (${voiceChannelId})`);
+      } catch (err) {
+        // state.connection may have been nulled by a concurrent leaveChannel during the wait
+        if (state.connection) state.connection.destroy();
+        state.connection = null;
+        state.channelId = null;
+        throw new Error(`Failed to join voice channel: ${err.message}`);
+      }
+
+      // Set up speaking detection for auto-subscribe
+      // Refresh bot IDs on each join (bots may have connected since last check)
+      refreshBotUserIds();
+
+      state.connection.receiver.speaking.on('start', (userId) => {
+        if (!state.recording) return;
+        if (state.activeSubscriptions.has(userId)) return;
+        // Ignore other bots to prevent ouroboros (bot transcribing its own TTS or other bots)
+        if (botUserIds.has(userId)) {
+          logger.debug(`Voice [${botName}]: ignoring bot user ${userId}`);
+          return;
+        }
+        logger.info(`Voice [${botName}]: user ${userId} started speaking, subscribing...`);
+        subscribeToUser(botName, userId);
+      });
+
+      return { channelId: voiceChannelId, channelName: channel.name, botName };
+    } finally {
+      state.joining = false;
+    }
   }
 
   // Chunking config
@@ -402,8 +412,8 @@ export function createVoiceManager(botClients, config, logger) {
 
         // Operator joined our assigned channel
         if (joinedChannel === channelId && leftChannel !== channelId) {
-          if (state.connection) {
-            logger.debug(`Voice auto-join [${botName}]: already connected`);
+          if (state.connection || state.joining) {
+            logger.debug(`Voice auto-join [${botName}]: already connected or joining`);
             return;
           }
           logger.info(`Voice auto-join [${botName}]: operator joined ${channelId}, following...`);
@@ -472,7 +482,7 @@ export function createVoiceManager(botClients, config, logger) {
 
     const [botName, channelId] = match;
     const state = getBotState(botName);
-    if (state.connection) {
+    if (state.connection || state.joining) {
       logger.info(`Voice startup sync [${botName}]: already connected to ${state.channelId}`);
       return { joined: false, reason: 'already_connected', botName, channelId: state.channelId };
     }

@@ -144,7 +144,7 @@ class RestartExecutor:
             localized_dir = self._localize_path(resume.working_dir)
             self.adapter.send_keys(
                 target_pane_id,
-                f"cd {shlex.quote(localized_dir or '$HOME')} && claude --resume {shlex.quote(resume.instance_id)}",
+                f"cd {shlex.quote(localized_dir or '$HOME')} && dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(target_pane_id)}",
                 "Enter",
             )
             time.sleep(1.5)

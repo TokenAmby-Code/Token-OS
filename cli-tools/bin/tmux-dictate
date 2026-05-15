@@ -121,5 +121,10 @@ tmux_send_guarded "${SEND_ARGS[@]}" -l "$TEXT"
 
 # Optionally submit
 if $SUBMIT; then
-    tmux_send_guarded "${SEND_ARGS[@]}" Enter
+    # Do not re-run the typing guard after injecting our own text: at that
+    # point the prompt necessarily contains pending input (the text we just
+    # sent), so a second guarded send would wait until timeout and abort the
+    # submit. The guard above already verified the pane was clear before the
+    # dictation write began.
+    TMUX_GUARD_SKIP=1 tmux_send_guarded "${SEND_ARGS[@]}" Enter
 fi

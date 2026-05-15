@@ -46,7 +46,7 @@ Three cross-device primitives:
 
 Claude Code sessions run inside tmux panes. This makes transplant possible — the pane persists even when the Claude process inside it is killed and restarted.
 
-- **Local transplant**: Kill Claude, restart in same pane with `--resume --fork-session`
+- **Local transplant**: Kill Claude, restart in same pane with `dispatch --id`
 - **Cross-device relay**: Kill local Claude, same pane runs `ssh -t` into remote Claude
 - **Headless**: tmux is irrelevant (no terminal at all)
 
@@ -94,7 +94,7 @@ When transplanting across devices, the session JSONL must be copied:
 1. **Find source JSONL**: `~/.claude/projects/{encoded-source-dir}/{session-id}.jsonl`
 2. **Encode target path**: Claude uses `tr '/.' '-'` to encode directory paths (e.g., `/home/token/project` becomes `-home-token-project`)
 3. **SCP to remote**: `scp $source_jsonl $target:~/.claude/projects/{encoded-target-dir}/`
-4. **Resume on remote**: `claude --resume $session_id --fork-session`
+4. **Resume on remote**: `dispatch --id "$session_id" --pane "$pane_id"`
 
 The `--fork-session` flag creates a new session branching from the transcript, so the original session file is preserved.
 

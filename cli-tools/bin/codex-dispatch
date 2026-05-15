@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # codex-dispatch — Launch Codex with Token-API session tracking and dispatch metadata
+# AUDIENCE: deprecated
 
 set -euo pipefail
+
+if [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" != "1" ]]; then
+  echo "codex-dispatch has been retired. Use: dispatch --engine codex" >&2
+  exit 64
+fi
+
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
@@ -109,6 +116,13 @@ build_env_object() {
   [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
   [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_CODEX_PROFILE" '. + {TOKEN_API_CODEX_PROFILE: $v}')
   [[ -n "${TOKEN_API_PARENT_INSTANCE_ID:-${PARENT_INSTANCE_ID:-}}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "${TOKEN_API_PARENT_INSTANCE_ID:-$PARENT_INSTANCE_ID}" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_MCP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP" '. + {TOKEN_API_DISPATCH_MCP: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_BROWSER" '. + {TOKEN_API_DISPATCH_WITH_BROWSER: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_DESKTOP" '. + {TOKEN_API_DISPATCH_WITH_DESKTOP: $v}')
+  [[ -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP_LIST" '. + {TOKEN_API_DISPATCH_MCP_LIST: $v}')
+  [[ -n "${TOKEN_API_DISCORD_HOSTED:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_HOSTED" '. + {TOKEN_API_DISCORD_HOSTED: $v}')
+  [[ -n "${TOKEN_API_DISCORD_CHANNEL:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_CHANNEL" '. + {TOKEN_API_DISCORD_CHANNEL: $v}')
+  [[ -n "${TOKEN_API_DISCORD_BOT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_BOT" '. + {TOKEN_API_DISCORD_BOT: $v}')
   echo "$env_obj"
 }
 
@@ -213,6 +227,13 @@ CODEX_ENV=(
   "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
   "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
   "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
+  "TOKEN_API_DISPATCH_MCP=${TOKEN_API_DISPATCH_MCP:-}"
+  "TOKEN_API_DISPATCH_WITH_BROWSER=${TOKEN_API_DISPATCH_WITH_BROWSER:-}"
+  "TOKEN_API_DISPATCH_WITH_DESKTOP=${TOKEN_API_DISPATCH_WITH_DESKTOP:-}"
+  "TOKEN_API_DISPATCH_MCP_LIST=${TOKEN_API_DISPATCH_MCP_LIST:-}"
+  "TOKEN_API_DISCORD_HOSTED=${TOKEN_API_DISCORD_HOSTED:-}"
+  "TOKEN_API_DISCORD_CHANNEL=${TOKEN_API_DISCORD_CHANNEL:-}"
+  "TOKEN_API_DISCORD_BOT=${TOKEN_API_DISCORD_BOT:-}"
 )
 
 CODEX_PROFILE_ARGS=()

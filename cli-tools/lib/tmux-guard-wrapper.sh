@@ -45,6 +45,7 @@ fi
 # We need tmux_pane_has_input() and tmux_wait_for_clear().
 # Resolve the lib path relative to this file.
 _tmux_guard_wrapper_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
+TMUX_GUARD_RESOLVER_BIN="$_tmux_guard_wrapper_dir/../bin/tmux-resolve-pane"
 if [[ -f "$_tmux_guard_wrapper_dir/tmux-guard.sh" ]]; then
     source "$_tmux_guard_wrapper_dir/tmux-guard.sh"
 fi
@@ -104,6 +105,29 @@ tmux() {
     if [[ -z "$pane" ]]; then
         "$real" "$@"
         return
+    fi
+
+    # Resolve Imperium stable pane ids (1:N, palace:NW, legion:custodes) once,
+    # then guard and execute against the live %pane id. This keeps the shell
+    # function override compatible with the bin/tmux shim.
+    local resolver_bin="${TMUX_GUARD_RESOLVER_BIN:-}"
+    if [[ -x "$resolver_bin" ]]; then
+        local resolved_pane
+        if resolved_pane=$("$resolver_bin" --format id "$pane" 2>/dev/null) && [[ -n "$resolved_pane" ]]; then
+            pane="$resolved_pane"
+            for ((i = 1; i < ${#args[@]}; i++)); do
+                if [[ "${args[$i]}" == "-t" ]] && (( i + 1 < ${#args[@]} )); then
+                    args[$((i + 1))]="$pane"
+                    set -- "${args[@]}"
+                    break
+                fi
+                if [[ "${args[$i]}" == -t* ]] && [[ "${args[$i]}" != "-t" ]]; then
+                    args[$i]="-t${pane}"
+                    set -- "${args[@]}"
+                    break
+                fi
+            done
+        fi
     fi
 
     # Check if tmux_wait_for_clear is available (from tmux-guard.sh)

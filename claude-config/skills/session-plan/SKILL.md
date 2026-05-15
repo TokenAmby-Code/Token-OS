@@ -232,8 +232,8 @@ worktree-delete <branch-name> -b
 For autonomous work without manual intervention:
 
 ```bash
-# One-shot: vault → read session doc → transplant → work
-vault-dispatch <session-doc> <working-dir> [--primarch <name>]
+# One-shot: launch canonical dispatch with a session doc
+dispatch --session-doc <session-doc> --dir <working-dir> [--persona <name>]
 
 # Full cycle: vault → worktree → implement → PR → merge → cleanup
 work-loop dispatch <session-doc> [--primarch <name>] [--branch <name>]

@@ -89,6 +89,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0",
             ),
             ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
+            ("discord_bot", "ALTER TABLE claude_instances ADD COLUMN discord_bot TEXT"),
             ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
             (
                 "instance_type",

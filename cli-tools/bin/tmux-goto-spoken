@@ -37,7 +37,7 @@ def resolve_pane(target: str) -> str:
                 "import os,sys;"
                 f"sys.path.insert(0, {str(lib_dir)!r});"
                 "from tmuxctl.service import TmuxControlPlane;"
-                f"print(TmuxControlPlane().resolve_pane({target!r}))"
+                f"print(TmuxControlPlane().resolve_pane_resolution({target!r}).pane_id)"
             ),
         ],
         capture_output=True,
@@ -46,10 +46,8 @@ def resolve_pane(target: str) -> str:
     )
     if proc.returncode != 0:
         return target
-    for line in proc.stdout.splitlines():
-        if line.startswith("pane_id: "):
-            return line.split(": ", 1)[1]
-    return target
+    pane_id = proc.stdout.strip()
+    return pane_id or target
 
 
 def main() -> int:

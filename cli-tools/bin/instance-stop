@@ -30,6 +30,7 @@ Examples:
 import os
 import sys
 import json
+import shlex
 import sqlite3
 from pathlib import Path
 
@@ -45,7 +46,7 @@ def get_active_instances():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
-        "SELECT id, tab_name, working_dir, registered_at FROM claude_instances WHERE status IN ('processing', 'idle') ORDER BY registered_at DESC"
+        "SELECT id, session_id, tab_name, working_dir, registered_at FROM claude_instances WHERE status IN ('processing', 'idle') ORDER BY registered_at DESC"
     )
     instances = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -351,10 +352,12 @@ def main():
             # Level 3 (SIGKILL) - process is dead, show resume info
             if status in ("nudged", "no_change"):
                 working_dir = target.get("working_dir", "")
-                instance_id = target.get("id", "")
+                instance_id = target.get("session_id") or target.get("id", "")
                 print(f"{sig}: process killed (PID {result.get('pid', '?')})")
                 if working_dir:
-                    print(f"\nTo resume: cd {working_dir} && claude --resume {instance_id}")
+                    print(
+                        f"\nTo resume: cd {shlex.quote(working_dir)} && dispatch --id {shlex.quote(instance_id)}"
+                    )
             elif status == "error":
                 print(f"Kill failed: {result.get('detail', 'unknown error')}", file=sys.stderr)
                 sys.exit(1)

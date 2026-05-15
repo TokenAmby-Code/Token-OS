@@ -6,11 +6,18 @@
 # Source of truth: ~/.claude/agents.db (primarchs table)
 # Persona files: <vault>/Personas/<name>.md
 #
+# AUDIENCE: deprecated
 # Usage: primarch <name> [claude-flags...]
 #        primarch list
 #        primarch info <name>
 
 set -euo pipefail
+
+if [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" != "1" ]]; then
+  echo "primarch has been retired. Use: dispatch --persona <name>" >&2
+  exit 64
+fi
+
 
 DB_PATH="${PRIMARCH_DB:-$HOME/.claude/agents.db}"
 
@@ -300,5 +307,39 @@ if [[ ! -x "$CLAUDE_BIN" ]]; then
     exit 1
 fi
 
+# Per-persona harness profile (~/.claude/profiles/<name>/).
+# When a profile dir exists, apply its slim-harness flags. Otherwise the
+# launch is unchanged. Keeps blast radius scoped to opted-in personas.
+#
+#   .mcp.json            — MCP allowlist (used with --strict-mcp-config)
+#   disallowed-tools.txt — newline list of built-in tools to block
+#   settings.json        — optional --settings override
+#
+# See Mars/Tasks/feature-custodes-harness-context-profile.md for rationale.
+PROFILE_DIR="$HOME/.claude/profiles/$PRIMARCH_NAME"
+PROFILE_FLAGS=()
+if [[ -d "$PROFILE_DIR" ]]; then
+    if [[ -f "$PROFILE_DIR/.mcp.json" ]]; then
+        PROFILE_FLAGS+=(--mcp-config "$PROFILE_DIR/.mcp.json" --strict-mcp-config)
+    fi
+    if [[ -f "$PROFILE_DIR/disallowed-tools.txt" ]]; then
+        DISALLOWED=()
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
+            DISALLOWED+=("$line")
+        done < "$PROFILE_DIR/disallowed-tools.txt"
+        if [[ ${#DISALLOWED[@]} -gt 0 ]]; then
+            PROFILE_FLAGS+=(--disallowedTools "${DISALLOWED[@]}")
+        fi
+    fi
+    if [[ -f "$PROFILE_DIR/settings.json" ]]; then
+        PROFILE_FLAGS+=(--settings "$PROFILE_DIR/settings.json")
+    fi
+    [[ ${#PROFILE_FLAGS[@]} -gt 0 ]] && echo -e "${DIM}Profile: $PROFILE_DIR${NC}"
+fi
+
 # Launch claude with persona
-exec "$CLAUDE_BIN" --dangerously-skip-permissions --append-system-prompt "$FULL_PROMPT" "$@"
+exec "$CLAUDE_BIN" --dangerously-skip-permissions ${PROFILE_FLAGS[@]+"${PROFILE_FLAGS[@]}"} --append-system-prompt "$FULL_PROMPT" "$@"

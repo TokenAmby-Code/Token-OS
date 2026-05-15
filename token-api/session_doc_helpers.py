@@ -10,7 +10,9 @@ All Obsidian note interactions should go through this module.
 import asyncio
 import logging
 import os
+import re
 import subprocess
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -186,6 +188,330 @@ def update_victory_frontmatter(
     return fm
 
 
+# ============ Generic Rubric Machinery ============
+# A "rubric" is a typed completion checklist embedded in a markdown note's
+# frontmatter. It powers the Golden Throne accountability check: GT reads
+# the rubric, finds the first unmet condition, and pings the agent with a
+# specific accusation instead of a generic "resume" poke.
+#
+# The pattern is intentionally generic so it works for session docs (rubric_key
+# defaults to "victory"), aspirants (rubric_key="dispatch"), and any future
+# per-primarch or per-persona schema. The rubric_key declares which dict-shaped
+# frontmatter field to evaluate; siblings are derived by suffix:
+#
+#   <rubric_key>                 → dict of {condition_key: bool}
+#   <rubric_key>_skip            → list of inapplicable condition keys
+#   <rubric_key>_notified_at     → ISO ts: first-touch Emperor notify
+#   <rubric_key>_acknowledged_at → ISO ts: Emperor's final ack (archives doc)
+#   <rubric_key>_reason          → free-text written at ack time
+#
+# Legacy support: if <rubric_key> is a scalar string (e.g. "pending",
+# "declared"), the evaluator returns legacy_string=True so callers can fall
+# back to old behavior without forcing migration.
+
+DEFAULT_RUBRIC_KEY = "victory"
+
+# Default rubric seeded into freshly-created session docs. Open-keyed by design:
+# adding a new SOP key here is the only change needed — the engine iterates the
+# dict and discovers it automatically.
+DEFAULT_SESSION_DOC_RUBRIC: dict[str, bool] = {
+    # Starts True at creation; UserPromptSubmit hook flips to False each turn,
+    # and any Write/Edit on the doc flips it back True. Silent guard: agents
+    # that end a turn without touching their session doc trip GT next cycle.
+    "session_doc_up_to_date": True,
+    "extensively_validated": False,  # services restarted, redeployed, live endpoints pinged
+    "vault_searched": False,  # related vault docs reviewed for staleness
+    "committed": False,
+    "pushed": False,
+    "pr_opened": False,
+    "coderabbit_passed": False,
+    # Derived in evaluate_rubric from fm['sanguinius_is']: True iff state is terminal.
+    "sanguinius_satisfied": False,
+    # Derived in evaluate_rubric from fm['commentary']: True iff commentary is None.
+    "commentary_resolved": True,
+}
+
+
+# Beautifier state machine. Frontmatter surface is a themed self-report string
+# (Sanguinius' perspective: "I am ___"). Internally we map to an integer so
+# comparisons don't rely on string parsing and so the same state machine can be
+# reused under a different label in other vaults (e.g. Pax-ENV uses `designer_is`
+# with unthemed strings; the integers are identical).
+#
+# Convention: any frontmatter key matching the regex r'^[a-z_]+_is$' is a
+# beautifier state. The prefix selects the registry (sanguinius_is →
+# SANGUINIUS_STATES; designer_is → DESIGNER_STATES, etc.). State >= 3 is terminal.
+SANGUINIUS_STATES: dict[str, int] = {
+    "yet to take wing": 0,  # never invoked
+    "at the easel": 1,  # drafting now
+    "hovering at your shoulder": 2,  # drafts presented, awaiting Emperor's eye
+    "folding my wings": 3,  # Emperor has chosen; Sang rests (terminal)
+}
+
+# Persona-name → state-map registry. Add more as other vaults port the pattern.
+BEAUTIFIER_STATE_REGISTRIES: dict[str, dict[str, int]] = {
+    "sanguinius": SANGUINIUS_STATES,
+}
+BEAUTIFIER_TERMINAL_INT = 3
+_IS_FIELD_RE = re.compile(r"^([a-z_]+)_is$")
+
+
+def resolve_beautifier_state(fm: dict) -> tuple[str | None, int | None]:
+    """Find a `<persona>_is` key in frontmatter and resolve it to (persona, state_int).
+
+    Returns (None, None) if no matching field exists or the registry is unknown.
+    Returns (persona, None) if the field exists but the value isn't in the registry.
+    """
+    for key, raw in fm.items():
+        m = _IS_FIELD_RE.match(key)
+        if not m:
+            continue
+        persona = m.group(1)
+        registry = BEAUTIFIER_STATE_REGISTRIES.get(persona)
+        if registry is None:
+            continue
+        if isinstance(raw, int):
+            return persona, raw
+        if isinstance(raw, str):
+            return persona, registry.get(raw.strip().lower())
+        return persona, None
+    return None, None
+
+
+@dataclass
+class RubricStatus:
+    """Evaluated rubric state. Returned by evaluate_rubric/read_rubric."""
+
+    rubric_key: str
+    complete: bool
+    missing: list[str]
+    skipped: list[str]
+    notified_at: str | None
+    acknowledged_at: str | None
+    reason: str | None
+    rubric: dict
+    legacy_string: bool = False
+    present: bool = True
+
+
+def _rubric_sibling(rubric_key: str, suffix: str) -> str:
+    """Build sibling field name by convention: 'victory' + 'skip' → 'victory_skip'."""
+    return f"{rubric_key}_{suffix}"
+
+
+def evaluate_rubric(fm: dict, rubric_key: str | None = None) -> RubricStatus:
+    """Evaluate the rubric in a frontmatter dict.
+
+    Resolves rubric_key with precedence: explicit arg > fm['rubric_key'] > 'victory'.
+    Supports three rubric shapes:
+      - dict of bools: modern typed rubric (the happy path)
+      - scalar string: legacy ('pending', 'declared'). Returns legacy_string=True.
+      - missing/unknown: returns present=False, treated as effectively complete
+        so legacy docs without any rubric don't trip GT.
+    """
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    rubric_value = fm.get(rk)
+    skip_raw = fm.get(_rubric_sibling(rk, "skip")) or []
+    skip = [s for s in skip_raw if isinstance(s, str)]
+    notified_at = fm.get(_rubric_sibling(rk, "notified_at"))
+    acknowledged_at = fm.get(_rubric_sibling(rk, "acknowledged_at"))
+    reason = fm.get(_rubric_sibling(rk, "reason"))
+
+    if rubric_value is None:
+        return RubricStatus(
+            rubric_key=rk,
+            complete=True,
+            missing=[],
+            skipped=[],
+            notified_at=notified_at,
+            acknowledged_at=acknowledged_at,
+            reason=reason,
+            rubric={},
+            legacy_string=False,
+            present=False,
+        )
+
+    if isinstance(rubric_value, str):
+        complete = rubric_value.lower() in {"declared", "true", "achieved", "complete"}
+        missing = [] if complete else [f"legacy:{rubric_value}"]
+        return RubricStatus(
+            rubric_key=rk,
+            complete=complete,
+            missing=missing,
+            skipped=[],
+            notified_at=notified_at,
+            acknowledged_at=acknowledged_at,
+            reason=reason,
+            rubric={rk: rubric_value},
+            legacy_string=True,
+            present=True,
+        )
+
+    if isinstance(rubric_value, bool):
+        complete = bool(rubric_value)
+        missing = [] if complete else [rk]
+        return RubricStatus(
+            rubric_key=rk,
+            complete=complete,
+            missing=missing,
+            skipped=[],
+            notified_at=notified_at,
+            acknowledged_at=acknowledged_at,
+            reason=reason,
+            rubric={rk: rubric_value},
+            legacy_string=False,
+            present=True,
+        )
+
+    if not isinstance(rubric_value, dict):
+        return RubricStatus(
+            rubric_key=rk,
+            complete=True,
+            missing=[],
+            skipped=[],
+            notified_at=notified_at,
+            acknowledged_at=acknowledged_at,
+            reason=reason,
+            rubric={},
+            legacy_string=False,
+            present=False,
+        )
+
+    # Derived subconditions: always recomputed from canonical frontmatter
+    # surfaces so Emperor edits gate victory immediately.
+    derived_dirty = False
+
+    # `commentary_resolved`: True iff fm['commentary'] is None. Emperor sets
+    # `commentary: "..."` as an inbox; the next Astartes reconciles it and
+    # clears the field.
+    if "commentary_resolved" in rubric_value:
+        if not derived_dirty:
+            rubric_value = dict(rubric_value)
+            derived_dirty = True
+        rubric_value["commentary_resolved"] = fm.get("commentary") is None
+
+    # `sanguinius_satisfied`: True iff a beautifier `<persona>_is` field
+    # resolves to its terminal integer (>=3, "folding my wings"). Generic so
+    # the same gate works under `designer_is` in vaults that swap the theme.
+    if "sanguinius_satisfied" in rubric_value:
+        if not derived_dirty:
+            rubric_value = dict(rubric_value)
+            derived_dirty = True
+        _, state_int = resolve_beautifier_state(fm)
+        rubric_value["sanguinius_satisfied"] = (
+            state_int is not None and state_int >= BEAUTIFIER_TERMINAL_INT
+        )
+
+    skip_set = set(skip)
+    missing = [k for k, v in rubric_value.items() if not bool(v) and k not in skip_set]
+    skipped = [k for k in rubric_value.keys() if k in skip_set]
+    return RubricStatus(
+        rubric_key=rk,
+        complete=(len(missing) == 0),
+        missing=missing,
+        skipped=skipped,
+        notified_at=notified_at,
+        acknowledged_at=acknowledged_at,
+        reason=reason,
+        rubric=dict(rubric_value),
+        legacy_string=False,
+        present=True,
+    )
+
+
+def read_rubric(file_path: Path, rubric_key: str | None = None) -> RubricStatus:
+    """Read frontmatter from disk and evaluate the rubric."""
+    fm, _ = read_frontmatter(file_path)
+    return evaluate_rubric(fm, rubric_key)
+
+
+def update_rubric_field(
+    file_path: Path,
+    key: str,
+    value: Any,
+    rubric_key: str | None = None,
+) -> dict:
+    """Atomically set rubric[key] = value in the file's frontmatter.
+
+    If the rubric is missing or legacy-scalar, the field is upgraded to a dict
+    containing only the supplied key. Returns the updated frontmatter dict.
+    """
+    fm, body = read_frontmatter(file_path)
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    existing = fm.get(rk)
+    if not isinstance(existing, dict):
+        existing = {}
+    upgraded = dict(existing)
+    upgraded[key] = value
+    fm[rk] = upgraded
+    new_content = serialize_frontmatter(fm, body)
+    file_path.write_text(new_content, encoding="utf-8")
+    return fm
+
+
+def mark_rubric_notified(file_path: Path, rubric_key: str | None = None) -> dict:
+    """Stamp <rubric_key>_notified_at = now() — first-touch Emperor notify."""
+    fm, body = read_frontmatter(file_path)
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    fm[_rubric_sibling(rk, "notified_at")] = datetime.now().isoformat()
+    new_content = serialize_frontmatter(fm, body)
+    file_path.write_text(new_content, encoding="utf-8")
+    return fm
+
+
+def clear_rubric_notified(file_path: Path, rubric_key: str | None = None) -> dict:
+    """Clear <rubric_key>_notified_at — used when a previously-complete rubric regresses."""
+    fm, body = read_frontmatter(file_path)
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    fm[_rubric_sibling(rk, "notified_at")] = None
+    new_content = serialize_frontmatter(fm, body)
+    file_path.write_text(new_content, encoding="utf-8")
+    return fm
+
+
+def mark_rubric_acknowledged(
+    file_path: Path,
+    reason: str,
+    rubric_key: str | None = None,
+) -> dict:
+    """Stamp <rubric_key>_acknowledged_at + <rubric_key>_reason — final Emperor ack."""
+    fm, body = read_frontmatter(file_path)
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    now = datetime.now().isoformat()
+    fm[_rubric_sibling(rk, "acknowledged_at")] = now
+    fm[_rubric_sibling(rk, "reason")] = reason
+    new_content = serialize_frontmatter(fm, body)
+    file_path.write_text(new_content, encoding="utf-8")
+    return fm
+
+
+def bump_session_doc_up_to_date(file_path: Path, value: bool) -> dict | None:
+    """Flip the session_doc_up_to_date inverse flag on a session doc rubric.
+
+    Convention: UserPromptSubmit hook sets this False each turn; a Write/Edit
+    that targets the doc flips it back True. Agents that end a turn without
+    touching their doc trip GT next cycle. Silent guard on the happy path.
+
+    Returns None if the doc has no rubric (legacy/string victory or missing).
+    """
+    try:
+        fm, body = read_frontmatter(file_path)
+    except FileNotFoundError:
+        return None
+    rk = fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    existing = fm.get(rk)
+    if not isinstance(existing, dict):
+        return None
+    if existing.get("session_doc_up_to_date") == value:
+        return fm
+    upgraded = dict(existing)
+    upgraded["session_doc_up_to_date"] = value
+    fm[rk] = upgraded
+    new_content = serialize_frontmatter(fm, body)
+    file_path.write_text(new_content, encoding="utf-8")
+    return fm
+
+
 # ============ Obsidian CLI Wrappers ============
 # For single-property ops, note reads, appends, creates — thin wrappers
 # around the obsidian CLI. These shell out to the CLI which handles
@@ -313,42 +639,65 @@ async def async_obsidian_create(vault: str, path: str, content: str) -> bool:
 def create_session_doc_file(
     file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None
 ) -> None:
-    """Create the markdown file for a session document."""
+    """Create the markdown file for a session document.
+
+    Seeds the typed victory rubric (see DEFAULT_SESSION_DOC_RUBRIC) so the
+    Golden Throne accountability engine can read specific unmet conditions
+    instead of firing a generic resume prompt.
+    """
     file_path.parent.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    project_line = f"\nproject: {project}" if project else ""
-    primarch_line = f"\nprimarch: {primarch_name}" if primarch_name else ""
-    content = f"""---
-session_doc_id: {doc_id}
-created: {today}{project_line}
-agents: []
-instance_ids: []{primarch_line}
-status: active
-type: session
-start_time: null
-end_time: null
-duration_minutes: null
-pool: null
-legion: null
-faction: null
-victory_conditions: []
-victory: pending
-victory_reason: null
-deliverables: []
-instance_type: one_off
-zealotry: 4
----
+    fm: dict[str, Any] = {
+        "session_doc_id": doc_id,
+        "created": today,
+    }
+    if project:
+        fm["project"] = project
+    fm["agents"] = []
+    fm["instance_ids"] = []
+    if primarch_name:
+        fm["primarch"] = primarch_name
+    fm["status"] = "active"
+    fm["type"] = "session"
+    fm["rubric_key"] = DEFAULT_RUBRIC_KEY
+    fm["start_time"] = None
+    fm["end_time"] = None
+    fm["duration_minutes"] = None
+    fm["pool"] = None
+    fm["legion"] = None
+    fm["faction"] = None
+    fm["victory_conditions"] = []
+    fm["commentary"] = None
+    fm["sanguinius_is"] = "yet to take wing"
+    fm["drafts"] = []
+    fm["victory"] = dict(DEFAULT_SESSION_DOC_RUBRIC)
+    fm["victory_skip"] = []
+    fm["victory_notified_at"] = None
+    fm["victory_acknowledged_at"] = None
+    fm["victory_reason"] = None
+    fm["deliverables"] = []
+    fm["instance_type"] = "one_off"
+    fm["zealotry"] = 4
+    fm["pr_url"] = None
 
-# Session: {title}
-
-## Plan
-
-_No plan defined yet._
-
-## Activity Log
-
-"""
-    file_path.write_text(content)
+    body = (
+        f"# Session: {title}\n\n"
+        "<!-- visual:html BEGIN -->\n"
+        '<div class="session-visual">\n'
+        "  <em>Sanguinius is yet to take wing. Dispatch with "
+        "<code>dispatch --persona sanguinius --session-doc &lt;name&gt;</code>.</em>\n"
+        "</div>\n"
+        "<!-- visual:html END -->\n\n"
+        "## Drafts\n"
+        "_Sanguinius stages alternates here while he hovers. On wings-fold the top kept draft is promoted into the canonical region above and these regions are cleared._\n\n"
+        "## HTML Corrections Buffer\n"
+        "<!-- corrections:html BEGIN -->\n"
+        "<!-- corrections:html END -->\n\n"
+        "## Scratchpad\n\n"
+        "_Assumptions, decisions in flight, handoff state. One thread per ongoing concern; flat is fine for one-off docs._\n\n"
+        "## Activity Log\n\n"
+    )
+    file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
 
 
 async def _update_doc_agents_list(db, doc_id: int) -> None:

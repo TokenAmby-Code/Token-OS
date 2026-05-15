@@ -295,7 +295,14 @@ fi
 
 success "Created PR #$PR_NUMBER: $PR_URL"
 
+# Session-doc rubric: record PR open + URL on the linked session doc.
+# Best-effort; rubric-flip exits silently when no doc is linked.
+if [[ -x "$SCRIPT_DIR/rubric-flip" ]]; then
+    "$SCRIPT_DIR/rubric-flip" --quiet --extra "pr_url=$PR_URL" pr_opened true || true
+fi
+
 if [[ "$NO_WAIT" == "true" ]]; then
+    printf '%s\n' "$PR_URL"
     log "Review wait skipped. Run: pr-review-loop $PR_NUMBER --read"
     exit 0
 fi

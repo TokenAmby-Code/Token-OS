@@ -56,6 +56,7 @@ INSTANCE_MUTATION_FIELDS = {
     "victory_reason",
     "discord_hosted",
     "discord_channel",
+    "discord_bot",
     "transplant_target_session",
     "closure_surface",
     "closure_required",

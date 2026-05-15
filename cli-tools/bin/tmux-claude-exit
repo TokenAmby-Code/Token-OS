@@ -4,7 +4,8 @@
 # AUDIENCE: human
 #
 # Sends Ctrl+C x3 to kill the current Claude session, then captures
-# the resume command from Claude's exit output, stages it in shell
+# the native resume session id from Claude's exit output, stages a
+# generic dispatch resume command in shell
 # history, and clears the terminal.
 #
 # Usage:
@@ -52,31 +53,31 @@ for i in 1 2 3; do
     sleep 0.2
 done
 
-# Wait for Claude to print its exit output (resume command)
+# Wait for Claude to print its exit output (native resume command)
 sleep 1
 
-# Capture the resume command from Claude's exit output.
+# Capture the resume session id from Claude's exit output.
 # Handles line-wrapping (panes are often 47-50 chars wide) and
 # rejects RHS noise (pane borders, /buddy panel text).
-RESUME_CMD=$(tmux capture-pane -p -t "$PANE" -S -20 2>/dev/null | python3 -c '
+RESUME_ID=$(tmux capture-pane -p -t "$PANE" -S -20 2>/dev/null | python3 -c '
 import sys, re
 
 lines = sys.stdin.read().split("\n")
 box_chars = set("│╭╮╰╯┌┐└┘├┤┬┴┼─╭╮╯╰")
+needle = "claude " + "--resume"
 
 for i in range(len(lines) - 1, -1, -1):
     line = lines[i]
     if any(c in box_chars for c in line):
         continue
-    if "claude --resume" not in line:
+    if needle not in line:
         continue
 
-    m = re.search(r"claude --resume\s+(.*)$", line)
+    m = re.search(r"claude\s+--resume\s+(.*)$", line)
     if not m:
         continue
 
     arg = m.group(1).strip()
-    cmd = "claude --resume " + arg
 
     # Detect truncation: unclosed quote or partial UUID
     needs_next = False
@@ -88,14 +89,16 @@ for i in range(len(lines) - 1, -1, -1):
     if needs_next and i + 1 < len(lines):
         nxt = lines[i + 1].strip()
         if nxt and not any(c in box_chars for c in nxt) and not re.match(r"^(tokenclaw|\$|%)", nxt):
-            cmd = cmd + nxt
+            arg = arg + nxt
 
-    print(cmd)
+    print(arg.strip(chr(34) + chr(39)))
     sys.exit(0)
 ' 2>/dev/null)
 
-if [[ -z "$RESUME_CMD" ]]; then
-    RESUME_CMD="claude --resume"
+RESUME_CMD=""
+if [[ -n "$RESUME_ID" ]]; then
+    RESUME_CMD="dispatch --id ${RESUME_ID}"
+    [[ -n "$PANE" ]] && RESUME_CMD+=" --pane ${PANE}"
 fi
 
 # Stage resume command in shell history, then clear

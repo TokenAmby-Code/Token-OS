@@ -44,6 +44,13 @@ build_payload() {
     --arg token_api_transplant_expected "${TOKEN_API_TRANSPLANT_EXPECTED:-}" \
     --arg token_api_instance_type "${TOKEN_API_INSTANCE_TYPE:-}" \
     --arg token_api_zealotry "${TOKEN_API_ZEALOTRY:-}" \
+    --arg token_api_dispatch_mcp "${TOKEN_API_DISPATCH_MCP:-}" \
+    --arg token_api_dispatch_with_browser "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" \
+    --arg token_api_dispatch_with_desktop "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" \
+    --arg token_api_dispatch_mcp_list "${TOKEN_API_DISPATCH_MCP_LIST:-}" \
+    --arg token_api_discord_hosted "${TOKEN_API_DISCORD_HOSTED:-}" \
+    --arg token_api_discord_channel "${TOKEN_API_DISCORD_CHANNEL:-}" \
+    --arg token_api_discord_bot "${TOKEN_API_DISCORD_BOT:-}" \
     --arg token_api_wrapper_launch_id "$WRAPPER_LAUNCH_ID" \
     --argjson pid "$$" \
     --argjson exit_code "${exit_code:-null}" \
@@ -73,6 +80,13 @@ build_payload() {
         TOKEN_API_TRANSPLANT_EXPECTED: $token_api_transplant_expected,
         TOKEN_API_INSTANCE_TYPE: $token_api_instance_type,
         TOKEN_API_ZEALOTRY: $token_api_zealotry,
+        TOKEN_API_DISPATCH_MCP: $token_api_dispatch_mcp,
+        TOKEN_API_DISPATCH_WITH_BROWSER: $token_api_dispatch_with_browser,
+        TOKEN_API_DISPATCH_WITH_DESKTOP: $token_api_dispatch_with_desktop,
+        TOKEN_API_DISPATCH_MCP_LIST: $token_api_dispatch_mcp_list,
+        TOKEN_API_DISCORD_HOSTED: $token_api_discord_hosted,
+        TOKEN_API_DISCORD_CHANNEL: $token_api_discord_channel,
+        TOKEN_API_DISCORD_BOT: $token_api_discord_bot,
         TOKEN_API_WRAPPER_LAUNCH_ID: $token_api_wrapper_launch_id
       }
     }'
@@ -122,7 +136,10 @@ if $PRINT_MODE; then
   quoted_engine="$(printf '%q' "$ENGINE")"
   quoted_wrapper_id="$(printf '%q' "$WRAPPER_LAUNCH_ID")"
 
-  cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_LAUNCH_ID=$quoted_wrapper_id $quoted_wrapper --dangerously-skip-permissions"
+  quoted_discord_hosted="$(printf '%q' "${TOKEN_API_DISCORD_HOSTED:-}")"
+  quoted_discord_channel="$(printf '%q' "${TOKEN_API_DISCORD_CHANNEL:-}")"
+  quoted_discord_bot="$(printf '%q' "${TOKEN_API_DISCORD_BOT:-}")"
+  cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_LAUNCH_ID=$quoted_wrapper_id TOKEN_API_DISCORD_HOSTED=$quoted_discord_hosted TOKEN_API_DISCORD_CHANNEL=$quoted_discord_channel TOKEN_API_DISCORD_BOT=$quoted_discord_bot $quoted_wrapper --dangerously-skip-permissions"
   for arg in "${redirect_args[@]}"; do
     cmd+=" $(printf '%q' "$arg")"
   done

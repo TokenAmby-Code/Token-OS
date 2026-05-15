@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# tmux-resolve-pane — resolve Imperium pane ids to live tmux %pane ids
+# TAGS: tmux, resolver
+# AUDIENCE: agent, user, system
+#
+# Accepts raw tmux pane ids (%5), @PANE_ID roles (palace:N, legion:custodes),
+# and positional ids (1:N, 1:NW, palace:NW). Resolution is live and uncached.
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+format="id"
+
+usage() {
+    cat <<'EOF'
+Usage: tmux-resolve-pane [--format id|full|json] <target>
+
+Examples:
+  tmux-resolve-pane 1:N
+  tmux-resolve-pane palace:NW
+  tmux-resolve-pane --format json legion:custodes
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --format)
+            format="${2:-}"; shift 2 ;;
+        --full)
+            format="full"; shift ;;
+        --json)
+            format="json"; shift ;;
+        --id)
+            format="id"; shift ;;
+        -h|--help)
+            usage; exit 0 ;;
+        --)
+            shift; break ;;
+        -*)
+            echo "tmux-resolve-pane: unknown option $1" >&2; exit 2 ;;
+        *)
+            break ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+case "$format" in
+    id|full|json) ;;
+    *) echo "tmux-resolve-pane: invalid format '$format'" >&2; exit 2 ;;
+esac
+
+PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli resolve-pane --format "$format" "$1"

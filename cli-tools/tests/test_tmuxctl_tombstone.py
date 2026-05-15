@@ -23,11 +23,12 @@ def _pane(
     kind: PaneKind = PaneKind.UNKNOWN,
     target: str = "",
     window: str = "palace",
+    window_index: int = 1,
 ) -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
         session_name="main",
-        window_index=1,
+        window_index=window_index,
         window_name=window,
         pane_index=1,
         width=100,
@@ -45,13 +46,14 @@ def _pane(
 
 
 def _workspace(*panes: PaneSnapshot) -> WorkspaceSnapshot:
+    first = panes[0]
     return WorkspaceSnapshot(
         session_name="main",
         windows=(
             WindowSnapshot(
                 session_name="main",
-                window_index=1,
-                window_name="palace",
+                window_index=first.window_index,
+                window_name=first.window_name,
                 archetype=WindowArchetype.PALACE,
                 focused=False,
                 grid_expanded="none",
@@ -94,6 +96,30 @@ def test_canonical_logical_slot_resolves_to_legacy_pane_before_mutation():
     resolved = resolve_pane_in_snapshot(workspace, "palace:NW")
 
     assert resolved.pane_id == "%1"
+
+
+def test_positional_window_index_slot_resolves_live_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "1:N")
+
+    assert resolved.pane_id == "%1"
+
+
+def test_positional_window_index_legacy_slot_resolves_canonical_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "1:NW")
+
+    assert resolved.pane_id == "%1"
+
+
+def test_positional_window_name_slot_resolves_live_pane():
+    workspace = _workspace(_pane("%2", "somnium:SE", window="somnium"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "somnium:BR")
+
+    assert resolved.pane_id == "%2"
 
 
 def test_single_tombstone_resolves_to_target():

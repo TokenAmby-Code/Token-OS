@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -3793,6 +3794,7 @@ def main():
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
+                            session_id = instance.get("session_id") or instance_id
                             instance_name = format_instance_name(instance)
                             working_dir = instance.get("working_dir", "")
 
@@ -3800,14 +3802,14 @@ def main():
                             unstick_feedback = (time.time(), f"Killing {instance_name}...")
                             _refresh(live)
 
-                            def _do_kill(iid, iname, wdir):
+                            def _do_kill(iid, iname, wdir, resume_id):
                                 global unstick_feedback
                                 result = unstick_instance(iid, level=3)
                                 if result and result.get("status") in ("nudged", "no_change"):
                                     # SIGKILL always "works" - process is dead
                                     # Auto-copy resume command to clipboard
                                     if wdir:
-                                        resume_cmd = f"cd {wdir} && claude --resume {iid}"
+                                        resume_cmd = f"cd {shlex.quote(wdir)} && dispatch --id {shlex.quote(resume_id)}"
                                         copied, _ = copy_to_clipboard(resume_cmd)
                                         if copied:
                                             unstick_feedback = (
@@ -3832,7 +3834,7 @@ def main():
 
                             threading.Thread(
                                 target=_do_kill,
-                                args=(instance_id, instance_name, working_dir),
+                                args=(instance_id, instance_name, working_dir, session_id),
                                 daemon=True,
                             ).start()
 
@@ -3908,14 +3910,14 @@ def main():
                         global resume_feedback
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
-                            instance_id = instance.get("id", "")
+                            instance_id = instance.get("session_id") or instance.get("id", "")
                             working_dir = instance.get("working_dir", "")
                             instance_name = format_instance_name(instance)
 
                             if not instance_id or not working_dir:
                                 resume_feedback = (time.time(), "Missing instance data")
                             else:
-                                resume_cmd = f"cd {working_dir} && claude --resume {instance_id}"
+                                resume_cmd = f"cd {shlex.quote(working_dir)} && dispatch --id {shlex.quote(instance_id)}"
                                 # Try to open in a new Windows Terminal tab
                                 try:
                                     subprocess.Popen(
@@ -4009,7 +4011,7 @@ def main():
                             and 0 <= selected_index < len(displayed)
                         ):
                             instance = displayed[selected_index]
-                            instance_id = instance.get("id", "")
+                            instance_id = instance.get("session_id") or instance.get("id", "")
                             try:
                                 req = urllib.request.Request(
                                     f"{API_URL}/api/instances/{instance_id}/archive",
@@ -4099,7 +4101,7 @@ def main():
                             if not instance_id or not working_dir:
                                 resume_feedback = (time.time(), "Missing instance data")
                             else:
-                                resume_cmd = f"cd {working_dir} && claude --resume {instance_id}"
+                                resume_cmd = f"cd {shlex.quote(working_dir)} && dispatch --id {shlex.quote(instance_id)}"
                                 copied, msg = copy_to_clipboard(resume_cmd)
                                 if copied:
                                     resume_feedback = (

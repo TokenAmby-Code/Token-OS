@@ -120,6 +120,7 @@ LAYOUT
   tx unfocus   restore sides
   tx expand    toggle pane size
   tx inspect   inspect typed state
+  tx resolve ID resolve pane id (1:N, palace:N)
     restart-plan   inspect restart registry/restore plan
   tx doctor    diagnose drift
   tx normalize reserved Python path
@@ -176,6 +177,7 @@ Layout:
   tx unfocus          restore side columns
   tx expand           toggle pane expand/retract
   tx inspect          inspect typed workspace state
+  tx resolve ID       resolve stable pane id to live %pane
     restart-plan      inspect restart registry/restore plan
   tx doctor           diagnose managed workspace drift
   tx normalize        reserved Python normalize path
@@ -785,6 +787,13 @@ case "$CMD" in
         ;;
     inspect)
         run_tmuxctl inspect "$@"
+        ;;
+    resolve|resolve-pane)
+        if [[ $# -eq 0 ]]; then
+            log_error "Usage: tx resolve <pane-id>"
+            exit 1
+        fi
+        run_tmuxctl resolve-pane --format id "$1"
         ;;
     doctor)
         run_tmuxctl doctor "$@"

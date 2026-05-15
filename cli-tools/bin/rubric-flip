@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# rubric-flip - Flip a rubric field on the linked session doc (best-effort)
+# TAGS: token-api, session, victory, golden-throne
+# AUDIENCE: human, agent, hook
+"""Flip a rubric field on the linked session doc.
+
+Used by automated hook surfaces (post-push, post-pr-create, CodeRabbit
+webhook) so SOP completion is recorded as proof, not a "did you remember"
+question. Silent-success: when no doc is linked, exits 0 with no output.
+
+Usage:
+    rubric-flip <key> <value>                           # e.g. rubric-flip pushed true
+    rubric-flip --doc-id 12 <key> <value>
+    rubric-flip --rubric-key dispatch <key> <value>     # for non-victory rubrics
+    rubric-flip --extra pr_url=https://... pr_opened true
+
+Flags:
+    --doc-id N            Explicit doc id (else auto-resolve from $TOKEN_API_INSTANCE_ID)
+    --rubric-key NAME     Target rubric key (default: doc's `rubric_key:` field, fallback "victory")
+    --extra K=V           Repeatable; sets additional sibling frontmatter fields atomically
+    --quiet               Suppress success output
+    -h, --help            Show this help
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def api_url() -> str:
+    return os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+
+
+def http_get(path: str) -> dict | None:
+    url = f"{api_url()}{path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            parsed = json.loads(resp.read().decode())
+            if not isinstance(parsed, dict):
+                return {"detail": parsed}
+            return parsed
+    except Exception:
+        return None
+
+
+def http_post(path: str, data: dict) -> tuple[int, dict]:
+    url = f"{api_url()}{path}"
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST", headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            parsed = json.loads(resp.read().decode())
+            if not isinstance(parsed, dict):
+                parsed = {"detail": parsed}
+            return resp.status, parsed
+    except urllib.error.HTTPError as e:
+        resp_body = e.read().decode() if e.fp else ""
+        try:
+            parsed = json.loads(resp_body)
+        except Exception:
+            parsed = {"raw": resp_body}
+        if not isinstance(parsed, dict):
+            parsed = {"detail": parsed}
+        return e.code, parsed
+    except urllib.error.URLError:
+        return 0, {}
+
+
+def parse_value(raw: str):
+    low = raw.lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def parse_args(argv: list[str]) -> dict:
+    args = {
+        "doc_id": None,
+        "rubric_key": None,
+        "extra": {},
+        "quiet": False,
+        "key": None,
+        "value": None,
+    }
+    positionals: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--doc-id":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --doc-id expects an integer value.")
+            i += 1
+            try:
+                args["doc_id"] = int(argv[i])
+            except ValueError:
+                raise SystemExit(
+                    f"Error: --doc-id expects an integer, got {argv[i]!r}."
+                )
+        elif a == "--rubric-key":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --rubric-key expects a value.")
+            i += 1
+            args["rubric_key"] = argv[i]
+        elif a == "--extra":
+            if i + 1 >= len(argv):
+                raise SystemExit("Error: --extra expects K=V.")
+            i += 1
+            spec = argv[i]
+            if "=" not in spec:
+                raise SystemExit(f"Error: --extra expects K=V, got {spec}")
+            ek, ev = spec.split("=", 1)
+            if not ek:
+                raise SystemExit("Error: --extra expects non-empty key before '='.")
+            args["extra"][ek] = parse_value(ev)
+        elif a == "--quiet":
+            args["quiet"] = True
+        elif a.startswith("-"):
+            raise SystemExit(f"Error: Unknown flag: {a}")
+        else:
+            positionals.append(a)
+        i += 1
+    if len(positionals) < 1:
+        raise SystemExit("Error: <key> required. See --help.")
+    if len(positionals) > 2:
+        raise SystemExit(
+            f"Error: Too many positional args ({len(positionals)}); expected <key> [<value>]."
+        )
+    args["key"] = positionals[0]
+    args["value"] = parse_value(positionals[1]) if len(positionals) > 1 else True
+    return args
+
+
+def resolve_doc_id(args: dict) -> int | None:
+    if args["doc_id"] is not None:
+        return args["doc_id"]
+    iid = os.environ.get("TOKEN_API_INSTANCE_ID")
+    if not iid:
+        return None
+    data = http_get(f"/api/instances/{iid}/session-doc")
+    if not data:
+        return None
+    doc_id = data.get("session_doc_id")
+    return int(doc_id) if doc_id else None
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
+    doc_id = resolve_doc_id(args)
+    if doc_id is None:
+        # Best-effort: no linked doc, exit silently.
+        return 0
+
+    payload: dict = {"key": args["key"], "value": args["value"]}
+    if args["rubric_key"]:
+        payload["rubric_key"] = args["rubric_key"]
+    if args["extra"]:
+        payload["extra"] = args["extra"]
+
+    status_code, body = http_post(
+        f"/api/session-docs/{doc_id}/rubric-flip", payload
+    )
+    if status_code == 0:
+        # API unreachable — silent best-effort exit.
+        return 0
+    if status_code >= 400:
+        # Non-fatal: surface the error but don't break the caller pipeline.
+        if not args["quiet"]:
+            print(f"rubric-flip: {status_code} — {body}", file=sys.stderr)
+        return 0
+    if not args["quiet"]:
+        print(f"rubric-flip: doc {doc_id} {args['key']}={args['value']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

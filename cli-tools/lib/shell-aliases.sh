@@ -155,21 +155,21 @@ api-ping() {
 # Primarch dispatch: uses _primarch_launch (mac .zsh_aliases) or primarch binary (WSL cli-tools)
 # Smart resume: queries token-api if session not found locally
 
-_resolve_codex_dispatch_bin() {
+_resolve_dispatch_bin() {
     local candidate=""
 
-    candidate="$(command -v codex-dispatch 2>/dev/null || true)"
+    candidate="$(command -v dispatch 2>/dev/null || true)"
     if [[ -n "$candidate" && -x "$candidate" ]]; then
         echo "$candidate"
         return 0
     fi
 
     for candidate in \
-        "${CLI_TOOLS:-}/bin/codex-dispatch" \
-        "${TOKEN_OS:-}/cli-tools/bin/codex-dispatch" \
-        "${IMPERIUM:-}/Token-OS/cli-tools/bin/codex-dispatch" \
-        "/Volumes/Imperium/Token-OS/cli-tools/bin/codex-dispatch" \
-        "/mnt/imperium/Token-OS/cli-tools/bin/codex-dispatch"
+        "${CLI_TOOLS:-}/bin/dispatch" \
+        "${TOKEN_OS:-}/cli-tools/bin/dispatch" \
+        "${IMPERIUM:-}/Token-OS/cli-tools/bin/dispatch" \
+        "/Volumes/Imperium/Token-OS/cli-tools/bin/dispatch" \
+        "/mnt/imperium/Token-OS/cli-tools/bin/dispatch"
     do
         [[ -n "$candidate" && -x "$candidate" ]] || continue
         echo "$candidate"
@@ -204,14 +204,18 @@ _resolve_claude_wrapper_bin() {
 }
 
 _codex_launch() {
-    local codex_dispatch_bin=""
-    codex_dispatch_bin="$(_resolve_codex_dispatch_bin)" || {
-        echo "codex-dispatch not found" >&2
+    local dispatch_bin=""
+    dispatch_bin="$(_resolve_dispatch_bin)" || {
+        echo "dispatch not found" >&2
         return 1
     }
 
     clear
-    "$codex_dispatch_bin" --launcher "shell-aliases" "$PWD" "$@"
+    if [[ $# -gt 0 ]]; then
+        "$dispatch_bin" --engine codex --dir "$PWD" --prompt "$*"
+    else
+        "$dispatch_bin" --engine codex --dir "$PWD"
+    fi
 }
 
 _claude_launch() {
@@ -317,69 +321,67 @@ claude() {
     _claude_launch "${args[@]}"
 }
 
-# cdc — cd + clear + claude
-cdc() {
-    local dir="" primarch="" claude_args=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --codex)
-                claude_args+=("$1"); shift ;;
-            -r|--resume|--continue|--haiku)
-                claude_args+=("$1"); shift ;;
-            -p|--primarch)
-                primarch="$2"; shift 2 ;;
-            *)
-                if [[ -z "$dir" ]]; then dir="$1"; else claude_args+=("$1"); fi
-                shift ;;
-        esac
+_dispatch_has_flag() {
+    local flag="$1"
+    shift
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == "$flag" ]] && return 0
     done
-    [[ -n "$dir" ]] && { cd "$dir" || return 1; }
-    clear
-    if [[ -n "$primarch" ]]; then
-        claude --primarch "$primarch" "${claude_args[@]}"
-    else
-        claude "${claude_args[@]}"
-    fi
+    return 1
 }
 
-# cc — clear + claude (always routes args to claude)
+_dispatch_human_surface() {
+    local origin="$1"
+    local do_clear="$2"
+    shift 2
+
+    local dispatch_bin=""
+    dispatch_bin="$(_resolve_dispatch_bin)" || {
+        echo "dispatch not found" >&2
+        return 1
+    }
+
+    [[ "$do_clear" == "true" ]] && clear
+
+    local -a args
+    if [[ $# -eq 0 ]]; then
+        args=(--interactive --aspirant --aspirant-kind dispatch)
+    else
+        args=("$@")
+        if ! _dispatch_has_flag --direct "${args[@]}" \
+            && ! _dispatch_has_flag --aspirant "${args[@]}" \
+            && ! _dispatch_has_flag --id "${args[@]}"; then
+            if _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_has_flag --kind "${args[@]}"; then
+                args=(--aspirant "${args[@]}")
+            else
+                args=(--aspirant --aspirant-kind dispatch "${args[@]}")
+            fi
+        fi
+    fi
+
+    TOKEN_API_DISPATCH_ORIGIN="$origin" "$dispatch_bin" "${args[@]}"
+}
+
+# cdc — cd + clear + dispatch aspirant intake
+cdc() {
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        local dir="$1"
+        shift
+        cd "$dir" >/dev/null || return 1
+    fi
+
+    _dispatch_human_surface cdc true "$@"
+}
+
+# cc — clear + dispatch aspirant intake
 cc() {
-    clear
-    claude "$@"
+    _dispatch_human_surface cc true "$@"
 }
 
-# c — smart toggle: clear if dirty, claude if already clear
-# Args always passthrough to claude. From ~, opens launcher.
-_c_cleared=true
+# c — dispatch aspirant intake
 c() {
-    if [[ $# -gt 0 ]]; then
-        case "$1" in
-            --prompt|--prompt-file)
-                if command -v claude-launcher &>/dev/null; then
-                    claude-launcher "$@"
-                    return
-                fi
-                ;;
-        esac
-        claude "$@"
-        return
-    fi
-
-    # First clean invocation opens the launcher from any directory. The launcher
-    # places the current directory at the top of the target list when relevant.
-    if $_c_cleared && command -v claude-launcher &>/dev/null; then
-        _c_cleared=false
-        claude-launcher
-        return
-    fi
-
-    if $_c_cleared; then
-        _c_cleared=false
-        claude
-    else
-        _c_cleared=true
-        clear
-    fi
+    _dispatch_human_surface c false "$@"
 }
 
 TRAPINT() {

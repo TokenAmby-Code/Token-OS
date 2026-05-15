@@ -11,3 +11,11 @@ hook_path="$(git rev-parse --git-path hooks/post-push 2>/dev/null || true)"
 if [[ -n "$hook_path" && -x "$hook_path" ]]; then
     "$hook_path" || true
 fi
+
+# Session-doc rubric: a successful push implies the agent committed and pushed.
+# Best-effort flips; rubric-flip exits silently when no doc is linked.
+_SELF_DIR="$(dirname "$(readlink -f "$0")")"
+if [[ -x "$_SELF_DIR/rubric-flip" ]]; then
+    "$_SELF_DIR/rubric-flip" --quiet committed true || true
+    "$_SELF_DIR/rubric-flip" --quiet pushed true || true
+fi
