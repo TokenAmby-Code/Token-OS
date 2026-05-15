@@ -3014,17 +3014,26 @@ async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str |
     return "stale_reused_or_empty_pane"
 
 
-def _agent_resume_command(
-    engine: str, session_id: str, working_dir: str, sop_file: str, pane: str | None = None
-) -> str:
+def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
     quoted_working_dir = shlex.quote(working_dir)
     quoted_session_id = shlex.quote(session_id)
-    _ = (engine, sop_file)
-    dispatch_bin = shlex.quote(os.environ.get("DISPATCH_BIN") or "dispatch")
-    cmd = f"cd {quoted_working_dir} && {dispatch_bin} --id {quoted_session_id}"
-    if pane:
-        cmd += f" --pane {shlex.quote(pane)}"
-    return cmd
+    quoted_sop_file = shlex.quote(sop_file)
+    if engine == "codex":
+        dispatch_bin = shlex.quote(
+            os.environ.get("CODEX_DISPATCH_BIN")
+            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
+        )
+        return (
+            f"cd {quoted_working_dir} && {dispatch_bin} "
+            f"--resume-session {quoted_session_id} "
+            f"--launcher golden-throne --launch-mode golden-throne-resume "
+            f"{quoted_working_dir} "
+            f'"$(cat {quoted_sop_file})"'
+        )
+    return (
+        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
+        f"--resume {quoted_session_id} --dangerously-skip-permissions"
+    )
 
 
 def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
@@ -5334,8 +5343,50 @@ async def _golden_throne_handle_victorious_bug(
     return {"state": "victorious_bug", "doc_id": doc_id, "enforcement": enforcement}
 
 
+_golden_throne_fire_times: deque[float] = deque()
+
+
+def _golden_throne_rate_limit_delay(now: float | None = None) -> tuple[float | None, dict]:
+    """Return defer delay if Golden Throne is over its rolling fire cap.
+
+    Mirrors the Pavlok cooldown pattern: keep recent fire timestamps in memory,
+    drop expired entries at function entry, and only append when the fire is
+    allowed to proceed.
+    """
+    try:
+        max_fires = int(os.getenv("GT_MAX_FIRES_PER_WINDOW", "3"))
+    except (TypeError, ValueError):
+        max_fires = 3
+    try:
+        window_seconds = int(os.getenv("GT_RATE_WINDOW_SECONDS", "60"))
+    except (TypeError, ValueError):
+        window_seconds = 60
+    max_fires = max(1, max_fires)
+    window_seconds = max(1, window_seconds)
+
+    now = now if now is not None else time.time()
+    while _golden_throne_fire_times and _golden_throne_fire_times[0] <= now - window_seconds:
+        _golden_throne_fire_times.popleft()
+
+    details = {
+        "max_fires": max_fires,
+        "window_seconds": window_seconds,
+        "recent_fires": len(_golden_throne_fire_times),
+    }
+
+    if len(_golden_throne_fire_times) >= max_fires:
+        oldest = _golden_throne_fire_times[0]
+        delay_seconds = max(0.001, window_seconds - (now - oldest))
+        details["deferred_seconds"] = delay_seconds
+        return delay_seconds, details
+
+    _golden_throne_fire_times.append(now)
+    details["recent_fires"] = len(_golden_throne_fire_times)
+    return None, details
+
+
 async def golden_throne_followup(session_id: str):
-    """APScheduler callback: rubric-aware Golden Throne accountability dispatch."""
+    """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
@@ -5353,15 +5404,9 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already processing, skipping")
         return
 
-    # Resolve linked session-doc rubric (the new contract). Falls back to
-    # legacy SOP behavior for instances without a typed rubric.
-    rubric_status, doc_meta = await _read_instance_session_doc_rubric(instance)
-    rubric_state = _golden_throne_rubric_state(rubric_status)
-    instance["pane_label"] = instance.get("pane_label")  # touched below; keep slot stable
-    if rubric_state == "acknowledged":
-        logger.info(
-            f"Golden Throne: {session_id[:12]} session doc already acknowledged, skipping"
-        )
+    # Skip if victory was declared
+    if instance.get("victory_at"):
+        logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
     quiet_hours = shared.get_quiet_hours_status()
@@ -5381,33 +5426,36 @@ async def golden_throne_followup(session_id: str):
         )
         return
 
-    # Resolve human-readable pane surface up-front; all three rubric paths use it.
-    tab_name = instance.get("tab_name", "session")
-    tmux_pane = instance.get("tmux_pane")
-    pane_label = await _tmux_pane_label(tmux_pane)
-    instance["pane_label"] = pane_label
-    pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
-    human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
-    instance["pane_surface"] = pane_surface
-    instance["human_pane_surface"] = human_pane_surface
-
-    # State machine branch BEFORE the per-instance send path.
-    # 'incomplete' falls through and uses an adaptive accountability prompt.
-    # 'ready_for_ack' and 'victorious_bug' return early — no instance send-keys.
-    if rubric_state == "ready_for_ack":
-        await _golden_throne_handle_ready_for_ack(
-            instance, rubric_status, doc_meta, human_pane_surface
+    delay_seconds, rate_details = _golden_throne_rate_limit_delay()
+    if delay_seconds is not None:
+        fire_at = datetime.now() + timedelta(seconds=delay_seconds)
+        scheduler.add_job(
+            golden_throne_followup,
+            DateTrigger(run_date=fire_at),
+            args=[session_id],
+            id=f"golden-throne-{session_id}",
+            replace_existing=True,
+            name=f"Golden Throne follow-up {session_id[:12]}",
+            misfire_grace_time=300,
+            jobstore="golden_throne",
+        )
+        logger.info(
+            f"Golden Throne: rate limited {session_id[:12]}, deferred "
+            f"{delay_seconds:.1f}s until {fire_at.isoformat()}"
+        )
+        await log_event(
+            "gt_fire_deferred",
+            instance_id=session_id,
+            details={
+                "reason": "rate_limit",
+                "fire_at": fire_at.isoformat(),
+                **rate_details,
+            },
         )
         return
-    if rubric_state == "victorious_bug":
-        await _golden_throne_handle_victorious_bug(
-            instance, rubric_status, doc_meta, human_pane_surface
-        )
-        return
 
-    # SOP selection: custom per-instance override, then rubric-adaptive, then default.
-    # 'incomplete' state with present rubric → adaptive accountability prompt.
-    # 'legacy' state (no rubric or scalar string) → existing static SOP behavior.
+    # SOP selection: custom per-instance override, then default.
+    # (Sync retrigger path removed — sync instances now self-evaluate via StopValidate.)
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     if custom_sop_path:
@@ -5418,31 +5466,18 @@ async def golden_throne_followup(session_id: str):
         else:
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
-    elif rubric_state == "incomplete" and rubric_status is not None:
-        sop_prompt = _golden_throne_accountability_prompt(
-            rubric_status, doc_meta.get("file_path")
-        )
-        logger.info(
-            f"GT: adaptive accountability prompt for {session_id[:12]} "
-            f"missing={rubric_status.missing}"
-        )
-        # Regression case: if the rubric was previously complete (notified_at
-        # stamped) but is now incomplete, clear the stamp so the next complete
-        # state goes back through the notify-only path instead of straight to bug-event.
-        if rubric_status.notified_at and doc_meta.get("file_path"):
-            try:
-                await asyncio.to_thread(
-                    clear_rubric_notified, doc_meta["file_path"]
-                )
-                logger.info(
-                    f"GT: cleared notified_at on {doc_meta['file_path']} (rubric regressed)"
-                )
-            except Exception as exc:
-                logger.warning(f"GT: failed to clear notified_at: {exc}")
     else:
         sop_prompt = _load_golden_throne_sop()
+    tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
+    tab_name = instance.get("tab_name", "session")
     engine = _agent_engine(instance)
+    pane_label = await _tmux_pane_label(tmux_pane)
+    pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
+    human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    instance["pane_label"] = pane_label
+    instance["pane_surface"] = pane_surface
+    instance["human_pane_surface"] = human_pane_surface
 
     # Dispatch: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
@@ -5461,7 +5496,7 @@ async def golden_throne_followup(session_id: str):
     }
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
         # Local delivery — transport detection per Golden Throne spec:
-        # Check pane_current_command to decide send-keys vs generic dispatch resume.
+        # Check pane_current_command to decide send-keys vs claude --resume
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -5497,16 +5532,9 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                if rubric_state == "incomplete" and rubric_status is not None and rubric_status.missing:
-                    first_missing = rubric_status.missing[0]
-                    inject_prompt = (
-                        f"Golden Throne accountability check: `{first_missing}` unmet. "
-                        f"Full conditions: cat {sop_file}"
-                    )
-                else:
-                    inject_prompt = (
-                        f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
-                    )
+                inject_prompt = (
+                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                )
             try:
                 queued = await enqueue_pane_write(
                     instance_id=session_id,
@@ -5556,15 +5584,13 @@ async def golden_throne_followup(session_id: str):
                 )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Agent not running — resume in a managed legion worker pane with SOP prompt.
+            # Agent not running — resume in a managed legion worker pane with SOP prompt
             try:
                 resume_pane = await _get_or_create_legion_pane()
                 # Write SOP to temp file (avoids shell escaping issues)
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                resume_cmd = _agent_resume_command(
-                    engine, session_id, working_dir, sop_file, resume_pane
-                )
+                resume_cmd = _agent_resume_command(engine, session_id, working_dir, sop_file)
                 queued = await enqueue_pane_write(
                     instance_id=session_id,
                     tmux_pane=resume_pane,
@@ -5710,20 +5736,14 @@ async def golden_throne_followup(session_id: str):
     if instance_type != "sync":
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
-        if rubric_state == "incomplete" and rubric_status is not None:
-            tts_body = _golden_throne_tts_text_for_rubric(human_pane_surface, rubric_status)
-            banner_body = _golden_throne_banner_text_for_rubric(human_pane_surface, rubric_status)
-        else:
-            tts_body = _golden_throne_tts_text(tab_name, human_pane_surface)
-            banner_body = _golden_throne_banner_text(tab_name, human_pane_surface)
         try:
             phone_result = await asyncio.to_thread(
                 _send_to_phone,
                 "/notify",
                 {
                     "vibe": vibe_intensity,
-                    "tts_text": tts_body,
-                    "banner_text": banner_body,
+                    "tts_text": _golden_throne_tts_text(tab_name, human_pane_surface),
+                    "banner_text": _golden_throne_banner_text(tab_name, human_pane_surface),
                 },
             )
         except Exception as e:
@@ -5738,7 +5758,6 @@ async def golden_throne_followup(session_id: str):
                 "pane_surface": pane_surface,
                 "human_pane_surface": human_pane_surface,
                 "resume_count": resume_state["resume_count"],
-                "rubric_state": rubric_state,
             },
         )
 
@@ -5753,8 +5772,6 @@ async def golden_throne_followup(session_id: str):
             "followup_id": followup_id,
             "dispatch_ack": dispatch_details,
             "phone_result": phone_result,
-            "rubric_state": rubric_state,
-            "missing_conditions": (rubric_status.missing if rubric_status else None),
         },
     )
 
@@ -8351,7 +8368,7 @@ ENFORCE_LEVEL_PARAMS = {
     1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "close {app}"}},
     2: {
         "endpoint": "/notify",
-        "params": {"vibe": 50, "beep": 30, "tts_text": "close {app}", "banner_text": "close {app}"},
+        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "close {app}"},
     },
     3: {
         "endpoint": "/notify",
@@ -20418,6 +20435,396 @@ hooks_init_deps(
     askq_touch2_callback=_askq_touch2_callback,
     askq_level3_callback=_askq_level3_callback,
 )
+
+
+def _cascade_level_endpoint_params(app_name: str, level: int) -> tuple[str, dict]:
+    """Return formatted phone endpoint/params for a cascade level."""
+    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
+    endpoint = level_config["endpoint"]
+    params = {
+        k: v.format(app=app_name) if isinstance(v, str) else v
+        for k, v in level_config["params"].items()
+    }
+    return endpoint, params
+
+
+def _cascade_pavlok_value(level: int, params: dict) -> int:
+    """Map cascade level to Pavlok zap intensity.
+
+    Historical lower levels carried phone vibe values. The cascade mandate is
+    shock+TTS at every level, so those values now become the zap ramp.
+    """
+    if "zap" in params:
+        return int(params["zap"])
+    if "vibe" in params:
+        return int(params["vibe"])
+    return min(100, max(10, level * 10))
+
+
+def _cascade_dispatch_result(pavlok_result: dict) -> str:
+    """Normalize send_pavlok_stimulus return shapes for cascade gating."""
+    if pavlok_result.get("success") is True:
+        return "fired"
+    if pavlok_result.get("skipped"):
+        return "skipped"
+    if pavlok_result.get("error") in {"timeout", "connection_error"}:
+        return "unreachable"
+    return "failed"
+
+
+DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
+
+
+async def _send_discord_fallback(app_name: str, level: int, params_override: dict | None = None):
+    """Send enforcement command to Discord #fallback via webhook.
+
+    Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
+
+    The phone's MacroDroid macro triggers on "POST /phone/enforce" in the Discord
+    notification, parses the JSON, and relays to its own localhost:7777/enforce.
+    Only /phone/enforce is accepted — no arbitrary code execution.
+    """
+    if params_override is None:
+        _, params = _cascade_level_endpoint_params(app_name, level)
+    else:
+        params = params_override
+    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
+    logger.info(f"DISCORD FALLBACK: {msg}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(DISCORD_FALLBACK_WEBHOOK, json={"content": msg})
+            if resp.status_code == 204:
+                logger.info("DISCORD FALLBACK: Webhook sent OK")
+            else:
+                logger.warning(
+                    f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}"
+                )
+    except Exception as e:
+        logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
+
+
+def _enforcement_state_payload(
+    *,
+    source: str,
+    app: str | None = None,
+    phone_app: str | None = None,
+    ack_source: str | None = None,
+    **extra,
+) -> dict:
+    """Build Custodes enforcement-state payloads without app/ack slot bleed.
+
+    `phone_app`/`app` are foreground application telemetry fields for the
+    phone cascade. Internal acknowledgement identifiers (AskUserQuestion,
+    Golden Throne, expected-ack namespaces) are diagnostic ack sources and must
+    never populate the cascade app slots.
+    """
+    payload = dict(extra)
+    if source == "phone":
+        resolved_phone_app = phone_app or app
+        if resolved_phone_app is not None:
+            payload["app"] = resolved_phone_app
+        payload["phone_app"] = resolved_phone_app
+    else:
+        if ack_source is None and app is not None:
+            ack_source = app
+        if ack_source is not None:
+            payload["ack_source"] = ack_source
+        payload["phone_app"] = None
+    return payload
+
+
+async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
+    """Atomically fire one cascade event.
+
+    Pavlok dispatch is the gate. Companion phone TTS/push and Discord fallback
+    are sent only when Pavlok returns dispatch_result == "fired".
+    """
+    app_name = payload.get("app") or payload.get("app_name") or "unknown"
+    repeat = bool(payload.get("repeat"))
+    endpoint, phone_params = _cascade_level_endpoint_params(app_name, level)
+    pavlok_value = int(payload.get("pavlok_value") or _cascade_pavlok_value(level, phone_params))
+    reason = payload.get("reason") or (
+        "cascade_level_5_repeat" if repeat else f"cascade_level_{level}"
+    )
+
+    pavlok_result = await asyncio.to_thread(
+        send_pavlok_stimulus,
+        "zap",
+        pavlok_value,
+        reason,
+        False,
+    )
+    dispatch_result = _cascade_dispatch_result(pavlok_result)
+    result = {
+        "level": level,
+        "ack_id": ack_id,
+        "app": app_name,
+        "dispatch_result": dispatch_result,
+        "pavlok": pavlok_result,
+        "phone": None,
+        "discord": None,
+    }
+
+    if dispatch_result != "fired":
+        await log_event(
+            "cascade_event_skipped",
+            device_id="phone",
+            details={
+                "app": app_name,
+                "level": level,
+                "ack_id": ack_id,
+                "repeat": repeat,
+                "dispatch_result": dispatch_result,
+                "pavlok": pavlok_result,
+            },
+        )
+        logger.warning(
+            "CASCADE: skipped companion notify app=%s level=%s ack_id=%s dispatch_result=%s",
+            app_name,
+            level,
+            ack_id,
+            dispatch_result,
+        )
+        return result
+
+    # Server-side Pavlok already fired. Do not ask the phone/Discord relay to
+    # zap again; send only companion TTS/push/banner effects.
+    companion_params = dict(phone_params)
+    companion_params.pop("zap", None)
+    phone_result = await asyncio.to_thread(_send_to_phone, endpoint, companion_params)
+    result["phone"] = phone_result
+    if not phone_result.get("success"):
+        await _send_discord_fallback(app_name, level, params_override=companion_params)
+        result["discord"] = "fallback_attempted"
+
+    return result
+
+
+async def _enforcement_cascade_worker(app_name: str):
+    """Background task that escalates enforcement levels until app_close or timeout.
+
+    Flow:
+      1. Escalate through levels 1-5 with configured delays
+      2. Each level fires Pavlok first through fire_cascade_event()
+      3. Companion TTS/push/Discord are sent only after Pavlok fires
+      4. Level 5 repeats every 30s until close or cascade timeout
+    """
+    cascade = ENFORCEMENT_CASCADE
+    start = time.monotonic()
+    ack_id = f"cascade:{app_name}:{int(time.time())}"
+    cascade["started_at"] = start
+    cascade["current_level"] = 0
+
+    if is_quiet_hours():
+        cascade["active"] = False
+        cascade["task"] = None
+        print(f"CASCADE SUPPRESSED: quiet hours app={app_name}")
+        await log_quiet_hours_suppressed(
+            source="phone",
+            event_type="enforcement_cascade_started",
+            app=app_name,
+        )
+        return
+
+    print(f"CASCADE START: app={app_name}")
+    await log_event(
+        "enforcement_cascade_start",
+        device_id="phone",
+        details={"app": app_name, "ack_id": ack_id},
+    )
+    await handle_custodes_state_event(
+        "enforcement_cascade_started",
+        "phone",
+        severity=2,
+        payload=_enforcement_state_payload(source="phone", app=app_name, ack_id=ack_id),
+    )
+
+    # Escalate through levels 1-5
+    for level in range(1, 6):
+        if not cascade["active"]:
+            print(f"CASCADE: app_close received, standing down at level {level}")
+            return
+
+        elapsed = time.monotonic() - start
+        if elapsed > ENFORCEMENT_CASCADE_TIMEOUT:
+            print(
+                f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}"
+            )
+            break
+
+        cascade["current_level"] = level
+        cascade["last_escalation"] = time.monotonic()
+        print(f"CASCADE: Escalating to level {level} for {app_name}")
+        await log_event(
+            "enforcement_cascade_escalate",
+            device_id="phone",
+            details={
+                "app": app_name,
+                "level": level,
+                "ack_id": ack_id,
+                "elapsed_s": round(elapsed),
+            },
+        )
+        await handle_custodes_state_event(
+            "enforcement_cascade_escalate",
+            "phone",
+            severity=min(2 + level, 5),
+            payload=_enforcement_state_payload(
+                source="phone",
+                app=app_name,
+                level=level,
+                ack_id=ack_id,
+                elapsed_s=round(elapsed),
+            ),
+        )
+
+        result = await fire_cascade_event(level, ack_id, {"app": app_name})
+        if result.get("dispatch_result") != "fired":
+            cascade["active"] = False
+            cascade["task"] = None
+            await log_event(
+                "enforcement_cascade_end",
+                device_id="phone",
+                details={
+                    "app": app_name,
+                    "final_level": level,
+                    "ack_id": ack_id,
+                    "elapsed_s": round(elapsed),
+                    "reason": "pavlok_not_fired",
+                    "dispatch_result": result.get("dispatch_result"),
+                },
+            )
+            return
+
+        # Wait before next level (level 5 repeats in a loop)
+        if level == 5:
+            # Pavlok repeat loop
+            while cascade["active"] and (time.monotonic() - start) < ENFORCEMENT_CASCADE_TIMEOUT:
+                await asyncio.sleep(30)
+                if not cascade["active"]:
+                    break
+                result = await fire_cascade_event(5, ack_id, {"app": app_name, "repeat": True})
+                if result.get("dispatch_result") != "fired":
+                    cascade["active"] = False
+                    cascade["task"] = None
+                    elapsed = time.monotonic() - start
+                    await log_event(
+                        "enforcement_cascade_end",
+                        device_id="phone",
+                        details={
+                            "app": app_name,
+                            "final_level": 5,
+                            "ack_id": ack_id,
+                            "elapsed_s": round(elapsed),
+                            "reason": "pavlok_not_fired",
+                            "dispatch_result": result.get("dispatch_result"),
+                        },
+                    )
+                    return
+        else:
+            delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
+            await asyncio.sleep(delay)
+
+    # Cascade exhausted or timed out
+    cascade["active"] = False
+    cascade["task"] = None
+    elapsed = time.monotonic() - start
+    print(
+        f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}"
+    )
+    await log_event(
+        "enforcement_cascade_end",
+        device_id="phone",
+        details={
+            "app": app_name,
+            "final_level": cascade["current_level"],
+            "ack_id": ack_id,
+            "elapsed_s": round(elapsed),
+            "reason": "timeout_or_exhausted",
+        },
+    )
+
+
+def start_enforcement_cascade(app_name: str):
+    """Start the enforcement cascade for a forbidden app. Idempotent — won't double-start."""
+    cascade = ENFORCEMENT_CASCADE
+    if is_quiet_hours():
+        print(f"CASCADE: quiet hours suppressed for {app_name}")
+        try:
+            asyncio.ensure_future(
+                log_quiet_hours_suppressed(
+                    source="phone",
+                    event_type="enforcement_cascade_start",
+                    app=app_name,
+                )
+            )
+        except RuntimeError:
+            pass
+        return
+    if cascade["active"]:
+        print(f"CASCADE: Already active for {cascade['app']}, ignoring {app_name}")
+        return
+
+    cascade["active"] = True
+    cascade["app"] = app_name
+    cascade["current_level"] = 0
+    cascade["task"] = asyncio.ensure_future(_enforcement_cascade_worker(app_name))
+
+
+def stop_enforcement_cascade(reason: str = "app_close"):
+    """Stop the enforcement cascade (app was closed or bailout triggered)."""
+    cascade = ENFORCEMENT_CASCADE
+    if not cascade["active"]:
+        return
+
+    app = cascade["app"]
+    level = cascade["current_level"]
+    elapsed = time.monotonic() - (cascade["started_at"] or time.monotonic())
+    print(f"CASCADE STOP: app={app} level={level} elapsed={elapsed:.0f}s reason={reason}")
+
+    cascade["active"] = False
+    cascade["app"] = None
+    cascade["current_level"] = 0
+    cascade["started_at"] = None
+    cascade["last_escalation"] = None
+
+    if cascade["task"] and not cascade["task"].done():
+        cascade["task"].cancel()
+    cascade["task"] = None
+
+    asyncio.ensure_future(
+        log_event(
+            "enforcement_cascade_stop",
+            device_id="phone",
+            details={"app": app, "level": level, "elapsed_s": round(elapsed), "reason": reason},
+        )
+    )
+
+
+def check_phone_reachable() -> dict:
+    """
+    Check if phone is reachable via heartbeat endpoint.
+
+    Returns:
+        dict with reachable status
+    """
+    host = PHONE_CONFIG["host"]
+    port = PHONE_CONFIG["port"]
+    timeout = PHONE_CONFIG["timeout"]
+
+    url = f"http://{host}:{port}/heartbeat"
+
+    try:
+        response = requests.get(url, timeout=timeout)
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        return {"reachable": True, "status_code": response.status_code}
+    except Exception:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        return {"reachable": False}
+
+
 
 
 if __name__ == "__main__":
