@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Instance registry types and normalization helpers for tmuxctl restart flows.
 
 The control plane should treat registry state as the primary source of intent
@@ -7,6 +5,8 @@ for restart planning. Live tmux state is still read for coherence checks and
 transport verification, but the planner should not depend on ad hoc snapshot
 files as its main authority.
 """
+
+from __future__ import annotations
 
 from .enums import InstanceStatus
 from .models import InstanceRegistryEntry, InstanceRegistrySnapshot

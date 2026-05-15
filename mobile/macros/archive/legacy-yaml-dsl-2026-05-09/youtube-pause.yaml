@@ -1,0 +1,23 @@
+# Youtube Pause — Background playback paused
+# When music stops playing and yt_bg is true, YouTube background audio paused
+# Reports as "close" by running the YouTube Close macro
+
+name: "Youtube Pause"
+category: "Telemetry"
+enabled: true
+
+triggers:
+  - type: music_playing
+    started: false
+
+actions:
+  - type: run_macro
+    macro_name: "YouTube Close"
+
+constraints:
+  - type: variable
+    variable: "yt_bg"
+    var_type: boolean
+    comparison: equals
+    value: true
+    local_var: false

@@ -155,16 +155,15 @@ demote() {
     pane_tag "$new_pane" "$slot_tag"
     tmux set-option -p -t "$new_pane" @GRID_RESERVED "false"
 
-    # Tag and move the original pane to the managed legion worker stack.
-    # tmuxctl owns the final invariant; direct move-pane is only the transport.
-    pane_tag "$current_pane" "legion:worker"
-    tmux set-option -p -t "$current_pane" @PANE_TYPE "stack-worker"
+    # Tag and move the original pane to legion
+    pane_tag "$current_pane" "legion:demoted"
+    tmux set-option -p -t "$current_pane" @PANE_TYPE "legion"
     tmux move-pane -s "$current_pane" -t "${SESSION}:${legion_win}" -d
     PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack enforce --focus --pane "$current_pane" >/dev/null 2>&1 || true
+        python3 -m tmuxctl.cli legion focus-selected --pane "$current_pane" >/dev/null 2>&1 || true
 
     # Update Token-API DB so orchestration sees the new location
-    relocate_pane "$current_pane" "legion:worker"
+    relocate_pane "$current_pane" "legion:demoted"
 
     # Refresh somnium layout so the replacement pane fills the correct geometry
     tmux-refresh-layout 2>/dev/null || true

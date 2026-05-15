@@ -1,0 +1,73 @@
+name: "Debug Logging Blocks"
+category: "Debug"
+description: |
+  Copy-paste these shell actions into other macros for debugging.
+  Import this macro, then copy individual actions into the target macro.
+  Delete this macro after debugging is complete.
+enabled: false
+
+triggers:
+  - type: http_server
+    identifier: "debug-test"
+    send_response: true
+    query_params_dict: "request-params"
+
+variables:
+  - name: request-params
+    type: dictionary
+    value: {}
+
+actions:
+  # ── BLOCK 1: Log entry point + raw query string ──
+  # Copy this as the FIRST action in any HTTP-triggered macro
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [DEBUG] {trigger} qs={http_query_string}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 2: Log dictionary variable state ──
+  # Copy this AFTER dictionary population to verify params parsed
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [DEBUG] dict={lv=request-params}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 3: Log iterator key/value (inside dictionary iteration loop) ──
+  # Copy this INSIDE the IterateDictionary action block
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [DEBUG] iter key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 4: Log constraint evaluation (before constrained action) ──
+  # Copy this right before a constrained action to see if we reach it
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [DEBUG] pre-constraint key={iterator_dictionary_key} val={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 5: Log Pavlok intent fire ──
+  # Copy this right after a SendIntent action for Pavlok
+  - type: shell
+    command: |
+      echo "$(date +%H:%M:%S) [DEBUG] pavlok action={iterator_dictionary_key} intensity={iterator_value}" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 6: Generic parameterized log ──
+  # The universal one — change TAG and MSG per use
+  - type: shell
+    command: |
+      TAG="MACRO_NAME"; MSG="checkpoint_name"; echo "$(date +%H:%M:%S) [$TAG] $MSG" >> /storage/emulated/0/MacroDroid/logs/debug.log
+    root: false
+
+  # ── BLOCK 7: Tail the debug log (for verification via SSH) ──
+  # Not a macro action — run this from SSH to watch logs:
+  # ssh-phone "tail -f /storage/emulated/0/MacroDroid/logs/debug.log"
+  - type: notification
+    title: "Debug Blocks"
+    text: "Import complete. Copy actions into target macros. Delete when done."
+    channel_type: 3
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "debug blocks imported"}'

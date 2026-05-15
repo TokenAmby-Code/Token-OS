@@ -1,0 +1,29 @@
+# Games Close Tracker + Logging
+# Reports to /phone when any tracked game is closed
+
+name: "Games Close"
+category: "Telemetry"
+description: "Track game app closes"
+enabled: true
+
+triggers:
+  - type: app_launched
+    apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+    packages:
+      - "com.doghowlgames.thronefall"
+      - "com.com.tann.dice"
+      - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+      - "com.GalacticSlice.OneBitAdventure"
+    launched: false  # App closed
+
+actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO games-close TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone"
+    method: POST
+    body: '{"app": "game", "action": "close"}'
+    content_type: "application/json"

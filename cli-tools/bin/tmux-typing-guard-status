@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# tmux-typing-guard-status - recent-keystroke indicator for tmux status bar
+# TAGS: tmux, guard, status
+# AUDIENCE: human, agent
+"""Show a compact tmux status segment while recent user typing is active.
+
+Uses tmux's client_activity timestamp, which updates on client input. The
+segment remains visible for TMUX_TYPING_GUARD_WINDOW seconds after the last
+registered keystroke/input event. Silent outside tmux or on failure.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+
+DEFAULT_WINDOW_SECONDS = 10
+
+
+def _window_seconds() -> int:
+    raw = os.environ.get("TMUX_TYPING_GUARD_WINDOW", str(DEFAULT_WINDOW_SECONDS))
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_WINDOW_SECONDS
+
+
+def _tmux_format(fmt: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", fmt],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.2,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _client_activity_epoch() -> int | None:
+    value = _tmux_format("#{client_activity}")
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def main() -> int:
+    plain = "--plain" in sys.argv[1:]
+    activity = _client_activity_epoch()
+    if activity is None:
+        return 0
+
+    age = int(time.time()) - activity
+    if age < 0 or age > _window_seconds():
+        return 0
+
+    if plain:
+        print("TYPE", end="")
+    else:
+        print("#[fg=colour214,bold]⌨#[default] ", end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -265,10 +265,10 @@ def test_golden_throne_transport_uses_instance_engine(app_env):
         "session-1",
         "/Volumes/Imperium/Imperium-ENV",
         "/tmp/sop.md",
-        "%123",
     )
     assert cmd.startswith("cd /Volumes/Imperium/Imperium-ENV && ")
-    assert "dispatch --id session-1 --pane %123" in cmd
+    assert "codex-dispatch" in cmd
+    assert "--resume-session session-1" in cmd
     assert "session-1" in cmd
 
 
@@ -287,16 +287,37 @@ async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, mo
         calls.append(args)
         if args[:2] == ("tmux", "display-message"):
             return _FakeProc(0, b"codex\n", b"")
-        return _FakeProc(7, b"attempted", b"send failed")
+        raise AssertionError(f"unexpected raw tmux send: {args}")
+
+    async def fake_tmux_send_payload_then_submit(pane, payload, **kwargs):
+        calls.append(("tmuxctl", "send-text-then-submit", pane, payload, kwargs))
+        return {
+            "returncode": 7,
+            "stdout": "attempted",
+            "stderr": "send failed",
+            "operation": "tmuxctl.send_text_then_submit",
+        }
 
     monkeypatch.setattr(app_env.main, "_load_golden_throne_sop", lambda: "resume work")
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", no_label)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
+    monkeypatch.setattr(
+        app_env.main, "_tmux_send_payload_then_submit", fake_tmux_send_payload_then_submit
+    )
     monkeypatch.setattr(app_env.main.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
     await app_env.main.golden_throne_followup("gt-dispatch-fail")
 
-    assert len(calls) == 3
+    assert calls == [
+        ("tmux", "display-message", "-t", "%10", "-p", "#{pane_current_command}"),
+        (
+            "tmuxctl",
+            "send-text-then-submit",
+            "%10",
+            "resume work",
+            {},
+        ),
+    ]
     assert _rows(app_env.db_path, "SELECT * FROM expected_acknowledgements") == []
     queue_rows = _rows(
         app_env.db_path,
@@ -334,7 +355,17 @@ async def test_golden_throne_validated_dispatch_counts_without_ack(app_env, monk
     async def fake_subprocess_exec(*args, **kwargs):
         if args[:2] == ("tmux", "display-message"):
             return _FakeProc(0, b"codex\n", b"")
-        return _FakeProc(0, b"injected", b"")
+        raise AssertionError(f"unexpected raw tmux send: {args}")
+
+    async def fake_tmux_send_payload_then_submit(pane, payload, **kwargs):
+        assert pane == "%10"
+        assert payload == "resume work"
+        return {
+            "returncode": 0,
+            "stdout": "injected\ninjected",
+            "stderr": "",
+            "operation": "tmuxctl.send_text_then_submit",
+        }
 
     monkeypatch.setattr(app_env.main, "_load_golden_throne_sop", lambda: "resume work")
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", pane_label)
@@ -343,6 +374,9 @@ async def test_golden_throne_validated_dispatch_counts_without_ack(app_env, monk
         app_env.main,
         "_send_to_phone",
         lambda *args, **kwargs: {"success": True, "status_code": 200},
+    )
+    monkeypatch.setattr(
+        app_env.main, "_tmux_send_payload_then_submit", fake_tmux_send_payload_then_submit
     )
     monkeypatch.setattr(app_env.main.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
@@ -492,20 +526,27 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
         calls.append(args)
         if args[:2] == ("tmux", "display-message"):
             return _FakeProc(0, b"bash\n", b"")
-        if args[:2] == ("tmux", "capture-pane"):
-            return _FakeProc(0, b"> \n", b"")
-        if args[:2] == ("tmux", "send-keys"):
-            assert args[3] == "%134"
-            assert not str(args[4]).startswith("cd ")
-            assert "codex resume" not in str(args[4])
-            return _FakeProc(0, b"injected", b"")
         raise AssertionError(f"unexpected subprocess: {args}")
+
+    async def fake_tmux_send_payload_then_submit(pane, payload, **kwargs):
+        calls.append(("tmuxctl", "send-text-then-submit", pane, payload, kwargs))
+        assert pane == "%134"
+        assert payload == "resume work"
+        return {
+            "returncode": 0,
+            "stdout": "injected",
+            "stderr": "",
+            "operation": "tmuxctl.send_text_then_submit",
+        }
 
     monkeypatch.setattr(app_env.main, "_load_golden_throne_sop", lambda: "resume work")
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", pane_label)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_agent_process", has_agent_process)
     monkeypatch.setattr(app_env.main, "_send_to_phone", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(
+        app_env.main, "_tmux_send_payload_then_submit", fake_tmux_send_payload_then_submit
+    )
     monkeypatch.setattr(app_env.main.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
     await app_env.main.golden_throne_followup("gt-bash-codex")
@@ -621,10 +662,10 @@ async def test_golden_throne_typing_block_defers_without_counting(app_env, monke
         "SELECT status, last_error, last_result_json FROM pane_write_queue WHERE instance_id = ?",
         ("gt-dispatch-defer",),
     )[0]
-    assert queue_row["status"] == "pending"
-    assert queue_row["last_error"] == "user_input_pending"
+    assert queue_row["status"] == "cancelled"
+    assert queue_row["last_error"] == "dispatch_deferred_rescheduled"
     result = json.loads(queue_row["last_result_json"])
-    assert result["reason"] == "dispatch_deferred"
+    assert result["reason"] == "dispatch_deferred_rescheduled"
     instance_row = _rows(
         app_env.db_path,
         "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
@@ -632,7 +673,10 @@ async def test_golden_throne_typing_block_defers_without_counting(app_env, monke
     )[0]
     assert instance_row["gt_resume_count"] == 0
     events = _rows(app_env.db_path, "SELECT event_type FROM events ORDER BY id")
-    assert [row["event_type"] for row in events] == ["golden_throne_dispatch_deferred"]
+    assert [row["event_type"] for row in events] == [
+        "golden_throne_scheduled",
+        "golden_throne_dispatch_deferred",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1547,7 +1591,7 @@ def test_work_state_resolves_noncanonical_tmux_target(app_env, monkeypatch):
     monkeypatch.setattr(app_env.main, "_detect_tmux_agent_panes", no_observed_agents)
     monkeypatch.setattr(app_env.main, "_tmux_pane_rows", tmux_pane_rows)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
-    monkeypatch.setattr(app_env.main, "_tmux_resolve_pane_id", resolve_pane_id)
+    monkeypatch.setattr(app_env.main, "_resolve_tmux_pane_id_for_read_model", resolve_pane_id)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """INSERT INTO claude_instances

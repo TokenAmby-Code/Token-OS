@@ -8,7 +8,7 @@
 #   tmux-resurrect restore    — Resume instances from snapshot into current workspace
 #
 # Snapshot captures: session_id, working_dir, @PANE_ID, primarch, instance_type
-# Restore maps @PANE_ID → new tmux pane target, runs `dispatch --id` in each.
+# Restore maps @PANE_ID → new tmux pane target, runs `claude --resume` in each.
 
 set -euo pipefail
 
@@ -61,7 +61,7 @@ for inst in instances:
     if not pane:
         continue
     result.append({
-        'session_id': inst.get('session_id', '') or inst.get('id', ''),
+        'session_id': inst.get('id', ''),
         'working_dir': inst.get('working_dir', '') or '',
         'tmux_pane': pane,
         'pane_label': inst.get('pane_label', '') or '',
@@ -179,7 +179,7 @@ for inst in instances:
         was_processing = status == 'processing'
 
     result.append({
-        'session_id': inst.get('session_id', '') or inst.get('id', ''),
+        'session_id': inst.get('id', ''),
         'working_dir': inst.get('working_dir', '') or '',
         'pane_label': label,
         'tab_name': inst.get('tab_name', '') or '',
@@ -248,7 +248,14 @@ for inst in json.loads(sys.stdin.read()):
             echo "  ${pane_label} (${target}) ← session ${session_id:0:8}..."
         fi
         local launch_cmd
-        printf -v launch_cmd 'cd %q && dispatch --id %q --pane %q' "$working_dir" "$session_id" "$target"
+        if [[ "$engine" == "codex" ]]; then
+            local dispatch_bin
+            dispatch_bin="$(command -v codex-dispatch 2>/dev/null || echo "${IMPERIUM}/Token-OS/cli-tools/bin/codex-dispatch")"
+            printf -v launch_cmd 'cd %q && %q --resume-session %q --resolved-tmux-pane %q --launcher tmux-resurrect --launch-mode restart-restore %q %q' \
+                "$working_dir" "$dispatch_bin" "$session_id" "$target" "$working_dir" "Resume after tmux restart. Read your session doc and continue only if clear."
+        else
+            printf -v launch_cmd 'cd %q && claude --resume %q' "$working_dir" "$session_id"
+        fi
         tmux send-keys -t "$target" "$launch_cmd" Enter
         sleep 1.5  # Give claude time to start or fail
 
@@ -348,7 +355,14 @@ for inst in json.load(open('$SNAPSHOT_FILE')):
             echo "  ${label} (${target}) ← session ${session_id:0:8}..."
         fi
         local launch_cmd
-        printf -v launch_cmd 'cd %q && dispatch --id %q --pane %q' "$working_dir" "$session_id" "$target"
+        if [[ "$engine" == "codex" ]]; then
+            local dispatch_bin
+            dispatch_bin="$(command -v codex-dispatch 2>/dev/null || echo "${IMPERIUM}/Token-OS/cli-tools/bin/codex-dispatch")"
+            printf -v launch_cmd 'cd %q && %q --resume-session %q --resolved-tmux-pane %q --launcher tmux-resurrect --launch-mode restart-restore %q %q' \
+                "$working_dir" "$dispatch_bin" "$session_id" "$target" "$working_dir" "Resume after tmux restart. Read your session doc and continue only if clear."
+        else
+            printf -v launch_cmd 'cd %q && claude --resume %q' "$working_dir" "$session_id"
+        fi
         tmux send-keys -t "$target" "$launch_cmd" Enter
         sleep 1.5
 

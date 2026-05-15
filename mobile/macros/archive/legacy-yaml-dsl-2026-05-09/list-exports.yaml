@@ -1,0 +1,28 @@
+# List Available Exports
+# HTTP endpoint that lists .mdr files in ~/macros/
+#
+# Usage: curl http://<phone-ip>:7777/list-exports
+
+name: "List Exports API"
+category: "Automation"
+description: "HTTP endpoint to list available macro exports"
+enabled: true
+
+variables:
+  - name: file_list
+    type: string
+    value: ""
+
+triggers:
+  - type: http_server
+    identifier: "list-exports"
+    send_response: true
+
+actions:
+  - type: shell
+    command: "ls -la ~/macros/*.mdr ~/macros/*.macro 2>/dev/null || echo 'No exports found'"
+    output_var: "file_list"
+
+  - type: http_response
+    code: "OK"
+    text: "{lv=file_list}"

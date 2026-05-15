@@ -114,7 +114,10 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
     plan = build_restart_plan(workspace, registry)
 
     assert [resume.instance_id for resume in plan.resumes] == ["new"]
-    assert any(issue.code == "duplicate_pane_label" and issue.severity is CoherenceSeverity.WARNING for issue in plan.coherence_issues)
+    assert any(
+        issue.code == "duplicate_pane_label" and issue.severity is CoherenceSeverity.WARNING
+        for issue in plan.coherence_issues
+    )
 
 
 def test_restart_plan_ignores_stale_stopped_duplicate_claims():

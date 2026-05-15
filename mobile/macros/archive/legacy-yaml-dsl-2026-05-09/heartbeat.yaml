@@ -1,0 +1,23 @@
+# Heartbeat Endpoint + Logging
+# Simple reachability check for the server
+# Returns OK to confirm phone is reachable
+
+name: "Heartbeat"
+category: "Telemetry"
+description: "HTTP endpoint for server reachability checks"
+enabled: true
+
+triggers:
+  - type: http_server
+    identifier: "heartbeat"
+    send_response: true
+
+actions:
+  # Log: heartbeat received
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO heartbeat PING" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "alive", "time": "{system_time}"}'

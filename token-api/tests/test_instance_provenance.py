@@ -131,63 +131,6 @@ class TestProvenance:
         assert row["launcher"] == "codex-dispatch"
         assert row["wrapper_launch_id"] == "bridge-1"
 
-
-    def test_session_start_records_dispatch_discord_metadata(self, client, app_env):
-        instance_id = str(uuid.uuid4())
-        resp = client.post(
-            "/api/hooks/SessionStart",
-            json={
-                "session_id": instance_id,
-                "cwd": "/tmp/dispatch-meta",
-                "pid": 777,
-                "env": {
-                    "TOKEN_API_LAUNCHER": "dispatch",
-                    "TOKEN_API_ENGINE": "codex",
-                    "TOKEN_API_WRAPPER_LAUNCH_ID": "dispatch-bridge-1",
-                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
-                    "TOKEN_API_DISPATCH_WINDOW": "legion",
-                    "TOKEN_API_DISPATCH_MODE": "new",
-                    "TOKEN_API_DISPATCH_SLOT": "new",
-                    "TOKEN_API_DISPATCH_SESSION_DOC_PATH": "Mars/Sessions/test.md",
-                    "TOKEN_API_TARGET_WORKING_DIR": "/tmp/dispatch-meta",
-                    "TOKEN_API_LAUNCH_MODE": "tmux_stack_new",
-                    "TOKEN_API_INSTANCE_TYPE": "golden_throne",
-                    "TOKEN_API_ZEALOTRY": "7",
-                    "TOKEN_API_DISCORD_HOSTED": "1",
-                    "TOKEN_API_DISCORD_CHANNEL": "1234567890",
-                    "TOKEN_API_DISCORD_BOT": "mechanicus",
-                },
-            },
-        )
-        assert resp.status_code == 200, resp.text
-
-        conn = _db(app_env)
-        row = conn.execute(
-            """SELECT launcher, engine, wrapper_launch_id, dispatch_target,
-                      dispatch_window, dispatch_mode, dispatch_slot,
-                      dispatch_session_doc_path, target_working_dir, launch_mode,
-                      instance_type, zealotry, discord_hosted, discord_channel, discord_bot
-               FROM claude_instances WHERE id = ?""",
-            (instance_id,),
-        ).fetchone()
-        conn.close()
-
-        assert row["launcher"] == "dispatch"
-        assert row["engine"] == "codex"
-        assert row["wrapper_launch_id"] == "dispatch-bridge-1"
-        assert row["dispatch_target"] == "legion:new"
-        assert row["dispatch_window"] == "legion"
-        assert row["dispatch_mode"] == "new"
-        assert row["dispatch_slot"] == "new"
-        assert row["dispatch_session_doc_path"] == "Mars/Sessions/test.md"
-        assert row["target_working_dir"] == "/tmp/dispatch-meta"
-        assert row["launch_mode"] == "tmux_stack_new"
-        assert row["instance_type"] == "golden_throne"
-        assert row["zealotry"] == 7
-        assert row["discord_hosted"] == 1
-        assert row["discord_channel"] == "1234567890"
-        assert row["discord_bot"] == "mechanicus"
-
     def test_manual_assign_doc_writes_continuity_mutation(self, client, app_env):
         instance_id = _session_start(client)
         conn = _db(app_env)

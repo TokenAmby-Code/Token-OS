@@ -1,0 +1,27 @@
+# Boot Music
+# Starts Spotify and plays music after device boot
+# Note: User preferred timer trigger at 8:32 weekdays over device_boot
+
+name: "Boot Music"
+category: "Music & Audio"
+description: "Start music automatically after device boot"
+enabled: true
+
+triggers:
+  - type: device_boot
+
+actions:
+  - type: wait
+    seconds: 30
+
+  - type: launch_activity
+    app: "Spotify"
+    package: "com.spotify.music"
+
+  - type: wait
+    seconds: 3
+
+  - type: media_control
+    option: play
+    app: "Spotify"
+    package: "com.spotify.music"

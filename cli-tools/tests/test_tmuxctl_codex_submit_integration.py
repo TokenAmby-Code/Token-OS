@@ -8,9 +8,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-
 from tmuxctl.tmux_adapter import TmuxAdapter
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_TMUX_CODEX_SUBMIT_INTEGRATION") != "1",
@@ -42,7 +40,15 @@ def test_codex_tui_text_then_submit_dispatches() -> None:
     cwd = Path(__file__).resolve().parents[2]
 
     try:
-        _tmux("new-session", "-d", "-s", session, "-c", str(cwd), "codex -C . --dangerously-bypass-approvals-and-sandbox")
+        _tmux(
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-c",
+            str(cwd),
+            "codex -C . --dangerously-bypass-approvals-and-sandbox",
+        )
         pane = _tmux("display-message", "-p", "-t", session, "#{pane_id}").stdout.strip()
 
         deadline = time.time() + 30

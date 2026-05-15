@@ -27,7 +27,6 @@ import time
 
 from .tmux_adapter import TmuxAdapter, TmuxError
 
-
 STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig")
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 
@@ -87,19 +86,13 @@ def _try_split(adapter: TmuxAdapter, target: str, cwd: str) -> str | None:
 def _create_spill_window(adapter: TmuxAdapter, session: str, name: str, cwd: str) -> str:
     """Create a new spillover window and return its first pane_id."""
     adapter.run("new-window", "-t", session, "-n", name, "-d", "-c", cwd)
-    return adapter.run(
-        "display-message", "-t", f"{session}:{name}", "-p", "#{pane_id}"
-    ).strip()
+    return adapter.run("display-message", "-t", f"{session}:{name}", "-p", "#{pane_id}").strip()
 
 
 def _tag_worker(adapter: TmuxAdapter, pane_id: str, base: str) -> None:
     """Tag a freshly added stack worker pane for downstream tools."""
-    adapter.run(
-        "set-option", "-p", "-t", pane_id, "@PANE_TYPE", "stack-worker", allow_failure=True
-    )
-    adapter.run(
-        "set-option", "-p", "-t", pane_id, "@PANE_ID", f"{base}:worker", allow_failure=True
-    )
+    adapter.run("set-option", "-p", "-t", pane_id, "@PANE_TYPE", "stack-worker", allow_failure=True)
+    adapter.run("set-option", "-p", "-t", pane_id, "@PANE_ID", f"{base}:worker", allow_failure=True)
 
 
 def add_stack_pane(
@@ -165,7 +158,12 @@ def dispatch_stack_command(
     pane = add_stack_pane(adapter, session, base, cwd=cwd)
     if focus:
         window_target = adapter.run(
-            "display-message", "-t", pane, "-p", "#{session_name}:#{window_name}", allow_failure=True
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{session_name}:#{window_name}",
+            allow_failure=True,
         ).strip()
         if window_target:
             adapter.run("select-window", "-t", window_target, allow_failure=True)

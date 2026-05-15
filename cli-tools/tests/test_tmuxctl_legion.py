@@ -11,7 +11,9 @@ from tmuxctl.stack import dispatch_stack_command
 
 
 class FakeLegionAdapter:
-    def __init__(self, *, guard: bool = False, window_name: str = "legion", rows: list[str] | None = None) -> None:
+    def __init__(
+        self, *, guard: bool = False, window_name: str = "legion", rows: list[str] | None = None
+    ) -> None:
         self.guard = guard
         self.window_name = window_name
         self.rows = rows

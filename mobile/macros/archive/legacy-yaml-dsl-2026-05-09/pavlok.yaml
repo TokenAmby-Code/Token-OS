@@ -1,0 +1,38 @@
+name: "Pavlok Endpoint"
+category: "Automation"
+description: "HTTP endpoint to trigger Pavlok stimulus via BLE. Accepts type (zap|beep|vibe) and intensity (multiples of 10, max 100)."
+enabled: true
+
+variables:
+  - name: result
+    type: string
+    value: ""
+
+triggers:
+  - type: http_server
+    identifier: "pavlok"
+    send_response: true
+
+actions:
+  # Run pavlok.sh via Termux:Tasker plugin
+  # Script at ~/.termux/tasker/pavlok.sh accepts: $1=type $2=intensity
+  # HTTP params get substituted via MacroDroid variables
+  - type: set_variable
+    name: type
+    type: string
+    value: "{http_param=type}"
+
+  - type: set_variable
+    name: intensity
+    type: string
+    value: "{http_param=intensity}"
+
+  - type: termux_tasker
+    executable: "pavlok.sh"
+    arguments: "{lv=type} {lv=intensity}"
+    wait_for_result: true
+    output_var: "result"
+
+  - type: http_response
+    code: "OK"
+    text: "{lv=result}"

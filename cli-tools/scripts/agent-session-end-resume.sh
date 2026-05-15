@@ -24,8 +24,15 @@ else
 fi
 
 case "$AGENT" in
-    claude|codex)
-        [[ -n "$SESSION_ID" ]] && RESUME_CMD="dispatch --id ${SESSION_ID} --pane ${PANE}" || RESUME_CMD=""
+    claude)
+        [[ -n "$SESSION_ID" ]] && RESUME_CMD="claude --resume ${SESSION_ID}" || RESUME_CMD=""
+        ;;
+    codex)
+        if [[ -n "$SESSION_ID" ]]; then
+            RESUME_CMD="codex-dispatch --resume-session ${SESSION_ID} --resolved-tmux-pane ${PANE} --launcher session-end-resume --launch-mode shell-resume \"\$PWD\" \"Resume this Codex session.\""
+        else
+            RESUME_CMD="codex resume --last"
+        fi
         ;;
     *)
         RESUME_CMD=""

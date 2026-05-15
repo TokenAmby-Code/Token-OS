@@ -949,7 +949,10 @@ def get_timer_header_text() -> Text:
     text.append("\n")
 
     text.append("Agents     ", style="bold cyan")
-    text.append(f"tracked={active_count} observed={observed_count} processing={processing_count}", style="white")
+    text.append(
+        f"tracked={active_count} observed={observed_count} processing={processing_count}",
+        style="white",
+    )
     if reason:
         text.append(f"  {reason}", style="dim")
     text.append("\n")

@@ -87,7 +87,7 @@ def _window_warnings(
     expanded_role = None
     if grid_expanded and grid_expanded != "none":
         if grid_expanded in visible_panes:
-            for pane_id, pane_role in zip(pane_ids, pane_roles):
+            for pane_id, pane_role in zip(pane_ids, pane_roles, strict=False):
                 if pane_id == grid_expanded:
                     expanded_role = pane_role
                     break
@@ -118,7 +118,9 @@ def _window_warnings(
             if len(missing_grid) != len(stash_panes):
                 warnings.append("expanded palace grid stash does not match missing grid panes")
             elif len(stash_panes) != len(PALACE_GRID_ROLES) - 1:
-                warnings.append(f"expanded palace grid should stash exactly {len(PALACE_GRID_ROLES) - 1} panes")
+                warnings.append(
+                    f"expanded palace grid should stash exactly {len(PALACE_GRID_ROLES) - 1} panes"
+                )
         elif missing_grid and not grid_focus_active:
             warnings.append(f"missing palace grid roles: {', '.join(missing_grid)}")
         elif missing_grid and grid_focus_active:

@@ -1,0 +1,38 @@
+# Enable Local Fallback
+# Centralized macro to enable all local management systems
+# Called when server is unreachable (404/timeout from telemetry)
+
+name: "Enable Local Fallback"
+category: "Local Management"
+description: "Enable all local enforcement macros when server is down"
+enabled: true
+
+triggers:
+  - type: http_server
+    identifier: "enable-local"
+    send_response: true
+
+actions:
+  # Enable Twitter Management
+  - type: enable_macro
+    macro_name: "Twitter Management"
+    enable: true
+
+  # Enable Youtube management
+  - type: enable_macro
+    macro_name: "Youtube management"
+    enable: true
+
+  # Enable Thronefall Management
+  - type: enable_macro
+    macro_name: "Thronefall Management"
+    enable: true
+
+  - type: notification
+    title: "Local Fallback Enabled"
+    text: "Server unreachable - using local enforcement"
+    channel_type: 1
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "local_fallback_enabled"}'

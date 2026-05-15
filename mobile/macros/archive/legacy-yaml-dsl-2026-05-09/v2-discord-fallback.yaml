@@ -1,0 +1,69 @@
+# Discord Fallback — Indirect HTTP relay via Discord
+#
+# Discord is a transport layer, not a command interface.
+# Token-API sends the LITERAL endpoint and JSON body to #fallback:
+#
+#   POST /phone/enforce {"level":"1","app":"twitter"}
+#
+# This macro detects that notification and replays it as a local
+# HTTP request to MacroDroid's own HTTP server (localhost:7777).
+#
+# Security constraint: ONLY /phone/enforce is accepted. No arbitrary
+# code execution. The Discord message IS the HTTP request — no parsing,
+# no interpretation, just relay.
+#
+# Flow:
+#   1. Token-API can't reach phone directly (Tailscale down, etc.)
+#   2. Token-API sends to Discord #fallback: POST /phone/enforce {"level":"1","app":"twitter"}
+#   3. Phone's Discord client shows notification
+#   4. This macro fires on notification containing "POST /phone/enforce"
+#   5. Macro hits localhost:7777/enforce with the level+app params
+#   6. v2-enforce-cascade handles the actual enforcement action
+
+name: "Discord Fallback v2"
+category: "Enforcement"
+description: "Relay enforcement commands received via Discord to local HTTP endpoint"
+enabled: true
+
+variables:
+  - name: notif_text
+    type: string
+    value: ""
+
+triggers:
+  - type: notification
+    app_name: "Discord"
+    text_contains: "POST /phone/enforce"
+
+actions:
+  # Capture notification text
+  - type: set_variable
+    name: "notif_text"
+    value: "{notification_text}"
+    var_type: string
+    local: true
+
+  # Log
+  - type: shell
+    command: 'echo "{system_time} INFO discord-fallback TRIGGERED notif={lv=notif_text}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Extract level and app from notification via shell, then hit local endpoint.
+  # The Discord message format is: POST /phone/enforce {"level":"N","app":"appname"}
+  # We parse with basic tools and curl localhost.
+  - type: shell
+    command: |
+      msg='{lv=notif_text}'
+      json=$(echo "$msg" | sed 's/.*POST \/phone\/enforce //')
+      level=$(echo "$json" | sed 's/.*"level":"\([^"]*\)".*/\1/')
+      app=$(echo "$json" | sed 's/.*"app":"\([^"]*\)".*/\1/')
+      curl -s "http://127.0.0.1:7777/enforce?level=${level}&app=${app}" && echo "OK" || echo "FAIL"
+    block: true
+
+  # Acknowledge receipt back to server
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "discord_fallback_received"}'
+    content_type: "application/json"
+    timeout: 5

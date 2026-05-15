@@ -1342,7 +1342,7 @@ class AhkRequest(BaseModel):
 
 
 class TmuxSendKeysRequest(BaseModel):
-    pane: str  # tmux pane target (e.g., "%5", "1:N", "palace:N")
+    pane: str  # tmux pane ID (e.g., "%5")
     command: str  # slash command or text to send (e.g., "/color cyan")
     no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
 
@@ -1354,45 +1354,6 @@ class GoldenThroneFollowupRequest(BaseModel):
     prompt: str
     engine: str = "claude"
 
-
-
-def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
-    if not tmux_pane:
-        return None
-    token_os = Path(__file__).resolve().parents[1]
-    cli_bin = token_os / "cli-tools" / "bin" / "tmux-resolve-pane"
-    cli_lib = token_os / "cli-tools" / "lib"
-    try:
-        result = subprocess.run(
-            [str(cli_bin), "--format", "id", tmux_pane],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=3,
-            check=False,
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
 
 def _pane_input_line_has_text(line: str) -> bool:
     stripped = line.rstrip()
@@ -1475,17 +1436,26 @@ def _tmux_pane_has_agent_process(pane: str, engine: str) -> bool:
     return False
 
 
-def _agent_resume_command(
-    engine: str, session_id: str, working_dir: str, sop_file: str, pane: str | None = None
-) -> str:
+def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
     quoted_working_dir = shlex.quote(working_dir)
     quoted_session_id = shlex.quote(session_id)
-    _ = (engine, sop_file)
-    dispatch_bin = shlex.quote(os.environ.get("DISPATCH_BIN") or "dispatch")
-    cmd = f"cd {quoted_working_dir} && {dispatch_bin} --id {quoted_session_id}"
-    if pane:
-        cmd += f" --pane {shlex.quote(pane)}"
-    return cmd
+    quoted_sop_file = shlex.quote(sop_file)
+    if engine == "codex":
+        dispatch_bin = shlex.quote(
+            os.environ.get("CODEX_DISPATCH_BIN")
+            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
+        )
+        return (
+            f"cd {quoted_working_dir} && {dispatch_bin} "
+            f"--resume-session {quoted_session_id} "
+            f"--launcher golden-throne --launch-mode golden-throne-resume "
+            f"{quoted_working_dir} "
+            f'"$(cat {quoted_sop_file})"'
+        )
+    return (
+        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
+        f"--resume {quoted_session_id} --dangerously-skip-permissions"
+    )
 
 
 def _dispatch_deferred(pane: str, reason: str = "dispatch_deferred") -> dict:
@@ -1832,12 +1802,29 @@ async def tmux_send_keys(req: TmuxSendKeysRequest):
     Used by Mac Token-API / claude-cmd for cross-machine dispatch.
     Input locking is handled by the caller (Mac-side DB lock), not here.
     """
-    requested_pane = req.pane
-    pane = _resolve_tmux_pane_id_sync(requested_pane)
+    pane = req.pane
     command = req.command
 
-    if not pane:
-        raise HTTPException(status_code=404, detail=f"Pane {requested_pane} not found")
+    # Validate pane format
+    if not pane.startswith("%"):
+        raise HTTPException(status_code=400, detail=f"Invalid pane format: {pane}")
+
+    # Verify pane exists
+    try:
+        verify = subprocess.run(
+            ["tmux", "display-message", "-t", pane, "-p", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if verify.returncode != 0 or not verify.stdout.strip():
+            raise HTTPException(status_code=404, detail=f"Pane {pane} not found")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="tmux command timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"tmux check failed: {e}")
 
     if _tmux_pane_has_pending_input(pane):
         logger.info(f"TMUX: deferred send to {pane}; pane has pending user input")
@@ -1913,14 +1900,14 @@ def _get_or_create_kreig_pane() -> str:
 
 @app.post("/golden-throne/followup")
 async def golden_throne_followup(req: GoldenThroneFollowupRequest):
-    """Resume an idle agent instance via tmux send-keys or dispatch resume.
+    """Resume an idle Claude instance via tmux send-keys or claude --resume.
 
     Called by Mac token-api when the Golden Throne timer fires for a WSL instance.
     Transport detection: if the tmux pane has claude running, send-keys the SOP prompt.
-    Otherwise, spawn `dispatch --id` in the remote managed worker stack.
+    Otherwise, spawn `claude --resume` in the remote managed worker stack.
     """
     transport = "unknown"
-    pane = _resolve_tmux_pane_id_sync(req.tmux_pane) if req.tmux_pane else None
+    pane = req.tmux_pane
 
     if pane:
         # Check if pane exists and what's running in it
@@ -1992,9 +1979,7 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 # Write SOP to temp file (avoids shell escaping)
                 sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
                 Path(sop_file).write_text(req.prompt)
-                resume_cmd = _agent_resume_command(
-                    engine, req.session_id, working_dir, sop_file, kreig_pane
-                )
+                resume_cmd = _agent_resume_command(engine, req.session_id, working_dir, sop_file)
                 _tmux_send_payload_then_submit(kreig_pane, resume_cmd)
                 transport = "resume"
                 logger.info(

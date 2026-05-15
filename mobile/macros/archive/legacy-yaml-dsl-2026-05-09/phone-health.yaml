@@ -1,0 +1,99 @@
+# Phone Health Consolidated Poll
+#
+# Replaces the existing "Server Poll" macro.
+# Runs every 15 minutes to:
+#  - Check server reachability
+#  - Manage local fallback state based on server status
+#  - Log heartbeat with wifi/battery/shizuku context
+#  - Report heartbeat event to server
+#
+# Variables:
+#   server_code (integer) — HTTP response code from /health
+#
+# Global variables used (read-only except Connection):
+#   Connection (bool) — true = server reachable, false = local fallback active
+#   shizuku_dead (bool) — set by shizuku-died.yaml
+
+name: "Phone Health"
+category: "System"
+description: "15-min consolidated health poll: server reachability + context logging"
+enabled: true
+
+variables:
+  - name: server_code
+    type: integer
+    value: 0
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  - type: regular_interval
+    interval: 15
+    unit: minutes
+
+actions:
+  # 1. Check server reachability
+  - type: http_request
+    url: "http://100.95.109.23:7777/health"
+    method: GET
+    code_var: "server_code"
+    block_next: true
+    timeout: 5
+
+  # 2. Server came back: was unreachable, now 200 → disable local fallback
+  - type: if
+    conditions:
+      - type: variable
+        variable: "server_code"
+        var_type: integer
+        comparison: equals
+        value: 200
+        local_var: true
+      - type: variable
+        variable: "Connection"
+        var_type: boolean
+        comparison: equals
+        value: "false"
+
+  - type: run_macro
+    macro_name: "Disable Local Fallback"
+
+  - type: end_if
+
+  # 3. Server went down: was reachable, now not 200 → mark Connection false
+  - type: if
+    conditions:
+      - type: variable
+        variable: "server_code"
+        var_type: integer
+        comparison: not_equals
+        value: 200
+        local_var: true
+      - type: variable
+        variable: "Connection"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+
+  - type: set_variable
+    name: "Connection"
+    value: "false"
+    var_type: boolean
+
+  - type: end_if
+
+  # 4. Log heartbeat with context
+  - type: shell
+    command: 'TS=$(date "+%Y-%m-%d %H:%M:%S"); BAT=$(dumpsys battery 2>/dev/null | grep -m1 "level:" | tr -d " " | cut -d: -f2); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); mkdir -p /storage/emulated/0/MacroDroid/logs; echo "$TS heartbeat server={lv=server_code} wifi=$SSID bat=${BAT}% shizuku_dead={shizuku_dead}" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  # 5. Report heartbeat to server (non-blocking)
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "heartbeat", "server": "{lv=server_code}", "shizuku_dead": "{shizuku_dead}", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false

@@ -8,9 +8,7 @@ import time
 import uuid
 
 import pytest
-
 from tmuxctl.tmux_adapter import TmuxAdapter
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_TMUX_SUBMIT_TIMING_INTEGRATION") != "1",
@@ -36,7 +34,7 @@ def test_text_then_submit_wait_prevents_newline_regression() -> None:
         pytest.skip("tmux binary not on PATH")
 
     session = f"submit-timing-test-{uuid.uuid4().hex[:8]}"
-    script = r'''
+    script = r"""
 import select
 import sys
 import termios
@@ -72,7 +70,7 @@ try:
         sys.stdout.flush()
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
-'''
+"""
 
     try:
         _tmux("new-session", "-d", "-s", session, sys.executable, "-c", script)

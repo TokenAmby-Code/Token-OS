@@ -301,7 +301,7 @@ def format_results_json(columns: list[str], rows: list[tuple[Any, ...]]) -> str:
     """Format query results as JSON."""
     results = []
     for row in rows:
-        results.append(dict(zip(columns, row)))
+        results.append(dict(zip(columns, row, strict=False)))
     return json.dumps(results, indent=2, default=str)
 
 

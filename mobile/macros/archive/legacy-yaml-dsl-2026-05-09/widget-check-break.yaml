@@ -1,0 +1,42 @@
+name: "Widget Check Break"
+category: "Widget"
+description: "On-demand: pulls break time from Token-API, shows toast for a few seconds"
+enabled: true
+
+variables:
+  - name: break_response
+    type: string
+    value: ""
+  - name: break_label
+    type: string
+    value: ""
+
+triggers:
+  # Trigger via HTTP so other macros/widgets can invoke it
+  - type: http_server
+    identifier: "widget-check-break"
+    send_response: true
+
+actions:
+  # Pull break time from Token-API
+  - type: http_request
+    url: "http://100.95.109.23:7777/api/widget/break"
+    method: GET
+    output_var: "break_response"
+    local: true
+
+  # Extract the label field (e.g. "12.5m" or "-3.2m")
+  - type: shell
+    command: "echo '{lv=break_response}' | python3 -c \"import sys,json; print(json.loads(sys.stdin.read())['label'])\""
+    output_var: "break_label"
+    local: true
+
+  # Show break time as toast
+  - type: toast
+    text: "Break: {lv=break_label}"
+    duration: long
+
+  # Respond OK
+  - type: http_response
+    code: "OK"
+    text: '{"label":"{lv=break_label}"}'

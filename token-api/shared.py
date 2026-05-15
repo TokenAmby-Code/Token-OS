@@ -117,7 +117,7 @@ def get_day_state_sync(date_str: str | None = None, db_path: Path | None = None)
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM day_state WHERE date = ?", (local_date,)).fetchone()
         result = dict(row) if row else None
-        if db_path is None:
+        if db_path is None or Path(db_path) == DB_PATH:
             _DAY_STATE_CACHE.update(
                 {"date": local_date, "value": result, "monotonic": time.monotonic()}
             )
@@ -180,6 +180,8 @@ def set_day_started_at_sync(
     result = dict(row)
     result["already_started"] = False
     result["updated"] = True
+    if db_path is None or Path(db_path) == DB_PATH:
+        _DAY_STATE_CACHE.update({"date": date_str, "value": result, "monotonic": time.monotonic()})
     return result
 
 
@@ -430,6 +432,10 @@ def is_satellite_tts_available() -> bool:
     return available
 
 
+_TMUX_PANE_RESOLVE_CACHE: dict[str, tuple[float, str | None]] = {}
+_TMUX_PANE_RESOLVE_TTL = 0.75
+
+
 async def _run_subprocess_offloop(
     args: list[str] | tuple[str, ...],
     *,
@@ -467,19 +473,21 @@ async def _resolve_tmux_pane_direct(tmux_pane: str) -> str | None:
 
 
 async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
-    """Return the live %pane id for a tmux target, following tombstones when present.
-
-    Deliberately uncached: tmux %pane ids are volatile descriptors. Token-API
-    callers must treat this resolver as a runtime dependency instead of storing
-    resolver output as authoritative state.
-    """
+    """Return the live %pane id for a tmux target, following tombstones when present."""
     if not tmux_pane:
         return None
-    cli_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmux-resolve-pane"
+    now = time.time()
+    cached = _TMUX_PANE_RESOLVE_CACHE.get(tmux_pane)
+    if cached and now - cached[0] < _TMUX_PANE_RESOLVE_TTL:
+        return cached[1]
+    if tmux_pane.startswith("%"):
+        pane_id = await _resolve_tmux_pane_direct(tmux_pane)
+        _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
+        return pane_id
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         proc = await _run_subprocess_offloop(
-            (str(cli_bin), "--format", "id", tmux_pane),
+            ("python3", "-m", "tmuxctl.cli", "resolve-pane", tmux_pane),
             env={
                 **os.environ,
                 "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
@@ -489,12 +497,17 @@ async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
             timeout=3,
         )
         if proc.returncode == 0:
-            pane_id = proc.stdout.decode(errors="ignore").strip()
-            if pane_id:
-                return pane_id
+            for line in proc.stdout.decode(errors="ignore").splitlines():
+                if line.startswith("pane_id: "):
+                    pane_id = line.split(": ", 1)[1].strip()
+                    if pane_id:
+                        _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
+                        return pane_id
     except Exception:
         pass
-    return await _resolve_tmux_pane_direct(tmux_pane)
+    pane_id = await _resolve_tmux_pane_direct(tmux_pane)
+    _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
+    return pane_id
 
 
 async def tmux_pane_exists(tmux_pane: str | None) -> bool:

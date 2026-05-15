@@ -1,0 +1,29 @@
+# Log Viewer Endpoint
+# HTTP endpoint to retrieve telemetry logs remotely
+# Usage: curl http://<phone-ip>:7777/logs
+# Optional: ?lines=N to control how many lines (default 100)
+
+name: "Log Viewer"
+category: "Endpoints"
+description: "HTTP endpoint to serve telemetry log contents"
+enabled: true
+
+variables:
+  - name: log_output
+    type: string
+    value: ""
+
+triggers:
+  - type: http_server
+    identifier: "logs"
+    send_response: true
+
+actions:
+  - type: shell
+    command: 'tail -200 /storage/emulated/0/MacroDroid/logs/telemetry.log 2>/dev/null || echo "NO_LOG_FILE"'
+    output_var: "log_output"
+    block: true
+
+  - type: http_response
+    code: "OK"
+    text: "{lv=log_output}"

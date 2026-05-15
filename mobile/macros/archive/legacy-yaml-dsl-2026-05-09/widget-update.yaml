@@ -1,0 +1,37 @@
+name: "Widget Update"
+category: "Widget"
+description: "Receives mode + instance count push from Token-API and stores in global vars for display"
+enabled: true
+
+global_variables:
+  - name: widget_mode
+    type: string
+    value: "idle"
+  - name: widget_instances
+    type: string
+    value: "0"
+
+triggers:
+  - type: http_server
+    identifier: "widget-update"
+    send_response: true
+
+actions:
+  # Store mode from query param
+  - type: set_variable
+    name: widget_mode
+    var_type: string
+    value: "{http_param=mode}"
+    global: true
+
+  # Store instance count from query param
+  - type: set_variable
+    name: widget_instances
+    var_type: string
+    value: "{http_param=instances}"
+    global: true
+
+  # Respond OK
+  - type: http_response
+    code: "OK"
+    text: '{"status":"ok"}'

@@ -1,0 +1,34 @@
+name: "BT Disconnect XM5 (Tile)"
+category: "Bluetooth"
+description: "Quick Settings tile to disconnect WF-1000XM5"
+enabled: true
+
+variables:
+  - name: bt_mac
+    type: string
+    value: "AC:80:0A:27:0B:A9"
+  - name: result
+    type: string
+    value: ""
+
+triggers:
+  - type: webhook
+    identifier: "bt-disconnect-tile"
+
+actions:
+  - type: shell
+    command: "cmd bluetooth_manager disconnect {lv=bt_mac}"
+    root: false
+    output_var: "result"
+
+  - type: toast
+    text: "XM5 disconnected"
+    duration: "short"
+
+  - type: vibrate
+    pattern: [0, 100]
+
+constraints:
+  - type: bluetooth
+    device: "WF-1000XM5"
+    state: "connected"

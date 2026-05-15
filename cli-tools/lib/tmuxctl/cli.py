@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 
 from .api import RegistryError
@@ -46,7 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_parser.add_argument("--window", default="current")
 
     focus_parser = subparsers.add_parser("focus")
-    focus_parser.add_argument("mode", nargs="?", default="toggle", choices=["toggle", "focus-grid", "unfocus-grid", "focus-side", "unfocus-side"])
+    focus_parser.add_argument(
+        "mode",
+        nargs="?",
+        default="toggle",
+        choices=["toggle", "focus-grid", "unfocus-grid", "focus-side", "unfocus-side"],
+    )
     focus_parser.add_argument("--window", default="current")
 
     restart_parser = subparsers.add_parser("restart")
@@ -60,7 +64,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve_parser = subparsers.add_parser("resolve-pane")
     resolve_parser.add_argument("target")
-    resolve_parser.add_argument("--format", choices=["full", "id", "json"], default="full")
 
     send_text_parser = subparsers.add_parser("send-text")
     send_text_parser.add_argument("--pane", required=True)
@@ -81,9 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     audience_return.add_argument("--client", default="")
 
     tombstone_parser = subparsers.add_parser("tombstone")
-    tombstone_subparsers = tombstone_parser.add_subparsers(
-        dest="tombstone_command", required=True
-    )
+    tombstone_subparsers = tombstone_parser.add_subparsers(dest="tombstone_command", required=True)
 
     tombstone_jump = tombstone_subparsers.add_parser("jump")
     tombstone_jump.add_argument("--pane", default="current")
@@ -162,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "focus":
             session_name, window_index = _parse_window_ref(args.window, control)
-            print(control.focus(session_name=session_name, window_index=window_index, mode=args.mode))
+            print(
+                control.focus(session_name=session_name, window_index=window_index, mode=args.mode)
+            )
             return 0
 
         if args.command == "restart":
@@ -179,19 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "resolve-pane":
-            resolved = control.resolve_pane_resolution(args.target)
-            if args.format == "id":
-                print(resolved.pane_id)
-            elif args.format == "json":
-                print(json.dumps({
-                    "requested": resolved.requested,
-                    "pane_id": resolved.pane_id,
-                    "role": resolved.pane_role,
-                    "kind": resolved.pane_kind.value,
-                    "chain": list(resolved.chain),
-                }))
-            else:
-                print(control.format_pane_resolution(resolved))
+            print(control.resolve_pane(args.target))
             return 0
 
         if args.command == "send-text":
@@ -234,9 +225,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "stack":
             if args.stack_command == "add":
                 from .stack import add_stack_pane
-                pane_id = add_stack_pane(
-                    control.adapter, args.session, args.base, cwd=args.cwd
-                )
+
+                pane_id = add_stack_pane(control.adapter, args.session, args.base, cwd=args.cwd)
                 print(pane_id)
                 return 0
             if args.stack_command == "dispatch":
@@ -296,10 +286,29 @@ def main(argv: list[str] | None = None) -> int:
                 print(enforce_legion_layout(control.adapter, target, focused_pane=pane, focus=True))
                 return 0
 
+        if args.command == "legion":
+            pane = args.pane
+            if pane == "current":
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            if args.legion_command == "focus-selected":
+                from .legion import focus_selected
+
+                print(focus_selected(control.adapter, pane))
+                return 0
+            if args.legion_command == "enforce":
+                from .legion import enforce_legion_layout
+
+                target = control.adapter.run(
+                    "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
+                ).strip()
+                print(enforce_legion_layout(control.adapter, target, focused_pane=pane))
+                return 0
+
         if args.command == "create":
             print(control.create_workspace(args.session))
             if args.attach:
                 from .builder import attach_workspace
+
                 attach_workspace(args.session)
             return 0
 

@@ -148,7 +148,9 @@ def _orchestrator_and_workers(
     non_clear = [pane for pane in orchestrators if not pane.clear]
     orchestrator = non_clear[0] if non_clear else (orchestrators[0] if orchestrators else None)
 
-    workers = [pane for pane in panes if pane.pane_id != (orchestrator.pane_id if orchestrator else "")]
+    workers = [
+        pane for pane in panes if pane.pane_id != (orchestrator.pane_id if orchestrator else "")
+    ]
     workers.sort(key=lambda pane: (pane.left, pane.top, pane.pane_id))
     return orchestrator, workers
 
@@ -244,7 +246,8 @@ def enforce_stack_layout(
             raise ValueError(f"{spec.base} window must contain {spec.orchestrator_role}")
     elif orchestrator.clear:
         untyped_live = [
-            pane for pane in panes
+            pane
+            for pane in panes
             if pane.pane_id != orchestrator.pane_id
             and not pane.clear
             and pane.role not in {spec.worker_role, *LEGACY_WORKER_ROLES}
@@ -270,7 +273,10 @@ def enforce_stack_layout(
                 worker.command,
                 worker.pending,
             )
-        elif worker.role not in {spec.worker_role, *LEGACY_WORKER_ROLES} or worker.pane_type not in {spec.worker_type, "legion"}:
+        elif worker.role not in {
+            spec.worker_role,
+            *LEGACY_WORKER_ROLES,
+        } or worker.pane_type not in {spec.worker_type, "legion"}:
             _tag_worker(adapter, worker.pane_id, spec)
         if admit and worker.clear:
             _set_pane_option(adapter, worker.pane_id, "@STACK_PENDING", "true")
@@ -315,9 +321,18 @@ def enforce_stack_layout(
         _tag_orchestrator(adapter, orchestrator.pane_id, spec)
         for worker in workers:
             _tag_worker(adapter, worker.pane_id, spec)
-        adapter.run("set-window-option", "-t", target, "main-pane-width", str(orchestrator_w), allow_failure=True)
+        adapter.run(
+            "set-window-option",
+            "-t",
+            target,
+            "main-pane-width",
+            str(orchestrator_w),
+            allow_failure=True,
+        )
         adapter.run("select-layout", "-t", target, "main-vertical", allow_failure=True)
-        adapter.run("resize-pane", "-t", orchestrator.pane_id, "-x", str(orchestrator_w), allow_failure=True)
+        adapter.run(
+            "resize-pane", "-t", orchestrator.pane_id, "-x", str(orchestrator_w), allow_failure=True
+        )
 
         if effective_focus:
             collapsed = [pane for pane in workers if pane.pane_id != effective_focus]
@@ -334,7 +349,9 @@ def enforce_stack_layout(
                     str(LEGION_COLLAPSED_HEIGHT),
                     allow_failure=True,
                 )
-            adapter.run("resize-pane", "-t", effective_focus, "-y", str(expanded_h), allow_failure=True)
+            adapter.run(
+                "resize-pane", "-t", effective_focus, "-y", str(expanded_h), allow_failure=True
+            )
             if focus and focused_pane in worker_ids:
                 _set_window_option(adapter, target, "@LEGION_FOCUSED_PANE", focused_pane)
     finally:
@@ -360,7 +377,9 @@ def add_orchestrator_stack_pane(
     target = f"{session}:{window}"
     names = [
         name.split("(", 1)[0]
-        for name in adapter.run("list-windows", "-t", session, "-F", "#{window_name}", allow_failure=True).splitlines()
+        for name in adapter.run(
+            "list-windows", "-t", session, "-F", "#{window_name}", allow_failure=True
+        ).splitlines()
     ]
     if window not in names:
         adapter.run("new-window", "-t", session, "-n", window, "-d", "-c", cwd)

@@ -1,0 +1,23 @@
+# Youtube Play — Background playback resumed
+# When music starts playing and yt_bg is true, YouTube is playing in background
+# Re-reports as "open" by running the YouTube Open macro
+
+name: "Youtube Play"
+category: "Telemetry"
+enabled: true
+
+triggers:
+  - type: music_playing
+    started: true
+
+actions:
+  - type: run_macro
+    macro_name: "YouTube Open"
+
+constraints:
+  - type: variable
+    variable: "yt_bg"
+    var_type: boolean
+    comparison: equals
+    value: true
+    local_var: false

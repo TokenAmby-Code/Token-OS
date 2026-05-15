@@ -94,10 +94,8 @@ class TmuxControlPlane:
     def focus(self, session_name: str, window_index: int, mode: str) -> str:
         return focus_window(self.adapter, session_name, window_index, mode)
 
-    def resolve_pane_resolution(self, target: str):
-        return resolve_pane(self.adapter, target)
-
-    def format_pane_resolution(self, resolved) -> str:
+    def resolve_pane(self, target: str) -> str:
+        resolved = resolve_pane(self.adapter, target)
         chain = " -> ".join(resolved.chain)
         lines = [
             f"requested: {resolved.requested}",
@@ -108,9 +106,6 @@ class TmuxControlPlane:
         if chain:
             lines.append(f"chain: {chain}")
         return "\n".join(lines)
-
-    def resolve_pane(self, target: str) -> str:
-        return self.format_pane_resolution(self.resolve_pane_resolution(target))
 
     def audience_toggle(self, target: str, *, client: str = "") -> str:
         return audience_toggle(self.adapter, target, client=client)

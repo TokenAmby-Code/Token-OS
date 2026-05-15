@@ -1,0 +1,24 @@
+# Geofence Home Exit Telemetry + Logging
+# Reports when leaving home
+
+name: "Geofence Home Exit"
+category: "Telemetry"
+description: "Track leaving home geofence"
+enabled: true
+
+triggers:
+  - type: geofence
+    geofence_id: "1e4e4f0d-ccd8-40a2-b84a-6027a2843cb8"
+    enter: false  # Exit
+
+actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO geofence-home EXIT" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.95.109.23:7777/api/location"
+    method: POST
+    body: '{"location": "home", "action": "exit"}'
+    content_type: "application/json"

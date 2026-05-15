@@ -1,0 +1,76 @@
+# YouTube Open Tracker with Fallback + Logging
+# Reports to /phone when YouTube is opened
+# If server unreachable, triggers local enforcement
+
+name: "YouTube Open"
+category: "Telemetry"
+description: "Track YouTube opens, fallback to local if server down"
+enabled: true
+
+variables:
+  - name: response_code
+    type: integer
+    value: 0
+
+triggers:
+  - type: app_launched
+    apps: ["YouTube", "YouTube"]
+    packages: ["com.google.android.youtube", "app.revanced.android.youtube"]
+    launched: true
+
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
+
+actions:
+  # Clear yt_bg flag — fresh foreground open
+  - type: set_variable
+    name: yt_bg
+    var_type: boolean
+    value: false
+    local: false
+
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO youtube-open TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone"
+    method: POST
+    body: '{"app": "youtube", "action": "open"}'
+    content_type: "application/json"
+    code_var: "response_code"
+    block_next: true
+    timeout: 5
+
+  # Log: HTTP result
+  - type: shell
+    command: 'echo "{system_time} INFO youtube-open HTTP_RESULT code={lv=response_code}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # If server unreachable (code != 200), trigger local fallback
+  - type: if
+    conditions:
+      - type: variable
+        variable: "response_code"
+        var_type: integer
+        comparison: not_equals
+        value: 200
+        local_var: true
+
+  # Log: fallback activated
+  - type: shell
+    command: 'echo "{system_time} WARN youtube-open FALLBACK server_unreachable" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Force run local management for this app
+  - type: run_macro
+    macro_name: "Youtube Disable"
+
+  # Enable all local fallbacks for future events
+  - type: run_macro
+    macro_name: "Enable Local Fallback"
+
+  - type: end_if

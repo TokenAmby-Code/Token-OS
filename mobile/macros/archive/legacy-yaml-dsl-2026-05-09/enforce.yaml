@@ -1,0 +1,266 @@
+# Enforce v2 - Server-Pushed App Enforcement
+#
+# Flow:
+#   1. HTTP request arrives with action + app params
+#   2. Gate on action (disable/enable)
+#   3. Switch on app name (if/else_if chain)
+#   4. After disable: wait_until app closes (5s timeout)
+#   5. If timed out → Shizuku is dead → call restart macro
+#   6. Return status to server
+#
+# The wait_until timeout IS the Shizuku health check:
+#   - disable_app succeeds → app force-closes → wait_until fires → ok
+#   - Shizuku dead → disable silently fails → app stays open → timeout
+
+name: "Enforce"
+category: "Enforcement"
+description: "Server-pushed enforcement with Shizuku health detection via wait_until timeout"
+enabled: true
+
+variables:
+  - name: action
+    type: string
+    value: ""
+  - name: app
+    type: string
+    value: ""
+  - name: response_msg
+    type: string
+    value: '{"status": "ok"}'
+  - name: timed_out
+    type: boolean
+    value: false
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  - type: http_server
+    identifier: "enforce"
+    send_response: true
+
+actions:
+  # Defaults
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok"}'
+    var_type: string
+    local: true
+
+  - type: set_variable
+    name: "timed_out"
+    value: "false"
+    var_type: boolean
+    local: true
+
+  # ========================================
+  # DISABLE
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "action"
+        var_type: string
+        comparison: equals
+        value: "disable"
+        local_var: true
+
+  # --- App switch: disable + wait for close ---
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "twitter"
+        local_var: true
+
+  - type: disable_app
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    disable: true
+
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["X"]
+        packages: ["com.twitter.android"]
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
+
+  - type: else_if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "youtube"
+        local_var: true
+
+  - type: disable_app
+    apps: ["YouTube", "YouTube"]
+    packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+    disable: true
+
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["YouTube", "YouTube"]
+        packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
+
+  - type: else_if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "game"
+        local_var: true
+
+  - type: disable_app
+    apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+    packages:
+      - "com.doghowlgames.thronefall"
+      - "com.com.tann.dice"
+      - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+      - "com.GalacticSlice.OneBitAdventure"
+    disable: true
+
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+        packages:
+          - "com.doghowlgames.thronefall"
+          - "com.com.tann.dice"
+          - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+          - "com.GalacticSlice.OneBitAdventure"
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
+
+  - type: end_if  # app switch
+
+  # --- Shizuku health: timed_out means app never closed ---
+  - type: if
+    conditions:
+      - type: variable
+        variable: "timed_out"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+        local_var: true
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "shizuku_dead", "app": "{lv=app}"}'
+    var_type: string
+    local: true
+
+  - type: run_macro
+    macro_name: "Shizuku Restart"
+
+  - type: else
+  # Not timed out = disable worked. Clear shizuku_dead if previously set.
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "false"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Restored"
+    text: "Enforcement working again."
+    channel_type: 1
+
+  - type: end_if  # shizuku_dead was true
+
+  - type: end_if  # timed_out check
+
+  - type: end_if  # action == disable
+
+  # ========================================
+  # ENABLE
+  # ========================================
+  - type: if
+    conditions:
+      - type: variable
+        variable: "action"
+        var_type: string
+        comparison: equals
+        value: "enable"
+        local_var: true
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "twitter"
+        local_var: true
+
+  - type: disable_app
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    disable: false
+
+  - type: else_if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "youtube"
+        local_var: true
+
+  - type: disable_app
+    apps: ["YouTube", "YouTube"]
+    packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+    disable: false
+
+  - type: else_if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "game"
+        local_var: true
+
+  - type: disable_app
+    apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+    packages:
+      - "com.doghowlgames.thronefall"
+      - "com.com.tann.dice"
+      - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+      - "com.GalacticSlice.OneBitAdventure"
+    disable: false
+
+  - type: end_if  # app switch
+
+  - type: end_if  # action == enable
+
+  # ========================================
+  # RESPONSE
+  # ========================================
+  - type: http_response
+    code: "OK"
+    text: '{lv=response_msg}'

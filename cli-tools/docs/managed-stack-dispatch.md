@@ -33,8 +33,7 @@ tmuxctl stack enforce --window main:legion
 
 ## Current entry points
 
-- `dispatch --target legion:new|mechanicus:new` allocates stack panes via `tmuxctl stack dispatch`.
-- `dispatch --id <session_id> --pane <tmux-pane-id>` is the canonical human-visible resume command. Shell history and staged resume commands should use `dispatch` only.
+- `vault-dispatch --target legion:new|mechanicus:new` allocates stack panes via `tmuxctl stack add`.
 - Prefix+Space (`tmux-legion-prompt`) launches via `tmuxctl stack dispatch legion`.
 - Claude print-mode redirection (`claude-wrapper.sh`) launches via `tmuxctl stack dispatch`.
 - Golden Throne resume fallback allocates managed legion workers via `tmuxctl stack add legion`; legacy side-window naming has been retired.
@@ -42,7 +41,3 @@ tmuxctl stack enforce --window main:legion
 - Pane demotion (`tmux-shuttle`) moves panes into legion as `legion:worker` / `stack-worker`, then calls `tmuxctl stack enforce --focus`.
 
 If a new tool needs a legion/mechanicus pane, wire it to `tmuxctl stack add` or `tmuxctl stack dispatch`. Do not duplicate layout, split, tagging, or focus behavior in shell.
-
-## Retired launcher names
-
-Human launch and resume paths should use `dispatch` directly; `claude-launcher` remains only as a compatibility route to `dispatch --interactive`. The retired agent-facing launcher names hard-fail while the cutover is reviewed: `claude-dispatch`, `codex-dispatch`, `vault-dispatch`, `primarch`, `inquisitor`, and `subagent`. Internal dispatch may still invoke `codex-dispatch` and `primarch` with `TOKEN_API_INTERNAL_DISPATCH=1`.

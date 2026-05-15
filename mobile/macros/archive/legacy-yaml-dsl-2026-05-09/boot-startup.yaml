@@ -1,0 +1,58 @@
+# Boot Startup
+#
+# Replaces boot-sshd.yaml.
+# On device boot:
+#   1. Wait for system to settle
+#   2. Start Termux sshd
+#   3. Notify user to open Shizuku (enforcement requires manual start)
+#   4. Launch Shizuku app so user is prompted while phone is in hand
+#   5. Report boot event to server
+#
+# Note: Shizuku cannot be auto-started from MacroDroid — it requires the user
+# to tap "Start" in the Shizuku app after wireless debugging is enabled.
+
+name: "Boot Startup"
+category: "System"
+description: "Boot sequence: sshd + Shizuku prompt + server notification"
+enabled: true
+
+triggers:
+  - type: device_boot
+
+actions:
+  # Wait for system to settle after boot
+  - type: wait
+    seconds: 15
+
+  # Start sshd via Termux RUN_COMMAND intent
+  - type: shell
+    command: "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/home/.termux/tasker/start-sshd.sh' --ez com.termux.RUN_COMMAND_BACKGROUND 'true'"
+    root: false
+    block: true
+
+  - type: wait
+    seconds: 3
+
+  # Notify user: Shizuku needs manual start
+  - type: notification
+    title: "System Starting"
+    text: "SSHD ready. Enable Wireless Debugging and open Shizuku to enable enforcement."
+    channel_type: 1
+
+  # Report boot to server (non-blocking)
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "device_boot", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  # Log boot event
+  - type: shell
+    command: 'echo "{system_time} BOOT sshd_started" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Launch Shizuku so user can tap Start while phone is in hand
+  - type: launch_app
+    app: "Shizuku"
+    package: "moe.shizuku.privileged.api"

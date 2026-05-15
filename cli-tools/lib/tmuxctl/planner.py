@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-UTC = timezone.utc  # back-compat for Python 3.9-3.10 (macOS system python3 is 3.9)
-
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
 from .labels import (
     PALACE_ROLES,
@@ -15,10 +13,13 @@ from .models import (
     CoherenceIssue,
     InstanceRegistryEntry,
     InstanceRegistrySnapshot,
+    PaneSnapshot,
     PlannedResume,
     RestartPlan,
     WorkspaceSnapshot,
 )
+
+UTC = timezone.utc  # noqa: UP017 - keep Python 3.9/3.10 compatibility for direct CLI use
 
 
 def build_restart_plan(
@@ -35,7 +36,7 @@ def build_restart_plan(
     a registry snapshot that already reflects the current device's instance view.
     """
 
-    pane_by_label = {}
+    pane_by_label: dict[str, PaneSnapshot] = {}
     for pane in workspace.iter_panes():
         if pane.pane_role:
             pane_by_label.setdefault(canonical_pane_role(pane.pane_role), pane)
@@ -61,9 +62,7 @@ def build_restart_plan(
             )
 
     duplicate_claims = Counter(
-        canonical_pane_role(inst.pane_label)
-        for inst in candidate_instances
-        if inst.pane_label
+        canonical_pane_role(inst.pane_label) for inst in candidate_instances if inst.pane_label
     )
 
     for pane_label, count in duplicate_claims.items():

@@ -1,0 +1,38 @@
+# Disable Local Fallback
+# Disables all local management systems when server is back online
+# Called when server connectivity is restored
+
+name: "Disable Local Fallback"
+category: "Local Management"
+description: "Disable local enforcement when server is available"
+enabled: true
+
+triggers:
+  - type: http_server
+    identifier: "disable-local"
+    send_response: true
+
+actions:
+  # Disable Twitter Management
+  - type: enable_macro
+    macro_name: "Twitter Management"
+    enable: false
+
+  # Disable Youtube management
+  - type: enable_macro
+    macro_name: "Youtube management"
+    enable: false
+
+  # Disable Thronefall Management
+  - type: enable_macro
+    macro_name: "Thronefall Management"
+    enable: false
+
+  - type: notification
+    title: "Server Restored"
+    text: "Using server-side enforcement"
+    channel_type: 0
+
+  - type: http_response
+    code: "OK"
+    text: '{"status": "local_fallback_disabled"}'

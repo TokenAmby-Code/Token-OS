@@ -1,0 +1,52 @@
+# Shizuku Restored Detector
+#
+# Event-driven: fires when Shizuku's foreground service notification is posted
+# (option=0). This happens when Shizuku successfully starts. Combined with
+# shizuku-died.yaml, this gives a full lifecycle tracking loop.
+#
+# Constraint: shizuku_dead == true ensures this only fires when we previously
+# flagged a death (not on initial boot or untracked starts).
+
+name: "Shizuku Restored"
+category: "System"
+description: "Detects Shizuku recovery via notification posted event"
+enabled: true
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  - type: notification
+    package: "moe.shizuku.privileged.api"
+    option: 0  # 0 = received/posted (service started)
+
+constraints:
+  - type: variable
+    variable: "shizuku_dead"
+    var_type: boolean
+    comparison: equals
+    value: "true"
+
+actions:
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "false"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Restored"
+    text: "Enforcement back online"
+    channel_type: 0
+
+  - type: shell
+    command: 'TS=$(date "+%Y-%m-%d %H:%M:%S"); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); echo "$TS SHIZUKU_RESTORED wifi=$SSID" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "shizuku_restored", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false

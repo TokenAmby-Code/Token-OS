@@ -1,0 +1,19 @@
+# Log Rotation
+# Runs daily at 3 AM to trim telemetry.log
+# Keeps last 1000 lines if file exceeds 2000 lines
+
+name: "Log Rotate"
+category: "System"
+description: "Daily log rotation for telemetry log"
+enabled: true
+
+triggers:
+  - type: time
+    hour: 3
+    minute: 0
+    days: [true, true, true, true, true, true, true]
+
+actions:
+  - type: shell
+    command: 'LOG=/storage/emulated/0/MacroDroid/logs/telemetry.log; [ -f "$LOG" ] && LC=$(wc -l < "$LOG") && [ "$LC" -gt 2000 ] && tail -1000 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG" && echo "{system_time} INFO log-rotate ROTATED from=$LC to=1000" >> "$LOG"'
+    block: true

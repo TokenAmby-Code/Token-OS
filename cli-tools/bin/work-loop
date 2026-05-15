@@ -72,7 +72,7 @@ list_workloop_panes() {
     local session="${1:-main}"
     local panes=()
 
-    while IFS=$'\t' read -r pane_id work_loop cmd window_name pane_role; do
+    while IFS=$'	' read -r pane_id work_loop cmd window_name pane_role; do
         [[ "${window_name%%(*}" == "legion" ]] || continue
         [[ "$pane_role" == "legion:worker" ]] || continue
         [[ "$work_loop" == "true" ]] || continue

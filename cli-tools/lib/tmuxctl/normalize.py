@@ -64,7 +64,8 @@ def _grid_panes(adapter: TmuxAdapter, target: str) -> list[dict[str, str]]:
 
 def _side_panes(adapter: TmuxAdapter, target: str) -> list[dict[str, str]]:
     return [
-        row for row in _pane_rows(adapter, target)
+        row
+        for row in _pane_rows(adapter, target)
         if row["grid_state"] == GRID_STATE_SIDE
         or canonical_pane_role(row["pane_role"]) in SIDE_ROLES
     ]
@@ -158,7 +159,9 @@ def _rebalance_grid(adapter: TmuxAdapter, target: str) -> None:
     if len(grid_panes) < 2:
         return
     if len(grid_panes) == 2:
-        north = next((p for p in grid_panes if canonical_pane_role(p["pane_role"]).endswith(":N")), None)
+        north = next(
+            (p for p in grid_panes if canonical_pane_role(p["pane_role"]).endswith(":N")), None
+        )
         if north:
             grid_top = min(int(pane["top"]) for pane in grid_panes)
             grid_bottom = max(int(pane["top"]) + int(pane["height"]) for pane in grid_panes)
@@ -284,11 +287,13 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
     grid_focus_active = (_window_option(adapter, target, "@FOCUS_GRID_ACTIVE") or "false") == "true"
     if grid_focus_active:
         from .focus import focus_window
+
         focus_window(adapter, session_name, window_index, "unfocus-grid")
 
     side_focus_active = (_window_option(adapter, target, "@FOCUS_SIDE_ACTIVE") or "false") == "true"
     if side_focus_active:
         from .focus import focus_window
+
         focus_window(adapter, session_name, window_index, "unfocus-side")
 
     grid_expanded = _window_option(adapter, target, "@GRID_EXPANDED") or "none"
@@ -334,6 +339,7 @@ def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int)
     _set_window_option(adapter, target, "@FOCUSED", "false")
 
     from .revert import enforce_known_window_state
+
     enforced = enforce_known_window_state(adapter, session_name, window_index)
     if not enforced.ok:
         raise ValueError("; ".join(enforced.violations))

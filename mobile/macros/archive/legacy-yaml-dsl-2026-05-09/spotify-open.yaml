@@ -1,0 +1,24 @@
+# Spotify Open — Clears YouTube background flag
+# When Spotify is opened, clear yt_bg since a new media source is active
+
+name: "Spotify open"
+category: "Telemetry"
+enabled: true
+
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
+
+triggers:
+  - type: app_launched
+    apps: ["Spotify"]
+    packages: ["com.spotify.music"]
+    launched: true
+
+actions:
+  - type: set_variable
+    name: yt_bg
+    var_type: boolean
+    value: false
+    local: false

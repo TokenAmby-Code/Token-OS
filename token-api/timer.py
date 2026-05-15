@@ -393,9 +393,7 @@ class TimerEngine:
             result.old_mode = old_mode
         return True, result
 
-    def enter_quiet(
-        self, now_mono_ms: int, context: str = "sleeping"
-    ) -> tuple[bool, TickResult]:
+    def enter_quiet(self, now_mono_ms: int, context: str = "sleeping") -> tuple[bool, TickResult]:
         """Enter quiet mode. Context distinguishes sleeping from do-not-disturb."""
         if self._manual_mode == TimerMode.QUIET and self.quiet_context == context:
             return False, TickResult()
@@ -666,7 +664,9 @@ class TimerEngine:
         elif old_mode == "quiet":
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._set_manual_mode(TimerMode.QUIET, data.get("quiet_context", "sleeping"), now_mono_ms)
+            self._set_manual_mode(
+                TimerMode.QUIET, data.get("quiet_context", "sleeping"), now_mono_ms
+            )
             if self._manual_substate:
                 self._manual_substate["lock_until_ms"] = None
         elif old_mode == "sleeping":

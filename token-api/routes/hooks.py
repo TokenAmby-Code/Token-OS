@@ -39,7 +39,6 @@ from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavl
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
-    bump_session_doc_up_to_date,
     read_frontmatter,
     resolve_session_doc_for_start,
     update_frontmatter,
@@ -204,63 +203,6 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     except Exception as exc:
         logger.debug(f"Hook: pane label lookup failed for {tmux_pane}: {exc}")
     return None
-
-
-async def _resolve_session_doc_path(db, instance_id: str) -> Path | None:
-    """Find the session-doc file_path for an instance. Returns None when unlinked."""
-    cursor = await db.execute(
-        """
-        SELECT sd.file_path
-        FROM claude_instances ci
-        LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-        WHERE ci.id = ?
-        """,
-        (instance_id,),
-    )
-    row = await cursor.fetchone()
-    if not row or not row[0]:
-        return None
-    return Path(row[0])
-
-
-async def _flip_session_doc_up_to_date(instance_id: str, value: bool, source: str) -> None:
-    """Best-effort flip of the session_doc_up_to_date inverse flag.
-
-    Per feedback_close_more_than_open / accountability spec: UserPromptSubmit
-    sets False each turn; a Write/Edit on the doc flips back True. Silent
-    guard — agents that end a turn without touching their doc trip GT.
-    """
-    try:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            fp = await _resolve_session_doc_path(db, instance_id)
-        if fp is None or not fp.exists():
-            return
-        await asyncio.to_thread(bump_session_doc_up_to_date, fp, value)
-    except Exception as exc:
-        logger.debug(
-            f"session_doc_up_to_date flip skipped for {instance_id[:12]} "
-            f"({source}, target={value}): {exc}"
-        )
-
-
-_DOC_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-
-
-def _tool_target_paths(payload: dict) -> list[str]:
-    """Extract candidate file paths the agent just wrote to from a PostToolUse payload."""
-    paths: list[str] = []
-    tool_input = payload.get("tool_input") or {}
-    if isinstance(tool_input, dict):
-        for key in ("file_path", "notebook_path", "path"):
-            value = tool_input.get(key)
-            if isinstance(value, str) and value:
-                paths.append(value)
-    tool_response = payload.get("tool_response") or {}
-    if isinstance(tool_response, dict):
-        value = tool_response.get("filePath") or tool_response.get("file_path")
-        if isinstance(value, str) and value:
-            paths.append(value)
-    return paths
 
 
 async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) -> bool:
@@ -632,9 +574,6 @@ async def handle_wrapper_start(payload: dict) -> dict:
             payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")
         ),
         "pid": payload.get("pid"),
-        "discord_hosted": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_HOSTED", "")),
-        "discord_channel": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_CHANNEL", "")),
-        "discord_bot": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_BOT", "")),
         "source": "wrapper",
     }
     await log_event("wrapper_start", details=details)
@@ -665,9 +604,6 @@ async def handle_wrapper_end(payload: dict) -> dict:
         ),
         "pid": payload.get("pid"),
         "exit_code": payload.get("exit_code"),
-        "discord_hosted": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_HOSTED", "")),
-        "discord_channel": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_CHANNEL", "")),
-        "discord_bot": _normalize_text(payload.get("env", {}).get("TOKEN_API_DISCORD_BOT", "")),
         "source": "wrapper",
     }
     await log_event("wrapper_end", details=details)
@@ -695,10 +631,6 @@ def _parse_launch_zealotry(value: Any) -> int | None:
     if 1 <= zealotry <= 10:
         return zealotry
     return None
-
-
-def _parse_env_bool(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ============ Claude Code Hook Handlers ============
@@ -800,16 +732,6 @@ async def handle_session_start(payload: dict) -> dict:
         launch_instance_type = None
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
-    )
-    discord_hosted_raw = payload.get("discord_hosted")
-    if discord_hosted_raw is None:
-        discord_hosted_raw = env.get("TOKEN_API_DISCORD_HOSTED", "")
-    launch_discord_hosted = _parse_env_bool(discord_hosted_raw)
-    launch_discord_channel = _normalize_text(
-        payload.get("discord_channel") or env.get("TOKEN_API_DISCORD_CHANNEL", "")
-    )
-    launch_discord_bot = _normalize_text(
-        payload.get("discord_bot") or env.get("TOKEN_API_DISCORD_BOT", "")
     )
     session_doc_policy = None
     dispatch_bound_doc = False
@@ -933,12 +855,6 @@ async def handle_session_start(payload: dict) -> dict:
                         else existing_row["zealotry"],
                         "session_doc_policy": session_doc_policy
                         or existing_row["session_doc_policy"],
-                        "discord_hosted": 1
-                        if launch_discord_hosted
-                        else existing_row["discord_hosted"],
-                        "discord_channel": launch_discord_channel
-                        or existing_row["discord_channel"],
-                        "discord_bot": launch_discord_bot or existing_row["discord_bot"],
                     },
                     mutation_type="instance_updated",
                     write_source="hooks",
@@ -1040,11 +956,6 @@ async def handle_session_start(payload: dict) -> dict:
                     if launch_zealotry is not None
                     else existing_row["zealotry"],
                     "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
-                    "discord_hosted": 1
-                    if launch_discord_hosted
-                    else existing_row["discord_hosted"],
-                    "discord_channel": launch_discord_channel or existing_row["discord_channel"],
-                    "discord_bot": launch_discord_bot or existing_row["discord_bot"],
                 }
                 await sanctioned_update_instance(
                     db,
@@ -1149,11 +1060,6 @@ async def handle_session_start(payload: dict) -> dict:
                         if launch_zealotry is not None
                         else old_inst["zealotry"],
                         "session_doc_policy": session_doc_policy or old_inst["session_doc_policy"],
-                        "discord_hosted": 1
-                        if launch_discord_hosted
-                        else old_inst["discord_hosted"],
-                        "discord_channel": launch_discord_channel or old_inst["discord_channel"],
-                        "discord_bot": launch_discord_bot or old_inst["discord_bot"],
                     },
                     mutation_type="instance_updated",
                     write_source="hooks",
@@ -1276,7 +1182,6 @@ async def handle_session_start(payload: dict) -> dict:
         # Preserve discord settings from prior registration (--resume re-registers with same id)
         _prior_discord_hosted = 0
         _prior_discord_channel = None
-        _prior_discord_bot = None
         _prior_legion = None
         _prior_wrapper_launch_id = None
         _prior_session_doc_policy = None
@@ -1285,7 +1190,7 @@ async def handle_session_start(payload: dict) -> dict:
         _prior_parent_instance_id = None
         _prior_dispatch = {}
         cursor = await db.execute(
-            """SELECT discord_hosted, discord_channel, discord_bot, legion,
+            """SELECT discord_hosted, discord_channel, legion,
                       wrapper_launch_id,
                       launcher, engine, dispatch_target, dispatch_window,
                       dispatch_mode, dispatch_slot, dispatch_session_doc_path,
@@ -1299,25 +1204,24 @@ async def handle_session_start(payload: dict) -> dict:
         if _prior_row:
             _prior_discord_hosted = _prior_row[0] or 0
             _prior_discord_channel = _prior_row[1]
-            _prior_discord_bot = _prior_row[2]
-            _prior_legion = _prior_row[3]
-            _prior_wrapper_launch_id = _prior_row[4]
+            _prior_legion = _prior_row[2]
+            _prior_wrapper_launch_id = _prior_row[3]
             _prior_dispatch = {
-                "launcher": _prior_row[5],
-                "engine": _prior_row[6],
-                "dispatch_target": _prior_row[7],
-                "dispatch_window": _prior_row[8],
-                "dispatch_mode": _prior_row[9],
-                "dispatch_slot": _prior_row[10],
-                "dispatch_session_doc_path": _prior_row[11],
-                "target_working_dir": _prior_row[12],
-                "launch_mode": _prior_row[13],
-                "transplant_expected": _prior_row[14] or 0,
+                "launcher": _prior_row[4],
+                "engine": _prior_row[5],
+                "dispatch_target": _prior_row[6],
+                "dispatch_window": _prior_row[7],
+                "dispatch_mode": _prior_row[8],
+                "dispatch_slot": _prior_row[9],
+                "dispatch_session_doc_path": _prior_row[10],
+                "target_working_dir": _prior_row[11],
+                "launch_mode": _prior_row[12],
+                "transplant_expected": _prior_row[13] or 0,
             }
-            _prior_session_doc_policy = _prior_row[15]
-            _prior_session_doc_id = _prior_row[16]
-            _prior_workflow_state = _prior_row[17]
-            _prior_parent_instance_id = _prior_row[18]
+            _prior_session_doc_policy = _prior_row[14]
+            _prior_session_doc_id = _prior_row[15]
+            _prior_workflow_state = _prior_row[16]
+            _prior_parent_instance_id = _prior_row[17]
             # Delete old row so INSERT succeeds (id is PRIMARY KEY)
             await sanctioned_delete_instance(
                 db,
@@ -1385,9 +1289,8 @@ async def handle_session_start(payload: dict) -> dict:
                 "instance_type": launch_instance_type or "one_off",
                 "zealotry": launch_zealotry if launch_zealotry is not None else 4,
                 "session_doc_policy": session_doc_policy,
-                "discord_hosted": 1 if launch_discord_hosted else _prior_discord_hosted,
-                "discord_channel": launch_discord_channel or _prior_discord_channel,
-                "discord_bot": launch_discord_bot or _prior_discord_bot,
+                "discord_hosted": _prior_discord_hosted,
+                "discord_channel": _prior_discord_channel,
                 "registered_at": now,
                 "last_activity": now,
             },
@@ -1522,9 +1425,6 @@ async def handle_session_start(payload: dict) -> dict:
             "zealotry": launch_zealotry if launch_zealotry is not None else 4,
             "dispatch_bound_doc": dispatch_bound_doc,
             "session_doc_policy": session_doc_policy,
-            "discord_hosted": launch_discord_hosted,
-            "discord_channel": launch_discord_channel,
-            "discord_bot": launch_discord_bot,
         },
     )
 
@@ -1786,11 +1686,6 @@ async def handle_prompt_submit(payload: dict) -> dict:
     except Exception:
         pass
 
-    # Session-doc accountability: each new user turn marks the doc stale.
-    # If the agent ends this turn without touching its session doc, the next
-    # GT cycle picks up `session_doc_up_to_date: false` and pings on it.
-    await _flip_session_doc_up_to_date(session_id, False, source="prompt_submit")
-
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
     response = {
         "success": True,
@@ -1835,30 +1730,6 @@ async def handle_post_tool_use(payload: dict) -> dict:
             reason="answered",
             answer=_askq_extract_answer(payload),
         )
-
-    # Session-doc accountability: doc-touch flip runs BEFORE the debounce so a
-    # Write/Edit that immediately follows another tool call still flips the
-    # flag (which is the entire signal the GT engine relies on).
-    if tool_name in _DOC_WRITE_TOOLS:
-        target_paths = _tool_target_paths(payload)
-        if target_paths:
-            try:
-                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-                    doc_path = await _resolve_session_doc_path(db, session_id)
-                if doc_path is not None:
-                    resolved_doc = doc_path.resolve() if doc_path.exists() else doc_path
-                    for tp in target_paths:
-                        try:
-                            tp_resolved = Path(tp).resolve()
-                        except Exception:
-                            tp_resolved = Path(tp)
-                        if tp_resolved == resolved_doc or Path(tp) == doc_path:
-                            await _flip_session_doc_up_to_date(
-                                session_id, True, source=f"post_tool_use:{tool_name}"
-                            )
-                            break
-            except Exception as exc:
-                logger.debug(f"PostToolUse doc-up-to-date check skipped: {exc}")
 
     # Debounce: only update every 2 seconds per session
     current_time = time.time()

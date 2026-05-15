@@ -9,8 +9,8 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.layout import PalaceLayout, SomniumLayout, WorkspaceLayout
 from tmuxctl.labels import PALACE_SIDE_ROLES, SOMNIUM_SIDE_ROLES
+from tmuxctl.layout import PalaceLayout, SomniumLayout, WorkspaceLayout
 
 
 def test_workspace_layout_ratios_are_canonical() -> None:
