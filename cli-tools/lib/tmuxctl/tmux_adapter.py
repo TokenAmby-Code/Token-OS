@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import time
+import hashlib
 from pathlib import Path
 
 
@@ -12,7 +13,8 @@ class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
 
 
-DEFAULT_SUBMIT_SETTLE_SECONDS = 0.3
+DEFAULT_SUBMIT_SETTLE_SECONDS = 1.0
+DEFAULT_PRE_SUBMIT_SETTLE_SECONDS = 1.0
 
 _PANE_TARGET_COMMANDS = {
     "break-pane",
@@ -32,6 +34,19 @@ _PANE_TARGET_COMMANDS = {
 _PANE_OPTION_COMMANDS = {"set-option", "set", "show-options", "show"}
 _PANE_TARGET_FLAGS = {"-t", "-s"}
 _SLOT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+
+def normalize_prompt_payload(text: str) -> str:
+    """Normalize a live-agent prompt payload before pane injection."""
+    normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
+    if not normalized.strip():
+        raise ValueError("prompt payload is empty after normalization")
+    return normalized
+
+
+def prompt_payload_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _tmux_binary() -> str:
@@ -300,10 +315,13 @@ class TmuxAdapter:
         empty prompt and is a no-op in Claude/Codex. If the first C-m was
         swallowed as a newline, the delayed second C-m submits the queued prompt.
         """
+        payload = normalize_prompt_payload(text)
         if clear_prompt:
             self.send_keys(target, "C-u")
-        self.run("send-keys", "-t", target, "-l", text)
+        self.run("send-keys", "-t", target, "-l", payload)
+        if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
         self.send_keys(target, "C-m")
         if submit_settle_seconds > 0:
             time.sleep(submit_settle_seconds)
-            self.send_keys(target, "C-m")
+        self.send_keys(target, "C-m")

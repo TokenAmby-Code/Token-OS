@@ -1626,6 +1626,15 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
 
     now = datetime.now().isoformat()
+    await log_event(
+        "hook_user_prompt_submit",
+        instance_id=session_id,
+        details={
+            "hook_event_name": "UserPromptSubmit",
+            "payload_keys": sorted(payload.keys()),
+            "prompt_hash": payload.get("prompt_hash") or payload.get("payload_hash"),
+        },
+    )
     consumed_injections: list[dict] = []
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:

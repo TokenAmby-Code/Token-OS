@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# agent-cmd - Engine-neutral live agent prompt injection via tmux.
+set -euo pipefail
+
+_BIN_DIR="$(dirname "$(readlink -f "$0")")"
+_LIB_DIR="${_BIN_DIR}/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${_LIB_DIR}/tmux-guard.sh"
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+TARGET_MODE="self"
+TARGET_VALUE=""
+DETACH=false
+RESOLVE_ONLY=false
+NO_ESCAPE=false
+COMMAND=""
+
+usage() {
+    cat <<'USAGE'
+agent-cmd - Send a prompt/command to a live Claude or Codex pane
+
+Usage: agent-cmd [--self|--pane PANE|--instance ID] [--detach] [--resolve-only] [--no-escape] <prompt>
+USAGE
+}
+
+parent_pid_of() {
+    local pid="$1"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
+    else
+        awk '{print $4}' "/proc/$pid/stat" 2>/dev/null
+    fi
+}
+
+find_agent_pid() {
+    local current="${1:-$PPID}" comm next
+    for _ in 1 2 3 4 5 6 7 8; do
+        [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+        if [[ "$(uname -s)" == Darwin ]]; then
+            comm=$(ps -p "$current" -o comm= 2>/dev/null) || break
+        else
+            comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
+        fi
+        case "$comm" in
+            *claude*|*codex*) echo "$current"; return 0 ;;
+        esac
+        next=$(parent_pid_of "$current") || break
+        current="$next"
+    done
+    return 1
+}
+
+find_tmux_pane() {
+    local target_pid="$1"
+    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+        local check_pid="$target_pid"
+        while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
+            if [[ "$check_pid" == "$pane_pid" ]]; then
+                echo "$pane_id"
+                return 0
+            fi
+            check_pid=$(parent_pid_of "$check_pid") || break
+        done
+    done | head -1
+}
+
+resolve_instance_id() {
+    local pid="$1"
+    local cache_file="${HOME}/.claude/session-pids/${pid}"
+    [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null || true
+}
+
+resolve_pane() {
+    "${_BIN_DIR}/tmux-resolve-pane" --format id "$1" 2>/dev/null || echo "$1"
+}
+
+payload_hash() {
+    python3 -c 'import sys,hashlib,re; s=re.sub(r"[\r\n]+", " ", sys.stdin.read()).rstrip(); print(hashlib.sha256(s.encode()).hexdigest())'
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --self) TARGET_MODE="self"; shift ;;
+        --pane) TARGET_MODE="pane"; TARGET_VALUE="$2"; shift 2 ;;
+        --instance) TARGET_MODE="instance"; TARGET_VALUE="$2"; shift 2 ;;
+        --detach) DETACH=true; shift ;;
+        --resolve-only) RESOLVE_ONLY=true; shift ;;
+        --no-escape) NO_ESCAPE=true; shift ;;  # accepted for claude-cmd compatibility
+        -h|--help) usage; exit 0 ;;
+        *) COMMAND="$1"; shift ;;
+    esac
+done
+
+if [[ "$RESOLVE_ONLY" != true && -z "$COMMAND" ]]; then
+    echo "Error: No command specified." >&2
+    usage >&2
+    exit 1
+fi
+
+PANE=""
+INSTANCE_ID=""
+case "$TARGET_MODE" in
+    self)
+        AGENT_PID=$(find_agent_pid || true)
+        [[ -z "$AGENT_PID" ]] && { echo "Error: Could not find agent ancestor process." >&2; exit 1; }
+        PANE=$(find_tmux_pane "$AGENT_PID")
+        INSTANCE_ID=$(resolve_instance_id "$AGENT_PID")
+        ;;
+    pane)
+        PANE="$TARGET_VALUE"
+        ;;
+    instance)
+        INSTANCE_ID="$TARGET_VALUE"
+        INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$TARGET_VALUE" 2>/dev/null || true)
+        PANE=$(echo "$INSTANCE_DATA" | jq -r '.tmux_pane // empty' 2>/dev/null || true)
+        INSTANCE_PID=$(echo "$INSTANCE_DATA" | jq -r '.pid // empty' 2>/dev/null || true)
+        [[ -z "$PANE" && -n "$INSTANCE_PID" ]] && PANE=$(find_tmux_pane "$INSTANCE_PID" || true)
+        [[ -z "$PANE" ]] && { echo "Error: Could not find pane for instance '$TARGET_VALUE'." >&2; exit 1; }
+        ;;
+esac
+
+[[ -n "$PANE" ]] && PANE=$(resolve_pane "$PANE")
+if [[ "$RESOLVE_ONLY" == true ]]; then
+    echo "$PANE"
+    exit 0
+fi
+
+send_command() {
+    local pane="$1" cmd="$2" locker="agent-cmd-$$" locked=false rc=0 out lock_resp
+    local dispatch_id hash
+    dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    hash=$(printf '%s' "$cmd" | payload_hash)
+
+    if [[ -n "${INSTANCE_ID:-}" ]]; then
+        for _ in {1..20}; do
+            lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
+                -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
+            if echo "$lock_resp" | grep -q '"acquired": *true'; then
+                locked=true
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+
+    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-10}"; then
+        echo "Warning: user input not cleared in $pane — aborting injection" >&2
+        rc=1
+    else
+        out=$("${_BIN_DIR}/tmuxctl" send-text --pane "$pane" --text "$cmd" 2>&1) || {
+            echo "$out" >&2
+            rc=1
+        }
+    fi
+
+    if [[ "$locked" == true ]]; then
+        curl -s --connect-timeout 1 --max-time 2 \
+            -X DELETE "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" \
+            >/dev/null 2>&1 || true
+    fi
+
+    printf '{"dispatch_id":"%s","payload_hash":"%s","pane":"%s","instance_id":"%s","verification_status":"%s","verified_by":"%s"}\n' \
+        "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$([[ $rc == 0 ]] && echo sent || echo failed)" "tmuxctl"
+    return "$rc"
+}
+
+if [[ "$DETACH" == true ]]; then
+    (send_command "$PANE" "$COMMAND" >/dev/null 2>&1) &
+    disown 2>/dev/null || true
+else
+    send_command "$PANE" "$COMMAND"
+fi

@@ -3888,11 +3888,19 @@ async def _tmux_send_payload_then_submit(
             "failed_operation": ["tmuxctl", "send_text_then_submit"],
         }
 
+    import hashlib, re, uuid
+    normalized = re.sub(r"[\r\n]+", " ", payload).rstrip()
     return {
         "returncode": 0,
         "stdout": "",
         "stderr": "",
         "operation": "tmuxctl.send_text_then_submit",
+        "dispatch_id": str(uuid.uuid4()),
+        "payload_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        "verification_status": "sent",
+        "verified_by": "tmuxctl",
+        "pane": tmux_pane,
+        "instance_id": None,
     }
 
 
