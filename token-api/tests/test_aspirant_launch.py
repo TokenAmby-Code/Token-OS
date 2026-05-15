@@ -120,9 +120,7 @@ def test_inbox_create_launches_managed_legion_session(aspirant_env, monkeypatch)
     prompt_file = Path(args[args.index("--prompt-file") + 1])
     system_file = Path(args[args.index("--system-prompt-file") + 1])
     assert "Build the new aspirant launch path." in prompt_file.read_text(encoding="utf-8")
-    assert "full aspirant implantation/trials session" in system_file.read_text(
-        encoding="utf-8"
-    )
+    assert "full aspirant implantation/trials session" in system_file.read_text(encoding="utf-8")
 
     conn = sqlite3.connect(aspirant_env.main.DB_PATH)
     row = conn.execute(

@@ -220,7 +220,7 @@ DEFAULT_SESSION_DOC_RUBRIC: dict[str, bool] = {
     # that end a turn without touching their session doc trip GT next cycle.
     "session_doc_up_to_date": True,
     "extensively_validated": False,  # services restarted, redeployed, live endpoints pinged
-    "vault_searched": False,         # related vault docs reviewed for staleness
+    "vault_searched": False,  # related vault docs reviewed for staleness
     "committed": False,
     "pushed": False,
     "pr_opened": False,
@@ -242,10 +242,10 @@ DEFAULT_SESSION_DOC_RUBRIC: dict[str, bool] = {
 # beautifier state. The prefix selects the registry (sanguinius_is →
 # SANGUINIUS_STATES; designer_is → DESIGNER_STATES, etc.). State >= 3 is terminal.
 SANGUINIUS_STATES: dict[str, int] = {
-    "yet to take wing": 0,         # never invoked
-    "at the easel": 1,             # drafting now
+    "yet to take wing": 0,  # never invoked
+    "at the easel": 1,  # drafting now
     "hovering at your shoulder": 2,  # drafts presented, awaiting Emperor's eye
-    "folding my wings": 3,         # Emperor has chosen; Sang rests (terminal)
+    "folding my wings": 3,  # Emperor has chosen; Sang rests (terminal)
 }
 
 # Persona-name → state-map registry. Add more as other vaults port the pattern.
@@ -683,7 +683,7 @@ def create_session_doc_file(
     body = (
         f"# Session: {title}\n\n"
         "<!-- visual:html BEGIN -->\n"
-        "<div class=\"session-visual\">\n"
+        '<div class="session-visual">\n'
         "  <em>Sanguinius is yet to take wing. Dispatch with "
         "<code>dispatch --persona sanguinius --session-doc &lt;name&gt;</code>.</em>\n"
         "</div>\n"

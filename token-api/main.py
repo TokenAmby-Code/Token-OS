@@ -5123,9 +5123,7 @@ def _humanize_condition_key(key: str) -> str:
     return key.replace("_", " ")
 
 
-def _golden_throne_tts_text_for_rubric(
-    human_pane_surface: str, status: RubricStatus
-) -> str:
+def _golden_throne_tts_text_for_rubric(human_pane_surface: str, status: RubricStatus) -> str:
     """Spoken GT body for an incomplete-rubric fire. ~50 char SAPI cap (see project_tts_wsl_sapi_truncation)."""
     if not status.missing:
         return f"Golden Throne {human_pane_surface}"
@@ -5133,9 +5131,7 @@ def _golden_throne_tts_text_for_rubric(
     return f"GT {human_pane_surface} needs {first}"
 
 
-def _golden_throne_banner_text_for_rubric(
-    human_pane_surface: str, status: RubricStatus
-) -> str:
+def _golden_throne_banner_text_for_rubric(human_pane_surface: str, status: RubricStatus) -> str:
     """On-screen banner for an incomplete-rubric fire."""
     if not status.missing:
         return f"GT {human_pane_surface}"
@@ -6893,7 +6889,12 @@ async def _victory_ack_core(
 
         # Precondition: rubric must be complete (else 409). Legacy docs without
         # a typed rubric get a pass — the Emperor can ack them freely.
-        if not force and rubric_status is not None and rubric_status.present and not rubric_status.legacy_string:
+        if (
+            not force
+            and rubric_status is not None
+            and rubric_status.present
+            and not rubric_status.legacy_string
+        ):
             if not rubric_status.complete:
                 raise HTTPException(
                     status_code=409,
@@ -7032,9 +7033,7 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
         raise HTTPException(status_code=400, detail="extra must be an object")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT file_path FROM session_documents WHERE id = ?", (doc_id,)
-        )
+        cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
         row = await cursor.fetchone()
     if not row or not row[0]:
         raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
@@ -7080,9 +7079,7 @@ async def victory_ack_session_doc(doc_id: int, request: Request):
     reason = body.get("reason") or "victory"
     deliverables = body.get("deliverables", []) or []
     force = bool(body.get("force"))
-    return await _victory_ack_core(
-        doc_id, reason, deliverables, force=force, source="victory-ack"
-    )
+    return await _victory_ack_core(doc_id, reason, deliverables, force=force, source="victory-ack")
 
 
 @app.post("/api/instances/{instance_id}/victory")
@@ -16595,7 +16592,9 @@ def _build_aspirant_initial_prompt(
     session_doc_path: Path,
     gene_seed: str,
 ) -> str:
-    thread_line = f"- Source/thread id: {source} / {thread_id}" if thread_id else f"- Source: {source}"
+    thread_line = (
+        f"- Source/thread id: {source} / {thread_id}" if thread_id else f"- Source: {source}"
+    )
     return f"""# Aspirant Session Launch
 
 You are being launched as a managed legion aspirant session.
@@ -16802,9 +16801,10 @@ async def launch_aspirant_session(
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0:
-            err_text = stderr.decode("utf-8", errors="replace").strip() or stdout.decode(
-                "utf-8", errors="replace"
-            ).strip()
+            err_text = (
+                stderr.decode("utf-8", errors="replace").strip()
+                or stdout.decode("utf-8", errors="replace").strip()
+            )
             raise RuntimeError(f"dispatch failed ({proc.returncode}): {err_text}")
 
         await _set_aspirant_properties(
@@ -20823,8 +20823,6 @@ def check_phone_reachable() -> dict:
         PHONE_STATE["reachable"] = False
         PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
         return {"reachable": False}
-
-
 
 
 if __name__ == "__main__":
