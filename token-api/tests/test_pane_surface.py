@@ -43,7 +43,10 @@ def test_golden_throne_human_surface_dynamic_workspace_uses_public_label(app_env
 
 
 def test_golden_throne_surface_does_not_embed_raw_tmux(app_env):
-    assert app_env.main._golden_throne_surface("Claude 08:14", "%210", "legion:aspirant") == "legion:aspirant"
+    assert (
+        app_env.main._golden_throne_surface("Claude 08:14", "%210", "legion:aspirant")
+        == "legion:aspirant"
+    )
     assert app_env.main._golden_throne_surface("Claude 08:14", "%210", None) == "Claude 08:14"
 
 

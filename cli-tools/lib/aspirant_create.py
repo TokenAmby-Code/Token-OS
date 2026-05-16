@@ -11,7 +11,6 @@ import json
 import os
 import re
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +18,7 @@ VALID_KINDS = {"dispatch", "deploy_p", "deploy_d"}
 VALID_DOMAINS = {"terra", "mars"}
 TOKEN_OS_ROOT = Path(__file__).resolve().parents[2]
 ASPIRANT_PERSONA = "aspirant"
+OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
 
 
 def aspirant_persona_prompt_path() -> Path:
@@ -37,10 +37,33 @@ def vault_root() -> Path:
     return Path("/Volumes/Imperium/Imperium-ENV")
 
 
+def imperium_env_vault_root() -> str:
+    """Return the default aspirant working directory (the Imperium-ENV vault root)."""
+    return str(vault_root())
+
+
+def non_empty_string(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
 def slugify(value: str, fallback: str = "aspirant") -> str:
     slug = re.sub(r"[^\w\s-]", "", value).strip().lower()
     slug = re.sub(r"\s+", "-", slug)
     return (slug or fallback)[:80]
+
+
+def human_filename_stem(value: str, fallback: str = "Aspirant", max_len: int = 90) -> str:
+    stem = re.sub(r"[\x00-\x1f\x7f]", "", value or "")
+    stem = re.sub(f"[{re.escape(OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS)}]", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    if stem.lower().endswith(".md"):
+        stem = stem[:-3].strip(" .")
+    stem = stem or fallback
+    if len(stem) > max_len:
+        stem = stem[:max_len].rstrip(" .")
+    return stem or fallback
 
 
 def yaml_scalar(value: object) -> str:
@@ -63,16 +86,54 @@ def yaml_key_list(key: str, values: list[str]) -> list[str]:
     return [f"{key}:", *yaml_list(values)]
 
 
+# Mandated starter questions seeded into every aspirant at intake.
+# Schema (Emperor-prescribed 2026-05-15): questions:[] of {question, answer, state, importance}.
+# state in {unanswered, refining, open, closed}. importance in 1..10.
+# Trials-clear gate predicate (MVP): every entry has state == "closed". No special case for q1.
+STARTER_QUESTIONS: list[dict[str, object]] = [
+    {
+        "question": "which other questions are needed for this aspirant?",
+        "answer": (
+            "add the answers as additional questions in this array, "
+            "do not duplicate records to this answer field"
+        ),
+        "state": "unanswered",
+        "importance": 10,
+    },
+    {
+        "question": (
+            "is there a better way to organize the thoughts from the gene seed? "
+            "can we create a descriptive reshuffle to ONLY increase readability "
+            "while preserving total semantic payload"
+        ),
+        "answer": None,
+        "state": "unanswered",
+        "importance": 8,
+    },
+]
+
+
+def yaml_starter_questions(key: str = "questions") -> list[str]:
+    out: list[str] = [f"{key}:"]
+    for q in STARTER_QUESTIONS:
+        out.append(f"  - question: {yaml_scalar(q['question'])}")
+        out.append(f"    answer: {yaml_scalar(q['answer'])}")
+        out.append(f"    state: {yaml_scalar(q['state'])}")
+        out.append(f"    importance: {yaml_scalar(q['importance'])}")
+    return out
+
+
 def unique_path(directory: Path, stem: str, suffix: str = ".md") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     candidate = directory / f"{stem}{suffix}"
     if not candidate.exists():
         return candidate
-    stamp = datetime.now().strftime("%H%M%S")
-    candidate = directory / f"{stem}-{stamp}{suffix}"
-    if not candidate.exists():
-        return candidate
-    return directory / f"{stem}-{stamp}-{uuid.uuid4().hex[:6]}{suffix}"
+    counter = 2
+    while True:
+        candidate = directory / f"{stem} {counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def rel_to_vault(path: Path, vault: Path) -> str:
@@ -135,7 +196,7 @@ def build_note_content(
         f"source: {yaml_scalar(args.source)}",
         "creation_surface: dispatch",
         "trials_verdict: pending",
-        "open_questions: {}",
+        *yaml_starter_questions(),
         "tags:",
         *[f"  - {yaml_scalar(t)}" for t in tags],
     ]
@@ -215,7 +276,7 @@ def build_session_doc(
         f"dispatch_blocked_reason: {yaml_scalar(blocked_reason)}",
         "trials_verdict: pending",
         "operator_approved_dispatch: false",
-        "open_questions: {}",
+        *yaml_starter_questions(),
         f"engine: {yaml_scalar(args.engine)}",
         f"persona: {yaml_scalar(args.persona)}",
         f"target_working_dir: {yaml_scalar(str(Path(args.dir).expanduser()) if args.dir else None)}",
@@ -250,7 +311,7 @@ def build_session_doc(
         "## Dispatch Boundary",
         "",
         "This is an adversarial trials session for future dispatch; no downstream agent has been launched yet.",
-        "The aspirant must generate and maintain proactive `open_questions` until all blocking ambiguities are answered or waived.",
+        "The aspirant must generate and maintain proactive `questions` (closing each entry only when answered or waived) until none remain non-closed.",
         "Repeated wakeups are not approval. `dispatch_ready` stays false until a separate explicit operator-authorized dispatch/worker phase.",
         "",
         "## Activity Log",
@@ -265,11 +326,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument("--kind", required=True, choices=sorted(VALID_KINDS))
     p.add_argument("--title", required=True)
-    p.add_argument("--objective", required=True)
+    p.add_argument("--objective", required=True, type=non_empty_string)
     p.add_argument("--source", default="dispatch")
     p.add_argument("--session-domain", choices=sorted(VALID_DOMAINS), default="mars")
     p.add_argument("--engine", choices=["claude", "codex"], default=None)
-    p.add_argument("--dir", default=None)
+    p.add_argument("--dir", default=imperium_env_vault_root())
     p.add_argument("--persona", default=None)
     p.add_argument("--target", default=None)
     p.add_argument("--zealotry", type=int, default=None)
@@ -300,8 +361,6 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
         else:
             note_status = "aspirant_intake"
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    short = uuid.uuid4().hex[:8]
     note_stem = slugify(args.title)
     note_path = unique_path(vault / "Aspirants", note_stem)
     note_rel = rel_to_vault(note_path, vault)
@@ -315,7 +374,10 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
             session_dir = vault / (
                 "Terra/Sessions" if args.session_domain == "terra" else "Mars/Sessions"
             )
-            session_doc_path = unique_path(session_dir, f"{today}-aspirant-{note_stem}-{short}")
+            session_doc_path = unique_path(
+                session_dir,
+                human_filename_stem(f"Aspirant - {args.title}", fallback="Aspirant"),
+            )
         session_doc_rel = rel_to_vault(session_doc_path, vault)
 
     note_path.write_text(

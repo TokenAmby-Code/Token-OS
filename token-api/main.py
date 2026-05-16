@@ -79,6 +79,8 @@ from pane_surface import (
 )
 from pane_surface import (
     is_meaningful_tab_name as _is_meaningful_surface_name,
+)
+from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from phone_service import (
@@ -89,6 +91,7 @@ from phone_service import (
     push_phone_widget_async,
     send_pavlok_stimulus,
 )
+from questions_gate import trials_clear
 from routes.day_start import fire_day_start_internal, sync_day_start_schedule_from_daily_note
 from routes.day_start import router as day_start_router
 from routes.hooks import (
@@ -115,22 +118,19 @@ from routes.voice import router as voice_router
 from schedule import router as schedule_router
 from session_doc_helpers import (
     DEFAULT_RUBRIC_KEY,
-    DEFAULT_SESSION_DOC_RUBRIC,
     RubricStatus,
     _update_doc_agents_list,
     bump_session_doc_up_to_date,
-    clear_rubric_notified,
     create_session_doc_file,
-    evaluate_rubric,
+    human_filename_stem,
     mark_rubric_acknowledged,
     mark_rubric_notified,
     read_frontmatter,
     read_rubric,
+    unique_human_path,
     update_frontmatter,
     update_rubric_field,
-    update_victory_frontmatter,
 )
-from session_doc_helpers import update_frontmatter as _update_session_doc_frontmatter
 from shared import (
     CRASH_LOG_PATH,
     DB_PATH,
@@ -174,6 +174,7 @@ from timer import (
 
 DESKFLOW_SERVER_PORT = 24800
 DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
+DESKFLOW_KEYMAP_GUARD = SCRIPTS_DIR / "Shell" / "deskflow-keymap-guard.sh"
 MAC_KVM_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
 
 # Configure logging for TUI capture
@@ -2500,16 +2501,10 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
             actor="rename-instance",
         )
 
-        # Only auto-generated per-instance docs should mirror renames.
-        session_doc_updated = bool(
-            session_doc_id and session_doc_policy in {"interactive_auto", "cron_created"}
-        )
-        if session_doc_updated:
-            now = datetime.now().isoformat()
-            await db.execute(
-                "UPDATE session_documents SET title = ?, updated_at = ? WHERE id = ?",
-                (request.tab_name, now, session_doc_id),
-            )
+        # Instance renames are instance-local. Session doc naming is doc-owned
+        # (`PATCH /api/session-docs/{doc_id}` or creation title), because a
+        # session doc may eventually have multiple attached instances.
+        session_doc_updated = False
 
         await db.commit()
 
@@ -3889,7 +3884,10 @@ async def _tmux_send_payload_then_submit(
             "failed_operation": ["tmuxctl", "send_text_then_submit"],
         }
 
-    import hashlib, re, uuid
+    import hashlib
+    import re
+    import uuid
+
     normalized = re.sub(r"[\r\n]+", " ", payload).rstrip()
     return {
         "returncode": 0,
@@ -5025,8 +5023,7 @@ def _tmux_pane_label_sync(tmux_pane: str | None) -> str | None:
     try:
         result = subprocess.run(
             ["tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=3,
             check=False,
@@ -6118,15 +6115,21 @@ async def _inject_custodes_prompt_to_pane(
 
 
 async def _find_custodes_tmux_pane() -> str | None:
-    """Recover a live Custodes pane from tmux when DB singleton tracking is stale."""
-    custodes_bg = LEGION_PANE_COLORS["custodes"]
+    """Recover a live Custodes pane from tmux when DB singleton tracking is stale.
+
+    Uses the `@PANE_ID = legion:custodes` tmux pane option as the identity signal
+    — set by `_create_custodes_legion_pane` at pane creation. Pane background
+    color is an OUTPUT of legion designation (driven by `pane_recolor_queue`),
+    never an input — keying recovery on color creates a circular SoT dependency
+    where a missed recolor makes Custodes "disappear" to the dispatcher.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_bg}",
+            "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -6141,15 +6144,15 @@ async def _find_custodes_tmux_pane() -> str | None:
     candidates: list[str] = []
     for line in stdout.decode().splitlines():
         try:
-            pane_id, window_name, current_cmd, pane_bg = line.split("\t", 3)
+            pane_id, pane_marker, current_cmd = line.split("\t", 2)
         except ValueError:
+            continue
+        if pane_marker != "legion:custodes":
             continue
         cmd_is_claude = "claude" in current_cmd.lower() or (
             current_cmd[0:1].isdigit() and "." in current_cmd
         )
-        if pane_bg == custodes_bg and cmd_is_claude:
-            candidates.append(pane_id)
-        elif window_name == "legion" and pane_bg == custodes_bg:
+        if cmd_is_claude:
             candidates.append(pane_id)
 
     return candidates[0] if candidates else None
@@ -6278,51 +6281,64 @@ async def _create_custodes_legion_pane() -> str | None:
 
 
 async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -> dict:
-    """Launch a new Custodes singleton carrying the missed state-hook prompt."""
-    pane_id = await _create_custodes_legion_pane()
-    if not pane_id:
-        return {"dispatched": False, "reason": "custodes_launch_no_pane"}
+    """Delegate prompt delivery to `tmuxctl assert-custodes`.
+
+    token-api no longer decides "launch vs upsert" — tmuxctl owns that. We just
+    hand it the prompt and read back the result. tmuxctl will:
+      * Resolve or create the `legion:custodes` pane.
+      * Upsert via `claude-cmd --pane` if a live claude process is detected.
+      * Otherwise launch fresh via `dispatch --persona custodes --sync` (the
+        non-deprecated replacement for `primarch custodes`).
+    """
     if cancel_check:
         canceled = await cancel_check("pre_launch_prompt")
         if canceled:
             return canceled
 
-    prompt_file = Path(tempfile.gettempdir()) / f"custodes-state-hook-{uuid.uuid4().hex}.md"
     launch_prompt = (
         "Custodes state hook fired while no live synced Custodes singleton was registered. "
         "Register yourself as legion=custodes, instance_type=sync, synced=true, then handle this intervention.\n\n"
         f"{prompt}"
     )
-    prompt_file.write_text(launch_prompt)
-    launch_cmd = (
-        f"cd {shlex.quote('/Volumes/Imperium/Imperium-ENV')} && "
-        f'primarch custodes "$(cat {shlex.quote(str(prompt_file))})" ; '
-        f"rm -f {shlex.quote(str(prompt_file))}"
-    )
 
+    tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
     try:
-        for keys in (["C-c"], ["C-u"], ["clear", "Enter"], [launch_cmd, "Enter"]):
-            proc = await asyncio.create_subprocess_exec(
-                "tmux",
-                "send-keys",
-                "-t",
-                pane_id,
-                *keys,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=5)
-            await asyncio.sleep(0.1)
+        proc = await asyncio.create_subprocess_exec(
+            str(tmuxctl_bin),
+            "assert-custodes",
+            "--stdin",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(launch_prompt.encode()), timeout=45
+        )
     except Exception as exc:
-        logger.warning(f"Custodes state hook: launch failed pane={pane_id}: {exc}")
+        logger.warning(f"Custodes state hook: tmuxctl assert-custodes failed: {exc}")
+        return {"dispatched": False, "reason": f"custodes_launch_failed: {exc}"}
+
+    raw = stdout.decode().strip()
+    try:
+        result = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        logger.warning(
+            f"Custodes state hook: assert-custodes returned non-JSON rc={proc.returncode}: {raw[:200]}"
+        )
         return {
             "dispatched": False,
-            "reason": f"custodes_launch_failed: {exc}",
-            "tmux_pane": pane_id,
+            "reason": f"custodes_launch_bad_output: rc={proc.returncode}",
         }
 
-    logger.warning(f"Custodes state hook: launched new Custodes singleton pane={pane_id}")
-    return {"dispatched": True, "reason": "launched_new_custodes", "tmux_pane": pane_id}
+    if not result.get("dispatched"):
+        logger.warning(
+            f"Custodes state hook: assert-custodes did not dispatch: {result.get('reason')} stderr={stderr.decode()[:200]}"
+        )
+    else:
+        logger.warning(
+            f"Custodes state hook: {result.get('reason')} pane={result.get('tmux_pane')}"
+        )
+    return result
 
 
 async def _inject_custodes_prompt_to_pane_maybe_cancel(
@@ -6576,6 +6592,16 @@ async def handle_custodes_state_event(
             "dedupe_key": intervention.dedupe_key,
             "reason": dedupe_reason,
         }
+
+    # Claim the dedupe key BEFORE dispatch to close the TOCTOU window.
+    # Without this, two events with the same dedupe_key arriving in quick succession
+    # both pass the check above and both dispatch, because the cache is only written
+    # after dispatch completes. Writing the claim here means the second event sees
+    # the cache hit and is suppressed.
+    _custodes_state_debounce[intervention.dedupe_key] = {
+        "at": time.time(),
+        "severity": intervention.severity,
+    }
 
     async def cancel_check(stage: str) -> dict | None:
         return await _custodes_intervention_negative_edge_cancel_result(
@@ -9257,7 +9283,7 @@ def _sync_save_daily_score(
     conn.execute(
         """INSERT INTO timer_daily_scores (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON CONFLICT(date) DO UPDATE SET 
+           ON CONFLICT(date) DO UPDATE SET
                productivity_score = excluded.productivity_score,
                total_work_ms = excluded.total_work_ms,
                total_break_used_ms = excluded.total_break_used_ms,
@@ -9916,6 +9942,7 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     productivity_active = timer_engine.productivity_active
     active_count = 0
     should_close = not productivity_active
+    work_state = await get_cached_work_state()
 
     if productivity_active:
         reason = f"productivity_active:{active_count}_instances"
@@ -12198,7 +12225,6 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
                 "receiver_pid": result.get("pid"),
                 "receiver_status": result.get("status"),
                 "source": request.source,
-                "port": AUDIO_RECEIVER_PORT,
             },
         )
 
@@ -12208,7 +12234,7 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
             action=action,
             receiver_started=True,
             receiver_pid=result.get("pid"),
-            message=f"Audio proxy activated. Receiver listening on port {AUDIO_RECEIVER_PORT}.",
+            message="Audio proxy activated.",
         )
     else:
         # Failed to start receiver
@@ -12444,15 +12470,45 @@ def _mac_deskflow_running() -> bool:
     return bool(_mac_deskflow_pids())
 
 
+def _ensure_mac_deskflow_keymap(reason: str):
+    """Pin the macOS input-source state Deskflow needs for US-ANSI symbols.
+
+    After macOS restart, Deskflow can reconnect with a JIS-like symbol map
+    (`'` arriving as `:`). This guard is surgical: it does not wipe Deskflow
+    settings; it reselects the known-good US-compatible input source and
+    disables client language-sync before client start/reload so the WSL server cannot overwrite the Mac input source.
+    """
+    if not DESKFLOW_KEYMAP_GUARD.exists():
+        logger.warning(f"KVM: Deskflow keymap guard missing: {DESKFLOW_KEYMAP_GUARD}")
+        return
+    result = subprocess.run(
+        [str(DESKFLOW_KEYMAP_GUARD)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode == 0:
+        logger.info(f"KVM: Deskflow keymap guard ok ({reason}): {result.stdout.strip()}")
+    else:
+        logger.warning(
+            f"KVM: Deskflow keymap guard failed ({reason}, exit={result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
 def _start_mac_deskflow_client(reason: str):
+    _ensure_mac_deskflow_keymap(f"{reason}_pre_start")
     subprocess.Popen(["open", "/Applications/Deskflow.app"])
     subprocess.Popen(["caffeinate", "-u", "-t", "5"])
+    _ensure_mac_deskflow_keymap(f"{reason}_post_start")
     logger.info(f"KVM: Started Deskflow client ({reason})")
 
 
 def _reload_mac_deskflow_client(reason: str):
+    _ensure_mac_deskflow_keymap(f"{reason}_pre_reload")
     subprocess.run(["open", "-a", "Deskflow"], capture_output=True, text=True, timeout=5)
     subprocess.Popen(["caffeinate", "-u", "-t", "5"])
+    _ensure_mac_deskflow_keymap(f"{reason}_post_reload")
     logger.info(f"KVM: Reloaded Deskflow client ({reason})")
 
 
@@ -15825,16 +15881,51 @@ def _format_discord_injection(channel_name: str, content: str) -> str:
 
 
 async def _resolve_selected_tmux_pane() -> str | None:
-    """Resolve the currently selected tmux pane from the active tmux client.
+    """Resolve the selected pane from the most recently active tmux client.
 
-    This intentionally does not use the instance DB. The Imperial Guard Discord
-    bot is an operator input surface: it should target whatever pane the human
-    has selected, independent of persona/legion/engine.
+    Token-API normally runs under launchd with no TMUX environment, so bare
+    `tmux display-message` can resolve the wrong client or fail with no current
+    client.  Imperial Guard voice is an operator input surface: target the pane
+    selected in the human's most recently active attached client.
     """
     try:
+        clients = await asyncio.create_subprocess_exec(
+            "tmux",
+            "list-clients",
+            "-F",
+            "#{client_activity}\t#{client_name}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        clients_stdout, clients_stderr = await asyncio.wait_for(clients.communicate(), timeout=5)
+        if clients.returncode != 0:
+            logger.warning(
+                "Discord active-pane injection: tmux client resolve failed: "
+                f"{clients_stderr.decode().strip()[:200]}"
+            )
+            return None
+
+        selected_client = None
+        selected_activity = -1
+        for line in clients_stdout.decode().splitlines():
+            try:
+                raw_activity, client_name = line.split("\t", 1)
+                activity = int(raw_activity or "0")
+            except ValueError:
+                continue
+            if client_name and activity > selected_activity:
+                selected_client = client_name
+                selected_activity = activity
+
+        if not selected_client:
+            logger.warning("Discord active-pane injection: no attached tmux client found")
+            return None
+
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "display-message",
+            "-c",
+            selected_client,
             "-p",
             "#{pane_id}",
             stdout=asyncio.subprocess.PIPE,
@@ -15865,6 +15956,7 @@ async def _resolve_selected_tmux_pane() -> str | None:
         if pane not in set(check_stdout.decode().splitlines()):
             logger.warning(f"Discord active-pane injection: selected pane {pane} is not alive")
             return None
+        logger.info(f"Discord active-pane injection: selected client {selected_client} pane {pane}")
         return pane
     except TimeoutError:
         logger.warning("Discord active-pane injection: tmux selected-pane resolve timed out")
@@ -15993,23 +16085,72 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
                 (legion,),
             )
         row = await cursor.fetchone()
-        if not row:
-            return False
 
-    instance_id, tmux_pane, device_id = row
-    if not tmux_pane:
-        logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
-        return False
+    instance_id = row[0] if row else None
+    tmux_pane = row[1] if row else None
+
+    # Custodes is a singleton pane.  The DB row is often stale after compaction,
+    # restarts, or manual pane recovery, while tmux still has the authoritative
+    # legion:custodes marker.  Recover from tmux instead of returning a false
+    # target failure.
+    if (not tmux_pane) and legion == "custodes" and not require_synced:
+        recovered = await _find_custodes_tmux_pane()
+        if recovered:
+            tmux_pane = recovered
+            logger.info(f"Discord injection: recovered Custodes pane {tmux_pane}")
 
     formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
 
+    if not tmux_pane and legion == "custodes" and not require_synced:
+        # Voice Custodes should not degrade to a target-failure readback just
+        # because the singleton row is stale or currently stopped.  Delegate
+        # upsert-vs-launch to the same tmuxctl owner used by state hooks.
+        try:
+            tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
+            proc = await asyncio.create_subprocess_exec(
+                str(tmuxctl_bin),
+                "assert-custodes",
+                "--stdin",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(formatted.encode()), timeout=45
+            )
+            result = json.loads(stdout.decode().strip() or "{}")
+            if result.get("dispatched"):
+                logger.info(
+                    f"Discord injection: custodes → {result.get('tmux_pane')} via assert-custodes"
+                )
+                return True
+            logger.warning(
+                "Discord injection: assert-custodes failed: "
+                f"{result.get('reason')} stderr={stderr.decode()[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"Discord injection: assert-custodes error: {e}")
+            return False
+
+    if not tmux_pane:
+        if instance_id:
+            logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
+        else:
+            logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
+        return False
+
     try:
-        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        agent_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "agent-cmd"
+        cmd = [str(agent_cmd)]
+        if instance_id:
+            cmd.extend(["--instance", instance_id])
+        else:
+            cmd.extend(["--pane", tmux_pane])
+        cmd.append(formatted)
+
         proc = await asyncio.create_subprocess_exec(
-            str(claude_cmd),
-            "--instance",
-            instance_id,
-            formatted,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={
@@ -16027,17 +16168,14 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
-            logger.info(
-                f"Discord injection: {legion} → {instance_id[:12]} (#{message.channel_name})"
-            )
+            target = instance_id[:12] if instance_id else tmux_pane
+            logger.info(f"Discord injection: {legion} → {target} (#{message.channel_name})")
             return True
-        else:
-            logger.warning(
-                f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}"
-            )
-            return False
+        logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+        return False
     except TimeoutError:
-        logger.warning(f"Discord injection timed out for {instance_id[:12]}")
+        target = instance_id[:12] if instance_id else tmux_pane
+        logger.warning(f"Discord injection timed out for {target}")
         return False
     except Exception as e:
         logger.warning(f"Discord injection error: {e}")
@@ -16528,9 +16666,9 @@ Rules:
 
 
 def _safe_filename_slug(value: str, fallback: str = "untitled") -> str:
-    slug = re.sub(r"[^\w\s-]", "", value).strip().lower()
-    slug = re.sub(r"\s+", "-", slug)
-    return (slug or fallback)[:80]
+    # Backcompat name for callers in this file.  Session docs now use
+    # readable, Obsidian Sync-safe stems rather than lowercase date slugs.
+    return human_filename_stem(value, fallback=fallback, max_len=80)
 
 
 def _resolve_aspirant_note_path(note_path: str) -> tuple[Path, str]:
@@ -16632,8 +16770,7 @@ async def _create_aspirant_session_doc(
     sessions_dir = OBSIDIAN_VAULT_PATH / "Terra" / "Sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    slug = _safe_filename_slug(f"aspirant-{title}", fallback="aspirant")
-    session_doc_path = sessions_dir / f"{today}-{slug}-{launch_id[:8]}.md"
+    session_doc_path = unique_human_path(sessions_dir, f"Aspirant - {title}", fallback="Aspirant")
 
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -17681,53 +17818,9 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
             logger.error(f"Trials: append command failed for '{title}': {e}")
             return
 
-        # Update status to trials_active (trials are ongoing until Emperor responds)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI,
-                "vault=Imperium-ENV",
-                "property:set",
-                f"path={note_path}",
-                "property=status",
-                "value=trials_active",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=15)
-        except Exception as e:
-            logger.warning(f"Trials: property:set failed for '{title}': {e}")
-
-        logger.info(f"Trials initiated for '{title}' ({note_path}) — awaiting Emperor response")
-
-        # Post trials to aspirant thread (primary) and #fleet (notification)
-        thread_id = await _read_note_property(note_path, "thread_id")
-        if thread_id:
-            trials_msg = (
-                f"**⚔️ Trials Initiated**\n"
-                f"Status: `trials_active` — awaiting Emperor review\n\n"
-                f"{trials_output[:1800]}"
-            )
-            await _post_to_aspirant_thread(thread_id, trials_msg)
-
-        # Brief notification to #fleet
-        try:
-            fleet_msg = (
-                f"**⚔️ Trials Initiated: {title}**\n"
-                f"Type: `{note_type}` | Respond in #aspirants thread"
-            )
-            discord_proc = await asyncio.create_subprocess_exec(
-                "discord",
-                "send",
-                "fleet",
-                "--bot",
-                "custodes",
-                fleet_msg,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(discord_proc.communicate(), timeout=15)
-        except Exception as e:
-            logger.warning(f"Trials: Discord notification failed for '{title}': {e}")
+        logger.info(
+            f"Trials generated for '{title}' ({note_path}) — frontmatter questions gate handles live validation"
+        )
 
         try:
             await log_event(
@@ -17746,238 +17839,8 @@ async def run_trials(note_path: str, title: str, note_type: str, vault_context: 
         logger.error(f"Trials failed for '{title}': {e}", exc_info=True)
 
 
-async def _read_thread_messages(thread_id: str, limit: int = 20) -> list[dict]:
-    """Read messages from a Discord thread by channel ID via the daemon."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{DISCORD_DAEMON_URL}/read",
-                params={"channel": thread_id, "limit": limit},
-            )
-            if resp.status_code == 200:
-                return resp.json().get("messages", [])
-    except Exception as e:
-        logger.warning(f"Failed to read thread {thread_id}: {e}")
-    return []
-
-
-async def run_trials_verdict(
-    note_path: str, title: str, note_type: str, emperor_response: str
-) -> None:
-    """Process Emperor's response to trials and render a PASS/FAIL verdict via Sonnet."""
-    try:
-        logger.info(f"Trials verdict: processing for '{title}'")
-
-        # Read the full note content
-        note_content = ""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI,
-                "vault=Imperium-ENV",
-                "read",
-                f"path={note_path}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            note_content = stdout.decode("utf-8", errors="replace").strip()
-        except Exception as e:
-            logger.error(f"Trials verdict: could not read note '{title}': {e}")
-            return
-
-        # Build verdict prompt for Sonnet
-        verdict_prompt = (
-            f"{CODEX_CONTEXT}\n\n"
-            f"You are the Adeptus Custodes rendering a verdict on the trials of aspirant note '{title}'.\n\n"
-            f"The Emperor has responded in the thread debate. Based on the Emperor's response and the note's "
-            f"content, determine whether this note should PASS (proceed to trials_passed) or FAIL (needs "
-            f"revision, set trials_failed).\n\n"
-            f"## The Note (type: {note_type})\n\n{note_content[:3000]}\n\n"
-            f"## Emperor's Response\n\n{emperor_response}\n\n"
-            f"## Instructions\n\n"
-            f"First line MUST be exactly one of:\n"
-            f"VERDICT: PASS - <one sentence reason>\n"
-            f"VERDICT: FAIL - <one sentence reason explaining what needs revision>\n\n"
-            f"Then 2-3 sentences of commentary on the debate and what happens next.\n"
-            f"If the Emperor's response is ambiguous or asks a question without clearly approving, default to FAIL."
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude",
-                "--model",
-                "claude-sonnet-4-6",
-                "-p",
-                "--no-session-persistence",
-                "--dangerously-skip-permissions",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(input=verdict_prompt.encode("utf-8")),
-                timeout=60,
-            )
-            verdict_output = stdout.decode("utf-8", errors="replace").strip()
-        except TimeoutError:
-            logger.error(f"Trials verdict: Sonnet timed out for '{title}'")
-            return
-        except Exception as e:
-            logger.error(f"Trials verdict: Sonnet failed for '{title}': {e}")
-            return
-
-        if not verdict_output:
-            logger.warning(f"Trials verdict: empty Sonnet response for '{title}'")
-            return
-
-        # Parse PASS/FAIL from first line
-        first_line = verdict_output.splitlines()[0] if verdict_output.splitlines() else ""
-        is_pass = "VERDICT: PASS" in first_line.upper()
-        new_status = "trials_passed" if is_pass else "trials_failed"
-        verdict_emoji = "✅" if is_pass else "❌"
-        callout_type = "success" if is_pass else "danger"
-
-        # Update note status property
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI,
-                "vault=Imperium-ENV",
-                "property:set",
-                f"path={note_path}",
-                "property=status",
-                f"value={new_status}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=15)
-        except Exception as e:
-            logger.warning(f"Trials verdict: property:set failed for '{title}': {e}")
-
-        # Append verdict section to note
-        verdict_section = (
-            f"\n\n## Verdict\n\n"
-            f"> [!{callout_type}] {verdict_emoji} {'Trials Passed' if is_pass else 'Trials Failed'}\n"
-            f"> {first_line}\n\n"
-            f"{chr(10).join(verdict_output.splitlines()[1:]).strip()}"
-        )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                OBSIDIAN_CLI,
-                "vault=Imperium-ENV",
-                "append",
-                f"path={note_path}",
-                f"content={verdict_section}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=15)
-        except Exception as e:
-            logger.warning(f"Trials verdict: append failed for '{title}': {e}")
-
-        # Post verdict back to aspirant thread
-        thread_id = await _read_note_property(note_path, "thread_id")
-        if thread_id:
-            thread_msg = (
-                f"**{verdict_emoji} Custodes Verdict: {'TRIALS PASSED' if is_pass else 'TRIALS FAILED'}**\n"
-                f"Status: `{new_status}`\n\n"
-                f"{verdict_output[:1800]}"
-            )
-            await _post_to_aspirant_thread(thread_id, thread_msg)
-
-        try:
-            await log_event(
-                "trials_verdict",
-                device_id="sonnet",
-                details={
-                    "path": note_path,
-                    "title": title,
-                    "type": note_type,
-                    "verdict": "pass" if is_pass else "fail",
-                    "status": new_status,
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Trials verdict: log_event failed for '{title}': {e}")
-        logger.info(f"Trials verdict for '{title}': {new_status}")
-
-        # On FAIL: do NOT auto-re-implant — wait for Emperor to engage in the thread.
-        # The old behavior created infinite implant → trial → fail → re-implant loops.
-        if not is_pass:
-            logger.info(
-                f"Trials failed for '{title}': awaiting Emperor feedback in thread (no auto-re-implant)"
-            )
-
-    except Exception as e:
-        logger.error(f"Trials verdict failed for '{title}': {e}", exc_info=True)
-
-
-@app.post("/api/inbox/trials-check")
-async def inbox_trials_check():
-    """Scan trials_active notes for Emperor replies and dispatch verdicts."""
-    import glob as glob_module
-
-    results: dict = {"scanned": 0, "trials_active": 0, "verdicts_triggered": 0, "notes": []}
-
-    note_files = glob_module.glob(str(OBSIDIAN_INBOX_PATH / "*.md"))
-    results["scanned"] = len(note_files)
-
-    for note_file in note_files:
-        filename = Path(note_file).name
-        note_path = f"Aspirants/{filename}"
-        title = filename.replace(".md", "")
-
-        status = await _read_note_property(note_path, "status")
-        if status != "trials_active":
-            continue
-
-        results["trials_active"] += 1
-
-        thread_id = await _read_note_property(note_path, "thread_id")
-        if not thread_id:
-            results["notes"].append({"title": title, "skipped": "no thread_id"})
-            continue
-
-        messages = await _read_thread_messages(thread_id, limit=20)
-        if not messages:
-            results["notes"].append({"title": title, "skipped": "no messages"})
-            continue
-
-        # Find the timestamp of the Trials Initiated post (the ⚔️ bot message)
-        trials_ts = None
-        for msg in messages:
-            if msg.get("author", {}).get("bot") and "Trials Initiated" in msg.get("content", ""):
-                trials_ts = msg.get("timestamp")
-                break
-
-        # Collect non-bot messages posted after the trials were initiated
-        emperor_replies = []
-        for msg in messages:
-            if msg.get("author", {}).get("bot"):
-                continue
-            if trials_ts and msg.get("timestamp", "") <= trials_ts:
-                continue
-            content = msg.get("content", "").strip()
-            if content:
-                emperor_replies.append(content)
-
-        if not emperor_replies:
-            results["notes"].append({"title": title, "skipped": "no Emperor reply yet"})
-            continue
-
-        note_type = await _read_note_property(note_path, "type") or "unknown"
-        emperor_response = "\n\n".join(emperor_replies)
-
-        asyncio.create_task(run_trials_verdict(note_path, title, note_type, emperor_response))
-        results["verdicts_triggered"] += 1
-        results["notes"].append(
-            {"title": title, "verdict": "dispatched", "replies": len(emperor_replies)}
-        )
-
-    return results
-
-
 async def run_deployment(note_path: str, title: str, note_type: str) -> None:
-    """Stage 4: Deployment — Guilliman codifies and promotes a trials_passed note to its final vault location."""
+    """Stage 4: Deployment — Guilliman codifies and promotes a questions-cleared note to its final vault location."""
     try:
         logger.info(f"Deployment: starting for '{title}' (type={note_type})")
 
@@ -18143,14 +18006,14 @@ async def run_deployment(note_path: str, title: str, note_type: str) -> None:
 
 
 class InboxDeployRequest(BaseModel):
-    """Manual trigger for deployment on a trials_passed note."""
+    """Manual trigger for deployment on a questions-cleared aspirant note."""
 
     path: str
 
 
 @app.post("/api/inbox/deploy")
 async def inbox_deploy(request: InboxDeployRequest):
-    """Manually trigger Guilliman deployment on a trials_passed note."""
+    """Manually trigger Guilliman deployment on a questions-cleared aspirant note."""
     filename = request.path.rsplit("/", 1)[-1] if "/" in request.path else request.path
     title = filename.replace(".md", "")
 
@@ -18160,9 +18023,18 @@ async def inbox_deploy(request: InboxDeployRequest):
 
     note_type = await _read_note_property(request.path, "type") or "descriptive"
     status = await _read_note_property(request.path, "status")
-    if status not in ("trials_passed", "trials_complete"):
+    if status != "aspirant_trials":
         raise HTTPException(
-            status_code=400, detail=f"Note status is '{status}', expected 'trials_passed'"
+            status_code=400, detail=f"Note status is '{status}', expected 'aspirant_trials'"
+        )
+    try:
+        clear, blockers = await asyncio.to_thread(trials_clear, full_path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not clear:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "questions_not_clear", "blockers": blockers},
         )
 
     asyncio.create_task(
@@ -19060,13 +18932,10 @@ async def _handle_orphan_doc(doc_id: int) -> None:
 @app.post("/api/session-docs")
 async def create_session_doc(request: SessionDocCreateRequest):
     """Create a new session document."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    slug = request.title.lower().replace(" ", "-")[:50]
-
     if request.file_path:
         fp = Path(request.file_path)
     else:
-        fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+        fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
 
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
@@ -19206,7 +19075,7 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
     """Update session document metadata."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, status FROM session_documents WHERE id = ?", (doc_id,)
+            "SELECT id, status, file_path FROM session_documents WHERE id = ?", (doc_id,)
         )
         row = await cursor.fetchone()
         if not row:
@@ -19217,6 +19086,27 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         if request.title is not None:
             updates.append("title = ?")
             params.append(request.title)
+            old_raw = Path(row[2]) if row[2] else None
+            old_path = (
+                old_raw
+                if old_raw and old_raw.is_absolute()
+                else (OBSIDIAN_VAULT_PATH / old_raw if old_raw else None)
+            )
+            if old_path and old_path.exists():
+                desired_name = f"{human_filename_stem(request.title, fallback='Session')}.md"
+                new_path = (
+                    old_path
+                    if old_path.name == desired_name
+                    else unique_human_path(old_path.parent, request.title, fallback="Session")
+                )
+                if new_path != old_path:
+                    old_path.rename(new_path)
+                try:
+                    new_file_path = str(new_path.relative_to(OBSIDIAN_VAULT_PATH))
+                except ValueError:
+                    new_file_path = str(new_path)
+                updates.append("file_path = ?")
+                params.append(new_file_path)
         if request.project is not None:
             updates.append("project = ?")
             params.append(request.project)
@@ -19480,13 +19370,11 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
         workflow_state = inst_row[2]
 
     # Create the doc by reusing the create endpoint logic
-    today = datetime.now().strftime("%Y-%m-%d")
-    slug = request.title.lower().replace(" ", "-")[:50]
 
     if request.file_path:
         fp = Path(request.file_path)
     else:
-        fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+        fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
 
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
@@ -19768,9 +19656,7 @@ async def link_primarch_doc(
             )
         elif request and request.title:
             # Create new doc + link
-            today = datetime.now().strftime("%Y-%m-%d")
-            slug = request.title.lower().replace(" ", "-")[:50]
-            fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+            fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
             if fp.exists():
                 raise HTTPException(409, f"File already exists: {fp}")
             cursor = await db.execute(
@@ -20749,86 +20635,6 @@ async def _enforcement_cascade_worker(app_name: str):
             "reason": "timeout_or_exhausted",
         },
     )
-
-
-def start_enforcement_cascade(app_name: str):
-    """Start the enforcement cascade for a forbidden app. Idempotent — won't double-start."""
-    cascade = ENFORCEMENT_CASCADE
-    if is_quiet_hours():
-        print(f"CASCADE: quiet hours suppressed for {app_name}")
-        try:
-            asyncio.ensure_future(
-                log_quiet_hours_suppressed(
-                    source="phone",
-                    event_type="enforcement_cascade_start",
-                    app=app_name,
-                )
-            )
-        except RuntimeError:
-            pass
-        return
-    if cascade["active"]:
-        print(f"CASCADE: Already active for {cascade['app']}, ignoring {app_name}")
-        return
-
-    cascade["active"] = True
-    cascade["app"] = app_name
-    cascade["current_level"] = 0
-    cascade["task"] = asyncio.ensure_future(_enforcement_cascade_worker(app_name))
-
-
-def stop_enforcement_cascade(reason: str = "app_close"):
-    """Stop the enforcement cascade (app was closed or bailout triggered)."""
-    cascade = ENFORCEMENT_CASCADE
-    if not cascade["active"]:
-        return
-
-    app = cascade["app"]
-    level = cascade["current_level"]
-    elapsed = time.monotonic() - (cascade["started_at"] or time.monotonic())
-    print(f"CASCADE STOP: app={app} level={level} elapsed={elapsed:.0f}s reason={reason}")
-
-    cascade["active"] = False
-    cascade["app"] = None
-    cascade["current_level"] = 0
-    cascade["started_at"] = None
-    cascade["last_escalation"] = None
-
-    if cascade["task"] and not cascade["task"].done():
-        cascade["task"].cancel()
-    cascade["task"] = None
-
-    asyncio.ensure_future(
-        log_event(
-            "enforcement_cascade_stop",
-            device_id="phone",
-            details={"app": app, "level": level, "elapsed_s": round(elapsed), "reason": reason},
-        )
-    )
-
-
-def check_phone_reachable() -> dict:
-    """
-    Check if phone is reachable via heartbeat endpoint.
-
-    Returns:
-        dict with reachable status
-    """
-    host = PHONE_CONFIG["host"]
-    port = PHONE_CONFIG["port"]
-    timeout = PHONE_CONFIG["timeout"]
-
-    url = f"http://{host}:{port}/heartbeat"
-
-    try:
-        response = requests.get(url, timeout=timeout)
-        PHONE_STATE["reachable"] = True
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        return {"reachable": True, "status_code": response.status_code}
-    except Exception:
-        PHONE_STATE["reachable"] = False
-        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
-        return {"reachable": False}
 
 
 if __name__ == "__main__":

@@ -89,6 +89,19 @@ curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/rename" \
   -d "{\"tab_name\": \"$PERSONA_TITLE\"}"
 ```
 
+**Custodes-only: also flip synced + instance_type.** Custodes is the synced singleton — the state-hook dispatcher requires `synced=1 AND instance_type='sync'` to find the live instance. Skip this for any other persona.
+
+```bash
+if [ "$LEGION" = "custodes" ]; then
+  curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/synced" \
+    -H "Content-Type: application/json" -d '{"synced": true}'
+  curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/type" \
+    -H "Content-Type: application/json" -d '{"instance_type": "sync"}'
+fi
+```
+
+Without this, `_dispatch_custodes_intervention` in `main.py` cannot see the instance, falls through to `_launch_custodes_for_intervention`, and spams `cd /Volumes/Imperium/Imperium-ENV && primarch custodes …` into the pane every time a state hook fires. (See `Mars/Tasks/Custodes Single Source of Truth.md`.)
+
 ### Step 5: Confirm
 
 Report what was set:

@@ -8,29 +8,35 @@ Operational contract:
 - Treat the Gene-Seed section as authoritative intent. Preserve it; do not rewrite it away or let later context override it.
 - Use Obsidian context actively: `obsidian vault=Imperium-ENV read`, `search`, `search:context`, and `backlinks` as needed.
 - Perform concrete implantation/trials work: find related vault notes, identify useful research/context, challenge assumptions, and write the useful output back to the aspirant note.
-- Your primary output is proactive `open_questions`: adversarial questions that must be answered or waived before the aspirant can pass trials.
+- Your primary output is proactive `questions`: adversarial entries appended to the frontmatter array. Every entry must be closed (answered or waived) before the aspirant can pass trials.
 - Append your work to the aspirant note under clear `## Implantation` / `## Trials` sections or a concise continuation if those sections already exist.
-- Ask for Emperor direction only by writing structured `open_questions`; do not treat wakeups, retries, or repeated nudges as approval.
+- Ask for Emperor direction only by writing structured `questions` entries; do not treat wakeups, retries, or repeated nudges as approval.
 - Keep changes surgical and auditable.
 
-Open-question contract:
-- Maintain frontmatter `open_questions` as the canonical state. Do not add `open_questions_resolved`; derive resolution from the dict.
-- Use stable letter keys (`a`, `b`, `c`, ...). Do not renumber existing questions.
-- Valid statuses are `open`, `answered`, and `waived`.
-- Use this shape:
+Question contract:
+- Maintain frontmatter `questions` as an array of objects. It is the canonical state — the trials-clear gate is a parser predicate over this array, not a prose contract.
+- Entry shape:
 
 ```yaml
-open_questions:
-  a:
-    question: "What operator decision blocks safe dispatch?"
-    status: open
+questions:
+  - question: "What operator decision blocks safe dispatch?"
     answer: null
-    followups: {}
+    state: unanswered
+    importance: 8
 ```
 
+- Fields:
+  - `question` — the adversarial question, plain text.
+  - `answer` — string when resolved, `null` when not. For waived entries, set `answer: "waived: <reason>"`.
+  - `state` — one of `unanswered`, `refining`, `open`, `closed`. Only `closed` counts as resolved.
+  - `importance` — integer 1–10. Use this to prioritize attention; it does NOT affect the gate.
+- Append new entries to the end of the array; do not renumber or reorder existing entries.
+- Empty `questions: []` unambiguously means "none posed yet."
+- Trials-clear predicate (MVP): every entry has `state == "closed"`. No special case for the meta-question; if you stop adding questions, close q1 explicitly.
+- Mandated starter entries are seeded by the intake template (`aspirant_create.py`):
+  1. Meta: "which other questions are needed for this aspirant?" (importance 10) — its `answer` field carries the instruction to append more questions; do not write the actual answer there.
+  2. Gene-seed reshuffle: "is there a better way to organize the thoughts from the gene seed?" (importance 8).
 - No asked/answered timestamps in this MVP.
-- Followups are nested under `followups` and count as unresolved until they are `answered` or `waived`.
-- Trials do not end while any question or followup remains `open`.
 
 Dispatch boundary rule:
 - Do not launch downstream workers.

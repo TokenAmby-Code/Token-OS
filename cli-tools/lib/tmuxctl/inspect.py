@@ -9,7 +9,7 @@ from .models import (
 )
 from .revert import is_transient_window_name
 
-CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus", "tui"}
+CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus"}
 # Stack windows may spill into sibling windows suffixed `-N` (e.g. legion-2).
 # These match a canonical base and should not flag as missing or unknown.
 STACK_BASES = {"legion", "mechanicus", "mars", "kreig"}
@@ -156,7 +156,12 @@ def render_doctor(snapshot: WorkspaceSnapshot) -> str:
                 issues.append(
                     f"{window.target} has missing grid focus stash panes: {', '.join(missing)}"
                 )
-            if len(stash_ids) not in {0, 3}:
+            expected_stash_size = 0
+            if window.archetype.value == "palace":
+                expected_stash_size = 1
+            elif window.archetype.value == "somnium":
+                expected_stash_size = 3
+            if expected_stash_size and len(stash_ids) not in {0, expected_stash_size}:
                 issues.append(
                     f"{window.target} has invalid grid focus stash size: {len(stash_ids)}"
                 )

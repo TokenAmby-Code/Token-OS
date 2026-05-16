@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -101,7 +102,7 @@ def test_dispatch_kind_alias_requires_aspirant():
 
 def test_dispatch_auto_policy_uses_origin_env(monkeypatch):
     monkeypatch.delenv("TOKEN_API_INTERNAL_DISPATCH", raising=False)
-    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "c")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "make this a tracked worker goal"],
         capture_output=True,
@@ -116,7 +117,7 @@ def test_dispatch_auto_policy_uses_origin_env(monkeypatch):
 
 
 def test_dispatch_direct_bypasses_auto_policy(monkeypatch):
-    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "c")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "--direct", "launch directly"],
         capture_output=True,
@@ -155,7 +156,7 @@ def test_dispatch_aspirant_uses_internal_backend_without_public_command(tmp_path
 
 
 def test_dispatch_auto_policy_ignores_resume(monkeypatch):
-    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "c")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -178,8 +179,83 @@ def test_dispatch_auto_policy_ignores_resume(monkeypatch):
     assert "dispatch aspirant dry-run" not in result.stdout
 
 
+def test_dispatch_resume_aliases_are_open(monkeypatch):
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    for flag in ("--resume", "-r"):
+        result = subprocess.run(
+            [
+                str(DISPATCH),
+                "--dry-run",
+                flag,
+                "missing-session",
+                "--engine",
+                "claude",
+                "--dir",
+                str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "resume_id:       missing-session" in result.stdout
+        assert "dispatch aspirant dry-run" not in result.stdout
+
+
+def test_dispatch_interactive_session_doc_resume_option(tmp_path, monkeypatch):
+    db = tmp_path / "agents.db"
+    import sqlite3
+
+    escaped_root = str(ROOT).replace("'", "''")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        f"""
+        CREATE TABLE session_documents (id INTEGER, file_path TEXT);
+        CREATE TABLE claude_instances (
+          session_id TEXT, engine TEXT, launcher TEXT, target_working_dir TEXT,
+          working_dir TEXT, dispatch_session_doc_path TEXT, session_doc_id INTEGER,
+          instance_type TEXT, zealotry TEXT, dispatch_target TEXT, dispatch_window TEXT,
+          dispatch_mode TEXT, dispatch_slot TEXT, launch_mode TEXT, tmux_pane TEXT,
+          primarch TEXT, parent_instance_id TEXT, discord_hosted TEXT,
+          discord_channel TEXT, discord_bot TEXT, tab_name TEXT, pane_label TEXT,
+          last_activity TEXT
+        );
+        INSERT INTO claude_instances (
+          session_id, engine, working_dir, instance_type, zealotry, tab_name, last_activity
+        ) VALUES ('resume-session-id', 'claude', '{escaped_root}', 'golden_throne', '5', 'Readable Name', '2026-05-15');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("TOKEN_API_DB", str(db))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__resume__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_RESUME", "resume-session-id")
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--interactive",
+            "--direct",
+            "--engine",
+            "claude",
+            "--dir",
+            str(ROOT),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "resume_id:       resume-session-id" in result.stdout
+    assert "resume_db:       true" in result.stdout
+
+
 def test_dispatch_auto_policy_ignores_internal_dispatch(monkeypatch):
-    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "c")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     monkeypatch.setenv("TOKEN_API_INTERNAL_DISPATCH", "1")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "internal launch"],
@@ -209,8 +285,11 @@ def test_human_shell_surfaces_call_dispatch_interactive_aspirants(tmp_path):
     script = f"""
       source {ROOT / "cli-tools" / "lib" / "shell-aliases.sh"}
       c
-      cc "do more"
+      d "do more"
       cdc {ROOT} "do cdc"
+      d --direct "direct work"
+      cdc {ROOT} --direct "direct cdc"
+      d --resume resume-session-id
     """
     env = os.environ.copy()
     env.update(
@@ -234,9 +313,62 @@ def test_human_shell_surfaces_call_dispatch_interactive_aspirants(tmp_path):
 
     assert result.returncode == 0, result.stderr
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "c|--interactive --aspirant --aspirant-kind dispatch"
-    assert lines[1] == "cc|--aspirant --aspirant-kind dispatch do more"
-    assert lines[2] == "cdc|--aspirant --aspirant-kind dispatch do cdc"
+    assert lines[0] == "d|--aspirant --aspirant-kind dispatch --interactive do more"
+    assert lines[1] == f"cdc|--aspirant --aspirant-kind dispatch --interactive --dir {ROOT} do cdc"
+    assert lines[2] == "d|--interactive --direct direct work"
+    assert lines[3] == f"cdc|--interactive --dir {ROOT} --direct direct cdc"
+    assert lines[4] == "d|--interactive --resume resume-session-id"
+
+
+def test_dispatch_human_origin_forces_interactive_even_with_direct(monkeypatch):
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__sisters_of_battle__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "launch directly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatch dry-run" in result.stdout
+    assert "dispatch aspirant dry-run" not in result.stdout
+    assert "engine:          codex" in result.stdout
+    assert "instance_type:   one_off" in result.stdout
+
+
+def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_MENU_CONSUMED", "1")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__sisters_of_battle__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--engine",
+            "claude",
+            "--dir",
+            str(ROOT),
+            "launch directly",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatch dry-run" in result.stdout
+    assert "engine:          claude" in result.stdout
+    assert "instance_type:   golden_throne" in result.stdout
 
 
 def test_dispatch_aspirant_rejects_inline_system_prompt():
@@ -276,8 +408,19 @@ def test_dispatch_interactive_aspirant_collects_objective_from_override(monkeypa
 def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     vault = tmp_path / "Imperium-ENV"
     vault.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmuxctl_log = tmp_path / "tmuxctl.log"
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%aspirant-pane\\n"\n',
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
     env = os.environ.copy()
     env["IMPERIUM"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TMUXCTL_LOG"] = str(tmuxctl_log)
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -304,10 +447,12 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "status: aspirant_trials" in result.stdout
-    assert "dispatch_schema_complete: True" in result.stdout
-    assert "dispatch_ready: False" in result.stdout
-    assert "operator_approved_dispatch: False" in result.stdout
+    data = json.loads(result.stdout.splitlines()[0])
+    assert data["status"] == "aspirant_trials"
+    assert data["dispatch_schema_complete"] is True
+    assert data["dispatch_ready"] is False
+    assert data["operator_approved_dispatch"] is False
+    assert "dispatched claude to %aspirant-pane" in result.stdout
 
     note = next((vault / "Aspirants").glob("implement-safely*.md"))
     note_text = note.read_text(encoding="utf-8")
@@ -316,4 +461,77 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "dispatch_ready: false" in note_text
     assert "trials_verdict: pending" in note_text
     assert "operator_approved_dispatch: false" in note_text
-    assert "open_questions: {}" in note_text
+    assert "questions:" in note_text
+    assert "which other questions are needed for this aspirant?" in note_text
+    assert "importance: 10" in note_text
+    assert "launch_action: dispatch --direct --engine claude" in result.stdout
+    assert "--target legion:new" in result.stdout
+    assert "--session-doc" in result.stdout
+    assert "--system-prompt-file" in result.stdout
+    assert "--prompt-file" in result.stdout
+    launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
+    assert "stack dispatch legion --session main" in launched
+    assert "--append-system-prompt" in launched
+    assert "Aspirant Session Startup" in launched
+    assert "## Implantation" in launched
+    assert "## Trials" in launched
+
+
+def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp_path):
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    env = os.environ.copy()
+    env["IMPERIUM"] = str(tmp_path)
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--aspirant",
+            "--aspirant-kind",
+            "dispatch",
+            "--intake-only",
+            "--engine",
+            "claude",
+            "--persona",
+            "vulkan",
+            "--dir",
+            str(ROOT),
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Tests pass",
+            "Implement safely",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "status: aspirant_trials" in result.stdout
+    assert "dispatch_schema_complete: True" in result.stdout
+    assert "dispatched claude" not in result.stdout
+
+
+def test_tmux_prefix_space_launcher_routes_to_d_without_popup_newline():
+    conf = (ROOT / "cli-tools" / "tmux" / "tmux-base.conf").read_text(encoding="utf-8")
+    assert "bind Space command-prompt" in conf
+    assert "display-popup" not in conf.split("bind Space", 1)[1].split("\n", 1)[0]
+    assert "tmux-legion-prompt --prompt" in conf
+
+    launcher = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt").read_text(encoding="utf-8")
+    assert 'LAUNCH_CMD="cd ~ && d ' in launcher
+    assert "c --prompt-file" not in launcher
+
+
+def test_fzf_launcher_expands_and_cli_prompt_retracts_idempotently():
+    dispatch = DISPATCH.read_text(encoding="utf-8")
+    assert 'tmux-grid-expand --pane "$pane" --expand' in dispatch
+    assert 'tmux-grid-expand --pane "$DISPATCH_AUTO_EXPANDED_PANE" --retract' in dispatch
+    assert '[[ -n "$PROMPT" ]] || return 0' in dispatch
+
+    expand = (ROOT / "cli-tools" / "bin" / "tmux-grid-expand").read_text(encoding="utf-8")
+    assert "--expand" in expand
+    assert 'if [[ "$EXPAND" == true ]]' in expand
+    assert 'if [[ "$WINDOW_ZOOMED" != "1" ]]' in expand

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import time
-import hashlib
 from pathlib import Path
 
 
@@ -34,7 +34,6 @@ _PANE_TARGET_COMMANDS = {
 _PANE_OPTION_COMMANDS = {"set-option", "set", "show-options", "show"}
 _PANE_TARGET_FLAGS = {"-t", "-s"}
 _SLOT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-
 
 
 def normalize_prompt_payload(text: str) -> str:
@@ -82,10 +81,18 @@ def _looks_like_custom_pane_target(target: str) -> bool:
         return False
     if ":" not in target:
         return False
-    _, slot = target.rsplit(":", 1)
-    if not slot or slot.isdigit():
+    left, slot = target.rsplit(":", 1)
+    if not slot or slot.isdigit() or not _SLOT_RE.match(slot):
         return False
-    return bool(_SLOT_RE.match(slot))
+    return left.isdigit() or left in {
+        "palace",
+        "somnium",
+        "legion",
+        "mechanicus",
+        "mars",
+        "kreig",
+        "tui",
+    }
 
 
 def _command_has_pane_option_scope(args: tuple[str, ...]) -> bool:
@@ -106,7 +113,7 @@ class TmuxAdapter:
 
     The adapter is the lowest Python tmux boundary. Pane-scoped target flags are
     resolved through tmuxctl before subprocess execution, so callers can pass
-    stable custom ids (``1:N``, ``1:NW``, ``palace:N``, ``legion:custodes``) in
+    stable custom ids (``1:N``, ``palace:N``, ``somnium:SE``, ``legion:custodes``) in
     place of volatile ``%N`` pane ids.
     """
 

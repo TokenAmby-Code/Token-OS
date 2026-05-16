@@ -93,6 +93,62 @@ run_tmuxctl() {
     PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m tmuxctl.cli "$@"
 }
 
+workspace_needs_repair() {
+    local session="${1:-$SESSION_NAME}"
+
+    tmux has-session -t "$session" 2>/dev/null || return 1
+
+    local window count roles expected role
+    for window in palace somnium legion mechanicus; do
+        if ! tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -Fxq "$window"; then
+            return 0
+        fi
+    done
+
+    count=$(tmux list-panes -t "${session}:palace" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" == "4" ]] || return 0
+    count=$(tmux list-panes -t "${session}:somnium" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" == "5" ]] || return 0
+    count=$(tmux list-panes -t "${session}:legion" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" -ge 1 ]] || return 0
+    count=$(tmux list-panes -t "${session}:mechanicus" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" -ge 1 ]] || return 0
+
+    roles=$(tmux list-panes -t "${session}:palace" -F '#{@PANE_ID}' 2>/dev/null || true)
+    for expected in palace:W palace:N palace:S palace:E; do
+        grep -Fxq "$expected" <<<"$roles" || return 0
+    done
+
+    roles=$(tmux list-panes -t "${session}:somnium" -F '#{@PANE_ID}' 2>/dev/null || true)
+    for expected in somnium:W somnium:N somnium:S somnium:NE somnium:SE; do
+        grep -Fxq "$expected" <<<"$roles" || return 0
+    done
+
+    role=$(tmux list-panes -t "${session}:legion" -F '#{@PANE_ID}' 2>/dev/null | head -1)
+    [[ "$role" == "legion:custodes" ]] || return 0
+    role=$(tmux list-panes -t "${session}:mechanicus" -F '#{@PANE_ID}' 2>/dev/null | head -1)
+    [[ "$role" == "mechanicus:fabricator-general" ]] || return 0
+
+    return 1
+}
+
+ensure_workspace_before_attach() {
+    local session="${1:-$SESSION_NAME}"
+
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        return 0
+    fi
+
+    if workspace_needs_repair "$session"; then
+        log_warn "Session '${session}' is not the managed full layout; rebuilding it."
+        if ! run_tmuxctl restart --execute --session "$session"; then
+            log_warn "Managed restart failed; replacing malformed session '${session}'."
+            tmux kill-session -t "$session" 2>/dev/null || true
+            run_tmuxctl create --session "$session"
+        fi
+    fi
+}
+
 # --- Help ---
 show_help() {
     # Detect terminal width, default to 80
@@ -222,13 +278,14 @@ cmd_start() {
     fi
 
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        ensure_workspace_before_attach "$SESSION_NAME"
         log_info "Attaching to existing session '${SESSION_NAME}'"
-        exec tmux attach-session -t "$SESSION_NAME"
+        exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
     fi
 
     log_info "Creating workspace session '${SESSION_NAME}'"
     run_tmuxctl create --session "$SESSION_NAME"
-    exec tmux attach-session -t "$SESSION_NAME"
+    exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
 }
 
 cmd_restart_pane() {
@@ -293,7 +350,7 @@ cmd_restart() {
 
     run_tmuxctl restart --execute --session "$session" || true
     tmux-resurrect restore 2>/dev/null || true
-    exec tmux attach-session -t "$SESSION_NAME"
+    exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
 }
 
 # Internal: invoked by `tx restart` via run-shell -b inside tmux. Runs the
@@ -682,11 +739,7 @@ if [[ $# -eq 0 ]]; then
     if in_tmux; then
         cmd_status
     else
-        if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-            cmd_start
-        else
-            show_help
-        fi
+        cmd_start
     fi
     exit 0
 fi

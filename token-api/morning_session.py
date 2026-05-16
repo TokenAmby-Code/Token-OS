@@ -15,7 +15,6 @@ The launcher exits after launch — the Claude session is autonomous from there.
 import json
 import os
 import subprocess
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -454,45 +453,41 @@ def create_legion_pane() -> str | None:
 
 
 def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
-    """Write prompt to temp file and launch interactive Claude via primarch in the legion pane."""
-    Path(PROMPT_FILE).write_text(prompt_text)
+    """Deliver the morning prompt via `tmuxctl assert-custodes`.
 
-    # Build launch command using primarch launcher
-    # primarch custodes sets TOKEN_API_PRIMARCH=custodes, which triggers
-    # auto-registration as legion=custodes, instance_type=sync in SessionStart hook
-    launch_cmd = (
-        f"cd '{VAULT_DIR}' && primarch custodes \"$(cat {PROMPT_FILE})\" ; rm -f {PROMPT_FILE}"
-    )
+    tmuxctl owns the detect→upsert/restart decision: if a claude is already
+    live in legion:custodes (e.g. yesterday's session never exited), the
+    prompt is upserted via `claude-cmd --pane` instead of stacking a fresh
+    shell launch on top. Otherwise tmuxctl fires `dispatch --persona custodes
+    --sync` (the non-deprecated launcher).
 
+    `pane_id` is accepted for compatibility but not used directly — tmuxctl
+    resolves `legion:custodes` itself via the `@PANE_ID` tag.
+    """
+    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     try:
-        # Clear pane and send launch command
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, "C-c"],
+        result = subprocess.run(
+            [str(tmuxctl), "assert-custodes", "--stdin"],
+            input=prompt_text,
             capture_output=True,
-            timeout=5,
+            text=True,
+            timeout=45,
         )
-        time.sleep(0.2)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, "C-u"],
-            capture_output=True,
-            timeout=5,
-        )
-        time.sleep(0.1)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, "clear", "Enter"],
-            capture_output=True,
-            timeout=5,
-        )
-        time.sleep(0.3)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, launch_cmd, "Enter"],
-            capture_output=True,
-            timeout=5,
-        )
-        return True
+    except subprocess.TimeoutExpired:
+        print("Error: tmuxctl assert-custodes timed out")
+        return False
     except Exception as e:
         print(f"Error launching in legion pane: {e}")
         return False
+
+    if result.returncode != 0:
+        print(
+            f"Error: tmuxctl assert-custodes rc={result.returncode}: "
+            f"stdout={result.stdout.strip()[:200]} stderr={result.stderr.strip()[:200]}"
+        )
+        return False
+    print(f"Morning session: {result.stdout.strip()}")
+    return True
 
 
 def run_morning_session() -> dict:

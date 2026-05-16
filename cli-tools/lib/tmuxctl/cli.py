@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from .api import RegistryError
 from .service import TmuxControlPlane
@@ -63,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--session", default="main")
 
     resolve_parser = subparsers.add_parser("resolve-pane")
+    resolve_parser.add_argument("--format", choices=["id", "full", "json"], default="full")
     resolve_parser.add_argument("target")
 
     send_text_parser = subparsers.add_parser("send-text")
@@ -132,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser = subparsers.add_parser("rebuild-window")
     rebuild_parser.add_argument("--window", default="current")
 
+    assert_custodes_parser = subparsers.add_parser(
+        "assert-custodes",
+        help="Deliver a prompt to legion:custodes: upsert if claude alive, else launch.",
+    )
+    assert_custodes_parser.add_argument("--session", default="main")
+    prompt_source = assert_custodes_parser.add_mutually_exclusive_group(required=True)
+    prompt_source.add_argument("--prompt", help="Inline prompt text")
+    prompt_source.add_argument("--prompt-file", help="Path to prompt file")
+    prompt_source.add_argument("--stdin", action="store_true", help="Read prompt from stdin")
+
     return parser
 
 
@@ -182,7 +194,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "resolve-pane":
-            print(control.resolve_pane(args.target))
+            resolved = control.resolve_pane(args.target)
+            if args.format == "id":
+                print(resolved.splitlines()[1].split(": ", 1)[1])
+            elif args.format == "json":
+                import json
+
+                values = {}
+                for line in resolved.splitlines():
+                    key, value = line.split(": ", 1)
+                    values[key] = value
+                print(json.dumps(values))
+            else:
+                print(resolved)
             return 0
 
         if args.command == "send-text":
@@ -316,6 +340,21 @@ def main(argv: list[str] | None = None) -> int:
             session_name, window_index = _parse_window_ref(args.window, control)
             print(control.rebuild_window(session_name=session_name, window_index=window_index))
             return 0
+
+        if args.command == "assert-custodes":
+            import json as _json
+
+            from .custodes import assert_custodes
+
+            if args.stdin:
+                prompt_text = sys.stdin.read()
+            elif args.prompt_file:
+                prompt_text = Path(args.prompt_file).read_text()
+            else:
+                prompt_text = args.prompt
+            result = assert_custodes(control.adapter, prompt_text, session=args.session)
+            print(_json.dumps(result))
+            return 0 if result.get("dispatched") else 1
 
         parser.error(f"unhandled command: {args.command}")
     except (

@@ -7,11 +7,13 @@
 #   tmux-grid-expand              # Toggle native zoom for the active pane
 #   tmux-grid-expand --pane %12   # Toggle native zoom for a specific pane
 #   tmux-grid-expand --retract    # Unzoom the target window if zoomed
+#   tmux-grid-expand --expand     # Zoom the target window if not already zoomed
 
 set -euo pipefail
 
 TARGET_PANE=""
 RETRACT=false
+EXPAND=false
 CLIENT=""
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +32,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --retract)
             RETRACT=true
+            shift
+            ;;
+        --expand)
+            EXPAND=true
             shift
             ;;
         -h|--help)
@@ -70,6 +76,13 @@ tmux set-option -w -t "$TARGET_WINDOW" @SIDE_EXPANDED "none" 2>/dev/null || true
 
 if [[ "$RETRACT" == true ]]; then
     if [[ "$WINDOW_ZOOMED" == "1" ]]; then
+        tmux resize-pane -Z -t "$TARGET_PANE"
+    fi
+    exit 0
+fi
+
+if [[ "$EXPAND" == true ]]; then
+    if [[ "$WINDOW_ZOOMED" != "1" ]]; then
         tmux resize-pane -Z -t "$TARGET_PANE"
     fi
     exit 0

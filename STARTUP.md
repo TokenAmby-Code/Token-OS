@@ -30,7 +30,7 @@ Central reference for all custom startup automations across devices.
 3. **caffeinate** starts immediately — display stays on
 4. **tokenapi** starts on `:7777`
 5. **gateway** + **discord-context** start
-6. Windows PC boots → Deskflow KVM connects → `POST /api/kvm/start` signals Mac
+6. Windows PC boots → Deskflow KVM connects → Mac Token-API runs keymap guard and starts/reloads Deskflow client
 
 ## Power Settings (`pmset`)
 
@@ -122,9 +122,14 @@ Not managed by us. Includes: Steam, Discord, Docker Desktop, Spotify, Figma Agen
 2. Task Scheduler fires all logon-triggered tasks (with respective delays)
 3. **ahk_boot** starts immediately and opens Windows Terminal with `monitor` on the leftmost screen — this starts WSL Ubuntu and triggers systemd
 4. WSL systemd starts **token-satellite** on `:7777`
-5. `startup.ahk` waits for `token-satellite` health, then calls `POST /kvm/control {"action":"reload"}` to kick DeskFlow's phased recovery ladder instead of launching the old task directly
+5. `startup.ahk` waits for `token-satellite` health, then calls `POST /kvm/control {"action":"reload"}` to kick DeskFlow's phased recovery ladder instead of launching the old task directly. Mac KVM start/reload runs `Shell/deskflow-keymap-guard.sh` to preserve the Australian-input-source keymap fix.
 6. `startup.ahk` launches **Bluetooth Audio Receiver** so the phone can route audio through the PC
 7. `ahk_init`, `ahk_admin`, PowerToys, DMT, and Fast! start on their respective schedules
+
+
+## Deskflow KVM Canonical Reference
+
+Deskflow architecture, keymap fix, and incident history are consolidated in the vault at `Terra/Ultramar/Personal-Infra/Deskflow KVM.md`. Do not use old incident notes as source of truth.
 
 ---
 

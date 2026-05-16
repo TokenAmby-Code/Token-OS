@@ -123,9 +123,9 @@ def _index_positionals(
     """Index public stable pane addresses for a pane.
 
     Supported address forms:
-      - raw logical role, already handled elsewhere: ``palace:NW``
-      - window-index position: ``1:NW`` / ``1:N``
-      - window-name position: ``palace:NW`` / ``somnium:SE`` / ``bridge:SR``
+      - raw logical role, already handled elsewhere: ``palace:N``
+      - window-index position: ``1:N``
+      - page-name position: ``palace:N`` / ``somnium:SE``
 
     The index is derived only from live tmux state and @PANE_ID. Nothing here is
     persisted; it is intended to replace stale stored %pane references at
@@ -211,9 +211,12 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
 def resolve_pane(adapter: TmuxAdapter, target: str) -> PaneResolution:
     """Resolve physical ids, @PANE_ID roles, and positional pane addresses.
 
-    Positional addresses are live runtime aliases such as ``1:N`` or ``1:NW``:
-    ``<window-index-or-name>:<position>``. They are resolved from tmux state on
-    every call and are not cached.
+    Positional addresses are live runtime aliases such as ``1:N``:
+    ``<window-index-or-page>:<position>``. They are resolved from tmux state on
+    every call and are not cached. The low-level tmux interceptors intentionally
+    restrict custom pane-target interception to numeric window indexes and the
+    managed page prefixes so tmux window targets like ``session:palace`` pass
+    through unchanged.
     """
     if target.startswith("%"):
         first = _snapshot_from_live(adapter, target)

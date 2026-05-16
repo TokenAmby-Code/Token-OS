@@ -281,3 +281,81 @@ class TestReconciliation:
             ("custodes", "%new"),
             ("astartes", "%old"),
         ]
+
+    def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env):
+        """Plan-mode context-clear: Claude Code emits fresh session_id but same pid+pane.
+        The supplant chain must catch this so legion='custodes' and synced=1 survive."""
+        old_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, legion, synced, instance_type, tmux_pane, pid,
+                registered_at, last_activity)
+               VALUES (?, ?, 'custodes-pre-plan', '/tmp/c', 'local', 'Mac-Mini',
+                       'idle', 'custodes', 1, 'sync', '%42', 7777,
+                       datetime('now'), datetime('now'))""",
+            (old_id, str(uuid.uuid4())),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": new_id,
+                "cwd": "/tmp/c",
+                "pid": 7777,
+                "tmux_pane": "%42",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["action"] == "supplanted"
+
+        conn = _db(app_env)
+        # Old id should be gone (replaced by new_id)
+        old_row = conn.execute("SELECT id FROM claude_instances WHERE id = ?", (old_id,)).fetchone()
+        new_row = conn.execute(
+            "SELECT legion, synced, instance_type, tmux_pane, pid FROM claude_instances WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+        conn.close()
+        assert old_row is None
+        assert new_row is not None
+        assert new_row["legion"] == "custodes"
+        assert new_row["synced"] == 1
+        assert new_row["instance_type"] == "sync"
+        assert new_row["tmux_pane"] == "%42"
+        assert new_row["pid"] == 7777
+
+    def test_pid_pane_supplant_only_matches_active_rows(self, client, app_env):
+        """Stopped rows with same pid+pane should NOT be supplanted (they're dead)."""
+        old_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, legion, synced, instance_type, tmux_pane, pid,
+                registered_at, last_activity)
+               VALUES (?, ?, 'dead-row', '/tmp/c', 'local', 'Mac-Mini',
+                       'stopped', 'custodes', 0, 'sync', '%42', 7777,
+                       datetime('now'), datetime('now'))""",
+            (old_id, str(uuid.uuid4())),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": new_id,
+                "cwd": "/tmp/c",
+                "pid": 7777,
+                "tmux_pane": "%42",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        # Should fall through to normal registration, not supplant the stopped row
+        assert resp.json()["action"] != "supplanted"
