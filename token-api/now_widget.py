@@ -65,7 +65,9 @@ def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
         ):
             surface = human_pane_surface(row["tab_name"], row["tmux_pane"], row["pane_label"])
             if surface == "session":
-                surface = Path(row["working_dir"]).name if row["working_dir"] else row["id"]
+                surface = row["tmux_pane"] or (
+                    Path(row["working_dir"]).name if row["working_dir"] else row["id"]
+                )
             active_instances.append(surface or "unknown")
 
         event_cutoff = (datetime.now(MST) - timedelta(hours=1)).isoformat()

@@ -36,6 +36,7 @@ from instance_mutation import (
 )
 from pane_surface import human_tab_name as _human_tab_name
 from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavlok_stimulus
+from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
@@ -257,6 +258,86 @@ def _normalize_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _instance_name_base_from_session_doc(title: str | None, file_path: str | None) -> str:
+    """Return the shared instance-name prefix for a session doc.
+
+    Instances are named after the document they are attached to, with a
+    monotonic per-document suffix: `<session-doc-name>-1`, `...-2`, etc.
+    Dates remain metadata, so strip legacy date prefixes/suffixes if they are
+    present on old docs.
+    """
+    raw = (title or "").strip()
+    if not raw and file_path:
+        raw = Path(file_path).stem
+    raw = re.sub(r"^\d{4}-\d{2}-\d{2}[- ]+", "", raw)
+    raw = re.sub(r"[- ]+\d{4}-\d{2}-\d{2}(?:-\d+)?$", "", raw)
+    raw = re.sub(r"[^\w\s-]", " ", raw)
+    raw = re.sub(r"[_\s-]+", "-", raw.lower()).strip("-")
+    return raw[:80].strip("-") or "session-doc"
+
+
+async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int) -> str:
+    cursor = await db.execute(
+        "SELECT title, file_path FROM session_documents WHERE id = ?", (doc_id,)
+    )
+    row = await cursor.fetchone()
+    title = row[0] if row else None
+    file_path = row[1] if row else None
+    base = _instance_name_base_from_session_doc(title, file_path)
+
+    # Monotonic by existing suffix, not row count: stopped/historical rows
+    # remain in the DB and prior instance renames may leave gaps.
+    cursor = await db.execute(
+        "SELECT tab_name FROM claude_instances WHERE session_doc_id = ?", (doc_id,)
+    )
+    rows = await cursor.fetchall()
+    suffix_rx = re.compile(rf"^{re.escape(base)}-(\d+)$")
+    max_suffix = 0
+    for row in rows:
+        match = suffix_rx.match(str(row[0] or ""))
+        if match:
+            max_suffix = max(max_suffix, int(match.group(1)))
+    return f"{base}-{max_suffix + 1}"
+
+
+async def _apply_session_doc_instance_name(
+    db: aiosqlite.Connection,
+    *,
+    instance_id: str,
+    session_doc_id: int | None,
+    wrapper_launch_id: str | None = None,
+) -> str | None:
+    """Name instance from its session doc: `<doc-slug>-<monotonic ordinal>`."""
+    if not session_doc_id:
+        return None
+    cursor = await db.execute(
+        """
+        SELECT ci.tab_name, sd.title, sd.file_path
+        FROM claude_instances ci
+        LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+        WHERE ci.id = ?
+        """,
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    base = _instance_name_base_from_session_doc(row[1], row[2])
+    if re.match(rf"^{re.escape(base)}-\d+$", str(row[0] or "")):
+        return str(row[0])
+    new_name = await _next_session_doc_instance_name(db, session_doc_id)
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates={"tab_name": new_name},
+        mutation_type="instance_updated",
+        write_source="hooks",
+        actor="SessionStart:session-doc-instance-name",
+        wrapper_launch_id=wrapper_launch_id,
+    )
+    return new_name
 
 
 def _json_or_none(value: str | None) -> Any:
@@ -610,17 +691,7 @@ async def handle_wrapper_end(payload: dict) -> dict:
     return {"success": True, "action": "wrapper_end_logged", "wrapper_launch_id": wrapper_launch_id}
 
 
-# ============ Session Doc Pool Derivation ============
-
-
-def _derive_pool(working_dir: str | None) -> str:
-    """Derive pool from working directory: civic/pax dirs → pk, everything else → personal."""
-    if not working_dir:
-        return "personal"
-    wd_lower = working_dir.lower()
-    if any(tok in wd_lower for tok in ("pax-env", "askcivic", "/civic/", "/pax/")):
-        return "pk"
-    return "personal"
+# ============ Launch Zealotry Parsing ============
 
 
 def _parse_launch_zealotry(value: Any) -> int | None:
@@ -779,6 +850,24 @@ async def handle_session_start(payload: dict) -> dict:
             if row:
                 supplant_id = row["id"]
 
+        # 4. PID+pane match (covers plan-mode context-clear: Claude Code emits a fresh
+        # session_id but the underlying process keeps the same PID and tmux pane).
+        # Without this, custodes rows lose legion/synced/instance_type on plan-mode exit,
+        # breaking the state-hook dispatcher's `legion='custodes' AND synced=1` predicate.
+        if not supplant_id:
+            payload_pid = payload.get("pid")
+            if payload_pid and tmux_pane:
+                cursor = await db.execute(
+                    """SELECT id FROM claude_instances
+                       WHERE pid = ? AND tmux_pane = ?
+                         AND status IN ('processing', 'idle')
+                       ORDER BY registered_at DESC LIMIT 1""",
+                    (payload_pid, tmux_pane),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    supplant_id = row["id"]
+
         # --- Handle --continue (same session ID) with transplant ---
         # With --continue, the session ID doesn't change. If the row already exists
         # and there's a transplant signal, update the row in-place (new device, dir, pid).
@@ -870,19 +959,21 @@ async def handle_session_start(payload: dict) -> dict:
                     previous_session_doc_id=existing_row["session_doc_id"],
                     previous_workflow_state=existing_row["workflow_state"],
                 )
+                await _apply_session_doc_instance_name(
+                    db,
+                    instance_id=session_id,
+                    session_doc_id=resolved_session_doc_id or existing_row["session_doc_id"],
+                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                )
                 await db.commit()
 
-                # Queue legion pane recolor (tmux_pane changed, trigger won't fire since legion didn't)
+                # Queue old-pane clear. The new pane recolor is handled by
+                # trg_tmux_pane_recolor when tmux_pane changes.
                 _transplant_legion = (
                     existing_row["legion"]
                     if hasattr(existing_row, "__getitem__") and existing_row["legion"]
                     else "astartes"
                 )
-                if _transplant_legion != "astartes" and tmux_pane:
-                    await db.execute(
-                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
-                        (session_id, _transplant_legion, tmux_pane),
-                    )
                 if (
                     old_tmux_pane
                     and old_tmux_pane != tmux_pane
@@ -964,6 +1055,12 @@ async def handle_session_start(payload: dict) -> dict:
                     mutation_type="instance_updated",
                     write_source="hooks",
                     actor="SessionStart",
+                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                )
+                await _apply_session_doc_instance_name(
+                    db,
+                    instance_id=session_id,
+                    session_doc_id=existing_row["session_doc_id"],
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
                 await db.commit()
@@ -1100,19 +1197,21 @@ async def handle_session_start(payload: dict) -> dict:
                     previous_session_doc_id=old_inst["session_doc_id"],
                     previous_workflow_state=old_inst["workflow_state"],
                 )
+                await _apply_session_doc_instance_name(
+                    db,
+                    instance_id=session_id,
+                    session_doc_id=session_doc_id,
+                    wrapper_launch_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
+                )
                 dispatch_bound_doc = (
                     session_doc_policy or old_inst["session_doc_policy"]
                 ) == "dispatch_explicit"
 
                 await db.commit()
 
-                # Queue legion pane recolor (tmux_pane changed via supplant, trigger won't fire)
+                # Queue old-pane clear. The new pane recolor is handled by
+                # trg_tmux_pane_recolor when tmux_pane changes via supplant.
                 _supplant_legion = old_inst["legion"] if old_inst["legion"] else "astartes"
-                if _supplant_legion != "astartes" and tmux_pane:
-                    await db.execute(
-                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, ?, ?)",
-                        (session_id, _supplant_legion, tmux_pane),
-                    )
                 if old_tmux_pane and old_tmux_pane != tmux_pane and _supplant_legion != "astartes":
                     await db.execute(
                         "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
@@ -1328,6 +1427,15 @@ async def handle_session_start(payload: dict) -> dict:
             previous_session_doc_id=_prior_session_doc_id,
             previous_workflow_state=_prior_workflow_state,
         )
+        tab_name = (
+            await _apply_session_doc_instance_name(
+                db,
+                instance_id=session_id,
+                session_doc_id=session_doc_id,
+                wrapper_launch_id=wrapper_launch_id,
+            )
+            or tab_name
+        )
 
         # Auto-detect legion from context
         auto_legion = None
@@ -1373,7 +1481,7 @@ async def handle_session_start(payload: dict) -> dict:
         if session_doc_id:
             await _update_doc_agents_list(db, session_doc_id)
 
-            # Populate start_time and pool in session doc frontmatter
+            # Populate start_time in session doc frontmatter
             cursor = await db.execute(
                 "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
             )
@@ -1382,8 +1490,7 @@ async def handle_session_start(payload: dict) -> dict:
                 fp = Path(doc_row[0])
                 if fp.exists():
                     start_time = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                    pool = _derive_pool(working_dir)
-                    fm_updates = {"start_time": start_time, "pool": pool}
+                    fm_updates = {"start_time": start_time}
                     if auto_legion:
                         fm_updates["legion"] = auto_legion
                     if primarch_name:
@@ -1626,6 +1733,15 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
 
     now = datetime.now().isoformat()
+    await log_event(
+        "hook_user_prompt_submit",
+        instance_id=session_id,
+        details={
+            "hook_event_name": "UserPromptSubmit",
+            "payload_keys": sorted(payload.keys()),
+            "prompt_hash": payload.get("prompt_hash") or payload.get("payload_hash"),
+        },
+    )
     consumed_injections: list[dict] = []
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
@@ -2775,7 +2891,7 @@ async def handle_stop_validate(payload: dict) -> dict:
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, instance_type, is_subagent, victory_at, workflow_state FROM claude_instances WHERE id = ?",
+            "SELECT id, instance_type, is_subagent, victory_at, workflow_state, session_doc_id FROM claude_instances WHERE id = ?",
             (session_id,),
         )
         instance = await cursor.fetchone()
@@ -2797,6 +2913,99 @@ async def handle_stop_validate(payload: dict) -> dict:
     # ── Skip: one-off instances don't need self-eval ──
     if instance_type == "one_off":
         return {}
+
+    # ── Questions gate: session docs with non-closed questions block once ──
+    if instance_type in ("golden_throne", "sync") and instance.get("session_doc_id"):
+        session_doc_path = None
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            cursor = await db.execute(
+                "SELECT file_path FROM session_documents WHERE id = ?",
+                (instance.get("session_doc_id"),),
+            )
+            doc_row = await cursor.fetchone()
+            if doc_row and doc_row[0]:
+                session_doc_path = doc_row[0]
+
+        if session_doc_path:
+            try:
+                is_clear, blockers = await asyncio.to_thread(trials_clear, Path(session_doc_path))
+            except (FileNotFoundError, ValueError) as exc:
+                logger.warning(
+                    "StopValidate: questions gate could not read %s for %s: %s",
+                    session_doc_path,
+                    session_id[:12],
+                    exc,
+                )
+                is_clear, blockers = True, []
+            if not is_clear:
+                _self_eval_pending[session_id] = now
+                blocked_at = datetime.now().isoformat()
+                top_blockers = blockers[:5]
+                blocker_lines = []
+                for b in top_blockers:
+                    try:
+                        imp = int(b.get("importance") or 0)
+                    except (TypeError, ValueError):
+                        imp = 0
+                    blocker_lines.append(
+                        f"[{imp}] {str(b.get('state') or '')}  {str(b.get('question') or '')[:80]}"
+                    )
+                self_eval_prompt = (
+                    "Your session doc has non-closed questions. Resolve or explicitly waive blockers before stopping.\n\n"
+                    "Top blockers:\n" + "\n".join(blocker_lines)
+                )
+                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=session_id,
+                        updates={
+                            "workflow_state": "blocked",
+                            "workflow_updated_at": blocked_at,
+                            "workflow_blocked_reason": "questions_unclosed",
+                            "stop_allowed": 0,
+                            "next_required_action": "self_eval",
+                            "next_action_owner": "agent",
+                        },
+                        mutation_type="status_changed",
+                        write_source="hooks",
+                        actor="StopValidate",
+                    )
+                    await append_workflow_event(
+                        db,
+                        instance_id=session_id,
+                        workflow_state="blocked",
+                        event_type="stop_blocked",
+                        event_owner="hooks",
+                        details={
+                            "instance_type": instance_type,
+                            "reason": "questions_unclosed",
+                            "blockers": blocker_lines,
+                        },
+                    )
+                    if instance.get("workflow_state") != "blocked":
+                        await append_workflow_event(
+                            db,
+                            instance_id=session_id,
+                            workflow_state="blocked",
+                            event_type="workflow_state_changed",
+                            event_owner="hooks",
+                            details={
+                                "old_workflow_state": instance.get("workflow_state"),
+                                "new_workflow_state": "blocked",
+                            },
+                        )
+                    await db.commit()
+                logger.info(
+                    "StopValidate: blocking %s (%s) on questions gate",
+                    session_id[:12],
+                    instance_type,
+                )
+                await log_event(
+                    "stop_validate_block",
+                    instance_id=session_id,
+                    details={"instance_type": instance_type, "reason": "questions_unclosed"},
+                )
+                return {"decision": "block", "reason": self_eval_prompt}
 
     # ── ScheduleWakeup detection: don't block if the SDK is handling wakeup ──
     transcript_tail = payload.get("transcript_tail", "")

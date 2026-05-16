@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ _VAULT_ROOT = _IMPERIUM_ROOT / "Imperium-ENV"
 TERRA_SESSIONS_DIR = _VAULT_ROOT / "Terra" / "Sessions"
 MARS_SESSIONS_DIR = _VAULT_ROOT / "Mars" / "Sessions"
 DAILY_NOTES_DIR = _IMPERIUM_ROOT / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
+OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
 
 
 class _ObsidianDumper(yaml.SafeDumper):
@@ -50,6 +51,40 @@ def _str_representer(dumper, data):
 
 
 _ObsidianDumper.add_representer(str, _str_representer)
+
+
+def human_filename_stem(value: str, fallback: str = "Session", max_len: int = 90) -> str:
+    """Return an Obsidian Sync-safe, human-readable filename stem.
+
+    Dates belong in frontmatter, not generated session-doc filenames.  Keep
+    casing and spaces for readability; only strip filesystem/Sync-illegal
+    characters, control characters, markdown extension suffixes, and noisy
+    whitespace.
+    """
+    stem = re.sub(r"[\x00-\x1f\x7f]", "", value or "")
+    stem = re.sub(f"[{re.escape(OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS)}]", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    if stem.lower().endswith(".md"):
+        stem = stem[:-3].strip(" .")
+    stem = stem or fallback
+    if len(stem) > max_len:
+        stem = stem[:max_len].rstrip(" .")
+    return stem or fallback
+
+
+def unique_human_path(directory: Path, title: str, fallback: str = "Session") -> Path:
+    """Create a non-date-prefixed, readable path with numeric collision suffixes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = human_filename_stem(title, fallback=fallback)
+    candidate = directory / f"{stem}.md"
+    if not candidate.exists():
+        return candidate
+    counter = 2
+    while True:
+        candidate = directory / f"{stem} {counter}.md"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def read_frontmatter(file_path: Path) -> tuple[dict[str, Any], str]:
@@ -663,7 +698,6 @@ def create_session_doc_file(
     fm["start_time"] = None
     fm["end_time"] = None
     fm["duration_minutes"] = None
-    fm["pool"] = None
     fm["legion"] = None
     fm["faction"] = None
     fm["victory_conditions"] = []
@@ -835,14 +869,8 @@ async def resolve_session_doc_for_start(
                 return existing[0], "cron_active"
 
         now_ts = datetime.now().isoformat()
-        today = datetime.now().strftime("%Y-%m-%d")
         doc_title = cron_job_name or "cron"
-        slug = doc_title.lower().replace(" ", "-")[:50]
-        fp = MARS_SESSIONS_DIR / f"{today}-{slug}.md"
-        counter = 1
-        while fp.exists():
-            fp = MARS_SESSIONS_DIR / f"{today}-{slug}-{counter}.md"
-            counter += 1
+        fp = unique_human_path(MARS_SESSIONS_DIR, doc_title, fallback="Cron Session")
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, cron_job_id, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, 'active', ?, ?)""",
@@ -855,16 +883,10 @@ async def resolve_session_doc_for_start(
     if is_subagent:
         return None, None
 
-    today = datetime.now().strftime("%Y-%m-%d")
     now_ts = datetime.now().isoformat()
     cwd_basename = Path(working_dir).name if working_dir else "session"
-    doc_title = f"{cwd_basename} {today}"
-    slug = doc_title.lower().replace(" ", "-")[:50]
-    fp = TERRA_SESSIONS_DIR / f"{today}-{slug}.md"
-    counter = 1
-    while fp.exists():
-        fp = TERRA_SESSIONS_DIR / f"{today}-{slug}-{counter}.md"
-        counter += 1
+    doc_title = human_filename_stem(cwd_basename.replace("-", " "), fallback="Session")
+    fp = unique_human_path(TERRA_SESSIONS_DIR, doc_title, fallback="Session")
     cursor = await db.execute(
         """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
            VALUES (?, ?, ?, 'active', ?, ?)""",

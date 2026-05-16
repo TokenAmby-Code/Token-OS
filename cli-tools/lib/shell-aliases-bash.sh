@@ -7,18 +7,13 @@
 bind '"\e[A": history-search-backward' 2>/dev/null
 bind '"\e[B": history-search-forward' 2>/dev/null
 
-# source with no args = reload profile
-source() {
-    if [[ $# -eq 0 ]]; then
-        builtin source ~/.bashrc
-    else
-        builtin source "$@"
-    fi
-}
+# Convenience: `reload` re-sources ~/.bashrc.
+# Why not override `source`? A function-wrapped source forces every sourced
+# file's `declare`/`local`/`typeset` into the function's scope, so any
+# `declare -A FOO=(...)` becomes function-local and vanishes on return —
+# silently breaking config files like ~/.bash_cd. Keep `source` as the builtin.
+alias reload='builtin source ~/.bashrc'
 
-# c() reset hook — any non-c command resets the clear/claude toggle
-_reset_c_cleared() { [[ "$BASH_COMMAND" != "c" && "$BASH_COMMAND" != "c " ]] && _c_cleared=false; }
-trap '_reset_c_cleared' DEBUG
 
 # Agent exit cleanup: hooks stage /tmp/agent-resume-${TMUX_PANE}; the next shell
 # prompt clears the terminal and records the resume command in bash history.

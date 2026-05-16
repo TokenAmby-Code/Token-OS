@@ -16,10 +16,7 @@ source() {
     fi
 }
 
-# c() reset hook — any non-c command resets the clear/claude toggle
-_reset_c_cleared() { [[ "$1" != "c" ]] && _c_cleared=false; }
 autoload -Uz add-zsh-hook
-add-zsh-hook preexec _reset_c_cleared
 
 # Agent exit cleanup: hooks stage /tmp/agent-resume-${TMUX_PANE}; the next shell
 # prompt clears the terminal and records the resume command in zsh history.

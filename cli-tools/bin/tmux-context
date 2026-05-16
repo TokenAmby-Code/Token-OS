@@ -24,6 +24,7 @@ Configuration (settings.json):
 import json
 import os
 import subprocess
+import subprocess
 import sys
 import time
 import urllib.request
@@ -287,7 +288,8 @@ def check_pre_compact(pane_id, pct, total_tokens):
     # Non-blocking nudge: tell agent to wrap up then enter plan mode.
     # Plan-gatekeeper hook will catch ExitPlanMode and force session doc update.
     msg = "Context threshold reached. Wrap up your immediate task, then switch to plan mode to refocus."
-    os.system(f'tmux send-keys -t "{pane_id}" "{msg}" Enter')
+    agent_cmd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-cmd")
+    subprocess.Popen([agent_cmd, "--pane", pane_id, msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def enforce_bypass_mode(pane_id):

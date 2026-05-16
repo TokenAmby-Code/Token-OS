@@ -117,6 +117,8 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert data["trials_verdict"] == "pending"
     assert data["operator_approved_dispatch"] is False
     assert data["session_doc"].startswith("Mars/Sessions/")
+    assert data["session_doc"].endswith("Aspirant - Worker plan.md")
+    assert not Path(data["session_doc"]).name.startswith("20")
     session_doc = vault / data["session_doc"]
     session_text = session_doc.read_text(encoding="utf-8")
     note_text = (vault / data["note_path"]).read_text(encoding="utf-8")
@@ -130,7 +132,11 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert "dispatch_ready: false" in session_text
     assert "trials_verdict: pending" in session_text
     assert "operator_approved_dispatch: false" in session_text
-    assert "open_questions: {}" in session_text
+    assert "questions:" in session_text
+    assert '  - question: "which other questions are needed for this aspirant?"' in session_text
+    assert '    state: "unanswered"' in session_text
+    assert "    importance: 10" in session_text
+    assert "    importance: 8" in session_text
     assert 'engine: "claude"' in session_text
     assert 'persona: "vulkan"' in session_text
     assert f"target_working_dir: {json.dumps(str(ROOT))}" in session_text
@@ -147,7 +153,9 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert 'dispatch_blocked_reason: "pending_aspirant_trials"' in note_text
     assert "trials_verdict: pending" in note_text
     assert "operator_approved_dispatch: false" in note_text
-    assert "open_questions: {}" in note_text
+    assert "questions:" in note_text
+    assert '  - question: "which other questions are needed for this aspirant?"' in note_text
+    assert "    importance: 10" in note_text
     prompt_line = next(
         line for line in session_text.splitlines() if line.startswith("aspirant_persona_prompt: ")
     )
@@ -191,15 +199,120 @@ def test_aspirant_create_dispatch_incomplete_stays_intake(tmp_path):
     assert 'dispatch_blocked_reason: "missing persona, dispatch_target, victory_conditions"' in text
     assert "trials_verdict: pending" in text
     assert "operator_approved_dispatch: false" in text
-    assert "open_questions: {}" in text
+    assert "questions:" in text
+    assert '  - question: "which other questions are needed for this aspirant?"' in text
+    assert "    importance: 10" in text
     assert "aspirant_persona: aspirant" in text
     session_text = (vault / data["session_doc"]).read_text(encoding="utf-8")
     assert "status: aspirant_intake" in session_text
     assert "dispatch_schema_complete: false" in session_text
     assert "dispatch_ready: false" in session_text
     assert "operator_approved_dispatch: false" in session_text
-    assert "open_questions: {}" in session_text
+    assert "questions:" in session_text
+    assert '  - question: "which other questions are needed for this aspirant?"' in session_text
+    assert "    importance: 10" in session_text
     assert "aspirant_persona_prompt: " in session_text
+
+
+def test_aspirant_create_dispatch_defaults_dir_to_imperium_env_vault(tmp_path):
+    env, vault = env_for(tmp_path)
+    result = subprocess.run(
+        [
+            *ASPIRANT_CREATE_MODULE,
+            "--json",
+            "--kind",
+            "dispatch",
+            "--title",
+            "Default dir",
+            "--objective",
+            "Use vault root by default",
+            "--engine",
+            "claude",
+            "--persona",
+            "vulkan",
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Tests pass",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    session_text = (vault / data["session_doc"]).read_text(encoding="utf-8")
+    note_text = (vault / data["note_path"]).read_text(encoding="utf-8")
+    expected = f"target_working_dir: {json.dumps(str(vault))}"
+    assert expected in session_text
+    assert expected in note_text
+
+
+def test_aspirant_create_rejects_empty_objective_without_staging(tmp_path):
+    env, vault = env_for(tmp_path)
+    result = subprocess.run(
+        [
+            *ASPIRANT_CREATE_MODULE,
+            "--json",
+            "--kind",
+            "dispatch",
+            "--title",
+            "Empty objective",
+            "--objective",
+            "",
+            "--engine",
+            "claude",
+            "--persona",
+            "vulkan",
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Tests pass",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "must not be empty" in result.stderr
+    assert not list((vault / "Aspirants").glob("*.md"))
+
+
+def test_aspirant_create_allows_trivial_non_empty_objective(tmp_path):
+    env, vault = env_for(tmp_path)
+    result = subprocess.run(
+        [
+            *ASPIRANT_CREATE_MODULE,
+            "--json",
+            "--kind",
+            "dispatch",
+            "--title",
+            "Trivial objective",
+            "--objective",
+            "test",
+            "--engine",
+            "claude",
+            "--persona",
+            "vulkan",
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Tests pass",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert (vault / data["note_path"]).exists()
+    assert data["status"] == "aspirant_trials"
 
 
 def test_dispatch_delegation_dry_run_uses_internal_creation_surface(tmp_path):

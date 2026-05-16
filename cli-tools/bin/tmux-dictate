@@ -110,6 +110,17 @@ if [[ -z "$TEXT" ]]; then
     exit 1
 fi
 
+# Submit through the canonical live-agent prompt primitive.
+if $SUBMIT; then
+    if [[ -n "$TARGET" ]]; then
+        "${_LIB_DIR}/../bin/agent-cmd" --pane "$TARGET" "$TEXT" >/dev/null
+    else
+        current_pane=$(tmux display-message -p '#{pane_id}')
+        "${_LIB_DIR}/../bin/agent-cmd" --pane "$current_pane" "$TEXT" >/dev/null
+    fi
+    exit 0
+fi
+
 # --- Build send-keys command ---
 SEND_ARGS=()
 if [[ -n "$TARGET" ]]; then
@@ -118,13 +129,3 @@ fi
 
 # Send literal text (guarded — waits if user is typing)
 tmux_send_guarded "${SEND_ARGS[@]}" -l "$TEXT"
-
-# Optionally submit
-if $SUBMIT; then
-    # Do not re-run the typing guard after injecting our own text: at that
-    # point the prompt necessarily contains pending input (the text we just
-    # sent), so a second guarded send would wait until timeout and abort the
-    # submit. The guard above already verified the pane was clear before the
-    # dictation write began.
-    TMUX_GUARD_SKIP=1 tmux_send_guarded "${SEND_ARGS[@]}" Enter
-fi

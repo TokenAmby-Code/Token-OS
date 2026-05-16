@@ -754,6 +754,24 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
+        # Trigger: whenever tmux_pane is (re)assigned on an instance that already
+        # has a legion, queue a recolor. Closes the order-of-operations gap where
+        # `legion` was set before `tmux_pane` — `trg_legion_recolor` fired with a
+        # NULL pane and the worker silently dropped it. With this trigger, the
+        # invariant "any (legion, tmux_pane) pair eventually paints" holds
+        # regardless of which column changes first.
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tmux_pane_recolor
+            AFTER UPDATE OF tmux_pane ON claude_instances
+            WHEN NEW.tmux_pane IS NOT NULL
+               AND NEW.tmux_pane IS NOT OLD.tmux_pane
+               AND NEW.legion IS NOT NULL
+            BEGIN
+                INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane)
+                VALUES (NEW.id, NEW.legion, NEW.tmux_pane);
+            END
+        """)
+
         # ── Pane State Queue (@CC_STATE) ──
         # Trigger-driven pane variable updates. Any status change on claude_instances
         # queues a tmux set-option, so @CC_STATE stays in sync without caller cooperation.

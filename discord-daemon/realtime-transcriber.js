@@ -1,4 +1,4 @@
-// realtime-transcriber.js — demo OpenAI Realtime transcription provider
+// realtime-transcriber.js — OpenAI Realtime transcription provider
 // Streams Discord PCM frames into a persistent Realtime transcription session.
 
 import WebSocket from 'ws';
@@ -22,7 +22,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
   function makeSession(botName, userId) {
     if (!apiKey) {
-      logger.warn('Realtime demo: skipping — no OpenAI API key');
+      logger.warn('Realtime: skipping — no OpenAI API key');
       return null;
     }
 
@@ -51,7 +51,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     };
 
     ws.on('open', () => {
-      logger.info(`Realtime demo [${botName}]: connected for user ${userId}`);
+      logger.info(`Realtime [${botName}]: connected for user ${userId}`);
       send(session, {
         type: 'session.update',
         session: {
@@ -76,7 +76,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         },
       });
       logger.info(
-        `Realtime demo [${botName}]: session.update sent ` +
+        `Realtime [${botName}]: session.update sent ` +
         `(intent=transcription, transcription=${transcriptionModel}, vad=${vad.silence_duration_ms ?? 500}ms)`
       );
     });
@@ -86,18 +86,18 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       try {
         event = JSON.parse(raw.toString());
       } catch {
-        logger.warn(`Realtime demo [${botName}]: non-JSON event`);
+        logger.warn(`Realtime [${botName}]: non-JSON event`);
         return;
       }
 
       if (event.type === 'error') {
         const message = event.error?.message || JSON.stringify(event.error || event);
-        logger.error(`Realtime demo [${botName}]: ${message}`);
+        logger.error(`Realtime [${botName}]: ${message}`);
         return;
       }
 
       if (event.type === 'session.updated') {
-        logger.info(`Realtime demo [${botName}]: session.updated acknowledged`);
+        logger.info(`Realtime [${botName}]: session.updated acknowledged`);
         session.ready = true;
         flushPendingAudio(session);
         if (session.pendingCommitMeta) {
@@ -110,19 +110,19 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
       if (event.type === 'input_audio_buffer.committed') {
         logger.info(
-          `Realtime demo [${botName}]: input committed item=${event.item_id || '?'} ` +
+          `Realtime [${botName}]: input committed item=${event.item_id || '?'} ` +
           `previous=${event.previous_item_id || 'none'}`
         );
         return;
       }
 
       if (event.type === 'input_audio_buffer.speech_started') {
-        logger.debug(`Realtime demo [${botName}]: server VAD speech started`);
+        logger.debug(`Realtime [${botName}]: server VAD speech started`);
         return;
       }
 
       if (event.type === 'input_audio_buffer.speech_stopped') {
-        logger.debug(`Realtime demo [${botName}]: server VAD speech stopped`);
+        logger.debug(`Realtime [${botName}]: server VAD speech stopped`);
         return;
       }
 
@@ -131,7 +131,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         const firstAudioLatency = session.firstAudioAt ? session.lastDeltaAt - session.firstAudioAt : null;
         if (event.delta) {
           logger.debug(
-            `Realtime demo [${botName}]: delta after ${firstAudioLatency ?? '?'}ms "${event.delta}"`
+            `Realtime [${botName}]: delta after ${firstAudioLatency ?? '?'}ms "${event.delta}"`
           );
         }
         return;
@@ -143,14 +143,13 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         const completedAt = Date.now();
         const firstAudioLatency = session.firstAudioAt ? completedAt - session.firstAudioAt : null;
         logger.info(
-          `Realtime demo [${botName}]: completed after ${firstAudioLatency ?? '?'}ms ` +
+          `Realtime [${botName}]: completed after ${firstAudioLatency ?? '?'}ms ` +
           `(${session.appendedFrames} frames, ${session.appendedBytes} bytes) "${text}"`
         );
         emitTranscript({
           userId,
           text,
           timestamp: completedAt,
-          pcmPath: null,
           botName,
           realtime: true,
           itemId: event.item_id,
@@ -163,12 +162,12 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
     ws.on('close', (code, reason) => {
       session.closed = true;
-      logger.info(`Realtime demo [${botName}]: closed for ${userId} (${code}) ${reason || ''}`);
+      logger.info(`Realtime [${botName}]: closed for ${userId} (${code}) ${reason || ''}`);
       cleanupSession(key);
     });
 
     ws.on('error', (err) => {
-      logger.error(`Realtime demo [${botName}]: websocket error for ${userId}: ${err.message}`);
+      logger.error(`Realtime [${botName}]: websocket error for ${userId}: ${err.message}`);
     });
 
     sessions.set(key, session);
@@ -186,7 +185,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     session.appendedBytes += audio.length;
     session.appendedFrames++;
     if (session.appendedFrames === 1) {
-      logger.info(`Realtime demo [${session.botName}]: first audio frame for user ${session.userId}`);
+      logger.info(`Realtime [${session.botName}]: first audio frame for user ${session.userId}`);
     }
     send(session, {
       type: 'input_audio_buffer.append',
@@ -197,7 +196,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
   function flushPendingAudio(session) {
     if (session.pendingAudio.length === 0) return;
     logger.info(
-      `Realtime demo [${session.botName}]: flushing ${session.pendingAudio.length} queued audio frames`
+      `Realtime [${session.botName}]: flushing ${session.pendingAudio.length} queued audio frames`
     );
     for (const audio of session.pendingAudio.splice(0)) {
       appendAudio(session, audio);
@@ -251,7 +250,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       if (session.pendingAudio.length > 0 || session.appendedFrames > 0) {
         session.pendingCommitMeta = meta;
         logger.info(
-          `Realtime demo [${botName}]: queued commit until ready for user ${userId} ` +
+          `Realtime [${botName}]: queued commit until ready for user ${userId} ` +
           `(pending=${session.pendingAudio.length}, reason=${meta.reason || 'manual'})`
         );
         return true;
@@ -260,7 +259,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     }
     if (session.appendedFrames === 0) return false;
     logger.info(
-      `Realtime demo [${botName}]: committing audio for user ${userId} ` +
+      `Realtime [${botName}]: committing audio for user ${userId} ` +
       `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'})`
     );
     return send(session, { type: 'input_audio_buffer.commit' });
@@ -269,7 +268,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
   function scheduleCleanup(session, delayMs, reason) {
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     session.cleanupTimer = setTimeout(() => {
-      logger.info(`Realtime demo [${session.botName}]: cleanup after ${reason} for user ${session.userId}`);
+      logger.info(`Realtime [${session.botName}]: cleanup after ${reason} for user ${session.userId}`);
       cleanupSession(session.key);
     }, delayMs);
   }

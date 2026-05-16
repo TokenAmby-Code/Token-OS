@@ -43,6 +43,10 @@ test "hello" --dry-run    # Show payload
 See `test --help` for full documentation.
 
 
+### Live agent pane prompt delivery (`agent-cmd`)
+
+`agent-cmd` is the canonical command for submitting text into an existing Claude/Codex prompt pane. It normalizes payloads and uses the hardened literal-send + delayed double-submit sequence through `tmuxctl`; `claude-cmd` remains as a compatibility wrapper. Use this for live prompt injection instead of raw `tmux send-keys ... Enter`. See `cli-tools/docs/pane-prompt-delivery.md`.
+
 ### Managed tmux stack dispatch (`tmuxctl stack`)
 
 `tmuxctl` is the single pane-backed dispatch primitive for managed stack pages. Use `tmuxctl stack add legion` to allocate a typed worker pane, or `tmuxctl stack dispatch legion --command ...` to allocate and launch in one step. Entry points such as `vault-dispatch`, Prefix+Space (`tmux-legion-prompt`), Golden Throne resume fallback, `work-loop`, and pane demotion route through this tmuxctl stack code instead of raw `tmux split-window`. See `cli-tools/docs/managed-stack-dispatch.md`.

@@ -1,5 +1,5 @@
 // voice.js — Discord voice channel management
-// Handles joining/leaving voice channels, audio capture, and transcription pipeline
+// Handles joining/leaving voice channels, live audio streaming, and TTS playback
 // Supports per-bot voice channels with auto-join/leave on operator presence
 
 import {
@@ -12,9 +12,8 @@ import {
   AudioPlayerStatus,
   StreamType,
 } from '@discordjs/voice';
-import { createWriteStream, mkdirSync, existsSync, unlinkSync } from 'fs';
+import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -31,7 +30,7 @@ export function createVoiceManager(botClients, config, logger) {
   const operatorUserId = config.operator_user_id;
   const voiceChannels = config.voice_channels || {};
 
-  // Per-bot connection state: botName -> { connection, recording, subscriptions, channelId }
+  // Per-bot connection state: botName -> { connection, listening, subscriptions, channelId }
   const botStates = new Map();
 
   // Collect all bot user IDs to filter out of audio capture (prevent ouroboros)
@@ -45,8 +44,7 @@ export function createVoiceManager(botClients, config, logger) {
     }
   }
 
-  // Transcription callback — set externally
-  let onTranscription = null;
+  // Realtime transcription callbacks — set externally
   let onAudioFrame = null;
   let onAudioEnd = null;
   let onAudioCommit = null;
@@ -56,7 +54,7 @@ export function createVoiceManager(botClients, config, logger) {
     if (!botStates.has(botName)) {
       botStates.set(botName, {
         connection: null,
-        recording: false,
+        listening: false,
         activeSubscriptions: new Map(),
         channelId: null,
         joining: false,
@@ -121,7 +119,7 @@ export function createVoiceManager(botClients, config, logger) {
       refreshBotUserIds();
 
       state.connection.receiver.speaking.on('start', (userId) => {
-        if (!state.recording) return;
+        if (!state.listening) return;
         if (state.activeSubscriptions.has(userId)) return;
         // Ignore other bots to prevent ouroboros (bot transcribing its own TTS or other bots)
         if (botUserIds.has(userId)) {
@@ -138,11 +136,9 @@ export function createVoiceManager(botClients, config, logger) {
     }
   }
 
-  // Chunking config
-  const MAX_CHUNK_SECONDS = 15;
-  const SILENCE_FLUSH_MS = 1500; // Flush after 1.5s of silence (raised from 0.8s — was cutting sentences)
-  const BYTES_PER_SECOND = 48000 * 2; // 48kHz mono s16le
-  const MAX_CHUNK_BYTES = MAX_CHUNK_SECONDS * BYTES_PER_SECOND;
+  // Explicit commit after Discord silence. Audio itself is streamed live to
+  // OpenAI Realtime; no local PCM chunk files are created.
+  const SILENCE_COMMIT_MS = 1500; // Wait after Discord silence before committing a turn.
 
   function subscribeToUser(botName, userId) {
     const state = getBotState(botName);
@@ -178,45 +174,38 @@ export function createVoiceManager(botClients, config, logger) {
       frameSize: 960,
     });
 
-    let chunks = [];
-    let totalBytes = 0;
-    let chunkIndex = 0;
+    let hasAudioSinceCommit = false;
+    let bytesSinceCommit = 0;
     let silenceTimer = null;
 
-    function flushChunk() {
-      const bytes = totalBytes;
-      const buffer = Buffer.concat(chunks);
-      chunks = [];
-      totalBytes = 0;
-      chunkIndex++;
-
-      if (bytes < 3200) {
-        logger.debug(`Voice [${botName}]: discarding tiny chunk from ${userId} (${bytes} bytes)`);
-        return;
+    function commitPending(reason, extra = {}) {
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
       }
-      logger.info(`Voice [${botName}]: captured chunk #${chunkIndex} — ${bytes} bytes from user ${userId}`);
-      processAudio(botName, userId, buffer, bytes);
+      if (!hasAudioSinceCommit) return false;
+      logger.info(`Voice [${botName}]: committing realtime audio from ${userId} (${bytesSinceCommit} bytes, reason=${reason})`);
+      if (onAudioCommit) {
+        try { onAudioCommit(userId, botName, { reason, ...extra }); } catch {}
+      }
+      hasAudioSinceCommit = false;
+      bytesSinceCommit = 0;
+      return true;
     }
 
     function startSilenceTimer() {
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
-        if (totalBytes > 0) {
-          logger.info(`Voice [${botName}]: silence detected (${SILENCE_FLUSH_MS}ms), flushing chunk`);
-          flushChunk();
-          if (onAudioCommit) {
-            try { onAudioCommit(userId, botName, { reason: 'silence', silenceMs: SILENCE_FLUSH_MS }); } catch {}
-          }
-        }
-      }, SILENCE_FLUSH_MS);
+        commitPending('silence', { silenceMs: SILENCE_COMMIT_MS });
+      }, SILENCE_COMMIT_MS);
     }
 
-    // Silence frames from Discord trigger the flush timer
+    // Silence frames from Discord trigger the commit timer.
     silenceFilter.on('silence', () => {
       if (onAudioFrame) {
         try { onAudioFrame(userId, SILENCE_PCM_20MS, botName, { silence: true }); } catch {}
       }
-      if (totalBytes > 0) {
+      if (hasAudioSinceCommit) {
         startSilenceTimer();
       }
     });
@@ -225,17 +214,11 @@ export function createVoiceManager(botClients, config, logger) {
       if (onAudioFrame) {
         try { onAudioFrame(userId, chunk, botName, { silence: false }); } catch {}
       }
-      // Real audio arrived — cancel any pending silence flush
+      // Real audio arrived — cancel any pending silence commit.
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
 
-      chunks.push(chunk);
-      totalBytes += chunk.length;
-
-      // Force split on long continuous speech
-      if (totalBytes >= MAX_CHUNK_BYTES) {
-        logger.info(`Voice [${botName}]: max chunk reached (${MAX_CHUNK_SECONDS}s), flushing...`);
-        flushChunk();
-      }
+      hasAudioSinceCommit = true;
+      bytesSinceCommit += chunk.length;
     });
 
     audioStream.pipe(silenceFilter).pipe(decoder);
@@ -244,11 +227,9 @@ export function createVoiceManager(botClients, config, logger) {
     decoder.on('end', () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       state.activeSubscriptions.delete(userId);
+      commitPending('stream-end');
       if (onAudioEnd) {
         try { onAudioEnd(userId, botName); } catch {}
-      }
-      if (totalBytes > 0) {
-        flushChunk();
       }
     });
 
@@ -270,42 +251,17 @@ export function createVoiceManager(botClients, config, logger) {
       }
     });
 
-    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, flush: flushChunk });
-  }
-
-  async function processAudio(botName, userId, pcmBuffer, totalBytes) {
-    const timestamp = Date.now();
-    const filename = `${userId}-${timestamp}.pcm`;
-    const filepath = join(AUDIO_DIR, filename);
-
-    // Save PCM to file for debugging/retry
-    const ws = createWriteStream(filepath);
-    ws.write(pcmBuffer);
-    ws.end();
-
-    logger.info(`Voice [${botName}]: saved audio to ${filepath} (${totalBytes} bytes)`);
-
-    // If transcription callback is set, call it with bot context
-    if (onTranscription) {
-      try {
-        await onTranscription(userId, pcmBuffer, filepath, botName);
-      } catch (err) {
-        logger.error(`Voice [${botName}]: transcription callback error: ${err.message}`);
-      }
-    }
+    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, commit: commitPending });
   }
 
   async function leaveChannel(botName = 'mechanicus') {
     const state = getBotState(botName);
     if (!state.connection) return { left: false, reason: 'not connected' };
 
-    // Flush any accumulated audio before destroying subscriptions
+    // Commit any pending realtime audio before destroying subscriptions.
     for (const [userId, sub] of state.activeSubscriptions) {
-      if (sub.flush) {
-        try { sub.flush(); } catch {}
-      }
-      if (onAudioCommit) {
-        try { onAudioCommit(userId, botName, { reason: 'leave' }); } catch {}
+      if (sub.commit) {
+        try { sub.commit('leave'); } catch {}
       }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
@@ -314,7 +270,7 @@ export function createVoiceManager(botClients, config, logger) {
 
     state.connection.destroy();
     state.connection = null;
-    state.recording = false;
+    state.listening = false;
     const leftChannel = state.channelId;
     state.channelId = null;
 
@@ -322,31 +278,28 @@ export function createVoiceManager(botClients, config, logger) {
     return { left: true, channelId: leftChannel, botName };
   }
 
-  function startRecording(botName = 'mechanicus') {
+  function startListening(botName = 'mechanicus') {
     const state = getBotState(botName);
     if (!state.connection) throw new Error(`Bot '${botName}' not connected to a voice channel`);
-    state.recording = true;
-    logger.info(`Voice [${botName}]: recording started`);
-    return { recording: true, channelId: state.channelId, botName };
+    state.listening = true;
+    logger.info(`Voice [${botName}]: listening started`);
+    return { listening: true, channelId: state.channelId, botName };
   }
 
-  function stopRecording(botName = 'mechanicus') {
+  function stopListening(botName = 'mechanicus') {
     const state = getBotState(botName);
-    state.recording = false;
-    // Flush and clean up active subscriptions
+    state.listening = false;
+    // Commit and clean up active subscriptions.
     for (const [userId, sub] of state.activeSubscriptions) {
-      if (sub.flush) {
-        try { sub.flush(); } catch {}
-      }
-      if (onAudioCommit) {
-        try { onAudioCommit(userId, botName, { reason: 'stop' }); } catch {}
+      if (sub.commit) {
+        try { sub.commit('stop'); } catch {}
       }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
     }
     state.activeSubscriptions.clear();
-    logger.info(`Voice [${botName}]: recording stopped`);
-    return { recording: false, channelId: state.channelId, botName };
+    logger.info(`Voice [${botName}]: listening stopped`);
+    return { listening: false, channelId: state.channelId, botName };
   }
 
   function getStatus(botName) {
@@ -357,7 +310,7 @@ export function createVoiceManager(botClients, config, logger) {
         botName,
         connected: !!state.connection,
         channelId: state.channelId,
-        recording: state.recording,
+        listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
         connectionState: state.connection?.state?.status || 'disconnected',
       };
@@ -368,7 +321,7 @@ export function createVoiceManager(botClients, config, logger) {
       statuses[name] = {
         connected: !!state.connection,
         channelId: state.channelId,
-        recording: state.recording,
+        listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
         connectionState: state.connection?.state?.status || 'disconnected',
       };
@@ -379,7 +332,7 @@ export function createVoiceManager(botClients, config, logger) {
         statuses[name] = {
           connected: false,
           channelId: null,
-          recording: false,
+          listening: false,
           activeListeners: 0,
           connectionState: 'disconnected',
           assignedChannel: voiceChannels[name],
@@ -419,8 +372,8 @@ export function createVoiceManager(botClients, config, logger) {
           logger.info(`Voice auto-join [${botName}]: operator joined ${channelId}, following...`);
           try {
             await joinChannel(channelId, botName);
-            startRecording(botName);
-            logger.info(`Voice auto-join [${botName}]: joined and recording`);
+            startListening(botName);
+            logger.info(`Voice auto-join [${botName}]: joined and listening`);
           } catch (err) {
             logger.error(`Voice auto-join [${botName}]: failed to join: ${err.message}`);
           }
@@ -490,8 +443,8 @@ export function createVoiceManager(botClients, config, logger) {
     logger.info(`Voice startup sync [${botName}]: operator already in ${channelId}, joining...`);
     try {
       await joinChannel(channelId, botName);
-      startRecording(botName);
-      logger.info(`Voice startup sync [${botName}]: joined and recording`);
+      startListening(botName);
+      logger.info(`Voice startup sync [${botName}]: joined and listening`);
       return { joined: true, botName, channelId };
     } catch (err) {
       logger.error(`Voice startup sync [${botName}]: failed to join: ${err.message}`);
@@ -636,14 +589,13 @@ export function createVoiceManager(botClients, config, logger) {
   return {
     joinChannel,
     leaveChannel,
-    startRecording,
-    stopRecording,
+    startListening,
+    stopListening,
     getStatus,
     setupAutoJoin,
     playAudio,
     stopPlayback,
     playTTS,
-    setTranscriptionCallback(cb) { onTranscription = cb; },
     setAudioFrameCallback(cb) { onAudioFrame = cb; },
     setAudioEndCallback(cb) { onAudioEnd = cb; },
     setAudioCommitCallback(cb) { onAudioCommit = cb; },

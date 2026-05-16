@@ -111,6 +111,28 @@ Sanction policy:
 
 ## Core API Endpoints
 
+### Aspirant full-session launch
+
+Token-API inbox aspirants now launch real managed Claude sessions instead of the old automatic MiniMax/Sonnet implantation pipeline.
+
+Entry points:
+```
+POST   /api/inbox/create                # Create aspirant note and launch managed legion session
+POST   /api/inbox/notify                # Notify/create aspirant and launch managed legion session
+```
+
+Launch contract:
+- Create aspirant note under `Imperium-ENV/Aspirants/`.
+- Create linked session doc under `Imperium-ENV/Terra/Sessions/`.
+- Session doc filenames are human-readable and never date-prefixed; dates stay in frontmatter.
+- Attached instances are named from the session doc (`<session-doc-slug>-1`, `<session-doc-slug>-2`, ...), not by mutating the doc from the instance name.
+- Mark note frontmatter with `aspirant_launcher: dispatch`, `aspirant_dispatch_target: legion:new`, launch id, session status, and session doc path.
+- Start `dispatch --target legion:new --dir <Imperium-ENV> --session-doc <doc> --system-prompt-file <file> --prompt-file <file> --gt`.
+- Suppress duplicate launches when the note already has `aspirant_launch_id` and status `launching` or `launched`.
+- On failure, mark the note `aspirant_session_status: failed` and record `aspirant_launch_error`.
+
+Related CLI behavior is documented in `/Volumes/Imperium/Scripts/cli-tools/docs/aspirant-dispatch.md`.
+
 ### Instance Management
 ```
 POST   /api/instances/register          # Register new instance
@@ -187,7 +209,7 @@ POST   /kvm/control                     # Manual DeskFlow control (action: start
 POST   /restart                         # Git pull + systemd restart
 ```
 
-**KVM Watchdog**: WSL satellite manages the server side. It starts DeskFlow at boot, checks for an established Mac client connection, and uses tiered recovery: Mac wake/start → local DeskFlow reload → full local restart → Mac client reload/restart. Failed recovery attempts back off exponentially and eventually enter `ceased` until manual/signal intervention. Mac Token-API also runs a client-side supervisor: if the WSL DeskFlow port is absent, it stops the Mac client so DeskFlow cannot retry-spam internally, then probes with exponential backoff and reopens the client only when the server port is reachable. Replaces the old "Deskflow" Windows scheduled task (now disabled).
+**KVM Watchdog**: WSL satellite manages the server side. It starts DeskFlow at boot, checks for an established Mac client connection, and uses tiered recovery: Mac wake/start → local DeskFlow reload → full local restart → Mac client reload/restart. Failed recovery attempts back off exponentially and eventually enter `ceased` until manual/signal intervention. Mac Token-API also runs a client-side supervisor: if the WSL DeskFlow port is absent, it stops the Mac client so DeskFlow cannot retry-spam internally, then probes with exponential backoff and reopens the client only when the server port is reachable. Mac KVM start/reload also runs `Shell/deskflow-keymap-guard.sh`, which pins the macOS input source to Australian and keeps `languageSync=false`; this is the authoritative fix for the recurring `'` → `:` keymap regression. Replaces the old "Deskflow" Windows scheduled task (now disabled). Vault reference: `Terra/Ultramar/Personal-Infra/Deskflow KVM.md`.
 
 ### Discord Integration
 ```

@@ -107,7 +107,7 @@ tmux() {
         return
     fi
 
-    # Resolve Imperium stable pane ids (1:N, palace:NW, legion:custodes) once,
+    # Resolve Imperium stable pane ids (1:N, palace:N, legion:custodes) once,
     # then guard and execute against the live %pane id. This keeps the shell
     # function override compatible with the bin/tmux shim.
     local resolver_bin="${TMUX_GUARD_RESOLVER_BIN:-}"

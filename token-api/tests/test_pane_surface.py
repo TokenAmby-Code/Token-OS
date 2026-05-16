@@ -31,8 +31,23 @@ def test_golden_throne_human_surface_missing_label_uses_name(app_env):
     assert app_env.main._golden_throne_human_surface("recovery-foo", "%103", None) == "recovery-foo"
 
 
-def test_golden_throne_human_surface_missing_meaningful_inputs_falls_back_to_tmux(app_env):
-    assert app_env.main._golden_throne_human_surface("Claude 8:14", "%108", None) == "%108"
+def test_golden_throne_human_surface_never_falls_back_to_raw_tmux(app_env):
+    assert app_env.main._golden_throne_human_surface("Claude 08:14", "%108", None) == "session"
+
+
+def test_golden_throne_human_surface_dynamic_workspace_uses_public_label(app_env):
+    assert (
+        app_env.main._golden_throne_human_surface("Claude 08:14", "%210", "legion:aspirant")
+        == "legion:aspirant"
+    )
+
+
+def test_golden_throne_surface_does_not_embed_raw_tmux(app_env):
+    assert (
+        app_env.main._golden_throne_surface("Claude 08:14", "%210", "legion:aspirant")
+        == "legion:aspirant"
+    )
+    assert app_env.main._golden_throne_surface("Claude 08:14", "%210", None) == "Claude 08:14"
 
 
 def test_golden_throne_notification_text_uses_surface_without_duplicate_name(app_env):

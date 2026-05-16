@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -12,7 +13,8 @@ class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
 
 
-DEFAULT_SUBMIT_SETTLE_SECONDS = 0.3
+DEFAULT_SUBMIT_SETTLE_SECONDS = 1.0
+DEFAULT_PRE_SUBMIT_SETTLE_SECONDS = 1.0
 
 _PANE_TARGET_COMMANDS = {
     "break-pane",
@@ -32,6 +34,18 @@ _PANE_TARGET_COMMANDS = {
 _PANE_OPTION_COMMANDS = {"set-option", "set", "show-options", "show"}
 _PANE_TARGET_FLAGS = {"-t", "-s"}
 _SLOT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def normalize_prompt_payload(text: str) -> str:
+    """Normalize a live-agent prompt payload before pane injection."""
+    normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
+    if not normalized.strip():
+        raise ValueError("prompt payload is empty after normalization")
+    return normalized
+
+
+def prompt_payload_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _tmux_binary() -> str:
@@ -67,10 +81,18 @@ def _looks_like_custom_pane_target(target: str) -> bool:
         return False
     if ":" not in target:
         return False
-    _, slot = target.rsplit(":", 1)
-    if not slot or slot.isdigit():
+    left, slot = target.rsplit(":", 1)
+    if not slot or slot.isdigit() or not _SLOT_RE.match(slot):
         return False
-    return bool(_SLOT_RE.match(slot))
+    return left.isdigit() or left in {
+        "palace",
+        "somnium",
+        "legion",
+        "mechanicus",
+        "mars",
+        "kreig",
+        "tui",
+    }
 
 
 def _command_has_pane_option_scope(args: tuple[str, ...]) -> bool:
@@ -91,7 +113,7 @@ class TmuxAdapter:
 
     The adapter is the lowest Python tmux boundary. Pane-scoped target flags are
     resolved through tmuxctl before subprocess execution, so callers can pass
-    stable custom ids (``1:N``, ``1:NW``, ``palace:N``, ``legion:custodes``) in
+    stable custom ids (``1:N``, ``palace:N``, ``somnium:SE``, ``legion:custodes``) in
     place of volatile ``%N`` pane ids.
     """
 
@@ -300,10 +322,13 @@ class TmuxAdapter:
         empty prompt and is a no-op in Claude/Codex. If the first C-m was
         swallowed as a newline, the delayed second C-m submits the queued prompt.
         """
+        payload = normalize_prompt_payload(text)
         if clear_prompt:
             self.send_keys(target, "C-u")
-        self.run("send-keys", "-t", target, "-l", text)
+        self.run("send-keys", "-t", target, "-l", payload)
+        if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
         self.send_keys(target, "C-m")
         if submit_settle_seconds > 0:
             time.sleep(submit_settle_seconds)
-            self.send_keys(target, "C-m")
+        self.send_keys(target, "C-m")

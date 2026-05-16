@@ -345,25 +345,36 @@ _dispatch_human_surface() {
     [[ "$do_clear" == "true" ]] && clear
 
     local -a args
-    if [[ $# -eq 0 ]]; then
-        args=(--interactive --aspirant --aspirant-kind dispatch)
-    else
-        args=("$@")
-        if ! _dispatch_has_flag --direct "${args[@]}" \
-            && ! _dispatch_has_flag --aspirant "${args[@]}" \
-            && ! _dispatch_has_flag --id "${args[@]}"; then
-            if _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_has_flag --kind "${args[@]}"; then
-                args=(--aspirant "${args[@]}")
-            else
-                args=(--aspirant --aspirant-kind dispatch "${args[@]}")
-            fi
+    args=("$@")
+
+    # Human launcher surfaces are canonical dispatch entrypoints. Always enter the
+    # dispatch selector and default to dispatch aspirant intake unless explicitly
+    # overridden with --direct, --aspirant, --id/--resume, or -r.
+    if [[ -z "${TOKEN_API_DISPATCH_MENU_CONSUMED:-${DISPATCH_MENU_CONSUMED:-}}" ]] \
+        && ! _dispatch_has_flag --interactive "${args[@]}"; then
+        args=(--interactive "${args[@]}")
+    fi
+    if ! _dispatch_has_flag --direct "${args[@]}" \
+        && ! _dispatch_has_flag --aspirant "${args[@]}" \
+        && ! _dispatch_has_flag --id "${args[@]}" \
+        && ! _dispatch_has_flag --resume "${args[@]}" \
+        && ! _dispatch_has_flag -r "${args[@]}"; then
+        if _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_has_flag --kind "${args[@]}"; then
+            args=(--aspirant "${args[@]}")
+        else
+            args=(--aspirant --aspirant-kind dispatch "${args[@]}")
         fi
     fi
 
     TOKEN_API_DISPATCH_ORIGIN="$origin" "$dispatch_bin" "${args[@]}"
 }
 
-# cdc — cd + clear + dispatch aspirant intake
+# Clear any stale interactive launcher definitions from older sourced versions.
+# This matters when reloading an existing shell after c/cc namespace changes.
+unalias c cc d 2>/dev/null || true
+unset -f cc d 2>/dev/null || true
+
+# cdc — cd + clear + dispatch aspirant selector; bypasses directory selection
 cdc() {
     if [[ $# -gt 0 && "$1" != -* ]]; then
         local dir="$1"
@@ -371,20 +382,16 @@ cdc() {
         cd "$dir" >/dev/null || return 1
     fi
 
-    _dispatch_human_surface cdc true "$@"
+    _dispatch_human_surface cdc true --dir "$PWD" "$@"
 }
 
-# cc — clear + dispatch aspirant intake
-cc() {
-    _dispatch_human_surface cc true "$@"
+# d — dispatch aspirant selector
+# Replaces cc as the human dispatch namespace.
+d() {
+    _dispatch_human_surface d false "$@"
 }
 
-# c — dispatch aspirant intake
+# c — clear only. Dispatch routing lives on d/cdc.
 c() {
-    _dispatch_human_surface c false "$@"
-}
-
-TRAPINT() {
-    _c_cleared=false
-    return 128
+    clear
 }

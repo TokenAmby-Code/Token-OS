@@ -405,19 +405,19 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         return json(res, result);
       }
 
-      // POST /voice/record — Start recording
-      if (method === 'POST' && path === '/voice/record') {
+      // POST /voice/listen — Start live transcription
+      if (method === 'POST' && path === '/voice/listen') {
         if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
         const body = await parseBody(req);
-        const result = voiceManager.startRecording(body.bot || 'mechanicus');
+        const result = voiceManager.startListening(body.bot || 'mechanicus');
         return json(res, result);
       }
 
-      // POST /voice/stop — Stop recording
+      // POST /voice/stop — Stop live transcription
       if (method === 'POST' && path === '/voice/stop') {
         if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
         const body = await parseBody(req);
-        const result = voiceManager.stopRecording(body.bot || 'mechanicus');
+        const result = voiceManager.stopListening(body.bot || 'mechanicus');
         return json(res, result);
       }
 

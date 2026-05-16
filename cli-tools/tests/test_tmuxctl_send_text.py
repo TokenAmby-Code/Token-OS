@@ -6,8 +6,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
+import pytest
 import tmuxctl.tmux_adapter as tmux_adapter
-from tmuxctl.tmux_adapter import TmuxAdapter
+from tmuxctl.tmux_adapter import TmuxAdapter, normalize_prompt_payload
 
 
 class RecordingAdapter(TmuxAdapter):
@@ -19,39 +20,39 @@ class RecordingAdapter(TmuxAdapter):
         return ""
 
 
-def test_send_text_then_submit_uses_literal_text_and_carriage_return():
+def test_normalize_prompt_payload_collapses_newlines_and_trims():
+    assert normalize_prompt_payload("hello\n\rworld  \n") == "hello world"
+
+
+def test_normalize_prompt_payload_rejects_empty():
+    with pytest.raises(ValueError):
+        normalize_prompt_payload(" \n\r\n")
+
+
+def test_send_text_then_submit_uses_literal_text_delay_and_double_carriage_return(monkeypatch):
     adapter = RecordingAdapter()
+    sleeps: list[float] = []
+    monkeypatch.setattr(tmux_adapter.time, "sleep", sleeps.append)
 
-    adapter.send_text_then_submit("%42", "hello\nworld", submit_settle_seconds=0)
+    adapter.send_text_then_submit("%42", "hello\nworld")
 
+    assert sleeps == [1.0, 1.0]
     assert adapter.calls == [
-        ("send-keys", "-t", "%42", "-l", "hello\nworld"),
+        ("send-keys", "-t", "%42", "-l", "hello world"),
+        ("send-keys", "-t", "%42", "C-m"),
         ("send-keys", "-t", "%42", "C-m"),
     ]
     assert not any("Enter" in call for call in adapter.calls)
 
 
-def test_send_text_then_submit_can_clear_prompt_first():
+def test_send_text_then_submit_can_clear_prompt_first(monkeypatch):
     adapter = RecordingAdapter()
+    monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
 
-    adapter.send_text_then_submit("%42", "hello", clear_prompt=True, submit_settle_seconds=0)
+    adapter.send_text_then_submit("%42", "hello", clear_prompt=True)
 
     assert adapter.calls == [
         ("send-keys", "-t", "%42", "C-u"),
-        ("send-keys", "-t", "%42", "-l", "hello"),
-        ("send-keys", "-t", "%42", "C-m"),
-    ]
-
-
-def test_send_text_then_submit_waits_before_submit_by_default(monkeypatch):
-    adapter = RecordingAdapter()
-    sleeps: list[float] = []
-    monkeypatch.setattr(tmux_adapter.time, "sleep", sleeps.append)
-
-    adapter.send_text_then_submit("%42", "hello")
-
-    assert sleeps == [tmux_adapter.DEFAULT_SUBMIT_SETTLE_SECONDS]
-    assert adapter.calls == [
         ("send-keys", "-t", "%42", "-l", "hello"),
         ("send-keys", "-t", "%42", "C-m"),
         ("send-keys", "-t", "%42", "C-m"),

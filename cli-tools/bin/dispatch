@@ -21,14 +21,15 @@ Usage:
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
-  --id <session_id>            Resume an existing agent session by session_id
+  --id, --resume, -r <id>      Resume an existing agent session by session_id
   --aspirant                  Create an aspirant instead of launching directly
   --aspirant-kind <kind>      dispatch, deploy_p, or deploy_d (with --aspirant)
+  --intake-only               With dispatch aspirants, create note/session only
   --kind <kind>               Compatibility alias for --aspirant-kind; requires --aspirant
   --direct                    Force direct launch; disable auto-aspirant policy
   --session-domain <domain>   Aspirant session-doc domain hint: terra or mars
   --persona <name>             Persona name (Claude/primarch backend)
-  --dir <path>                 Working directory (default: cwd)
+  --dir <path>                 Working directory (aspirant default: Imperium-ENV vault root)
   --title <text>               Aspirant title metadata
   --objective <text>           Aspirant objective metadata
   --victory-condition <text>  Aspirant victory condition; may repeat
@@ -59,9 +60,11 @@ quote() { printf '%q' "$1"; }
 ENGINE="claude"
 ENGINE_EXPLICIT=false
 RESUME_ID=""
+RESUME_REQUESTED=false
 RESUME_ROW_FOUND=false
 ASPIRANT=false
 ASPIRANT_KIND="dispatch"
+INTAKE_ONLY=false
 KIND_ALIAS_USED=false
 DIRECT=false
 SESSION_DOMAIN=""
@@ -88,14 +91,24 @@ WITH_MCP=""
 DISCORD_CHANNEL=""
 DRY_RUN=false
 INTERACTIVE=false
+DISPATCH_AUTO_EXPANDED_PANE=""
 DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
-    --id) RESUME_ID="${2:-}"; shift 2 ;;
+    --id|--resume|-r)
+      if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+        err "--id/--resume/-r requires a session_id"
+        exit 64
+      fi
+      RESUME_REQUESTED=true
+      RESUME_ID="$2"
+      shift 2
+      ;;
     --aspirant) ASPIRANT=true; shift ;;
     --aspirant-kind) ASPIRANT_KIND="${2:-}"; shift 2 ;;
+    --intake-only) INTAKE_ONLY=true; shift ;;
     --kind) ASPIRANT_KIND="${2:-}"; KIND_ALIAS_USED=true; shift 2 ;;
     --direct) DIRECT=true; shift ;;
     --session-domain) SESSION_DOMAIN="${2:-}"; shift 2 ;;
@@ -130,6 +143,62 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+dispatch_origin_is_human_surface() {
+  local origin="${TOKEN_API_DISPATCH_ORIGIN:-${DISPATCH_ORIGIN:-}}"
+  case "$origin" in
+    d|cdc|human:d|human:cdc) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+dispatch_menu_already_consumed() {
+  [[ -n "${TOKEN_API_DISPATCH_MENU_CONSUMED:-${DISPATCH_MENU_CONSUMED:-}}" ]]
+}
+
+# d/cdc are human launcher surfaces. They should always get the interactive
+# selector, even when --direct is present to bypass aspirant intake. But a
+# dispatch launch chain gets exactly one menu; recursive dispatches spawned
+# after an interactive selection must not re-open fzf.
+if dispatch_menu_already_consumed; then
+  INTERACTIVE=false
+elif ! $INTERACTIVE && dispatch_origin_is_human_surface; then
+  INTERACTIVE=true
+fi
+
+if $RESUME_REQUESTED && { [[ -z "$RESUME_ID" ]] || [[ "$RESUME_ID" == --* ]]; }; then
+  err "--id/--resume/-r requires a session_id"
+  exit 64
+fi
+
+dispatch_tmux_pane() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    printf '%s' "$TMUX_PANE"
+  elif command -v tmux >/dev/null 2>&1 && [[ -n "${TMUX:-}" ]]; then
+    tmux display-message -p '#{pane_id}' 2>/dev/null || true
+  fi
+}
+
+dispatch_expand_for_fzf() {
+  $DRY_RUN && return 0
+  [[ -n "${TMUX:-}" ]] || return 0
+  command -v tmux-grid-expand >/dev/null 2>&1 || return 0
+  local pane
+  pane="$(dispatch_tmux_pane)"
+  [[ -n "$pane" ]] || return 0
+  tmux-grid-expand --pane "$pane" --expand >/dev/null 2>&1 || return 0
+  DISPATCH_AUTO_EXPANDED_PANE="$pane"
+}
+
+dispatch_retract_after_cli_prompt() {
+  $DRY_RUN && return 0
+  [[ -n "$DISPATCH_AUTO_EXPANDED_PANE" ]] || return 0
+  [[ -n "$PROMPT" ]] || return 0
+  command -v tmux-grid-expand >/dev/null 2>&1 || return 0
+  tmux-grid-expand --pane "$DISPATCH_AUTO_EXPANDED_PANE" --retract >/dev/null 2>&1 || true
+  DISPATCH_AUTO_EXPANDED_PANE=""
+}
+
 
 expand_path() {
   local path="$1"
@@ -212,23 +281,37 @@ directory_candidates() {
 }
 
 session_doc_candidates() {
-  printf '__none__\tnew session doc\n'
+  printf '%s\t%s\n' '__none__' 'new session doc'
+  printf '%s\t%s\n' '__resume__' 'resume a session'
   sqlite_query "
     SELECT file_path,
-           COALESCE(title, ''),
-           COALESCE(project, ''),
-           COALESCE(status, ''),
-           COALESCE(updated_at, '')
+           COALESCE(NULLIF(title, ''), '')
     FROM session_documents
     WHERE file_path IS NOT NULL AND file_path != ''
     ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC
     LIMIT 80;
-  " | while IFS=$'\t' read -r file_path title project status updated_at; do
+  " | while IFS=$'\t' read -r file_path title; do
     [[ -n "$file_path" ]] || continue
-    local label="${title:-$(basename "$file_path")}" meta="${status:-unknown}"
-    [[ -n "$project" ]] && meta+="/${project}"
-    [[ -n "$updated_at" ]] && meta+=" ${updated_at%%.*}"
-    printf '%s\t%s — %s — %s\n' "$file_path" "$label" "$meta" "$(compact_path "$file_path")"
+    local label="$title"
+    if [[ -z "$label" ]]; then
+      label="$(basename "$file_path")"
+      label="${label%.md}"
+    fi
+    printf '%s\t%s\n' "$file_path" "$label"
+  done
+}
+
+resume_session_candidates() {
+  sqlite_query "
+    SELECT session_id,
+           COALESCE(NULLIF(tab_name, ''), NULLIF(pane_label, ''), NULLIF(primarch, ''), NULLIF(engine, ''), substr(session_id, 1, 8))
+    FROM claude_instances
+    WHERE session_id IS NOT NULL AND session_id != ''
+    ORDER BY last_activity DESC
+    LIMIT 80;
+  " | while IFS=$'\t' read -r session_id label; do
+    [[ -n "$session_id" ]] || continue
+    printf '%s\t%s\n' "$session_id" "${label:-${session_id:0:8}}"
   done
 }
 
@@ -271,6 +354,7 @@ interactive_override_for() {
   case "$1" in
     dir) printf '%s' "${DISPATCH_INTERACTIVE_DIR:-}" ;;
     session_doc) printf '%s' "${DISPATCH_INTERACTIVE_SESSION_DOC:-}" ;;
+    resume) printf '%s' "${DISPATCH_INTERACTIVE_RESUME:-}" ;;
     persona) printf '%s' "${DISPATCH_INTERACTIVE_PERSONA:-}" ;;
     mode) printf '%s' "${DISPATCH_INTERACTIVE_MODE:-}" ;;
   esac
@@ -313,11 +397,28 @@ run_interactive_selection() {
   local selected default_mode
 
   WORK_DIR="$(expand_path "$WORK_DIR")"
-  selected="$(directory_candidates | dedupe_tsv | pick_fzf_value dir 'dir> ' "$WORK_DIR")"
-  [[ -n "$selected" ]] && WORK_DIR="$selected"
+  if ! $WORK_DIR_EXPLICIT; then
+    selected="$(directory_candidates | dedupe_tsv | pick_fzf_value dir 'dir> ' "$WORK_DIR")"
+    [[ -n "$selected" ]] && WORK_DIR="$selected"
+  fi
 
   selected="$(session_doc_candidates | dedupe_tsv | pick_fzf_value session_doc 'session-doc> ' "${SESSION_DOC:-__none__}")"
-  if [[ "$selected" == "__none__" || "$selected" == "none" ]]; then SESSION_DOC=""; else SESSION_DOC="$selected"; fi
+  case "$selected" in
+    __none__|none)
+      SESSION_DOC=""
+      ;;
+    __resume__|resume)
+      selected="$(resume_session_candidates | dedupe_tsv | pick_fzf_value resume 'resume> ' "${RESUME_ID:-}")"
+      [[ -n "$selected" ]] || { err "no resumable sessions found"; exit 66; }
+      RESUME_ID="$selected"
+      ASPIRANT=false
+      DIRECT=true
+      return 0
+      ;;
+    *)
+      SESSION_DOC="$selected"
+      ;;
+  esac
 
   local default_persona
   if [[ -n "$PERSONA" ]]; then
@@ -357,8 +458,11 @@ run_interactive_selection() {
 
 }
 
-if $INTERACTIVE; then
+if $INTERACTIVE && [[ -z "$RESUME_ID" ]]; then
+  dispatch_expand_for_fzf
   run_interactive_selection
+  export TOKEN_API_DISPATCH_MENU_CONSUMED=1
+  export DISPATCH_MENU_CONSUMED=1
 fi
 
 if $KIND_ALIAS_USED && ! $ASPIRANT; then
@@ -385,11 +489,7 @@ auto_aspirant_policy_applies() {
   [[ -n "${TOKEN_API_ASPIRANT_PIPELINE:-}" ]] && return 1
   [[ -n "$PERSONA" ]] && return 1
 
-  local origin="${TOKEN_API_DISPATCH_ORIGIN:-${DISPATCH_ORIGIN:-}}"
-  case "$origin" in
-    c|cc|cdc|human:c|human:cc|human:cdc) return 0 ;;
-    *) return 1 ;;
-  esac
+  dispatch_origin_is_human_surface
 }
 
 if ! $ASPIRANT && auto_aspirant_policy_applies; then
@@ -522,6 +622,8 @@ if ! $ASPIRANT || [[ "$ASPIRANT_KIND" == "dispatch" ]]; then
   WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 fi
 
+dispatch_retract_after_cli_prompt
+
 if [[ -n "$RESUME_INSTANCE_TYPE" ]]; then
   INSTANCE_TYPE="$RESUME_INSTANCE_TYPE"
 elif $SYNC; then
@@ -562,6 +664,77 @@ run_internal_aspirant_create() {
   PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m aspirant_create "${ASPIRANT_CREATE_ARGS[@]}"
 }
 
+vault_root_for_aspirant() {
+  if [[ -n "${IMPERIUM:-}" ]]; then
+    printf '%s/Imperium-ENV' "$IMPERIUM"
+  else
+    printf '%s' "/Volumes/Imperium/Imperium-ENV"
+  fi
+}
+
+abs_vault_path() {
+  local path="$1" vault
+  vault="$(vault_root_for_aspirant)"
+  if [[ "$path" = /* ]]; then
+    printf '%s' "$path"
+  else
+    printf '%s/%s' "$vault" "$path"
+  fi
+}
+
+build_aspirant_launch_prompt_file() {
+  local note_rel="$1" session_doc_rel="$2" note_abs session_doc_abs prompt_file
+  note_abs="$(abs_vault_path "$note_rel")"
+  session_doc_abs="$(abs_vault_path "$session_doc_rel")"
+  prompt_file="$(mktemp "${TMPDIR:-/tmp}/dispatch-aspirant-prompt.XXXXXX")"
+  cat >"$prompt_file" <<EOF_ASPIRANT_PROMPT
+# Aspirant Session Startup
+
+You are launching a full aspirant trials session.
+
+Read these files before acting:
+- Aspirant note: ${note_abs}
+- Session doc: ${session_doc_abs}
+
+The aspirant note contains the gene-seed content. The session doc is your linked session memory.
+
+Startup instructions:
+- Orient from the linked session doc and vault context before making decisions.
+- Perform concrete implantation/trials work: inspect related vault notes, validate dispatch metadata, challenge assumptions, and identify blockers.
+- Append your useful output back to the aspirant note under clear \`## Implantation\` and/or \`## Trials\` sections, or concise continuations if those sections already exist.
+- Maintain frontmatter \`questions\` as an array of objects. Append new entries to the end of the array; close each entry as it is answered or explicitly waived.
+- Do not launch downstream workers from this aspirant session.
+EOF_ASPIRANT_PROMPT
+  printf '%s' "$prompt_file"
+}
+
+launch_dispatch_aspirant_session() {
+  local result_json="$1" note_rel session_doc_rel vault prompt_file
+  note_rel="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("note_path") or "")' <<<"$result_json")"
+  session_doc_rel="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_doc") or "")' <<<"$result_json")"
+  [[ -n "$note_rel" && -n "$session_doc_rel" ]] || { err "aspirant creation did not return note/session paths"; return 70; }
+  vault="$(vault_root_for_aspirant)"
+  prompt_file="$(build_aspirant_launch_prompt_file "$note_rel" "$session_doc_rel")"
+
+  printf 'launch_action: dispatch --direct --engine claude --dir %q --target legion:new --session-doc %q --system-prompt-file %q --prompt-file %q --gt\n' \
+    "$vault" "$(abs_vault_path "$session_doc_rel")" "$(aspirant_persona_prompt_path)" "$prompt_file"
+  TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
+  TOKEN_API_INTERNAL_DISPATCH=1 \
+  "${SCRIPT_DIR}/dispatch" \
+    --direct \
+    --engine claude \
+    --dir "$vault" \
+    --target legion:new \
+    --session-doc "$(abs_vault_path "$session_doc_rel")" \
+    --system-prompt-file "$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-/Volumes/Imperium/Scripts}/cli-tools/prompts/aspirant-persona.md")" \
+    --prompt-file "$prompt_file" \
+    --gt
+}
+
+aspirant_persona_prompt_path() {
+  printf '%s' "$(cd "${SCRIPT_DIR}/.." && pwd)/prompts/aspirant-persona.md"
+}
+
 if $ASPIRANT; then
   if [[ -z "$OBJECTIVE" ]]; then
     err "--aspirant requires --objective or prompt text"
@@ -586,6 +759,13 @@ dispatch aspirant dry-run
   trials_verdict:  pending
 EOF_ASPIRANT_DRY
     exit 0
+  fi
+  if [[ "$ASPIRANT_KIND" == "dispatch" && "$INTAKE_ONLY" != true ]]; then
+    ASPIRANT_CREATE_ARGS+=(--json)
+    ASPIRANT_RESULT="$(run_internal_aspirant_create)"
+    printf '%s\n' "$ASPIRANT_RESULT"
+    launch_dispatch_aspirant_session "$ASPIRANT_RESULT"
+    exit $?
   fi
   run_internal_aspirant_create
   exit $?
