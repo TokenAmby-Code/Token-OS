@@ -5009,7 +5009,16 @@ def _load_golden_throne_sop() -> str:
     return (
         "Read your session doc. Assess what remains. "
         "Act if clear, escalate if blocked. Update session doc. "
-        "Declare victory when exhausted."
+        "Do not just say 'victory' in-thread; victory is an API/session-doc "
+        "state transition. If done, call POST $TOKEN_API_URL/api/session-docs/"
+        "<doc_id>/victory-ack or POST $TOKEN_API_URL/api/instances/"
+        "<instance_id>/victory. If Golden Throne pings are wrong for this "
+        "thread, disable them by setting the instance to one_off: PATCH "
+        "$TOKEN_API_URL/api/instances/<instance_id>/type with "
+        "{\"instance_type\":\"one_off\"}. Do not allow yourself to be "
+        "Sisyphus-looped; either make measurable progress, escalate, disable "
+        "Golden Throne for this thread, or perform the victory state transition "
+        "so usage limits are not burned."
     )
 
 
@@ -5178,6 +5187,18 @@ def _golden_throne_accountability_prompt(status: RubricStatus, doc_path: Path | 
         f"  2. Escalate to Emperor via /api/notify if you are blocked, or\n"
         f"  3. Mark inapplicable conditions in `{status.rubric_key}_skip` "
         f"(with justification in the doc body).\n\n"
+        f"Declaring victory is not an in-thread action: do not merely write "
+        f"'victory' or a completion claim. Victory must be recorded through "
+        f"the API/session-doc state transition: POST "
+        f"$TOKEN_API_URL/api/session-docs/<doc_id>/victory-ack, or the legacy "
+        f"POST $TOKEN_API_URL/api/instances/<instance_id>/victory if no doc id "
+        f"is available.\n"
+        f"To disable Golden Throne pings for this thread, set the instance to "
+        f"one_off: PATCH $TOKEN_API_URL/api/instances/<instance_id>/type with "
+        f'{{"instance_type":"one_off"}}.\n'
+        f"Do not allow yourself to be Sisyphus-looped. Either make measurable "
+        f"progress, escalate, disable Golden Throne for this thread, or perform "
+        f"the victory state transition so usage limits are not burned.\n\n"
         f"Silently rolling over is not an option. The session doc is the contract."
     )
 
