@@ -29,7 +29,12 @@ class _FakeHTTPClient:
 
 
 class _FakeProc:
-    def __init__(self, returncode=0, stdout=b"dispatched claude to %1", stderr=b""):
+    def __init__(
+        self,
+        returncode: int = 0,
+        stdout: bytes = b"dispatched claude to legion:new",
+        stderr: bytes = b"",
+    ) -> None:
         self.returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
