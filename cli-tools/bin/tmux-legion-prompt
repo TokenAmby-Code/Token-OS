@@ -88,10 +88,16 @@ if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qE 
     tmux new-window -t "$SESSION" -n "$WINDOW" -d -c "$HOME"
 fi
 
-LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
 
 printf -v PROMPT_Q '%q' "$PROMPT_TEXT"
-LAUNCH_CMD="cd ~ && d ${PROMPT_Q}"
+DISPATCH_BIN="${SCRIPT_DIR}/dispatch"
+printf -v DISPATCH_BIN_Q '%q' "$DISPATCH_BIN"
+# Use the dispatch binary directly. A fresh managed pane may not have the `d`
+# shell function loaded yet; TOKEN_API_DISPATCH_ORIGIN=d preserves human-surface
+# behavior, including the fzf selector/aspirant policy.
+LAUNCH_CMD="cd ~ && TOKEN_API_DISPATCH_ORIGIN=d ${DISPATCH_BIN_Q} --prompt ${PROMPT_Q}"
 
 if $DRY_RUN; then
     log "DRY RUN"

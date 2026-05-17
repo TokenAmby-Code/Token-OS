@@ -452,7 +452,8 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert data["dispatch_schema_complete"] is True
     assert data["dispatch_ready"] is False
     assert data["operator_approved_dispatch"] is False
-    assert "dispatched claude to %aspirant-pane" in result.stdout
+    assert "dispatched claude to legion:new" in result.stdout
+    assert "%aspirant-pane" not in result.stdout
 
     note = next((vault / "Aspirants").glob("implement-safely*.md"))
     note_text = note.read_text(encoding="utf-8")
@@ -471,10 +472,14 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--prompt-file" in result.stdout
     launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
     assert "stack dispatch legion --session main" in launched
-    assert "--append-system-prompt" in launched
-    assert "Aspirant Session Startup" in launched
-    assert "## Implantation" in launched
-    assert "## Trials" in launched
+    assert "--command bash " in launched
+    assert "%aspirant-pane" not in launched
+    staged_path = Path(launched.rsplit("--command bash ", 1)[1].strip())
+    staged = staged_path.read_text(encoding="utf-8", errors="replace")
+    assert "--append-system-prompt" in staged
+    assert "Aspirant Session Startup" in staged
+    assert "## Implantation" in staged
+    assert "## Trials" in staged
 
 
 def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp_path):
@@ -521,7 +526,9 @@ def test_tmux_prefix_space_launcher_routes_to_d_without_popup_newline():
     assert "tmux-legion-prompt --prompt" in conf
 
     launcher = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt").read_text(encoding="utf-8")
-    assert 'LAUNCH_CMD="cd ~ && d ' in launcher
+    assert "TOKEN_API_DISPATCH_ORIGIN=d" in launcher
+    assert "${SCRIPT_DIR}/dispatch" in launcher
+    assert 'LAUNCH_CMD="cd ~ && d ' not in launcher
     assert "c --prompt-file" not in launcher
 
 
