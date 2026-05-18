@@ -124,6 +124,7 @@ async function main() {
           is_reply: false,
           is_voice: true,
           bot_name: botLabel,
+          target_tmux_pane: result.lockedTmuxPane || result.commitMeta?.lockedTmuxPane || null,
         }),
       });
       logger.info(`Transcription [${botLabel}]: Token API ack ${resp.status}`);

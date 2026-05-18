@@ -15,7 +15,7 @@ import {
 import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { Transform } from 'stream';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import { Events } from 'discord.js';
 import prism from 'prism-media';
@@ -36,6 +36,51 @@ export function createVoiceManager(botClients, config, logger) {
   // Collect all bot user IDs to filter out of audio capture (prevent ouroboros)
   // Populated lazily after bots connect
   const botUserIds = new Set();
+
+
+  function resolveSelectedTmuxPane() {
+    try {
+      const clientsOut = execFileSync('tmux', [
+        'list-clients',
+        '-F',
+        '#{client_activity}\t#{client_name}',
+      ], { encoding: 'utf8', timeout: 5000 });
+
+      let selectedClient = null;
+      let selectedActivity = -1;
+      for (const line of clientsOut.split(/\r?\n/)) {
+        if (!line) continue;
+        const [rawActivity, clientName] = line.split('\t');
+        const activity = Number.parseInt(rawActivity || '0', 10);
+        if (clientName && Number.isFinite(activity) && activity > selectedActivity) {
+          selectedClient = clientName;
+          selectedActivity = activity;
+        }
+      }
+      if (!selectedClient) return null;
+
+      const pane = execFileSync('tmux', [
+        'display-message',
+        '-c',
+        selectedClient,
+        '-p',
+        '#{pane_id}',
+      ], { encoding: 'utf8', timeout: 5000 }).trim();
+      if (!pane.startsWith('%')) return null;
+
+      const panesOut = execFileSync('tmux', [
+        'list-panes',
+        '-a',
+        '-F',
+        '#{pane_id}',
+      ], { encoding: 'utf8', timeout: 5000 });
+      if (!new Set(panesOut.split(/\r?\n/)).has(pane)) return null;
+      return pane;
+    } catch (err) {
+      logger.warn(`Voice: selected tmux pane resolve failed: ${err.message}`);
+      return null;
+    }
+  }
 
   function refreshBotUserIds() {
     for (const client of Object.values(botClients)) {
@@ -177,6 +222,10 @@ export function createVoiceManager(botClients, config, logger) {
     let hasAudioSinceCommit = false;
     let bytesSinceCommit = 0;
     let silenceTimer = null;
+    const lockedTmuxPane = resolveSelectedTmuxPane();
+    if (lockedTmuxPane) {
+      logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
+    }
 
     function commitPending(reason, extra = {}) {
       if (silenceTimer) {
@@ -186,7 +235,7 @@ export function createVoiceManager(botClients, config, logger) {
       if (!hasAudioSinceCommit) return false;
       logger.info(`Voice [${botName}]: committing realtime audio from ${userId} (${bytesSinceCommit} bytes, reason=${reason})`);
       if (onAudioCommit) {
-        try { onAudioCommit(userId, botName, { reason, ...extra }); } catch {}
+        try { onAudioCommit(userId, botName, { reason, lockedTmuxPane, ...extra }); } catch {}
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;

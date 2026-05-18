@@ -47,6 +47,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       resampleRemainder: Buffer.alloc(0),
       pendingAudio: [],
       pendingCommitMeta: null,
+      lastCommitMeta: null,
       cleanupTimer: null,
     };
 
@@ -155,6 +156,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           itemId: event.item_id,
           startedAt: session.startedAt,
           firstDeltaAt: session.lastDeltaAt,
+          commitMeta: session.lastCommitMeta || null,
+          lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || null,
         });
         scheduleCleanup(session, 1000, 'completed');
       }
@@ -258,9 +261,10 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       return false;
     }
     if (session.appendedFrames === 0) return false;
+    session.lastCommitMeta = meta || {};
     logger.info(
       `Realtime [${botName}]: committing audio for user ${userId} ` +
-      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'})`
+      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
     );
     return send(session, { type: 'input_audio_buffer.commit' });
   }

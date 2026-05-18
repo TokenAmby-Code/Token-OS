@@ -714,6 +714,7 @@ class DiscordMessageRequest(BaseModel):
     is_reply: bool = False
     is_voice: bool = False
     bot_name: str | None = None
+    target_tmux_pane: str | None = None
     reply_to_message_id: str | None = None
     attachments: list | None = None
     embeds: int | None = 0
@@ -16009,10 +16010,26 @@ async def _discord_voice_error_message(bot: str, error_msg: str):
 
 
 async def _try_discord_active_pane_injection(message) -> bool:
-    """Inject a Discord voice transcript into the currently selected tmux pane."""
-    pane = await _resolve_selected_tmux_pane()
-    if not pane:
-        return False
+    """Inject a Discord voice transcript into the pane locked for this utterance.
+
+    The Discord daemon captures target_tmux_pane at speech start (or, failing
+    that, at the silence/commit edge) so click-away during transcription does
+    not retarget the final transcript.  If old daemons omit it, fall back to the
+    currently selected pane for compatibility.
+    """
+    requested_pane = getattr(message, "target_tmux_pane", None)
+    if requested_pane:
+        if not requested_pane.startswith("%") or not await _tmux_pane_exists(requested_pane):
+            logger.warning(
+                f"Discord active-pane injection: locked pane {requested_pane!r} is invalid or dead"
+            )
+            return False
+        pane = requested_pane
+        logger.info(f"Discord active-pane injection: using locked pane {pane}")
+    else:
+        pane = await _resolve_selected_tmux_pane()
+        if not pane:
+            return False
 
     formatted = _format_discord_injection("imperial_guard", message.content or "")
 
