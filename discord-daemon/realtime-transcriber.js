@@ -48,6 +48,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       pendingAudio: [],
       pendingCommitMeta: null,
       lastCommitMeta: null,
+      committed: false,
       cleanupTimer: null,
     };
 
@@ -166,7 +167,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     ws.on('close', (code, reason) => {
       session.closed = true;
       logger.info(`Realtime [${botName}]: closed for ${userId} (${code}) ${reason || ''}`);
-      cleanupSession(key);
+      cleanupSession(session);
     });
 
     ws.on('error', (err) => {
@@ -209,7 +210,11 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
   function getSession(botName, userId) {
     const key = keyFor(botName, userId);
     const existing = sessions.get(key);
-    if (existing && !existing.closed) return existing;
+    if (existing && !existing.closed && !existing.committed) return existing;
+    if (existing && existing.committed && !existing.closed) {
+      logger.info(`Realtime [${botName}]: starting next session while committed transcript is pending for user ${userId}`);
+      sessions.delete(key);
+    }
     return makeSession(botName, userId);
   }
 
@@ -262,6 +267,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     }
     if (session.appendedFrames === 0) return false;
     session.lastCommitMeta = meta || {};
+    session.committed = true;
     logger.info(
       `Realtime [${botName}]: committing audio for user ${userId} ` +
       `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
@@ -273,14 +279,14 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     session.cleanupTimer = setTimeout(() => {
       logger.info(`Realtime [${session.botName}]: cleanup after ${reason} for user ${session.userId}`);
-      cleanupSession(session.key);
+      cleanupSession(session);
     }, delayMs);
   }
 
-  function cleanupSession(key) {
-    const session = sessions.get(key);
+  function cleanupSession(sessionOrKey) {
+    const session = typeof sessionOrKey === 'string' ? sessions.get(sessionOrKey) : sessionOrKey;
     if (!session) return;
-    sessions.delete(key);
+    if (sessions.get(session.key) === session) sessions.delete(session.key);
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     try { session.ws.close(); } catch {}
   }
