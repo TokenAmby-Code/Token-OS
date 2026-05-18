@@ -715,6 +715,8 @@ class DiscordMessageRequest(BaseModel):
     is_voice: bool = False
     bot_name: str | None = None
     target_tmux_pane: str | None = None
+    voice_no_submit: bool = False
+    voice_append_submit: bool = False
     reply_to_message_id: str | None = None
     attachments: list | None = None
     embeds: int | None = 0
@@ -16034,12 +16036,16 @@ async def _try_discord_active_pane_injection(message) -> bool:
 
     try:
         tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
+        dictate_args = [str(tmux_dictate), "-t", pane]
+        if not getattr(message, "voice_no_submit", False) and not getattr(message, "voice_append_submit", False):
+            dictate_args.append("--submit")
+        if getattr(message, "voice_append_submit", False):
+            # A pooled short utterance is already sitting in the prompt bar.
+            # Append only the new speech, then submit the combined prompt.
+            formatted = f" {message.content or ''}"
+        dictate_args.append(formatted)
         proc = await asyncio.create_subprocess_exec(
-            str(tmux_dictate),
-            "-t",
-            pane,
-            "--submit",
-            formatted,
+            *dictate_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={
@@ -16057,7 +16063,15 @@ async def _try_discord_active_pane_injection(message) -> bool:
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
-            logger.info(f"Discord active-pane injection: imperial_guard → {pane}")
+            if getattr(message, "voice_append_submit", False):
+                enter = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", pane, "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(enter.communicate(), timeout=5)
+            mode = "no-submit" if getattr(message, "voice_no_submit", False) else "submit"
+            logger.info(f"Discord active-pane injection: imperial_guard → {pane} ({mode})")
             return True
         logger.warning(
             f"Discord active-pane injection failed for {pane} (rc={proc.returncode}): {stderr.decode()[:200]}"
