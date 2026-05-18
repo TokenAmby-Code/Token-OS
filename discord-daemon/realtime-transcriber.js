@@ -240,7 +240,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (!audio || audio.length === 0) return;
     if (!session.ready) {
       session.pendingAudio.push(audio);
-      if (session.pendingAudio.length > 200) session.pendingAudio.shift();
+      if (session.pendingAudio.length > 1000) session.pendingAudio.shift();
       return;
     }
     appendAudio(session, audio);
