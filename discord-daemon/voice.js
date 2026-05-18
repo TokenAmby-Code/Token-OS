@@ -38,44 +38,68 @@ export function createVoiceManager(botClients, config, logger) {
   const botUserIds = new Set();
 
 
+  function paneInfo(pane) {
+    if (!pane?.startsWith?.('%')) return null;
+    try {
+      const raw = execFileSync('tmux', [
+        'display-message',
+        '-t',
+        pane,
+        '-p',
+        '#{pane_id}\t#{session_name}\t#{pane_current_command}\t#{pane_current_path}',
+      ], { encoding: 'utf8', timeout: 5000 }).trim();
+      const [paneId, sessionName, command, currentPath] = raw.split('\t');
+      if (paneId !== pane) return null;
+      return { paneId, sessionName, command, currentPath };
+    } catch {
+      return null;
+    }
+  }
+
+  function isRoutablePane(pane) {
+    const info = paneInfo(pane);
+    if (!info) return false;
+    if (info.sessionName === 'discord-daemon') return false;
+    if ((info.currentPath || '').endsWith('/Token-OS/discord-daemon')) return false;
+    return true;
+  }
+
   function resolveSelectedTmuxPane() {
     try {
       const clientsOut = execFileSync('tmux', [
         'list-clients',
         '-F',
-        '#{client_activity}\t#{client_name}',
+        '#{client_activity}\t#{client_name}\t#{session_name}',
       ], { encoding: 'utf8', timeout: 5000 });
 
-      let selectedClient = null;
-      let selectedActivity = -1;
+      const clients = [];
       for (const line of clientsOut.split(/\r?\n/)) {
         if (!line) continue;
-        const [rawActivity, clientName] = line.split('\t');
+        const [rawActivity, clientName, sessionName] = line.split('\t');
         const activity = Number.parseInt(rawActivity || '0', 10);
-        if (clientName && Number.isFinite(activity) && activity > selectedActivity) {
-          selectedClient = clientName;
-          selectedActivity = activity;
+        if (clientName && Number.isFinite(activity) && sessionName !== 'discord-daemon') {
+          clients.push({ clientName, sessionName, activity });
         }
       }
-      if (!selectedClient) return null;
+      clients.sort((a, b) => b.activity - a.activity);
 
-      const pane = execFileSync('tmux', [
-        'display-message',
-        '-c',
-        selectedClient,
-        '-p',
-        '#{pane_id}',
-      ], { encoding: 'utf8', timeout: 5000 }).trim();
-      if (!pane.startsWith('%')) return null;
+      for (const client of clients) {
+        const pane = execFileSync('tmux', [
+          'display-message',
+          '-c',
+          client.clientName,
+          '-p',
+          '#{pane_id}',
+        ], { encoding: 'utf8', timeout: 5000 }).trim();
+        if (isRoutablePane(pane)) {
+          logger.info(`Voice: selected tmux client ${client.clientName} (${client.sessionName}) pane ${pane}`);
+          return pane;
+        }
+        logger.warn(`Voice: selected pane ${pane || '?'} from client ${client.clientName} is not routable`);
+      }
 
-      const panesOut = execFileSync('tmux', [
-        'list-panes',
-        '-a',
-        '-F',
-        '#{pane_id}',
-      ], { encoding: 'utf8', timeout: 5000 });
-      if (!new Set(panesOut.split(/\r?\n/)).has(pane)) return null;
-      return pane;
+      logger.warn('Voice: no routable attached tmux client pane found');
+      return null;
     } catch (err) {
       logger.warn(`Voice: selected tmux pane resolve failed: ${err.message}`);
       return null;
