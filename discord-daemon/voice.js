@@ -246,10 +246,7 @@ export function createVoiceManager(botClients, config, logger) {
     let hasAudioSinceCommit = false;
     let bytesSinceCommit = 0;
     let silenceTimer = null;
-    const lockedTmuxPane = resolveSelectedTmuxPane();
-    if (lockedTmuxPane) {
-      logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
-    }
+    let lockedTmuxPane = null;
 
     function commitPending(reason, extra = {}) {
       if (silenceTimer) {
@@ -263,6 +260,7 @@ export function createVoiceManager(botClients, config, logger) {
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;
+      lockedTmuxPane = null;
       return true;
     }
 
@@ -273,17 +271,26 @@ export function createVoiceManager(botClients, config, logger) {
       }, SILENCE_COMMIT_MS);
     }
 
-    // Silence frames from Discord trigger the commit timer.
+    // Silence frames from Discord trigger the local commit timer only. Do not
+    // append synthetic silence into Realtime: it can create empty sessions after
+    // cleanup and swallow the next short utterance.
     silenceFilter.on('silence', () => {
-      if (onAudioFrame) {
-        try { onAudioFrame(userId, SILENCE_PCM_20MS, botName, { silence: true }); } catch {}
-      }
       if (hasAudioSinceCommit) {
         startSilenceTimer();
       }
     });
 
     decoder.on('data', (chunk) => {
+      // First real audio frame of a local utterance: lock the active pane now.
+      if (!hasAudioSinceCommit) {
+        lockedTmuxPane = resolveSelectedTmuxPane();
+        if (lockedTmuxPane) {
+          logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
+        } else {
+          logger.warn(`Voice [${botName}]: no selected tmux pane lock for user ${userId}`);
+        }
+      }
+
       if (onAudioFrame) {
         try { onAudioFrame(userId, chunk, botName, { silence: false }); } catch {}
       }
