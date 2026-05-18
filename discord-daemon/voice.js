@@ -86,8 +86,8 @@ export function createVoiceManager(botClients, config, logger) {
       for (const client of clients) {
         const pane = execFileSync('tmux', [
           'display-message',
-          '-c',
-          client.clientName,
+          '-t',
+          client.sessionName,
           '-p',
           '#{pane_id}',
         ], { encoding: 'utf8', timeout: 5000 }).trim();
