@@ -519,11 +519,19 @@ def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp
     assert "dispatched claude" not in result.stdout
 
 
-def test_tmux_prefix_space_launcher_routes_to_d_without_popup_newline():
+def test_tmux_prefix_space_launcher_uses_large_popup_without_enter_newline_hang():
     conf = (ROOT / "cli-tools" / "tmux" / "tmux-base.conf").read_text(encoding="utf-8")
-    assert "bind Space command-prompt" in conf
-    assert "display-popup" not in conf.split("bind Space", 1)[1].split("\n", 1)[0]
-    assert "tmux-legion-prompt --prompt" in conf
+    bind_line = "bind Space" + conf.split("bind Space", 1)[1].split("\n", 1)[0]
+    assert "display-popup" in bind_line
+    assert "tmux-legion-prompt-popup" in bind_line
+    assert "command-prompt" not in bind_line
+
+    popup = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt-popup").read_text(encoding="utf-8")
+    assert "IFS= read -r PROMPT_TEXT" in popup
+    assert "run-shell -b" in popup
+    assert "tmux-legion-prompt-popup.log" in popup
+    assert "stty -echo -icanon" not in popup
+    assert 'tmux run-shell -b "tmux-run tmux-legion-prompt --prompt-file' in popup
 
     launcher = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt").read_text(encoding="utf-8")
     assert "TOKEN_API_DISPATCH_ORIGIN=d" in launcher

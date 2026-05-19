@@ -78,7 +78,8 @@ async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monk
     assert result["nudge_number"] == 1
     assert enqueued[0]["tmux_pane"] == "%10"
     assert enqueued[0]["source"] == "naming_nudge"
-    assert "instance-name 'anti-archaeology-chunk-a-naming-nudge'" in enqueued[0]["payload"]
+    assert 'session-doc-name "Your Descriptive Title"' in enqueued[0]["payload"]
+    assert "Do not use dates" in enqueued[0]["payload"]
 
     row = _fetchone(
         app_env.db_path,

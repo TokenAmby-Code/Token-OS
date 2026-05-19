@@ -71,7 +71,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
                 type: 'server_vad',
                 threshold: vad.threshold ?? 0.5,
                 prefix_padding_ms: vad.prefix_padding_ms ?? 300,
-                silence_duration_ms: vad.silence_duration_ms ?? 500,
+                silence_duration_ms: vad.silence_duration_ms ?? 300,
               },
             },
           },
@@ -79,7 +79,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       });
       logger.info(
         `Realtime [${botName}]: session.update sent ` +
-        `(intent=transcription, transcription=${transcriptionModel}, vad=${vad.silence_duration_ms ?? 500}ms)`
+        `(intent=transcription, transcription=${transcriptionModel}, vad=${vad.silence_duration_ms ?? 300}ms)`
       );
     });
 

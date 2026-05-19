@@ -117,7 +117,7 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert data["trials_verdict"] == "pending"
     assert data["operator_approved_dispatch"] is False
     assert data["session_doc"].startswith("Mars/Sessions/")
-    assert data["session_doc"].endswith("Aspirant - Worker plan.md")
+    assert data["session_doc"].endswith("aspirant-worker-plan.md")
     assert not Path(data["session_doc"]).name.startswith("20")
     session_doc = vault / data["session_doc"]
     session_text = session_doc.read_text(encoding="utf-8")

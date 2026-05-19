@@ -9,10 +9,11 @@ Relevant config:
   "realtime_model": "gpt-realtime",
   "realtime_transcription_model": "gpt-4o-transcribe",
   "realtime_language": "en",
+  "voice_silence_commit_ms": 700,
   "realtime_vad": {
     "threshold": 0.5,
     "prefix_padding_ms": 300,
-    "silence_duration_ms": 500
+    "silence_duration_ms": 300
   }
 }
 ```
@@ -27,9 +28,21 @@ There is no legacy bridge, local WAV conversion, or local audio-file retry path 
 
 - Realtime sockets open with `?intent=transcription`.
 - Discord silence frames feed a local commit timer.
-- After 1.5s of Discord silence, the daemon sends `input_audio_buffer.commit`.
+- After `voice_silence_commit_ms` of Discord silence (default 700ms), the daemon sends `input_audio_buffer.commit`.
 - Leave/stop also commits any active user buffer before tearing down the voice stream.
 - Stream-end commits the user buffer and gives the transcription up to 20 seconds to complete before cleanup.
+
+## Voice Draft Lifecycle
+
+The daemon is transport only: every completed realtime transcript is forwarded to Token API with the bot/user metadata and, for Imperial Guard, the daemon-supplied `target_tmux_pane`. There is no short-fragment debounce, false-positive drop list, pooling, or daemon-side auto-submit.
+
+Token API owns the visible draft lifecycle:
+
+- first non-command utterance creates one draft lock for `(bot_name, author_id)` and types into the target pane without Enter;
+- later non-command utterances append to that same locked pane;
+- `ship` / `ship it` submits the locked pane;
+- `scratch` / `scratch that` cancels the locked pane;
+- pane titles are marked with a lock prefix while a draft is active and restored when the draft clears.
 
 ## Live Test Notes
 
@@ -50,4 +63,9 @@ From the realtime log sample (`n=8`):
 
 - Requires `OPENAI_API_KEY` or `openai_api_key` in Discord config.
 - This is transcription-only, not a full speech-to-speech Realtime agent.
-- Short standalone utterances can still be dropped by the short-utterance debounce. Realtime final transcripts should probably bypass most of that debounce, keeping only explicit false-positive drops.
+- Short standalone utterances are forwarded losslessly to Token API; draft lifecycle command handling decides whether they become text or control actions.
+
+
+## Latency Defaults
+
+Defaults are intentionally fast but nonzero: `voice_silence_commit_ms = 700` and realtime VAD `silence_duration_ms = 300`. Do not set these to `0`; human micro-pauses, Discord frame jitter, and tiny audio buffers can split words into noisy fragments, reorder pending transcripts, or produce empty/buffer-too-small commits. If tuning further, treat about 400-500ms local commit and 200-250ms VAD as the aggressive floor.

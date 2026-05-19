@@ -6,7 +6,7 @@
 1. Displays context % in Claude Code's status line
 2. Sets @CONTEXT_INFO pane option for tmux pane border display
 3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
-4. Nudges agent to plan mode at 125k token threshold (non-blocking)
+4. Nudges agent to plan mode at 180k token threshold (non-blocking)
 5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
 
 Enriches display with Token-API instance data (voice, session doc).
@@ -31,7 +31,7 @@ import urllib.request
 
 # --- Config ---
 STATE_DIR = "/tmp/claude-panes"
-FLUSH_TOKEN_THRESHOLD = 125_000  # used context tokens — nudge agent to plan mode for refocus
+FLUSH_TOKEN_THRESHOLD = 180_000  # used context tokens — nudge agent to plan mode for refocus
 FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
 MODE_ENFORCE_COOLDOWN = 8  # seconds — don't re-check mode within 8s of last correction
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
@@ -287,7 +287,7 @@ def check_pre_compact(pane_id, pct, total_tokens):
 
     # Non-blocking nudge: tell agent to wrap up then enter plan mode.
     # Plan-gatekeeper hook will catch ExitPlanMode and force session doc update.
-    msg = "Context threshold reached. Wrap up your immediate task, then switch to plan mode to refocus."
+    msg = "Context threshold reached (180k). Pause your current task and update your session document comprehensively — include completed work, assumptions made, unvalidated code, design decisions, and remaining tasks. Then end your inference with an explicit recommendation: switch to plan mode OR run /compact to refocus."
     agent_cmd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-cmd")
     subprocess.Popen([agent_cmd, "--pane", pane_id, msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

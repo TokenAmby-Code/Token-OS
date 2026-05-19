@@ -124,8 +124,9 @@ POST   /api/inbox/notify                # Notify/create aspirant and launch mana
 Launch contract:
 - Create aspirant note under `Imperium-ENV/Aspirants/`.
 - Create linked session doc under `Imperium-ENV/Terra/Sessions/`.
-- Session doc filenames are human-readable and never date-prefixed; dates stay in frontmatter.
-- Attached instances are named from the session doc (`<session-doc-slug>-1`, `<session-doc-slug>-2`, ...), not by mutating the doc from the instance name.
+- Session doc filenames are descriptive lower-kebab and never date-prefixed; dates stay in frontmatter.
+- Do not synthesize names from cwd, timestamp, UUID, pane ID, model, or machine. If a doc needs a name, nudge the live instance to choose one with `session-doc-name "Descriptive Title"`.
+- Attached instances may derive from a real named session doc (`<session-doc-slug>-1`, `<session-doc-slug>-2`, ...), not by mutating the doc from the instance name.
 - Mark note frontmatter with `aspirant_launcher: dispatch`, `aspirant_dispatch_target: legion:new`, launch id, session status, and session doc path.
 - Start `dispatch --target legion:new --dir <Imperium-ENV> --session-doc <doc> --system-prompt-file <file> --prompt-file <file> --gt`.
 - Suppress duplicate launches when the note already has `aspirant_launch_id` and status `launching` or `launched`.

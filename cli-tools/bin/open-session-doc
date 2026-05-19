@@ -3,16 +3,14 @@
 # TAGS: tmux, obsidian, origin, session
 # AUDIENCE: tmux binding
 #
-# Resolves: pane_id → claude_instances → session_documents → file_path
+# Resolves: cardinal pane id → claude_instances → session_documents → file_path
 # Routes:   open on the machine that triggered the keystroke (origin_machine)
 #
 # Usage:
-#   open-session-doc [pane_id] [client_pid]
+#   open-session-doc [cardinal-pane-id|current] [client_pid]
 #
-# Both args are optional. Without them, falls back to $TMUX_PANE and the
-# tmux display-message client_pid. Designed to be invoked from a tmux binding
-# via format substitutions:
-#   bind S run-shell "tmux-run open-session-doc '#{pane_id}' '#{client_pid}'"
+# Both args are optional. Without a pane id, tmuxctl resolves the current pane's
+# stable @PANE_ID cardinal label. Do not pass raw tmux %pane ids here.
 
 set -u
 
@@ -23,37 +21,26 @@ source "$_LIB/nas-path.sh"
 # shellcheck source=../lib/origin.sh
 source "$_LIB/origin.sh"
 
-PANE_ID="${1:-${TMUX_PANE:-}}"
+PANE_ID="${1:-current}"
 CLIENT_PID="${2:-}"
 
 if [[ -z "$PANE_ID" ]]; then
-    echo "open-session-doc: no pane id (arg 1 or \$TMUX_PANE)" >&2
+    echo "open-session-doc: no pane id" >&2
     exit 1
 fi
 
-# --- 1. Ask Token-API for the session doc ---
-# Pane IDs start with '%' which collides with URL percent-encoding — encode.
-PANE_ENC=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PANE_ID")
-resp=$(curl -sS --max-time 3 -w '\n%{http_code}' \
-    "$TOKEN_API_URL/api/panes/${PANE_ENC}/session-doc" 2>&1) || {
-    tmux display-message "open-session-doc: token-api unreachable" 2>/dev/null || true
-    echo "open-session-doc: token-api request failed: $resp" >&2
+# --- 1. Ask tmuxctl for the session doc using cardinal pane identity ---
+body=$(tmuxctl session-doc --pane "$PANE_ID" --format json 2>&1) || {
+    tmux display-message "open-session-doc: no doc for cardinal pane $PANE_ID" 2>/dev/null || true
+    echo "open-session-doc: tmuxctl session-doc failed: $body" >&2
     exit 1
 }
-http_code="${resp##*$'\n'}"
-body="${resp%$'\n'*}"
-
-if [[ "$http_code" != "200" ]]; then
-    tmux display-message "open-session-doc: no doc for $PANE_ID ($http_code)" 2>/dev/null || true
-    echo "open-session-doc: HTTP $http_code from Token-API: $body" >&2
-    exit 1
-fi
 
 # --- 2. Parse doc fields (python to avoid jq dep) ---
 read -r VAULT FILE_PATH TITLE < <(python3 -c '
 import sys, json
 d = json.loads(sys.stdin.read())
-print(d["vault"], d["file_path"], d.get("title", ""))
+print("Imperium-ENV", d["file_path"], d.get("title", ""))
 ' <<< "$body")
 
 if [[ -z "$VAULT" || -z "$FILE_PATH" ]]; then

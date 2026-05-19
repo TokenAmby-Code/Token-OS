@@ -207,7 +207,7 @@ export function createVoiceManager(botClients, config, logger) {
 
   // Explicit commit after Discord silence. Audio itself is streamed live to
   // OpenAI Realtime; no local PCM chunk files are created.
-  const SILENCE_COMMIT_MS = config.voice_silence_commit_ms ?? 3000; // Wait after Discord silence before committing a turn.
+  const SILENCE_COMMIT_MS = config.voice_silence_commit_ms ?? 700; // Wait after Discord silence before committing a turn.
 
   function subscribeToUser(botName, userId) {
     const state = getBotState(botName);

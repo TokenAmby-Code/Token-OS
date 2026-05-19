@@ -278,6 +278,16 @@ def _instance_name_base_from_session_doc(title: str | None, file_path: str | Non
     return raw[:80].strip("-") or "session-doc"
 
 
+def _is_unnamed_session_doc_base(base: str | None) -> bool:
+    return (base or "") in {
+        "needs-name",
+        "needs-session-name",
+        "unnamed-session",
+        "session",
+        "session-doc",
+    }
+
+
 async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int) -> str:
     cursor = await db.execute(
         "SELECT title, file_path FROM session_documents WHERE id = ?", (doc_id,)
@@ -286,6 +296,8 @@ async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int)
     title = row[0] if row else None
     file_path = row[1] if row else None
     base = _instance_name_base_from_session_doc(title, file_path)
+    if _is_unnamed_session_doc_base(base):
+        return "needs-name"
 
     # Monotonic by existing suffix, not row count: stopped/historical rows
     # remain in the DB and prior instance renames may leave gaps.
@@ -325,6 +337,8 @@ async def _apply_session_doc_instance_name(
     if not row:
         return None
     base = _instance_name_base_from_session_doc(row[1], row[2])
+    if _is_unnamed_session_doc_base(base):
+        return None
     if re.match(rf"^{re.escape(base)}-\d+$", str(row[0] or "")):
         return str(row[0])
     new_name = await _next_session_doc_instance_name(db, session_doc_id)
@@ -730,7 +744,7 @@ async def handle_session_start(payload: dict) -> dict:
     raw_tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or ""
     # Strip Claude Code's ✳ prefix and whitespace artifacts from pane titles
     tab_name = raw_tab_name.lstrip("✳ ").strip() if raw_tab_name else ""
-    tab_name = tab_name or f"Claude {datetime.now().strftime('%H:%M')}"
+    tab_name = tab_name or "needs-name"
 
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")

@@ -455,7 +455,7 @@ class TestWorkflowState:
                 "pid": 12345,
                 "env": {
                     "TOKEN_API_ENGINE": "claude",
-                    "TOKEN_API_LAUNCHER": "vault-dispatch",
+                    "TOKEN_API_LAUNCHER": "dispatch",
                     "TOKEN_API_DISPATCH_TARGET": "legion:new",
                     "TOKEN_API_DISPATCH_WINDOW": "legion",
                     "TOKEN_API_DISPATCH_MODE": "stack_new",
@@ -497,7 +497,7 @@ class TestWorkflowState:
                 "pid": 22222,
                 "env": {
                     "TOKEN_API_ENGINE": "codex",
-                    "TOKEN_API_LAUNCHER": "vault-dispatch",
+                    "TOKEN_API_LAUNCHER": "dispatch",
                     "TOKEN_API_DISPATCH_TARGET": "bridge:SW",
                     "TOKEN_API_DISPATCH_WINDOW": "bridge",
                     "TOKEN_API_DISPATCH_MODE": "named_slot",

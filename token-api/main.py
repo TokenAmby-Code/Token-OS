@@ -497,6 +497,12 @@ class AudioProxyDisconnectRequest(BaseModel):
     source: str = "macrodroid"
 
 
+class MediaPauseRequest(BaseModel):
+    """Request from a desktop media pause key."""
+
+    source: str = "desktop"
+
+
 class AudioProxyStatusResponse(BaseModel):
     """Response for status query."""
 
@@ -1403,12 +1409,14 @@ async def _has_pending_naming_nudge(db, instance_id: str) -> bool:
 
 
 def _build_naming_nudge_message(slug: str | None) -> str:
-    derived = (slug or "your-task-name").strip() or "your-task-name"
-    command_slug = derived.replace("'", "").strip() or "your-task-name"
+    derived = (slug or "").strip()
+    hint = f" Current rough doc slug is `{derived}`." if derived else ""
     return (
-        f"Your name is missing. Run `instance-name '{command_slug}'` "
-        f"(use slug `{derived}` from your session doc, or pick your own "
-        "3-6 word descriptor of what you're doing)."
+        "Your session document still needs a descriptive name. "
+        "Choose a 3-6 word title that describes the work, then run "
+        "`session-doc-name \"Your Descriptive Title\"`. "
+        "Do not use dates, timestamps, UUIDs, pane IDs, model names, or generic project roots."
+        f"{hint}"
     )
 
 
@@ -9424,6 +9432,43 @@ AUDIO_PROXY_STATE = {
     "last_disconnect_time": None,
 }
 
+PHONE_YOUTUBE_APP_KEYS = {
+    "youtube",
+    "com.google.android.youtube",
+    "yt",
+    "yt_bg",
+    "youtube background",
+}
+
+
+def phone_youtube_active() -> bool:
+    """Return true when phone telemetry says YouTube is the active media source."""
+    app = (PHONE_STATE.get("current_app") or "").strip().lower()
+    return bool(PHONE_STATE.get("is_distracted")) and app in PHONE_YOUTUBE_APP_KEYS
+
+
+def send_tts_transport_control(command: str = "toggle") -> dict:
+    """Send transport control to the WSL TTS satellite."""
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    try:
+        response = requests.post(
+            f"http://{host}:{port}/tts/control",
+            json={"command": command},
+            timeout=3,
+        )
+        return {
+            "success": response.status_code == 200,
+            "status_code": response.status_code,
+            "body": response.text[:200],
+        }
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "timeout"}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "connection_error"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ============ Headless Mode (disabled on macOS) ============
 
 
@@ -10546,6 +10591,54 @@ async def restart_satellite_proxy():
         return {"success": True, "note": "timeout expected during restart"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ============ Media Transport Passthrough ============
+
+
+@app.post("/api/media/pause")
+async def media_pause_passthrough(request: MediaPauseRequest | None = None):
+    """
+    Pause key dispatcher for the WSL/desktop media key path.
+
+    If phone telemetry says YouTube is active, route pause to the phone's
+    MacroDroid `/pause` endpoint so Bluetooth-sink phone audio pauses at the
+    source. Otherwise preserve the old desktop behavior by toggling WSL TTS
+    transport.
+    """
+    request = request or MediaPauseRequest()
+    current_app = PHONE_STATE.get("current_app")
+    youtube_active = phone_youtube_active()
+    audio_proxy_connected = bool(AUDIO_PROXY_STATE.get("phone_connected"))
+
+    if youtube_active:
+        result = await asyncio.to_thread(
+            _send_to_phone,
+            "/pause",
+            {"source": request.source},
+        )
+        payload = {
+            "handled": bool(result.get("success")),
+            "target": "phone_youtube",
+            "phone_app": current_app,
+            "audio_proxy_connected": audio_proxy_connected,
+            "phone_result": result,
+            "source": request.source,
+        }
+        await log_event("media_pause_passthrough", device_id="phone", details=payload)
+        return payload
+
+    result = await asyncio.to_thread(send_tts_transport_control, "toggle")
+    payload = {
+        "handled": bool(result.get("success")),
+        "target": "tts",
+        "phone_app": current_app,
+        "audio_proxy_connected": audio_proxy_connected,
+        "tts_result": result,
+        "source": request.source,
+    }
+    await log_event("media_pause_passthrough", details=payload)
+    return payload
 
 
 # ============ Phone Heartbeat Endpoints ============
@@ -14309,6 +14402,8 @@ def _is_placeholder_tab_name(tab_name: str | None) -> bool:
     cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
     if not cleaned:
         return False
+    if cleaned in {"needs-name", "needs-session-name"}:
+        return True
     return bool(DEFAULT_TAB_NAME_RX.match(cleaned))
 
 
@@ -16247,6 +16342,225 @@ _aspirant_thread_gates: dict[str, int] = {}
 _aspirant_gated_queue: dict[str, list[tuple[str, str]]] = {}  # thread_id -> [(message, bot)]
 
 
+_VOICE_DRAFT_TITLE_PREFIX = {
+    "imperial_guard": "IG🔒",
+    "mechanicus": "MECH🔒",
+    "custodes": "CUST🔒",
+}
+_discord_voice_drafts: dict[tuple[str, str], dict] = {}
+
+
+def _discord_voice_author_key(request: DiscordMessageRequest) -> tuple[str, str]:
+    bot = (request.bot_name or "unknown").strip().lower()
+    author_id = str((request.author or {}).get("id") or "unknown")
+    return (bot, author_id)
+
+
+def _normalize_discord_voice_command(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]+", "", (text or "").lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _discord_voice_command(text: str) -> str | None:
+    normalized = _normalize_discord_voice_command(text)
+    if normalized in {"ship", "ship it"}:
+        return "ship"
+    if normalized in {"scratch", "scratch that"}:
+        return "scratch"
+    return None
+
+
+async def _tmux_display_value(pane: str, fmt: str) -> str | None:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        fmt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode != 0:
+        return None
+    return stdout.decode(errors="replace").rstrip("\n")
+
+
+async def _tmux_set_pane_title(pane: str, title: str) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "select-pane",
+        "-t",
+        pane,
+        "-T",
+        title,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=5)
+
+
+async def _discord_voice_restore_title(state: dict) -> None:
+    pane = state.get("pane")
+    if pane and await _tmux_pane_exists(pane):
+        try:
+            await _tmux_set_pane_title(pane, state.get("title") or "")
+        except Exception as e:
+            logger.warning(f"Voice draft: failed restoring pane title for {pane}: {e}")
+
+
+async def _discord_voice_mark_title(bot: str, pane: str) -> str:
+    old_title = await _tmux_display_value(pane, "#{pane_title}") or ""
+    prefix = _VOICE_DRAFT_TITLE_PREFIX.get(bot, f"{bot.upper()[:4]}🔒")
+    if not old_title.startswith(prefix):
+        await _tmux_set_pane_title(pane, f"{prefix} {old_title}".strip())
+    return old_title
+
+
+async def _discord_voice_type(pane: str, text: str) -> bool:
+    tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
+    proc = await asyncio.create_subprocess_exec(
+        str(tmux_dictate),
+        "-t",
+        pane,
+        text,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": ":".join(
+                [
+                    str(SCRIPTS_DIR / "cli-tools" / "bin"),
+                    str(Path.home() / ".local" / "bin"),
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    os.environ.get("PATH", ""),
+                ]
+            ),
+        },
+    )
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    if proc.returncode != 0:
+        logger.warning(f"Voice draft: tmux-dictate failed for {pane}: {stderr.decode()[:200]}")
+        return False
+    return True
+
+
+async def _discord_voice_send_key(pane: str, key: str) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "send-keys",
+        "-t",
+        pane,
+        key,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode != 0:
+        logger.warning(f"Voice draft: send-key {key} failed for {pane}: {stderr.decode()[:200]}")
+        return False
+    return True
+
+
+async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest) -> str | None:
+    if bot == "imperial_guard":
+        pane = message.target_tmux_pane
+        if pane and pane.startswith("%") and await _tmux_pane_exists(pane):
+            return pane
+        logger.warning(f"Voice draft [imperial_guard]: supplied target pane invalid/dead: {pane!r}")
+        return None
+
+    require_synced = bot == "mechanicus"
+    async with aiosqlite.connect(DB_PATH) as db:
+        if require_synced:
+            cursor = await db.execute(
+                """SELECT tmux_pane FROM claude_instances
+                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (bot,),
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT tmux_pane FROM claude_instances
+                   WHERE legion = ? AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (bot,),
+            )
+        row = await cursor.fetchone()
+    pane = row[0] if row else None
+    if (not pane) and bot == "custodes":
+        pane = await _find_custodes_tmux_pane()
+    if pane and await _tmux_pane_exists(pane):
+        return pane
+    logger.warning(f"Voice draft [{bot}]: no live target pane")
+    return None
+
+
+async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
+    key = _discord_voice_author_key(request)
+    bot, author_id = key
+    text = (request.content or "").strip()
+    command = _discord_voice_command(text)
+    state = _discord_voice_drafts.get(key)
+
+    if state and not await _tmux_pane_exists(state.get("pane")):
+        _discord_voice_drafts.pop(key, None)
+        logger.warning(f"Voice draft [{bot}/{author_id}]: locked pane died; cleared draft")
+        await _discord_voice_error_message(bot, "Voice draft cleared. The locked terminal pane is gone.")
+        return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "cleared": True, "reason": "dead_pane"}
+
+    if command == "ship":
+        if not state:
+            logger.info(f"Voice draft [{bot}/{author_id}]: ship with no active draft")
+            await _discord_voice_error_message(bot, "No active voice draft to ship.")
+            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "command": "ship", "reason": "no_draft"}
+        ok = await _discord_voice_send_key(state["pane"], "Enter")
+        await _discord_voice_restore_title(state)
+        _discord_voice_drafts.pop(key, None)
+        return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "command": "ship", "pane": state["pane"]}
+
+    if command == "scratch":
+        if not state:
+            logger.info(f"Voice draft [{bot}/{author_id}]: scratch with no active draft")
+            await _discord_voice_error_message(bot, "No active voice draft to scratch.")
+            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "command": "scratch", "reason": "no_draft"}
+        ok = await _discord_voice_send_key(state["pane"], "C-c")
+        await _discord_voice_restore_title(state)
+        _discord_voice_drafts.pop(key, None)
+        return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "command": "scratch", "pane": state["pane"]}
+
+    if not text:
+        return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "empty"}
+
+    if not state:
+        pane = await _resolve_discord_voice_target(bot, request)
+        if not pane:
+            if bot == "imperial_guard":
+                await _discord_voice_error_message(
+                    bot,
+                    "Voice not received. No active tmux pane could be targeted.",
+                )
+            else:
+                await _discord_voice_error(bot, text)
+            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "no_target"}
+        if await _tmux_pane_has_pending_input(pane):
+            logger.warning(f"Voice draft [{bot}/{author_id}]: birth blocked by typing guard on {pane}")
+            await _discord_voice_error_message(bot, "Voice draft not started. The target terminal already has pending input.")
+            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "typing_guard", "pane": pane}
+        title = await _discord_voice_mark_title(bot, pane)
+        state = {"pane": pane, "title": title, "created_at": datetime.now().isoformat()}
+        _discord_voice_drafts[key] = state
+        logger.info(f"Voice draft [{bot}/{author_id}]: locked {pane}")
+
+    segment = text if not state.get("utterances") else f" {text}"
+    ok = await _discord_voice_type(state["pane"], segment)
+    if ok:
+        state["utterances"] = int(state.get("utterances") or 0) + 1
+    return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "drafting": True, "pane": state["pane"]}
+
+
 @app.post("/api/discord/message")
 async def receive_discord_message(request: DiscordMessageRequest):
     """Receive a forwarded Discord message from the discord-cli daemon."""
@@ -16335,42 +16649,7 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
-        if request.bot_name == "imperial_guard":
-            injected = await _try_discord_active_pane_injection(request)
-            if injected:
-                logger.info("Voice [imperial_guard] injected into selected tmux pane")
-            else:
-                logger.warning(
-                    "Voice [imperial_guard] active-pane injection failed — sending voice error feedback"
-                )
-                asyncio.create_task(
-                    _discord_voice_error_message(
-                        "imperial_guard",
-                        "Voice not received. No active tmux pane could be targeted.",
-                    )
-                )
-            return {
-                "received": True,
-                "message_id": request.message_id,
-                "voice": True,
-                "active_pane": True,
-                "injected": injected,
-            }
-
-        legion = request.bot_name  # "mechanicus", "custodes", etc.
-        injected = await _try_discord_injection(legion, request)
-        if injected:
-            logger.info(f"Voice [{legion}] injected into live instance")
-        else:
-            # No silent failures — TTS the error back through Discord so the operator knows
-            logger.warning(f"Voice [{legion}] injection failed — sending voice error feedback")
-            asyncio.create_task(_discord_voice_error(legion, request.content))
-        return {
-            "received": True,
-            "message_id": request.message_id,
-            "voice": True,
-            "injected": injected,
-        }
+        return await _handle_discord_voice_draft(request)
 
     # Trigger 0: bare URL in #forge → auto-clip to vault
     stripped = content.strip()
@@ -18521,150 +18800,14 @@ async def _gather_evaluator_context(
 async def _auto_name_instance(
     instance: dict, transcript_tail: str, transcript_path: str = ""
 ) -> None:
-    """Generate a session name via MiniMax if instance hasn't been explicitly named.
+    """Deprecated: do not programmatically invent names.
 
-    Called on first stop. If tab_name hasn't been set by our naming pipeline
-    (instance-name CLI or a prior auto-name), MiniMax reads the transcript tail
-    and generates a short kebab-case name. The name is applied to both the DB
-    and Claude Code UI via /rename + /color.
+    Naming is now agent-owned. The system may detect unnamed docs and interview
+    the live instance, but it must not synthesize a fallback name from cwd,
+    timestamp, transcript, model, pane, or UUID.
     """
-    import re as _re
-
-    instance_id = instance.get("id", "?")[:12]
-    tab_name = instance.get("tab_name", "")
-    logger.info(f"AutoName: checking {instance_id} tab_name={tab_name!r}")
-
-    # Skip if already named by our pipeline (kebab-case = our convention).
-    # Auto-name if: default "Claude HH:MM", Claude Code auto-title (has spaces),
-    # or fallback "Claude Code" / empty.
-    is_our_name = bool(
-        tab_name and " " not in tab_name and _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", tab_name)
-    )
-    if is_our_name:
-        logger.info(f"AutoName: skipping {instance_id} — already named ({tab_name!r})")
-        return
-
-    tmux_pane = instance.get("tmux_pane")
-    if not tmux_pane:
-        logger.info(f"AutoName: skipping {instance_id} — no tmux_pane")
-        return
-
-    # Try embedded transcript tail first, fall back to reading transcript file
-    if not transcript_tail or len(transcript_tail) < 50:
-        if transcript_path and os.path.exists(transcript_path):
-            try:
-                with open(transcript_path) as f:
-                    lines = f.readlines()
-                transcript_tail = "".join(lines[-60:])
-                logger.info(f"AutoName: read {len(transcript_tail)} chars from transcript file")
-            except Exception as e:
-                logger.warning(f"AutoName: failed to read transcript file: {e}")
-
-    if not transcript_tail or len(transcript_tail) < 50:
-        logger.info(
-            f"AutoName: skipping {instance_id} — transcript too short ({len(transcript_tail or '')} chars)"
-        )
-        return
-
-    if minimax_limiter.remaining < 3:
-        logger.warning(
-            f"AutoName: skipping {instance_id} — MiniMax budget low ({minimax_limiter.remaining})"
-        )
-        return
-
-    # Blocklist: meta/format names MiniMax parrots from prompt instructions
-    _name_blocklist = {
-        "kebab-case",
-        "example-name",
-        "session-name",
-        "coding-session",
-        "test-name",
-        "name-here",
-        "your-name",
-        "my-name",
-        "new-name",
-    }
-
-    system_prompt = (
-        "Output a single short name for a coding session. "
-        "Format: lowercase words joined by hyphens, 2-4 words total. "
-        "Examples: auth-refactor, tmux-grid-expand, fix-deploy-pipeline. "
-        "The name must describe WHAT the session worked on. "
-        "RESPOND WITH ONLY THE NAME. No explanation. No quotes. Just the name."
-    )
-    user_content = f"Transcript tail (last ~60 lines):\n\n{transcript_tail[:3000]}"
-
-    try:
-        name = await minimax_chat(system_prompt, user_content, max_tokens=32)
-        name = name.strip().strip('"').strip("'").lower()
-        # Validate: must be lowercase-hyphenated, 2-4 words, no spaces
-        if not _re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+){1,3}$", name):
-            # MiniMax sometimes returns prose — try to extract a valid name from it
-            match = _re.search(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+){1,3})\b", name)
-            if match:
-                name = match.group(1)
-                logger.info(f"AutoName: extracted {name!r} from verbose response")
-            else:
-                logger.warning(f"AutoName: MiniMax returned invalid name: {name[:100]!r}")
-                return
-        # Reject format-descriptor names that MiniMax parrots from the prompt
-        if name in _name_blocklist:
-            logger.warning(f"AutoName: MiniMax returned blocklisted name: {name!r}")
-            return
-        logger.info(f"AutoName: naming {instance['id'][:12]} -> {name}")
-
-        # Rename via Token-API directly (faster than claude-cmd for the API side)
-        instance_id = instance["id"]
-        async with aiosqlite.connect(DB_PATH) as db:
-            await sanctioned_update_instance(
-                db,
-                instance_id=instance_id,
-                updates={"tab_name": name},
-                mutation_type="instance_updated",
-                write_source="system",
-                actor="rename-instance",
-            )
-            await db.commit()
-
-        # Also rename + recolor in Claude Code UI via tmux
-        # Send /rename and /color in concert with instance profile
-        device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-        # Resolve cc_color from profile_name (not a DB column)
-        cc_color = ""
-        profile_name = instance.get("profile_name", "")
-        if profile_name:
-            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
-                if p["name"] == profile_name:
-                    cc_color = p.get("cc_color", "")
-                    break
-        cmds = [f"/rename {name}"]
-        if cc_color:
-            cmds.append(f"/color {cc_color}")
-
-        if device_id == LOCAL_DEVICE_NAME:
-            for cmd in cmds:
-                proc = await asyncio.create_subprocess_exec(
-                    "claude-cmd",
-                    "--pane",
-                    tmux_pane,
-                    cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=10)
-        else:
-            # WSL: deliver via satellite /tmux/send-keys
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    for cmd in cmds:
-                        await client.post(
-                            f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/send-keys",
-                            json={"pane": tmux_pane, "command": cmd},
-                        )
-            except Exception as e:
-                logger.warning(f"AutoName: satellite delivery failed: {e}")
-    except Exception as e:
-        logger.error(f"AutoName: failed for {instance.get('id', '?')[:12]}: {e}")
+    logger.info(f"AutoName: disabled for {str(instance.get('id', '?'))[:12]}")
+    return
 
 
 async def _run_stop_evaluators(
@@ -19181,6 +19324,32 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         params.append(doc_id)
 
         await db.execute(f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?", params)
+        if request.title is not None:
+            base = human_filename_stem(request.title, fallback="session-doc")
+            cursor = await db.execute(
+                """SELECT id, tab_name
+                   FROM claude_instances
+                   WHERE session_doc_id = ?
+                   ORDER BY registered_at ASC, id ASC""",
+                (doc_id,),
+            )
+            linked = await cursor.fetchall()
+            ordinal = 1
+            for inst_id, tab_name in linked:
+                current = str(tab_name or "")
+                if re.match(rf"^{re.escape(base)}-\d+$", current):
+                    continue
+                if current and not _is_placeholder_tab_name(current):
+                    continue
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=inst_id,
+                    updates={"tab_name": f"{base}-{ordinal}"},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="session-doc-rename",
+                )
+                ordinal += 1
         await db.commit()
 
     logger.info(f"Updated session doc {doc_id}: {updates}")

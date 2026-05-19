@@ -67,6 +67,47 @@ def fetch_instance_registry() -> InstanceRegistrySnapshot:
     )
 
 
+def _api_get_json(path: str) -> dict | list:
+    api_url = _token_api_url().rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{api_url}{path}", timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        raise RegistryError(f"failed to fetch {path} from {api_url}") from exc
+
+
+def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
+    """Resolve a cardinal pane label to its linked session document.
+
+    This intentionally keys on stable @PANE_ID/pane_label values such as
+    ``palace:N`` or ``legion:custodes``. It does not accept or require raw tmux
+    ``%pane`` ids.
+    """
+    instances = _api_get_json("/api/instances?status=processing&sort=recent_activity")
+    if not isinstance(instances, list):
+        instances = []
+    candidates = [row for row in instances if row.get("pane_label") == pane_label]
+    if not candidates:
+        all_instances = _api_get_json("/api/instances?sort=recent_activity")
+        if isinstance(all_instances, list):
+            candidates = [
+                row
+                for row in all_instances
+                if row.get("pane_label") == pane_label and row.get("status") != "stopped"
+            ]
+    if not candidates:
+        raise RegistryError(f"no live instance for pane label {pane_label}")
+    doc_id = candidates[0].get("session_doc_id")
+    if not doc_id:
+        raise RegistryError(f"instance for pane label {pane_label} has no session doc")
+    doc = _api_get_json(f"/api/session-docs/{int(doc_id)}")
+    if not isinstance(doc, dict):
+        raise RegistryError(f"malformed session-doc response for {doc_id}")
+    doc["instance_id"] = candidates[0].get("id")
+    doc["pane_label"] = pane_label
+    return doc
+
+
 def build_client_attachments(
     client_rows: list[dict[str, str]],
     managed_sessions: tuple[GroupedSessionSnapshot, ...],

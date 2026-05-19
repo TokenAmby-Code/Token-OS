@@ -1,7 +1,7 @@
 #!/bin/bash
 # agent-catch-release.sh — PreToolUse hook for Agent tool
 #
-# Intercepts non-Explore subagent spawns and dispatches them via vault-dispatch
+# Intercepts non-Explore subagent spawns and dispatches them via `dispatch`
 # instead of burning parent context. The agent gets a block message telling it
 # where the work was dispatched and how to read results.
 #
@@ -51,7 +51,7 @@ log "CATCH ${SUBAGENT_TYPE} agent: ${AGENT_DESC}"
 # --- Resolve environment ---
 source "$(dirname "$(readlink -f "$0")")/../../Token-OS/cli-tools/lib/nas-path.sh" 2>/dev/null || true
 VAULT_DIR="${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV"
-DISPATCH_BIN="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/vault-dispatch"
+DISPATCH_BIN="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/dispatch"
 
 # Resolve parent's working directory from the hook's CWD
 PARENT_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
@@ -61,7 +61,7 @@ fi
 
 # --- Check prerequisites ---
 if [[ ! -x "$DISPATCH_BIN" ]]; then
-  log "FALLBACK: vault-dispatch not found at $DISPATCH_BIN — allowing subagent"
+  log "FALLBACK: dispatch not found at $DISPATCH_BIN — allowing subagent"
   exit 0
 fi
 
@@ -142,41 +142,39 @@ SESSIONEOF
 
 log "Created session doc: ${SESSION_DOC_REL}"
 
-# --- Dispatch via vault-dispatch (async — don't block the hook response) ---
+# --- Dispatch via `dispatch` (async — don't block the hook response) ---
+# Pane allocation is delegated to dispatch via `--target legion:new`, which routes
+# through tmuxctl stack allocation. If no pane can be allocated, dispatch fails
+# and we fall back to allowing the subagent inline.
 DISPATCH_OUTPUT=""
 DISPATCH_PANE=""
 
-# Find a free pane first — if none, fall back to allowing the subagent
-FREE_PANE=$("$DISPATCH_BIN" --list-free 2>/dev/null | grep -oE '%[0-9]+' | head -1)
-if [[ -z "$FREE_PANE" ]]; then
-  log "FALLBACK: no free panes available — allowing subagent"
-  rm -f "$SESSION_DOC_ABS"
-  exit 0
-fi
-
-# Run vault-dispatch targeting the free pane
 DISPATCH_TMP=$(mktemp /tmp/catch-release-XXXXXX)
-if ! "$DISPATCH_BIN" "$SESSION_DOC_REL" "$PARENT_CWD" --pane "$FREE_PANE" > "$DISPATCH_TMP" 2>&1; then
+if ! "$DISPATCH_BIN" \
+      --session-doc "$SESSION_DOC_REL" \
+      --dir "$PARENT_CWD" \
+      --target legion:new \
+      > "$DISPATCH_TMP" 2>&1; then
   DISPATCH_ERR=$(cat "$DISPATCH_TMP" 2>/dev/null)
-  log "FALLBACK: vault-dispatch failed — ${DISPATCH_ERR:0:200} — allowing subagent"
+  log "FALLBACK: dispatch failed — ${DISPATCH_ERR:0:200} — allowing subagent"
   rm -f "$DISPATCH_TMP" "$SESSION_DOC_ABS"
   exit 0
 fi
 DISPATCH_OUTPUT=$(cat "$DISPATCH_TMP")
 rm -f "$DISPATCH_TMP"
 
-# Extract pane ID from dispatch output (looks for "pane: %NNN" or "Using pane: %NNN")
+# Extract pane ID from dispatch output
 DISPATCH_PANE=$(echo "$DISPATCH_OUTPUT" | grep -oE '%[0-9]+' | head -1)
 
 log "DISPATCHED to pane ${DISPATCH_PANE:-unknown}, session doc: ${SESSION_DOC_REL}"
 
 # --- Build the block response ---
 # The reason message instructs the agent on what happened and what to do next
-REASON="This subagent was dispatched to tmux pane ${DISPATCH_PANE:-?} via vault-dispatch instead of running in your context."
+REASON="This subagent was dispatched to tmux pane ${DISPATCH_PANE:-?} via \`dispatch\` instead of running in your context."
 REASON+=" Session doc: ${SESSION_DOC_REL}"
 REASON+=" The dispatched agent will read the session doc, transplant to ${PARENT_CWD}, and work autonomously."
 REASON+=" To check results: read ${SESSION_DOC_REL} for the work log, or check the pane status."
-REASON+=" For future work like this, use vault-dispatch directly or update your session doc with dispatch instructions."
+REASON+=" For future work like this, call \`dispatch --session-doc <path> --dir <path>\` directly or update your session doc with dispatch instructions."
 
 # Output the block decision
 jq -n -c \

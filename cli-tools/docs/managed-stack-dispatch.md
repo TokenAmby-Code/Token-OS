@@ -33,7 +33,7 @@ tmuxctl stack enforce --window main:legion
 
 ## Current entry points
 
-- `vault-dispatch --target legion:new|mechanicus:new` allocates stack panes via `tmuxctl stack add`.
+- `dispatch --target legion:new|mechanicus:new` allocates stack panes via `tmuxctl stack add`.
 - Prefix+Space (`tmux-legion-prompt`) launches via `tmuxctl stack dispatch legion`.
 - Claude print-mode redirection (`claude-wrapper.sh`) launches via `tmuxctl stack dispatch`.
 - Golden Throne resume fallback allocates managed legion workers via `tmuxctl stack add legion`; legacy side-window naming has been retired.

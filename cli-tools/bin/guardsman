@@ -9,6 +9,7 @@
 #   guardsman --batch <file> --serial          Run checks sequentially
 #   guardsman --batch <file> --limit N         Run first N checks only
 #   guardsman --report                         Show results of last batch
+#   guardsman --assert-instance <id> "check"   On FAIL, dispatch/resume the asserter
 #
 # Backend: MiniMax M2.5 via OpenClaw (free, no rate limits)
 #
@@ -31,7 +32,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$HOME/.claude/guardsman-results"
+DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 mkdir -p "$RESULTS_DIR"
 
 SYSTEM_MSG='You are an Imperial Guardsman — a disposable validation judge.
@@ -69,8 +72,10 @@ run_single() {
 
   # Run the command locally, capture output
   local cmd_output exit_code
-  cmd_output=$(eval "$cmd" 2>&1) || true
+  set +e
+  cmd_output=$(eval "$cmd" 2>&1)
   exit_code=$?
+  set -e
 
   # Truncate output for MiniMax context
   local truncated
@@ -117,6 +122,39 @@ $prompt" \
 
   echo "$result_line"
   echo "$result_line" > "$result_file"
+}
+
+notify_asserter_on_fail() {
+  local instance_id="$1"
+  local check="$2"
+  local result_line="$3"
+
+  [[ -n "$instance_id" ]] || return 0
+  [[ "$result_line" == FAIL:* ]] || return 0
+
+  local prompt
+  prompt="HOOKED ASSERTION FAILED. You are the registered asserter for this regression.
+
+Check: ${check}
+Result: ${result_line}
+
+Investigate and fix the regression. If you are already active, this message should upsert into your pane; otherwise resume yourself via dispatch."
+
+  local status tmux_pane escaped_id
+  escaped_id=$(printf "%s" "$instance_id" | sed "s/'/''/g")
+  status=$(sqlite3 "$DB_PATH" "SELECT COALESCE(status,'') FROM claude_instances WHERE session_id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
+  tmux_pane=$(sqlite3 "$DB_PATH" "SELECT COALESCE(tmux_pane,'') FROM claude_instances WHERE session_id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
+
+  local agent_cmd_bin="${SCRIPT_DIR}/agent-cmd"
+  local dispatch_bin="${SCRIPT_DIR}/dispatch"
+
+  if [[ -n "$tmux_pane" && ( "$status" == "idle" || "$status" == "processing" ) && -x "$agent_cmd_bin" ]]; then
+    "$agent_cmd_bin" --instance "$instance_id" "$prompt" >/dev/null 2>&1 && return 0
+  fi
+
+  if [[ -x "$dispatch_bin" ]]; then
+    "$dispatch_bin" --id "$instance_id" --prompt "$prompt" >/dev/null 2>&1 || true
+  fi
 }
 
 run_batch() {
@@ -249,6 +287,15 @@ case "$1" in
     ;;
   --report)
     show_report
+    ;;
+  --assert-instance)
+    shift
+    asserter_id="${1:-}"; shift || die "Usage: guardsman --assert-instance <instance_id> <check>"
+    [[ -n "$asserter_id" ]] || die "--assert-instance requires instance_id"
+    check="$*"
+    result=$(run_single "$check")
+    echo "$result"
+    notify_asserter_on_fail "$asserter_id" "$check" "$result"
     ;;
   -h|--help|help)
     awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"

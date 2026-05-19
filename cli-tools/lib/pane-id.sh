@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pane-id.sh — Human-readable tmux pane ID system
-# Sourced by tx, vault-dispatch, tmuxctl, and other tmux tools.
+# Sourced by tx, dispatch, tmuxctl, and other tmux tools.
 #
 # Pane IDs use the format window:position (e.g., palace:N, mechanicus:1).
 # Stored as @PANE_ID tmux pane option. Resolves to tmux pane target (%N).

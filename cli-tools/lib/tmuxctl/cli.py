@@ -67,6 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("--format", choices=["id", "full", "json"], default="full")
     resolve_parser.add_argument("target")
 
+    session_doc_parser = subparsers.add_parser(
+        "session-doc",
+        help="Resolve a cardinal pane id to its linked session document.",
+    )
+    session_doc_parser.add_argument("--pane", default="current")
+    session_doc_parser.add_argument(
+        "--format",
+        choices=["json", "id", "path", "title", "cardinal"],
+        default="json",
+    )
+
     send_text_parser = subparsers.add_parser("send-text")
     send_text_parser.add_argument("--pane", required=True)
     text_source = send_text_parser.add_mutually_exclusive_group(required=True)
@@ -207,6 +218,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(values))
             else:
                 print(resolved)
+            return 0
+
+        if args.command == "session-doc":
+            import json
+
+            doc = control.session_doc_for_pane(args.pane)
+            if args.format == "json":
+                print(json.dumps(doc))
+            elif args.format == "id":
+                print(doc["id"])
+            elif args.format == "path":
+                print(doc.get("file_path") or "")
+            elif args.format == "title":
+                print(doc.get("title") or "")
+            elif args.format == "cardinal":
+                print(doc.get("pane_label") or control.cardinal_pane_label(args.pane))
             return 0
 
         if args.command == "send-text":

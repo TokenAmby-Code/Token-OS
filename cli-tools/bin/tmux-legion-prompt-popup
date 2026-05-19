@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# tmux-legion-prompt-popup — Large Ctrl-Space prompt UI for legion dispatch
+# TAGS: tmux, legion, launcher, prompt
+# AUDIENCE: human
+
+set -euo pipefail
+
+PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/tmux-legion-prompt.XXXXXX")"
+PROMPT_TEXT=""
+LOG_FILE="${TMUX_LEGION_PROMPT_LOG:-$HOME/.claude/tmux-legion-prompt-popup.log}"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+log_debug() { printf '%s %s\n' "$(date -Iseconds 2>/dev/null || date)" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+log_debug "popup start tty=$(tty 2>/dev/null || echo none)"
+
+printf '\033[2J\033[H'
+printf 'dispatch> '
+
+# Use canonical terminal input here. Raw-mode read was unreliable under tmux
+# display-popup on some clients and returned immediate EOF. The expensive work
+# is backgrounded after Enter, so the popup closes immediately after submit.
+if ! IFS= read -r PROMPT_TEXT; then
+    log_debug "read failed/EOF"
+    rm -f "$PROMPT_FILE"
+    exit 130
+fi
+
+log_debug "read complete chars=${#PROMPT_TEXT}"
+printf '%s\n' "$PROMPT_TEXT" > "$PROMPT_FILE"
+
+if ! printf '%s\n' "$PROMPT_TEXT" | grep -vE '^[[:space:]]*$' >/dev/null; then
+    log_debug "empty prompt; cancelling file=$PROMPT_FILE"
+    rm -f "$PROMPT_FILE"
+    exit 130
+fi
+
+printf -v PROMPT_FILE_Q '%q' "$PROMPT_FILE"
+log_debug "dispatching prompt_file=$PROMPT_FILE chars=${#PROMPT_TEXT}"
+tmux run-shell -b "tmux-run tmux-legion-prompt --prompt-file ${PROMPT_FILE_Q}"
+exit 0
