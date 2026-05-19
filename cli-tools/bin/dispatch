@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 
@@ -905,6 +906,23 @@ build_agent_command() {
 
 FINAL_COMMAND="$(build_agent_command)"
 
+redact_tmux_panes_for_display() {
+  sed -E 's/%[0-9]+/<tmux-pane>/g'
+}
+
+stage_agent_command() {
+  local cmd="$1" stage
+  stage="$(mktemp -t dispatch-agent.XXXXXX)"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf 'trap %q EXIT\n' "rm -f $stage"
+    printf '%s\n' "$cmd"
+  } >"$stage"
+  chmod 0700 "$stage"
+  printf 'bash %q' "$stage"
+}
+
 build_dispatch_command() {
   local -a args
   if [[ -n "$RESUME_ID" ]]; then
@@ -950,8 +968,8 @@ dispatch dry-run
   resume_id:       ${RESUME_ID:-none}
   resume_db:       $RESUME_ROW_FOUND
   dir:             $WORK_DIR
-  target:          ${TARGET:-current}
-  resolved_target: ${RESOLVED_TARGET:-current}
+  target:          $(printf '%s' "${TARGET:-current}" | redact_tmux_panes_for_display)
+  resolved_target: $(printf '%s' "${RESOLVED_TARGET:-current}" | redact_tmux_panes_for_display)
   persona:         $PERSONA_DISPLAY
   instance_type:   $INSTANCE_TYPE
   zealotry:        $ZEALOTRY
@@ -962,11 +980,11 @@ dispatch dry-run
   discord:         ${DISCORD_CHANNEL:-none}${DISCORD_CHANNEL:+ (bot: $DISCORD_BOT)}
   launch_env:
 EOF_DRY
-  for e in "${COMMON_ENV[@]}"; do echo "    $e"; done
+  for e in "${COMMON_ENV[@]}"; do printf '%s\n' "    $e" | redact_tmux_panes_for_display; done
   echo "  dispatch_command:"
-  echo "    $RESOLVED_DISPATCH_COMMAND"
+  printf '%s\n' "    $RESOLVED_DISPATCH_COMMAND" | redact_tmux_panes_for_display
   echo "  final_command:"
-  echo "    $FINAL_COMMAND"
+  printf '%s\n' "    $FINAL_COMMAND" | redact_tmux_panes_for_display
   exit 0
 fi
 
@@ -977,8 +995,11 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   fi
   session="main"
   stack="$DISPATCH_WINDOW"
-  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "$FINAL_COMMAND")"
-  echo "dispatched $ENGINE to $pane_id"
+  STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
+  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "$STAGED_COMMAND")"
+  stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
+  [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
+  printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
   exit 0
 fi
 
@@ -989,8 +1010,17 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   fi
   tmux send-keys -t "$TARGET" "clear" Enter
   sleep 0.2
-  tmux send-keys -t "$TARGET" "$FINAL_COMMAND" Enter
-  echo "dispatched $ENGINE to $TARGET"
+  STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
+  tmux send-keys -t "$TARGET" "$STAGED_COMMAND" Enter
+  target_display="$TARGET"
+  if [[ "$TARGET" == %* ]]; then
+    if command -v pane_id_of >/dev/null 2>&1; then
+      human_target="$(pane_id_of "$TARGET" 2>/dev/null || true)"
+      [[ -n "$human_target" ]] && target_display="$human_target"
+    fi
+    [[ "$target_display" == %* ]] && target_display="tmux target"
+  fi
+  echo "dispatched $ENGINE to $target_display"
   exit 0
 fi
 
