@@ -111,7 +111,7 @@ def add_stack_pane(
     cwd = cwd or os.path.expanduser("~")
 
     if base in {"legion", "mechanicus"}:
-        from .legion import add_orchestrator_stack_pane
+        from .stack import add_orchestrator_stack_pane
 
         return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd)
 
@@ -169,7 +169,7 @@ def dispatch_stack_command(
             adapter.run("select-window", "-t", window_target, allow_failure=True)
         adapter.run("select-pane", "-t", pane, allow_failure=True)
         if base in {"legion", "mechanicus"}:
-            from .legion import enforce_stack_layout
+            from .stack import enforce_stack_layout
 
             target = adapter.run(
                 "display-message",
@@ -185,3 +185,23 @@ def dispatch_stack_command(
         time.sleep(settle_seconds)
     adapter.run("send-keys", "-t", pane, command, "Enter")
     return pane
+
+# Generic persona-pane stack page implementation. Imported at module end so the
+# implementation can reuse stack_base_of()/spill helpers above without a cycle.
+from ._stack_core import (  # noqa: E402,F401
+    CUSTODES_ROLE,
+    FABRICATOR_ROLE,
+    LEGACY_WORKER_ROLES,
+    STACK_COLLAPSED_HEIGHT,
+    STACK_ORCHESTRATOR_RATIO,
+    REGIMENT_ROLE,
+    STACK_PAGE_SPECS,
+    StackPane,
+    PersonaPaneSpec,
+    StackPageSpec,
+    add_orchestrator_stack_pane,
+    add_stack_worker_pane,
+    enforce_stack_page_layout,
+    enforce_stack_layout,
+    focus_selected,
+)

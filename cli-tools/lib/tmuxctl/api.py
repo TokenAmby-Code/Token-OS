@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import sys
+import textwrap
 import urllib.error
 import urllib.request
 
@@ -96,7 +97,11 @@ def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
                 if row.get("pane_label") == pane_label and row.get("status") != "stopped"
             ]
     if not candidates:
-        raise RegistryError(f"no live instance for pane label {pane_label}")
+        all_instances = _api_get_json("/api/instances?sort=recent_activity")
+        diagnostics = _session_doc_resolution_diagnostics(pane_label, all_instances)
+        raise RegistryError(
+            f"no live instance for pane label {pane_label}\n{diagnostics}".rstrip()
+        )
     doc_id = candidates[0].get("session_doc_id")
     if not doc_id:
         raise RegistryError(f"instance for pane label {pane_label} has no session doc")
@@ -106,6 +111,39 @@ def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
     doc["instance_id"] = candidates[0].get("id")
     doc["pane_label"] = pane_label
     return doc
+
+
+def _session_doc_resolution_diagnostics(pane_label: str, rows: dict | list) -> str:
+    if not isinstance(rows, list):
+        return ""
+    matching_panes = {
+        row.get("tmux_pane") for row in rows if row.get("pane_label") == pane_label and row.get("tmux_pane")
+    }
+    related = [
+        row
+        for row in rows
+        if row.get("pane_label") == pane_label
+        or (row.get("tmux_pane") and row.get("tmux_pane") in matching_panes)
+    ][:8]
+    if not related:
+        recent = rows[:5]
+        lines = ["diagnostics: no rows with matching pane_label; recent rows:"]
+        source = recent
+    else:
+        lines = ["diagnostics: related registry rows:"]
+        source = related
+    for row in source:
+        lines.append(
+            textwrap.shorten(
+                "  "
+                f"id={row.get('id')} status={row.get('status')} "
+                f"tmux_pane={row.get('tmux_pane')} pane_label={row.get('pane_label')} "
+                f"session_doc_id={row.get('session_doc_id')} tab_name={row.get('tab_name')}",
+                width=240,
+                placeholder="…",
+            )
+        )
+    return "\n".join(lines)
 
 
 def build_client_attachments(

@@ -102,6 +102,8 @@ def _role_position_aliases(role: str) -> tuple[str, ...]:
     if not role or ":" not in role:
         return ()
     canonical = canonical_pane_role(role)
+    if canonical.endswith(":custodes") or canonical.endswith(":fabricator-general"):
+        return tuple(dict.fromkeys((canonical.rsplit(":", 1)[1], "0")))
     position = canonical.rsplit(":", 1)[1]
     aliases = [position]
     for alias in pane_role_aliases(canonical):

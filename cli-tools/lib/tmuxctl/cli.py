@@ -295,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(pane_id)
                 return 0
             if args.stack_command == "enforce":
-                from .legion import enforce_stack_layout
+                from .stack import enforce_stack_layout
 
                 if args.window:
                     target = args.window
@@ -324,17 +324,17 @@ def main(argv: list[str] | None = None) -> int:
             if pane == "current":
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
             if args.legion_command == "focus-selected":
-                from .legion import focus_selected
+                from .stack import focus_selected
 
                 print(focus_selected(control.adapter, pane))
                 return 0
             if args.legion_command == "enforce":
-                from .legion import enforce_legion_layout
+                from .stack import enforce_stack_layout
 
                 target = control.adapter.run(
                     "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                 ).strip()
-                print(enforce_legion_layout(control.adapter, target, focused_pane=pane, focus=True))
+                print(enforce_stack_layout(control.adapter, target, focused_pane=pane, focus=True))
                 return 0
 
         if args.command == "legion":
@@ -342,17 +342,17 @@ def main(argv: list[str] | None = None) -> int:
             if pane == "current":
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
             if args.legion_command == "focus-selected":
-                from .legion import focus_selected
+                from .stack import focus_selected
 
                 print(focus_selected(control.adapter, pane))
                 return 0
             if args.legion_command == "enforce":
-                from .legion import enforce_legion_layout
+                from .stack import enforce_stack_layout
 
                 target = control.adapter.run(
                     "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                 ).strip()
-                print(enforce_legion_layout(control.adapter, target, focused_pane=pane))
+                print(enforce_stack_layout(control.adapter, target, focused_pane=pane))
                 return 0
 
         if args.command == "create":

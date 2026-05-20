@@ -203,9 +203,10 @@ def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     """Build the mechanicus stack window.
 
-    Pane 1 is the Fabricator-General orchestrator slot. If that orchestrator is
-    promoted to an audience surface, this pane becomes its tombstone. Worker
-    panes are added by stack.add_stack_pane.
+    The left column contains Fabricator-General plus Administratum persona
+    panes. Fabricator-General has the ``4:0`` positional abbreviation when the
+    mechanicus window is index 4; Administratum uses ``4:admin`` only. Worker
+    panes are added by stack.add_stack_pane on the right stack.
     """
     target = f"{session}:{MECHANICUS_WINDOW}"
     adapter.run(
@@ -218,8 +219,12 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
         "-c",
         _window_dir(MECHANICUS_WINDOW),
     )
-    _pane_tag(adapter, f"{target}.1", "mechanicus:fabricator-general")
-    _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "mechanicus")
+    fabricator = f"{target}.1"
+    admin = _split_pane(adapter, fabricator, "-v", "-l", "50%", cwd=_window_dir(MECHANICUS_WINDOW))
+    _pane_tag(adapter, fabricator, "mechanicus:fabricator-general")
+    _set_pane_option(adapter, fabricator, "@PANE_TYPE", "mechanicus")
+    _pane_tag(adapter, admin, "mechanicus:admin")
+    _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
 
 
 def build_tui_window(adapter: TmuxAdapter, session: str) -> None:

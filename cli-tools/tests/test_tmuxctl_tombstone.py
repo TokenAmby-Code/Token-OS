@@ -269,3 +269,29 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
     assert result == "selected palace:N via palace:NE -> palace:NE"
     assert "%9" not in result
     assert selected == ["%9"]
+
+
+def test_numeric_legion_worker_abbreviation_resolves_by_window_index():
+    workspace = _workspace(_pane("%5", "legion:5", window="legion", window_index=3))
+
+    resolved = resolve_pane_in_snapshot(workspace, "3:5")
+
+    assert resolved.pane_id == "%5"
+
+
+def test_legion_custodes_has_zero_abbreviation():
+    workspace = _workspace(_pane("%C", "legion:custodes", window="legion", window_index=3))
+
+    resolved = resolve_pane_in_snapshot(workspace, "3:0")
+
+    assert resolved.pane_id == "%C"
+
+
+def test_mechanicus_fabricator_has_zero_abbreviation_and_admin_named_slot():
+    workspace = _workspace(
+        _pane("%F", "mechanicus:fabricator-general", window="mechanicus", window_index=4),
+        _pane("%A", "mechanicus:admin", window="mechanicus", window_index=4),
+    )
+
+    assert resolve_pane_in_snapshot(workspace, "4:0").pane_id == "%F"
+    assert resolve_pane_in_snapshot(workspace, "4:admin").pane_id == "%A"
