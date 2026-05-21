@@ -412,6 +412,7 @@ def enforce_stack_layout(
     focus: bool = False,
     admit: bool = False,
     kill_pending_clear: bool = False,
+    prune_dead_workers: bool = True,
 ) -> str:
     window_name = _show(adapter, target, "#{window_name}")
     spec = _stack_spec_for_window(window_name)
@@ -569,7 +570,19 @@ def enforce_stack_layout(
                 worker.command,
                 True,
             )
-        if worker.clear and not (worker.pending and not kill_pending_clear):
+        if (
+            prune_dead_workers
+            and worker.clear
+            and not (worker.pending and not kill_pending_clear)
+        ):
+            # Overflow-safety contract: dispatch never silent-kills an existing
+            # stack-worker pane to make room. `clear` is true for any pane
+            # parked at a shell prompt — which can be live Emperor work between
+            # commands, not a dead worker. Only periodic sweeps
+            # (sweep_stack_assertions) opt into pruning; dispatch calls
+            # enforce_stack_layout with prune_dead_workers=False so an at-
+            # ceiling dispatch surfaces tmux's native "no space for new pane"
+            # error instead of silently freeing a slot.
             adapter.run("kill-pane", "-t", worker.pane_id, allow_failure=True)
         elif not worker.clear and worker.pending:
             _clear_pending(adapter, worker.pane_id)
@@ -745,7 +758,9 @@ def add_orchestrator_stack_pane(
     )
     _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
     adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
-    enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
+    enforce_stack_layout(
+        adapter, target, focused_pane=pane, focus=True, prune_dead_workers=False
+    )
     return pane
 
 
