@@ -417,10 +417,18 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+    tmux_log = tmp_path / "tmux.log"
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$TMUX_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
     env = os.environ.copy()
     env["IMPERIUM"] = str(tmp_path)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
+    env["TMUX_LOG"] = str(tmux_log)
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -472,9 +480,19 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--prompt-file" in result.stdout
     launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
     assert "stack dispatch legion --session main" in launched
-    assert "--command bash " in launched
+    # tmuxctl now spawns the pane with a throwaway `clear` warmup that absorbs
+    # any leading-char loss from the upstream type-check guard; the real
+    # `bash <staged>` is sent via a follow-up tmux send-keys after a settle.
+    assert "--command clear" in launched
     assert "%aspirant-pane" not in launched
-    staged_path = Path(launched.rsplit("--command bash ", 1)[1].strip())
+    tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
+    assert "send-keys -t %aspirant-pane bash " in tmux_text
+    assert "Enter" in tmux_text
+    send_line = next(
+        line for line in tmux_text.splitlines()
+        if "send-keys -t %aspirant-pane bash " in line
+    )
+    staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "--append-system-prompt" in staged
     assert "Aspirant Session Startup" in staged

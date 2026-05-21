@@ -995,8 +995,17 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   fi
   session="main"
   stack="$DISPATCH_WINDOW"
+  # Newborn-pane keystroke race: the first send-keys burst into a freshly
+  # spawned pane can lose its leading chars (an upstream type-check guard
+  # races shell-readiness). Spawn the pane with a throwaway `clear` warmup
+  # that absorbs the loss, then send the real staged `. <tmpfile>` command
+  # via our own send-keys after a settle — mirroring the tmux_target dance
+  # below. Without this, `source <tmpfile>` arrives as e.g. `ur <tmpfile>`
+  # and the agent never launches.
+  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "clear")"
+  sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "$STAGED_COMMAND")"
+  tmux send-keys -t "$pane_id" "$STAGED_COMMAND" Enter
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
   printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
