@@ -36,7 +36,7 @@ from instance_mutation import (
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from pane_surface import human_tab_name as _human_tab_name
+from pane_surface import human_pane_surface, human_tab_name as _human_tab_name
 from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavlok_stimulus
 from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
@@ -1097,7 +1097,10 @@ async def _enqueue_and_send_stop_delivery(
 async def _fanout_stop_subscriptions(instance: dict, payload: dict, final_response: str | None) -> list[dict]:
     session_id = instance["id"]
     stop_event_key = _stop_event_key(session_id, payload)
-    name = _human_tab_name(instance.get("tab_name")) or session_id[:12]
+    surface = human_pane_surface(
+        instance.get("tab_name"), instance.get("tmux_pane"), instance.get("pane_label")
+    )
+    name = surface if surface != "session" else session_id[:12]
     response = (final_response or "").strip()
     if len(response) > 4000:
         response = response[:4000] + "\n… [truncated]"
@@ -2643,7 +2646,10 @@ async def handle_stop(payload: dict) -> dict:
     instance = dict(instance)
     device_id = instance.get("device_id", "Mac-Mini")
     tab_name = instance.get("tab_name", "Claude")
-    notify_surface = _human_tab_name(tab_name) or session_id[:12]
+    _resolved_surface = human_pane_surface(
+        tab_name, instance.get("tmux_pane"), instance.get("pane_label")
+    )
+    notify_surface = _resolved_surface if _resolved_surface != "session" else session_id[:12]
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
     # Update last_activity but DON'T set idle yet — that's the evaluators' job.
