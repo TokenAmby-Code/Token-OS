@@ -294,6 +294,10 @@ sys.excepthook = _global_exception_handler
 LEGION_PANE_COLORS = {
     "custodes": "#302800",  # dark gold
     "mechanicus": "#300808",  # dark red
+    "fabricator": "#300808",  # FG shares the 4:mechanicus page tint. Without this
+                              # entry the recolor worker resolves .get("fabricator",
+                              # "default") and overwrites the bg=#300808 that
+                              # _assert_persona_color sets — the two systems fight.
     "civic": "#083010",  # dark green
     "astartes": "default",  # no tint (default legion)
 }
