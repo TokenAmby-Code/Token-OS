@@ -53,7 +53,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 |----------|---------|
 | `/notify?vibe=N&beep=N&tts_text=X&banner_text=X&type=T` | Notification + TTS + Pavlok vibe/beep |
 | `/enforce?zap=N&tts_text=X&banner_text=X&type=T` | Same + Pavlok zap + Spotify redirect |
-| `/zap?zap=30` or `/zap?action=zap\|beep\|vibe&intensity=N` | Direct single Pavlok stimulus (lightweight) |
+| `/zap?zap=30` or `/zap?action=zap\|beep\|vibe&intensity=1-100` | Direct single Pavlok stimulus (lightweight) |
 | `/token-ping` | Local relay → Token-API with Discord fallback |
 | `/heartbeat` | Health check |
 | `/sshd` | Start Termux SSH daemon |
