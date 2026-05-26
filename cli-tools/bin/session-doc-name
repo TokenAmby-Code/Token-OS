@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Rename the current pane's session document.
+# Usage: session-doc-name "Descriptive Session Title"
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -lt 1 ]]; then
+  cat >&2 <<'EOF'
+Usage: session-doc-name "Descriptive Session Title"
+
+Names the session document attached to the current tmux pane. Use a descriptive
+3-6 word title. Do not use dates, timestamps, UUIDs, pane IDs, model names, or
+generic project roots.
+EOF
+  exit $([[ $# -lt 1 ]] && echo 2 || echo 0)
+fi
+
+TITLE="$*"
+TITLE="$(printf '%s' "$TITLE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+if [[ -z "$TITLE" ]]; then
+  echo "Error: title cannot be empty" >&2
+  exit 2
+fi
+if [[ "$TITLE" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} || "$TITLE" =~ [0-9]{2}:[0-9]{2} ]]; then
+  echo "Error: title must not contain dates or timestamps" >&2
+  exit 2
+fi
+
+DOC=$("$(dirname "$0")/tmuxctl" session-doc --pane current --format json 2>/dev/null || true)
+DOC_ID=$(echo "$DOC" | jq -r '.id // .doc_id // empty' 2>/dev/null || true)
+if [[ -z "$DOC_ID" ]]; then
+  echo "Error: could not resolve session doc for current cardinal pane" >&2
+  exit 1
+fi
+
+RESP=$(jq -n --arg title "$TITLE" '{title: $title}' \
+  | curl -s -X PATCH "$API_URL/api/session-docs/$DOC_ID" \
+      -H "Content-Type: application/json" \
+      --data-binary @- 2>/dev/null || true)
+
+if echo "$RESP" | jq -e '.updated == true' >/dev/null 2>&1; then
+  echo "Session doc named: $TITLE"
+else
+  echo "Error: $(echo "$RESP" | jq -r '.detail // "session doc rename failed"' 2>/dev/null || echo "session doc rename failed")" >&2
+  exit 1
+fi

@@ -16,7 +16,6 @@ TMUX_GRID_STATE_MINI="mini"
 # Deprecated compatibility state; canonical side rails use "side".
 TMUX_GRID_STATE_TALL="tall-grid"
 
-TMUX_PANE_TYPE_TUI="tui"
 TMUX_PANE_TYPE_LEGION="legion"
 TMUX_PANE_TYPE_MECHANICUS="mechanicus"
 
@@ -44,7 +43,6 @@ tmux_pane_type_from_pane_id() {
     case "$win" in
         mechanicus|mars|kreig) echo "$TMUX_PANE_TYPE_MECHANICUS" ;;
         legion) echo "$TMUX_PANE_TYPE_LEGION" ;;
-        tui)    echo "$TMUX_PANE_TYPE_TUI" ;;
         *) return 1 ;;
     esac
 }
@@ -57,7 +55,6 @@ tmux_is_valid_pane_slot() {
         somnium:NW|somnium:SW|somnium:NE|somnium:SE|somnium:EE) return 0 ;;
         palace:SL|palace:TL|palace:BL|palace:TR|palace:BR|palace:SR) return 0 ;;
         somnium:TL|somnium:BL|somnium:TR|somnium:BR|somnium:SR) return 0 ;;
-        tui:1) return 0 ;;
         mechanicus:*|mars:*|kreig:*|legion:*) return 0 ;;
         *) return 1 ;;
     esac

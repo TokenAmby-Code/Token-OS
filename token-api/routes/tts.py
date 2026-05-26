@@ -325,30 +325,36 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
 
 
 def _get_discord_voice_bot() -> str | None:
-    """Check if operator is in a Discord voice channel (any bot connected = operator present).
+    """Return a bot whose voice connection can actually deliver audio, else None.
 
-    Returns the bot name if one is connected, None otherwise. Cached for 5s.
+    A bot is a usable consumer only when the daemon reports it both `connected`
+    AND `connectionState == "ready"`. The daemon's multi-bot status historically
+    set `connected = !!state.connection`, which stays truthy for a destroyed /
+    half-open connection. Trusting that flag let TTS route to a dead pipe and
+    claim success — the `feedback_anti_blind_dedup` failure mode. We require the
+    `ready` connection state so a stale connection no longer masquerades as a
+    live voice consumer. Cached for 5s.
     """
     now = time.time()
     cache = _get_discord_voice_bot
     if hasattr(cache, "_result") and now - cache._checked < 5:
         return cache._result
 
+    result = None
     try:
         resp = requests.get(f"{DISCORD_DAEMON_URL}/voice/status", timeout=1)
         if resp.status_code == 200:
             statuses = resp.json()
             for bot_name, status in statuses.items():
-                if status.get("connected"):
-                    cache._result = bot_name
-                    cache._checked = now
-                    return bot_name
+                if status.get("connected") and status.get("connectionState") == "ready":
+                    result = bot_name
+                    break
     except Exception:
         pass
 
-    cache._result = None
+    cache._result = result
     cache._checked = now
-    return None
+    return result
 
 
 def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int = 0) -> dict:
@@ -373,12 +379,26 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
                     "voice": mac_voice,
                     "message": message[:50],
                 }
-        return {"success": False, "error": f"Discord TTS returned {resp.status_code}"}
+            # 200 but no confirmed playback: the daemon accepted the request but
+            # did not deliver audio to a live channel. Do not claim success.
+            return {
+                "success": False,
+                "error": "discord_voice_not_played",
+                "reason": "bot_not_in_channel",
+                "bot": bot_name,
+            }
+        if resp.status_code == 409:
+            return {"success": False, "error": "discord_voice_busy", "reason": "discord_voice_busy"}
+        return {
+            "success": False,
+            "error": f"Discord TTS returned {resp.status_code}",
+            "reason": "discord_daemon_error",
+        }
     except requests.Timeout:
-        return {"success": False, "error": "discord_tts_timeout"}
+        return {"success": False, "error": "discord_tts_timeout", "reason": "discord_tts_timeout"}
     except Exception as e:
         logger.warning(f"TTS Discord: failed ({e}), will fall through to local")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": str(e), "reason": "discord_unreachable"}
 
 
 def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
@@ -469,6 +489,23 @@ def speak_tts(
     device = routing["device"]
     logger.info(f"TTS: Routing to {device} ({routing['reason']})")
 
+    def _finish(result: dict) -> dict:
+        """Stamp truthful routing telemetry so callers can see where audio
+        actually went (or why it failed) without trusting the requested device.
+        `route` is the device that produced a successful delivery; on failure it
+        is None and `reason` carries an actionable code."""
+        result = dict(result or {})
+        result.setdefault("success", False)
+        result.setdefault("method", None)
+        result["requested_device"] = device
+        if result.get("success"):
+            result["route"] = result.get("method") or device
+            result.setdefault("reason", None)
+        else:
+            result["route"] = None
+            result.setdefault("reason", result.get("error") or "tts_delivery_failed")
+        return result
+
     # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
     # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
     if device == "wsl" and not wsl_voice:
@@ -480,7 +517,7 @@ def speak_tts(
     if device == "discord":
         result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
-            return result
+            return _finish(result)
         logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
         # Re-resolve skipping discord — try WSL/phone/mac
         if is_satellite_tts_available():
@@ -492,12 +529,12 @@ def speak_tts(
                 message, fallthrough_voice, fallthrough_rate, use_file_playback=use_file_playback
             )
             if result.get("success"):
-                return result
+                return _finish(result)
         if is_phone_reachable() and _send_to_phone:
             result = _send_to_phone("/notify", {"tts_text": message})
             if result.get("success"):
-                return result
-        return speak_tts_mac(message, voice, rate)
+                return _finish(result)
+        return _finish(speak_tts_mac(message, voice, rate))
 
     if device == "wsl":
         result = speak_tts_wsl(
@@ -507,22 +544,22 @@ def speak_tts(
             use_file_playback=use_file_playback,
         )
         if result.get("success"):
-            return result
+            return _finish(result)
         logger.info(
             f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})"
         )
-        return speak_tts_mac(message, voice, rate)
+        return _finish(speak_tts_mac(message, voice, rate))
 
     if device == "phone":
         if _send_to_phone:
             result = _send_to_phone("/notify", {"tts_text": message})
             if result.get("success"):
-                return result
+                return _finish(result)
             logger.info(f"TTS: Phone failed ({result.get('error')}), falling back to Mac")
-        return speak_tts_mac(message, voice, rate)
+        return _finish(speak_tts_mac(message, voice, rate))
 
     # device == "mac" (or unknown)
-    return speak_tts_mac(message, voice, rate)
+    return _finish(speak_tts_mac(message, voice, rate))
 
 
 # ============ TTS Queue System ============
@@ -1073,6 +1110,17 @@ async def send_notification(request: NotifyRequest):
         else:
             results["webhook"] = {"success": False, "error": "phone sender not initialized"}
 
+    # Derive a truthful top-level success/reason from the component that owns
+    # delivery for this device. Callers route on this without having to know the
+    # per-component envelope shape. `route` reflects where audio actually went.
+    if method == "webhook":
+        primary = results.get("webhook") or {}
+    else:
+        primary = results.get("tts") or {}
+    success = bool(primary.get("success"))
+    reason = primary.get("reason") if not success else None
+    route = primary.get("route") or (primary.get("method") if success else None)
+
     # Log the notification event
     await log_event(
         "notification_sent",
@@ -1080,19 +1128,45 @@ async def send_notification(request: NotifyRequest):
         details={"message": request.message[:100], "results": results},
     )
 
-    return {"device_id": device_id, "method": method, "results": results}
+    return {
+        "device_id": device_id,
+        "method": method,
+        "success": success,
+        "route": route,
+        "reason": reason,
+        "results": results,
+    }
 
 
 @router.post("/api/notify/tts")
 async def notify_tts(request: TTSRequest):
-    """Speak a message using TTS only.
+    """Speak a message using TTS only — TTS-only sibling of the canonical
+    `POST /api/notify`.
+
+    Both endpoints delegate to the same routing core (`speak_tts`), so the TTS
+    result here matches `/api/notify`'s `results.tts`. `/api/notify` is the
+    canonical entry point (it also handles sound + device webhook + quiet-hours
+    fanout); use this one only when you want speech with no sound/banner.
+
+    The response always carries populated `success` / `method` / `route` /
+    `reason` so observability is never a null-triple (regression
+    `regression-notify-tts-endpoint-null-triple-2026-05-25`).
 
     When instance_id is provided and no explicit voice is set, uses the
     instance's assigned voice profile (WSL voice + Mac fallback).
     """
+    if not request.message:
+        return {"success": False, "method": None, "route": None, "reason": "no_message"}
+
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {request.message[:80]}")
-        return {"success": True, "suppressed": True, "reason": "quiet_hours"}
+        return {
+            "success": True,
+            "suppressed": True,
+            "method": "suppressed",
+            "route": "suppressed",
+            "reason": "quiet_hours",
+        }
 
     # Resolve voice from instance profile when instance_id provided and no explicit voice
     voice = request.voice

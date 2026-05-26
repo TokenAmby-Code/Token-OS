@@ -150,6 +150,18 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "parent_instance_id",
                 "ALTER TABLE claude_instances ADD COLUMN parent_instance_id TEXT",
             ),
+            (
+                "planning_state",
+                "ALTER TABLE claude_instances ADD COLUMN planning_state TEXT DEFAULT 'none'",
+            ),
+            (
+                "planning_updated_at",
+                "ALTER TABLE claude_instances ADD COLUMN planning_updated_at TIMESTAMP",
+            ),
+            (
+                "planning_source",
+                "ALTER TABLE claude_instances ADD COLUMN planning_source TEXT",
+            ),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -231,6 +243,68 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_state_injections_pending_audience
             ON state_injections(audience_instance_id, status, created_at)
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stop_hook_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_instance_id TEXT NOT NULL,
+                target_pane TEXT,
+                subscriber_instance_id TEXT,
+                subscriber_pane TEXT NOT NULL,
+                event TEXT NOT NULL DEFAULT 'stop',
+                delivery TEXT NOT NULL DEFAULT 'prompt',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                unsubscribed_at TIMESTAMP,
+                purpose TEXT NOT NULL DEFAULT 'generic',
+                payload TEXT,
+                oneshot INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(target_instance_id, subscriber_instance_id, subscriber_pane, event)
+            )
+        """)
+        cursor = await db.execute("PRAGMA table_info(stop_hook_subscriptions)")
+        sub_columns = {col[1] for col in await cursor.fetchall()}
+        sub_migrations = [
+            ("purpose", "ALTER TABLE stop_hook_subscriptions ADD COLUMN purpose TEXT NOT NULL DEFAULT 'generic'"),
+            ("payload", "ALTER TABLE stop_hook_subscriptions ADD COLUMN payload TEXT"),
+            ("oneshot", "ALTER TABLE stop_hook_subscriptions ADD COLUMN oneshot INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for column_name, sql in sub_migrations:
+            if column_name not in sub_columns:
+                await db.execute(sql)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stop_hook_subscriptions_active
+            ON stop_hook_subscriptions(target_instance_id, event, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stop_hook_subscriptions_purpose
+            ON stop_hook_subscriptions(purpose, status)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stop_hook_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscription_id INTEGER NOT NULL,
+                target_instance_id TEXT NOT NULL,
+                subscriber_instance_id TEXT,
+                subscriber_pane TEXT NOT NULL,
+                event TEXT NOT NULL DEFAULT 'stop',
+                stop_event_key TEXT NOT NULL,
+                delivery TEXT NOT NULL DEFAULT 'prompt',
+                status TEXT NOT NULL,
+                payload_json TEXT,
+                pane_write_queue_id TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TIMESTAMP,
+                UNIQUE(subscription_id, stop_event_key)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stop_hook_deliveries_target
+            ON stop_hook_deliveries(target_instance_id, created_at DESC)
         """)
 
         await db.execute("""
@@ -793,6 +867,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
             BEGIN
                 INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
                 VALUES (NEW.id, '@CC_STATE', NEW.status, NEW.tmux_pane);
+            END
+        """)
+
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_planning_pane_state
+            AFTER UPDATE OF planning_state ON claude_instances
+            WHEN OLD.planning_state IS NOT NEW.planning_state
+            BEGIN
+                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                VALUES (NEW.id, '@PLANNING_STATE', NEW.planning_state, NEW.tmux_pane);
             END
         """)
 

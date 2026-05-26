@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pane-id.sh — Human-readable tmux pane ID system
-# Sourced by tx, vault-dispatch, tmuxctl, and other tmux tools.
+# Sourced by tx, dispatch, tmuxctl, and other tmux tools.
 #
 # Pane IDs use the format window:position (e.g., palace:N, mechanicus:1).
 # Stored as @PANE_ID tmux pane option. Resolves to tmux pane target (%N).
@@ -51,7 +51,7 @@ pane_tag() {
 
     pane_type=$(tmux_pane_type_from_pane_id "$pane_id" 2>/dev/null || true)
     case "$pane_type" in
-        "$TMUX_PANE_TYPE_MECHANICUS"|"$TMUX_PANE_TYPE_LEGION"|"$TMUX_PANE_TYPE_TUI")
+        "$TMUX_PANE_TYPE_MECHANICUS"|"$TMUX_PANE_TYPE_LEGION")
             tmux set-option -p -t "$target" @PANE_TYPE "$pane_type"
             ;;
     esac

@@ -4,10 +4,9 @@
 # AUDIENCE: human, agent
 #
 # Usage:
-#   token-restart              # Full restart: Mac + WSL + phone TUI
+#   token-restart              # Full restart: Mac + WSL satellite
 #   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
-#   token-restart --tui-only   # Respawn all TUI panes (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
@@ -47,10 +46,9 @@ show_help() {
 token-restart - Multi-device restart orchestrator
 
 Usage:
-    token-restart              Full restart (Mac → WSL → phone)
+    token-restart              Full restart (Mac → WSL)
     token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
-    token-restart --tui-only   Respawn all TUI panes via tmux (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
@@ -59,14 +57,13 @@ Usage:
     When run from a non-Mac device, proxies to Mac via SSH.
 
 Flow:
-    1. Restart Mac token-api (launchctl) + respawn Mac TUI panes
+    1. Restart Mac token-api (launchctl)
     2. Restart WSL satellite (HTTP → restart, SSH fallback)
-    3. Respawn TUI panes on WSL + phone via SSH (tui-respawn)
-    4. Health-check all, print summary
+    3. Health-check all, print summary
 
 Notes:
     - All devices read from NAS (/Volumes/Imperium/Token-OS) — no sync needed
-    - WSL and phone steps are fire-and-forget if unreachable
+    - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
 EOF
@@ -84,7 +81,6 @@ remote_restart() {
     # Pass through relevant flags
     local flags=""
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
-    [[ "${ACTION}" == "tui-only" ]] && flags="$flags --tui-only"
 
     if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
@@ -115,38 +111,6 @@ remote_status() {
             echo -e "  WSL:   ${YELLOW}○${NC} unknown"
         fi
     }
-}
-
-# ============ TUI Respawn ============
-
-respawn_local_tui() {
-    if command -v tui-respawn &>/dev/null; then
-        tui-respawn 2>/dev/null || true
-    else
-        echo -e "  ${YELLOW}⚠${NC} tui-respawn not found locally"
-    fi
-}
-
-respawn_wsl_tui() {
-    local nas_path
-    nas_path="$(imperium_cfg nas_imperium wsl)"
-    if ssh -o ConnectTimeout=3 -o BatchMode=yes wsl \
-        "${nas_path}/Token-OS/cli-tools/bin/tui-respawn" 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} WSL TUI panes respawned"
-    else
-        echo -e "  ${YELLOW}⚠${NC} WSL unreachable or no tmux session, skipping TUI respawn"
-    fi
-}
-
-respawn_phone_tui() {
-    local nas_path
-    nas_path="$(imperium_cfg nas_imperium phone 2>/dev/null || echo "")"
-    if [[ -n "$nas_path" ]] && ssh -o ConnectTimeout=3 -o BatchMode=yes phone \
-        "${nas_path}/Token-OS/cli-tools/bin/tui-respawn" 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} Phone TUI panes respawned"
-    else
-        echo -e "  ${YELLOW}⚠${NC} Phone unreachable or no tmux session, skipping TUI respawn"
-    fi
 }
 
 # ============ Mac ============
@@ -385,26 +349,17 @@ full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 1. Mac restart + local TUI respawn
+    # 1. Mac restart
     restart_mac || true
-    echo -e "${BLUE}→${NC} Respawning local TUI panes..."
-    respawn_local_tui
     echo ""
 
-    # 2. WSL restart + remote TUI respawn (parallel)
+    # 2. WSL restart
     restart_wsl &
     local wsl_pid=$!
 
     wait $wsl_pid 2>/dev/null || true
 
-    # 3. Respawn TUI panes on remote machines
-    echo ""
-    echo -e "${BLUE}→${NC} Respawning remote TUI panes..."
-    respawn_wsl_tui &
-    respawn_phone_tui &
-    wait
-
-    # 4. Summary
+    # 3. Summary
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
     if check_mac_health; then
@@ -444,10 +399,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --wsl-only)
             ACTION="wsl-only"
-            shift
-            ;;
-        --tui-only)
-            ACTION="tui-only"
             shift
             ;;
         --no-push)
@@ -497,16 +448,6 @@ case "$ACTION" in
         ;;
     wsl-only)
         restart_wsl
-        ;;
-    tui-only)
-        echo -e "${BOLD}=== TUI Respawn (all machines) ===${NC}"
-        echo ""
-        echo -e "${BLUE}→${NC} Respawning local TUI panes..."
-        respawn_local_tui
-        echo -e "${BLUE}→${NC} Respawning remote TUI panes..."
-        respawn_wsl_tui &
-        respawn_phone_tui &
-        wait
         ;;
     restart)
         if [[ -n "$DEPLOY_FROM" ]]; then

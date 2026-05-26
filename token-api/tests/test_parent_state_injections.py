@@ -42,7 +42,7 @@ def test_session_start_captures_parent_instance_id(app_env):
                 "cwd": "/tmp",
                 "env": {
                     "TOKEN_API_PARENT_INSTANCE_ID": "parent-abc",
-                    "TOKEN_API_LAUNCHER": "vault-dispatch",
+                    "TOKEN_API_LAUNCHER": "dispatch",
                     "TOKEN_API_ENGINE": "codex",
                 },
             }

@@ -10,6 +10,7 @@ Uses dependency injection from main.py for runtime-owned callbacks.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 import shared
+import talk as talk_service
 from enforcement_service import close_distraction_windows
 from instance_mutation import (
     _fetch_instance_row,
@@ -34,8 +36,8 @@ from instance_mutation import (
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from pane_surface import human_tab_name as _human_tab_name
-from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavlok_stimulus
+from pane_surface import human_pane_surface
+from phone_service import _send_to_phone, check_instance_count_pavlok
 from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
@@ -69,7 +71,79 @@ router = APIRouter()
 _QUESTION_LOG_TITLE = "AskUserQuestion Log"
 _UNANSWERED_TITLE = "Unanswered Questions"
 _ASKQ_PERSIST_LOCK = asyncio.Lock()
-VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off"}
+VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off", "hook_driven"}
+
+
+def _tmuxctl_bin() -> Path:
+    return Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "tmuxctl"
+
+
+def _spawn_session_end_assertion(tmux_pane: str, session_id: str) -> None:
+    """Assert/prune a just-closed pane without blocking hook completion."""
+    if not tmux_pane:
+        return
+    tmuxctl = _tmuxctl_bin()
+    if not tmuxctl.exists():
+        logger.warning("Hook: SessionEnd assert skipped for %s — tmuxctl not found", tmux_pane)
+        return
+    code = r"""
+import os
+import subprocess
+import sys
+import time
+
+tmuxctl, pane, session_id = sys.argv[1:4]
+env = os.environ.copy()
+env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
+try:
+    # Let the DB-triggered pane_state_queue publish its stopped state first;
+    # assert-instance then owns the final close-down cleanup and clears stale
+    # stopped/idle header chrome rather than racing the queue worker.
+    time.sleep(2)
+    proc = subprocess.run(
+        [tmuxctl, "assert-instance", "--pane", pane],
+        text=True,
+        capture_output=True,
+        timeout=75,
+        check=False,
+        env=env,
+    )
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    raise SystemExit(proc.returncode)
+except subprocess.TimeoutExpired as exc:
+    sys.stderr.write(f"SessionEnd assert-instance timeout pane={pane} session={session_id}: {exc}\n")
+    raise SystemExit(124)
+"""
+    log_path = Path("/tmp/session-end-assert-instance.log")
+    log_handle = None
+    try:
+        log_handle = log_path.open("a")
+        subprocess.Popen(
+            ["python3", "-c", code, str(tmuxctl), tmux_pane, session_id],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.info(
+            "Hook: SessionEnd spawned assert-instance for %s (%s)",
+            tmux_pane,
+            session_id[:12],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Hook: SessionEnd failed to spawn assert-instance for %s: %s",
+            tmux_pane,
+            exc,
+        )
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
 
 
 # ============ Injected Dependencies ============
@@ -83,11 +157,9 @@ _auto_name_instance: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
 _golden_throne_activity_callback: Callable[..., Any] | None = None
-# AUQ ladder escalation callbacks. Level 2 keeps the historical
-# `_askq_touch2_callback` name for the cascade since main.py already wires it.
+# AskUserQuestion ladder L1 only — L2/L3 warn-stage callbacks were removed
+# when the cascade was collapsed. Golden Throne now owns missed-ack escalation.
 _askq_level1_callback: Callable[..., Any] | None = None
-_askq_touch2_callback: Callable[..., Any] | None = None
-_askq_level3_callback: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -101,14 +173,12 @@ def init_deps(
     schedule_golden_throne_callback=None,
     golden_throne_activity_callback=None,
     askq_level1_callback=None,
-    askq_touch2_callback=None,
-    askq_level3_callback=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
     global _run_stop_evaluators, _auto_name_instance, _work_action_callback
     global _schedule_golden_throne_callback, _golden_throne_activity_callback
-    global _askq_level1_callback, _askq_touch2_callback, _askq_level3_callback
+    global _askq_level1_callback
 
     _scheduler = scheduler
     _timer_engine = timer_engine
@@ -119,8 +189,6 @@ def init_deps(
     _schedule_golden_throne_callback = schedule_golden_throne_callback
     _golden_throne_activity_callback = golden_throne_activity_callback
     _askq_level1_callback = askq_level1_callback
-    _askq_touch2_callback = askq_touch2_callback
-    _askq_level3_callback = askq_level3_callback
 
 
 def _require_dep(name: str, value):
@@ -148,6 +216,48 @@ class PreToolUseResponse(BaseModel):
     permissionDecisionReason: str | None = None
 
 
+class HookSubscribeRequest(BaseModel):
+    target_instance_id: str | None = None
+    target_pane: str | None = None
+    subscriber_instance_id: str | None = None
+    subscriber_pane: str | None = None
+    event: str = "stop"
+    delivery: str = "prompt"
+    purpose: str = "generic"
+    payload: str | None = None
+    oneshot: bool = False
+
+
+class HookUnsubscribeRequest(BaseModel):
+    target_instance_id: str | None = None
+    target_pane: str | None = None
+    subscriber_instance_id: str | None = None
+    subscriber_pane: str | None = None
+    event: str = "stop"
+    purpose: str | None = None
+
+
+class PlanningStateRequest(BaseModel):
+    instance_id: str | None = None
+    tmux_pane: str | None = None
+    state: str | None = None
+    cycle: bool = False
+    source: str = "api"
+
+
+class HookSubscriptionsQuery(BaseModel):
+    target_instance_id: str | None = None
+    target_pane: str | None = None
+    subscriber_instance_id: str | None = None
+    subscriber_pane: str | None = None
+    event: str = "stop"
+    status: str = "active"
+
+
+class HookReconcileRequest(BaseModel):
+    page: str = "mechanicus"
+
+
 # ============ Hook Handler State ============
 # Debouncing for PostToolUse to avoid excessive API calls
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
@@ -164,6 +274,9 @@ NUDGE_COOLDOWN_SECONDS = 300  # 5 minutes
 # (self-eval complete, chose not to continue), the second stop passes through.
 _self_eval_pending: dict[str, float] = {}  # session_id -> timestamp of block
 SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
+
+MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
+MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
 
 
 async def _run_subprocess_offloop(
@@ -278,6 +391,16 @@ def _instance_name_base_from_session_doc(title: str | None, file_path: str | Non
     return raw[:80].strip("-") or "session-doc"
 
 
+def _is_unnamed_session_doc_base(base: str | None) -> bool:
+    return (base or "") in {
+        "needs-name",
+        "needs-session-name",
+        "unnamed-session",
+        "session",
+        "session-doc",
+    }
+
+
 async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int) -> str:
     cursor = await db.execute(
         "SELECT title, file_path FROM session_documents WHERE id = ?", (doc_id,)
@@ -286,6 +409,8 @@ async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int)
     title = row[0] if row else None
     file_path = row[1] if row else None
     base = _instance_name_base_from_session_doc(title, file_path)
+    if _is_unnamed_session_doc_base(base):
+        return "needs-name"
 
     # Monotonic by existing suffix, not row count: stopped/historical rows
     # remain in the DB and prior instance renames may leave gaps.
@@ -325,6 +450,8 @@ async def _apply_session_doc_instance_name(
     if not row:
         return None
     base = _instance_name_base_from_session_doc(row[1], row[2])
+    if _is_unnamed_session_doc_base(base):
+        return None
     if re.match(rf"^{re.escape(base)}-\d+$", str(row[0] or "")):
         return str(row[0])
     new_name = await _next_session_doc_instance_name(db, session_doc_id)
@@ -522,6 +649,504 @@ async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | No
         "audience_instance_id": parent_instance_id,
         "payload": injection_payload,
     }
+
+
+async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
+    raw = _normalize_text(pane)
+    if not raw:
+        return None
+    resolved = await talk_service.resolve_pane(raw) or raw
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT id, tmux_pane, tab_name, engine, status, last_activity
+           FROM claude_instances
+           WHERE tmux_pane = ?
+           ORDER BY CASE WHEN status = 'stopped' THEN 1 ELSE 0 END,
+                    last_activity DESC
+           LIMIT 1""",
+        (resolved,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else {"tmux_pane": resolved}
+
+
+async def _resolve_instance_by_id(db, instance_id: str | None) -> dict | None:
+    raw = _normalize_text(instance_id)
+    if not raw:
+        return None
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT id, tmux_pane, tab_name, engine, status, last_activity
+           FROM claude_instances
+           WHERE id = ? OR session_id = ?
+           ORDER BY last_activity DESC
+           LIMIT 1""",
+        (raw, raw),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else {"id": raw}
+
+
+async def _upsert_stop_subscription(
+    db,
+    *,
+    target_instance_id: str,
+    target_pane: str | None,
+    subscriber_instance_id: str | None,
+    subscriber_pane: str,
+    event: str = "stop",
+    delivery: str = "prompt",
+    purpose: str = "generic",
+    payload: str | None = None,
+    oneshot: bool = False,
+) -> int:
+    now = datetime.now().isoformat()
+    event = event or "stop"
+    delivery = delivery or "prompt"
+    purpose = purpose or "generic"
+    cursor = await db.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+            event, delivery, status, created_at, updated_at, purpose, payload, oneshot)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+           ON CONFLICT(target_instance_id, subscriber_instance_id, subscriber_pane, event)
+           DO UPDATE SET
+             target_pane = excluded.target_pane,
+             delivery = excluded.delivery,
+             purpose = excluded.purpose,
+             payload = excluded.payload,
+             oneshot = excluded.oneshot,
+             status = 'active',
+             updated_at = excluded.updated_at,
+             unsubscribed_at = NULL""",
+        (
+            target_instance_id,
+            target_pane,
+            subscriber_instance_id,
+            subscriber_pane,
+            event,
+            delivery,
+            now,
+            now,
+            purpose,
+            payload,
+            1 if oneshot else 0,
+        ),
+    )
+    if cursor.lastrowid:
+        return int(cursor.lastrowid)
+    lookup = await db.execute(
+        """SELECT id FROM stop_hook_subscriptions
+           WHERE target_instance_id = ?
+             AND COALESCE(subscriber_instance_id, '') = COALESCE(?, '')
+             AND subscriber_pane = ?
+             AND event = ?""",
+        (target_instance_id, subscriber_instance_id, subscriber_pane, event),
+    )
+    row = await lookup.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _auto_subscribe_parent_on_start(
+    db,
+    *,
+    child_instance_id: str,
+    child_pane: str | None,
+    parent_instance_id: str | None,
+) -> dict | None:
+    parent_instance_id = _normalize_text(parent_instance_id)
+    if not parent_instance_id:
+        return None
+    parent = await _resolve_instance_by_id(db, parent_instance_id)
+    parent_pane = _normalize_text((parent or {}).get("tmux_pane"))
+    if not parent_pane:
+        return None
+    sub_id = await _upsert_stop_subscription(
+        db,
+        target_instance_id=child_instance_id,
+        target_pane=child_pane,
+        subscriber_instance_id=(parent or {}).get("id") or parent_instance_id,
+        subscriber_pane=parent_pane,
+        event="stop",
+        delivery="prompt",
+    )
+    return {
+        "subscription_id": sub_id,
+        "target_instance_id": child_instance_id,
+        "subscriber_instance_id": (parent or {}).get("id") or parent_instance_id,
+        "subscriber_pane": parent_pane,
+    }
+
+
+def _is_mechanicus_worker_label(label: str | None) -> bool:
+    label = _normalize_text(label)
+    if not label:
+        return False
+    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+        return False
+    prefix, _, suffix = label.partition(":")
+    if prefix != "mechanicus":
+        return False
+    if suffix.isdigit():
+        return int(suffix) > 0
+    return suffix == "worker" or suffix.startswith("worker-")
+
+
+def _is_mechanicus_stack_window(value: str | None) -> bool:
+    text = _normalize_text(value)
+    return bool(text and re.match(r"^mechanicus(?:-\d+)?(?:\W.*)?$", text))
+
+
+def _is_mechanicus_worker_row(row: dict) -> bool:
+    label = row.get("effective_pane_label") or row.get("pane_label")
+    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+        return False
+    if _is_mechanicus_worker_label(label):
+        return True
+    return _normalize_text(
+        row.get("dispatch_target")
+    ) == "mechanicus:new" or _is_mechanicus_stack_window(row.get("dispatch_window"))
+
+
+async def _active_stop_subscription_id(
+    db,
+    *,
+    target_instance_id: str,
+    subscriber_instance_id: str | None,
+    subscriber_pane: str,
+    event: str = "stop",
+) -> int | None:
+    cursor = await db.execute(
+        """SELECT id FROM stop_hook_subscriptions
+           WHERE target_instance_id = ?
+             AND COALESCE(subscriber_instance_id, '') = COALESCE(?, '')
+             AND subscriber_pane = ?
+             AND event = ?
+             AND status = 'active'
+           LIMIT 1""",
+        (target_instance_id, subscriber_instance_id, subscriber_pane, event),
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else None
+
+
+async def _active_hook_instances(db) -> list[dict]:
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT id, tmux_pane, pane_label, tab_name, status, last_activity,
+                  dispatch_target, dispatch_window
+           FROM claude_instances
+           WHERE status IN ('idle', 'processing')
+             AND tmux_pane IS NOT NULL
+           ORDER BY last_activity DESC, registered_at DESC"""
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def _with_effective_pane_labels(rows: list[dict]) -> list[dict]:
+    resolved: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        label = _normalize_text(item.get("pane_label"))
+        if not label:
+            label = await _tmux_pane_label(item.get("tmux_pane"))
+        item["effective_pane_label"] = label
+        resolved.append(item)
+    return resolved
+
+
+async def _find_live_fabricator_general(db) -> dict | None:
+    rows = await _with_effective_pane_labels(await _active_hook_instances(db))
+    for row in rows:
+        if row.get("effective_pane_label") == MECHANICUS_FG_LABEL:
+            return row
+    return None
+
+
+async def _reconcile_mechanicus_stop_subscriptions(
+    db,
+    *,
+    source_instance_id: str | None = None,
+) -> dict:
+    """Ensure active Mechanicus stack workers deliver Stop notices to FG."""
+    fg = await _find_live_fabricator_general(db)
+    counts = {"created": 0, "existing": 0, "skipped": 0}
+    skipped: list[dict] = []
+    subscriptions: list[dict] = []
+    if not fg or not fg.get("id") or not fg.get("tmux_pane"):
+        return {
+            "success": True,
+            "action": "no_live_fabricator_general",
+            "page": "mechanicus",
+            **counts,
+            "subscriber": None,
+            "subscriptions": [],
+        }
+
+    rows = await _with_effective_pane_labels(await _active_hook_instances(db))
+    if source_instance_id:
+        rows = [row for row in rows if row.get("id") == source_instance_id]
+
+    for row in rows:
+        target_id = _normalize_text(row.get("id"))
+        target_pane = _normalize_text(row.get("tmux_pane"))
+        label = row.get("effective_pane_label")
+        if not target_id or not target_pane:
+            counts["skipped"] += 1
+            skipped.append({"instance_id": target_id, "reason": "missing_target"})
+            continue
+        if target_id == fg.get("id") or label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+            counts["skipped"] += 1
+            skipped.append({"instance_id": target_id, "pane_label": label, "reason": "persona"})
+            continue
+        if not _is_mechanicus_worker_row(row):
+            counts["skipped"] += 1
+            skipped.append(
+                {"instance_id": target_id, "pane_label": label, "reason": "not_mechanicus_worker"}
+            )
+            continue
+
+        existing_id = await _active_stop_subscription_id(
+            db,
+            target_instance_id=target_id,
+            subscriber_instance_id=fg.get("id"),
+            subscriber_pane=fg["tmux_pane"],
+        )
+        sub_id = await _upsert_stop_subscription(
+            db,
+            target_instance_id=target_id,
+            target_pane=target_pane,
+            subscriber_instance_id=fg.get("id"),
+            subscriber_pane=fg["tmux_pane"],
+            event="stop",
+            delivery="prompt",
+        )
+        if existing_id:
+            counts["existing"] += 1
+        else:
+            counts["created"] += 1
+        subscriptions.append(
+            {
+                "subscription_id": sub_id,
+                "target_instance_id": target_id,
+                "target_pane": target_pane,
+                "target_pane_label": label,
+                "subscriber_instance_id": fg.get("id"),
+                "subscriber_pane": fg["tmux_pane"],
+            }
+        )
+
+    return {
+        "success": True,
+        "action": "reconciled",
+        "page": "mechanicus",
+        **counts,
+        "subscriber": {
+            "instance_id": fg.get("id"),
+            "pane": fg.get("tmux_pane"),
+            "pane_label": fg.get("effective_pane_label"),
+        },
+        "subscriptions": subscriptions,
+        "skipped_targets": skipped,
+    }
+
+
+async def _reconcile_mechanicus_on_session_start(db, instance_id: str) -> dict | None:
+    rows = await _with_effective_pane_labels(await _active_hook_instances(db))
+    current = next((row for row in rows if row.get("id") == instance_id), None)
+    if not current:
+        return None
+    label = current.get("effective_pane_label")
+    if label == MECHANICUS_FG_LABEL:
+        return await _reconcile_mechanicus_stop_subscriptions(db)
+    if _is_mechanicus_worker_row(current):
+        return await _reconcile_mechanicus_stop_subscriptions(db, source_instance_id=instance_id)
+    return None
+
+
+def _stop_event_key(session_id: str, payload: dict) -> str:
+    path = payload.get("transcript_path")
+    if path:
+        try:
+            p = Path(path)
+            if p.exists():
+                st = p.stat()
+                return f"transcript:{p}:{st.st_mtime_ns}:{st.st_size}"
+        except OSError:
+            pass
+    stable = {
+        k: v
+        for k, v in payload.items()
+        if not str(k).startswith("_") and k not in {"stop_hook_active"}
+    }
+    raw = json.dumps(stable, sort_keys=True, default=str)
+    return f"payload:{session_id}:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
+async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
+    """Best-effort live prompt delivery used from hooks without importing main.py."""
+    try:
+        from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+
+        adapter = TmuxAdapter()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(adapter.send_text_then_submit, tmux_pane, payload),
+                timeout=10,
+            )
+            return {"status": "sent", "operation": "tmuxctl.send_text_then_submit"}
+        except TmuxError as exc:
+            return {"status": "failed", "error": str(exc)}
+    except Exception:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "send-keys", "-t", tmux_pane, payload, "Enter"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return {"status": "sent", "operation": "tmux.send-keys"}
+        return {"status": "failed", "error": proc.stderr.decode(errors="replace")}
+
+
+async def _enqueue_and_send_stop_delivery(
+    db,
+    *,
+    subscription: dict,
+    stop_event_key: str,
+    payload: str,
+) -> dict:
+    delivery_id: int | None = None
+    queue_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    try:
+        cursor = await db.execute(
+            """INSERT INTO stop_hook_deliveries
+               (subscription_id, target_instance_id, subscriber_instance_id,
+                subscriber_pane, event, stop_event_key, delivery, status,
+                payload_json, pane_write_queue_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+            (
+                subscription["id"],
+                subscription["target_instance_id"],
+                subscription["subscriber_instance_id"],
+                subscription["subscriber_pane"],
+                subscription["event"],
+                stop_event_key,
+                subscription["delivery"],
+                json.dumps({"prompt": payload}, sort_keys=True),
+                queue_id,
+                now,
+            ),
+        )
+        delivery_id = int(cursor.lastrowid)
+    except aiosqlite.IntegrityError:
+        return {"status": "duplicate", "subscription_id": subscription["id"]}
+
+    await db.execute(
+        """INSERT INTO pane_write_queue
+           (id, instance_id, tmux_pane, source, purpose, payload, status, created_at, updated_at)
+           VALUES (?, ?, ?, 'hook', 'stop_subscription', ?, 'pending', ?, ?)""",
+        (
+            queue_id,
+            subscription["subscriber_instance_id"] or subscription["subscriber_pane"],
+            subscription["subscriber_pane"],
+            payload,
+            now,
+            now,
+        ),
+    )
+    await db.commit()
+
+    send_result = await _direct_pane_write(subscription["subscriber_pane"], payload)
+    sent = send_result.get("status") == "sent"
+    final_status = "sent" if sent else "failed"
+    await db.execute(
+        """UPDATE pane_write_queue
+           SET status = ?, attempted_at = ?, sent_at = ?, updated_at = ?,
+               last_error = ?, last_result_json = ?
+           WHERE id = ?""",
+        (
+            final_status,
+            now,
+            now if sent else None,
+            datetime.now().isoformat(),
+            send_result.get("error"),
+            json.dumps(send_result, sort_keys=True),
+            queue_id,
+        ),
+    )
+    await db.execute(
+        """UPDATE stop_hook_deliveries
+           SET status = ?, delivered_at = ?, error = ?
+           WHERE id = ?""",
+        (
+            final_status,
+            datetime.now().isoformat() if sent else None,
+            send_result.get("error"),
+            delivery_id,
+        ),
+    )
+    await db.commit()
+    return {
+        "status": final_status,
+        "delivery_id": delivery_id,
+        "queue_id": queue_id,
+        "subscriber_pane": subscription["subscriber_pane"],
+        "send": send_result,
+    }
+
+
+async def _fanout_stop_subscriptions(
+    instance: dict, payload: dict, final_response: str | None
+) -> list[dict]:
+    session_id = instance["id"]
+    stop_event_key = _stop_event_key(session_id, payload)
+    surface = human_pane_surface(
+        instance.get("tab_name"), instance.get("tmux_pane"), instance.get("pane_label")
+    )
+    name = surface if surface != "session" else session_id[:12]
+    response = (final_response or "").strip()
+    if len(response) > 4000:
+        response = response[:4000] + "\n… [truncated]"
+    default_notice = (
+        "<system-reminder>\n"
+        f"Stop-hook subscription: {name} ({session_id[:12]}) stopped.\n\n"
+        "Final response:\n"
+        f"{response or '[no final assistant text captured]'}\n"
+        "</system-reminder>"
+    )
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM stop_hook_subscriptions
+               WHERE target_instance_id = ?
+                 AND event = 'stop'
+                 AND status = 'active'
+               ORDER BY created_at ASC, id ASC""",
+            (session_id,),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        results = []
+        for row in rows:
+            delivery_payload = row.get("payload") or default_notice
+            result = await _enqueue_and_send_stop_delivery(
+                db,
+                subscription=row,
+                stop_event_key=stop_event_key,
+                payload=delivery_payload,
+            )
+            results.append(result)
+            if row.get("oneshot") and result.get("status") != "duplicate":
+                now = datetime.now().isoformat()
+                await db.execute(
+                    """UPDATE stop_hook_subscriptions
+                       SET status = 'delivered', unsubscribed_at = ?, updated_at = ?
+                       WHERE id = ? AND status = 'active'""",
+                    (now, now, row["id"]),
+                )
+                await db.commit()
+        return results
 
 
 def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | None:
@@ -730,7 +1355,7 @@ async def handle_session_start(payload: dict) -> dict:
     raw_tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or ""
     # Strip Claude Code's ✳ prefix and whitespace artifacts from pane titles
     tab_name = raw_tab_name.lstrip("✳ ").strip() if raw_tab_name else ""
-    tab_name = tab_name or f"Claude {datetime.now().strftime('%H:%M')}"
+    tab_name = tab_name or "needs-name"
 
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
@@ -966,6 +1591,22 @@ async def handle_session_start(payload: dict) -> dict:
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
                 await db.commit()
+                auto_subscription = await _auto_subscribe_parent_on_start(
+                    db,
+                    child_instance_id=session_id,
+                    child_pane=tmux_pane,
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                )
+                if auto_subscription:
+                    await db.commit()
+                mechanicus_subscription = await _reconcile_mechanicus_on_session_start(
+                    db, session_id
+                )
+                if mechanicus_subscription and (
+                    mechanicus_subscription.get("created")
+                    or mechanicus_subscription.get("existing")
+                ):
+                    await db.commit()
 
                 # Queue old-pane clear. The new pane recolor is handled by
                 # trg_tmux_pane_recolor when tmux_pane changes.
@@ -1010,6 +1651,8 @@ async def handle_session_start(payload: dict) -> dict:
                     "color": hex_color,
                     "cc_color": cc_color,
                     "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
+                    "stop_subscription": auto_subscription,
+                    "mechanicus_stop_subscription": mechanicus_subscription,
                 }
             else:
                 # Normal re-registration / Codex resume. Refresh transport fields so
@@ -1064,6 +1707,22 @@ async def handle_session_start(payload: dict) -> dict:
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
                 await db.commit()
+                auto_subscription = await _auto_subscribe_parent_on_start(
+                    db,
+                    child_instance_id=session_id,
+                    child_pane=tmux_pane or existing_row["tmux_pane"],
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                )
+                if auto_subscription:
+                    await db.commit()
+                mechanicus_subscription = await _reconcile_mechanicus_on_session_start(
+                    db, session_id
+                )
+                if mechanicus_subscription and (
+                    mechanicus_subscription.get("created")
+                    or mechanicus_subscription.get("existing")
+                ):
+                    await db.commit()
                 await log_event(
                     "instance_reregistered",
                     instance_id=session_id,
@@ -1081,6 +1740,8 @@ async def handle_session_start(payload: dict) -> dict:
                     "action": "reregistered",
                     "instance_id": session_id,
                     "pane_label": pane_label or existing_row["pane_label"],
+                    "stop_subscription": auto_subscription,
+                    "mechanicus_stop_subscription": mechanicus_subscription,
                 }
 
         if supplant_id:
@@ -1208,6 +1869,22 @@ async def handle_session_start(payload: dict) -> dict:
                 ) == "dispatch_explicit"
 
                 await db.commit()
+                auto_subscription = await _auto_subscribe_parent_on_start(
+                    db,
+                    child_instance_id=session_id,
+                    child_pane=tmux_pane,
+                    parent_instance_id=parent_instance_id or old_inst["parent_instance_id"],
+                )
+                if auto_subscription:
+                    await db.commit()
+                mechanicus_subscription = await _reconcile_mechanicus_on_session_start(
+                    db, session_id
+                )
+                if mechanicus_subscription and (
+                    mechanicus_subscription.get("created")
+                    or mechanicus_subscription.get("existing")
+                ):
+                    await db.commit()
 
                 # Queue old-pane clear. The new pane recolor is handled by
                 # trg_tmux_pane_recolor when tmux_pane changes via supplant.
@@ -1259,6 +1936,8 @@ async def handle_session_start(payload: dict) -> dict:
                     "color": hex_color,
                     "cc_color": cc_color,
                     "session_doc_id": session_doc_id,
+                    "stop_subscription": auto_subscription,
+                    "mechanicus_stop_subscription": mechanicus_subscription,
                 }
 
         # --- Normal registration (no supplant) ---
@@ -1497,6 +2176,20 @@ async def handle_session_start(payload: dict) -> dict:
                         fm_updates["primarch"] = primarch_name
                     await asyncio.to_thread(update_frontmatter, fp, fm_updates)
 
+        auto_subscription = await _auto_subscribe_parent_on_start(
+            db,
+            child_instance_id=session_id,
+            child_pane=tmux_pane,
+            parent_instance_id=parent_instance_id,
+        )
+        if auto_subscription:
+            await db.commit()
+        mechanicus_subscription = await _reconcile_mechanicus_on_session_start(db, session_id)
+        if mechanicus_subscription and (
+            mechanicus_subscription.get("created") or mechanicus_subscription.get("existing")
+        ):
+            await db.commit()
+
     logger.info(
         f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})"
         f"{' [subagent]' if is_subagent else ''}"
@@ -1543,6 +2236,8 @@ async def handle_session_start(payload: dict) -> dict:
         "color": profile.get("color") if not is_subagent else None,
         "cc_color": profile.get("cc_color") if not is_subagent else None,
         "session_doc_id": session_doc_id,
+        "stop_subscription": auto_subscription,
+        "mechanicus_stop_subscription": mechanicus_subscription,
     }
 
 
@@ -1559,20 +2254,26 @@ async def handle_session_end(payload: dict) -> dict:
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         cursor = await db.execute(
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
-                      tmux_pane, legion, workflow_state
+                      tmux_pane, legion, workflow_state, pane_label
                FROM claude_instances WHERE id = ?""",
             (session_id,),
         )
         row = await cursor.fetchone()
 
         if not row:
+            fallback_pane = _normalize_text(
+                payload.get("pane_label")
+                or payload.get("tmux_pane")
+                or payload.get("env", {}).get("TMUX_PANE", "")
+            )
+            _spawn_session_end_assertion(fallback_pane, session_id)
             return {"success": False, "action": "not_found", "instance_id": session_id}
 
         is_subagent = row[2]
         session_doc_id = row[3]
         _stop_pane = row[4]
-        _stop_legion = row[5] or "astartes"
         _prior_workflow_state = row[6]
+        _stop_pane_label = row[7]
 
         # Populate end_time and duration_minutes in session doc frontmatter
         if session_doc_id and not is_subagent:
@@ -1649,14 +2350,13 @@ async def handle_session_end(payload: dict) -> dict:
             workflow_events=workflow_events,
         )
 
-        # Reset pane background on stop (clear legion tint so stale colors don't linger)
-        if _stop_pane and _stop_legion != "astartes":
-            await db.execute(
-                "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
-                (session_id, _stop_pane),
-            )
-
         await db.commit()
+
+        # Close-time pane cleanup is centralized through tmuxctl assertion:
+        # persona panes self-heal/recolor, dead stack workers prune, and failed
+        # assertions clear stale overlays. Spawn bounded work out-of-band so the
+        # hook response is not held hostage by a relaunch.
+        _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
 
         # Check remaining active instances
         cursor = await db.execute(
@@ -1951,7 +2651,10 @@ async def handle_stop(payload: dict) -> dict:
     instance = dict(instance)
     device_id = instance.get("device_id", "Mac-Mini")
     tab_name = instance.get("tab_name", "Claude")
-    notify_surface = _human_tab_name(tab_name) or session_id[:12]
+    _resolved_surface = human_pane_surface(
+        tab_name, instance.get("tmux_pane"), instance.get("pane_label")
+    )
+    notify_surface = _resolved_surface if _resolved_surface != "session" else session_id[:12]
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
     # Update last_activity but DON'T set idle yet — that's the evaluators' job.
@@ -1989,6 +2692,25 @@ async def handle_stop(payload: dict) -> dict:
             )
         await db.commit()
 
+    # Trinity Chunk 1: resolve any open `talk` pairs awaiting natural-stop
+    # slash-copy of this target's final response. Fires for every Stop hook —
+    # the turn-flip end is the right signal regardless of sync/one-off status.
+    try:
+        target_pane = instance.get("tmux_pane") or ""
+        if target_pane:
+            resolved_talks = await talk_service.fire_slash_copy_for_pane(
+                target_pane,
+                transcript_path=payload.get("transcript_path"),
+            )
+            if resolved_talks:
+                logger.info(
+                    "talk: slash-copied %d pair(s) for %s on Stop hook",
+                    len(resolved_talks),
+                    target_pane,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("talk: slash-copy hook failed for %s: %s", session_id[:12], exc)
+
     # Fire async stop evaluators (action_validator, plan_auditor, etc.)
     # Skips subagents, sync instances, and intermediate stops.
     if will_evaluate:
@@ -2015,36 +2737,9 @@ async def handle_stop(payload: dict) -> dict:
         "instance_id": session_id,
         "device_id": device_id,
     }
-    child_fanout = await _enqueue_child_stop_fanout(instance, payload)
-    if child_fanout:
-        result["parent_fanout"] = child_fanout
 
-    # ── Subagent detection: skip all notifications for subagents ──
-    # DB flag covers subagent-CLI spawned instances; PID check covers Task tool subagents.
     pid = payload.get("pid")
     is_subagent_instance = bool(instance.get("is_subagent")) or bool(pid and is_subagent_pid(pid))
-    if is_subagent_instance:
-        result["action"] = "stop_processed_subagent"
-        logger.info(
-            f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications"
-        )
-        return result
-
-    # Intermediate stop: background subagents still pending. Update state but skip notifications.
-    if _pending_background_tasks.get(session_id, 0) > 0:
-        result["action"] = "stop_processed_intermediate"
-        logger.info(
-            f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications"
-        )
-        return result
-
-    # Sync instances that passed through StopValidate don't need notifications
-    # (the self-eval prompt already gave them a chance to continue).
-    instance_type = instance.get("instance_type", "one_off")
-    if instance_type == "sync" and not is_subagent_instance:
-        result["action"] = "stop_processed_sync"
-        await log_event("hook_stop", instance_id=session_id, details={"sync": True})
-        return result
 
     # ── Golden Throne timer arm ──
     # StopValidate may block once for self-eval, but the async Stop hook owns
@@ -2084,27 +2779,82 @@ async def handle_stop(payload: dict) -> dict:
 
     if transcript_lines:
         for line in reversed(transcript_lines):
-            if '"role":"assistant"' in line:
-                try:
-                    data = json.loads(line)
-                    content = data.get("message", {}).get("content")
-                    if isinstance(content, str) and content.strip():
-                        tts_text = content
-                    elif isinstance(content, list):
-                        # Extract text from content array (skip tool_use-only messages)
-                        texts = [
-                            c.get("text", "")
-                            for c in content
-                            if c.get("type") == "text" and c.get("text", "").strip()
-                        ]
-                        if texts:
-                            tts_text = "\n".join(texts)
-                    elif isinstance(content, dict) and content.get("text", "").strip():
-                        tts_text = content["text"]
-                    if tts_text:
-                        break
-                except json.JSONDecodeError:
-                    continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = data.get("message", {})
+            if message.get("role") != "assistant" and data.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                tts_text = content
+            elif isinstance(content, list):
+                # Extract text from content array (skip tool_use-only messages)
+                texts = [
+                    c.get("text", "")
+                    for c in content
+                    if c.get("type") == "text" and c.get("text", "").strip()
+                ]
+                if texts:
+                    tts_text = "\n".join(texts)
+            elif isinstance(content, dict) and content.get("text", "").strip():
+                tts_text = content["text"]
+            if tts_text:
+                break
+
+    if not tts_text:
+        try:
+            tts_text = await talk_service.slash_copy_target(
+                {
+                    "target_instance_id": session_id,
+                    "target_working_dir": instance.get("working_dir"),
+                    "target_engine": instance.get("engine") or "claude",
+                    "target_pane": instance.get("tmux_pane") or "",
+                    "payload_sent_at": 0,
+                },
+                transcript_path=transcript_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Hook: Stop final-response fallback failed for %s: %s", session_id[:12], exc
+            )
+
+    # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
+    # state_injections so a subscribed parent gets an immediate prompt instead
+    # of waiting until its next PromptSubmit.
+    live_stop_deliveries = await _fanout_stop_subscriptions(instance, payload, tts_text)
+    if live_stop_deliveries:
+        result["stop_subscriptions"] = live_stop_deliveries
+    live_stop_sent = any(d.get("status") == "sent" for d in live_stop_deliveries)
+    live_stop_handled = live_stop_sent or any(
+        d.get("status") == "duplicate" for d in live_stop_deliveries
+    )
+    if not live_stop_handled:
+        child_fanout = await _enqueue_child_stop_fanout(instance, payload)
+        if child_fanout:
+            result["parent_fanout"] = child_fanout
+
+    # ── Subagent/intermediate/sync detection: after Chunk 2 fanout, skip user
+    # notifications for non-user-visible stop events.
+    if is_subagent_instance:
+        result["action"] = "stop_processed_subagent"
+        logger.info(
+            f"Hook: Stop {session_id[:12]}... subagent — state updated/fanout processed, skipping notifications"
+        )
+        return result
+
+    if _pending_background_tasks.get(session_id, 0) > 0:
+        result["action"] = "stop_processed_intermediate"
+        logger.info(
+            f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications"
+        )
+        return result
+
+    if instance_type == "sync":
+        result["action"] = "stop_processed_sync"
+        await log_event("hook_stop", instance_id=session_id, details={"sync": True})
+        return result
 
     # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
     if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):
@@ -2177,15 +2927,12 @@ async def handle_stop(payload: dict) -> dict:
         play_sound(notification_sound)
         result["sound"] = {"played": notification_sound}
 
-    # Pavlok vibe notification (skip for subagents)
-    if not instance.get("is_subagent"):
-        vibe_result = send_pavlok_stimulus(
-            stimulus_type="vibe",
-            value=30,
-            reason="claude_finished",
-            respect_cooldown=False,
-        )
-        result["pavlok_vibe"] = vibe_result
+    # NOTE: No Pavlok stimulus on Stop. A Stop-hook chime is a notification, not
+    # an enforcement event. Pavlok stim delivery is the explicit product of
+    # enforce/cascade pathways only (see enforce.py / main.py distraction paths).
+    # Mirroring every "claude_finished" Stop to a Pavlok soft buzz turned the
+    # watch into a per-Stop buzzer and bypassed the soft cooldown
+    # (respect_cooldown=False). Ref: regression-pavlok-soft-on-tts-chime-2026-05-24.
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event(
@@ -3071,6 +3818,243 @@ async def handle_stop_validate(payload: dict) -> dict:
         }
 
     return {}  # default: allow stop
+
+
+@router.post("/api/hooks/subscribe")
+async def subscribe_hook(request: HookSubscribeRequest) -> dict:
+    if request.event != "stop":
+        return {"success": False, "action": "unsupported_event", "event": request.event}
+    if request.delivery not in {"prompt", "ephemeral"}:
+        return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        target = await _resolve_instance_by_id(db, request.target_instance_id)
+        if not target or not target.get("id"):
+            target = await _resolve_instance_for_pane(db, request.target_pane)
+        subscriber = await _resolve_instance_by_id(db, request.subscriber_instance_id)
+        if not subscriber or not subscriber.get("tmux_pane"):
+            subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
+
+        target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
+        target_pane = (target or {}).get("tmux_pane") or _normalize_text(request.target_pane)
+        subscriber_id = (subscriber or {}).get("id") or _normalize_text(
+            request.subscriber_instance_id
+        )
+        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(
+            request.subscriber_pane
+        )
+        if not target_id:
+            return {"success": False, "action": "target_unresolved"}
+        if not subscriber_pane:
+            return {"success": False, "action": "subscriber_unresolved"}
+        sub_id = await _upsert_stop_subscription(
+            db,
+            target_instance_id=target_id,
+            target_pane=target_pane,
+            subscriber_instance_id=subscriber_id,
+            subscriber_pane=subscriber_pane,
+            event=request.event,
+            delivery=request.delivery,
+            purpose=request.purpose,
+            payload=request.payload,
+            oneshot=request.oneshot,
+        )
+        await db.commit()
+    return {
+        "success": True,
+        "action": "subscribed",
+        "subscription_id": sub_id,
+        "target_instance_id": target_id,
+        "target_pane": target_pane,
+        "subscriber_instance_id": subscriber_id,
+        "subscriber_pane": subscriber_pane,
+        "event": request.event,
+        "delivery": request.delivery,
+        "purpose": request.purpose,
+        "payload": request.payload,
+        "oneshot": request.oneshot,
+    }
+
+
+PLANNING_STATES = {"none", "preplanning", "planning", "approving"}
+PLANNING_CYCLE = {
+    "none": "preplanning",
+    "preplanning": "planning",
+    "planning": "none",
+    "approving": "none",
+}
+
+
+@router.post("/api/planning/state")
+async def set_planning_state(request: PlanningStateRequest) -> dict:
+    source = _normalize_text(request.source) or "api"
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        instance = await _resolve_instance_by_id(db, request.instance_id)
+        if not instance or not instance.get("id"):
+            instance = await _resolve_instance_for_pane(db, request.tmux_pane)
+        instance_id = (instance or {}).get("id")
+        tmux_pane = (instance or {}).get("tmux_pane") or _normalize_text(request.tmux_pane)
+        if not instance_id:
+            return {"success": False, "action": "instance_unresolved", "tmux_pane": tmux_pane}
+
+        cursor = await db.execute(
+            "SELECT planning_state, tmux_pane, engine FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"success": False, "action": "instance_not_found", "instance_id": instance_id}
+        previous = row["planning_state"] or "none"
+        if request.cycle:
+            new_state = PLANNING_CYCLE.get(previous, "preplanning")
+        else:
+            new_state = _normalize_text(request.state) or "none"
+        if new_state not in PLANNING_STATES:
+            return {"success": False, "action": "invalid_state", "state": new_state}
+        tmux_pane = tmux_pane or row["tmux_pane"]
+        now = datetime.now().isoformat()
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "planning_state": new_state,
+                "planning_updated_at": now,
+                "planning_source": source,
+            },
+            mutation_type="planning_state_changed",
+            write_source="api",
+            actor="planning-state",
+        )
+        # The DB trigger enqueues @PLANNING_STATE when the value changes.  If the
+        # state is reasserted, queue an explicit projection so tmux hints recover.
+        if previous == new_state:
+            await db.execute(
+                """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                   VALUES (?, '@PLANNING_STATE', ?, ?)""",
+                (instance_id, new_state, tmux_pane),
+            )
+        await db.commit()
+        event_details = {
+            "old_state": previous,
+            "new_state": new_state,
+            "source": source,
+            "tmux_pane": tmux_pane,
+        }
+    await log_event(
+        "planning_state_changed",
+        instance_id=instance_id,
+        details=event_details,
+    )
+    return {
+        "success": True,
+        "action": "planning_state_changed",
+        "instance_id": instance_id,
+        "tmux_pane": tmux_pane,
+        "previous_state": previous,
+        "planning_state": new_state,
+        "source": source,
+        "engine": (instance or {}).get("engine") or row["engine"],
+    }
+
+
+@router.post("/api/hooks/unsubscribe")
+async def unsubscribe_hook(request: HookUnsubscribeRequest) -> dict:
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        target = await _resolve_instance_by_id(db, request.target_instance_id)
+        if not target or not target.get("id"):
+            target = await _resolve_instance_for_pane(db, request.target_pane)
+        subscriber = await _resolve_instance_by_id(db, request.subscriber_instance_id)
+        if not subscriber or not subscriber.get("tmux_pane"):
+            subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
+        target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
+        subscriber_id = (subscriber or {}).get("id") or _normalize_text(
+            request.subscriber_instance_id
+        )
+        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(
+            request.subscriber_pane
+        )
+        clauses = ["event = ?", "status = 'active'"]
+        params: list[str] = [request.event]
+        if target_id:
+            clauses.append("target_instance_id = ?")
+            params.append(target_id)
+        if _normalize_text(request.target_pane):
+            clauses.append("target_pane = ?")
+            params.append(_normalize_text(request.target_pane))
+        if subscriber_id:
+            clauses.append("subscriber_instance_id = ?")
+            params.append(subscriber_id)
+        if subscriber_pane:
+            clauses.append("subscriber_pane = ?")
+            params.append(subscriber_pane)
+        if request.purpose:
+            clauses.append("purpose = ?")
+            params.append(request.purpose)
+        if len(clauses) == 2:
+            return {"success": False, "action": "no_selector"}
+        now = datetime.now().isoformat()
+        cursor = await db.execute(
+            f"""UPDATE stop_hook_subscriptions
+                SET status = 'unsubscribed', unsubscribed_at = ?, updated_at = ?
+                WHERE {" AND ".join(clauses)}""",
+            (now, now, *params),
+        )
+        await db.commit()
+    return {"success": True, "action": "unsubscribed", "count": cursor.rowcount or 0}
+
+
+@router.get("/api/hooks/subscriptions")
+async def list_hook_subscriptions(
+    target_instance_id: str | None = None,
+    target_pane: str | None = None,
+    subscriber_instance_id: str | None = None,
+    subscriber_pane: str | None = None,
+    event: str = "stop",
+    status: str = "active",
+    purpose: str | None = None,
+) -> dict:
+    clauses = ["event = ?"]
+    params: list[str] = [event]
+    if status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    if target_instance_id:
+        clauses.append("target_instance_id = ?")
+        params.append(target_instance_id)
+    if target_pane:
+        clauses.append("target_pane = ?")
+        params.append(target_pane)
+    if subscriber_instance_id:
+        clauses.append("subscriber_instance_id = ?")
+        params.append(subscriber_instance_id)
+    if subscriber_pane:
+        clauses.append("subscriber_pane = ?")
+        params.append(subscriber_pane)
+    if purpose:
+        clauses.append("purpose = ?")
+        params.append(purpose)
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM stop_hook_subscriptions
+                WHERE {" AND ".join(clauses)}
+                ORDER BY updated_at DESC, id DESC""",
+            params,
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    return {"success": True, "subscriptions": rows, "count": len(rows)}
+
+
+@router.post("/api/hooks/reconcile")
+async def reconcile_hook_subscriptions(request: HookReconcileRequest) -> dict:
+    page = (request.page or "mechanicus").strip().lower()
+    if page != "mechanicus":
+        return {"success": False, "action": "unsupported_page", "page": request.page}
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        result = await _reconcile_mechanicus_stop_subscriptions(db)
+        if result.get("created") or result.get("existing"):
+            await db.commit()
+    return result
 
 
 # Hook dispatcher endpoint

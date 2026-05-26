@@ -9,7 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import audience as audience_module
-from tmuxctl.audience import _window_base, audience_toggle
+from tmuxctl.audience import _window_base
 from tmuxctl.enums import GridState, PaneKind, WindowArchetype
 from tmuxctl.models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
 from tmuxctl.resolver import PaneResolution, resolve_pane_in_snapshot
@@ -204,40 +204,6 @@ def test_audience_window_warns_when_page_type_does_not_match():
     assert "audience pane role does not match window page: audience:somnium:W" in warnings
 
 
-class FakeAudienceAdapter:
-    def __init__(self) -> None:
-        self.commands: list[tuple[str, ...]] = []
-
-    def run(self, *args: str, allow_failure: bool = False) -> str:
-        self.commands.append(args)
-        if args[:3] == ("display-message", "-t", "%5"):
-            return "\t".join(
-                [
-                    "%5",
-                    "main",
-                    "somnium",
-                    "somnium:EE",
-                    "tui",
-                    "",
-                    "side",
-                    "false",
-                    "/Volumes/Imperium/Token-OS",
-                ]
-            )
-        return ""
-
-
-def test_tui_pane_toggle_selects_dedicated_tui_window():
-    adapter = FakeAudienceAdapter()
-
-    result = audience_toggle(adapter, "%5")
-
-    assert result == "selected main:tui"
-    assert ("select-window", "-t", "main:tui") in adapter.commands
-    assert ("select-pane", "-t", "main:tui.1") in adapter.commands
-    assert not any(command[0] == "split-window" for command in adapter.commands)
-
-
 def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
     class FakeAdapter:
         def show_pane_option(self, pane_id: str, option: str) -> str:
@@ -269,3 +235,29 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
     assert result == "selected palace:N via palace:NE -> palace:NE"
     assert "%9" not in result
     assert selected == ["%9"]
+
+
+def test_numeric_legion_worker_abbreviation_resolves_by_window_index():
+    workspace = _workspace(_pane("%5", "legion:5", window="legion", window_index=3))
+
+    resolved = resolve_pane_in_snapshot(workspace, "3:5")
+
+    assert resolved.pane_id == "%5"
+
+
+def test_legion_custodes_has_zero_abbreviation():
+    workspace = _workspace(_pane("%C", "legion:custodes", window="legion", window_index=3))
+
+    resolved = resolve_pane_in_snapshot(workspace, "3:0")
+
+    assert resolved.pane_id == "%C"
+
+
+def test_mechanicus_fabricator_has_zero_abbreviation_and_admin_named_slot():
+    workspace = _workspace(
+        _pane("%F", "mechanicus:fabricator-general", window="mechanicus", window_index=4),
+        _pane("%A", "mechanicus:admin", window="mechanicus", window_index=4),
+    )
+
+    assert resolve_pane_in_snapshot(workspace, "4:0").pane_id == "%F"
+    assert resolve_pane_in_snapshot(workspace, "4:admin").pane_id == "%A"

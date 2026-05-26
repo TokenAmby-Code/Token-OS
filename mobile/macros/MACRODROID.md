@@ -67,6 +67,7 @@ Server-driven endpoints on the phone use the MacroDroid HTTP server:
 /notify?<params>   notification + TTS + Pavlok vibe/beep
 /enforce?<params>  notification + TTS + Pavlok zap + Spotify redirect
 /zap?<params>      direct Pavlok zap
+/pause             pause active YouTube/media playback
 /heartbeat         reachability
 /list-exports      export/list support
 /sshd              starts Termux sshd

@@ -36,7 +36,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "main.py" = ["B007", "B008", "B904", "E402", "E722", "F841"]
-"token-api-tui.py" = ["B007", "E402", "E722", "F841"]
 "token-satellite.py" = ["B007", "B904", "F841"]
 "timer.py" = ["UP042"]
 "cron_engine.py" = ["B904"]

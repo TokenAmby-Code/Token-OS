@@ -1948,3 +1948,51 @@ def test_mewgenics_space_work_action_interleave_prevents_second_press_zap(app_en
     assert second.status_code == 200
     assert second.json() == {"recorded": True, "reason": "armed", "zap_fired": False}
     assert calls == []
+
+
+def test_media_pause_routes_to_phone_youtube_when_telemetry_active(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def fake_send_to_phone(endpoint, params):
+        calls.append((endpoint, params))
+        return {"success": True, "status_code": 200}
+
+    app_env.main.PHONE_STATE["current_app"] = "youtube"
+    app_env.main.PHONE_STATE["is_distracted"] = True
+    app_env.main.AUDIO_PROXY_STATE["phone_connected"] = True
+    monkeypatch.setattr(app_env.main, "_send_to_phone", fake_send_to_phone)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/media/pause", json={"source": "pytest"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target"] == "phone_youtube"
+    assert body["handled"] is True
+    assert body["audio_proxy_connected"] is True
+    assert calls == [("/pause", {"source": "pytest"})]
+
+
+def test_media_pause_falls_back_to_tts_when_phone_youtube_inactive(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def fake_tts_control(command):
+        calls.append(command)
+        return {"success": True, "status_code": 200}
+
+    app_env.main.PHONE_STATE["current_app"] = None
+    app_env.main.PHONE_STATE["is_distracted"] = False
+    monkeypatch.setattr(app_env.main, "send_tts_transport_control", fake_tts_control)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/media/pause", json={"source": "pytest"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target"] == "tts"
+    assert body["handled"] is True
+    assert calls == ["toggle"]

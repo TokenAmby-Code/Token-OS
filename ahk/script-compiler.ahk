@@ -123,8 +123,8 @@ MButton:: {
     }
 }
 
-Media_Stop:: {  ; Pause/Play toggle TTS
-    PostToTokenApi("/api/tts/control", '{"command":"toggle"}')
+Media_Stop:: {  ; Pause key: phone YouTube passthrough, otherwise TTS toggle
+    PostToTokenApi("/api/media/pause", '{"source":"ahk_media_stop"}')
 }
 
 Media_Next:: {  ; Skip current TTS (play next in queue)
@@ -149,6 +149,17 @@ Media_Prev:: {  ; Restart current TTS message from beginning
 
 ^!+w:: {  ; Ctrl+Alt+Shift+W = Work Action (reset idle)
     PostToTokenApi("/api/work-action", "")
+}
+
+^!k:: {  ; Ctrl+Alt+K = run WSL `deskflow` without opening a terminal
+    ToolTip("deskflow…")
+    try {
+        Run('wsl.exe -d Ubuntu -e bash -lic "deskflow"',, "Hide")
+        ToolTip("deskflow launched")
+    } catch as err {
+        ToolTip("deskflow failed: " err.Message)
+    }
+    SetTimer(() => ToolTip(), -1500)
 }
 
 ^!c:: {  ; Ctrl+Win+C = Copy clipboard → stash → Mac clipboard
@@ -241,4 +252,3 @@ global dictationActive := false
     active := dictationActive ? "true" : "false"
     PostToTokenApi("/api/dictation?active=" active, "")
 }
-

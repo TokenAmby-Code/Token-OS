@@ -3,7 +3,7 @@
 # "all" includes every tool.
 
 $IMPERIUM/Imperium-ENV:
-  tags: [vault, workflow, system]
+  tags: [vault, dispatch]
 
 ~/worktrees:
   tags: [deploy, db, git, pr, worktree, instance, workflow, system]

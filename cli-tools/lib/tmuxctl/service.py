@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .api import build_client_attachments, fetch_instance_registry
+from .api import build_client_attachments, fetch_instance_registry, fetch_session_doc_for_pane_label
+from .labels import canonical_pane_role
 from .audience import audience_return, audience_toggle
 from .builder import (
     PALACE_WINDOW,
@@ -106,6 +107,27 @@ class TmuxControlPlane:
         if chain:
             lines.append(f"chain: {chain}")
         return "\n".join(lines)
+
+    def cardinal_pane_label(self, target: str) -> str:
+        """Resolve a target to its stable cardinal @PANE_ID label.
+
+        Raw tmux %pane ids are intentionally not returned. Callers that need a
+        durable identity should use cardinal pane labels only.
+        """
+        if target == "current":
+            target = self.adapter.run("display-message", "-p", "#{@PANE_ID}").strip()
+        if not target:
+            raise ValueError("current pane has no cardinal @PANE_ID")
+        if target.startswith("%"):
+            raise ValueError("raw tmux %pane ids are not valid cardinal ids")
+        resolved = resolve_pane(self.adapter, target)
+        if not resolved.pane_role:
+            raise ValueError(f"pane target has no cardinal @PANE_ID: {target}")
+        return canonical_pane_role(resolved.pane_role)
+
+    def session_doc_for_pane(self, target: str) -> dict:
+        pane_label = self.cardinal_pane_label(target)
+        return fetch_session_doc_for_pane_label(pane_label)
 
     def audience_toggle(self, target: str, *, client: str = "") -> str:
         return audience_toggle(self.adapter, target, client=client)

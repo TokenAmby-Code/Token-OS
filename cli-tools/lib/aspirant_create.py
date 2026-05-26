@@ -54,10 +54,10 @@ def slugify(value: str, fallback: str = "aspirant") -> str:
     return (slug or fallback)[:80]
 
 
-def human_filename_stem(value: str, fallback: str = "Aspirant", max_len: int = 90) -> str:
+def human_filename_stem(value: str, fallback: str = "aspirant", max_len: int = 90) -> str:
     stem = re.sub(r"[\x00-\x1f\x7f]", "", value or "")
     stem = re.sub(f"[{re.escape(OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS)}]", " ", stem)
-    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    stem = re.sub(r"[_\s-]+", "-", stem.lower()).strip("- .")
     if stem.lower().endswith(".md"):
         stem = stem[:-3].strip(" .")
     stem = stem or fallback
@@ -121,6 +121,34 @@ def yaml_starter_questions(key: str = "questions") -> list[str]:
         out.append(f"    state: {yaml_scalar(q['state'])}")
         out.append(f"    importance: {yaml_scalar(q['importance'])}")
     return out
+
+
+
+def questions_panel_lines(max_rows: int = 8) -> list[str]:
+    lines = [
+        "> [!question]- Questions Gate — frontmatter editor",
+        "> Questions live in frontmatter as `questions: []`. StopValidate clears only when every question has `state: closed`.",
+        "> Add new question objects in source/YAML if all visible rows are full; Meta Bind inputs below edit existing array entries.",
+        ">",
+        "> ```dataview",
+        "> TABLE WITHOUT ID q.state AS State, q.importance AS Importance, q.question AS Question, q.answer AS Answer",
+        "> FLATTEN questions AS q",
+        "> WHERE file.path = this.file.path",
+        "> ```",
+        ">",
+        "> #### Editable fields",
+        ">",
+    ]
+    for i in range(max_rows):
+        lines += [
+            f"> ##### Question {i}",
+            f"> - Question: `INPUT[textArea:questions[{i}].question]`",
+            f"> - Answer: `INPUT[textArea:questions[{i}].answer]`",
+            f"> - State: `INPUT[inlineSelect(option(unanswered), option(refining), option(open), option(closed)):questions[{i}].state]`",
+            f"> - Importance: `INPUT[slider(minValue(1), maxValue(10), stepSize(1)):questions[{i}].importance]`",
+            ">",
+        ]
+    return lines
 
 
 def unique_path(directory: Path, stem: str, suffix: str = ".md") -> Path:
@@ -241,6 +269,7 @@ def build_note_content(
     lines += ["", "## Intake", "", f"- Kind: `{args.kind}`", f"- Source: `{args.source}`"]
     if blocked_reason:
         lines.append(f"- Dispatch blocked: {blocked_reason}")
+    lines += ["", *questions_panel_lines()]
     return "\n".join(lines) + "\n"
 
 
@@ -314,6 +343,7 @@ def build_session_doc(
         "The aspirant must generate and maintain proactive `questions` (closing each entry only when answered or waived) until none remain non-closed.",
         "Repeated wakeups are not approval. `dispatch_ready` stays false until a separate explicit operator-authorized dispatch/worker phase.",
         "",
+        *questions_panel_lines(),
         "## Activity Log",
         "",
     ]
@@ -376,7 +406,7 @@ def aspirant_create(args: argparse.Namespace) -> dict[str, object]:
             )
             session_doc_path = unique_path(
                 session_dir,
-                human_filename_stem(f"Aspirant - {args.title}", fallback="Aspirant"),
+                human_filename_stem(f"Aspirant - {args.title}", fallback="aspirant"),
             )
         session_doc_rel = rel_to_vault(session_doc_path, vault)
 

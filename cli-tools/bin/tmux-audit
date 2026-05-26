@@ -152,26 +152,6 @@ assert_grid() {
 }
 
 # ============================================================
-# ASSERTION: tui
-# TUI monitor panes are alive (not remain-on-exit dead state).
-# ============================================================
-assert_tui() {
-    while IFS=$'\t' read -r pid ptype dead win; do
-        [[ "$ptype" != "tui" ]] && continue
-        if [[ "$dead" == "1" ]]; then
-            # Check dirty flag — if intentionally stopped, leave it
-            local dirty
-            dirty=$(tmux show-options -pv -t "$pid" @TUI_DIRTY 2>/dev/null || echo "false")
-            if [[ "$dirty" != "true" ]]; then
-                tmux respawn-pane -k -t "$pid" "tui-pane-guard" 2>/dev/null || true
-                echo "tui: respawned dead TUI pane $pid in $win"
-            fi
-        fi
-    done < <(tmux list-panes -s -t "$SESSION" \
-        -F '#{pane_id}	#{@PANE_TYPE}	#{pane_dead}	#{window_name}' 2>/dev/null || true)
-}
-
-# ============================================================
 # ASSERTION: layout
 # Palace + somnium pane proportions haven't drifted from canonical sizing.
 # Light check: only flags, doesn't auto-fix (refresh-layout is destructive
@@ -210,7 +190,6 @@ run_assertion() {
     case "$name" in
         backburner) assert_backburner ;;
         grid)       assert_grid ;;
-        tui)        assert_tui ;;
         layout)     assert_layout ;;
         *) echo "Unknown assertion: $name" ;;
     esac
@@ -221,6 +200,5 @@ if [[ -n "$ONLY" ]]; then
 else
     assert_backburner
     assert_grid
-    assert_tui
     assert_layout
 fi

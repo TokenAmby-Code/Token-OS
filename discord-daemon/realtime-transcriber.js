@@ -47,6 +47,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       resampleRemainder: Buffer.alloc(0),
       pendingAudio: [],
       pendingCommitMeta: null,
+      lastCommitMeta: null,
+      committed: false,
       cleanupTimer: null,
     };
 
@@ -69,7 +71,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
                 type: 'server_vad',
                 threshold: vad.threshold ?? 0.5,
                 prefix_padding_ms: vad.prefix_padding_ms ?? 300,
-                silence_duration_ms: vad.silence_duration_ms ?? 500,
+                silence_duration_ms: vad.silence_duration_ms ?? 300,
               },
             },
           },
@@ -77,7 +79,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       });
       logger.info(
         `Realtime [${botName}]: session.update sent ` +
-        `(intent=transcription, transcription=${transcriptionModel}, vad=${vad.silence_duration_ms ?? 500}ms)`
+        `(intent=transcription, transcription=${transcriptionModel}, vad=${vad.silence_duration_ms ?? 300}ms)`
       );
     });
 
@@ -155,6 +157,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           itemId: event.item_id,
           startedAt: session.startedAt,
           firstDeltaAt: session.lastDeltaAt,
+          commitMeta: session.lastCommitMeta || null,
+          lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || null,
         });
         scheduleCleanup(session, 1000, 'completed');
       }
@@ -163,7 +167,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     ws.on('close', (code, reason) => {
       session.closed = true;
       logger.info(`Realtime [${botName}]: closed for ${userId} (${code}) ${reason || ''}`);
-      cleanupSession(key);
+      cleanupSession(session);
     });
 
     ws.on('error', (err) => {
@@ -206,7 +210,11 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
   function getSession(botName, userId) {
     const key = keyFor(botName, userId);
     const existing = sessions.get(key);
-    if (existing && !existing.closed) return existing;
+    if (existing && !existing.closed && !existing.committed) return existing;
+    if (existing && existing.committed && !existing.closed) {
+      logger.info(`Realtime [${botName}]: starting next session while committed transcript is pending for user ${userId}`);
+      sessions.delete(key);
+    }
     return makeSession(botName, userId);
   }
 
@@ -237,7 +245,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (!audio || audio.length === 0) return;
     if (!session.ready) {
       session.pendingAudio.push(audio);
-      if (session.pendingAudio.length > 200) session.pendingAudio.shift();
+      if (session.pendingAudio.length > 1000) session.pendingAudio.shift();
       return;
     }
     appendAudio(session, audio);
@@ -258,9 +266,11 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       return false;
     }
     if (session.appendedFrames === 0) return false;
+    session.lastCommitMeta = meta || {};
+    session.committed = true;
     logger.info(
       `Realtime [${botName}]: committing audio for user ${userId} ` +
-      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'})`
+      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
     );
     return send(session, { type: 'input_audio_buffer.commit' });
   }
@@ -269,14 +279,14 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     session.cleanupTimer = setTimeout(() => {
       logger.info(`Realtime [${session.botName}]: cleanup after ${reason} for user ${session.userId}`);
-      cleanupSession(session.key);
+      cleanupSession(session);
     }, delayMs);
   }
 
-  function cleanupSession(key) {
-    const session = sessions.get(key);
+  function cleanupSession(sessionOrKey) {
+    const session = typeof sessionOrKey === 'string' ? sessions.get(sessionOrKey) : sessionOrKey;
     if (!session) return;
-    sessions.delete(key);
+    if (sessions.get(session.key) === session) sessions.delete(session.key);
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     try { session.ws.close(); } catch {}
   }

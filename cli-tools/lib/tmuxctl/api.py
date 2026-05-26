@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import sys
+import textwrap
 import urllib.error
 import urllib.request
 
@@ -65,6 +66,84 @@ def fetch_instance_registry() -> InstanceRegistrySnapshot:
         device_id=_device_name(),
         instances=payload,
     )
+
+
+def _api_get_json(path: str) -> dict | list:
+    api_url = _token_api_url().rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{api_url}{path}", timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        raise RegistryError(f"failed to fetch {path} from {api_url}") from exc
+
+
+def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
+    """Resolve a cardinal pane label to its linked session document.
+
+    This intentionally keys on stable @PANE_ID/pane_label values such as
+    ``palace:N`` or ``legion:custodes``. It does not accept or require raw tmux
+    ``%pane`` ids.
+    """
+    instances = _api_get_json("/api/instances?status=processing&sort=recent_activity")
+    if not isinstance(instances, list):
+        instances = []
+    candidates = [row for row in instances if row.get("pane_label") == pane_label]
+    if not candidates:
+        all_instances = _api_get_json("/api/instances?sort=recent_activity")
+        if isinstance(all_instances, list):
+            candidates = [
+                row
+                for row in all_instances
+                if row.get("pane_label") == pane_label and row.get("status") != "stopped"
+            ]
+    if not candidates:
+        all_instances = _api_get_json("/api/instances?sort=recent_activity")
+        diagnostics = _session_doc_resolution_diagnostics(pane_label, all_instances)
+        raise RegistryError(
+            f"no live instance for pane label {pane_label}\n{diagnostics}".rstrip()
+        )
+    doc_id = candidates[0].get("session_doc_id")
+    if not doc_id:
+        raise RegistryError(f"instance for pane label {pane_label} has no session doc")
+    doc = _api_get_json(f"/api/session-docs/{int(doc_id)}")
+    if not isinstance(doc, dict):
+        raise RegistryError(f"malformed session-doc response for {doc_id}")
+    doc["instance_id"] = candidates[0].get("id")
+    doc["pane_label"] = pane_label
+    return doc
+
+
+def _session_doc_resolution_diagnostics(pane_label: str, rows: dict | list) -> str:
+    if not isinstance(rows, list):
+        return ""
+    matching_panes = {
+        row.get("tmux_pane") for row in rows if row.get("pane_label") == pane_label and row.get("tmux_pane")
+    }
+    related = [
+        row
+        for row in rows
+        if row.get("pane_label") == pane_label
+        or (row.get("tmux_pane") and row.get("tmux_pane") in matching_panes)
+    ][:8]
+    if not related:
+        recent = rows[:5]
+        lines = ["diagnostics: no rows with matching pane_label; recent rows:"]
+        source = recent
+    else:
+        lines = ["diagnostics: related registry rows:"]
+        source = related
+    for row in source:
+        lines.append(
+            textwrap.shorten(
+                "  "
+                f"id={row.get('id')} status={row.get('status')} "
+                f"tmux_pane={row.get('tmux_pane')} pane_label={row.get('pane_label')} "
+                f"session_doc_id={row.get('session_doc_id')} tab_name={row.get('tab_name')}",
+                width=240,
+                placeholder="…",
+            )
+        )
+    return "\n".join(lines)
 
 
 def build_client_attachments(

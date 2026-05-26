@@ -47,3 +47,10 @@ Dispatch boundary rule:
 - Never self-set `dispatch_ready: true`.
 - Never self-set `operator_approved_dispatch: true`.
 - Execution/remediation requires a separate explicit operator-authorized dispatch/worker phase.
+
+Terminal transition (one-shot exception):
+- When the operator explicitly authorizes the end of the aspirant phase in-thread (e.g. "dispatch the worker", "ship it", "transition to execution"), the aspirant MAY:
+  1. Set `operator_approved_dispatch: true` and `dispatch_ready: true`.
+  2. Issue exactly ONE `dispatch` invocation, with metadata matching the closed-questions decisions.
+- The terminal dispatch ends the aspirant phase. No further questions, no second dispatch, no execution in-thread after the dispatch fires.
+- Self-authorization remains forbidden: wakeups, retries, silence, or ambient nudges do NOT count as authorization. Authorization must be a fresh in-thread operator message naming the transition.

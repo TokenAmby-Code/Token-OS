@@ -3,11 +3,8 @@
 # TAGS: tmux, lifecycle
 # AUDIENCE: system (called by tmux pane-died hook, not directly)
 #
-# Respawns any dead pane. TUI panes get special handling:
-# - Skips respawn if @TUI_DIRTY=true (intentional stop via tui-respawn or manual)
-# - Restarts with tui-pane-guard instead of the default shell
-#
-# Non-TUI panes get a 1s delay to prevent tight crash loops.
+# Respawns any dead pane.
+# Generic panes get a 1s delay to prevent tight crash loops.
 
 set -euo pipefail
 
@@ -39,13 +36,7 @@ case "$WINDOW_BASE:$PANE_ROLE" in
         ;;
 esac
 
-if [[ "$PANE_TYPE" == "tui" ]]; then
-    TUI_DIRTY=$(tmux show-options -pv -t "$PANE_ID" @TUI_DIRTY 2>/dev/null || echo "false")
-    if [[ "$TUI_DIRTY" == "true" ]]; then
-        exit 0
-    fi
-    tmux respawn-pane -k -t "$PANE_ID" tui-pane-guard
-elif [[ "$PANE_TYPE" == "tombstone" ]]; then
+if [[ "$PANE_TYPE" == "tombstone" ]]; then
     SOURCE=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_SOURCE 2>/dev/null || echo "unknown")
     TARGET=$(tmux show-options -pv -t "$PANE_ID" @TOMBSTONE_TARGET 2>/dev/null || echo "unknown")
     tmux respawn-pane -k -t "$PANE_ID" "tmux-tombstone '$SOURCE' '$TARGET'"

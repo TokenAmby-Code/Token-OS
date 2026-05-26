@@ -305,13 +305,6 @@ cmd_restart_pane() {
     # Kill current process and respawn a fresh shell
     tmux respawn-pane -k -t "$pane_id"
 
-    # Re-inject default command based on pane type
-    if [[ "$pane_type" == "tui" ]]; then
-        # TUI pane — relaunch via guard (handles auto-restart lifecycle)
-        sleep 0.3
-        tmux send-keys -t "$pane_id" "exec tui-pane-guard" Enter
-    fi
-
     log_success "Pane ${pane_id} restarted (${pane_type:-$grid_state})"
 }
 

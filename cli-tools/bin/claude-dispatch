@@ -5,7 +5,6 @@
 set -euo pipefail
 case "claude-dispatch" in
   claude-dispatch) replacement='dispatch --engine claude' ;;
-  vault-dispatch) replacement='dispatch --session-doc <path> --dir <path>' ;;
   claude-launcher) replacement='dispatch --interactive' ;;
   inquisitor) replacement='dispatch --persona inquisition --prompt <task>' ;;
   subagent) replacement='dispatch --prompt <task>' ;;

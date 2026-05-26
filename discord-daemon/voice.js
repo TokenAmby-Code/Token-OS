@@ -15,7 +15,7 @@ import {
 import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { Transform } from 'stream';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import { Events } from 'discord.js';
 import prism from 'prism-media';
@@ -32,10 +32,129 @@ export function createVoiceManager(botClients, config, logger) {
 
   // Per-bot connection state: botName -> { connection, listening, subscriptions, channelId }
   const botStates = new Map();
+  const muteTimers = new Map();
 
   // Collect all bot user IDs to filter out of audio capture (prevent ouroboros)
   // Populated lazily after bots connect
   const botUserIds = new Set();
+
+
+  function tmuxExecOptions(extra = {}) {
+    // The daemon runs inside its own tmux pane. If TMUX is inherited, tmux
+    // client-scoped queries such as `display-message -c /dev/ttys000` can be
+    // evaluated against the daemon's pane instead of the human client. Route
+    // discovery must query the server as an external client.
+    const { TMUX, ...env } = process.env;
+    return { ...extra, env };
+  }
+
+  function paneInfo(pane) {
+    if (!pane?.startsWith?.('%')) return null;
+    try {
+      const raw = execFileSync('tmux', [
+        'display-message',
+        '-t',
+        pane,
+        '-p',
+        '#{pane_id}\t#{session_name}\t#{pane_current_command}\t#{pane_current_path}',
+      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 })).trim();
+      const [paneId, sessionName, command, currentPath] = raw.split('\t');
+      if (paneId !== pane) return null;
+      return { paneId, sessionName, command, currentPath };
+    } catch {
+      return null;
+    }
+  }
+
+  function isRoutablePane(pane) {
+    const info = paneInfo(pane);
+    if (!info) return false;
+    if (info.sessionName === 'discord-daemon') return false;
+    if (info.sessionName?.startsWith?.('tx_test_')) return false;
+    if ((info.currentPath || '').endsWith('/Token-OS/discord-daemon')) return false;
+    return true;
+  }
+
+  function resolveFallbackTmuxPane() {
+    try {
+      const windowsOut = execFileSync('tmux', [
+        'list-windows',
+        '-a',
+        '-F',
+        '#{session_name}\t#{window_active}\t#{window_index}\t#{pane_id}',
+      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
+
+      const candidates = [];
+      for (const line of windowsOut.split(/\r?\n/)) {
+        if (!line) continue;
+        const [sessionName, rawActive, rawIndex, pane] = line.split('\t');
+        if (!pane?.startsWith?.('%')) continue;
+        if (sessionName === 'discord-daemon' || sessionName?.startsWith?.('tx_test_')) continue;
+        if (!isRoutablePane(pane)) continue;
+        const active = rawActive === '1' ? 1 : 0;
+        const index = Number.parseInt(rawIndex || '9999', 10);
+        candidates.push({ sessionName, pane, active, index: Number.isFinite(index) ? index : 9999 });
+      }
+
+      candidates.sort((a, b) => {
+        if (a.sessionName === 'main' && b.sessionName !== 'main') return -1;
+        if (b.sessionName === 'main' && a.sessionName !== 'main') return 1;
+        if (b.active !== a.active) return b.active - a.active;
+        return a.index - b.index;
+      });
+
+      if (candidates.length > 0) {
+        const chosen = candidates[0];
+        logger.warn(`Voice: falling back to active ${chosen.sessionName} pane ${chosen.pane}`);
+        return chosen.pane;
+      }
+    } catch (err) {
+      logger.warn(`Voice: fallback tmux pane resolve failed: ${err.message}`);
+    }
+    return null;
+  }
+
+  function resolveSelectedTmuxPane() {
+    try {
+      const clientsOut = execFileSync('tmux', [
+        'list-clients',
+        '-F',
+        '#{client_activity}\t#{client_name}\t#{session_name}',
+      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
+
+      const clients = [];
+      for (const line of clientsOut.split(/\r?\n/)) {
+        if (!line) continue;
+        const [rawActivity, clientName, sessionName] = line.split('\t');
+        const activity = Number.parseInt(rawActivity || '0', 10);
+        if (clientName && Number.isFinite(activity) && sessionName !== 'discord-daemon') {
+          clients.push({ clientName, sessionName, activity });
+        }
+      }
+      clients.sort((a, b) => b.activity - a.activity);
+
+      for (const client of clients) {
+        const pane = execFileSync('tmux', [
+          'display-message',
+          '-c',
+          client.clientName,
+          '-p',
+          '#{pane_id}',
+        ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 })).trim();
+        if (isRoutablePane(pane)) {
+          logger.info(`Voice: selected tmux client ${client.clientName} (${client.sessionName}) pane ${pane}`);
+          return pane;
+        }
+        logger.warn(`Voice: selected pane ${pane || '?'} from client ${client.clientName} is not routable`);
+      }
+
+      logger.warn('Voice: no routable attached tmux client pane found');
+      return resolveFallbackTmuxPane();
+    } catch (err) {
+      logger.warn(`Voice: selected tmux pane resolve failed: ${err.message}`);
+      return resolveFallbackTmuxPane();
+    }
+  }
 
   function refreshBotUserIds() {
     for (const client of Object.values(botClients)) {
@@ -60,6 +179,7 @@ export function createVoiceManager(botClients, config, logger) {
         joining: false,
         player: null,       // AudioPlayer for playback
         playing: false,      // Currently playing audio
+        leaveTimer: null,
       });
     }
     return botStates.get(botName);
@@ -68,6 +188,19 @@ export function createVoiceManager(botClients, config, logger) {
   function getClient(botName = 'mechanicus') {
     return botClients[botName];
   }
+
+  function connectionUsable(state) {
+    const status = state.connection?.state?.status;
+    if (!state.connection) return false;
+    if (status === 'destroyed' || status === 'disconnected') {
+      state.connection = null;
+      state.listening = false;
+      state.channelId = null;
+      return false;
+    }
+    return true;
+  }
+
 
   async function joinChannel(voiceChannelId, botName = 'mechanicus') {
     const client = getClient(botName);
@@ -89,7 +222,12 @@ export function createVoiceManager(botClients, config, logger) {
 
       // Destroy existing connection if any
       if (state.connection) {
-        state.connection.destroy();
+        try { state.connection.destroy(); } catch {}
+        state.connection = null;
+      }
+      if (state.leaveTimer) {
+        clearTimeout(state.leaveTimer);
+        state.leaveTimer = null;
       }
 
       state.connection = joinVoiceChannel({
@@ -138,7 +276,7 @@ export function createVoiceManager(botClients, config, logger) {
 
   // Explicit commit after Discord silence. Audio itself is streamed live to
   // OpenAI Realtime; no local PCM chunk files are created.
-  const SILENCE_COMMIT_MS = 1500; // Wait after Discord silence before committing a turn.
+  const SILENCE_COMMIT_MS = config.voice_silence_commit_ms ?? 700; // Wait after Discord silence before committing a turn.
 
   function subscribeToUser(botName, userId) {
     const state = getBotState(botName);
@@ -177,6 +315,7 @@ export function createVoiceManager(botClients, config, logger) {
     let hasAudioSinceCommit = false;
     let bytesSinceCommit = 0;
     let silenceTimer = null;
+    let lockedTmuxPane = null;
 
     function commitPending(reason, extra = {}) {
       if (silenceTimer) {
@@ -186,10 +325,11 @@ export function createVoiceManager(botClients, config, logger) {
       if (!hasAudioSinceCommit) return false;
       logger.info(`Voice [${botName}]: committing realtime audio from ${userId} (${bytesSinceCommit} bytes, reason=${reason})`);
       if (onAudioCommit) {
-        try { onAudioCommit(userId, botName, { reason, ...extra }); } catch {}
+        try { onAudioCommit(userId, botName, { reason, lockedTmuxPane, ...extra }); } catch {}
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;
+      lockedTmuxPane = null;
       return true;
     }
 
@@ -200,19 +340,28 @@ export function createVoiceManager(botClients, config, logger) {
       }, SILENCE_COMMIT_MS);
     }
 
-    // Silence frames from Discord trigger the commit timer.
+    // Silence frames from Discord trigger the local commit timer only. Do not
+    // append synthetic silence into Realtime: it can create empty sessions after
+    // cleanup and swallow the next short utterance.
     silenceFilter.on('silence', () => {
-      if (onAudioFrame) {
-        try { onAudioFrame(userId, SILENCE_PCM_20MS, botName, { silence: true }); } catch {}
-      }
       if (hasAudioSinceCommit) {
         startSilenceTimer();
       }
     });
 
     decoder.on('data', (chunk) => {
+      // First real audio frame of a local utterance: lock the active pane now.
+      if (!hasAudioSinceCommit) {
+        lockedTmuxPane = resolveSelectedTmuxPane();
+        if (lockedTmuxPane) {
+          logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
+        } else {
+          logger.warn(`Voice [${botName}]: no selected tmux pane lock for user ${userId}`);
+        }
+      }
+
       if (onAudioFrame) {
-        try { onAudioFrame(userId, chunk, botName, { silence: false }); } catch {}
+        try { onAudioFrame(userId, chunk, botName, { silence: false, lockedTmuxPane }); } catch {}
       }
       // Real audio arrived — cancel any pending silence commit.
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
@@ -256,7 +405,7 @@ export function createVoiceManager(botClients, config, logger) {
 
   async function leaveChannel(botName = 'mechanicus') {
     const state = getBotState(botName);
-    if (!state.connection) return { left: false, reason: 'not connected' };
+    if (!connectionUsable(state)) return { left: false, reason: 'not connected' };
 
     // Commit any pending realtime audio before destroying subscriptions.
     for (const [userId, sub] of state.activeSubscriptions) {
@@ -268,7 +417,7 @@ export function createVoiceManager(botClients, config, logger) {
     }
     state.activeSubscriptions.clear();
 
-    state.connection.destroy();
+    try { state.connection.destroy(); } catch (err) { logger.warn(`Voice [${botName}]: destroy during leave ignored: ${err.message}`); }
     state.connection = null;
     state.listening = false;
     const leftChannel = state.channelId;
@@ -308,7 +457,7 @@ export function createVoiceManager(botClients, config, logger) {
       const state = getBotState(botName);
       return {
         botName,
-        connected: !!state.connection,
+        connected: connectionUsable(state),
         channelId: state.channelId,
         listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
@@ -318,8 +467,12 @@ export function createVoiceManager(botClients, config, logger) {
     // Return all bots' status
     const statuses = {};
     for (const [name, state] of botStates) {
+      // connectionUsable() reflects whether audio can actually be delivered —
+      // it also nulls out destroyed/disconnected connections. Using the raw
+      // `!!state.connection` here used to report a dead pipe as connected,
+      // which let Token-API route TTS to nobody and claim success.
       statuses[name] = {
-        connected: !!state.connection,
+        connected: connectionUsable(state),
         channelId: state.channelId,
         listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
@@ -340,6 +493,58 @@ export function createVoiceManager(botClients, config, logger) {
       }
     }
     return statuses;
+  }
+
+  async function muteMember(userId = operatorUserId, botName = 'mechanicus', durationMs = config.voice_command_mute_ms ?? 15000) {
+    if (!userId) throw new Error('user_id required');
+    const client = botClients[botName]?.client;
+    if (!client) throw new Error(`Bot '${botName}' client not available`);
+    const guild = await client.guilds.fetch(guildId);
+    const member = await guild.members.fetch(userId);
+    if (!member?.voice?.channelId) {
+      return { muted: false, reason: 'member_not_in_voice', userId, botName };
+    }
+
+    const key = `${guildId}:${userId}`;
+    if (muteTimers.has(key)) clearTimeout(muteTimers.get(key));
+
+    await member.voice.setMute(true, 'Voice command: temporary mute');
+    logger.info(`Voice [${botName}]: server-muted member ${userId} for ${durationMs}ms`);
+
+    const timer = setTimeout(async () => {
+      muteTimers.delete(key);
+      try {
+        const fresh = await guild.members.fetch(userId);
+        if (fresh?.voice?.serverMute) {
+          await fresh.voice.setMute(false, 'Voice command: temporary mute expired');
+          logger.info(`Voice [${botName}]: temporary mute expired for member ${userId}`);
+        }
+      } catch (err) {
+        logger.warn(`Voice [${botName}]: temporary unmute failed for ${userId}: ${err.message}`);
+      }
+    }, Math.max(1000, Number(durationMs) || 15000));
+    muteTimers.set(key, timer);
+
+    return { muted: true, temporary: true, durationMs, userId, botName, channelId: member.voice.channelId };
+  }
+
+  async function unmuteMember(userId = operatorUserId, botName = 'mechanicus') {
+    if (!userId) throw new Error('user_id required');
+    const client = botClients[botName]?.client;
+    if (!client) throw new Error(`Bot '${botName}' client not available`);
+    const guild = await client.guilds.fetch(guildId);
+    const key = `${guildId}:${userId}`;
+    if (muteTimers.has(key)) {
+      clearTimeout(muteTimers.get(key));
+      muteTimers.delete(key);
+    }
+    const member = await guild.members.fetch(userId);
+    if (!member?.voice?.channelId) {
+      return { unmuted: false, reason: 'member_not_in_voice', userId, botName };
+    }
+    await member.voice.setMute(false, 'Voice command: unmute');
+    logger.info(`Voice [${botName}]: server-unmuted member ${userId}`);
+    return { unmuted: true, userId, botName, channelId: member.voice.channelId };
   }
 
   /**
@@ -365,7 +570,11 @@ export function createVoiceManager(botClients, config, logger) {
 
         // Operator joined our assigned channel
         if (joinedChannel === channelId && leftChannel !== channelId) {
-          if (state.connection || state.joining) {
+          if (state.leaveTimer) {
+            clearTimeout(state.leaveTimer);
+            state.leaveTimer = null;
+          }
+          if (connectionUsable(state) || state.joining) {
             logger.debug(`Voice auto-join [${botName}]: already connected or joining`);
             return;
           }
@@ -381,13 +590,19 @@ export function createVoiceManager(botClients, config, logger) {
 
         // Operator left our assigned channel
         if (leftChannel === channelId && joinedChannel !== channelId) {
-          if (!state.connection) return;
-          logger.info(`Voice auto-join [${botName}]: operator left ${channelId}, disconnecting...`);
-          try {
-            await leaveChannel(botName);
-          } catch (err) {
-            logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
-          }
+          if (!connectionUsable(state)) return;
+          const graceMs = Number(config.voice_auto_leave_grace_ms ?? 5000);
+          if (state.leaveTimer) clearTimeout(state.leaveTimer);
+          logger.info(`Voice auto-join [${botName}]: operator left ${channelId}, disconnecting after ${graceMs}ms grace...`);
+          state.leaveTimer = setTimeout(async () => {
+            state.leaveTimer = null;
+            if (!connectionUsable(state)) return;
+            try {
+              await leaveChannel(botName);
+            } catch (err) {
+              logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
+            }
+          }, Math.max(0, graceMs));
         }
       });
 
@@ -435,7 +650,7 @@ export function createVoiceManager(botClients, config, logger) {
 
     const [botName, channelId] = match;
     const state = getBotState(botName);
-    if (state.connection || state.joining) {
+    if (connectionUsable(state) || state.joining) {
       logger.info(`Voice startup sync [${botName}]: already connected to ${state.channelId}`);
       return { joined: false, reason: 'already_connected', botName, channelId: state.channelId };
     }
@@ -485,7 +700,7 @@ export function createVoiceManager(botClients, config, logger) {
    */
   async function playAudio(filePath, botName = 'mechanicus') {
     const state = getBotState(botName);
-    if (!state.connection) {
+    if (!connectionUsable(state)) {
       throw new Error(`Bot '${botName}' not connected to a voice channel`);
     }
 
@@ -550,7 +765,7 @@ export function createVoiceManager(botClients, config, logger) {
    */
   async function playTTS(message, botName = 'mechanicus', opts = {}) {
     const state = getBotState(botName);
-    if (!state.connection) {
+    if (!connectionUsable(state)) {
       throw new Error(`Bot '${botName}' not connected to a voice channel`);
     }
 
@@ -596,6 +811,8 @@ export function createVoiceManager(botClients, config, logger) {
     playAudio,
     stopPlayback,
     playTTS,
+    muteMember,
+    unmuteMember,
     setAudioFrameCallback(cb) { onAudioFrame = cb; },
     setAudioEndCallback(cb) { onAudioEnd = cb; },
     setAudioCommitCallback(cb) { onAudioCommit = cb; },

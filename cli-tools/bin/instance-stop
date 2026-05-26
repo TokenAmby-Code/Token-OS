@@ -7,7 +7,6 @@
 Usage:
     instance-stop <name>               # Stop by name (fuzzy match)
     instance-stop --id <uuid>          # Stop by exact ID
-    instance-stop --selected           # Stop selected Somnium instance
     instance-stop --unstick <name>     # Nudge stuck instance (SIGWINCH, gentle)
     instance-stop --unstick=2 <name>   # Interrupt stuck instance (SIGINT, cancel op)
     instance-stop --unstick=3 <name>   # Kill deadlocked instance (SIGKILL, resumable)
@@ -36,7 +35,6 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".claude" / "agents.db"
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
-SOMNIUM_SELECTION_PATH = Path.home() / ".claude" / "tui-state" / "somnium.json"
 
 def get_active_instances():
     """Get all active instances from the database."""
@@ -65,27 +63,6 @@ def find_instance_by_name(name: str, instances: list) -> list:
             matches.append(inst)
 
     return matches
-
-def get_selected_instance_id() -> str | None:
-    """Read the selected Somnium instance ID exported by the TUI."""
-    try:
-        data = json.loads(SOMNIUM_SELECTION_PATH.read_text())
-    except FileNotFoundError:
-        print(
-            f"Error: No Somnium selection state found at {SOMNIUM_SELECTION_PATH}",
-            file=sys.stderr,
-        )
-        return None
-    except Exception as e:
-        print(f"Error: Could not read Somnium selection state: {e}", file=sys.stderr)
-        return None
-
-    instance_id = data.get("selected_instance_id")
-    if not instance_id:
-        active_table = data.get("active_table", "unknown")
-        print(f"Error: Somnium selection has no instance (active_table={active_table})", file=sys.stderr)
-        return None
-    return instance_id
 
 def stop_instance(instance_id: str) -> bool:
     """Stop an instance via the API."""
@@ -210,7 +187,6 @@ def main():
     # Parse flags
     instance_id = None
     name = None
-    use_selected = "--selected" in args
     do_diagnose = "--diagnose" in args
     do_unstick = False
     unstick_level = 1
@@ -243,18 +219,13 @@ def main():
                 sys.exit(1)
             instance_id = args[i + 1]
             i += 2
-        elif args[i] in ("--kill", "--diagnose", "--selected") or args[i].startswith("--unstick"):
+        elif args[i] in ("--kill", "--diagnose") or args[i].startswith("--unstick"):
             i += 1
         else:
             name = args[i]
             i += 1
 
     instances = get_active_instances()
-
-    if use_selected:
-        instance_id = get_selected_instance_id()
-        if not instance_id:
-            sys.exit(1)
 
     if instance_id:
         # Find by exact ID (or prefix)

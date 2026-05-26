@@ -21,13 +21,15 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+_VAULT_ROOT = Path(os.environ.get("IMPERIUM_ENV", "")) if os.environ.get("IMPERIUM_ENV") else None
 _IMPERIUM_ROOT = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
 if not _IMPERIUM_ROOT.exists():
     _IMPERIUM_ROOT = Path.home()
-_VAULT_ROOT = _IMPERIUM_ROOT / "Imperium-ENV"
+if _VAULT_ROOT is None:
+    _VAULT_ROOT = _IMPERIUM_ROOT / "Imperium-ENV"
 TERRA_SESSIONS_DIR = _VAULT_ROOT / "Terra" / "Sessions"
 MARS_SESSIONS_DIR = _VAULT_ROOT / "Mars" / "Sessions"
-DAILY_NOTES_DIR = _IMPERIUM_ROOT / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
+DAILY_NOTES_DIR = _VAULT_ROOT / "Terra" / "Journal"
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
 
 
@@ -53,17 +55,16 @@ def _str_representer(dumper, data):
 _ObsidianDumper.add_representer(str, _str_representer)
 
 
-def human_filename_stem(value: str, fallback: str = "Session", max_len: int = 90) -> str:
-    """Return an Obsidian Sync-safe, human-readable filename stem.
+def human_filename_stem(value: str, fallback: str = "needs-session-name", max_len: int = 90) -> str:
+    """Return an Obsidian Sync-safe, hyphenated filename stem.
 
-    Dates belong in frontmatter, not generated session-doc filenames.  Keep
-    casing and spaces for readability; only strip filesystem/Sync-illegal
-    characters, control characters, markdown extension suffixes, and noisy
-    whitespace.
+    Dates belong in frontmatter, not generated session-doc filenames.  File
+    stems are lower-kebab for schema consistency; human display belongs in the
+    note title/frontmatter.
     """
     stem = re.sub(r"[\x00-\x1f\x7f]", "", value or "")
     stem = re.sub(f"[{re.escape(OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS)}]", " ", stem)
-    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    stem = re.sub(r"[_\s-]+", "-", stem.lower()).strip("- .")
     if stem.lower().endswith(".md"):
         stem = stem[:-3].strip(" .")
     stem = stem or fallback
@@ -72,8 +73,8 @@ def human_filename_stem(value: str, fallback: str = "Session", max_len: int = 90
     return stem or fallback
 
 
-def unique_human_path(directory: Path, title: str, fallback: str = "Session") -> Path:
-    """Create a non-date-prefixed, readable path with numeric collision suffixes."""
+def unique_human_path(directory: Path, title: str, fallback: str = "needs-session-name") -> Path:
+    """Create a non-date-prefixed, hyphenated path with numeric collision suffixes."""
     directory.mkdir(parents=True, exist_ok=True)
     stem = human_filename_stem(title, fallback=fallback)
     candidate = directory / f"{stem}.md"
@@ -81,7 +82,7 @@ def unique_human_path(directory: Path, title: str, fallback: str = "Session") ->
         return candidate
     counter = 2
     while True:
-        candidate = directory / f"{stem} {counter}.md"
+        candidate = directory / f"{stem}-{counter}.md"
         if not candidate.exists():
             return candidate
         counter += 1
@@ -819,6 +820,50 @@ async def resolve_today_daily_note_session_doc(db, date_str: str | None = None) 
     return await resolve_or_create_session_doc_for_path(db, DAILY_NOTES_DIR / f"{date_str}.md")
 
 
+def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
+    """Create the Custodes daily-note home on demand.
+
+    Custodes continuity is daily-note backed, not an interactive session-doc
+    placeholder.  Keep the shape intentionally plain so existing journal notes
+    remain valid Obsidian daily notes while still carrying session_doc_id for
+    Token-API binding.
+    """
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    fm: dict[str, Any] = {
+        "session_doc_id": doc_id,
+        "created": date_str,
+        "date": date_str,
+        "type": "daily-note",
+        "status": "active",
+        "legion": "custodes",
+        "agents": [],
+        "instance_ids": [],
+    }
+    body = f"# {date_str}\n\n## Custodes\n\n## Log\n"
+    file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
+
+
+async def resolve_or_create_today_daily_note_session_doc(
+    db, date_str: str | None = None
+) -> int:
+    """Return today's Custodes daily note, creating note and DB row if absent."""
+    date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+    fp = (DAILY_NOTES_DIR / f"{date_str}.md").resolve()
+    existing = await resolve_or_create_session_doc_for_path(db, fp)
+    if existing:
+        return existing
+
+    now_ts = datetime.now().isoformat()
+    cursor = await db.execute(
+        """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+           VALUES (?, ?, ?, 'active', ?, ?)""",
+        (date_str, str(fp), "Custodes Daily Note", now_ts, now_ts),
+    )
+    doc_id = int(cursor.lastrowid)
+    await asyncio.to_thread(create_daily_note_file, fp, date_str, doc_id)
+    return doc_id
+
+
 async def resolve_session_doc_for_start(
     db,
     *,
@@ -839,6 +884,10 @@ async def resolve_session_doc_for_start(
     4. active cron doc (or create one)
     5. generic interactive doc (top-level only)
     """
+    if primarch_name == "custodes":
+        doc_id = await resolve_or_create_today_daily_note_session_doc(db)
+        return doc_id, "daily_note_custodes"
+
     if dispatch_session_doc_path:
         fp = Path(dispatch_session_doc_path)
         if not fp.is_absolute():
@@ -846,12 +895,6 @@ async def resolve_session_doc_for_start(
         doc_id = await resolve_or_create_session_doc_for_path(db, fp)
         if doc_id:
             return doc_id, "dispatch_explicit"
-
-    if primarch_name == "custodes":
-        doc_id = await resolve_today_daily_note_session_doc(db)
-        if doc_id:
-            return doc_id, "daily_note_custodes"
-        logger.warning("Custodes launch had no daily note to bind; falling through to other policy")
 
     if primarch_name:
         doc_id = await resolve_active_primarch_session_doc(db, primarch_name)
@@ -870,7 +913,7 @@ async def resolve_session_doc_for_start(
 
         now_ts = datetime.now().isoformat()
         doc_title = cron_job_name or "cron"
-        fp = unique_human_path(MARS_SESSIONS_DIR, doc_title, fallback="Cron Session")
+        fp = unique_human_path(MARS_SESSIONS_DIR, doc_title, fallback="needs-session-name")
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, cron_job_id, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, 'active', ?, ?)""",
@@ -884,9 +927,10 @@ async def resolve_session_doc_for_start(
         return None, None
 
     now_ts = datetime.now().isoformat()
-    cwd_basename = Path(working_dir).name if working_dir else "session"
-    doc_title = human_filename_stem(cwd_basename.replace("-", " "), fallback="Session")
-    fp = unique_human_path(TERRA_SESSIONS_DIR, doc_title, fallback="Session")
+    # No cwd/date fallback names. A new interactive session gets a placeholder
+    # and is expected to name its own session doc via `session-doc-name`.
+    doc_title = "Needs Session Name"
+    fp = unique_human_path(TERRA_SESSIONS_DIR, doc_title, fallback="needs-session-name")
     cursor = await db.execute(
         """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
            VALUES (?, ?, ?, 'active', ?, ?)""",

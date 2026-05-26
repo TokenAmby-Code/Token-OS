@@ -82,7 +82,11 @@ def _looks_like_custom_pane_target(target: str) -> bool:
     if ":" not in target:
         return False
     left, slot = target.rsplit(":", 1)
-    if not slot or slot.isdigit() or not _SLOT_RE.match(slot):
+    if not slot:
+        return False
+    if slot.isdigit():
+        return left.isdigit()
+    if not _SLOT_RE.match(slot):
         return False
     return left.isdigit() or left in {
         "palace",
