@@ -37,7 +37,7 @@ from instance_mutation import (
     sanctioned_update_instance,
 )
 from pane_surface import human_pane_surface, human_tab_name as _human_tab_name
-from phone_service import _send_to_phone, check_instance_count_pavlok, send_pavlok_stimulus
+from phone_service import _send_to_phone, check_instance_count_pavlok
 from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
@@ -2920,15 +2920,12 @@ async def handle_stop(payload: dict) -> dict:
         play_sound(notification_sound)
         result["sound"] = {"played": notification_sound}
 
-    # Pavlok vibe notification (skip for subagents)
-    if not instance.get("is_subagent"):
-        vibe_result = send_pavlok_stimulus(
-            stimulus_type="vibe",
-            value=30,
-            reason="claude_finished",
-            respect_cooldown=False,
-        )
-        result["pavlok_vibe"] = vibe_result
+    # NOTE: No Pavlok stimulus on Stop. A Stop-hook chime is a notification, not
+    # an enforcement event. Pavlok stim delivery is the explicit product of
+    # enforce/cascade pathways only (see enforce.py / main.py distraction paths).
+    # Mirroring every "claude_finished" Stop to a Pavlok soft buzz turned the
+    # watch into a per-Stop buzzer and bypassed the soft cooldown
+    # (respect_cooldown=False). Ref: regression-pavlok-soft-on-tts-chime-2026-05-24.
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event(
