@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# talk - Two-way inter-persona conversation primitive.
+# TAGS: trinity, ipc, talk
+# AUDIENCE: agent
+"""Two-way talk between two tmux panes via Token-API.
+
+Usage:
+    talk --pane <id> "prompt"            # block until response or stop
+    talk --pane <id> --no-wait "prompt"  # send-only; return talk_id immediately
+    talk --pane <id> --timeout 600 "..." # override wait timeout (seconds)
+    talk --pane <id> --json "..."        # emit machine-readable JSON
+    talk --pane <id> --caller %23 "..."  # override caller-pane detection
+
+Pane addressing accepts:
+    %23                  raw tmux pane id
+    somnium:SE           position id (window:position)
+    main:2:SE            full triple (session:window:position)
+
+See Mars/Tasks/trinity-chunk-1-talk-cli.md and
+Terra/Ultramar/Inter-Persona Communication.md for the canon spec.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_TIMEOUT_TOTAL = 600.0
+DEFAULT_SERVER_POLL = 30.0
+
+TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+
+
+def _err(msg: str) -> None:
+    print(f"talk: {msg}", file=sys.stderr)
+
+
+def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
+    url = f"{TOKEN_API_URL}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _get(path: str, timeout: float = 60.0) -> dict:
+    url = f"{TOKEN_API_URL}{path}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _resolve_caller(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    env_pane = os.environ.get("TMUX_PANE")
+    if env_pane:
+        return env_pane
+    _err(
+        "could not detect caller pane (no --caller and $TMUX_PANE unset). "
+        "Pass --caller %<id> explicitly."
+    )
+    sys.exit(64)
+
+
+def _render_response(record: dict, *, json_out: bool) -> None:
+    if json_out:
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return
+    status = record.get("status")
+    text = (record.get("result_text") or "").strip()
+    kind = record.get("result_kind") or ""
+    returned_by = record.get("returned_by_pane") or ""
+    if status == "returned":
+        header = f"[talk:{kind}"
+        if returned_by:
+            header += f" from {returned_by}"
+        header += "]"
+        print(header)
+        if text:
+            print(text)
+    elif status in {"cancelled", "expired"}:
+        print(f"[talk:{status}] {record.get('result_kind') or ''}".rstrip())
+    elif status == "open":
+        print(f"[talk:pending] talk_id={record.get('talk_id')}")
+    else:
+        print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="talk",
+        description="Two-way inter-persona conversation between tmux panes.",
+        add_help=True,
+    )
+    parser.add_argument("--pane", required=True, help="Target pane (raw id or position id)")
+    parser.add_argument(
+        "--caller",
+        default=None,
+        help="Caller pane id (defaults to $TMUX_PANE)",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Return talk_id immediately, do not block for response",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_TOTAL,
+        help=f"Total wait timeout in seconds (default {int(DEFAULT_TIMEOUT_TOTAL)})",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_out",
+        action="store_true",
+        help="Emit JSON result instead of human text",
+    )
+    parser.add_argument("prompt", help="The message to send")
+    args = parser.parse_args(argv)
+
+    caller = _resolve_caller(args.caller)
+    body = {
+        "caller_pane": caller,
+        "target_pane": args.pane,
+        "payload": args.prompt,
+    }
+    try:
+        send = _post("/api/talk/send", body, timeout=60.0)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+        except Exception:
+            detail = str(exc)
+        _err(f"send failed: {detail}")
+        return 1
+    except urllib.error.URLError as exc:
+        _err(f"Token-API unreachable at {TOKEN_API_URL}: {exc.reason}")
+        return 1
+
+    status = send.get("status")
+    talk_id = send.get("talk_id")
+    if status == "returned":
+        # Caller hit the explicit-return shortcut — we ARE the return.
+        if args.json_out:
+            print(json.dumps(send, indent=2, sort_keys=True))
+        else:
+            print(f"[talk:returned] delivered to {args.pane}")
+        return 0
+    if args.no_wait:
+        if args.json_out:
+            print(json.dumps(send, indent=2, sort_keys=True))
+        else:
+            print(f"[talk:open] talk_id={talk_id} target={args.pane}")
+        return 0
+    if status != "open" or not talk_id:
+        _err(f"unexpected send status: {status}")
+        return 2
+
+    deadline = time.monotonic() + args.timeout
+    poll_url = f"/api/talk/await/{talk_id}?timeout={DEFAULT_SERVER_POLL}"
+    last_record: dict = send
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if args.json_out:
+                    print(json.dumps(last_record, indent=2, sort_keys=True))
+                else:
+                    print(f"[talk:timeout] talk_id={talk_id}")
+                return 124
+            wait = min(DEFAULT_SERVER_POLL, max(2.0, remaining))
+            try:
+                record = _get(
+                    f"/api/talk/await/{talk_id}?timeout={wait}",
+                    timeout=wait + 15.0,
+                )
+            except urllib.error.HTTPError as exc:
+                _err(f"await failed: {exc}")
+                return 1
+            except urllib.error.URLError as exc:
+                _err(f"await connection error: {exc.reason}")
+                return 1
+            last_record = record
+            if record.get("status") and record["status"] != "open":
+                _render_response(record, json_out=args.json_out)
+                return 0 if record["status"] == "returned" else 3
+            # Still open — loop and re-poll.
+    except KeyboardInterrupt:
+        try:
+            _post(f"/api/talk/cancel/{talk_id}", {}, timeout=10.0)
+        except Exception:
+            pass
+        _err(f"interrupted; cancelled talk_id={talk_id}")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
