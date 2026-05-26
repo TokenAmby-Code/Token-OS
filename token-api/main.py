@@ -10761,18 +10761,23 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # Handle app close
     if action == "close":
         old_app = PHONE_STATE.get("current_app")
+        old_app_norm = (old_app or "").lower()
+        close_matches_current = bool(old_app_norm) and (
+            old_app_norm == app_name or (package and old_app_norm == package.lower())
+        )
         opened_at = PHONE_STATE.get("app_opened_at")
         duration_seconds = None
-        if opened_at:
+        if opened_at and close_matches_current:
             try:
                 duration_seconds = round(
                     (datetime.now() - datetime.fromisoformat(opened_at)).total_seconds()
                 )
             except Exception:
                 duration_seconds = None
-        PHONE_STATE["current_app"] = None
-        PHONE_STATE["app_opened_at"] = None
-        PHONE_STATE["is_distracted"] = False
+        if close_matches_current:
+            PHONE_STATE["current_app"] = None
+            PHONE_STATE["app_opened_at"] = None
+            PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
         # Clear Twitter tracking on close
@@ -10787,14 +10792,18 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         timer_updated = False
         acknowledged_acks = await acknowledge_phone_acks(app_name)
         stop_enforcement_cascade(reason=f"negative_edge_close:{app_name}")
-        if old_app:
+        if close_matches_current:
             timer_updated = False
             print(f"    Phone close -> working | timer={timer_updated}")
+        elif old_app:
+            print(f"    Ignoring close for {app_name}; current_app remains {old_app}")
 
         await log_event(
             "phone_app_closed",
             details={
                 "app": app_name,
+                "old_app": old_app,
+                "matched_current": close_matches_current,
                 "display_name": display_name,
                 "package": package,
                 "duration_seconds": duration_seconds,
@@ -13379,6 +13388,283 @@ def _ops_display_name(inst: dict) -> str:
     )
 
 
+def _ops_parse_duration_seconds(value: str | int | float | None, default: int) -> int:
+    """Parse compact duration query params such as `21600`, `6h`, `60s`, `15m`."""
+    if value is None:
+        return default
+    if isinstance(value, int | float):
+        return max(1, int(value))
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", raw)
+    if not match:
+        return default
+    amount = float(match.group(1))
+    unit = match.group(2) or "s"
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return max(1, int(amount * multiplier))
+
+
+def _ops_timer_mode_rate(mode: str | None) -> int:
+    """Timer v2 signed balance rate in ms/ms for history reconstruction."""
+    normalized = (mode or "").lower()
+    if normalized == TimerMode.WORKING.value:
+        return 1
+    if normalized in (TimerMode.DISTRACTED.value, TimerMode.BREAK.value):
+        return -1
+    return 0
+
+
+def _ops_advance_timer_balance(balance_ms: int, mode: str | None, seconds: float) -> int:
+    return int(balance_ms + (_ops_timer_mode_rate(mode) * seconds * 1000))
+
+
+def _ops_shift_to_annotation(row: dict) -> dict:
+    mode = row.get("new_mode") or "unknown"
+    trigger = row.get("trigger") or "mode_change"
+    lane = "timer"
+    if row.get("source") == "phone" or row.get("phone_app"):
+        lane = "phone"
+    elif trigger in {"enforcement", "break_exhausted"}:
+        lane = "enforcement"
+    severity = "info"
+    if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}:
+        severity = "warn"
+    if trigger in {"enforcement", "break_exhausted"}:
+        severity = "bad"
+    if mode == TimerMode.WORKING.value:
+        severity = "good"
+    return {
+        "id": f"timer-shift-{row.get('id')}",
+        "t": row.get("timestamp"),
+        "lane": lane,
+        "type": trigger,
+        "label": f"{row.get('old_mode') or 'start'} → {mode}",
+        "severity": severity,
+        "details": {
+            "source": row.get("source"),
+            "phone_app": row.get("phone_app"),
+            "break_balance_ms": row.get("break_balance_ms"),
+            "details": _ops_parse_event_details(row.get("details")),
+        },
+    }
+
+
+async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = "60s") -> dict:
+    """Return live timer history for the ops graph.
+
+    The existing timer persistence stores exact shift rows plus current engine
+    state, not 1Hz samples. This read model reconstructs a bucketed line from
+    the last known shift, the TimerEngine's signed mode rates, and the current
+    live snapshot. It is real telemetry, not frontend mock data; gaps are
+    explicitly marked when no shift row anchors the requested window.
+    """
+    now = datetime.now()
+    window_seconds = max(15 * 60, min(_ops_parse_duration_seconds(window, 6 * 3600), 48 * 3600))
+    bucket_seconds = max(10, min(_ops_parse_duration_seconds(bucket, 60), 15 * 60))
+    start = now - timedelta(seconds=window_seconds)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM timer_shifts
+            WHERE datetime(timestamp) < datetime(?)
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (start.isoformat(),),
+        )
+        previous = await cursor.fetchone()
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM timer_shifts
+            WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (start.isoformat(), now.isoformat()),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+
+    work_state = await get_cached_work_state()
+    current_mode = timer_engine.current_mode.value
+    current_balance = int(timer_engine.break_balance_ms)
+    current_active = int(work_state.active_instance_count)
+    current_processing = int(work_state.processing_recent_count)
+    current_phone_app = PHONE_STATE.get("current_app")
+    current_desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
+
+    anchors: list[dict] = []
+    gaps: list[dict] = []
+    data_start = start
+
+    if previous:
+        prev = dict(previous)
+        prev_t = _ops_parse_datetime(prev.get("timestamp")) or start
+        prev_mode = prev.get("new_mode") or current_mode
+        prev_balance = int(prev.get("break_balance_ms") or 0)
+        start_balance = _ops_advance_timer_balance(
+            prev_balance, prev_mode, max(0, (start - prev_t).total_seconds())
+        )
+        anchors.append(
+            {
+                "t": start,
+                "mode": prev_mode,
+                "activity": "distraction"
+                if prev_mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
+                else "working",
+                "break_balance_ms": start_balance,
+                "active_instance_count": int(prev.get("active_instances") or 0),
+                "processing_recent_count": 0,
+                "phone_app": prev.get("phone_app"),
+                "desktop_mode": None,
+                "productivity_active": bool(prev.get("active_instances") or 0),
+            }
+        )
+    elif rows:
+        first_t = _ops_parse_datetime(rows[0].get("timestamp")) or start
+        data_start = first_t
+        anchors.append(
+            {
+                "t": first_t,
+                "mode": rows[0].get("new_mode") or rows[0].get("old_mode") or current_mode,
+                "activity": "distraction"
+                if (rows[0].get("new_mode") or rows[0].get("old_mode"))
+                in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
+                else "working",
+                "break_balance_ms": int(rows[0].get("break_balance_ms") or 0),
+                "active_instance_count": int(rows[0].get("active_instances") or 0),
+                "processing_recent_count": 0,
+                "phone_app": rows[0].get("phone_app"),
+                "desktop_mode": None,
+                "productivity_active": bool(rows[0].get("active_instances") or 0),
+            }
+        )
+        if first_t > start + timedelta(seconds=bucket_seconds):
+            gaps.append({"start": start.isoformat(), "end": first_t.isoformat(), "reason": "no_anchor"})
+    else:
+        # No persisted shifts in the window. Use a flat live line rather than
+        # fabricating a plausible arc.
+        anchors.append(
+            {
+                "t": start,
+                "mode": current_mode,
+                "activity": timer_engine.activity.value,
+                "break_balance_ms": current_balance,
+                "active_instance_count": current_active,
+                "processing_recent_count": current_processing,
+                "phone_app": current_phone_app,
+                "desktop_mode": current_desktop_mode,
+                "productivity_active": work_state.productivity_active,
+            }
+        )
+        gaps.append({"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_shifts"})
+
+    for row in rows:
+        mode = row.get("new_mode") or current_mode
+        anchors.append(
+            {
+                "t": _ops_parse_datetime(row.get("timestamp")) or now,
+                "mode": mode,
+                "activity": "distraction"
+                if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
+                else "working",
+                "break_balance_ms": int(row.get("break_balance_ms") or 0),
+                "active_instance_count": int(row.get("active_instances") or 0),
+                "processing_recent_count": 0,
+                "phone_app": row.get("phone_app"),
+                "desktop_mode": None,
+                "productivity_active": bool(row.get("active_instances") or 0),
+            }
+        )
+
+    anchors.append(
+        {
+            "t": now,
+            "mode": current_mode,
+            "activity": timer_engine.activity.value,
+            "break_balance_ms": current_balance,
+            "active_instance_count": current_active,
+            "processing_recent_count": current_processing,
+            "phone_app": current_phone_app,
+            "desktop_mode": current_desktop_mode,
+            "productivity_active": work_state.productivity_active,
+        }
+    )
+    anchors.sort(key=lambda item: item["t"])
+
+    segments = []
+    for i, anchor in enumerate(anchors[:-1]):
+        next_anchor = anchors[i + 1]
+        if next_anchor["t"] <= anchor["t"]:
+            continue
+        segments.append(
+            {
+                "start": anchor["t"].isoformat(),
+                "end": next_anchor["t"].isoformat(),
+                "mode": anchor["mode"],
+                "activity": anchor["activity"],
+                "productivity_active": anchor["productivity_active"],
+                "source": None,
+            }
+        )
+
+    points = []
+    bucket_delta = timedelta(seconds=bucket_seconds)
+    cursor = data_start
+    anchor_index = 0
+    while cursor < now:
+        while anchor_index + 1 < len(anchors) and anchors[anchor_index + 1]["t"] <= cursor:
+            anchor_index += 1
+        anchor = anchors[anchor_index]
+        elapsed = max(0, (cursor - anchor["t"]).total_seconds())
+        points.append(
+            {
+                "t": cursor.isoformat(),
+                "break_balance_ms": _ops_advance_timer_balance(
+                    int(anchor["break_balance_ms"]), anchor["mode"], elapsed
+                ),
+                "mode": anchor["mode"],
+                "activity": anchor["activity"],
+                "productivity_active": anchor["productivity_active"],
+                "active_instance_count": anchor["active_instance_count"],
+                "processing_recent_count": anchor["processing_recent_count"],
+                "desktop_mode": anchor.get("desktop_mode"),
+                "phone_app": anchor.get("phone_app"),
+            }
+        )
+        cursor += bucket_delta
+
+    # Always include an exact live endpoint as the final point.
+    points.append(
+        {
+            "t": now.isoformat(),
+            "break_balance_ms": current_balance,
+            "mode": current_mode,
+            "activity": timer_engine.activity.value,
+            "productivity_active": work_state.productivity_active,
+            "active_instance_count": current_active,
+            "processing_recent_count": current_processing,
+            "desktop_mode": current_desktop_mode,
+            "phone_app": current_phone_app,
+        }
+    )
+
+    return {
+        "generated_at": now.isoformat(),
+        "window_seconds": window_seconds,
+        "bucket_seconds": bucket_seconds,
+        "points": points,
+        "segments": segments,
+        "annotations": [_ops_shift_to_annotation(row) for row in rows],
+        "gaps": gaps,
+        "source": "timer_shifts+live_timer_engine",
+    }
+
+
 async def _ops_read_cron_summary() -> dict:
     if cron_engine is not None:
         try:
@@ -13615,6 +13901,280 @@ async def _ops_read_events() -> list[dict]:
     ]
 
 
+def _ops_assertion(
+    assertion_id: str,
+    label: str,
+    value: str,
+    status: str,
+    *,
+    confidence: str = "high",
+    evidence: list[str] | None = None,
+    freshness_seconds: int | None = None,
+    correction_hint: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    return {
+        "id": assertion_id,
+        "label": label,
+        "value": value,
+        "status": status,
+        "confidence": confidence,
+        "evidence": evidence or [],
+        "freshness_seconds": freshness_seconds,
+        "correction_hint": correction_hint,
+        "details": details or {},
+    }
+
+
+def _ops_build_state_assertions(
+    *,
+    generated_at: datetime,
+    work_state: WorkStateResponse,
+    instances: dict,
+    events: list[dict],
+    enforcement_summary: dict,
+    tts_summary: dict,
+) -> list[dict]:
+    """Plain-language assertions: what Token-API currently believes is true.
+
+    These are intentionally redundant with the raw state. The cockpit should
+    show beliefs, evidence, freshness, and correction affordances without
+    making the operator infer semantics from dozens of fields.
+    """
+    desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
+    desktop_last = DESKTOP_STATE.get("last_detection")
+    desktop_age = _ops_seconds_since(desktop_last, now=generated_at)
+    phone_app = PHONE_STATE.get("current_app")
+    phone_distracted = bool(PHONE_STATE.get("is_distracted", False))
+    phone_last = PHONE_STATE.get("last_activity")
+    phone_age = _ops_seconds_since(phone_last, now=generated_at)
+    phone_heartbeat_age = _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen"))
+    mode = timer_engine.current_mode.value
+    break_balance = int(timer_engine.break_balance_ms)
+    stale_count = int((instances.get("counts") or {}).get("stale") or 0)
+    active_count = int((instances.get("counts") or {}).get("active") or 0)
+    pending_enforcement = int(enforcement_summary.get("pending_count") or 0)
+    tts_queue_len = int(tts_summary.get("queue_length") or 0)
+    latest_phone_distraction = next(
+        (event for event in events if event.get("event_type") == "phone_distraction_observed"),
+        None,
+    )
+    latest_desktop_detection = next(
+        (event for event in events if "desktop" in str(event.get("event_type") or "")),
+        None,
+    )
+    latest_phone_details = (
+        _ops_parse_event_details(latest_phone_distraction.get("details"))
+        if latest_phone_distraction
+        else None
+    )
+    latest_phone_label = "none"
+    if isinstance(latest_phone_details, dict):
+        latest_phone_label = str(
+            latest_phone_details.get("display_name")
+            or latest_phone_details.get("app")
+            or "unknown"
+        )
+
+    assertions = [
+        _ops_assertion(
+            "timer_mode",
+            "Timer mode",
+            mode.upper(),
+            "bad"
+            if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
+            else "warn"
+            if mode == TimerMode.MULTITASKING.value
+            else "good"
+            if mode == TimerMode.WORKING.value
+            else "neutral",
+            evidence=[
+                f"activity={timer_engine.activity.value}",
+                f"productivity_active={work_state.productivity_active}",
+                f"manual_mode={timer_engine.manual_mode.value if timer_engine.manual_mode else 'none'}",
+            ],
+            correction_hint="If wrong, use timer-mode resume/pause/break or correct the attention source.",
+            details={
+                "activity": timer_engine.activity.value,
+                "productivity_active": work_state.productivity_active,
+                "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
+            },
+        ),
+        _ops_assertion(
+            "break_balance",
+            "Break balance",
+            f"{round(break_balance / 60000, 1)} min",
+            "bad" if break_balance < 0 else "good",
+            evidence=[
+                f"available_ms={max(0, break_balance)}",
+                f"backlog_ms={abs(min(0, break_balance))}",
+            ],
+            correction_hint="If this jumped unexpectedly, inspect timer history gaps and reset/daily-reset events.",
+            details={"break_balance_ms": break_balance},
+        ),
+        _ops_assertion(
+            "productivity",
+            "Productivity",
+            "ACTIVE" if work_state.productivity_active else "INACTIVE",
+            "good" if work_state.productivity_active else "neutral",
+            evidence=[
+                work_state.reason,
+                f"active_instances={work_state.active_instance_count}",
+                f"observed_agents={work_state.observed_agent_count}",
+                f"processing_recent={work_state.processing_recent_count}",
+            ],
+            correction_hint="If wrong, check live agent panes, instance registration, and stale pane filtering.",
+            details=work_state.model_dump(),
+        ),
+        _ops_assertion(
+            "desktop_attention",
+            "Desktop attention",
+            str(desktop_mode or "unknown"),
+            "bad"
+            if desktop_mode in {"scrolling", "gaming"}
+            else "warn"
+            if desktop_mode in {"video", "music"}
+            else "neutral",
+            confidence="low" if desktop_age is not None and desktop_age > 300 else "high",
+            freshness_seconds=desktop_age,
+            evidence=[
+                f"work_mode={DESKTOP_STATE.get('work_mode', 'clocked_in')}",
+                f"ahk_reachable={DESKTOP_STATE.get('ahk_reachable')}",
+                f"steam={DESKTOP_STATE.get('steam_app_name') or DESKTOP_STATE.get('steam_exe') or 'none'}",
+            ],
+            correction_hint="If wrong, correct the desktop detector/AHK source or close the detected app.",
+            details={
+                "last_detection": desktop_last,
+                "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+                "steam_exe": DESKTOP_STATE.get("steam_exe"),
+            },
+        ),
+        _ops_assertion(
+            "phone_attention",
+            "Phone attention",
+            str(phone_app or "clear"),
+            "bad" if phone_distracted else "warn"
+            if timer_engine.activity == Activity.DISTRACTION and latest_phone_distraction
+            else "neutral",
+            confidence="low"
+            if phone_heartbeat_age is not None and phone_heartbeat_age > 600
+            else "low"
+            if timer_engine.activity == Activity.DISTRACTION
+            and not phone_distracted
+            and latest_phone_distraction
+            else "medium"
+            if phone_age is not None and phone_age > 180
+            else "high",
+            freshness_seconds=phone_age,
+            evidence=[
+                f"is_distracted={phone_distracted}",
+                f"heartbeat_age_s={phone_heartbeat_age if phone_heartbeat_age is not None else 'unknown'}",
+                f"app_opened_at={PHONE_STATE.get('app_opened_at') or 'none'}",
+                f"latest_phone_distraction={latest_phone_label}",
+            ],
+            correction_hint="If wrong, send/refresh phone close telemetry or clear stale phone app state.",
+            details={
+                "last_activity": phone_last,
+                "heartbeat_age_seconds": phone_heartbeat_age,
+                "latest_phone_distraction": latest_phone_distraction,
+            },
+        ),
+        _ops_assertion(
+            "fleet",
+            "Fleet",
+            f"{active_count} active",
+            "warn" if stale_count else "good" if active_count else "neutral",
+            evidence=[
+                f"stale={stale_count}",
+                f"processing={instances.get('counts', {}).get('by_status', {}).get('processing', 0)}",
+                f"idle={instances.get('counts', {}).get('by_status', {}).get('idle', 0)}",
+            ],
+            correction_hint="If wrong, refresh pane registrations or inspect stale instance rows.",
+            details=instances.get("counts", {}),
+        ),
+        _ops_assertion(
+            "enforcement",
+            "Enforcement",
+            "CLEAR" if pending_enforcement == 0 else f"{pending_enforcement} pending",
+            "good" if pending_enforcement == 0 else "bad",
+            evidence=[
+                f"pavlok_enabled={((enforcement_summary.get('pavlok') or {}).get('enabled'))}",
+                f"pending_count={pending_enforcement}",
+            ],
+            correction_hint="If wrong, acknowledge/resolve pending expected acknowledgements.",
+            details={"pending": enforcement_summary.get("pending", [])[:3]},
+        ),
+        _ops_assertion(
+            "tts",
+            "TTS queue",
+            f"{tts_queue_len} queued",
+            "warn" if tts_queue_len else "neutral",
+            evidence=[
+                f"backend={tts_summary.get('backend')}",
+                f"satellite_available={tts_summary.get('satellite_available')}",
+                f"global_mode={tts_summary.get('global_mode')}",
+            ],
+            correction_hint="If wrong, inspect TTS queue status or satellite health.",
+            details={
+                "hot_queue_length": tts_summary.get("hot_queue_length", 0),
+                "pause_queue_length": tts_summary.get("pause_queue_length", 0),
+            },
+        ),
+    ]
+
+    if timer_engine.activity == Activity.DISTRACTION and desktop_mode not in {
+        "video",
+        "scrolling",
+        "gaming",
+    } and not phone_distracted:
+        latest = latest_phone_distraction or latest_desktop_detection
+        latest_details = (
+            _ops_parse_event_details(latest.get("details")) if latest else None
+        )
+        latest_label = "unknown"
+        if isinstance(latest_details, dict):
+            latest_label = str(
+                latest_details.get("display_name")
+                or latest_details.get("app")
+                or latest_details.get("mode")
+                or latest.get("event_type")
+            )
+        elif latest:
+            latest_label = str(latest.get("event_type"))
+        assertions.append(
+            _ops_assertion(
+                "attention_consistency",
+                "Attention consistency",
+                "TIMER DISTRACTION WITHOUT ACTIVE SOURCE",
+                "bad",
+                confidence="low",
+                freshness_seconds=_ops_seconds_since(latest.get("created_at"), now=generated_at)
+                if latest
+                else None,
+                evidence=[
+                    f"timer_activity={timer_engine.activity.value}",
+                    f"desktop_mode={desktop_mode}",
+                    f"phone_current_app={phone_app or 'none'}",
+                    f"latest_source={latest_label}",
+                ],
+                correction_hint="Timer says distraction but live attention sources look clear. Refresh phone telemetry or clear stale timer activity/source.",
+                details={"latest_attention_event": latest},
+            )
+        )
+
+    # Attention-critical assertions first, quiet/neutral assertions later.
+    severity_order = {"bad": 0, "warn": 1, "good": 2, "neutral": 3}
+    confidence_order = {"low": 0, "medium": 1, "high": 2}
+    return sorted(
+        assertions,
+        key=lambda item: (
+            severity_order.get(item["status"], 4),
+            confidence_order.get(item["confidence"], 3),
+            item["label"],
+        ),
+    )
+
+
 @app.get("/ui/ops")
 async def ops_ui():
     """Serve the Terminus ops cockpit shell."""
@@ -13637,6 +14197,12 @@ async def ops_ui_asset(asset_path: str):
     return FileResponse(target, media_type=media_type or "application/octet-stream")
 
 
+@app.get("/api/ui/ops/timer/history")
+async def get_ops_timer_history(window: str = "6h", bucket: str = "60s"):
+    """Live timer history for the ops cockpit graph."""
+    return await _ops_read_timer_history(window=window, bucket=bucket)
+
+
 @app.get("/api/ui/ops/state")
 async def get_ops_display_state():
     """Aggregate read model for the Terminus ops cockpit."""
@@ -13647,6 +14213,14 @@ async def get_ops_display_state():
     cron_summary = await _ops_read_cron_summary()
     enforcement_summary = await _ops_read_enforcement_summary()
     tts_summary = get_tts_queue_status()
+    assertions = _ops_build_state_assertions(
+        generated_at=now,
+        work_state=work_state,
+        instances=instances,
+        events=events,
+        enforcement_summary=enforcement_summary,
+        tts_summary=tts_summary,
+    )
 
     break_balance_ms = timer_engine.break_balance_ms
     return {
@@ -13668,6 +14242,7 @@ async def get_ops_display_state():
             "total_break_time_ms": timer_engine.total_break_time_ms,
             "daily_start_date": timer_engine.daily_start_date,
         },
+        "assertions": assertions,
         "attention": {
             "desktop": {
                 "mode": DESKTOP_STATE.get("current_mode", "silence"),
