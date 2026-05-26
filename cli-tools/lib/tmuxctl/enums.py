@@ -9,7 +9,6 @@ class WindowArchetype(str, Enum):
     SOMNIUM = "somnium"
     LEGION_STACK = "legion_stack"
     MECHANICUS_STACK = "mechanicus_stack"
-    TUI_SINGLE = "tui_single"
 
 
 class GridState(str, Enum):
@@ -23,7 +22,6 @@ class GridState(str, Enum):
 class PaneKind(str, Enum):
     UNKNOWN = "unknown"
     AUDIENCE = "audience"
-    TUI = "tui"
     LEGION = "legion"
     MECHANICUS = "mechanicus"
     TOMBSTONE = "tombstone"

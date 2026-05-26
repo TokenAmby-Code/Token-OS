@@ -33,7 +33,6 @@ New binaries:
 - `cli-tools/bin/tmux-refresh-layout`
 - `cli-tools/bin/tmux-reset`
 - `cli-tools/bin/tmux-resume`
-- `cli-tools/bin/tui-pane-guard`
 - `cli-tools/bin/tx`
 - `cli-tools/bin/wt-focus`
 - `cli-tools/bin/portable-monitor`
@@ -67,12 +66,11 @@ New directory tree:
 
 ---
 
-### 4. token-api — Server, TUI, cron, stop-hook overhaul
+### 4. token-api — Server, cron, stop-hook overhaul
 **Status:** done (b84502f) — 3 files CIFS ghost-deleted on disk (pyproject.toml, stop_hook.py, uv.lock)
 
 Modified:
 - `token-api/main.py` — major expansion
-- `token-api/token-api-tui.py` — major refactor
 - `token-api/cron_engine.py`
 - `token-api/stop_hook.py` — major refactor
 - `token-api/corax_watchtower.py`
@@ -82,7 +80,6 @@ Modified:
 - `token-api/test_cron_engine.py`
 - `token-api/token-api.service`
 - `token-api/tts-studio.py`
-- `token-api/tui-screenshot.py`
 - `token-api/pyproject.toml`
 - `token-api/uv.lock`
 
@@ -108,7 +105,6 @@ New:
 - `cli-tools/bin/nas-env`
 - `cli-tools/bin/return-trip-watcher`
 - `cli-tools/bin/tailscale-check`
-- `cli-tools/bin/tui-screenshot`
 - `cli-tools/bin/victory`
 
 Modified:

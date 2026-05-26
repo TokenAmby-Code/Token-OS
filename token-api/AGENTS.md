@@ -6,7 +6,7 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 - **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
 - **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
-- **Somnium display/control**: HTML/Obsidian is the preferred rich dashboard surface; tmux owns active-pane operational keybindings; `token-api-tui.py` is legacy terminal status/selection UI
+- **Ops cockpit**: rich live visualization work belongs in the TypeScript web cockpit; tmux owns active-pane operational keybindings
 - **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
 
 ### Multi-Device Network
@@ -14,28 +14,26 @@ Local FastAPI server for Claude instance management, notifications, and system c
 ```
 Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
   ├── WSL (100.66.10.74:7777)     ← satellite: TTS (Windows SAPI), process enforcement, /restart
-  └── Phone (SSH)                  ← TUI restart signals only, webhook notifications
+  └── Phone (SSH)                  ← webhook notifications
 ```
 
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
 - **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
-- `token-restart` orchestrates all three: Mac restart → WSL restart → phone signal
-- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`, but new rich visualization work should target HTML served by Token-API and embedded in Obsidian
+- `token-restart` orchestrates Mac restart → WSL restart
+- Android/browser clients can reach the Mac API over Tailscale. New rich visualization work should target the TypeScript web cockpit.
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
 
-### Somnium Display/Control Directive
+### Ops Cockpit Direction
 
 High-level directive: see `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Somnium Display and Control Surface Directive.md`.
 
 The current direction is:
 
-- HTML is the primary rich visualization surface for somnium dashboards, graphs, timelines, and cohesive state views.
-- Obsidian is the preferred frame for viewing those HTML dashboards.
+- The TypeScript web cockpit is the primary rich visualization surface for dashboards, graphs, timelines, and cohesive state views.
 - tmux owns active-pane operator keybindings for the somnium pane/window.
-- `token-api-tui.py` should narrow toward compact status rendering and explicit selection-state export.
 - Token-API remains the authoritative state/mutation backend.
 
-Do not add new primary operational keybindings to `token-api-tui.py`. New actions should be Token-API/CLI mutations invoked from tmux keybindings. Existing TUI commands are compatibility behavior while the migration is underway.
+New actions should be Token-API/CLI mutations invoked from tmux keybindings. New rich display work should target the TypeScript cockpit.
 
 ## Key Files
 
@@ -46,7 +44,6 @@ Do not add new primary operational keybindings to `token-api-tui.py`. New action
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
 | `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
-| `token-api-tui.py` | Legacy Rich terminal dashboard; should evolve toward compact status/selection export |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
 
@@ -599,16 +596,8 @@ agents-db events --limit 5
 
 ## Known Issues & Fixes
 
-### Display Name Priority (Fixed 2026-01-26)
-The `format_instance_name()` function in the TUI now correctly prioritizes custom `tab_name` over `working_dir`. Previously, renamed instances still showed the directory path.
-
-Location: `token-api-tui.py:280` - `is_custom_tab_name()` and `format_instance_name()`
-
-### Backspace in TUI Rename
-The TUI rename input captures raw terminal characters. Backspace (`\x7f`) may appear in names if terminal handling is imperfect. Workaround: use `instance-name` CLI instead.
-
 ### is_processing Flag Not Persisting (Fixed 2026-01-26)
-Three bugs caused the green arrow (processing indicator) to not display properly:
+Three bugs caused the processing indicator to not display properly:
 
 1. **PostToolUse clearing flag**: The `handle_post_tool_use()` was setting `is_processing=0` on every tool use, immediately clearing the flag set by `prompt_submit`. Fixed to only update `last_activity` as a heartbeat.
 
@@ -618,19 +607,11 @@ Three bugs caused the green arrow (processing indicator) to not display properly
 
 Location: `main.py` - `handle_post_tool_use()`, `clear_stale_processing_flags()`, `get_instance_todos()`
 
-### TUI Todo Caching (Added 2026-01-26)
-The TUI now caches todo data per instance. When `is_processing=0`, it displays cached data instead of empty values. This prevents progress/task columns from disappearing between prompts.
-
-Location: `token-api-tui.py` - `todos_cache` global, `get_instance_todos()` with `use_cache` parameter
-
 ## Development Notes
 
 - Server runs on port 7777 (hardcoded in `main.py`)
-- TUI polls database directly, not via API (for speed)
-- TUI refresh interval: 2 seconds
-- Database changes from CLI/API are picked up on next TUI refresh
-- New rich dashboards should be implemented as HTML served by Token-API, suitable for Obsidian iframe/embed viewing.
-- New operational shortcuts should be tmux active-pane bindings calling CLI/API commands, not new TUI key handlers.
+- New rich dashboards should be implemented in the TypeScript cockpit.
+- New operational shortcuts should be tmux active-pane bindings calling CLI/API commands.
 
 ## Potential Future Tools/Skills
 

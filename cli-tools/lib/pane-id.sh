@@ -51,7 +51,7 @@ pane_tag() {
 
     pane_type=$(tmux_pane_type_from_pane_id "$pane_id" 2>/dev/null || true)
     case "$pane_type" in
-        "$TMUX_PANE_TYPE_MECHANICUS"|"$TMUX_PANE_TYPE_LEGION"|"$TMUX_PANE_TYPE_TUI")
+        "$TMUX_PANE_TYPE_MECHANICUS"|"$TMUX_PANE_TYPE_LEGION")
             tmux set-option -p -t "$target" @PANE_TYPE "$pane_type"
             ;;
     esac

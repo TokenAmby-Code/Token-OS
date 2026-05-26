@@ -12,7 +12,6 @@ PALACE_WINDOW = "palace"
 SOMNIUM_WINDOW = "somnium"
 LEGION_WINDOW = "legion"
 MECHANICUS_WINDOW = "mechanicus"
-TUI_WINDOW = "tui"
 
 DETACHED_W = 240
 DETACHED_H = 60
@@ -22,13 +21,7 @@ def _home() -> str:
     return os.path.expanduser("~")
 
 
-def _imperium_root() -> str:
-    return os.environ.get("IMPERIUM", "/Volumes/Imperium")
-
-
 def _window_dir(window: str) -> str:
-    if window == TUI_WINDOW:
-        return f"{_imperium_root()}/Token-OS/token-api"
     return _home()
 
 
@@ -225,15 +218,6 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _set_pane_option(adapter, fabricator, "@PANE_TYPE", "mechanicus")
     _pane_tag(adapter, admin, "mechanicus:admin")
     _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
-
-
-def build_tui_window(adapter: TmuxAdapter, session: str) -> None:
-    target = f"{session}:{TUI_WINDOW}"
-    adapter.run("new-window", "-t", session, "-n", TUI_WINDOW, "-d", "-c", _window_dir(TUI_WINDOW))
-    _pane_tag(adapter, f"{target}.1", "tui:1")
-    _set_pane_option(adapter, f"{target}.1", "@PANE_TYPE", "tui")
-    adapter.run("send-keys", "-t", f"{target}.1", "exec tui-pane-guard", "Enter")
-
 
 def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     """Build the full somnium workspace from an empty server.

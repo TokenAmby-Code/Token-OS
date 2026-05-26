@@ -234,13 +234,6 @@ def _select_pane_for_client(adapter: TmuxAdapter, pane_id: str, client: str = ""
     adapter.run("select-pane", "-t", pane_id, allow_failure=True)
 
 
-def _select_tui_window(adapter: TmuxAdapter, session_name: str, client: str = "") -> None:
-    target = f"{session_name}:tui"
-    _switch_client(adapter, target, client)
-    adapter.run("select-window", "-t", target)
-    adapter.run("select-pane", "-t", f"{target}.1", allow_failure=True)
-
-
 def _display_role(adapter: TmuxAdapter, target: str) -> str:
     if not target:
         return ""
@@ -421,9 +414,6 @@ def audience_toggle(adapter: TmuxAdapter, target: str, *, client: str = "") -> s
     pane_type = context.pane_type
     window_name = _window_base(context.window_name)
 
-    if pane_type == PaneKind.TUI.value and window_name != "tui":
-        _select_tui_window(adapter, context.session_name, client)
-        return f"selected {context.session_name}:tui"
     if pane_type == PaneKind.TOMBSTONE.value:
         return audience_jump(adapter, pane_id, client=client)
     if window_name in set(PAGE_AUDIENCE.values()):

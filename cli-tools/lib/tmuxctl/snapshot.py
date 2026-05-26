@@ -58,8 +58,6 @@ def _infer_archetype(window_name: str) -> WindowArchetype:
         return WindowArchetype.LEGION_STACK
     if base in {"mechanicus", "mars", "kreig"}:
         return WindowArchetype.MECHANICUS_STACK
-    if base == "tui":
-        return WindowArchetype.TUI_SINGLE
     return WindowArchetype.UNKNOWN
 
 
@@ -236,10 +234,6 @@ def build_window_snapshot(
         grid_focus_active=grid_focus_active,
         grid_focus_stash=grid_focus_stash,
     )
-    window_base = window_name.split("(", 1)[0]
-    if window_base in {"palace", "somnium"} and any(p.pane_kind is PaneKind.TUI for p in panes):
-        warnings = (*warnings, f"{window_base} must not contain @PANE_TYPE=tui panes")
-
     return WindowSnapshot(
         session_name=session_name,
         window_index=window_index,
