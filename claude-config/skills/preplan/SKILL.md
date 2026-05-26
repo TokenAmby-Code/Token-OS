@@ -32,8 +32,8 @@ Prepare the next planning turn without implementing code.
 Keep the final response short. Use this shape:
 
 ```markdown
-preplan complete: <one-sentence handoff>
 - State: ...
 - Remaining decisions: ...
 - Recommended plan focus: ...
+preplan complete: <one-sentence handoff>
 ```

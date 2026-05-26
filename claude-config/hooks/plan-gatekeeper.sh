@@ -19,7 +19,7 @@ log() {
 PANE="${TMUX_PANE:-}"
 if [[ -n "$PANE" ]]; then
   (
-    tmux-plan-approve-clear --pane "$PANE" --agent claude --timeout 10 >> "$LOG" 2>&1 || true
+    tmux-plan-approve-clear --pane "$PANE" --agent auto --timeout 10 >> "$LOG" 2>&1 || true
   ) </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
   log "ExitPlanMode ${SESSION_ID:-unknown}: launched clear-context approver for $PANE"

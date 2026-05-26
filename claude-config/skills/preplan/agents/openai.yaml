@@ -4,4 +4,4 @@ interface:
   default_prompt: "$preplan prepare the planning handoff"
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

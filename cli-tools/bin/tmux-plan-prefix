@@ -117,14 +117,14 @@ unsubscribe_preplan() {
 }
 
 jump_prompt_start() {
-    for _ in $(seq 1 50); do tmux send-keys -t "$PANE" PgUp; done
+    for ((i=0; i<50; i++)); do tmux send-keys -t "$PANE" PgUp; done
     tmux send-keys -t "$PANE" Home
     sleep 0.05
 }
 
 jump_prompt_end() {
     sleep 0.05
-    for _ in $(seq 1 50); do tmux send-keys -t "$PANE" PgDn; done
+    for ((i=0; i<50; i++)); do tmux send-keys -t "$PANE" PgDn; done
     tmux send-keys -t "$PANE" End
 }
 
@@ -147,7 +147,7 @@ mutate_preplan_to_plan() {
     # 9 chars) and insert the real command. In Claude Code, deleting only the
     # leading invoker plus "pre" leaves "lan ..." because /preplan is handled
     # as slash-command text/chip state, not a plain editable prefix.
-    for _ in $(seq 1 9); do tmux send-keys -t "$PANE" Delete; done
+    for ((i=0; i<9; i++)); do tmux send-keys -t "$PANE" Delete; done
     sleep 0.05
     tmux send-keys -t "$PANE" -l "/plan "
     jump_prompt_end
