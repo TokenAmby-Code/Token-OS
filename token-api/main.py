@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -47,6 +48,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import shared
+import talk as talk_service
 import temp_message as temp_message_service
 from cron_engine import CronEngine
 from custodes_state_policy import (
@@ -229,8 +231,110 @@ import traceback
 # Machine identity from centralized config
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
+from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
+from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
+ASSERT_PERSONA_PANE_LABELS = {
+    "legion:custodes",
+    "mechanicus:fabricator-general",
+    "mechanicus:admin",
+}
+
+
+def _is_assert_persona_label(value: str | None) -> bool:
+    return (value or "") in ASSERT_PERSONA_PANE_LABELS
+
+
+def _run_tmux_focus_preserved(
+    args: tuple[str, ...] | list[str],
+    *,
+    source: str,
+    attempted_target: str = "",
+    allow_failure: bool = True,
+) -> str:
+    """Run a tmux operation from Token-API without leaving the client focused elsewhere."""
+    argv = tuple(args)
+    if not argv:
+        return ""
+    tmux_args = argv[1:] if Path(argv[0]).name == "tmux" else argv
+    adapter = _TmuxCtlAdapter()
+    with _tmuxctl_preserve_focus(
+        adapter,
+        source=source,
+        attempted_target=attempted_target,
+    ):
+        return adapter.run(*tmux_args, allow_failure=allow_failure)
+
+
+def spawn_tmux_assert_instance(
+    pane_target: str | None, instance_id: str = "", source: str = "system"
+) -> None:
+    """Run close-down pane assertion out-of-band and log stdout/stderr.
+
+    This is intentionally shared by hook-adjacent fallback paths (pane-state
+    projection, dead-pane cleanup, reconciler). SessionEnd is preferred, but
+    real exits can be observed first by these workers; stale pane chrome must
+    still converge through tmuxctl's single assert-instance path.
+    """
+    if not pane_target:
+        return
+    tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
+    if not tmuxctl.exists():
+        logger.warning(
+            "%s: assert-instance skipped for %s — tmuxctl not found", source, pane_target
+        )
+        return
+    code = r"""
+import os
+import subprocess
+import sys
+import time
+
+tmuxctl, pane, instance_id, source = sys.argv[1:5]
+env = os.environ.copy()
+env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
+try:
+    time.sleep(2)
+    proc = subprocess.run(
+        [tmuxctl, "assert-instance", "--pane", pane],
+        text=True,
+        capture_output=True,
+        timeout=75,
+        check=False,
+        env=env,
+    )
+    sys.stdout.write(f"[{source}] pane={pane} instance={instance_id}\n")
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    raise SystemExit(proc.returncode)
+except subprocess.TimeoutExpired as exc:
+    sys.stderr.write(f"[{source}] assert-instance timeout pane={pane} instance={instance_id}: {exc}\n")
+    raise SystemExit(124)
+"""
+    log_path = Path("/tmp/session-end-assert-instance.log")
+    log_handle = None
+    try:
+        log_handle = log_path.open("a")
+        subprocess.Popen(
+            ["python3", "-c", code, str(tmuxctl), pane_target, instance_id, source],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.info(
+            "%s: spawned assert-instance for %s (%s)", source, pane_target, instance_id[:12]
+        )
+    except Exception as exc:
+        logger.warning("%s: failed to spawn assert-instance for %s: %s", source, pane_target, exc)
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
 
 
 def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
@@ -294,9 +398,9 @@ LEGION_PANE_COLORS = {
     "custodes": "#302800",  # dark gold
     "mechanicus": "#300808",  # dark red
     "fabricator": "#300808",  # FG shares the 4:mechanicus page tint. Without this
-                              # entry the recolor worker resolves .get("fabricator",
-                              # "default") and overwrites the bg=#300808 that
-                              # _assert_persona_color sets — the two systems fight.
+    # entry the recolor worker resolves .get("fabricator",
+    # "default") and overwrites the bg=#300808 that
+    # _assert_persona_color sets — the two systems fight.
     "civic": "#083010",  # dark green
     "astartes": "default",  # no tint (default legion)
 }
@@ -363,6 +467,26 @@ class TempMessageRequest(BaseModel):
     selector: str = Field(..., min_length=1)
     payload: str = Field(..., min_length=1)
     idempotency_key: str | None = None
+
+
+class TalkSendRequest(BaseModel):
+    caller_pane: str = Field(..., min_length=1)
+    target_pane: str = Field(..., min_length=1)
+    payload: str = Field(..., min_length=1)
+
+
+class TalkReturnRequest(BaseModel):
+    caller_pane: str = Field(..., min_length=1)
+    target_pane: str = Field(..., min_length=1)
+    payload: str = Field(..., min_length=1)
+
+
+class BriefSendRequest(BaseModel):
+    caller_pane: str | None = None
+    panes: list[str] = Field(default_factory=list)
+    pages: list[str] = Field(default_factory=list)
+    payload: str = Field(..., min_length=1)
+    ephemeral: bool = False
 
 
 class ProfileResponse(BaseModel):
@@ -1417,7 +1541,7 @@ def _build_naming_nudge_message(slug: str | None) -> str:
     return (
         "Your session document still needs a descriptive name. "
         "Choose a 3-6 word title that describes the work, then run "
-        "`session-doc-name \"Your Descriptive Title\"`. "
+        '`session-doc-name "Your Descriptive Title"`. '
         "Do not use dates, timestamps, UUIDs, pane IDs, model names, or generic project roots."
         f"{hint}"
     )
@@ -2766,6 +2890,9 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
                 f"Golden Throne: failed to schedule stop-hook follow-up "
                 f"for {instance_id[:12]}: {exc}"
             )
+        # Trinity Chunk 1 slash-copy is handled in routes/hooks.py:handle_stop,
+        # which has the Stop payload's transcript_path (authoritative JSONL
+        # location for the just-stopped session). Do not duplicate here.
 
     return {
         "status": "updated",
@@ -2848,25 +2975,18 @@ EXPECTED_ACK_DEFAULT_LEVEL2_DELAY = timedelta(minutes=3)
 EXPECTED_ACK_DEFAULT_PAVLOK_DELAY = timedelta(minutes=3)
 ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS = 300
 
-EXPECTED_ACK_STAGE_NOTIFY = "notify"
-EXPECTED_ACK_STAGE_WARN = "warn"
+# Only the terminal enforce stage survives the cascade collapse. Notify/warn
+# tiers are gone — Golden Throne owns any softer escalation cadence by polling
+# /api/enforcement/status and firing /api/enforce per missed ack.
 EXPECTED_ACK_STAGE_ENFORCE = "enforce"
 EXPECTED_ACK_STAGE_BY_LEVEL = {
-    1: EXPECTED_ACK_STAGE_NOTIFY,
-    2: EXPECTED_ACK_STAGE_WARN,
     3: EXPECTED_ACK_STAGE_ENFORCE,
 }
 EXPECTED_ACK_LEVEL_BY_STAGE = {stage: level for level, stage in EXPECTED_ACK_STAGE_BY_LEVEL.items()}
 EXPECTED_ACK_DUE_FIELD_BY_STAGE = {
-    EXPECTED_ACK_STAGE_NOTIFY: "ack_due_at",
-    EXPECTED_ACK_STAGE_WARN: "level2_due_at",
     EXPECTED_ACK_STAGE_ENFORCE: "pavlok_due_at",
 }
-EXPECTED_ACK_POLICY_DEFAULT = (
-    EXPECTED_ACK_STAGE_NOTIFY,
-    EXPECTED_ACK_STAGE_WARN,
-    EXPECTED_ACK_STAGE_ENFORCE,
-)
+EXPECTED_ACK_POLICY_DEFAULT = (EXPECTED_ACK_STAGE_ENFORCE,)
 EXPECTED_ACK_POLICY_BY_SOURCE = {}
 
 
@@ -3140,15 +3260,12 @@ async def record_golden_throne_resume(instance: dict) -> dict:
             severity=4,
             payload=payload,
         )
-        enforcement = await unified_enforce(
-            "enforce",
-            f"Golden Throne second resume: {human_surface}",
-            source="golden_throne",
-            phone_params={
-                "zap": PAVLOK_CONFIG.get("friday_zap_value", 30),
-                "tts_text": f"golden throne enforcement {human_surface}",
-                "banner_text": f"GT enforce: {human_surface}",
-            },
+        enforcement = await enforce(
+            EnforceRequest(
+                message=f"Golden Throne second resume: {human_surface}",
+                intensity=int(PAVLOK_CONFIG.get("friday_zap_value", 30)),
+                source="golden_throne",
+            )
         )
         await log_event(
             "golden_throne_second_resume_enforced",
@@ -4290,6 +4407,21 @@ async def compute_work_state() -> WorkStateResponse:
             """
         )
         rows = await cursor.fetchall()
+        pane_activity_cursor = await db.execute(
+            """
+            SELECT tmux_pane, MAX(last_activity) AS last_activity
+            FROM claude_instances
+            WHERE tmux_pane IS NOT NULL
+              AND device_id = ?
+            GROUP BY tmux_pane
+            """,
+            (LOCAL_DEVICE_NAME,),
+        )
+        pane_last_activity: dict[str, str] = {
+            r["tmux_pane"]: r["last_activity"]
+            for r in await pane_activity_cursor.fetchall()
+            if r["last_activity"]
+        }
 
     for row in rows:
         last_activity = row["last_activity"]
@@ -4352,6 +4484,19 @@ async def compute_work_state() -> WorkStateResponse:
         is_agent, engine = _pane_is_agent_from_snapshot(command, tty, agent_engines_by_tty)
         if not is_agent:
             continue
+        # Gate observed panes by the same 30-min recency cutoff applied to
+        # active_instances. An idle Claude pane that hasn't moved in hours
+        # otherwise flickers productivity_active back on every poll cycle.
+        # No DB row → treat as not-recent (per observed-agents-recency-cutoff
+        # ticket: unregistered panes default to not-recent).
+        pane_last_activity_str = pane_last_activity.get(pane)
+        if not pane_last_activity_str:
+            continue
+        try:
+            if datetime.fromisoformat(pane_last_activity_str) < cutoff:
+                continue
+        except Exception:
+            continue
         observed_agents.append(
             AgentRuntime(
                 id=None,
@@ -4361,6 +4506,7 @@ async def compute_work_state() -> WorkStateResponse:
                 working_dir=cwd,
                 tmux_pane=pane,
                 device_id=LOCAL_DEVICE_NAME,
+                last_activity=pane_last_activity_str,
                 registered=False,
                 live_pane=True,
             )
@@ -4890,51 +5036,35 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
         desktop_result = None
         if DESKTOP_STATE.get("current_mode") in ("video", "scrolling", "gaming"):
             desktop_result = close_distraction_windows()
-        result = await unified_enforce(
-            "warn",
-            f"{message}. Backlog violation.",
-            source=ack["source"],
-            channel="briefing",
-            phone_params={
-                "vibe": 70,
-                "beep": 60,
-                "banner_text": "Backlog violation",
-                "tts_text": "backlog violation",
-            },
+        result = await enforce(
+            EnforceRequest(
+                message=f"{message}. Backlog violation.",
+                intensity=25,
+                source=ack["source"],
+            )
         )
-        result = {"unified": result, "desktop": desktop_result}
+        result = {"enforce": result, "desktop": desktop_result}
     elif ack["source"] == "backlog_violation" and level == 2:
-        result = await unified_enforce(
-            "warn",
-            message,
-            source=ack["source"],
-            phone_params={"vibe": 90, "beep": 80, "banner_text": "Backlog parry expired"},
+        result = await enforce(
+            EnforceRequest(
+                message=f"{message} (backlog parry expired)",
+                intensity=25,
+                source=ack["source"],
+            )
         )
     elif level == 1:
-        result = await unified_enforce(
-            "notify",
-            message,
-            source=ack["source"],
-            channel="briefing",
-            phone_params={
-                "vibe": 30,
-                "banner_text": ack_due_text,
-                "tts_text": ack_due_text,
-            },
+        result = await dispatch_notification(
+            NotifyRequest(message=ack_due_text or message, type="tts")
         )
     elif level == 2:
         if ack["source"] == "desktop_gaming":
             await asyncio.to_thread(enforce_desktop_app, "mewgenics", "minimize")
-        result = await unified_enforce(
-            "warn",
-            message,
-            source=ack["source"],
-            phone_params={
-                "vibe": 50,
-                "beep": 50,
-                "banner_text": ack_overdue_text,
-                "tts_text": ack_overdue_text,
-            },
+        result = await enforce(
+            EnforceRequest(
+                message=ack_overdue_text or message,
+                intensity=25,
+                source=ack["source"],
+            )
         )
     else:
         if ack["source"] == "backlog_violation" and not _backlog_distraction_still_active(ack):
@@ -5029,7 +5159,7 @@ def _load_golden_throne_sop() -> str:
         "<instance_id>/victory. If Golden Throne pings are wrong for this "
         "thread, disable them by setting the instance to one_off: PATCH "
         "$TOKEN_API_URL/api/instances/<instance_id>/type with "
-        "{\"instance_type\":\"one_off\"}. Do not allow yourself to be "
+        '{"instance_type":"one_off"}. Do not allow yourself to be '
         "Sisyphus-looped; either make measurable progress, escalate, disable "
         "Golden Throne for this thread, or perform the victory state transition "
         "so usage limits are not burned."
@@ -5349,15 +5479,12 @@ async def _golden_throne_handle_victorious_bug(
         severity=4,
         payload=payload,
     )
-    enforcement = await unified_enforce(
-        "enforce",
-        f"GT bug on victorious {human_pane_surface}",
-        source="golden_throne",
-        phone_params={
-            "zap": PAVLOK_CONFIG.get("friday_zap_value", 30),
-            "tts_text": tts_body,
-            "banner_text": banner_body,
-        },
+    enforcement = await enforce(
+        EnforceRequest(
+            message=tts_body or f"GT bug on victorious {human_pane_surface}",
+            intensity=int(PAVLOK_CONFIG.get("friday_zap_value", 30)),
+            source="golden_throne",
+        )
     )
     await log_event(
         "golden_throne_victorious_bug",
@@ -6315,16 +6442,63 @@ async def _create_custodes_legion_pane() -> str | None:
         return None
 
 
-async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -> dict:
-    """Delegate prompt delivery to `tmuxctl assert-custodes`.
+async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
+    tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
 
-    token-api no longer decides "launch vs upsert" — tmuxctl owns that. We just
-    hand it the prompt and read back the result. tmuxctl will:
-      * Resolve or create the `legion:custodes` pane.
-      * Upsert via `claude-cmd --pane` if a live claude process is detected.
-      * Otherwise launch fresh via `dispatch --persona custodes --sync` (the
-        non-deprecated replacement for `primarch custodes`).
-    """
+    async def _run_assert() -> tuple[dict, str]:
+        proc = await asyncio.create_subprocess_exec(
+            str(tmuxctl_bin),
+            "assert-instance",
+            "--pane",
+            "legion:custodes",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+        raw = stdout.decode().strip()
+        try:
+            result = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            result = {
+                "ok": False,
+                "reason": f"bad_assert_output rc={proc.returncode}",
+                "raw": raw[:200],
+            }
+        return result, stderr.decode()
+
+    result, stderr = await _run_assert()
+    if result.get("action") in {"launched", "persona_correction_sent"}:
+        await asyncio.sleep(3)
+        result, stderr = await _run_assert()
+    if not result.get("ok"):
+        logger.warning(
+            f"{source}: assert-instance legion:custodes failed: {result.get('reason')} stderr={stderr[:200]}"
+        )
+        return {
+            "dispatched": False,
+            "reason": result.get("reason") or "assert_failed",
+            "assertion": result,
+        }
+
+    proc = await asyncio.create_subprocess_exec(
+        str(tmuxctl_bin),
+        "send-text",
+        "--pane",
+        "legion:custodes",
+        "--stdin",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr_b = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=45)
+    if proc.returncode != 0:
+        reason = stderr_b.decode().strip()[:240] or stdout.decode().strip()[:240]
+        return {"dispatched": False, "reason": f"send_text_failed: {reason}", "assertion": result}
+    return {"dispatched": True, "reason": "sent", "pane": result.get("pane"), "assertion": result}
+
+
+async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -> dict:
+    """Assert `legion:custodes`, then send the intervention only after assertion is true."""
     if cancel_check:
         canceled = await cancel_check("pre_launch_prompt")
         if canceled:
@@ -6336,43 +6510,15 @@ async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -
         f"{prompt}"
     )
 
-    tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(tmuxctl_bin),
-            "assert-custodes",
-            "--stdin",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(launch_prompt.encode()), timeout=45
-        )
+        result = await _assert_and_send_custodes(launch_prompt, source="Custodes state hook")
     except Exception as exc:
-        logger.warning(f"Custodes state hook: tmuxctl assert-custodes failed: {exc}")
+        logger.warning(f"Custodes state hook: assert/send legion:custodes failed: {exc}")
         return {"dispatched": False, "reason": f"custodes_launch_failed: {exc}"}
-
-    raw = stdout.decode().strip()
-    try:
-        result = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        logger.warning(
-            f"Custodes state hook: assert-custodes returned non-JSON rc={proc.returncode}: {raw[:200]}"
-        )
-        return {
-            "dispatched": False,
-            "reason": f"custodes_launch_bad_output: rc={proc.returncode}",
-        }
-
     if not result.get("dispatched"):
-        logger.warning(
-            f"Custodes state hook: assert-custodes did not dispatch: {result.get('reason')} stderr={stderr.decode()[:200]}"
-        )
+        logger.warning(f"Custodes state hook: delivery failed: {result.get('reason')}")
     else:
-        logger.warning(
-            f"Custodes state hook: {result.get('reason')} pane={result.get('tmux_pane')}"
-        )
+        logger.warning(f"Custodes state hook: delivered pane={result.get('pane')}")
     return result
 
 
@@ -7260,7 +7406,7 @@ async def trigger_golden_throne_followup(instance_id: str):
 
 # ============ Instance Lifecycle Type ============
 
-VALID_INSTANCE_TYPES = {"sync", "golden_throne", "one_off", "archived"}
+VALID_INSTANCE_TYPES = {"sync", "golden_throne", "one_off", "hook_driven", "archived"}
 
 
 @app.patch("/api/instances/{instance_id}/type")
@@ -7907,7 +8053,7 @@ async def orchestrator_pane_truth():
             flags.append("superseded_duplicate")
         if tmux_pane and tmux_pane not in pane_ids_in_tmux:
             flags.append("pane_missing")
-        if pane_meta and row.get("pane_label") != pane_meta["session_window"]:
+        if pane_meta and row.get("pane_label") != pane_meta["pane_label"]:
             flags.append("pane_label_drift")
         if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
             flags.append("tab_name_placeholder")
@@ -7940,6 +8086,169 @@ async def orchestrator_pane_truth():
         )
 
     return out
+
+
+# --- Trinity Chunk 1: talk / brief inter-persona comm primitives ------------
+
+
+async def _talk_send_payload(target_pane: str, payload: str) -> dict:
+    """Inject `payload` into ``target_pane`` via the existing pane-write queue.
+
+    Drained synchronously so a CLI long-poll sees an actual delivery state.
+    """
+    queued = await enqueue_pane_write(
+        instance_id=target_pane,
+        tmux_pane=target_pane,
+        source="talk",
+        purpose="talk_send",
+        payload=payload,
+    )
+    drained = await process_pane_write_queue_once(queued["id"])
+    return drained[0] if drained else queued
+
+
+@app.post("/api/talk/send")
+async def talk_send(request: TalkSendRequest):
+    """Open a two-way talk pair and inject the payload into the target's input.
+
+    Returns ``talk_id``; the caller then long-polls ``/api/talk/await/{id}``.
+    If the target_pane is already the turn-holder of a pair where the caller
+    is the listener (i.e. caller=A, target=B and now A → B again while B has
+    not yet returned), the existing pair is reused — no new id.
+    """
+    caller_raw = request.caller_pane.strip()
+    target_raw = request.target_pane.strip()
+    caller_pane = await talk_service.resolve_pane(caller_raw)
+    target_pane = await talk_service.resolve_pane(target_raw)
+    if not caller_pane:
+        raise HTTPException(status_code=400, detail=f"caller_pane unresolved: {caller_raw}")
+    if not target_pane:
+        raise HTTPException(status_code=400, detail=f"target_pane unresolved: {target_raw}")
+    if caller_pane == target_pane:
+        raise HTTPException(status_code=400, detail="caller_pane and target_pane are the same")
+
+    # Explicit-return shortcut: if the SWAPPED pair (caller=target, target=caller)
+    # is already open, this call IS the return.
+    returned = await talk_service.return_talk(
+        caller_pane=caller_pane,
+        target_pane=target_pane,
+        payload=request.payload,
+    )
+    if returned is not None:
+        # Still deliver the message into the original caller's pane so the
+        # listener actually sees the response in its input stream.
+        try:
+            send_result = await _talk_send_payload(target_pane, request.payload)
+        except Exception as exc:  # noqa: BLE001
+            send_result = {"status": "failed", "error": str(exc)}
+        return {
+            "status": "returned",
+            "talk_id": returned["talk_id"],
+            "result_kind": "explicit",
+            "delivery": send_result,
+            "talk": returned,
+        }
+
+    target_instance = await talk_service.lookup_instance_for_pane(target_pane)
+    target_engine = (target_instance or {}).get("engine") or "claude"
+    record = await talk_service.register_talk(
+        caller_pane=caller_pane,
+        target_pane=target_pane,
+        payload=request.payload,
+        target_instance=target_instance,
+        engine=target_engine,
+    )
+    try:
+        send_result = await _talk_send_payload(target_pane, request.payload)
+    except Exception as exc:  # noqa: BLE001
+        await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
+        raise HTTPException(status_code=502, detail=f"talk delivery failed: {exc}") from exc
+
+    return {
+        "status": "open",
+        "talk_id": record["talk_id"],
+        "caller_pane": caller_pane,
+        "target_pane": target_pane,
+        "target_instance_id": record["target_instance_id"],
+        "delivery": send_result,
+    }
+
+
+@app.get("/api/talk/await/{talk_id}")
+async def talk_await(talk_id: str, timeout: float = 30.0):
+    """Long-poll for a talk pair result. ``timeout`` capped server-side."""
+    timeout = max(1.0, min(float(timeout or 30.0), 120.0))
+    record = await talk_service.await_talk(talk_id, timeout=timeout)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"talk_id not found: {talk_id}")
+    return record
+
+
+@app.post("/api/talk/cancel/{talk_id}")
+async def talk_cancel(talk_id: str):
+    record = await talk_service.cancel_talk(talk_id, reason="caller_cancel")
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"talk_id not open: {talk_id}")
+    return {"status": "cancelled", "talk_id": talk_id}
+
+
+@app.post("/api/brief/send")
+async def brief_send(request: BriefSendRequest):
+    """Fire-and-forget delivery to one or more panes/pages with dedup."""
+    if not request.panes and not request.pages:
+        raise HTTPException(status_code=400, detail="at least one --pane or --page required")
+
+    resolved, unresolved = await talk_service.resolve_brief_targets(
+        panes=request.panes,
+        pages=request.pages,
+    )
+    if not resolved:
+        return {
+            "status": "no_targets",
+            "ephemeral": request.ephemeral,
+            "resolved": [],
+            "unresolved": unresolved,
+            "delivered": 0,
+        }
+
+    delivered: list[dict] = []
+    for target in resolved:
+        pane_id = target["pane_id"]
+        try:
+            if request.ephemeral:
+                # Reuse the temp_message side-channel infra (/btw or /side).
+                instance = await talk_service.lookup_instance_for_pane(pane_id)
+                engine = (instance or {}).get("engine")
+                receipt = await temp_message_service.send_temp_message(
+                    pane_id,
+                    request.payload,
+                    engine,
+                    instance_id=(instance or {}).get("id") or pane_id,
+                    queue_sender=enqueue_pane_write,
+                    queue_drainer=process_pane_write_queue_once,
+                )
+                receipt = {**receipt, **target}
+            else:
+                queued = await enqueue_pane_write(
+                    instance_id=pane_id,
+                    tmux_pane=pane_id,
+                    source="brief",
+                    purpose="brief_send",
+                    payload=request.payload,
+                )
+                drained = await process_pane_write_queue_once(queued["id"])
+                receipt = drained[0] if drained else queued
+                receipt = {**receipt, **target}
+            delivered.append(receipt)
+        except Exception as exc:  # noqa: BLE001
+            delivered.append({**target, "status": "failed", "error": str(exc)})
+    return {
+        "status": "ok",
+        "ephemeral": request.ephemeral,
+        "delivered": len([r for r in delivered if r.get("status") in {"sent", "pending"}]),
+        "resolved": delivered,
+        "unresolved": unresolved,
+    }
 
 
 @app.post("/api/orchestrator/temp_message")
@@ -8397,61 +8706,6 @@ async def put_daily_note_callout(request: DailyNoteCalloutRequest):
         "path": str(result.path),
         "bytes_written": result.bytes_written,
     }
-
-
-# ============ Enforcement Cascade v3 ============
-# Server-driven escalation. Phone executes v3 param-based endpoints.
-# Fallback chain: phone /enforce|/notify → server-side Pavlok API → Discord webhook.
-ENFORCEMENT_CASCADE = {
-    "active": False,  # Is a cascade currently running?
-    "app": None,  # Which app triggered it
-    "current_level": 0,  # Current escalation level (0-5)
-    "started_at": None,  # monotonic time
-    "last_escalation": None,  # monotonic time of last level bump
-    "task": None,  # asyncio.Task for the cascade worker
-}
-
-# Level delays (seconds after previous level)
-ENFORCEMENT_LEVEL_DELAYS = {
-    1: 0,  # Vibe — immediate after Discord fallback timeout
-    2: 15,  # Vibe + beep + TTS
-    3: 15,  # Stronger vibe + beep + TTS warning
-    4: 10,  # Spotify redirect
-    5: 30,  # Pavlok zap (repeats every 30s)
-}
-
-# v3 param mapping per cascade level
-# Levels 1-3 use /notify (vibe/beep), level 4-5 use /enforce (Spotify/zap)
-# Static cues stay short; Custodes carries the explanatory follow-up.
-# Previous long/static cues:
-# - "Final warning. Close {app}"
-# - "Twitter open for 7 minutes. Forcing break."
-# - "Distraction timeout. Close distractions now."
-# - "Break time exhausted"
-ENFORCE_LEVEL_PARAMS = {
-    1: {"endpoint": "/notify", "params": {"vibe": 30, "banner_text": "close {app}"}},
-    2: {
-        "endpoint": "/notify",
-        "params": {"vibe": 50, "beep": 30, "tts_text": "Close {app}", "banner_text": "close {app}"},
-    },
-    3: {
-        "endpoint": "/notify",
-        "params": {
-            "vibe": 80,
-            "beep": 50,
-            "tts_text": "last call {app}",
-            "banner_text": "last call",
-        },
-    },
-    4: {"endpoint": "/enforce", "params": {"banner_text": "enforcement active"}},
-    5: {
-        "endpoint": "/enforce",
-        "params": {"zap": 50, "tts_text": "pavlok fired", "banner_text": "enforcement: Pavlok"},
-    },
-}
-
-ENFORCEMENT_CASCADE_TIMEOUT = 300  # 5 min total cascade timeout
-DISCORD_FALLBACK_TIMEOUT = 30  # 30s to wait for app_close via Discord
 
 
 # [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
@@ -9472,6 +9726,7 @@ def send_tts_transport_control(command: str = "toggle") -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 # ============ Headless Mode (disabled on macOS) ============
 
 
@@ -9675,83 +9930,19 @@ from routes.tts import init_deps as tts_init_deps
 
 tts_init_deps(send_to_phone=_send_to_phone)
 
+# Wire enforce + notify dependencies (atomic emitter + device-aware dispatcher)
+from enforce import EnforceRequest, enforce
+from enforce import init_deps as enforce_init_deps
+from notify import NotifyRequest, dispatch_notification
+from notify import init_deps as notify_init_deps
+
+notify_init_deps(send_to_phone=_send_to_phone)
+enforce_init_deps(is_quiet_hours=is_quiet_hours)
+
 # Wire voice route dependencies
 from routes.voice import init_deps as voice_init_deps
 
 voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
-
-
-def _send_enforce_to_phone(app_name: str, level: int) -> dict:
-    """Send enforcement level to phone using v3 params.
-
-    Maps cascade level to v3 endpoint + params, sends to phone.
-    Returns dict with success status.
-    """
-    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
-    endpoint = level_config["endpoint"]
-    params = {
-        k: v.format(app=app_name) if isinstance(v, str) else v
-        for k, v in level_config["params"].items()
-    }
-    pavlok_result = None
-    if endpoint == "/enforce":
-        # Any mobile /enforce path must also have a server-side Pavlok path.
-        # If the phone is known offline, skip the dead mobile route entirely.
-        pavlok_result = send_pavlok_stimulus(
-            "zap",
-            params.get("zap", 30),
-            reason=f"phone_enforce_level_{level}_{app_name}",
-            respect_cooldown=False,
-        )
-        if PHONE_STATE.get("reachable") is False:
-            return {
-                "success": bool(pavlok_result.get("success")),
-                "endpoint": endpoint,
-                "phone_skipped": True,
-                "reason": "phone_known_offline",
-                "pavlok": pavlok_result,
-            }
-    phone_result = _send_to_phone(endpoint, params)
-    if pavlok_result is not None:
-        return {
-            **phone_result,
-            "endpoint": endpoint,
-            "pavlok": pavlok_result,
-            "success": bool(phone_result.get("success") or pavlok_result.get("success")),
-        }
-    return phone_result
-
-
-DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
-
-
-async def _send_discord_fallback(app_name: str, level: int):
-    """Send enforcement command to Discord #fallback via webhook.
-
-    Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
-
-    The phone's MacroDroid macro triggers on "POST /phone/enforce" in the Discord
-    notification, parses the JSON, and relays to its own localhost:7777/enforce.
-    Only /phone/enforce is accepted — no arbitrary code execution.
-    """
-    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
-    params = {
-        k: v.format(app=app_name) if isinstance(v, str) else v
-        for k, v in level_config["params"].items()
-    }
-    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
-    logger.info(f"DISCORD FALLBACK: {msg}")
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(DISCORD_FALLBACK_WEBHOOK, json={"content": msg})
-            if resp.status_code == 204:
-                logger.info("DISCORD FALLBACK: Webhook sent OK")
-            else:
-                logger.warning(
-                    f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}"
-                )
-    except Exception as e:
-        logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
 
 
 def _enforcement_state_payload(
@@ -9765,9 +9956,9 @@ def _enforcement_state_payload(
     """Build Custodes enforcement-state payloads without app/ack slot bleed.
 
     `phone_app`/`app` are foreground application telemetry fields for the
-    phone cascade. Internal acknowledgement identifiers (AskUserQuestion,
+    phone path. Internal acknowledgement identifiers (AskUserQuestion,
     Golden Throne, expected-ack namespaces) are diagnostic ack sources and must
-    never populate the cascade app slots.
+    never populate the phone-app slots.
     """
     payload = dict(extra)
     if source == "phone":
@@ -9784,194 +9975,62 @@ def _enforcement_state_payload(
     return payload
 
 
-async def _enforcement_cascade_worker(app_name: str):
-    """Background task that escalates enforcement levels until app_close or timeout.
+def start_enforcement_cascade(app_name: str) -> None:
+    """Fire a single atomic enforce for a distraction app.
 
-    Flow:
-      1. Send Discord fallback (level 0 — soft close via notification)
-      2. Wait DISCORD_FALLBACK_TIMEOUT for app_close
-      3. If still open, escalate through levels 1-5 with configured delays
-      4. Level 5 (Pavlok) repeats every 30s until close or cascade timeout
+    Replaces the legacy 5-level cascade. Golden Throne owns any repetition.
+    Distraction-source is set to "phone" so the notification is never routed
+    back to the device the user is being asked to put down.
     """
-    cascade = ENFORCEMENT_CASCADE
-    start = time.monotonic()
-    cascade["started_at"] = start
-    cascade["current_level"] = 0
-
     if is_quiet_hours():
-        cascade["active"] = False
-        cascade["task"] = None
-        print(f"CASCADE SUPPRESSED: quiet hours app={app_name}")
-        await log_quiet_hours_suppressed(
-            source="phone",
-            event_type="enforcement_cascade_started",
-            app=app_name,
-        )
-        return
-
-    print(f"CASCADE START: app={app_name}")
-    await log_event("enforcement_cascade_start", device_id="phone", details={"app": app_name})
-    await handle_custodes_state_event(
-        "enforcement_cascade_started",
-        "phone",
-        severity=2,
-        payload=_enforcement_state_payload(source="phone", app=app_name),
-    )
-
-    # Level 0: Discord fallback (soft close)
-    await _send_discord_fallback(app_name, 1)
-
-    # Wait for Discord fallback to work
-    await asyncio.sleep(DISCORD_FALLBACK_TIMEOUT)
-    if not cascade["active"]:
-        print("CASCADE: app_close received during Discord fallback wait")
-        return
-
-    # Escalate through levels 1-5
-    for level in range(1, 6):
-        if not cascade["active"]:
-            print(f"CASCADE: app_close received, standing down at level {level}")
-            return
-
-        elapsed = time.monotonic() - start
-        if elapsed > ENFORCEMENT_CASCADE_TIMEOUT:
-            print(
-                f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}"
-            )
-            break
-
-        cascade["current_level"] = level
-        cascade["last_escalation"] = time.monotonic()
-        print(f"CASCADE: Escalating to level {level} for {app_name}")
-        await log_event(
-            "enforcement_cascade_escalate",
-            device_id="phone",
-            details={"app": app_name, "level": level, "elapsed_s": round(elapsed)},
-        )
-        await handle_custodes_state_event(
-            "enforcement_cascade_escalate",
-            "phone",
-            severity=min(2 + level, 5),
-            payload=_enforcement_state_payload(
-                source="phone",
-                app=app_name,
-                level=level,
-                elapsed_s=round(elapsed),
-            ),
-        )
-
-        # Try phone first, fall back to server-side Pavlok API, then Discord
-        result = await asyncio.to_thread(_send_enforce_to_phone, app_name, level)
-        if not result["success"]:
-            # Phone unreachable — try server-side Pavlok API for levels with haptics
-            level_params = ENFORCE_LEVEL_PARAMS.get(level, {}).get("params", {})
-            if "zap" in level_params:
-                send_pavlok_stimulus(
-                    "zap",
-                    level_params["zap"],
-                    reason=f"cascade_level_{level}",
-                    respect_cooldown=False,
-                )
-            elif "vibe" in level_params:
-                send_pavlok_stimulus(
-                    "vibe",
-                    level_params["vibe"],
-                    reason=f"cascade_level_{level}",
-                    respect_cooldown=False,
-                )
-            # Discord as last resort
-            await _send_discord_fallback(app_name, level)
-
-        # Wait before next level (level 5 repeats in a loop)
-        if level == 5:
-            # Pavlok repeat loop
-            while cascade["active"] and (time.monotonic() - start) < ENFORCEMENT_CASCADE_TIMEOUT:
-                await asyncio.sleep(30)
-                if not cascade["active"]:
-                    break
-                result = await asyncio.to_thread(_send_enforce_to_phone, app_name, 5)
-                if not result["success"]:
-                    send_pavlok_stimulus(
-                        "zap", 50, reason="cascade_level_5_repeat", respect_cooldown=False
-                    )
-                    await _send_discord_fallback(app_name, 5)
-        else:
-            delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
-            await asyncio.sleep(delay)
-
-    # Cascade exhausted or timed out
-    cascade["active"] = False
-    cascade["task"] = None
-    elapsed = time.monotonic() - start
-    print(
-        f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}"
-    )
-    await log_event(
-        "enforcement_cascade_end",
-        device_id="phone",
-        details={
-            "app": app_name,
-            "final_level": cascade["current_level"],
-            "elapsed_s": round(elapsed),
-            "reason": "timeout_or_exhausted",
-        },
-    )
-
-
-def start_enforcement_cascade(app_name: str):
-    """Start the enforcement cascade for a forbidden app. Idempotent — won't double-start."""
-    cascade = ENFORCEMENT_CASCADE
-    if is_quiet_hours():
-        print(f"CASCADE: quiet hours suppressed for {app_name}")
+        print(f"ENFORCE: quiet hours suppressed for {app_name}")
         try:
             asyncio.ensure_future(
                 log_quiet_hours_suppressed(
                     source="phone",
-                    event_type="enforcement_cascade_start",
+                    event_type="phone_distraction_enforce",
                     app=app_name,
                 )
             )
         except RuntimeError:
             pass
         return
-    if cascade["active"]:
-        print(f"CASCADE: Already active for {cascade['app']}, ignoring {app_name}")
-        return
 
-    cascade["active"] = True
-    cascade["app"] = app_name
-    cascade["current_level"] = 0
-    cascade["task"] = asyncio.ensure_future(_enforcement_cascade_worker(app_name))
-
-
-def stop_enforcement_cascade(reason: str = "app_close"):
-    """Stop the enforcement cascade (app was closed or bailout triggered)."""
-    cascade = ENFORCEMENT_CASCADE
-    if not cascade["active"]:
-        return
-
-    app = cascade["app"]
-    level = cascade["current_level"]
-    elapsed = time.monotonic() - (cascade["started_at"] or time.monotonic())
-    print(f"CASCADE STOP: app={app} level={level} elapsed={elapsed:.0f}s reason={reason}")
-
-    cascade["active"] = False
-    cascade["app"] = None
-    cascade["current_level"] = 0
-    cascade["started_at"] = None
-    cascade["last_escalation"] = None
-
-    if cascade["task"] and not cascade["task"].done():
-        cascade["task"].cancel()
-    cascade["task"] = None
-
-    asyncio.ensure_future(
-        log_event(
-            "enforcement_cascade_stop",
-            device_id="phone",
-            details={"app": app, "level": level, "elapsed_s": round(elapsed), "reason": reason},
+    print(f"ENFORCE: phone distraction app={app_name}")
+    try:
+        asyncio.ensure_future(
+            handle_custodes_state_event(
+                "phone_distraction_enforce",
+                "phone",
+                severity=4,
+                payload=_enforcement_state_payload(source="phone", app=app_name),
+            )
         )
-    )
+    except RuntimeError:
+        pass
+    try:
+        asyncio.ensure_future(
+            enforce(
+                EnforceRequest(
+                    message=f"Close {app_name}",
+                    intensity=50,
+                    distraction_source="phone",
+                    source=f"phone_distraction_{app_name}",
+                )
+            )
+        )
+    except RuntimeError:
+        pass
+
+
+def stop_enforcement_cascade(reason: str = "app_close") -> None:
+    """No-op shim retained for in-tree callers after cascade removal.
+
+    Golden Throne now owns any ongoing escalation state, so there is nothing
+    to stop here. Kept so prompt-submit, quiet-enter, negative-edge close,
+    and work-action paths keep their call signatures.
+    """
+    asyncio.ensure_future(log_event("enforcement_stop_shim", details={"reason": reason}))
 
 
 def check_phone_reachable() -> dict:
@@ -11793,76 +11852,6 @@ async def hook_work_action_callback(source: str, note: str | None = None):
     return await work_action(WorkActionRequest(source=source, note=note))
 
 
-# ============ Pavlok Endpoints ============
-
-
-@app.post("/api/pavlok/zap")
-async def pavlok_zap(
-    type: str = "zap",
-    value: int | None = None,
-    reason: str = "manual",
-):
-    """Send a stimulus to the Pavlok watch. Bypasses cooldown for manual triggers."""
-    result = send_pavlok_stimulus(
-        stimulus_type=type,
-        value=value,
-        reason=reason,
-        respect_cooldown=False,
-    )
-    await log_event("pavlok_stimulus", details=result)
-    return result
-
-
-@app.post("/api/pavlok/toggle")
-async def pavlok_toggle(enabled: bool | None = None):
-    """Toggle or set Pavlok enforcement. No body = toggle current state."""
-    if enabled is None:
-        PAVLOK_CONFIG["enabled"] = not PAVLOK_CONFIG["enabled"]
-    else:
-        PAVLOK_CONFIG["enabled"] = enabled
-    await log_event("pavlok_toggled", details={"enabled": PAVLOK_CONFIG["enabled"]})
-    return {"enabled": PAVLOK_CONFIG["enabled"]}
-
-
-@app.get("/api/pavlok/status")
-async def pavlok_status():
-    """Get current Pavlok state."""
-    cooldown_remaining = 0.0
-    if PAVLOK_STATE["last_stimulus_at"]:
-        elapsed = (
-            datetime.now() - datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
-        ).total_seconds()
-        cooldown_remaining = max(0.0, PAVLOK_CONFIG["cooldown_seconds"] - elapsed)
-
-    def _cooldown_remaining(last_at: str | None, cooldown_seconds: int | None) -> int:
-        if not last_at or not cooldown_seconds:
-            return 0
-        elapsed = (datetime.now() - datetime.fromisoformat(last_at)).total_seconds()
-        return round(max(0, cooldown_seconds - elapsed))
-
-    return {
-        "enabled": PAVLOK_CONFIG["enabled"],
-        "token_set": bool(PAVLOK_CONFIG["token"]),
-        "last_stimulus_at": PAVLOK_STATE["last_stimulus_at"],
-        "cooldown_remaining_seconds": round(cooldown_remaining),
-        "default_zap_value": PAVLOK_CONFIG["default_zap_value"],
-        "cooldown_seconds": PAVLOK_CONFIG["cooldown_seconds"],
-        "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
-        "zap_count_date": PAVLOK_STATE.get("zap_count_date"),
-        "zap_count": PAVLOK_STATE.get("zap_count", 0),
-        "zap_cooldown_seconds": PAVLOK_CONFIG.get("zap_cooldown_seconds"),
-        "soft_cooldown_seconds": PAVLOK_CONFIG.get("soft_cooldown_seconds"),
-        "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
-        "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
-        "zap_cooldown_remaining_seconds": _cooldown_remaining(
-            PAVLOK_STATE.get("last_zap_at"), PAVLOK_CONFIG.get("zap_cooldown_seconds")
-        ),
-        "soft_cooldown_remaining_seconds": _cooldown_remaining(
-            PAVLOK_STATE.get("last_soft_at"), PAVLOK_CONFIG.get("soft_cooldown_seconds")
-        ),
-    }
-
-
 # ============ Work Mode / Geofence Endpoints ============
 # MacroDroid uses geofence to send work mode changes
 
@@ -13330,6 +13319,394 @@ async def root():
         "version": "0.1.0",
         "description": "Local FastAPI server for Claude instance management",
         "docs": "/docs",
+        "ui": "/ui/ops",
+    }
+
+
+def _ops_parse_datetime(timestamp: str | datetime | None) -> datetime | None:
+    if not timestamp:
+        return None
+    if isinstance(timestamp, datetime):
+        return timestamp
+    try:
+        normalized = timestamp.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+
+
+def _ops_seconds_since(
+    timestamp: str | datetime | None, *, now: datetime | None = None
+) -> int | None:
+    parsed = _ops_parse_datetime(timestamp)
+    if not parsed:
+        return None
+    reference = now or (datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now())
+    try:
+        return max(0, int((reference - parsed).total_seconds()))
+    except Exception:
+        return None
+
+
+def _ops_parse_event_details(raw: str | None) -> dict | list | str | None:
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict:
+    if age_seconds is None:
+        return {"is_stale": False, "threshold_seconds": None, "reason": None}
+    threshold = 10 * 60 if status == "processing" else 2 * 60 * 60
+    is_stale = age_seconds >= threshold
+    return {
+        "is_stale": is_stale,
+        "threshold_seconds": threshold,
+        "reason": f"{status or 'unknown'}_activity_age" if is_stale else None,
+    }
+
+
+def _ops_display_name(inst: dict) -> str:
+    return (
+        inst.get("tab_name")
+        or inst.get("pane_label")
+        or inst.get("session_doc_title")
+        or inst.get("working_dir")
+        or str(inst.get("id") or "")[:12]
+    )
+
+
+async def _ops_read_cron_summary() -> dict:
+    if cron_engine is not None:
+        try:
+            status = await cron_engine.get_status()
+            jobs = status.get("jobs") or []
+            return {
+                "available": True,
+                "total_jobs": status.get("total_jobs", 0),
+                "enabled": status.get("enabled", 0),
+                "running": status.get("running", 0),
+                "runs_last_24h": status.get("runs_last_24h", 0),
+                "jobs": jobs[:12],
+            }
+        except Exception as exc:
+            logger.warning(f"Ops cron summary via cron_engine failed: {exc}")
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            counts = await db.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_jobs,
+                    SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled
+                FROM cron_jobs
+                """
+            )
+            count_row = await counts.fetchone()
+            runs = await db.execute(
+                "SELECT COUNT(*) AS runs_last_24h FROM cron_runs WHERE started_at > ?",
+                ((datetime.now() - timedelta(hours=24)).isoformat(),),
+            )
+            runs_row = await runs.fetchone()
+            jobs_cursor = await db.execute(
+                """
+                SELECT id, name, enabled, schedule_type, schedule_value, updated_at
+                FROM cron_jobs
+                ORDER BY enabled DESC, name ASC
+                LIMIT 12
+                """
+            )
+            jobs = [dict(row) for row in await jobs_cursor.fetchall()]
+        return {
+            "available": True,
+            "total_jobs": int(count_row["total_jobs"] or 0) if count_row else 0,
+            "enabled": int(count_row["enabled"] or 0) if count_row else 0,
+            "running": 0,
+            "runs_last_24h": int(runs_row["runs_last_24h"] or 0) if runs_row else 0,
+            "jobs": jobs,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "total_jobs": 0,
+            "enabled": 0,
+            "running": 0,
+            "runs_last_24h": 0,
+            "jobs": [],
+        }
+
+
+async def _ops_read_enforcement_summary() -> dict:
+    now = datetime.now()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM expected_acknowledgements
+                WHERE status = 'pending'
+                ORDER BY ack_due_at ASC
+                LIMIT 12
+                """
+            )
+            rows = await cursor.fetchall()
+        pending = []
+        for row in rows:
+            ack = _expected_ack_row_to_dict(row)
+            ack["current_level"] = _ack_current_level(ack, now)
+            pending.append(ack)
+        return {
+            "available": True,
+            "pending_count": len(pending),
+            "pending": pending,
+            "pavlok": {
+                "enabled": PAVLOK_CONFIG.get("enabled"),
+                "zap_count": PAVLOK_STATE.get("zap_count", 0),
+                "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
+                "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
+                "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
+            },
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "pending_count": 0,
+            "pending": [],
+            "pavlok": {
+                "enabled": PAVLOK_CONFIG.get("enabled"),
+                "zap_count": PAVLOK_STATE.get("zap_count", 0),
+                "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
+                "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
+                "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
+            },
+        }
+
+
+async def _ops_read_instances(now: datetime) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project,
+                   sd.cron_job_id AS session_doc_cron_job_id
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            WHERE ci.status IN ('processing', 'idle')
+            ORDER BY
+                CASE ci.status WHEN 'processing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                ci.last_activity DESC
+            LIMIT 160
+            """
+        )
+        rows = await cursor.fetchall()
+
+    active = []
+    status_counts: dict[str, int] = {}
+    engine_counts: dict[str, int] = {}
+    legion_counts: dict[str, int] = {}
+    stale_count = 0
+    for row in rows:
+        inst = dict(row)
+        status = inst.get("status") or "unknown"
+        engine = inst.get("engine") or "claude"
+        legion = inst.get("legion") or inst.get("instance_type") or "unassigned"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        engine_counts[engine] = engine_counts.get(engine, 0) + 1
+        legion_counts[legion] = legion_counts.get(legion, 0) + 1
+        activity_anchor = inst.get("last_activity") or inst.get("registered_at")
+        age_seconds = _ops_seconds_since(activity_anchor, now=now)
+        staleness = _ops_instance_staleness(status, age_seconds)
+        if staleness["is_stale"]:
+            stale_count += 1
+        gt_job = scheduler.get_job(f"golden-throne-{inst.get('id')}")
+        active.append(
+            {
+                "id": inst.get("id"),
+                "session_id": inst.get("session_id"),
+                "display_name": _ops_display_name(inst),
+                "tab_name": inst.get("tab_name"),
+                "status": status,
+                "engine": engine,
+                "device_id": inst.get("device_id"),
+                "working_dir": inst.get("working_dir"),
+                "tmux_pane": inst.get("tmux_pane"),
+                "pane_label": inst.get("pane_label"),
+                "last_activity": inst.get("last_activity"),
+                "registered_at": inst.get("registered_at"),
+                "age_seconds": age_seconds,
+                "age_minutes": None if age_seconds is None else age_seconds // 60,
+                "is_subagent": bool(inst.get("is_subagent") or 0),
+                "legion": inst.get("legion"),
+                "instance_type": inst.get("instance_type"),
+                "workflow_state": inst.get("workflow_state"),
+                "next_required_action": inst.get("next_required_action"),
+                "stop_allowed": bool(inst.get("stop_allowed"))
+                if inst.get("stop_allowed") is not None
+                else None,
+                "session_doc": {
+                    "id": inst.get("session_doc_id"),
+                    "title": inst.get("session_doc_title"),
+                    "path": inst.get("session_doc_path") or inst.get("dispatch_session_doc_path"),
+                    "status": inst.get("session_doc_status"),
+                    "project": inst.get("session_doc_project"),
+                    "policy": inst.get("session_doc_policy"),
+                    "binding_source": inst.get("continuity_binding_source"),
+                    "cron_job_id": inst.get("session_doc_cron_job_id"),
+                },
+                "stale": staleness,
+                "zealotry": inst.get("zealotry") or 4,
+                "gt": {
+                    "next_fire": gt_job.next_run_time.isoformat()
+                    if gt_job and gt_job.next_run_time
+                    else None,
+                    "resume_count": inst.get("gt_resume_count") or 0,
+                    "resume_window_started_at": inst.get("gt_resume_window_started_at"),
+                    "last_resume_at": inst.get("gt_last_resume_at"),
+                    "victory_at": inst.get("victory_at"),
+                    "victory_reason": inst.get("victory_reason"),
+                },
+            }
+        )
+
+    return {
+        "active": active,
+        "counts": {
+            "active": len(active),
+            "stale": stale_count,
+            "by_status": status_counts,
+            "by_engine": engine_counts,
+            "by_legion": legion_counts,
+        },
+    }
+
+
+async def _ops_read_events() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT event_type, instance_id, device_id, details, created_at
+            FROM events
+            ORDER BY created_at DESC
+            LIMIT 24
+            """
+        )
+        rows = await cursor.fetchall()
+    return [
+        {
+            "event_type": row["event_type"],
+            "instance_id": row["instance_id"],
+            "device_id": row["device_id"],
+            "details": _ops_parse_event_details(row["details"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+@app.get("/ui/ops")
+async def ops_ui():
+    """Serve the Terminus ops cockpit shell."""
+    index_path = UI_DIR / "ops" / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Ops UI build not found")
+    return FileResponse(index_path, media_type="text/html")
+
+
+@app.get("/ui/ops/{asset_path:path}")
+async def ops_ui_asset(asset_path: str):
+    """Serve built Terminus ops assets without exposing paths outside ui/ops."""
+    if not asset_path or asset_path.startswith(("/", "\\")):
+        raise HTTPException(status_code=404, detail="Ops UI asset not found")
+    root = (UI_DIR / "ops").resolve()
+    target = (root / asset_path).resolve()
+    if not target.is_relative_to(root) or not target.is_file() or target.name == "index.html":
+        raise HTTPException(status_code=404, detail="Ops UI asset not found")
+    media_type, _ = mimetypes.guess_type(str(target))
+    return FileResponse(target, media_type=media_type or "application/octet-stream")
+
+
+@app.get("/api/ui/ops/state")
+async def get_ops_display_state():
+    """Aggregate read model for the Terminus ops cockpit."""
+    now = datetime.now()
+    work_state = await get_cached_work_state()
+    instances = await _ops_read_instances(now)
+    events = await _ops_read_events()
+    cron_summary = await _ops_read_cron_summary()
+    enforcement_summary = await _ops_read_enforcement_summary()
+    tts_summary = get_tts_queue_status()
+
+    break_balance_ms = timer_engine.break_balance_ms
+    return {
+        "surface": "ops",
+        "generated_at": now.isoformat(),
+        "timer": {
+            "mode": timer_engine.current_mode.value,
+            "activity": timer_engine.activity.value,
+            "productivity_active": work_state.productivity_active,
+            "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
+            "manual_mode_lock": timer_engine.manual_mode_lock,
+            "manual_trigger": timer_engine.manual_trigger,
+            "focus_active": timer_engine.focus_active,
+            "break_balance_ms": break_balance_ms,
+            "break_available_ms": max(0, break_balance_ms),
+            "break_backlog_ms": abs(min(0, break_balance_ms)),
+            "is_in_backlog": break_balance_ms < 0,
+            "total_work_time_ms": timer_engine.total_work_time_ms,
+            "total_break_time_ms": timer_engine.total_break_time_ms,
+            "daily_start_date": timer_engine.daily_start_date,
+        },
+        "attention": {
+            "desktop": {
+                "mode": DESKTOP_STATE.get("current_mode", "silence"),
+                "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+                "last_detection": DESKTOP_STATE.get("last_detection"),
+                "location_zone": DESKTOP_STATE.get("location_zone"),
+                "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
+                "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
+                "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+                "steam_exe": DESKTOP_STATE.get("steam_exe"),
+                "in_meeting": DESKTOP_STATE.get("in_meeting", False),
+            },
+            "phone": {
+                "app": PHONE_STATE.get("current_app"),
+                "is_distracted": PHONE_STATE.get("is_distracted", False),
+                "last_activity": PHONE_STATE.get("last_activity"),
+                "app_opened_at": PHONE_STATE.get("app_opened_at"),
+                "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
+            },
+        },
+        "work_state": work_state.model_dump(),
+        "instances": instances,
+        "events": events,
+        "cron": cron_summary,
+        "tts": {
+            "current": tts_summary.get("current"),
+            "hot_queue": tts_summary.get("hot_queue", []),
+            "pause_queue": tts_summary.get("pause_queue", []),
+            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
+            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
+            "queue_length": tts_summary.get("queue_length", 0),
+            "backend": tts_summary.get("backend"),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+        },
+        "voice_drafts": [
+            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
+        ],
+        "enforcement": enforcement_summary,
     }
 
 
@@ -13666,18 +14043,22 @@ async def _async_enforce_twitter_timeout():
     except Exception:
         pass
 
-    # Phone: v3 enforce with zap, fallback to server-side Pavlok API
+    # Pavlok is queued separately; /enforce is notification/TTS/Spotify only.
+    pavlok_result = await asyncio.to_thread(
+        send_pavlok_stimulus,
+        "zap",
+        30,
+        "twitter_timeout",
+        True,
+    )
     result = await asyncio.to_thread(
         _send_to_phone,
         "/enforce",
         {
-            "zap": 30,
             "tts_text": "twitter timeout",
             "banner_text": "Twitter timeout",
         },
     )
-    if not result["success"]:
-        send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
 
     # Force timer into BREAK mode (clear any existing manual mode first)
     old_mode = timer_engine.current_mode.value
@@ -13698,6 +14079,8 @@ async def _async_enforce_twitter_timeout():
         details={
             "old_mode": old_mode,
             "forced_break": changed,
+            "pavlok": pavlok_result,
+            "phone": result,
         },
     )
 
@@ -13820,11 +14203,11 @@ async def legion_pane_recolor_worker():
                                 cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", "bg=default"]
                             else:
                                 cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", f"bg={bg}"]
-                            await _run_subprocess_offloop(
-                                cmd,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL,
-                                timeout=5,
+                            await asyncio.to_thread(
+                                _run_tmux_focus_preserved,
+                                tuple(cmd),
+                                source="token-api pane-recolor",
+                                attempted_target=tmux_pane,
                             )
                             logger.info(
                                 f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})"
@@ -13869,15 +14252,25 @@ async def pane_state_worker():
                     continue
 
                 processed = []
+                stopped_assertions: list[tuple[str, str]] = []
                 for row in rows:
                     pane = row["tmux_pane"]
+                    pane_label = None
                     if not pane:
                         cur2 = await db.execute(
-                            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                            "SELECT tmux_pane, pane_label FROM claude_instances WHERE id = ?",
                             (row["instance_id"],),
                         )
                         r = await cur2.fetchone()
                         pane = r["tmux_pane"] if r else None
+                        pane_label = r["pane_label"] if r else None
+                    else:
+                        cur2 = await db.execute(
+                            "SELECT pane_label FROM claude_instances WHERE id = ?",
+                            (row["instance_id"],),
+                        )
+                        r = await cur2.fetchone()
+                        pane_label = r["pane_label"] if r else None
                     if pane:
                         try:
                             await _run_subprocess_offloop(
@@ -13899,12 +14292,20 @@ async def pane_state_worker():
                             )
                         except Exception as e:
                             logger.warning(f"Pane state set failed for {pane}: {e}")
+                    if (
+                        row["variable"] == "@CC_STATE"
+                        and row["value"] == "stopped"
+                        and not _is_assert_persona_label(pane_label)
+                    ):
+                        stopped_assertions.append((pane_label or pane, row["instance_id"]))
                     processed.append(row["id"])
 
                 if processed:
                     ph = ",".join("?" * len(processed))
                     await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
                     await db.commit()
+                for pane_target, instance_id in stopped_assertions:
+                    spawn_tmux_assert_instance(pane_target, instance_id, "pane-state-stopped")
         except Exception as e:
             logger.error(f"Pane state worker error: {e}")
         await asyncio.sleep(1)
@@ -13918,7 +14319,7 @@ RECONCILE_PROCESSING_THRESHOLD_SECONDS = 10
 
 
 async def _read_tmux_panes() -> dict[str, dict] | None:
-    """Return ``{pane_id: {session_window, current_command, title}}`` from tmux.
+    """Return ``{pane_id: {pane_label, session_window, current_command, title}}`` from tmux.
 
     Returns ``None`` when tmux itself is unreachable (don't reconcile a blind cycle).
     Returns ``{}`` when tmux is alive but has zero panes.
@@ -13930,7 +14331,7 @@ async def _read_tmux_panes() -> dict[str, dict] | None:
                 "list-panes",
                 "-a",
                 "-F",
-                "#{pane_id}|#{session_name}:#{window_name}|#{pane_current_command}|#{pane_title}",
+                "#{pane_id}|#{@PANE_ID}|#{session_name}:#{window_name}|#{pane_current_command}|#{pane_title}",
             ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -13942,12 +14343,13 @@ async def _read_tmux_panes() -> dict[str, dict] | None:
         return None
     panes: dict[str, dict] = {}
     for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
-        parts = line.split("|", 3)
-        if len(parts) < 4:
+        parts = line.split("|", 4)
+        if len(parts) < 5:
             continue
-        pane_id, session_window, current_command, title = parts
+        pane_id, pane_label, session_window, current_command, title = parts
         if pane_id:
             panes[pane_id] = {
+                "pane_label": pane_label or session_window,
                 "session_window": session_window,
                 "current_command": current_command,
                 "title": title,
@@ -14048,8 +14450,8 @@ def _compute_drift_flags(
     if tmux_pane and tmux_pane not in panes:
         flags.append("pane_missing")
     if tmux_pane and tmux_pane in panes:
-        tmux_sw = panes[tmux_pane]["session_window"]
-        if row.get("pane_label") != tmux_sw:
+        tmux_label = panes[tmux_pane]["pane_label"]
+        if row.get("pane_label") != tmux_label:
             flags.append("pane_label_drift")
     if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
         flags.append("tab_name_placeholder")
@@ -14155,6 +14557,12 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                         actor="reconciler",
                     )
                     counts["pane_vanished"] += 1
+                    if not _is_assert_persona_label(row.get("pane_label")):
+                        spawn_tmux_assert_instance(
+                            row.get("pane_label") or tmux_pane,
+                            row.get("id", ""),
+                            "reconciler-pane-missing",
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Reconciler pane_missing mutation failed for {row.get('id')}: {e}"
@@ -14163,16 +14571,38 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
 
             # Pane label drift.
             if tmux_pane and tmux_pane in panes:
-                tmux_sw = panes[tmux_pane]["session_window"]
-                if row.get("pane_label") != tmux_sw:
+                tmux_label = panes[tmux_pane]["pane_label"]
+                if row.get("pane_label") != tmux_label:
                     try:
+                        workflow_events = [
+                            {
+                                "workflow_state": row.get("status"),
+                                "event_type": "pane_label_reconciled",
+                                "event_owner": "tmux_db_reconciler",
+                                "details": {
+                                    "previous_pane_label": row.get("pane_label"),
+                                    "tmux_pane_label": tmux_label,
+                                    "tmux_session_window": panes[tmux_pane].get("session_window"),
+                                    "tmux_pane": tmux_pane,
+                                },
+                            }
+                        ]
                         await sanctioned_update_instance(
                             db,
                             instance_id=row["id"],
-                            updates={"pane_label": tmux_sw},
+                            updates={"pane_label": tmux_label},
                             mutation_type="reconcile_pane_label",
                             write_source="tmux_db_reconciler",
                             actor="reconciler",
+                            workflow_events=workflow_events,
+                        )
+                        logger.info(
+                            "Reconciler pane_label mutation instance=%s tmux_pane=%s old=%s new=%s session_window=%s",
+                            row.get("id"),
+                            tmux_pane,
+                            row.get("pane_label"),
+                            tmux_label,
+                            panes[tmux_pane].get("session_window"),
                         )
                         counts["pane_label_drift"] += 1
                     except Exception as e:
@@ -14369,6 +14799,14 @@ async def clear_stale_processing_flags():
                     logger.warning(
                         f"Auto-stopped {len(stopped_dead_panes)} dead tmux-pane instance rows"
                     )
+                    for stopped in stopped_dead_panes:
+                        if _is_assert_persona_label(stopped.get("pane_label")):
+                            continue
+                        spawn_tmux_assert_instance(
+                            stopped.get("pane_label") or stopped.get("tmux_pane"),
+                            stopped.get("id", ""),
+                            "clear-dead-tmux-pane",
+                        )
                     for stopped in stopped_dead_panes:
                         if stopped.get("instance_type") != "golden_throne":
                             continue
@@ -14784,7 +15222,8 @@ def _morning_health_check() -> None:
 def _morning_escalate(level: int) -> None:
     """APScheduler callback: fire morning enforce escalation at the given level.
 
-    Runs in APScheduler thread — bridges to async unified_enforce via event loop.
+    Runs in APScheduler thread — bridges to async enforce via event loop.
+    L1 is a pure notification; L2/L3 fire atomic shock+TTS at rising intensity.
     """
     state = MORNING_ENFORCE_STATE
     if state["status"] != "pending":
@@ -14795,277 +15234,69 @@ def _morning_escalate(level: int) -> None:
     logger.warning(f"Morning enforce escalation L{level} fired")
 
     if level == 1:
-        _unified_enforce_sync(
-            level="notify",
-            message="Morning session pending.",
-            source="morning",
-            channel="briefing",
-        )
+        _notify_sync(NotifyRequest(message="Morning session pending.", type="tts"))
     elif level == 2:
-        _unified_enforce_sync(
-            level="warn",
-            message="**Morning Session** (unacknowledged)",
-            source="morning",
+        _enforce_sync(
+            EnforceRequest(
+                message="Morning Session unacknowledged",
+                intensity=25,
+                source="morning",
+            )
         )
     elif level == 3:
         state["status"] = "blocked"
         logger.warning("Morning enforce L3: morning_blocked — Custodes will not proceed")
-        _unified_enforce_sync(
-            level="block",
-            message=(
-                "**Morning Session BLOCKED** (15 min elapsed)\n"
-                "Custodes will not proceed until you respond.\n"
-                "Acknowledge: `POST /api/morning/acknowledge`\n"
-                "Override: `POST /api/morning/override` (requires reason)"
-            ),
-            source="morning",
-        )
-
-
-# ── Unified Enforce ───────────────────────────────────────
-# Single entry point for all escalation: Discord (@mention for notify, DM for warn/enforce/block)
-# + phone notifications + TTS. Agents call this, not raw urllib.
-
-_ENFORCE_LEVELS = {
-    "notify": {
-        "phone_endpoint": "/notify",
-        "phone_vibe": 30,
-        "discord_mode": "channel",
-        "emoji": "",
-    },
-    "warn": {
-        "phone_endpoint": "/notify",
-        "phone_vibe": 50,
-        "phone_beep": 30,
-        "discord_mode": "dm",
-        "emoji": "⚠️",
-    },
-    "enforce": {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "⛔"},
-    "block": {"phone_endpoint": "/enforce", "phone_zap": 30, "discord_mode": "dm", "emoji": "🚫"},
-}
-
-
-def _enforcement_label(level: str, source: str, message: str = "") -> str:
-    haystack = f"{source} {message}".lower()
-    if "break_exhausted" in haystack or "break exhausted" in haystack:
-        return "break exhausted"
-    if "backlog" in haystack:
-        return "backlog violation"
-    if "ack" in haystack:
-        return "ack overdue" if level != "notify" else "ack due"
-    if level in ("enforce", "block"):
-        return "enforcement active"
-    if level == "warn":
-        return "enforcement incoming"
-    return "enforcement notice"
-
-
-async def unified_enforce(
-    level: str,
-    message: str,
-    source: str = "agent",
-    channel: str | None = None,
-    bot: str = "custodes",
-    phone_params: dict | None = None,
-    legion_context: str | None = None,
-) -> dict:
-    """Unified enforce: Discord + phone + TTS in one call.
-
-    Args:
-        level: "notify" | "warn" | "enforce" | "block"
-        message: Human-readable message content
-        source: Origin of the enforce ("morning", "timer", "agent", "custom")
-        channel: Discord channel for @mention-level messages (None = DM only)
-        bot: Discord bot identity ("custodes", "mechanicus", "inquisition")
-        phone_params: Override default phone notification params
-        legion_context: For third-person framing of non-custodes escalations
-    """
-    cfg = _ENFORCE_LEVELS.get(level)
-    if not cfg:
-        return {"success": False, "error": f"Unknown enforce level: {level}"}
-
-    result = {"level": level, "source": source, "discord": None, "phone": None, "tts": None}
-    if is_quiet_hours():
-        suppression = await log_quiet_hours_suppressed(
-            source=source,
-            event_type="unified_enforce",
-            details={"level": level, "message": message[:200], "channel": channel, "bot": bot},
-        )
-        result.update(
-            {
-                "success": True,
-                "suppressed": True,
-                "reason": "quiet_hours",
-                "quiet_hours": suppression["quiet_hours"],
-            }
-        )
-        return result
-
-    # ── Discord ──
-    discord_mode = cfg["discord_mode"]
-    emoji = cfg["emoji"]
-
-    # Third-person framing for non-custodes escalations
-    if legion_context and bot != "custodes":
-        discord_text = f"{emoji} There's a report of a stranded **{legion_context}** that needs attention.\n{message}"
-    else:
-        discord_text = f"{emoji} {message}" if emoji else message
-
-    try:
-        import urllib.request as _urllib_req
-
-        if discord_mode == "channel" and channel:
-            payload = json.dumps(
-                {
-                    "channel": channel,
-                    "bot": bot,
-                    "content": discord_text[:2000],
-                }
-            ).encode()
-            req = _urllib_req.Request(
-                f"{DISCORD_DAEMON_URL}/send",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _urllib_req.urlopen(req, timeout=10)
-            )
-            result["discord"] = f"channel:{channel}"
-        elif discord_mode == "dm" or (discord_mode == "channel" and not channel):
-            payload = json.dumps({"content": discord_text[:2000]}).encode()
-            req = _urllib_req.Request(
-                f"{DISCORD_DAEMON_URL}/dm",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _urllib_req.urlopen(req, timeout=10)
-            )
-            result["discord"] = "dm"
-        logger.info(f"Enforce [{level}]: Discord {result['discord']} sent")
-    except Exception as e:
-        logger.warning(f"Enforce [{level}]: Discord failed: {e}")
-        result["discord"] = f"error:{e}"
-
-    # ── Phone ──
-    p = phone_params or {}
-    phone_endpoint = p.get("endpoint", cfg["phone_endpoint"])
-    phone_payload = {}
-    if "phone_vibe" in cfg:
-        phone_payload["vibe"] = p.get("vibe", cfg["phone_vibe"])
-    if "phone_beep" in cfg:
-        phone_payload["beep"] = p.get("beep", cfg["phone_beep"])
-    direct_pavlok = level in ("enforce", "block") and p.get("direct_pavlok", True)
-    zap_value = p.get("zap", cfg.get("phone_zap", 30))
-    if "phone_zap" in cfg and not direct_pavlok:
-        phone_payload["zap"] = zap_value
-    label = _enforcement_label(level, source, message)
-    phone_payload["tts_text"] = p.get("tts_text", label)
-    phone_payload["banner_text"] = p.get("banner_text", label)
-
-    phone_result = _send_to_phone(phone_endpoint, phone_payload)
-    result["phone"] = phone_result
-    if level in ("enforce", "block"):
-        if direct_pavlok:
-            pavlok_result = send_pavlok_stimulus(
-                "zap",
-                value=zap_value,
-                reason=f"enforce_{level}_{source}",
-            )
-            result["pavlok"] = pavlok_result
-            await log_event("pavlok_stimulus", details=pavlok_result)
-            if not pavlok_result.get("success"):
-                logger.warning(f"Enforce [{level}]: direct Pavlok zap failed: {pavlok_result}")
-        elif not phone_result.get("success"):
-            pavlok_result = send_pavlok_stimulus(
-                "zap",
-                value=zap_value,
-                reason=f"enforce_{level}_{source}",
-            )
-            result["pavlok"] = pavlok_result
-            await log_event("pavlok_stimulus", details=pavlok_result)
-            logger.warning(f"Enforce [{level}]: phone unreachable, Pavlok zap fallback fired")
-
-    # ── Desktop TTS ──
-    speak_checkin_tts(p.get("desktop_tts_text", phone_payload["tts_text"]))
-    result["tts"] = "sent"
-
-    await log_event("enforce", details={"level": level, "source": source, "message": message[:200]})
-    logger.info(f"Enforce [{level}] from {source}: complete")
-    return result
-
-
-def _unified_enforce_sync(
-    level: str,
-    message: str,
-    source: str = "agent",
-    channel: str | None = None,
-    bot: str = "custodes",
-    phone_params: dict | None = None,
-    legion_context: str | None = None,
-) -> dict:
-    """Sync wrapper for unified_enforce — for APScheduler callbacks."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                unified_enforce(
-                    level,
-                    message,
-                    source,
-                    channel,
-                    bot,
-                    phone_params,
-                    legion_context,
+        _enforce_sync(
+            EnforceRequest(
+                message=(
+                    "Morning Session BLOCKED (15 min elapsed). "
+                    "Custodes will not proceed until you respond."
                 ),
-                loop,
+                intensity=50,
+                source="morning",
             )
+        )
+
+
+# ── Atomic Enforce (stateless emitter) ────────────────────
+# Every /api/enforce call fires Pavlok (>=25 intensity) AND a notification.
+# Escalation, ack tracking, and ladder logic live in Golden Throne, not here.
+# Implementation: enforce.py + notify.py.
+
+
+def _enforce_sync(request: EnforceRequest) -> dict:
+    """Sync wrapper for enforce() — for APScheduler callbacks."""
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(enforce(request), APP_LOOP)
             return future.result(timeout=20)
-        else:
-            return asyncio.run(
-                unified_enforce(
-                    level,
-                    message,
-                    source,
-                    channel,
-                    bot,
-                    phone_params,
-                    legion_context,
-                )
-            )
+        return asyncio.run(enforce(request))
     except Exception as e:
         logger.warning(f"Enforce sync wrapper failed: {e}")
-        return {"success": False, "error": str(e)}
+        return {"fired": False, "error": str(e)}
 
 
-class EnforceRequest(BaseModel):
-    level: str  # "notify" | "warn" | "enforce" | "block"
-    message: str
-    source: str = "api"
-    channel: str | None = None
-    bot: str = "custodes"
-    phone_params: dict | None = None
-    legion_context: str | None = None
+def _notify_sync(request: NotifyRequest) -> dict:
+    """Sync wrapper for dispatch_notification() — for APScheduler callbacks."""
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(dispatch_notification(request), APP_LOOP)
+            return future.result(timeout=20)
+        return asyncio.run(dispatch_notification(request))
+    except Exception as e:
+        logger.warning(f"Notify sync wrapper failed: {e}")
+        return {"delivered": False, "error": str(e)}
 
 
 @app.post("/api/enforce")
 async def enforce_endpoint(request: EnforceRequest):
-    """Unified enforce endpoint — callable by agents, CLI tools, and cron jobs."""
-    if request.level not in _ENFORCE_LEVELS:
-        raise HTTPException(
-            status_code=400, detail=f"level must be one of: {', '.join(_ENFORCE_LEVELS)}"
-        )
-    return await unified_enforce(
-        level=request.level,
-        message=request.message,
-        source=request.source,
-        channel=request.channel,
-        bot=request.bot,
-        phone_params=request.phone_params,
-        legion_context=request.legion_context,
-    )
+    """Atomic stateless enforce: Pavlok shock + notification.
+
+    Every call fires Pavlok (>=25 intensity) AND a notification. Guardrails:
+    quiet-hours + in-meeting only. No warnings, no soft tiers, no cooldowns.
+    Escalation/ack tracking live in Golden Throne, not here.
+    """
+    return await enforce(request)
 
 
 @app.post("/api/enforcement/ack")
@@ -15464,7 +15695,6 @@ async def alarm_dismiss(delay_minutes: int = 0):
 
 # ============ Stash: Cross-Machine Clipboard & File Sharing ============
 
-import mimetypes
 
 
 def stash_cleanup():
@@ -15704,7 +15934,9 @@ async def _try_discord_active_pane_injection(message) -> bool:
     """
     requested_pane = getattr(message, "target_tmux_pane", None)
     if not requested_pane:
-        logger.warning("Discord active-pane injection: no locked pane supplied; refusing fallback retarget")
+        logger.warning(
+            "Discord active-pane injection: no locked pane supplied; refusing fallback retarget"
+        )
         return False
 
     if not requested_pane.startswith("%") or not await _tmux_pane_exists(requested_pane):
@@ -15720,7 +15952,9 @@ async def _try_discord_active_pane_injection(message) -> bool:
     try:
         tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
         dictate_args = [str(tmux_dictate), "-t", pane]
-        if not getattr(message, "voice_no_submit", False) and not getattr(message, "voice_append_submit", False):
+        if not getattr(message, "voice_no_submit", False) and not getattr(
+            message, "voice_append_submit", False
+        ):
             dictate_args.append("--submit")
         if getattr(message, "voice_append_submit", False):
             # A pooled short utterance is already sitting in the prompt bar.
@@ -15748,7 +15982,11 @@ async def _try_discord_active_pane_injection(message) -> bool:
         if proc.returncode == 0:
             if getattr(message, "voice_append_submit", False):
                 enter = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", pane, "Enter",
+                    "tmux",
+                    "send-keys",
+                    "-t",
+                    pane,
+                    "Enter",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -15840,31 +16078,18 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
         # because the singleton row is stale or currently stopped.  Delegate
         # upsert-vs-launch to the same tmuxctl owner used by state hooks.
         try:
-            tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
-            proc = await asyncio.create_subprocess_exec(
-                str(tmuxctl_bin),
-                "assert-custodes",
-                "--stdin",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(formatted.encode()), timeout=45
-            )
-            result = json.loads(stdout.decode().strip() or "{}")
+            result = await _assert_and_send_custodes(formatted, source="Discord injection")
             if result.get("dispatched"):
                 logger.info(
-                    f"Discord injection: custodes → {result.get('tmux_pane')} via assert-custodes"
+                    f"Discord injection: custodes → {result.get('pane')} via assert-instance legion:custodes"
                 )
                 return True
             logger.warning(
-                "Discord injection: assert-custodes failed: "
-                f"{result.get('reason')} stderr={stderr.decode()[:200]}"
+                f"Discord injection: assert-instance legion:custodes failed: {result.get('reason')}"
             )
             return False
         except Exception as e:
-            logger.warning(f"Discord injection: assert-custodes error: {e}")
+            logger.warning(f"Discord injection: assert-instance legion:custodes error: {e}")
             return False
 
     if not tmux_pane:
@@ -15938,8 +16163,28 @@ _VOICE_DRAFT_TITLE_PREFIX = {
 _discord_voice_drafts: dict[tuple[str, str], dict] = {}
 
 
+def _discord_voice_draft_summary(key: tuple[str, str], state: dict) -> dict:
+    bot, author_id = key
+    return {
+        "bot_name": bot,
+        "author_id": author_id,
+        "pane": state.get("pane"),
+        "created_at": state.get("created_at"),
+        "utterances": int(state.get("utterances") or 0),
+        "pane_alive": None,
+    }
+
+
+async def _clear_discord_voice_draft(key: tuple[str, str]) -> dict | None:
+    state = _discord_voice_drafts.pop(key, None)
+    if not state:
+        return None
+    await _discord_voice_restore_title(state)
+    return _discord_voice_draft_summary(key, state)
+
+
 def _discord_voice_author_key(request: DiscordMessageRequest) -> tuple[str, str]:
-    bot = (request.bot_name or "unknown").strip().lower()
+    bot = (request.bot_name or "unknown").strip().lower().replace("-", "_")
     author_id = str((request.author or {}).get("id") or "unknown")
     return (bot, author_id)
 
@@ -15949,13 +16194,61 @@ def _normalize_discord_voice_command(text: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
-def _discord_voice_command(text: str) -> str | None:
+def _discord_voice_parse_command(text: str) -> tuple[str | None, str]:
     normalized = _normalize_discord_voice_command(text)
-    if normalized in {"ship", "ship it"}:
-        return "ship"
-    if normalized in {"scratch", "scratch that"}:
-        return "scratch"
-    return None
+    if normalized.startswith("command "):
+        normalized = normalized.removeprefix("command ").strip()
+
+    commands = {
+        "ship it": "ship",
+        "ship": "ship",
+        "scratch that": "scratch",
+        "scratch": "scratch",
+        "mute": "mute",
+        "unmute": "unmute",
+        "retarget": "clear",
+        "reset target": "clear",
+        "clear target": "clear",
+        "clear lock": "clear",
+        "unlock": "clear",
+    }
+    for phrase, command in sorted(commands.items(), key=lambda item: len(item[0]), reverse=True):
+        if normalized == phrase:
+            return command, ""
+        suffix = f" {phrase}"
+        if normalized.endswith(suffix):
+            # Strip the command phrase from the original text by word count. This
+            # preserves punctuation/casing in the draft payload while allowing
+            # suffix commands such as "do x and y ship".
+            words = (text or "").strip().split()
+            return command, " ".join(words[: -len(phrase.split())]).strip()
+    return None, (text or "").strip()
+
+
+async def _discord_voice_mute_member(bot: str, author_id: str) -> bool:
+    """Ask the Discord daemon to server-mute the speaking operator if possible."""
+    try:
+        import functools
+
+        import requests as _req
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None,
+            functools.partial(
+                _req.post,
+                f"{DISCORD_DAEMON_URL}/voice/mute",
+                json={"bot": bot, "user_id": author_id, "duration_ms": 15000},
+                timeout=10,
+            ),
+        )
+        if resp.status_code == 200:
+            return bool(resp.json().get("muted"))
+        logger.warning(f"Voice mute failed via daemon: HTTP {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        logger.warning(f"Voice mute daemon request failed: {e}")
+        return False
 
 
 async def _tmux_display_value(pane: str, fmt: str) -> str | None:
@@ -15976,17 +16269,12 @@ async def _tmux_display_value(pane: str, fmt: str) -> str | None:
 
 
 async def _tmux_set_pane_title(pane: str, title: str) -> None:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "select-pane",
-        "-t",
-        pane,
-        "-T",
-        title,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    await asyncio.to_thread(
+        _run_tmux_focus_preserved,
+        ("tmux", "select-pane", "-t", pane, "-T", title),
+        source="token-api pane-title",
+        attempted_target=pane,
     )
-    await asyncio.wait_for(proc.communicate(), timeout=5)
 
 
 async def _discord_voice_restore_title(state: dict) -> None:
@@ -16086,41 +16374,166 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
     return None
 
 
+async def _discord_voice_unmute_member(bot: str, author_id: str) -> bool:
+    """Ask the Discord daemon to server-unmute the speaking operator if possible."""
+    try:
+        import functools
+
+        import requests as _req
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None,
+            functools.partial(
+                _req.post,
+                f"{DISCORD_DAEMON_URL}/voice/unmute",
+                json={"bot": bot, "user_id": author_id},
+                timeout=10,
+            ),
+        )
+        if resp.status_code == 200:
+            return bool(resp.json().get("unmuted"))
+        logger.warning(f"Voice unmute failed via daemon: HTTP {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        logger.warning(f"Voice unmute daemon request failed: {e}")
+        return False
+
+
 async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
     key = _discord_voice_author_key(request)
     bot, author_id = key
     text = (request.content or "").strip()
-    command = _discord_voice_command(text)
+    command, draft_text = _discord_voice_parse_command(text)
     state = _discord_voice_drafts.get(key)
 
     if state and not await _tmux_pane_exists(state.get("pane")):
         _discord_voice_drafts.pop(key, None)
         logger.warning(f"Voice draft [{bot}/{author_id}]: locked pane died; cleared draft")
-        await _discord_voice_error_message(bot, "Voice draft cleared. The locked terminal pane is gone.")
-        return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "cleared": True, "reason": "dead_pane"}
+        await _discord_voice_error_message(
+            bot, "Voice draft cleared. The locked terminal pane is gone."
+        )
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": False,
+            "cleared": True,
+            "reason": "dead_pane",
+        }
 
     if command == "ship":
         if not state:
             logger.info(f"Voice draft [{bot}/{author_id}]: ship with no active draft")
             await _discord_voice_error_message(bot, "No active voice draft to ship.")
-            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "command": "ship", "reason": "no_draft"}
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "injected": False,
+                "command": "ship",
+                "reason": "no_draft",
+            }
+        if draft_text:
+            segment = draft_text if not state.get("utterances") else f" {draft_text}"
+            if await _discord_voice_type(state["pane"], segment):
+                state["utterances"] = int(state.get("utterances") or 0) + 1
         ok = await _discord_voice_send_key(state["pane"], "Enter")
         await _discord_voice_restore_title(state)
         _discord_voice_drafts.pop(key, None)
-        return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "command": "ship", "pane": state["pane"]}
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": ok,
+            "command": "ship",
+            "pane": state["pane"],
+        }
 
     if command == "scratch":
         if not state:
             logger.info(f"Voice draft [{bot}/{author_id}]: scratch with no active draft")
             await _discord_voice_error_message(bot, "No active voice draft to scratch.")
-            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "command": "scratch", "reason": "no_draft"}
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "injected": False,
+                "command": "scratch",
+                "reason": "no_draft",
+            }
         ok = await _discord_voice_send_key(state["pane"], "C-c")
         await _discord_voice_restore_title(state)
         _discord_voice_drafts.pop(key, None)
-        return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "command": "scratch", "pane": state["pane"]}
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": ok,
+            "command": "scratch",
+            "pane": state["pane"],
+        }
 
+    if command == "clear":
+        if state:
+            await _discord_voice_restore_title(state)
+            _discord_voice_drafts.pop(key, None)
+            logger.info(f"Voice draft [{bot}/{author_id}]: lock cleared by command")
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "injected": True,
+                "command": "clear",
+                "cleared": True,
+            }
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": True,
+            "command": "clear",
+            "cleared": False,
+            "reason": "no_draft",
+        }
+
+    if command == "mute":
+        if draft_text and state:
+            segment = draft_text if not state.get("utterances") else f" {draft_text}"
+            if await _discord_voice_type(state["pane"], segment):
+                state["utterances"] = int(state.get("utterances") or 0) + 1
+        muted = await _discord_voice_mute_member(bot, author_id)
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": muted,
+            "command": "mute",
+            "muted": muted,
+            "temporary": True,
+            "duration_ms": 15000,
+        }
+
+    if command == "unmute":
+        unmuted = await _discord_voice_unmute_member(bot, author_id)
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": unmuted,
+            "command": "unmute",
+            "unmuted": unmuted,
+        }
+
+    text = draft_text
     if not text:
-        return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "empty"}
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": False,
+            "reason": "empty",
+        }
 
     if not state:
         pane = await _resolve_discord_voice_target(bot, request)
@@ -16132,11 +16545,28 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
                 )
             else:
                 await _discord_voice_error(bot, text)
-            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "no_target"}
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "injected": False,
+                "reason": "no_target",
+            }
         if await _tmux_pane_has_pending_input(pane):
-            logger.warning(f"Voice draft [{bot}/{author_id}]: birth blocked by typing guard on {pane}")
-            await _discord_voice_error_message(bot, "Voice draft not started. The target terminal already has pending input.")
-            return {"received": True, "message_id": request.message_id, "voice": True, "injected": False, "reason": "typing_guard", "pane": pane}
+            logger.warning(
+                f"Voice draft [{bot}/{author_id}]: birth blocked by typing guard on {pane}"
+            )
+            await _discord_voice_error_message(
+                bot, "Voice draft not started. The target terminal already has pending input."
+            )
+            return {
+                "received": True,
+                "message_id": request.message_id,
+                "voice": True,
+                "injected": False,
+                "reason": "typing_guard",
+                "pane": pane,
+            }
         title = await _discord_voice_mark_title(bot, pane)
         state = {"pane": pane, "title": title, "created_at": datetime.now().isoformat()}
         _discord_voice_drafts[key] = state
@@ -16146,7 +16576,78 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
     ok = await _discord_voice_type(state["pane"], segment)
     if ok:
         state["utterances"] = int(state.get("utterances") or 0) + 1
-    return {"received": True, "message_id": request.message_id, "voice": True, "injected": ok, "drafting": True, "pane": state["pane"]}
+    else:
+        failure_msg = (
+            "Voice [imperial_guard] active-pane injection failed. Voice not received."
+            if bot == "imperial_guard"
+            else f"Voice [{bot}] active-pane injection failed. Voice not received."
+        )
+        logger.warning(f"{failure_msg} pane={state['pane']}")
+        if not state.get("utterances"):
+            await _discord_voice_restore_title(state)
+            _discord_voice_drafts.pop(key, None)
+        await _discord_voice_error_message(bot, failure_msg)
+        return {
+            "received": True,
+            "message_id": request.message_id,
+            "voice": True,
+            "injected": False,
+            "drafting": bool(state.get("utterances")),
+            "reason": "active_pane_injection_failed",
+            "pane": state["pane"],
+        }
+    return {
+        "received": True,
+        "message_id": request.message_id,
+        "voice": True,
+        "injected": ok,
+        "drafting": True,
+        "pane": state["pane"],
+    }
+
+
+@app.get("/api/discord/voice-drafts")
+async def list_discord_voice_drafts():
+    """Inspect in-memory Discord voice draft locks."""
+    drafts = []
+    for key, state in _discord_voice_drafts.items():
+        item = _discord_voice_draft_summary(key, state)
+        try:
+            item["pane_alive"] = await _tmux_pane_exists(state.get("pane"))
+        except Exception:
+            item["pane_alive"] = False
+        drafts.append(item)
+    return {"count": len(drafts), "drafts": drafts}
+
+
+@app.post("/api/discord/voice-drafts/clear")
+async def clear_discord_voice_drafts(request: Request):
+    """Clear Discord voice draft locks without restarting Token API.
+
+    Optional JSON body:
+      {"bot_name": "imperial_guard", "author_id": "..."}
+
+    Omit filters to clear all locks.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    bot_name = (body.get("bot_name") or "").strip().lower()
+    author_id = str(body.get("author_id") or "").strip()
+
+    cleared = []
+    for key in list(_discord_voice_drafts.keys()):
+        bot, author = key
+        if bot_name and bot != bot_name:
+            continue
+        if author_id and author != author_id:
+            continue
+        item = await _clear_discord_voice_draft(key)
+        if item:
+            cleared.append(item)
+    logger.info(f"Voice draft: cleared {len(cleared)} lock(s) via API")
+    return {"cleared": len(cleared), "drafts": cleared}
 
 
 @app.post("/api/discord/message")
@@ -16237,7 +16738,23 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
-        return await _handle_discord_voice_draft(request)
+        voice_result = await _handle_discord_voice_draft(request)
+        try:
+            await log_event(
+                "discord_voice_draft",
+                device_id="discord",
+                details={
+                    "bot_name": request.bot_name,
+                    "author_id": author_id,
+                    "message_id": request.message_id,
+                    "content": (request.content or "")[:500],
+                    "target_tmux_pane": request.target_tmux_pane,
+                    "result": voice_result,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Voice draft audit log failed: {e}")
+        return voice_result
 
     # Trigger 0: bare URL in #forge → auto-clip to vault
     stripped = content.strip()
@@ -20032,96 +20549,17 @@ async def _askq_level1_callback(instance_id: str, question_text: str, state: dic
         snippet = snippet[:157] + "..."
     msg = f"Open question on **{label}**: {snippet}" if snippet else f"Open question on **{label}**"
     try:
-        await unified_enforce(
-            "notify",
-            msg,
-            source="askq_ladder",
-            channel="briefing",
-            phone_params={
-                "vibe": 30,
-                "banner_text": f"AskQ open: {label}",
-                "tts_text": f"You have an open question on {label}.",
-            },
+        await dispatch_notification(
+            NotifyRequest(
+                message=f"You have an open question on {label}.",
+                type="tts",
+                instance_id=instance_id,
+            )
         )
     except Exception as e:
-        logger.warning(f"AskQ Level 1: Discord/phone nudge failed: {e}")
+        logger.warning(f"AskQ Level 1: notify failed: {e}")
 
 
-async def _askq_touch2_callback(instance_id: str, question_text: str) -> None:
-    """Level 2 of the AskUserQuestion ladder: warn without phone-app cascade.
-
-    Coordinate point with the enforce → custodes wire effort. Fires the custodes
-    state event with `enforcement_cascade_started`, but does not route the
-    internal ack name through the phone-app cascade. The historical name
-    `_askq_touch2_callback` is preserved because routes/hooks.py wires it as
-    the level-2 hook.
-    """
-    app_name = "askuserquestion"
-    question_snippet = question_text[:200]
-    try:
-        await handle_custodes_state_event(
-            "enforcement_cascade_started",
-            "askq_ladder",
-            severity=3,
-            payload=_enforcement_state_payload(
-                source="askq_ladder",
-                ack_source=app_name,
-                question=question_snippet,
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"AskQ Level 2: custodes event failed: {e}")
-    try:
-        await unified_enforce(
-            "warn",
-            f"AskUserQuestion still needs an answer: {question_snippet}",
-            source="askq_ladder",
-            channel="briefing",
-            phone_params={
-                "vibe": 50,
-                "beep": 50,
-                "banner_text": "AskUserQuestion overdue",
-                "tts_text": "AskUserQuestion overdue",
-            },
-        )
-    except Exception as e:
-        logger.warning(f"AskQ Level 2: warning enforce failed: {e}")
-
-
-async def _askq_level3_callback(instance_id: str, question_text: str, state: dict) -> None:
-    """Level 3 of the AskUserQuestion ladder: pavlok shock.
-
-    Final tier — same path as expected_ack pavlok. The autonomous fallback
-    prompt is delivered separately by routes/hooks.py via `_askq_send_bust_prompt`.
-    """
-    try:
-        pavlok_result = await asyncio.to_thread(
-            send_pavlok_stimulus,
-            "zap",
-            PAVLOK_CONFIG.get("friday_zap_value", 30),
-            "askq_ladder_bust",
-            True,
-        )
-        await log_event("pavlok_stimulus", details=pavlok_result)
-    except Exception as e:
-        logger.warning(f"AskQ Level 3: pavlok zap failed: {e}")
-    try:
-        await handle_custodes_state_event(
-            "enforcement_cascade_escalate",
-            "askq_ladder",
-            severity=5,
-            payload=_enforcement_state_payload(
-                source="askq_ladder",
-                ack_source="askuserquestion",
-                level=3,
-                question=question_text[:200],
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"AskQ Level 3: custodes event failed: {e}")
-
-
-# Wire hook-route dependencies after hook-owned callbacks are defined.
 hooks_init_deps(
     scheduler=scheduler,
     timer_engine=shared.timer_engine,
@@ -20132,317 +20570,7 @@ hooks_init_deps(
     schedule_golden_throne_callback=schedule_golden_throne_followup,
     golden_throne_activity_callback=golden_throne_user_activity,
     askq_level1_callback=_askq_level1_callback,
-    askq_touch2_callback=_askq_touch2_callback,
-    askq_level3_callback=_askq_level3_callback,
 )
-
-
-def _cascade_level_endpoint_params(app_name: str, level: int) -> tuple[str, dict]:
-    """Return formatted phone endpoint/params for a cascade level."""
-    level_config = ENFORCE_LEVEL_PARAMS.get(level, ENFORCE_LEVEL_PARAMS[5])
-    endpoint = level_config["endpoint"]
-    params = {
-        k: v.format(app=app_name) if isinstance(v, str) else v
-        for k, v in level_config["params"].items()
-    }
-    return endpoint, params
-
-
-def _cascade_pavlok_value(level: int, params: dict) -> int:
-    """Map cascade level to Pavlok zap intensity.
-
-    Historical lower levels carried phone vibe values. The cascade mandate is
-    shock+TTS at every level, so those values now become the zap ramp.
-    """
-    if "zap" in params:
-        return int(params["zap"])
-    if "vibe" in params:
-        return int(params["vibe"])
-    return min(100, max(10, level * 10))
-
-
-def _cascade_dispatch_result(pavlok_result: dict) -> str:
-    """Normalize send_pavlok_stimulus return shapes for cascade gating."""
-    if pavlok_result.get("success") is True:
-        return "fired"
-    if pavlok_result.get("skipped"):
-        return "skipped"
-    if pavlok_result.get("error") in {"timeout", "connection_error"}:
-        return "unreachable"
-    return "failed"
-
-
-DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "")
-
-
-async def _send_discord_fallback(app_name: str, level: int, params_override: dict | None = None):
-    """Send enforcement command to Discord #fallback via webhook.
-
-    Format: POST /phone/enforce {"level":"N","app":"appname","params":{...}}
-
-    The phone's MacroDroid macro triggers on "POST /phone/enforce" in the Discord
-    notification, parses the JSON, and relays to its own localhost:7777/enforce.
-    Only /phone/enforce is accepted — no arbitrary code execution.
-    """
-    if params_override is None:
-        _, params = _cascade_level_endpoint_params(app_name, level)
-    else:
-        params = params_override
-    msg = f'POST /phone/enforce {{"level":"{level}","app":"{app_name}","params":{json.dumps(params)}}}'
-    logger.info(f"DISCORD FALLBACK: {msg}")
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(DISCORD_FALLBACK_WEBHOOK, json={"content": msg})
-            if resp.status_code == 204:
-                logger.info("DISCORD FALLBACK: Webhook sent OK")
-            else:
-                logger.warning(
-                    f"DISCORD FALLBACK: Webhook returned {resp.status_code}: {resp.text[:200]}"
-                )
-    except Exception as e:
-        logger.warning(f"DISCORD FALLBACK: Webhook failed: {e}")
-
-
-def _enforcement_state_payload(
-    *,
-    source: str,
-    app: str | None = None,
-    phone_app: str | None = None,
-    ack_source: str | None = None,
-    **extra,
-) -> dict:
-    """Build Custodes enforcement-state payloads without app/ack slot bleed.
-
-    `phone_app`/`app` are foreground application telemetry fields for the
-    phone cascade. Internal acknowledgement identifiers (AskUserQuestion,
-    Golden Throne, expected-ack namespaces) are diagnostic ack sources and must
-    never populate the cascade app slots.
-    """
-    payload = dict(extra)
-    if source == "phone":
-        resolved_phone_app = phone_app or app
-        if resolved_phone_app is not None:
-            payload["app"] = resolved_phone_app
-        payload["phone_app"] = resolved_phone_app
-    else:
-        if ack_source is None and app is not None:
-            ack_source = app
-        if ack_source is not None:
-            payload["ack_source"] = ack_source
-        payload["phone_app"] = None
-    return payload
-
-
-async def fire_cascade_event(level: int, ack_id: str, payload: dict) -> dict:
-    """Atomically fire one cascade event.
-
-    Pavlok dispatch is the gate. Companion phone TTS/push and Discord fallback
-    are sent only when Pavlok returns dispatch_result == "fired".
-    """
-    app_name = payload.get("app") or payload.get("app_name") or "unknown"
-    repeat = bool(payload.get("repeat"))
-    endpoint, phone_params = _cascade_level_endpoint_params(app_name, level)
-    pavlok_value = int(payload.get("pavlok_value") or _cascade_pavlok_value(level, phone_params))
-    reason = payload.get("reason") or (
-        "cascade_level_5_repeat" if repeat else f"cascade_level_{level}"
-    )
-
-    pavlok_result = await asyncio.to_thread(
-        send_pavlok_stimulus,
-        "zap",
-        pavlok_value,
-        reason,
-        False,
-    )
-    dispatch_result = _cascade_dispatch_result(pavlok_result)
-    result = {
-        "level": level,
-        "ack_id": ack_id,
-        "app": app_name,
-        "dispatch_result": dispatch_result,
-        "pavlok": pavlok_result,
-        "phone": None,
-        "discord": None,
-    }
-
-    if dispatch_result != "fired":
-        await log_event(
-            "cascade_event_skipped",
-            device_id="phone",
-            details={
-                "app": app_name,
-                "level": level,
-                "ack_id": ack_id,
-                "repeat": repeat,
-                "dispatch_result": dispatch_result,
-                "pavlok": pavlok_result,
-            },
-        )
-        logger.warning(
-            "CASCADE: skipped companion notify app=%s level=%s ack_id=%s dispatch_result=%s",
-            app_name,
-            level,
-            ack_id,
-            dispatch_result,
-        )
-        return result
-
-    # Server-side Pavlok already fired. Do not ask the phone/Discord relay to
-    # zap again; send only companion TTS/push/banner effects.
-    companion_params = dict(phone_params)
-    companion_params.pop("zap", None)
-    phone_result = await asyncio.to_thread(_send_to_phone, endpoint, companion_params)
-    result["phone"] = phone_result
-    if not phone_result.get("success"):
-        await _send_discord_fallback(app_name, level, params_override=companion_params)
-        result["discord"] = "fallback_attempted"
-
-    return result
-
-
-async def _enforcement_cascade_worker(app_name: str):
-    """Background task that escalates enforcement levels until app_close or timeout.
-
-    Flow:
-      1. Escalate through levels 1-5 with configured delays
-      2. Each level fires Pavlok first through fire_cascade_event()
-      3. Companion TTS/push/Discord are sent only after Pavlok fires
-      4. Level 5 repeats every 30s until close or cascade timeout
-    """
-    cascade = ENFORCEMENT_CASCADE
-    start = time.monotonic()
-    ack_id = f"cascade:{app_name}:{int(time.time())}"
-    cascade["started_at"] = start
-    cascade["current_level"] = 0
-
-    if is_quiet_hours():
-        cascade["active"] = False
-        cascade["task"] = None
-        print(f"CASCADE SUPPRESSED: quiet hours app={app_name}")
-        await log_quiet_hours_suppressed(
-            source="phone",
-            event_type="enforcement_cascade_started",
-            app=app_name,
-        )
-        return
-
-    print(f"CASCADE START: app={app_name}")
-    await log_event(
-        "enforcement_cascade_start",
-        device_id="phone",
-        details={"app": app_name, "ack_id": ack_id},
-    )
-    await handle_custodes_state_event(
-        "enforcement_cascade_started",
-        "phone",
-        severity=2,
-        payload=_enforcement_state_payload(source="phone", app=app_name, ack_id=ack_id),
-    )
-
-    # Escalate through levels 1-5
-    for level in range(1, 6):
-        if not cascade["active"]:
-            print(f"CASCADE: app_close received, standing down at level {level}")
-            return
-
-        elapsed = time.monotonic() - start
-        if elapsed > ENFORCEMENT_CASCADE_TIMEOUT:
-            print(
-                f"CASCADE: Timeout ({ENFORCEMENT_CASCADE_TIMEOUT}s), standing down at level {level}"
-            )
-            break
-
-        cascade["current_level"] = level
-        cascade["last_escalation"] = time.monotonic()
-        print(f"CASCADE: Escalating to level {level} for {app_name}")
-        await log_event(
-            "enforcement_cascade_escalate",
-            device_id="phone",
-            details={
-                "app": app_name,
-                "level": level,
-                "ack_id": ack_id,
-                "elapsed_s": round(elapsed),
-            },
-        )
-        await handle_custodes_state_event(
-            "enforcement_cascade_escalate",
-            "phone",
-            severity=min(2 + level, 5),
-            payload=_enforcement_state_payload(
-                source="phone",
-                app=app_name,
-                level=level,
-                ack_id=ack_id,
-                elapsed_s=round(elapsed),
-            ),
-        )
-
-        result = await fire_cascade_event(level, ack_id, {"app": app_name})
-        if result.get("dispatch_result") != "fired":
-            cascade["active"] = False
-            cascade["task"] = None
-            await log_event(
-                "enforcement_cascade_end",
-                device_id="phone",
-                details={
-                    "app": app_name,
-                    "final_level": level,
-                    "ack_id": ack_id,
-                    "elapsed_s": round(elapsed),
-                    "reason": "pavlok_not_fired",
-                    "dispatch_result": result.get("dispatch_result"),
-                },
-            )
-            return
-
-        # Wait before next level (level 5 repeats in a loop)
-        if level == 5:
-            # Pavlok repeat loop
-            while cascade["active"] and (time.monotonic() - start) < ENFORCEMENT_CASCADE_TIMEOUT:
-                await asyncio.sleep(30)
-                if not cascade["active"]:
-                    break
-                result = await fire_cascade_event(5, ack_id, {"app": app_name, "repeat": True})
-                if result.get("dispatch_result") != "fired":
-                    cascade["active"] = False
-                    cascade["task"] = None
-                    elapsed = time.monotonic() - start
-                    await log_event(
-                        "enforcement_cascade_end",
-                        device_id="phone",
-                        details={
-                            "app": app_name,
-                            "final_level": 5,
-                            "ack_id": ack_id,
-                            "elapsed_s": round(elapsed),
-                            "reason": "pavlok_not_fired",
-                            "dispatch_result": result.get("dispatch_result"),
-                        },
-                    )
-                    return
-        else:
-            delay = ENFORCEMENT_LEVEL_DELAYS.get(level + 1, 15)
-            await asyncio.sleep(delay)
-
-    # Cascade exhausted or timed out
-    cascade["active"] = False
-    cascade["task"] = None
-    elapsed = time.monotonic() - start
-    print(
-        f"CASCADE END: app={app_name} elapsed={elapsed:.0f}s final_level={cascade['current_level']}"
-    )
-    await log_event(
-        "enforcement_cascade_end",
-        device_id="phone",
-        details={
-            "app": app_name,
-            "final_level": cascade["current_level"],
-            "ack_id": ack_id,
-            "elapsed_s": round(elapsed),
-            "reason": "timeout_or_exhausted",
-        },
-    )
 
 
 if __name__ == "__main__":
