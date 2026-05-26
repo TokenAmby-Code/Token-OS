@@ -190,6 +190,16 @@ h1 {
   animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 .panel--feature { border-color: var(--brass-deep); }
+.panel--timerGraph {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 4px 0 10px;
+}
+.panel--timerGraph .panel__head {
+  padding: 0 2px;
+}
 .row--split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .row--split .panel { margin-bottom: 0; }
 /* staggered load reveal */
@@ -251,9 +261,82 @@ h1 {
 .chart-tip__muted { color: var(--muted); font-size: 10.5px; }
 .dot-sm { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
 
-.legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-.legend__item { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; font-family: 'IBM Plex Mono', monospace; }
-.legend__swatch { width: 11px; height: 11px; border-radius: 3px; opacity: 0.85; }
+/* ── state assertions ───────────────────────────────────────────────── */
+
+.assertions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.assertion {
+  position: relative;
+  overflow: hidden;
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  min-height: 146px;
+}
+
+.assertion::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--muted);
+}
+.assertion--good::before { background: var(--m-working); }
+.assertion--warn::before { background: var(--m-break); }
+.assertion--bad::before { background: var(--hazard); }
+.assertion--neutral::before { background: var(--line-bright); }
+.assertion--conf-low { border-style: dashed; }
+.assertion--conf-medium { border-color: color-mix(in srgb, var(--line-bright) 70%, var(--m-break)); }
+
+.assertion header,
+.assertion footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.assertion__label,
+.assertion__confidence {
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.assertion__confidence { color: var(--faint); }
+.assertion__value {
+  display: block;
+  margin: 8px 0 7px;
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 22px;
+  letter-spacing: 0.02em;
+}
+.assertion ul {
+  margin: 0;
+  padding-left: 15px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.assertion footer {
+  margin-top: 9px;
+  color: var(--faint);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+}
+.assertion__hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 65%;
+}
 
 /* ── fleet table ────────────────────────────────────────────────────── */
 

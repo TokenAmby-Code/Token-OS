@@ -36,7 +36,7 @@ from instance_mutation import (
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from pane_surface import human_pane_surface, human_tab_name as _human_tab_name
+from pane_surface import human_pane_surface
 from phone_service import _send_to_phone, check_instance_count_pavlok
 from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
@@ -661,7 +661,8 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
         """SELECT id, tmux_pane, tab_name, engine, status, last_activity
            FROM claude_instances
            WHERE tmux_pane = ?
-           ORDER BY last_activity DESC
+           ORDER BY CASE WHEN status = 'stopped' THEN 1 ELSE 0 END,
+                    last_activity DESC
            LIMIT 1""",
         (resolved,),
     )
@@ -802,10 +803,9 @@ def _is_mechanicus_worker_row(row: dict) -> bool:
         return False
     if _is_mechanicus_worker_label(label):
         return True
-    return (
-        _normalize_text(row.get("dispatch_target")) == "mechanicus:new"
-        or _is_mechanicus_stack_window(row.get("dispatch_window"))
-    )
+    return _normalize_text(
+        row.get("dispatch_target")
+    ) == "mechanicus:new" or _is_mechanicus_stack_window(row.get("dispatch_window"))
 
 
 async def _active_stop_subscription_id(
@@ -960,9 +960,7 @@ async def _reconcile_mechanicus_on_session_start(db, instance_id: str) -> dict |
     if label == MECHANICUS_FG_LABEL:
         return await _reconcile_mechanicus_stop_subscriptions(db)
     if _is_mechanicus_worker_row(current):
-        return await _reconcile_mechanicus_stop_subscriptions(
-            db, source_instance_id=instance_id
-        )
+        return await _reconcile_mechanicus_stop_subscriptions(db, source_instance_id=instance_id)
     return None
 
 
@@ -1082,7 +1080,12 @@ async def _enqueue_and_send_stop_delivery(
         """UPDATE stop_hook_deliveries
            SET status = ?, delivered_at = ?, error = ?
            WHERE id = ?""",
-        (final_status, datetime.now().isoformat() if sent else None, send_result.get("error"), delivery_id),
+        (
+            final_status,
+            datetime.now().isoformat() if sent else None,
+            send_result.get("error"),
+            delivery_id,
+        ),
     )
     await db.commit()
     return {
@@ -1094,7 +1097,9 @@ async def _enqueue_and_send_stop_delivery(
     }
 
 
-async def _fanout_stop_subscriptions(instance: dict, payload: dict, final_response: str | None) -> list[dict]:
+async def _fanout_stop_subscriptions(
+    instance: dict, payload: dict, final_response: str | None
+) -> list[dict]:
     session_id = instance["id"]
     stop_event_key = _stop_event_key(session_id, payload)
     surface = human_pane_surface(
@@ -2811,7 +2816,9 @@ async def handle_stop(payload: dict) -> dict:
                 transcript_path=transcript_path,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Hook: Stop final-response fallback failed for %s: %s", session_id[:12], exc)
+            logger.warning(
+                "Hook: Stop final-response fallback failed for %s: %s", session_id[:12], exc
+            )
 
     # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
     # state_injections so a subscribed parent gets an immediate prompt instead
@@ -3829,8 +3836,12 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
 
         target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
         target_pane = (target or {}).get("tmux_pane") or _normalize_text(request.target_pane)
-        subscriber_id = (subscriber or {}).get("id") or _normalize_text(request.subscriber_instance_id)
-        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(request.subscriber_pane)
+        subscriber_id = (subscriber or {}).get("id") or _normalize_text(
+            request.subscriber_instance_id
+        )
+        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(
+            request.subscriber_pane
+        )
         if not target_id:
             return {"success": False, "action": "target_unresolved"}
         if not subscriber_pane:
@@ -3865,7 +3876,12 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
 
 
 PLANNING_STATES = {"none", "preplanning", "planning", "approving"}
-PLANNING_CYCLE = {"none": "preplanning", "preplanning": "planning", "planning": "none", "approving": "none"}
+PLANNING_CYCLE = {
+    "none": "preplanning",
+    "preplanning": "planning",
+    "planning": "none",
+    "approving": "none",
+}
 
 
 @router.post("/api/planning/state")
@@ -3882,7 +3898,7 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
             return {"success": False, "action": "instance_unresolved", "tmux_pane": tmux_pane}
 
         cursor = await db.execute(
-            "SELECT planning_state, tmux_pane FROM claude_instances WHERE id = ?",
+            "SELECT planning_state, tmux_pane, engine FROM claude_instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -3937,6 +3953,7 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
         "previous_state": previous,
         "planning_state": new_state,
         "source": source,
+        "engine": (instance or {}).get("engine") or row["engine"],
     }
 
 
@@ -3950,8 +3967,12 @@ async def unsubscribe_hook(request: HookUnsubscribeRequest) -> dict:
         if not subscriber or not subscriber.get("tmux_pane"):
             subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
         target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
-        subscriber_id = (subscriber or {}).get("id") or _normalize_text(request.subscriber_instance_id)
-        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(request.subscriber_pane)
+        subscriber_id = (subscriber or {}).get("id") or _normalize_text(
+            request.subscriber_instance_id
+        )
+        subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(
+            request.subscriber_pane
+        )
         clauses = ["event = ?", "status = 'active'"]
         params: list[str] = [request.event]
         if target_id:

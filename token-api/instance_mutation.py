@@ -66,6 +66,9 @@ INSTANCE_MUTATION_FIELDS = {
     "parent_instance_id",
     "primarch",
     "transplant_expected",
+    "planning_state",
+    "planning_updated_at",
+    "planning_source",
 }
 
 LEGION_PANE_COLORS = {

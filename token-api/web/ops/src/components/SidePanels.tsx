@@ -4,6 +4,37 @@
 import type { OpsState } from '../types';
 import { formatAge, formatTime, summarizeDetails } from '../format';
 
+export function AssertionsPanel({ state }: { state: OpsState }) {
+  const assertions = state.assertions ?? [];
+  if (!assertions.length) return <p className="empty">No state assertions reported.</p>;
+  return (
+    <div className="assertions">
+      {assertions.map((item) => (
+        <article
+          key={item.id}
+          className={`assertion assertion--${item.status} assertion--conf-${item.confidence}`}
+          title={item.correction_hint ?? undefined}
+        >
+          <header>
+            <span className="assertion__label">{item.label}</span>
+            <span className="assertion__confidence">{item.confidence}</span>
+          </header>
+          <strong className="assertion__value">{item.value}</strong>
+          <ul>
+            {item.evidence.slice(0, 3).map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+          <footer>
+            <span>{item.freshness_seconds == null ? 'freshness —' : `fresh ${formatAge(item.freshness_seconds)}`}</span>
+            {item.correction_hint ? <span className="assertion__hint">{item.correction_hint}</span> : null}
+          </footer>
+        </article>
+      ))}
+    </div>
+  );
+}
+
 export function AttentionPanel({ state }: { state: OpsState }) {
   const ws = state.work_state;
   const d = state.attention.desktop;

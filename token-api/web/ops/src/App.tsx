@@ -3,7 +3,7 @@ import { formatClock } from './format';
 import { TopStrip } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
 import { InstancesPanel } from './components/InstancesPanel';
-import { AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
+import { AssertionsPanel, AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
 import { VoiceQueuePanel } from './components/VoiceQueuePanel';
 import { OpsGraph } from './components/OpsGraph';
 
@@ -80,19 +80,25 @@ export function App() {
           <TopStrip state={state} />
 
           <Panel
+            title="State assertions"
+            meta={<span className="panel__meta-note">what Token-API believes is true</span>}
+          >
+            <AssertionsPanel state={state} />
+          </Panel>
+
+          <Panel
             title="Timer posture"
-            className="panel--feature"
+            className="panel--timerGraph"
             meta={
               <span className="panel__meta-note">
                 {timer.data
                   ? `today · since 07:00 · ${timer.data.points.length} pts`
                   : 'loading'}
-                {timer.error ? ' · mock' : ''}
+                {timer.error ? ` · ${timer.error}` : ''}
               </span>
             }
           >
             {timer.data ? <TimerGraph history={timer.data} /> : <div className="chart-empty">Loading history…</div>}
-            <Legend />
           </Panel>
 
           <Panel
@@ -148,27 +154,6 @@ export function App() {
           </footer>
         </>
       )}
-    </div>
-  );
-}
-
-function Legend() {
-  const items: Array<[string, string]> = [
-    ['WORKING', 'var(--m-working)'],
-    ['MULTITASK', 'var(--m-multi)'],
-    ['DISTRACTED', 'var(--m-distracted)'],
-    ['BREAK', 'var(--m-break)'],
-    ['IDLE', 'var(--m-idle)'],
-    ['SLEEPING', 'var(--m-sleep)'],
-  ];
-  return (
-    <div className="legend">
-      {items.map(([label, color]) => (
-        <span className="legend__item" key={label}>
-          <span className="legend__swatch" style={{ background: color }} />
-          {label}
-        </span>
-      ))}
     </div>
   );
 }

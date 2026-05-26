@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { OpsState, TimerHistory, OpsGraph } from './types';
-import { mockTimerHistory, mockOpsGraph } from './mock';
+import { mockOpsGraph } from './mock';
 
 export type Feed<T> = {
   data: T | null;
@@ -83,22 +83,17 @@ function secondsSinceDayStart(): number {
 /**
  * Timer history feed. The window spans from the start of the day (07:00) to
  * now, so the graph compresses as the day fills rather than scrolling a fixed
- * window. The window is recomputed every fetch. The backend endpoint does not
- * exist yet, so this falls back to mocked data — the component contract stays
- * identical when `GET /api/ui/ops/timer/history` ships. Polled slowly per the
- * brief.
+ * window. The window is recomputed every fetch. This is live telemetry from
+ * `GET /api/ui/ops/timer/history`; no mock fallback, because fake timer data is
+ * worse than an explicit degraded state. Polled slowly per the brief.
  */
 export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerHistory> {
   return usesPolling<TimerHistory>(async (signal) => {
     const windowSec = secondsSinceDayStart();
-    try {
-      return await getJson<TimerHistory>(
-        `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
-        signal,
-      );
-    } catch {
-      return mockTimerHistory(windowSec, bucketSec);
-    }
+    return getJson<TimerHistory>(
+      `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
+      signal,
+    );
   }, intervalMs);
 }
 

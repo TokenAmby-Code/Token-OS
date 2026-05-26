@@ -115,13 +115,8 @@ export function TimerGraph({ history }: Props) {
           if (w <= 0) return null;
           const v = modeVisual(seg.mode);
           return (
-            <g key={i}>
+            <g key={i} aria-label={v.label}>
               <rect x={sx} y={PAD.top} width={w} height={plotH} fill={v.color} opacity={0.1} />
-              {w > 34 ? (
-                <text x={sx + 5} y={PAD.top + 12} className="band-label" fill={v.color}>
-                  {v.label}
-                </text>
-              ) : null}
             </g>
           );
         })}

@@ -87,6 +87,18 @@ export type OpsEvent = {
   created_at: string;
 };
 
+export type StateAssertion = {
+  id: string;
+  label: string;
+  value: string;
+  status: 'good' | 'warn' | 'bad' | 'neutral' | string;
+  confidence: 'high' | 'medium' | 'low' | string;
+  evidence: string[];
+  freshness_seconds: number | null;
+  correction_hint: string | null;
+  details: Record<string, unknown>;
+};
+
 export type OpsState = {
   surface: 'ops';
   generated_at: string;
@@ -103,6 +115,7 @@ export type OpsState = {
     total_work_time_ms: number;
     total_break_time_ms: number;
   };
+  assertions: StateAssertion[];
   attention: {
     desktop: {
       mode: string;
@@ -190,7 +203,18 @@ export type TimerHistorySegment = {
   end: string;
   mode: TimerMode;
   activity: string;
+  productivity_active?: boolean;
   source?: string | null;
+};
+
+export type TimerHistoryAnnotation = {
+  id: string;
+  t: string;
+  lane: 'timer' | 'desktop' | 'phone' | 'enforcement' | 'gt' | 'instance' | string;
+  type: string;
+  label: string;
+  severity?: 'info' | 'warn' | 'bad' | 'good' | string;
+  details?: Record<string, unknown>;
 };
 
 export type TimerHistory = {
@@ -199,6 +223,9 @@ export type TimerHistory = {
   bucket_seconds: number;
   points: TimerHistoryPoint[];
   segments: TimerHistorySegment[];
+  annotations?: TimerHistoryAnnotation[];
+  gaps?: Array<{ start: string; end: string; reason: string }>;
+  source?: string;
 };
 
 // ── Arbitrary node/edge graph read-model (GET /api/ui/ops/graph/{name}) ───

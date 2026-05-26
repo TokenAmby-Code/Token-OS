@@ -16,14 +16,15 @@ def _insert_instance(
     pane_label=None,
     dispatch_target=None,
     dispatch_window=None,
+    engine=None,
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
-            parent_instance_id, pane_label, dispatch_target, dispatch_window)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?)""",
+            parent_instance_id, pane_label, dispatch_target, dispatch_window, engine)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
@@ -35,6 +36,7 @@ def _insert_instance(
             pane_label,
             dispatch_target,
             dispatch_window,
+            engine,
         ),
     )
     conn.commit()
@@ -406,7 +408,7 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
 def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env):
     from fastapi.testclient import TestClient
 
-    _insert_instance(app_env.db_path, "planner-1", pane="%91")
+    _insert_instance(app_env.db_path, "planner-1", pane="%91", engine="codex")
     client = TestClient(app_env.main.app)
 
     resp = client.post(
@@ -419,6 +421,7 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env):
     assert data["previous_state"] == "none"
     assert data["planning_state"] == "preplanning"
     assert data["instance_id"] == "planner-1"
+    assert data["engine"] == "codex"
 
     conn = sqlite3.connect(app_env.db_path)
     inst = conn.execute(
