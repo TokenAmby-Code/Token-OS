@@ -56,6 +56,8 @@ function tailFile(path, maxLines = 80) {
 
 function createDiscordFixerHook() {
   const recent = new Map();
+  const RECENT_TTL_MS = 10 * 60_000;
+  const RECENT_MAX = 500;
   const agentCmd = join(BASE_DIR, 'cli-tools', 'bin', 'agent-cmd');
 
   function resolveFixerInstanceId() {
@@ -145,6 +147,13 @@ function createDiscordFixerHook() {
     const errorCode = classifyErrorCode(msg, meta);
     const key = `${errorCode}:${String(msg).slice(0, 180)}`;
     const now = Date.now();
+    for (const [k, ts] of recent) {
+      if (now - ts > RECENT_TTL_MS) recent.delete(k);
+    }
+    if (recent.size > RECENT_MAX) {
+      const oldestKey = recent.keys().next().value;
+      if (oldestKey) recent.delete(oldestKey);
+    }
     const last = recent.get(key) || 0;
     if (now - last < 30_000) return;
     recent.set(key, now);
