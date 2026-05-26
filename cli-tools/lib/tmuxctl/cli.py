@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 from .api import RegistryError
 from .service import TmuxControlPlane
@@ -64,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--session", default="main")
 
     resolve_parser = subparsers.add_parser("resolve-pane")
-    resolve_parser.add_argument("--format", choices=["id", "full", "json"], default="full")
+    resolve_parser.add_argument("--format", choices=["id", "physical", "full", "json"], default="full")
     resolve_parser.add_argument("target")
 
     session_doc_parser = subparsers.add_parser(
@@ -84,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     text_source.add_argument("--text")
     text_source.add_argument("--stdin", action="store_true")
     send_text_parser.add_argument("--clear-prompt", action="store_true")
+
+    invoke_skill_parser = subparsers.add_parser(
+        "invoke-skill",
+        help="Insert a harness-correct explicit skill invocation at the prompt start.",
+    )
+    invoke_skill_parser.add_argument("skill")
+    invoke_skill_parser.add_argument("--pane", default="current")
+    invoke_skill_parser.add_argument("--agent", default="auto")
+    invoke_skill_parser.add_argument("--dry-run", action="store_true")
 
     audience_parser = subparsers.add_parser("audience")
     audience_subparsers = audience_parser.add_subparsers(dest="audience_command", required=True)
@@ -128,6 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
     stack_enforce.add_argument("--focus", action="store_true")
     stack_enforce.add_argument("--admit", action="store_true")
     stack_enforce.add_argument("--kill-pending-clear", action="store_true")
+    stack_sweep = stack_subparsers.add_parser("sweep")
+    stack_sweep.add_argument("--session", default="main")
+    stack_sweep.add_argument("--keep-pending-clear", action="store_true")
 
     legion_parser = subparsers.add_parser("legion")
     legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
@@ -145,15 +156,30 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser = subparsers.add_parser("rebuild-window")
     rebuild_parser.add_argument("--window", default="current")
 
-    assert_custodes_parser = subparsers.add_parser(
-        "assert-custodes",
-        help="Deliver a prompt to legion:custodes: upsert if claude alive, else launch.",
+    assert_instance_parser = subparsers.add_parser("assert-instance")
+    assert_instance_parser.add_argument("--pane", required=True)
+
+    guard_parser = subparsers.add_parser("mechanicus-focus-guard")
+    guard_parser.add_argument("--pane", default="")
+    guard_parser.add_argument("--client", default="")
+    guard_parser.add_argument("--surface", default="after-select")
+
+    allow_mech_parser = subparsers.add_parser("allow-mechanicus-focus")
+    allow_mech_parser.add_argument("--seconds", type=float, default=4.0)
+    allow_mech_parser.add_argument("--reason", default="explicit")
+    allow_human_parser = subparsers.add_parser("allow-human-mechanicus-focus")
+    allow_human_parser.add_argument("--client", default="")
+    allow_human_parser.add_argument("--reason", default="explicit-human-navigation")
+
+    pane_select_parser = subparsers.add_parser(
+        "pane-select",
+        help="Explicit human pane selection with cardinal routing.",
     )
-    assert_custodes_parser.add_argument("--session", default="main")
-    prompt_source = assert_custodes_parser.add_mutually_exclusive_group(required=True)
-    prompt_source.add_argument("--prompt", help="Inline prompt text")
-    prompt_source.add_argument("--prompt-file", help="Path to prompt file")
-    prompt_source.add_argument("--stdin", action="store_true", help="Read prompt from stdin")
+    pane_select_parser.add_argument("--mode", choices=["absolute", "relative"], required=True)
+    pane_select_parser.add_argument(
+        "--direction", choices=["up", "down", "left", "right"], required=True
+    )
+    pane_select_parser.add_argument("--client", default="")
 
     return parser
 
@@ -207,7 +233,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "resolve-pane":
             resolved = control.resolve_pane(args.target)
             if args.format == "id":
-                print(resolved.splitlines()[1].split(": ", 1)[1])
+                print(control.public_pane_id(args.target))
+            elif args.format == "physical":
+                print(control.physical_pane_id(args.target))
             elif args.format == "json":
                 import json
 
@@ -237,6 +265,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "send-text":
+            import json as _json
+            from .assertions import assert_instance
+
+            assertion = assert_instance(control.adapter, args.pane)
+            if not assertion.get("ok"):
+                if assertion.get("action") == "persona_correction_sent":
+                    raise ValueError(
+                        "persona correction sent; retry after settle before sending payload: "
+                        f"{_json.dumps(assertion)}"
+                    )
+                raise ValueError(f"pane has no live instance: {_json.dumps(assertion)}")
             text = sys.stdin.read() if args.stdin else args.text
             control.adapter.send_text_then_submit(
                 args.pane,
@@ -245,7 +284,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "invoke-skill":
+            from .skill_invoke import normalize_agent, skill_invocation_text
+
+            pane = args.pane
+            if pane == "current" and not args.dry_run:
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            if args.dry_run:
+                agent = normalize_agent(args.agent)
+                if agent == "auto":
+                    agent = "claude"
+                print(skill_invocation_text(args.skill, agent))
+                return 0
+            print(control.invoke_skill(pane, args.skill, agent=args.agent), end="")
+            return 0
+
         if args.command == "audience":
+            import os as _os
+
+            _os.environ.setdefault("IMPERIUM_ALLOW_TMUX_FOCUS", "1")
+            _os.environ.setdefault("IMPERIUM_ALLOW_MECHANICUS_FOCUS", "1")
             pane = args.pane
             if pane == "current":
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
@@ -257,6 +315,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         if args.command == "tombstone":
+            import os as _os
+
+            _os.environ.setdefault("IMPERIUM_ALLOW_TMUX_FOCUS", "1")
+            _os.environ.setdefault("IMPERIUM_ALLOW_MECHANICUS_FOCUS", "1")
             if args.tombstone_command == "jump":
                 pane = args.pane
                 if pane == "current":
@@ -294,6 +356,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(pane_id)
                 return 0
+            if args.stack_command == "sweep":
+                from .stack import sweep_stack_assertions
+
+                print(
+                    sweep_stack_assertions(
+                        control.adapter,
+                        args.session,
+                        kill_pending_clear=not args.keep_pending_clear,
+                    )
+                )
+                return 0
             if args.stack_command == "enforce":
                 from .stack import enforce_stack_layout
 
@@ -307,8 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                     target = control.adapter.run(
                         "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                     ).strip()
-                print(
-                    enforce_stack_layout(
+                result = enforce_stack_layout(
                         control.adapter,
                         target,
                         focused_pane=pane,
@@ -316,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
                         admit=args.admit,
                         kill_pending_clear=args.kill_pending_clear,
                     )
-                )
+                print(result)
                 return 0
 
         if args.command == "legion":
@@ -368,20 +440,63 @@ def main(argv: list[str] | None = None) -> int:
             print(control.rebuild_window(session_name=session_name, window_index=window_index))
             return 0
 
-        if args.command == "assert-custodes":
+        if args.command == "assert-instance":
             import json as _json
+            from .assertions import assert_instance
 
-            from .custodes import assert_custodes
-
-            if args.stdin:
-                prompt_text = sys.stdin.read()
-            elif args.prompt_file:
-                prompt_text = Path(args.prompt_file).read_text()
-            else:
-                prompt_text = args.prompt
-            result = assert_custodes(control.adapter, prompt_text, session=args.session)
+            result = assert_instance(control.adapter, args.pane)
             print(_json.dumps(result))
-            return 0 if result.get("dispatched") else 1
+            return 0 if result.get("ok") else 1
+
+        if args.command == "mechanicus-focus-guard":
+            import json as _json
+            from .focus_guard import remember_or_bounce
+
+            result = remember_or_bounce(
+                control.adapter,
+                pane=args.pane,
+                client=args.client,
+                surface=args.surface,
+            )
+            print(_json.dumps(result))
+            return 0
+
+        if args.command == "allow-mechanicus-focus":
+            from .focus_guard import allow_temporarily
+
+            until = allow_temporarily(
+                control.adapter,
+                seconds=args.seconds,
+                reason=args.reason,
+                actor="tmuxctl",
+            )
+            print(f"{until:.3f}")
+            return 0
+
+        if args.command == "allow-human-mechanicus-focus":
+            from .focus_guard import allow_human_focus
+
+            allow_human_focus(
+                control.adapter,
+                client=args.client,
+                reason=args.reason,
+                actor="tmuxctl",
+            )
+            print("ok")
+            return 0
+
+        if args.command == "pane-select":
+            from .pane_select import select_pane
+
+            print(
+                select_pane(
+                    control.adapter,
+                    mode=args.mode,
+                    direction=args.direction,
+                    client=args.client,
+                )
+            )
+            return 0
 
         parser.error(f"unhandled command: {args.command}")
     except (

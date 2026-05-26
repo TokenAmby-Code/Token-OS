@@ -16,6 +16,12 @@ if [[ -z "$PANE" ]] && command -v jq >/dev/null 2>&1; then
 fi
 [[ -z "$PANE" ]] && exit 0
 
+OLD_PWD="${PWD:-}"
+if command -v jq >/dev/null 2>&1; then
+    OLD_PWD="$(printf '%s' "$INPUT" | jq -r '.cwd // .working_dir // .env.PWD // empty' 2>/dev/null || true)"
+fi
+[[ -z "$OLD_PWD" ]] && OLD_PWD="${PWD:-$HOME}"
+
 SESSION_ID=""
 if command -v jq >/dev/null 2>&1; then
     SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // .conversation_id // empty' 2>/dev/null || true)"
@@ -41,7 +47,7 @@ esac
 
 SENTINEL="/tmp/agent-resume-${PANE}"
 TMP="${SENTINEL}.tmp.$$"
-printf '%s\n%s\n' "$AGENT" "$RESUME_CMD" > "$TMP"
+printf '%s\n%s\n%s\n' "$AGENT" "$OLD_PWD" "$RESUME_CMD" > "$TMP"
 mv "$TMP" "$SENTINEL"
 
 # Compatibility for already-open shells that only know about the old Claude

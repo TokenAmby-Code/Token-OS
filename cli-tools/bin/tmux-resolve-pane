@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-resolve-pane — resolve Imperium pane ids to live tmux %pane ids
+# tmux-resolve-pane — resolve Imperium pane ids to public stable pane ids
 # TAGS: tmux, resolver
 # AUDIENCE: agent, user, system
 #
@@ -13,7 +13,7 @@ format="id"
 
 usage() {
     cat <<'EOF'
-Usage: tmux-resolve-pane [--format id|full|json] <target>
+Usage: tmux-resolve-pane [--format id|physical|full|json] <target>
 
 Examples:
   tmux-resolve-pane 1:N
@@ -32,6 +32,8 @@ while [[ $# -gt 0 ]]; do
             format="json"; shift ;;
         --id)
             format="id"; shift ;;
+        --physical)
+            format="physical"; shift ;;
         -h|--help)
             usage; exit 0 ;;
         --)
@@ -49,7 +51,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 case "$format" in
-    id|full|json) ;;
+    id|physical|full|json) ;;
     *) echo "tmux-resolve-pane: invalid format '$format'" >&2; exit 2 ;;
 esac
 

@@ -102,8 +102,13 @@ def main() -> int:
         return 0
 
     target_window = probe.stdout.strip()
-    subprocess.run(["tmux", "select-window", "-t", target_window], check=False)
-    subprocess.run(["tmux", "select-pane", "-t", pane], check=False)
+    env = dict(
+        os.environ,
+        IMPERIUM_ALLOW_TMUX_FOCUS="1",
+        IMPERIUM_ALLOW_MECHANICUS_FOCUS="1",
+    )
+    subprocess.run(["tmux", "select-window", "-t", target_window], check=False, env=env)
+    subprocess.run(["tmux", "select-pane", "-t", pane], check=False, env=env)
 
     label = row["tab_name"] or row["instance_id"][:8]
     tmux_msg(f"→ {label} ({pane}, {age}s ago)")

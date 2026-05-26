@@ -6,17 +6,28 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.stack import STACK_COLLAPSED_HEIGHT, enforce_stack_layout, focus_selected
+from tmuxctl.stack import (
+    STACK_COLLAPSED_HEIGHT,
+    enforce_stack_layout,
+    focus_selected,
+    sweep_stack_assertions,
+)
 from tmuxctl.stack import dispatch_stack_command
 
 
 class FakeLegionAdapter:
     def __init__(
-        self, *, guard: bool = False, window_name: str = "legion", rows: list[str] | None = None
+        self,
+        *,
+        guard: bool = False,
+        window_name: str = "legion",
+        rows: list[str] | None = None,
+        zoomed: bool = False,
     ) -> None:
         self.guard = guard
         self.window_name = window_name
         self.rows = rows
+        self.zoomed = zoomed
         self.commands: list[tuple[str, ...]] = []
         self.window_options: dict[str, str] = {}
 
@@ -38,6 +49,8 @@ class FakeLegionAdapter:
                 return "50\n"
             if fmt == "#{window_name}":
                 return f"{self.window_name}\n"
+            if fmt == "#{window_zoomed_flag}":
+                return "1\n" if self.zoomed else "0\n"
             if fmt == "#{session_name}:#{window_index}":
                 return "main:3\n"
             if fmt == "#{session_name}:#{window_name}":
@@ -45,6 +58,8 @@ class FakeLegionAdapter:
             if fmt == "#{pane_id}":
                 return f"{target}\n"
         if args[0] == "list-windows":
+            if args[-1] == "#{window_index}\t#{window_name}":
+                return f"3\t{self.window_name}\n"
             return f"{self.window_name}\n"
         if args[0] == "list-panes":
             if self.rows is not None:
@@ -99,6 +114,16 @@ def test_selecting_custodes_does_not_resize_legion():
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
 
 
+def test_selecting_custodes_is_noop_even_when_window_zoomed():
+    adapter = FakeLegionAdapter(zoomed=True)
+
+    result = focus_selected(adapter, "%C")  # type: ignore[arg-type]
+
+    assert result.endswith(": custodes")
+    assert not any(command[0] == "resize-pane" for command in adapter.commands)
+    assert adapter.zoomed is True
+
+
 def test_selecting_regiment_expands_it_and_collapses_siblings_to_ribbons():
     adapter = FakeLegionAdapter()
 
@@ -130,6 +155,7 @@ def test_normalize_uses_stored_focus_without_reselecting_or_clearing_it():
     result = enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
 
     assert result == "normalized stack layout main:3"
+    assert ("select-layout", "-t", "main:3", "main-vertical") in adapter.commands
     assert any(command[:3] == ("resize-pane", "-t", "%1") for command in adapter.commands)
     assert ("resize-pane", "-t", "%2", "-y", str(STACK_COLLAPSED_HEIGHT)) in adapter.commands
     assert adapter.window_options["@STACK_FOCUSED_PANE"] == "%1"
@@ -248,6 +274,56 @@ def test_stack_dispatch_reuses_lowest_available_worker_id():
     assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
 
 
+def test_mechanicus_stack_dispatch_no_focus_does_not_select_worker():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t0\t81\t0\t80\t10\tcodex\tfalse",
+        ],
+    )
+
+    pane = dispatch_stack_command(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "mechanicus",
+        "echo hello",
+        cwd="/tmp",
+        focus=False,
+        settle_seconds=0,
+    )
+
+    assert pane == "%N"
+    assert not any(command[0] == "select-window" for command in adapter.commands)
+    assert not any(
+        command[0] == "select-pane" and "-T" not in command
+        for command in adapter.commands
+    )
+
+
+def test_stale_stored_stack_focus_falls_back_to_live_worker():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t0\t81\t0\t80\t10\tcodex\tfalse",
+        ],
+    )
+    adapter.window_options["@STACK_FOCUSED_PANE"] = "%77"
+
+    dispatch_stack_command(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "mechanicus",
+        "echo hello",
+        cwd="/tmp",
+        focus=False,
+        settle_seconds=0,
+    )
+
+    assert ("split-window", "-v", "-t", "%1", "-d", "-P", "-F", "#{pane_id}", "-l", "3", "-c", "/tmp") in adapter.commands
+
+
 def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():
     adapter = FakeLegionAdapter(
         window_name="mechanicus",
@@ -277,6 +353,44 @@ def test_mechanicus_enforce_creates_admin_pane_when_missing():
     assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:admin") in adapter.commands
 
 
+def test_zoomed_stack_enforce_defers_structural_layout_mutations():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        zoomed=True,
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ],
+    )
+
+    result = enforce_stack_layout(adapter, "main:4")  # type: ignore[arg-type]
+
+    assert result == "noop stack layout main:4: window zoomed"
+    assert not any(
+        command[0] in {"select-layout", "resize-pane", "join-pane", "split-window"}
+        for command in adapter.commands
+    )
+
+
+def test_zoomed_stack_sweep_noops_and_does_not_issue_focus_or_layout_commands():
+    adapter = FakeLegionAdapter(zoomed=True)
+
+    result = sweep_stack_assertions(adapter, "main")  # type: ignore[arg-type]
+
+    assert result == "noop stack layout main:3: window zoomed"
+    assert not any(
+        command[0]
+        in {
+            "select-window",
+            "select-pane",
+            "select-layout",
+            "resize-pane",
+            "join-pane",
+            "split-window",
+        }
+        for command in adapter.commands
+    )
+
+
 def test_selecting_already_focused_worker_does_not_reenforce():
     adapter = FakeLegionAdapter(
         rows=[
@@ -291,3 +405,22 @@ def test_selecting_already_focused_worker_does_not_reenforce():
 
     assert result == "noop stack focus %1: already focused"
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
+
+
+def test_stack_enforce_defers_while_pane_select_zoom_restore_pending():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t1\t81\t0\t80\t10\tcodex\tfalse",
+        ],
+    )
+    adapter.window_options["@PANE_SELECT_ZOOM_RESTORE_PENDING"] = "true"
+
+    result = enforce_stack_layout(adapter, "main:4", focused_pane="%1", focus=True)  # type: ignore[arg-type]
+
+    assert result == "noop stack layout main:4: pane-select zoom restore pending"
+    assert not any(
+        command[0] in {"select-layout", "resize-pane", "join-pane", "split-window"}
+        for command in adapter.commands
+    )

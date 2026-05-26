@@ -17,6 +17,7 @@ STACK_FOCUS_GUARD_OPTION = "@STACK_FOCUS_GUARD"
 STACK_FOCUSED_PANE_OPTION = "@STACK_FOCUSED_PANE"
 LEGACY_FOCUS_GUARD_OPTION = "@LEGION_FOCUS_GUARD"
 LEGACY_FOCUSED_PANE_OPTION = "@LEGION_FOCUSED_PANE"
+PANE_SELECT_ZOOM_RESTORE_PENDING_OPTION = "@PANE_SELECT_ZOOM_RESTORE_PENDING"
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
 logger = logging.getLogger(__name__)
 
@@ -94,8 +95,16 @@ def _stack_window_option(adapter: TmuxAdapter, target: str, option: str) -> str:
     return value
 
 
+def _window_zoomed(adapter: TmuxAdapter, target: str) -> bool:
+    return _show(adapter, target, "#{window_zoomed_flag}") == "1"
+
+
 def _set_pane_option(adapter: TmuxAdapter, pane: str, option: str, value: str) -> None:
     adapter.run("set-option", "-p", "-t", pane, option, value, allow_failure=True)
+
+
+def _mechanicus_focus_allowed() -> bool:
+    return os.environ.get("IMPERIUM_ALLOW_MECHANICUS_FOCUS") == "1"
 
 
 def _window_base(name: str) -> str:
@@ -339,7 +348,7 @@ def _dock_secondary_personas_under_orchestrator(
     adapter.run("resize-pane", "-t", orchestrator.pane_id, "-y", str(persona_h), allow_failure=True)
     for pane in personas:
         adapter.run("resize-pane", "-t", pane.pane_id, "-x", str(orchestrator_w), allow_failure=True)
-    if selected_before:
+    if selected_before and not (spec.base == "mechanicus" and not _mechanicus_focus_allowed()):
         adapter.run("select-pane", "-t", selected_before, allow_failure=True)
 
 
@@ -413,6 +422,33 @@ def enforce_stack_layout(
     admit: bool = False,
     kill_pending_clear: bool = False,
 ) -> str:
+    from .focus_guard import preserve_focus
+
+    with preserve_focus(
+        adapter,
+        source="tmuxctl stack enforce",
+        attempted_target=focused_pane or target,
+        enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
+    ):
+        return _enforce_stack_layout_impl(
+            adapter,
+            target,
+            focused_pane=focused_pane,
+            focus=focus,
+            admit=admit,
+            kill_pending_clear=kill_pending_clear,
+        )
+
+
+def _enforce_stack_layout_impl(
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    focused_pane: str = "",
+    focus: bool = False,
+    admit: bool = False,
+    kill_pending_clear: bool = False,
+) -> str:
     window_name = _show(adapter, target, "#{window_name}")
     spec = _stack_spec_for_window(window_name)
     if spec is None:
@@ -437,6 +473,11 @@ def enforce_stack_layout(
             and _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION) == focused_pane
         ):
             return f"noop stack focus {focused_pane}: already focused"
+
+    if _window_zoomed(adapter, target):
+        return f"noop stack layout {target}: window zoomed"
+    if _stack_window_option(adapter, target, PANE_SELECT_ZOOM_RESTORE_PENDING_OPTION) == "true":
+        return f"noop stack layout {target}: pane-select zoom restore pending"
 
     orchestrator, workers = _orchestrator_and_workers(panes, spec)
     if orchestrator is None:
@@ -472,6 +513,14 @@ def enforce_stack_layout(
         if personas:
             panes = _stack_panes(adapter, target)
             orchestrator, workers = _orchestrator_and_workers(panes, spec)
+        try:
+            from .assertions import assert_persona
+
+            assert_persona(adapter, spec.orchestrator_role)
+            for persona_spec in spec.secondary_personas:
+                assert_persona(adapter, persona_spec.role)
+        except Exception as exc:  # layout should still normalize if Token-API is down
+            logger.warning("stack persona assertion failed target=%s: %s", target, exc)
 
     assigned_ordinals = {
         value
@@ -570,7 +619,12 @@ def enforce_stack_layout(
                 True,
             )
         if worker.clear and not (worker.pending and not kill_pending_clear):
-            adapter.run("kill-pane", "-t", worker.pane_id, allow_failure=True)
+            try:
+                from .assertions import assert_instance
+
+                assert_instance(adapter, worker.pane_id, prune=True)
+            except Exception:
+                adapter.run("kill-pane", "-t", worker.pane_id, allow_failure=True)
         elif not worker.clear and worker.pending:
             _clear_pending(adapter, worker.pane_id)
 
@@ -718,7 +772,9 @@ def add_orchestrator_stack_pane(
                 cwd,
             ).strip()
         else:
-            focus = _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION) or workers[0].pane_id
+            worker_ids = {worker.pane_id for worker in workers}
+            stored_focus = _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION)
+            focus = stored_focus if stored_focus in worker_ids else workers[0].pane_id
             pane = adapter.run(
                 "split-window",
                 "-v",
@@ -745,7 +801,8 @@ def add_orchestrator_stack_pane(
     )
     _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
     adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
-    enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
+    focus_new_worker = not (base == "mechanicus" and not _mechanicus_focus_allowed())
+    enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus_new_worker)
     return pane
 
 

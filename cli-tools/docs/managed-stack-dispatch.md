@@ -31,6 +31,48 @@ tmuxctl stack enforce --focus --pane %123
 tmuxctl stack enforce --window main:legion
 ```
 
+Sweep every managed stack page in a session and prune dead/clear worker artifacts:
+
+```bash
+tmuxctl stack sweep --session main
+```
+
+Do **not** run `stack sweep` on a timer. Periodic sweeps caused observable focus snaps because tmux layout repair can briefly reselect panes even when wrapped in focus restore. Stack repair is event-driven: pane birth/death hooks, explicit human pane/window selection, dispatch/admit paths, and manual repair when debugging.
+
+Dispatch wrappers call `tmuxctl stack dispatch ... --no-focus` for `:new` stack launches. Automated FG/worker dispatches must allocate `mechanicus:new` and must not select/focus the new pane unless a human explicitly asks to inspect it. Numbered stack panes (`mechanicus:1`, `mechanicus:2`, etc.) are identities for existing workers, not launch targets for new work.
+
+Focus safety: `stack enforce`, explicit/manual `stack sweep`, and non-focusing dispatch are automation surfaces. They must preserve the operator's current window/pane even when tmux layout commands internally reselect panes. Human navigation into stack windows is handled separately by the focus guard / human client marker; see [`tmux-focus-guard.md`](tmux-focus-guard.md).
+
+Zoom safety: native tmux zoom (`Prefix+e` / `tmux-grid-expand`, implemented as `resize-pane -Z`) is a human visual state. If a managed stack window is zoomed, `stack enforce` and `stack sweep` must defer structural layout normalization and return a no-op instead of running `select-layout`, `resize-pane`, `join-pane`, or secondary-persona `split-window` operations that would de-expand the pane. This complements focus safety: focus-preserving automation prevents camera snaps, while zoom-preserving automation prevents visual de-expansion. Normalization resumes after the human unzooms the window.
+
+## Pane-bound assertion (`tmuxctl assert-instance`)
+
+`tmuxctl assert-instance --pane <target>` is the public assertion primitive for pane-backed agents. It resolves the pane, reads its `@PANE_ID` / `@PANE_TYPE`, checks the live runtime plus Token-API registry row, and returns JSON:
+
+```json
+{"ok": true, "pane": "%26", "pane_label": "legion:custodes", "pane_type": "legion", "instance_id": "...", "action": "none", "reason": "live"}
+```
+
+Exit code is boolean: `0` only when `ok=true`.
+
+Behavior is type-bound:
+
+- Persona panes (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`):
+  - blank/no live runtime: launch the configured persona in the same pane;
+  - live runtime but no coherent registry identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
+  - live runtime with wrong identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
+  - live and coherent: return `ok=true`.
+- Stack workers (`@PANE_TYPE=stack-worker`):
+  - no live runtime: mark stale Token-API rows stopped, clear stale pane identity, and prune the pane;
+  - workers are never restarted automatically.
+- Other structured panes (palace/somnium/etc.):
+  - assertion is truth-only; no launch/restart;
+  - stale Token-API rows may be marked stopped as coherence cleanup.
+
+`send-text` runs this assertion opportunistically before injecting payloads. If assertion sends persona correction, `send-text` refuses the real payload; callers must settle and retry assertion before delivery.
+
+Operational note: after plan-mode or any mode transition that can drop persona registration, run `tmuxctl assert-instance --pane <persona-pane>`. A duplicate `/persona` line means the first correction had not yet produced a coherent registry row when the retry ran; this is safe but should be treated as a settle/retry tuning issue, not as permission to manually spawn the persona.
+
 ## Current entry points
 
 - `dispatch --target legion:new|mechanicus:new` allocates stack panes via `tmuxctl stack add`.

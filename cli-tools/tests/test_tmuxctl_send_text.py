@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -57,3 +58,94 @@ def test_send_text_then_submit_can_clear_prompt_first(monkeypatch):
         ("send-keys", "-t", "%42", "C-m"),
         ("send-keys", "-t", "%42", "C-m"),
     ]
+
+
+def test_automation_focus_guard_blocks_mechanicus_select_pane(monkeypatch):
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["display-message", "-t"]:
+            return subprocess.CompletedProcess(cmd, 0, "mechanicus\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("IMPERIUM_TMUX_AUTOMATION", "1")
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    assert adapter.run("select-pane", "-t", "%42") == ""
+
+    assert ["tmux", "display-message", "-t", "%42", "-p", "#{window_name}"] in calls
+    assert ["tmux", "select-pane", "-t", "%42"] not in calls
+
+
+def test_focus_guard_allow_env_opens_override_and_executes(monkeypatch):
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["display-message", "-t"]:
+            return subprocess.CompletedProcess(cmd, 0, "mechanicus\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("IMPERIUM_ALLOW_MECHANICUS_FOCUS", "1")
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.run("select-pane", "-t", "%42")
+
+    assert any(cmd[:4] == ["tmux", "set-option", "-g", "@IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL"] for cmd in calls)
+    assert ["tmux", "select-pane", "-t", "%42"] in calls
+
+
+def test_automation_focus_guard_does_not_block_style_changes(monkeypatch):
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("IMPERIUM_TMUX_AUTOMATION", "1")
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.run("select-pane", "-t", "%42", "-P", "bg=default")
+
+    assert calls == [["tmux", "select-pane", "-t", "%42", "-P", "bg=default"]]
+
+
+def test_automation_focus_guard_blocks_non_mechanicus_select_pane(monkeypatch):
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["display-message", "-t"]:
+            return subprocess.CompletedProcess(cmd, 0, "palace\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("IMPERIUM_TMUX_AUTOMATION", "1")
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    assert adapter.run("select-pane", "-t", "%42") == ""
+
+    assert ["tmux", "select-pane", "-t", "%42"] not in calls
+
+
+def test_focus_restore_env_allows_automation_restore(monkeypatch):
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["display-message", "-t"]:
+            return subprocess.CompletedProcess(cmd, 0, "mechanicus\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("IMPERIUM_TMUX_AUTOMATION", "1")
+    monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_RESTORE", "1")
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.run("select-pane", "-t", "%42")
+
+    assert ["tmux", "select-pane", "-t", "%42"] in calls

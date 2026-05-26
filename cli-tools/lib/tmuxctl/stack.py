@@ -155,36 +155,97 @@ def dispatch_stack_command(
     own input, but entry points that create-and-launch work should route through
     this function instead of doing raw ``tmux split-window`` themselves.
     """
-    pane = add_stack_pane(adapter, session, base, cwd=cwd)
-    if focus:
-        window_target = adapter.run(
-            "display-message",
-            "-t",
-            pane,
-            "-p",
-            "#{session_name}:#{window_name}",
-            allow_failure=True,
-        ).strip()
-        if window_target:
-            adapter.run("select-window", "-t", window_target, allow_failure=True)
-        adapter.run("select-pane", "-t", pane, allow_failure=True)
-        if base in {"legion", "mechanicus"}:
-            from .stack import enforce_stack_layout
+    from .focus_guard import preserve_focus
 
-            target = adapter.run(
+    with preserve_focus(
+        adapter,
+        source="tmuxctl stack dispatch",
+        attempted_target=f"{session}:{base}",
+        enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
+    ):
+        pane = add_stack_pane(adapter, session, base, cwd=cwd)
+        if focus:
+            window_target = adapter.run(
                 "display-message",
                 "-t",
                 pane,
                 "-p",
-                "#{session_name}:#{window_index}",
+                "#{session_name}:#{window_name}",
                 allow_failure=True,
             ).strip()
-            if target:
-                enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
-    if settle_seconds > 0:
-        time.sleep(settle_seconds)
-    adapter.run("send-keys", "-t", pane, command, "Enter")
-    return pane
+            if window_target:
+                adapter.run("select-window", "-t", window_target, allow_failure=True)
+            adapter.run("select-pane", "-t", pane, allow_failure=True)
+            if base in {"legion", "mechanicus"}:
+                from .stack import enforce_stack_layout
+
+                target = adapter.run(
+                    "display-message",
+                    "-t",
+                    pane,
+                    "-p",
+                    "#{session_name}:#{window_index}",
+                    allow_failure=True,
+                ).strip()
+                if target:
+                    enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+        adapter.run("send-keys", "-t", pane, command, "Enter")
+        return pane
+
+
+def sweep_stack_assertions(
+    adapter: TmuxAdapter,
+    session: str = "main",
+    *,
+    kill_pending_clear: bool = True,
+) -> str:
+    """Assert/prune every active managed stack window in a session.
+
+    Invocation-scoped assertion only repairs panes that a caller targets. This
+    sweep walks all live stack pages (including spill windows) and delegates to
+    enforce_stack_layout, which retags clear unknown worker artifacts and prunes
+    dead stack-worker panes. Use from cron/hook surfaces as the low-friction
+    periodic cleanup pass.
+    """
+    from .stack import enforce_stack_layout
+    from .focus_guard import preserve_focus
+
+    with preserve_focus(
+        adapter,
+        source="tmuxctl stack sweep",
+        attempted_target=session,
+        enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
+    ):
+        rows = adapter.run(
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_index}\t#{window_name}",
+            allow_failure=True,
+        ).splitlines()
+        results: list[str] = []
+        for row in rows:
+            if "\t" not in row:
+                continue
+            index, raw_name = row.split("\t", 1)
+            name = raw_name.split("(", 1)[0]
+            if not is_stack_base(name):
+                continue
+            target = f"{session}:{index}"
+            try:
+                results.append(
+                    enforce_stack_layout(
+                        adapter,
+                        target,
+                        kill_pending_clear=kill_pending_clear,
+                    )
+                )
+            except Exception as exc:
+                results.append(f"sweep failed {target}: {exc}")
+        return "\n".join(results) if results else f"no stack windows in {session}"
 
 # Generic persona-pane stack page implementation. Imported at module end so the
 # implementation can reuse stack_base_of()/spill helpers above without a cycle.

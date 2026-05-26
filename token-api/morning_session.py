@@ -453,28 +453,39 @@ def create_legion_pane() -> str | None:
 
 
 def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
-    """Deliver the morning prompt via `tmuxctl assert-custodes`.
-
-    tmuxctl owns the detect→upsert/restart decision: if a claude is already
-    live in legion:custodes (e.g. yesterday's session never exited), the
-    prompt is upserted via `claude-cmd --pane` instead of stacking a fresh
-    shell launch on top. Otherwise tmuxctl fires `dispatch --persona custodes
-    --sync` (the non-deprecated launcher).
-
-    `pane_id` is accepted for compatibility but not used directly — tmuxctl
-    resolves `legion:custodes` itself via the `@PANE_ID` tag.
-    """
+    """Assert `legion:custodes`, then send the morning prompt after assertion is true."""
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
-    try:
+    import time
+
+    def _assert_once() -> dict:
         result = subprocess.run(
-            [str(tmuxctl), "assert-custodes", "--stdin"],
+            [str(tmuxctl), "assert-instance", "--pane", "legion:custodes"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        try:
+            return json.loads(result.stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            return {"ok": False, "reason": f"bad_assert_output rc={result.returncode}"}
+
+    try:
+        assertion = _assert_once()
+        if assertion.get("action") in {"launched", "persona_correction_sent"}:
+            time.sleep(3)
+            assertion = _assert_once()
+        if not assertion.get("ok"):
+            print(f"Error: tmuxctl assert-instance legion:custodes failed: {assertion}")
+            return False
+        result = subprocess.run(
+            [str(tmuxctl), "send-text", "--pane", "legion:custodes", "--stdin"],
             input=prompt_text,
             capture_output=True,
             text=True,
             timeout=45,
         )
     except subprocess.TimeoutExpired:
-        print("Error: tmuxctl assert-custodes timed out")
+        print("Error: tmuxctl assert/send legion:custodes timed out")
         return False
     except Exception as e:
         print(f"Error launching in legion pane: {e}")
@@ -482,11 +493,11 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
 
     if result.returncode != 0:
         print(
-            f"Error: tmuxctl assert-custodes rc={result.returncode}: "
+            f"Error: tmuxctl send-text legion:custodes rc={result.returncode}: "
             f"stdout={result.stdout.strip()[:200]} stderr={result.stderr.strip()[:200]}"
         )
         return False
-    print(f"Morning session: {result.stdout.strip()}")
+    print(f"Morning session: sent via assert-instance {assertion}")
     return True
 
 
