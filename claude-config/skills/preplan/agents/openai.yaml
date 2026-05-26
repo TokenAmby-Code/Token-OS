@@ -1,0 +1,7 @@
+interface:
+  display_name: "Preplan"
+  short_description: "Prepare a session-doc-backed planning handoff without implementation."
+  default_prompt: "$preplan prepare the planning handoff"
+
+policy:
+  allow_implicit_invocation: true

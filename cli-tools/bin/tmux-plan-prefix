@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# tmux-plan-prefix - Prefix current prompt with /plan without submitting
+# tmux-plan-prefix - Shift+Tab planning cycle for Claude/Codex panes
 # TAGS: tmux, plan, keybind
 # AUDIENCE: human
+#
+# Cycle: none -> /preplan -> /plan -> cleared.
+# The Token-API planning state is authoritative; tmux @PLANNING_STATE is only a
+# local UI hint. /preplan creates a one-shot self stop-hook subscription that
+# submits `/plan create the plan` after the preplan response stops.
+# Skill invocation is harness-specific: Claude receives `/preplan`; Codex
+# receives `$preplan`. /plan is a real command and stays slash-prefixed in both.
 
 set -euo pipefail
 
 PANE=""
-PREFIX="/plan "
+DRY_RUN=false
+FORCE_STATE=""
+API_URL=""
+AGENT="auto"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pane) PANE="$2"; shift 2 ;;
-        --prefix) PREFIX="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --state) FORCE_STATE="$2"; shift 2 ;;
+        --api-url) API_URL="$2"; shift 2 ;;
+        --agent) AGENT="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,/^$/s/^# //p' "$0"
             exit 0
@@ -29,19 +42,184 @@ if [[ -z "$PANE" ]]; then
     fi
 fi
 
-# Claude and Codex prompt widgets can keep long drafts in a scrollable input.
-# Match the working /btw navigation pattern: jump to the top-left of the draft,
-# insert the slash command prefix, then return the cursor to the draft end.
-for _ in $(seq 1 50); do
-    tmux send-keys -t "$PANE" PgUp
-done
-tmux send-keys -t "$PANE" Home
-sleep 0.05
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${_script_dir}/../lib/nas-path.sh" >/dev/null 2>&1 || true
+API_URL="${API_URL:-${TOKEN_API_URL:-}}"
 
-tmux send-keys -t "$PANE" -l "$PREFIX"
-sleep 0.05
+json_escape() {
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
 
-for _ in $(seq 1 50); do
-    tmux send-keys -t "$PANE" PgDn
-done
-tmux send-keys -t "$PANE" End
+normalize_agent() {
+    case "${1:-auto}" in
+        codex|openai) echo codex ;;
+        claude|claude-code) echo claude ;;
+        *) echo auto ;;
+    esac
+}
+
+preplan_prefix_for_agent() {
+    case "$(normalize_agent "$1")" in
+        codex) echo '$preplan ' ;;
+        *) echo '/preplan ' ;;
+    esac
+}
+
+cycle_local() {
+    case "${1:-none}" in
+        none|"") echo preplanning ;;
+        preplanning) echo planning ;;
+        planning|approving) echo none ;;
+        *) echo preplanning ;;
+    esac
+}
+
+api_cycle_state() {
+    local body response current
+    body="{\"tmux_pane\":$(json_escape "$PANE"),\"cycle\":true,\"source\":\"tmux-plan-prefix\"}"
+    if response=$(curl -sf --max-time 2 -X POST "${API_URL}/api/planning/state" \
+        -H 'Content-Type: application/json' \
+        -d "$body" 2>/dev/null); then
+        if [[ -n "$response" ]]; then
+            python3 -c 'import json,sys
+obj=json.load(sys.stdin)
+if not obj.get("success"):
+    print(obj.get("action") or "planning_state_failed", file=sys.stderr)
+    raise SystemExit(1)
+state=obj.get("planning_state") or "none"
+engine=obj.get("engine") or obj.get("agent") or "auto"
+print(f"{state}\t{engine}")' <<<"$response" && return 0
+        fi
+    fi
+
+    # Fallback for a not-yet-restarted Token-API: use the pane-local tmux hint
+    # so the keybinding still works instead of silently logging a JSON error.
+    current=$(tmux display-message -p -t "$PANE" '#{@PLANNING_STATE}' 2>/dev/null || true)
+    echo "tmux-plan-prefix: planning API unavailable; falling back to tmux @PLANNING_STATE" >&2
+    printf '%s\t%s\n' "$(cycle_local "${current:-none}")" "$AGENT"
+}
+
+subscribe_preplan() {
+    local body
+    body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
+    curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
+        -H 'Content-Type: application/json' \
+        -d "$body" >/dev/null || true
+}
+
+unsubscribe_preplan() {
+    local body
+    body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"purpose\":\"preplan_plan\"}"
+    curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/unsubscribe" \
+        -H 'Content-Type: application/json' \
+        -d "$body" >/dev/null || true
+}
+
+jump_prompt_start() {
+    for _ in $(seq 1 50); do tmux send-keys -t "$PANE" PgUp; done
+    tmux send-keys -t "$PANE" Home
+    sleep 0.05
+}
+
+jump_prompt_end() {
+    sleep 0.05
+    for _ in $(seq 1 50); do tmux send-keys -t "$PANE" PgDn; done
+    tmux send-keys -t "$PANE" End
+}
+
+insert_preplan() {
+    local invoke_agent
+    invoke_agent="$AGENT_RESOLVED"
+    # If the operator did not force an agent, let tmuxctl inspect the live pane.
+    # Token-API can have stale pane rows from prior sessions; a stopped Claude
+    # row for a live Codex pane must not force /preplan.
+    if [[ "$(normalize_agent "$AGENT")" == "auto" ]]; then
+        invoke_agent="auto"
+    fi
+    "${_script_dir}/tmuxctl" invoke-skill --pane "$PANE" --agent "$invoke_agent" preplan >/dev/null
+}
+
+mutate_preplan_to_plan() {
+    jump_prompt_start
+    # /plan is universal; only the initial skill invocation leader differs.
+    # Remove the whole explicit skill invocation (`/preplan ` or `$preplan ` =
+    # 9 chars) and insert the real command. In Claude Code, deleting only the
+    # leading invoker plus "pre" leaves "lan ..." because /preplan is handled
+    # as slash-command text/chip state, not a plain editable prefix.
+    for _ in $(seq 1 9); do tmux send-keys -t "$PANE" Delete; done
+    sleep 0.05
+    tmux send-keys -t "$PANE" -l "/plan "
+    jump_prompt_end
+}
+
+clear_plan() {
+    jump_prompt_start
+    # Current Claude/Codex prompt widgets clear the /plan command chip with one
+    # Delete but leave the separator space before the draft. A second Delete
+    # removes that single leftover space. Do not send five/eight deletes; those
+    # eat the first draft characters (abc...).
+    tmux send-keys -t "$PANE" Delete
+    sleep 0.05
+    tmux send-keys -t "$PANE" Delete
+    jump_prompt_end
+}
+
+if $DRY_RUN; then
+    current="${FORCE_STATE:-none}"
+    next="$(cycle_local "$current")"
+    AGENT_RESOLVED="$(normalize_agent "$AGENT")"
+    [[ "$AGENT_RESOLVED" == "auto" ]] && AGENT_RESOLVED="claude"
+    prefix="$(preplan_prefix_for_agent "$AGENT_RESOLVED")"
+    case "$next" in
+        preplanning) action="insert:${prefix% } subscribe:preplan_plan" ;;
+        planning) action="mutate:${prefix% }->/plan unsubscribe:preplan_plan" ;;
+        none) action="clear:/plan unsubscribe:preplan_plan" ;;
+        *) action="noop" ;;
+    esac
+    printf 'pane=%s agent=%s previous=%s planning_state=%s action=%s\n' "$PANE" "$AGENT_RESOLVED" "$current" "$next" "$action"
+    exit 0
+fi
+
+if [[ -z "$API_URL" ]]; then
+    echo "tmux-plan-prefix: TOKEN_API_URL unavailable" >&2
+    exit 1
+fi
+
+API_RESULT="$(api_cycle_state)"
+if [[ "$API_RESULT" == *$'\t'* ]]; then
+    STATE="${API_RESULT%%$'\t'*}"
+    DETECTED_AGENT="${API_RESULT#*$'\t'}"
+else
+    STATE="$API_RESULT"
+    DETECTED_AGENT="auto"
+fi
+if [[ "$(normalize_agent "$AGENT")" == "auto" ]]; then
+    AGENT_RESOLVED="$(normalize_agent "$DETECTED_AGENT")"
+else
+    AGENT_RESOLVED="$(normalize_agent "$AGENT")"
+fi
+[[ "$AGENT_RESOLVED" == "auto" ]] && AGENT_RESOLVED="claude"
+tmux set-option -p -t "$PANE" @PLANNING_STATE "$STATE" 2>/dev/null || true
+tmux set-option -p -t "$PANE" @PLANNING_AGENT "$AGENT_RESOLVED" 2>/dev/null || true
+
+case "$STATE" in
+    preplanning)
+        subscribe_preplan
+        insert_preplan
+        ;;
+    planning)
+        unsubscribe_preplan
+        mutate_preplan_to_plan
+        ;;
+    none)
+        unsubscribe_preplan
+        clear_plan
+        ;;
+    approving)
+        ;;
+    *)
+        echo "tmux-plan-prefix: unexpected planning state: $STATE" >&2
+        exit 1
+        ;;
+esac
