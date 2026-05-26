@@ -42,8 +42,8 @@ export function createTranscriber(config, logger) {
   }
 
   return {
-    handleAudioFrame(userId, pcmChunk, botName) {
-      realtime.appendPCM(userId, pcmChunk, botName);
+    handleAudioFrame(userId, pcmChunk, botName, meta) {
+      realtime.appendPCM(userId, pcmChunk, botName, meta);
     },
     closeUser(userId, botName) {
       if (realtime) realtime.closeUser(userId, botName);

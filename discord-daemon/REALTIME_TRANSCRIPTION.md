@@ -40,8 +40,10 @@ Token API owns the visible draft lifecycle:
 
 - first non-command utterance creates one draft lock for `(bot_name, author_id)` and types into the target pane without Enter;
 - later non-command utterances append to that same locked pane;
-- `ship` / `ship it` submits the locked pane;
-- `scratch` / `scratch that` cancels the locked pane;
+- standalone or suffix `ship` / `ship it` submits the locked pane;
+- standalone or suffix `scratch` / `scratch that` cancels the locked pane;
+- leading filler `command` is ignored for commands, e.g. `command ship`;
+- `mute` temporarily server-mutes the speaking member for 15s when bot permissions allow; `unmute` clears it; `retarget` / `clear target` clears the draft lock without sending keys;
 - pane titles are marked with a lock prefix while a draft is active and restored when the draft clears.
 
 ## Live Test Notes
@@ -69,3 +71,8 @@ From the realtime log sample (`n=8`):
 ## Latency Defaults
 
 Defaults are intentionally fast but nonzero: `voice_silence_commit_ms = 700` and realtime VAD `silence_duration_ms = 300`. Do not set these to `0`; human micro-pauses, Discord frame jitter, and tiny audio buffers can split words into noisy fragments, reorder pending transcripts, or produce empty/buffer-too-small commits. If tuning further, treat about 400-500ms local commit and 200-250ms VAD as the aggressive floor.
+
+
+## Gapless capture notes
+
+The Discord receiver subscription stays active across commits. Local silence commits only close the current Realtime input buffer; the next real PCM frame immediately creates a fresh Realtime session and queues audio while its WebSocket becomes ready. Server VAD may also auto-commit before the local timer; the daemon treats `input_audio_buffer.committed` as a committed session so subsequent frames start the next session rather than appending to an already-committed buffer. This may create overlapping or duplicated syllables at boundaries, which is preferred over dropped speech.
