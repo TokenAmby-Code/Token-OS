@@ -177,8 +177,6 @@ def dispatch_stack_command(
                 adapter.run("select-window", "-t", window_target, allow_failure=True)
             adapter.run("select-pane", "-t", pane, allow_failure=True)
             if base in {"legion", "mechanicus"}:
-                from .stack import enforce_stack_layout
-
                 target = adapter.run(
                     "display-message",
                     "-t",
@@ -209,7 +207,6 @@ def sweep_stack_assertions(
     dead stack-worker panes. Use from cron/hook surfaces as the low-friction
     periodic cleanup pass.
     """
-    from .stack import enforce_stack_layout
     from .focus_guard import preserve_focus
 
     with preserve_focus(
@@ -247,22 +244,23 @@ def sweep_stack_assertions(
                 results.append(f"sweep failed {target}: {exc}")
         return "\n".join(results) if results else f"no stack windows in {session}"
 
+
 # Generic persona-pane stack page implementation. Imported at module end so the
 # implementation can reuse stack_base_of()/spill helpers above without a cycle.
 from ._stack_core import (  # noqa: E402,F401
     CUSTODES_ROLE,
     FABRICATOR_ROLE,
     LEGACY_WORKER_ROLES,
+    REGIMENT_ROLE,
     STACK_COLLAPSED_HEIGHT,
     STACK_ORCHESTRATOR_RATIO,
-    REGIMENT_ROLE,
     STACK_PAGE_SPECS,
-    StackPane,
     PersonaPaneSpec,
     StackPageSpec,
+    StackPane,
     add_orchestrator_stack_pane,
     add_stack_worker_pane,
-    enforce_stack_page_layout,
     enforce_stack_layout,
+    enforce_stack_page_layout,
     focus_selected,
 )

@@ -13,6 +13,7 @@ Lookup chain:
 Empty / stale queue → tmux display-message "no recent speaker".
 """
 
+import os
 import sqlite3
 import subprocess
 import sys

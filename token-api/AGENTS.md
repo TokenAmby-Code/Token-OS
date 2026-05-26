@@ -200,7 +200,8 @@ GET    /health                          # Health check (includes tts_backend sta
 ```
 
 ### Ops Cockpit
-```
+
+```text
 GET    /ui/ops                          # Terminus Vite React cockpit shell
 GET    /ui/ops/{asset_path}             # Built cockpit assets only; path traversal guarded
 GET    /api/ui/ops/state                # Aggregate read model for cockpit UI

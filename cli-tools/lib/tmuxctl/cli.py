@@ -63,7 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--session", default="main")
 
     resolve_parser = subparsers.add_parser("resolve-pane")
-    resolve_parser.add_argument("--format", choices=["id", "physical", "full", "json"], default="full")
+    resolve_parser.add_argument(
+        "--format", choices=["id", "physical", "full", "json"], default="full"
+    )
     resolve_parser.add_argument("target")
 
     session_doc_parser = subparsers.add_parser(
@@ -266,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "send-text":
             import json as _json
+
             from .assertions import assert_instance
 
             assertion = assert_instance(control.adapter, args.pane)
@@ -381,13 +384,13 @@ def main(argv: list[str] | None = None) -> int:
                         "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                     ).strip()
                 result = enforce_stack_layout(
-                        control.adapter,
-                        target,
-                        focused_pane=pane,
-                        focus=args.focus,
-                        admit=args.admit,
-                        kill_pending_clear=args.kill_pending_clear,
-                    )
+                    control.adapter,
+                    target,
+                    focused_pane=pane,
+                    focus=args.focus,
+                    admit=args.admit,
+                    kill_pending_clear=args.kill_pending_clear,
+                )
                 print(result)
                 return 0
 
@@ -442,23 +445,25 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "assert-instance":
             import json as _json
+
             from .assertions import assert_instance
 
-            result = assert_instance(control.adapter, args.pane)
-            print(_json.dumps(result))
-            return 0 if result.get("ok") else 1
+            assertion_result = assert_instance(control.adapter, args.pane)
+            print(_json.dumps(assertion_result))
+            return 0 if assertion_result.get("ok") else 1
 
         if args.command == "mechanicus-focus-guard":
             import json as _json
+
             from .focus_guard import remember_or_bounce
 
-            result = remember_or_bounce(
+            guard_result = remember_or_bounce(
                 control.adapter,
                 pane=args.pane,
                 client=args.client,
                 surface=args.surface,
             )
-            print(_json.dumps(result))
+            print(_json.dumps(guard_result))
             return 0
 
         if args.command == "allow-mechanicus-focus":

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
 
 from .focus_guard import allow_human_focus
 from .labels import canonical_pane_role
@@ -193,7 +193,9 @@ def _list_stack_panes(adapter: TmuxAdapter, window_target: str) -> list[StackPan
         ]
     )
     panes: list[StackPaneInfo] = []
-    for line in adapter.run("list-panes", "-t", window_target, "-F", fmt, allow_failure=True).splitlines():
+    for line in adapter.run(
+        "list-panes", "-t", window_target, "-F", fmt, allow_failure=True
+    ).splitlines():
         parts = line.split("\t")
         if len(parts) < 5:
             continue
@@ -281,7 +283,9 @@ def _absolute_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: D
     return ""
 
 
-def _relative_special_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: Direction) -> str:
+def _relative_special_target(
+    adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: Direction
+) -> str:
     if direction != "right":
         return ""
     if ctx.window_base not in _PRIMARY_PERSONA_ROLES:
@@ -304,9 +308,12 @@ def _select_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, target: str) -
                 adapter.run("select-pane", "-Z", "-t", target)
             else:
                 adapter.run("select-pane", "-t", target)
-        pane_id = pane_id or adapter.run(
-            "display-message", "-t", target, "-p", "#{pane_id}", allow_failure=True
-        ).strip()
+        pane_id = (
+            pane_id
+            or adapter.run(
+                "display-message", "-t", target, "-p", "#{pane_id}", allow_failure=True
+            ).strip()
+        )
         _reexpand_if_needed(
             adapter,
             was_zoomed=was_zoomed,
