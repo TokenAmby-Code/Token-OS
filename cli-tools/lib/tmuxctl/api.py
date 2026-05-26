@@ -68,6 +68,70 @@ def fetch_instance_registry() -> InstanceRegistrySnapshot:
     )
 
 
+def stop_instance(instance_id: str) -> None:
+    api_url = _token_api_url().rstrip("/")
+    request = urllib.request.Request(f"{api_url}/api/instances/{instance_id}", method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            return
+    except (OSError, urllib.error.URLError) as exc:
+        raise RegistryError(f"failed to stop instance {instance_id} via {api_url}") from exc
+
+
+def patch_instance(instance_id: str, suffix: str, body: dict) -> None:
+    api_url = _token_api_url().rstrip("/")
+    payload = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_url}/api/instances/{instance_id}/{suffix.lstrip('/')}",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            return
+    except (OSError, urllib.error.URLError) as exc:
+        raise RegistryError(
+            f"failed to patch instance {instance_id}/{suffix} via {api_url}"
+        ) from exc
+
+
+def update_instance_activity(instance_id: str, action: str = "prompt_submit") -> None:
+    api_url = _token_api_url().rstrip("/")
+    payload = json.dumps({"action": action}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_url}/api/instances/{instance_id}/activity",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            return
+    except (OSError, urllib.error.URLError) as exc:
+        raise RegistryError(
+            f"failed to update activity for instance {instance_id} via {api_url}"
+        ) from exc
+
+
+def log_event(event_type: str, *, instance_id: str = "", details: dict | None = None) -> None:
+    api_url = _token_api_url().rstrip("/")
+    payload = json.dumps(
+        {"event_type": event_type, "instance_id": instance_id or None, "details": details or {}}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_url}/api/events/log",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3):
+            return
+    except (OSError, urllib.error.URLError):
+        return
+
+
 def _api_get_json(path: str) -> dict | list:
     api_url = _token_api_url().rstrip("/")
     try:
@@ -99,9 +163,7 @@ def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
     if not candidates:
         all_instances = _api_get_json("/api/instances?sort=recent_activity")
         diagnostics = _session_doc_resolution_diagnostics(pane_label, all_instances)
-        raise RegistryError(
-            f"no live instance for pane label {pane_label}\n{diagnostics}".rstrip()
-        )
+        raise RegistryError(f"no live instance for pane label {pane_label}\n{diagnostics}".rstrip())
     doc_id = candidates[0].get("session_doc_id")
     if not doc_id:
         raise RegistryError(f"instance for pane label {pane_label} has no session doc")
@@ -117,7 +179,9 @@ def _session_doc_resolution_diagnostics(pane_label: str, rows: dict | list) -> s
     if not isinstance(rows, list):
         return ""
     matching_panes = {
-        row.get("tmux_pane") for row in rows if row.get("pane_label") == pane_label and row.get("tmux_pane")
+        row.get("tmux_pane")
+        for row in rows
+        if row.get("pane_label") == pane_label and row.get("tmux_pane")
     }
     related = [
         row
