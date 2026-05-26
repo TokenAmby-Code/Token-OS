@@ -592,6 +592,7 @@ PAVLOK_CONFIG = {
     "cooldown_seconds": 30,
     "zap_cooldown_seconds": 20 * 60,
     "soft_cooldown_seconds": 3 * 60,
+    "min_gap_seconds": 2.0,
     "daily_zap_cap": 6,
     "default_zap_value": 50,
     "friday_zap_value": 30,

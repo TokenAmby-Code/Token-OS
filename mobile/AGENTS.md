@@ -44,7 +44,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 [Notification/Enforcement — v3 unified params]    │
   /notify?params  <───────────────────────────────┘
   /enforce?params (+ Pavlok zap + Spotify redirect)
-  /zap?params     (direct Pavlok, lightweight)
+  /zap?params     (direct single Pavlok stimulus, lightweight)
 ```
 
 ### Phone Endpoints (MacroDroid HTTP Server, port 7777)
@@ -53,7 +53,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 |----------|---------|
 | `/notify?vibe=N&beep=N&tts_text=X&banner_text=X&type=T` | Notification + TTS + Pavlok vibe/beep |
 | `/enforce?zap=N&tts_text=X&banner_text=X&type=T` | Same + Pavlok zap + Spotify redirect |
-| `/zap?zap=N` | Direct Pavlok zap (lightweight) |
+| `/zap?zap=30` or `/zap?action=zap\|beep\|vibe&intensity=N` | Direct single Pavlok stimulus (lightweight) |
 | `/token-ping` | Local relay → Token-API with Discord fallback |
 | `/heartbeat` | Health check |
 | `/sshd` | Start Termux SSH daemon |
