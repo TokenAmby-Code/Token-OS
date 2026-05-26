@@ -177,6 +177,9 @@ def inspect() -> dict[str, Any]:
     if not canonical.exists():
         findings.append(Finding("error", "canonical_missing", str(canonical), "canonical skills directory is missing"))
         return _result(canonical, claude_root, codex_roots, skills, findings)
+    if not canonical.is_dir():
+        findings.append(Finding("error", "canonical_not_directory", str(canonical), "canonical skills path is not a directory"))
+        return _result(canonical, claude_root, codex_roots, skills, findings)
 
     if claude_root.exists() or claude_root.is_symlink():
         _check_link(claude_root, canonical, findings, "claude_root")
@@ -314,6 +317,9 @@ def install() -> dict[str, Any]:
     if not canonical.exists():
         findings.append(Finding("error", "canonical_missing", str(canonical), "canonical skills directory is missing"))
         return _result(canonical, home / ".claude" / "skills", _codex_roots(home), [], findings)
+    if not canonical.is_dir():
+        findings.append(Finding("error", "canonical_not_directory", str(canonical), "canonical skills path is not a directory"))
+        return _result(canonical, home / ".claude" / "skills", _codex_roots(home), [], findings)
 
     _safe_link(canonical, home / ".claude" / "skills", findings)
     claude_commands = home / ".claude" / "commands"
@@ -335,6 +341,9 @@ def install() -> dict[str, Any]:
                 link_name = str(_frontmatter(md).get("name") or skill.name)
             except Exception:
                 link_name = skill.name
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", link_name):
+            findings.append(Finding("error", "skill_name_invalid", str(skill), f"invalid skill name {link_name!r}"))
+            continue
         if link_name == "preplan" and md.exists():
             _safe_link(md, canonical_commands / "preplan.md", findings)
             _safe_link(md, claude_commands / "preplan.md", findings)

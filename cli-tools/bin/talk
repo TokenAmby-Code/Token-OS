@@ -179,7 +179,7 @@ def main(argv: list[str]) -> int:
                 else:
                     print(f"[talk:timeout] talk_id={talk_id}")
                 return 124
-            wait = min(DEFAULT_SERVER_POLL, max(2.0, remaining))
+            wait = max(0.1, min(DEFAULT_SERVER_POLL, remaining))
             try:
                 record = _get(
                     f"/api/talk/await/{talk_id}?timeout={wait}",
