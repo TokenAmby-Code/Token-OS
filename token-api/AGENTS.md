@@ -263,7 +263,8 @@ Three independent layers currently compose into 6 effective modes:
 - **Phone foreground is a distraction contribution** — it may move the derived activity layer to `distraction`, but it must not create `trigger=phone_app` shifts or assert `work_gaming`.
 - **Productivity remains server-derived** — active Claude/Codex instances and work-action calls drive `Productivity`; phone apps have no authority to mark work active.
 - **Location is a modifier** — geofence state can apply exemptions/bounties/manual context, but it should feed the composite state rather than bypassing derivation.
-- **Parameterized idle timeout**: 2hr from WORKING, 2min from MULTITASKING.
+- **Work activity decay**: productivity drops after 3 minutes with no qualifying work signal (recent processing/pane activity, `/api/work-action`, prompt submit, AskUserQuestion answer, or tmux typing-guard signal).
+- **Parameterized idle timeout**: IDLE auto-breaks after 7 minutes. Total grace from last work action to break is about 10 minutes when activity is otherwise clear.
 - **Gym bounty**: +30 min break on gym exit (`apply_gym_bounty()`).
 - **Daily reset**: 7 AM (CronTrigger hour=7).
 - **Serialization**: `format_version: 2` in DB. Legacy v1 flat modes auto-migrated on load.
@@ -542,11 +543,10 @@ Global dictation state tracked via `POST /api/dictation` (set) and `GET /api/dic
 # Quick status check
 token-status
 
-# Multi-device restart (Mac → WSL → phone, no sync needed in NAS era)
-token-restart                    # Full restart: Mac, WSL satellite, phone TUI
+# Multi-device restart (Mac → WSL satellite → Ops browser refresh, no sync needed in NAS era)
+token-restart                    # Full restart: Mac, WSL satellite, reload open /ui/ops browser tabs
 token-restart --from <dir>       # Update plist to serve from <dir>, then restart
 token-restart --wsl-only         # WSL satellite only (HTTP or SSH fallback)
-token-restart --tui-only         # TUI restart signals only (no server restart)
 token-restart --kill             # Kill Mac server (launchd auto-restarts)
 token-restart --watch            # Full restart + tail logs
 token-restart --status           # Multi-device status (Mac + WSL + phone)

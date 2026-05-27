@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import { useOpsState, useTimerHistory, useOpsGraph } from './api';
 import { formatClock } from './format';
 import { TopStrip } from './components/TopStrip';
@@ -35,6 +36,19 @@ export function App() {
   const graph = useOpsGraph();
 
   const state = ops.data;
+  const initialBuildId = useRef<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!state) return;
+    if (initialBuildId.current === undefined) {
+      initialBuildId.current = state.ui_build_id;
+      return;
+    }
+    if (state.ui_build_id && initialBuildId.current && state.ui_build_id !== initialBuildId.current) {
+      window.location.reload();
+    }
+  }, [state?.ui_build_id]);
+
   // Connection health: error AND data older than ~6s ⇒ visibly degraded.
   const stale = ops.error && ops.lastOk != null && Date.now() - ops.lastOk > 6000;
   const connClass = ops.error ? (stale ? 'conn--bad' : 'conn--warn') : 'conn--ok';
@@ -92,7 +106,7 @@ export function App() {
             meta={
               <span className="panel__meta-note">
                 {timer.data
-                  ? `today · since 07:00 · ${timer.data.points.length} pts`
+                  ? `today · since 07:20 · ${timer.data.points.length} pts`
                   : 'loading'}
                 {timer.error ? ` · ${timer.error}` : ''}
               </span>

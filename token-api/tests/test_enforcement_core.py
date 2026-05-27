@@ -1065,7 +1065,7 @@ def test_phone_slay_the_spire_productivity_contributes_composite_timer_state(app
     assert details["count"] == 1
 
 
-def test_work_action_clears_phone_without_erasing_desktop_distraction(app_env):
+def test_work_action_preserves_phone_and_desktop_distraction_sources(app_env):
     from fastapi.testclient import TestClient
 
     app_env.main.DESKTOP_STATE["current_mode"] = "gaming"
@@ -1088,15 +1088,15 @@ def test_work_action_clears_phone_without_erasing_desktop_distraction(app_env):
     client = TestClient(app_env.main.app)
     resp = client.post(
         "/api/work-action",
-        json={"source": "unit_test", "note": "clear phone only"},
+        json={"source": "unit_test", "note": "work while phone video continues"},
     )
 
     assert resp.status_code == 200
-    assert app_env.main.PHONE_STATE["current_app"] is None
-    assert app_env.main.PHONE_STATE["is_distracted"] is False
+    assert app_env.main.PHONE_STATE["current_app"] == "youtube"
+    assert app_env.main.PHONE_STATE["is_distracted"] is True
     assert app_env.main.DESKTOP_STATE["current_mode"] == "gaming"
     assert app_env.main.timer_engine.activity == app_env.main.Activity.DISTRACTION
-    assert app_env.main.timer_engine.current_mode.value == "multitasking"
+    assert app_env.main.timer_engine.current_mode == app_env.main.TimerMode.MULTITASKING
 
 
 @pytest.mark.asyncio
@@ -1203,7 +1203,8 @@ def test_work_action_acknowledges_phone_and_backlog_acks(app_env):
         "SELECT status FROM expected_acknowledgements ORDER BY id",
     )
     assert [row["status"] for row in rows] == ["acknowledged", "acknowledged"]
-    assert app_env.main.PHONE_STATE["is_distracted"] is False
+    assert app_env.main.PHONE_STATE["current_app"] == "youtube"
+    assert app_env.main.PHONE_STATE["is_distracted"] is True
 
 
 @pytest.mark.asyncio
@@ -1377,7 +1378,7 @@ def test_work_state_ignores_idle_tracked_instance_without_agent_process(app_env,
     body = resp.json()
     assert body["productivity_active"] is False
     assert body["active_instance_count"] == 0
-    assert body["reason"] == "no_live_agent"
+    assert body["reason"] == "no_recent_work_activity"
 
 
 def test_state_validate_app_assertion_uses_http_status(app_env):
@@ -1560,6 +1561,103 @@ def test_phone_close_acknowledges_pending_phone_ack(app_env):
     assert row["status"] == "acknowledged"
     assert row["acknowledged_at"]
 
+
+
+def test_desktop_clear_preserves_active_phone_distraction(app_env):
+    from fastapi.testclient import TestClient
+
+    app_env.main.DESKTOP_STATE["current_mode"] = "video"
+    app_env.main.DESKTOP_STATE["work_mode"] = "clocked_in"
+    app_env.main.DESKTOP_STATE["startup_grace_secs"] = 0
+    app_env.main.PHONE_STATE.update(
+        {
+            "current_app": "youtube",
+            "app_opened_at": datetime.now().isoformat(),
+            "is_distracted": True,
+            "last_activity": datetime.now().isoformat(),
+        }
+    )
+    now_ms = int(app_env.main.time.monotonic() * 1000)
+    app_env.main.timer_engine.set_productivity(True, now_ms)
+    app_env.main.timer_engine.set_activity(
+        app_env.main.Activity.DISTRACTION,
+        is_scrolling_gaming=False,
+        now_mono_ms=now_ms,
+    )
+
+    client = TestClient(app_env.main.app)
+    resp = client.post(
+        "/desktop",
+        json={"detected_mode": "silence", "window_title": "Desktop", "source": "pytest"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert app_env.main.DESKTOP_STATE["current_mode"] == "silence"
+    assert app_env.main.PHONE_STATE["current_app"] == "youtube"
+    assert app_env.main.PHONE_STATE["is_distracted"] is True
+    assert app_env.main.timer_engine.activity == app_env.main.Activity.DISTRACTION
+    assert app_env.main.timer_engine.current_mode == app_env.main.TimerMode.MULTITASKING
+
+
+def test_phone_close_recomputes_activity_without_erasing_desktop(app_env):
+    from fastapi.testclient import TestClient
+
+    app_env.main.DESKTOP_STATE["current_mode"] = "video"
+    app_env.main.PHONE_STATE.update(
+        {
+            "current_app": "youtube",
+            "app_opened_at": datetime.now().isoformat(),
+            "is_distracted": True,
+            "last_activity": datetime.now().isoformat(),
+        }
+    )
+    now_ms = int(app_env.main.time.monotonic() * 1000)
+    app_env.main.timer_engine.set_productivity(True, now_ms)
+    app_env.main.timer_engine.set_activity(
+        app_env.main.Activity.DISTRACTION,
+        is_scrolling_gaming=False,
+        now_mono_ms=now_ms,
+    )
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/phone", json={"app": "youtube", "action": "close"})
+
+    assert resp.status_code == 200, resp.text
+    assert app_env.main.PHONE_STATE["current_app"] is None
+    assert app_env.main.PHONE_STATE["is_distracted"] is False
+    assert app_env.main.DESKTOP_STATE["current_mode"] == "video"
+    assert app_env.main.timer_engine.activity == app_env.main.Activity.DISTRACTION
+    assert app_env.main.timer_engine.current_mode == app_env.main.TimerMode.MULTITASKING
+
+
+def test_phone_close_returns_to_working_when_no_attention_sources_remain(app_env):
+    from fastapi.testclient import TestClient
+
+    app_env.main.DESKTOP_STATE["current_mode"] = "silence"
+    app_env.main.PHONE_STATE.update(
+        {
+            "current_app": "youtube",
+            "app_opened_at": datetime.now().isoformat(),
+            "is_distracted": True,
+            "last_activity": datetime.now().isoformat(),
+        }
+    )
+    now_ms = int(app_env.main.time.monotonic() * 1000)
+    app_env.main.timer_engine.set_productivity(True, now_ms)
+    app_env.main.timer_engine.set_activity(
+        app_env.main.Activity.DISTRACTION,
+        is_scrolling_gaming=False,
+        now_mono_ms=now_ms,
+    )
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/phone", json={"app": "youtube", "action": "close"})
+
+    assert resp.status_code == 200, resp.text
+    assert app_env.main.PHONE_STATE["current_app"] is None
+    assert app_env.main.PHONE_STATE["is_distracted"] is False
+    assert app_env.main.timer_engine.activity == app_env.main.Activity.WORKING
+    assert app_env.main.timer_engine.current_mode == app_env.main.TimerMode.WORKING
 
 def test_mewgenics_turn_legacy_endpoint_does_not_create_ack(app_env):
     from fastapi.testclient import TestClient

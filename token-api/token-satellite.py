@@ -1997,8 +1997,13 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
 
 @app.post("/restart")
 async def restart_satellite(pull: bool = True):
-    """Git pull, write TUI signals, then exit for systemd restart."""
-    result = {"pull": None, "tui_signals": False, "restarting": True}
+    """Git pull, then exit for systemd restart.
+
+    Legacy TUI restart signal files are intentionally gone. The live cockpit is
+    `/ui/ops`; browser refresh is handled by token-restart on Mac and by the
+    frontend build-id auto-reload loop for remote browsers.
+    """
+    result = {"pull": None, "browser_gui": "frontend_auto_reload", "restarting": True}
     _send_lifecycle_event("restart_requested", {"pull": pull})
 
     # 1. Git pull
@@ -2017,19 +2022,11 @@ async def restart_satellite(pull: bool = True):
         except Exception as e:
             result["pull"] = {"success": False, "error": str(e)}
 
-    # 2. Write TUI restart signals
-    signal_dir = Path.home() / ".claude"
-    signal_dir.mkdir(parents=True, exist_ok=True)
-    signal_data = json.dumps({"reason": "token-restart", "timestamp": datetime.now().isoformat()})
-    for suffix in ("desktop", "mobile"):
-        (signal_dir / f"tui-restart-{suffix}.signal").write_text(signal_data)
-    result["tui_signals"] = True
-
-    # 3. Shutdown cleanly
+    # 2. Shutdown cleanly
     deskflow_watchdog.stop()
     tts_engine.shutdown()
 
-    # 4. Schedule exit after response is sent (systemd Restart=always brings us back)
+    # 3. Schedule exit after response is sent (systemd Restart=always brings us back)
     def delayed_exit():
         time.sleep(0.5)
         logger.info("RESTART: Exiting for systemd restart")
@@ -2037,7 +2034,7 @@ async def restart_satellite(pull: bool = True):
 
     threading.Thread(target=delayed_exit, daemon=True).start()
 
-    logger.info(f"RESTART: pull={result['pull']}, signals written, exiting in 0.5s")
+    logger.info(f"RESTART: pull={result['pull']}, exiting in 0.5s")
     return result
 
 

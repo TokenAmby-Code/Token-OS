@@ -92,6 +92,40 @@ def test_ops_timer_history_returns_live_shape(client, app_env):
     assert body["annotations"][0]["type"] == "test"
 
 
+def test_work_state_ignores_stale_idle_instances(client, app_env):
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO claude_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id,
+            status, tmux_pane, engine, registered_at, last_activity)
+           VALUES (?, ?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',
+                   'idle', '%44', 'codex',
+                   datetime('now', '-20 minutes'), datetime('now', '-10 minutes'))""",
+        (str(uuid.uuid4()), str(uuid.uuid4())),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/work-state")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["productivity_active"] is False
+    assert body["reason"] == "no_recent_work_activity"
+
+
+def test_work_action_sets_short_productivity_window(client):
+    resp = client.post("/api/work-action", json={"source": "pytest", "note": "state assertion"})
+    assert resp.status_code == 200, resp.text
+
+    state_resp = client.get("/api/work-state")
+
+    assert state_resp.status_code == 200, state_resp.text
+    body = state_resp.json()
+    assert body["productivity_active"] is True
+    assert body["reason"] == "recent_work_action"
+
+
 def test_ops_ui_serves_index_html(client):
     resp = client.get("/ui/ops")
 

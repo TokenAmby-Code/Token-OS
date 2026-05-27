@@ -70,11 +70,11 @@ The cockpit exposes state assertions near the top because the operator should ne
 
 ### Timer graph specifics
 
-- **X axis**: spans from the day-start (currently hardcoded `DAY_START_HOUR = 7` in `api.ts`) to now, so it compresses as the day fills rather than scrolling a fixed window. Tape-measure ticks — labeled `HH:00` on the hour, medium mark at `:30`, minor marks at `:15`/`:45`.
+- **X axis**: spans from the day-start (currently hardcoded `DAY_START_HOUR = 7 / DAY_START_MINUTE = 20` in `api.ts`) to now, so it compresses as the day fills rather than scrolling a fixed window. Tape-measure ticks — labeled `HH:00` on the hour, medium mark at `:30`, minor marks at `:15`/`:45`.
 - **Y axis**: signed break balance, quantized to **quarter-hour** steps chosen from a ladder of 15-min multiples (never a blind divide); the domain snaps to that step so top/bottom/zero land on clean values. Zero line is drawn prominently but unlabeled.
 - Hover crosshair shows timestamp, mode, balance, productivity, desktop mode, phone app.
 
-> **Day-start is hardcoded to 07:00 for MVP.** It should eventually be read from the Token-API state payload, but that depends on finishing the morning-session and Hatch alarm-clock integration so the server publishes an authoritative day-start. Until then the constant in `api.ts` is the single place to change it; it lines up with the 7 AM timer daily reset.
+> **Day-start is hardcoded to 07:20 for MVP.** It should eventually be read from the Token-API state payload, but that depends on finishing the morning-session and Hatch alarm-clock integration so the server publishes an authoritative day-start. Until then the constant in `api.ts` is the single place to change it; it lines up with the 7 AM timer daily reset; the graph display now starts at 07:20.
 
 ### Live and mocked read-models
 
@@ -131,6 +131,6 @@ open http://localhost:7777/ui/ops
 ## Current limitations
 
 - **Relationship graph backend not built.** The graph panel still runs on `mock.ts` until `GET /api/ui/ops/graph/{name}` ships. Timer history is live via `GET /api/ui/ops/timer/history`.
-- **Day-start hardcoded to 07:00.** Pending morning-session / Hatch alarm-clock integration that lets the server publish an authoritative day-start to read from state.
+- **Day-start hardcoded to 07:20.** Pending morning-session / Hatch alarm-clock integration that lets the server publish an authoritative day-start to read from state.
 - Read-only surface; operational mutations should remain Token-API/CLI mutations invoked from tmux keybindings until deliberately designed.
 - Built frontend assets are committed for this pilot to keep LaunchAgent runtime Python-only. No CSS framework — design system is hand-rolled CSS variables in `styles.css`.

@@ -60,8 +60,8 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
 }
 
 # Timeouts
-IDLE_TIMEOUT_FROM_WORKING_MS = 7_200_000  # 2 hours
-IDLE_TIMEOUT_FROM_MULTITASKING_MS = 120_000  # 2 minutes
+IDLE_TIMEOUT_FROM_WORKING_MS = 420_000  # 7 minutes after productivity goes inactive
+IDLE_TIMEOUT_FROM_MULTITASKING_MS = 420_000  # 7 minutes after productivity goes inactive
 DISTRACTION_TIMEOUT_MS = 600_000  # 10 minutes (scrolling/gaming only)
 GYM_BOUNTY_MS = 1_800_000  # 30 minutes
 
@@ -259,6 +259,16 @@ class TimerEngine:
     @property
     def idle_timeout_ms(self) -> int:
         return self._productivity_substate["idle_timeout_ms"]
+
+    @property
+    def idle_entered_ms(self) -> int | None:
+        return self._productivity_substate["idle_entered_ms"]
+
+    def idle_remaining_ms(self, now_mono_ms: int) -> int | None:
+        idle_entered = self.idle_entered_ms
+        if idle_entered is None or self.idle_timeout_exempt:
+            return None
+        return max(0, self.idle_timeout_ms - (now_mono_ms - idle_entered))
 
     @property
     def distraction_started_ms(self) -> int | None:

@@ -290,4 +290,4 @@ The brief recommends React Flow (graph) and uPlot/visx (timer). Both were implem
 ### Deferred / blocked
 
 - `GET /api/ui/ops/timer/history` backend is built and live. `GET /api/ui/ops/graph/{name}` still needs a backend; the component contract is final and mock-swappable.
-- **Day-start** is hardcoded to `DAY_START_HOUR = 7` in `api.ts`. It should be read from the state payload once morning-session + Hatch alarm-clock integration publishes an authoritative day-start. It currently lines up with the 7 AM timer daily reset.
+- **Day-start** is hardcoded to `DAY_START_HOUR = 7 / DAY_START_MINUTE = 20` in `api.ts`. It should be read from the state payload once morning-session + Hatch alarm-clock integration publishes an authoritative day-start. It currently lines up with the 7 AM timer daily reset; the graph display now starts at 07:20.
