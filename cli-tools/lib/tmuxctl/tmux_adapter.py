@@ -164,6 +164,9 @@ class TmuxAdapter:
         # typing guard is active. Reads pass through untouched; sanctioned
         # human-initiated sends are allowed but logged. Never raises.
         args_tuple = tuple(args)
+        # Clear any prior suppression payload so an allowed send (which also
+        # returns empty stdout) is never misread as suppressed by callers/tests.
+        self.last_send_gate_result = None
         gate = send_gate.evaluate(args_tuple)
         if gate is not None:
             send_gate.record_suppression(gate)

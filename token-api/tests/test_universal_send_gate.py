@@ -11,25 +11,26 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 PHX = ZoneInfo("America/Phoenix")
 
 
-def _insert_day_state(db_path, date, day_started_at, source):
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "INSERT INTO day_state (date, day_started_at, source) VALUES (?, ?, ?)",
-        (date, day_started_at, source),
-    )
-    conn.commit()
-    conn.close()
+def _insert_day_state(db_path: str | Path, date: str, day_started_at: str, source: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO day_state (date, day_started_at, source) VALUES (?, ?, ?)",
+            (date, day_started_at, source),
+        )
+        conn.commit()
 
 
 # ---- (c) morning-latch source rule -----------------------------------------
 
 
-def test_schedule_fallback_does_not_release_morning_latch(app_env, monkeypatch):
+def test_schedule_fallback_does_not_release_morning_latch(app_env: Any, monkeypatch: Any) -> None:
     shared = app_env.shared
     monkeypatch.setenv("TOKEN_API_QUIET_START_HOUR", "23")
     monkeypatch.setenv("TOKEN_API_QUIET_END_HOUR", "9")
@@ -43,7 +44,7 @@ def test_schedule_fallback_does_not_release_morning_latch(app_env, monkeypatch):
     assert status["active"] is True, "schedule_fallback wake-anchor must not end quiet hours"
 
 
-def test_official_morning_source_releases_morning_latch(app_env, monkeypatch):
+def test_official_morning_source_releases_morning_latch(app_env: Any, monkeypatch: Any) -> None:
     shared = app_env.shared
     monkeypatch.setenv("TOKEN_API_QUIET_START_HOUR", "23")
     monkeypatch.setenv("TOKEN_API_QUIET_END_HOUR", "9")
@@ -58,7 +59,7 @@ def test_official_morning_source_releases_morning_latch(app_env, monkeypatch):
 # ---- (d) timer does not originate interventions during quiet ---------------
 
 
-async def test_timer_intervention_suppressed_during_quiet(app_env, monkeypatch):
+async def test_timer_intervention_suppressed_during_quiet(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
     dispatched: list[str] = []
 
@@ -82,7 +83,7 @@ async def test_timer_intervention_suppressed_during_quiet(app_env, monkeypatch):
     assert dispatched == [], "no custodes intervention may be dispatched during quiet hours"
 
 
-async def test_timer_intervention_dispatches_outside_quiet(app_env, monkeypatch):
+async def test_timer_intervention_dispatches_outside_quiet(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
     dispatched: list[str] = []
 

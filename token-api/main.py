@@ -3599,20 +3599,30 @@ async def _dispatch_timer_intervention(
     (``shared.get_quiet_hours_status``). Returns True if dispatched, False if
     suppressed. Never raises into the timer loop.
     """
-    if is_quiet_hours(now) or shared.get_quiet_hours_status(now).get("active"):
-        await log_quiet_hours_suppressed(
-            source=source,
-            event_type=event_name,
-            details={"suppressed_by": "timer_quiet_guard", "severity": severity},
+    try:
+        if is_quiet_hours(now) or shared.get_quiet_hours_status(now).get("active"):
+            await log_quiet_hours_suppressed(
+                source=source,
+                event_type=event_name,
+                details={"suppressed_by": "timer_quiet_guard", "severity": severity},
+            )
+            return False
+        kwargs: dict = {}
+        if severity is not None:
+            kwargs["severity"] = severity
+        if payload is not None:
+            kwargs["payload"] = payload
+        asyncio.create_task(handle_custodes_state_event(event_name, source, **kwargs))
+        return True
+    except Exception:
+        # Never let a quiet-guard failure leak into the timer loop. Fail safe:
+        # do NOT originate an intervention when we cannot evaluate quiet state.
+        logger.exception(
+            "timer intervention guard failed; suppressing (event=%s source=%s)",
+            event_name,
+            source,
         )
         return False
-    kwargs: dict = {}
-    if severity is not None:
-        kwargs["severity"] = severity
-    if payload is not None:
-        kwargs["payload"] = payload
-    asyncio.create_task(handle_custodes_state_event(event_name, source, **kwargs))
-    return True
 
 
 QUIET_RESUME_JOB_ID = "quiet-resume-after-state-buster"

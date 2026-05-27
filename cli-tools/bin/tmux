@@ -100,16 +100,19 @@ resolve_target() {
 # shell escape hatch around TmuxAdapter.run()'s Python gate — together they make
 # the sentinel inescapable across both languages. Only the mutating send verbs
 # are gated (reads pass through). Sanctioned human-initiated sends
-# (TMUX_SEND_GATE_ALLOW set) skip the gate; any check error fails open so a
-# transient fault never bricks all pane writes. Returns 0 (true) to SUPPRESS.
+# (TMUX_SEND_GATE_ALLOW set) are still routed through the canonical predicate so
+# the override is allowed AND audited (send_gate_override) — never silently
+# bypassed. Any check error fails open so a transient fault never bricks all
+# pane writes. Returns 0 (true) to SUPPRESS.
 send_gate_suppresses() {
     case "${1:-}" in
         send-keys|send-key|send|paste-buffer) ;;
         *) return 1 ;;  # not a mutating send verb — never gated
     esac
-    [[ -n "${TMUX_SEND_GATE_ALLOW:-}" ]] && return 1  # sanctioned human send
     local lib_dir rc=0
     lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || return 1
+    # TMUX_SEND_GATE_ALLOW (if set) is inherited by the child, which logs the
+    # override and returns allow (rc 0); only rc 100 means suppress.
     PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.send_gate check "$@" >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 100 ]]

@@ -22,9 +22,9 @@ from tmuxctl.tmux_adapter import TmuxAdapter
 
 class _FakeCompleted:
     def __init__(self) -> None:
-        self.returncode = 0
-        self.stdout = ""
-        self.stderr = ""
+        self.returncode: int = 0
+        self.stdout: str = ""
+        self.stderr: str = ""
 
 
 @pytest.fixture
