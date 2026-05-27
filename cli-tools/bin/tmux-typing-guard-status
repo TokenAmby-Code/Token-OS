@@ -4,66 +4,33 @@
 # AUDIENCE: human, agent
 """Show a compact tmux status segment while recent user typing is active.
 
-Uses tmux's client_activity timestamp, which updates on client input. The
-segment remains visible for TMUX_TYPING_GUARD_WINDOW seconds after the last
-registered keystroke/input event. Silent outside tmux or on failure.
+Thin reader of the ONE canonical typing-guard predicate
+(`tmuxctl.send_gate.typing_guard_active`), which reads tmux's #{client_activity}
+timestamp and stays active for TMUX_TYPING_GUARD_WINDOW seconds after the last
+keystroke. Keeping the client_activity logic in a single place means the status
+segment, tmux-guard.sh, and the universal send gate can never disagree. Silent
+outside tmux or on failure.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
+import pathlib
 import sys
-import time
 
-DEFAULT_WINDOW_SECONDS = 10
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "lib"))
 
+try:
+    from tmuxctl.send_gate import typing_guard_active
+except Exception:  # fail-open: render nothing if the predicate can't be imported
 
-def _window_seconds() -> int:
-    raw = os.environ.get("TMUX_TYPING_GUARD_WINDOW", str(DEFAULT_WINDOW_SECONDS))
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return DEFAULT_WINDOW_SECONDS
-
-
-def _tmux_format(fmt: str) -> str | None:
-    try:
-        proc = subprocess.run(
-            ["tmux", "display-message", "-p", fmt],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.2,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip()
-
-
-def _client_activity_epoch() -> int | None:
-    value = _tmux_format("#{client_activity}")
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+    def typing_guard_active(**_kwargs) -> bool:
+        return False
 
 
 def main() -> int:
     plain = "--plain" in sys.argv[1:]
-    activity = _client_activity_epoch()
-    if activity is None:
+    if not typing_guard_active():
         return 0
-
-    age = int(time.time()) - activity
-    if age < 0 or age > _window_seconds():
-        return 0
-
     if plain:
         print("TYPE", end="")
     else:

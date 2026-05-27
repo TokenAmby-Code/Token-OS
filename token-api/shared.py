@@ -38,6 +38,21 @@ STASH_MAX_AGE_HOURS = 24
 QUIET_HOURS_START = int(os.environ.get("TOKEN_API_QUIET_START_HOUR", "23"))
 QUIET_HOURS_END = int(os.environ.get("TOKEN_API_QUIET_END_HOUR", "9"))
 QUIET_HOURS_TIMEZONE = os.environ.get("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
+# Only an explicit/official morning action releases the morning quiet latch
+# early. day_state is written by exactly two paths: the automated
+# schedule_fallback wake-anchor (source="schedule_fallback") — which fired while
+# the Emperor slept and must NOT release quiet — and /api/day-start/fire (the
+# documented "single morning latch") whose human/official sources are
+# alarm_silenced|manual|custodes. The automated "schedule"/"schedule_fallback"
+# are deliberately excluded; if early release never fires the 09:00 clock
+# boundary still ends quiet hours. Kept in sync with tmuxctl.send_gate.
+OFFICIAL_MORNING_SOURCES = frozenset(
+    s.strip()
+    for s in os.environ.get(
+        "TOKEN_API_MORNING_SOURCES", "alarm_silenced,manual,custodes,morning"
+    ).split(",")
+    if s.strip()
+)
 _DAY_STATE_CACHE_TTL_SECONDS = 60.0
 _DAY_STATE_CACHE: dict[str, object] = {"date": None, "value": None, "monotonic": 0.0}
 
@@ -234,8 +249,16 @@ def get_quiet_hours_status(now: datetime | None = None) -> dict:
     else:
         day_state = get_day_state_sync(local_date)
     day_started_at = day_state.get("day_started_at") if day_state else None
+    day_source = day_state.get("source") if day_state else None
 
-    if active and segment == "morning_latch" and day_started_at:
+    if (
+        active
+        and segment == "morning_latch"
+        and day_started_at
+        and day_source in OFFICIAL_MORNING_SOURCES
+    ):
+        # Released only by the official morning system. A schedule_fallback
+        # wake-anchor (or any non-morning source) leaves the latch ON.
         active = False
         reason = "day_started"
     elif active:
@@ -251,6 +274,7 @@ def get_quiet_hours_status(now: datetime | None = None) -> dict:
         "timezone": QUIET_HOURS_TIMEZONE,
         "local_time": local_now.isoformat(),
         "day_started_at": day_started_at,
+        "day_source": day_source,
         "day_state_date": local_now.date().isoformat(),
         "quiet_segment": segment,
     }

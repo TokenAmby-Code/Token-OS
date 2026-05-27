@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import send_gate
+
 
 class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
@@ -124,6 +126,9 @@ class TmuxAdapter:
     def __init__(self, tmux_binary: str | None = None) -> None:
         self.tmux_binary = tmux_binary or _tmux_binary()
         self._resolving_targets = False
+        # Last structured suppression result from the universal send gate, for
+        # callers/tests that want to inspect why a send was a silent no-op.
+        self.last_send_gate_result: dict | None = None
 
     def _resolve_pane_target_arg(self, target: str) -> str:
         if not _looks_like_custom_pane_target(target):
@@ -152,7 +157,20 @@ class TmuxAdapter:
         return resolved
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
-        resolved_args = self._resolve_tmux_args(tuple(args))
+        # Universal send gate — the inescapable pane-write sentinel. Every send
+        # to a pane that originates in Python (token-api interventions, the
+        # tmuxctl CLI, enforcement, pane recovery) funnels through run(), so
+        # gating here means no byte reaches a pane while quiet hours OR the
+        # typing guard is active. Reads pass through untouched; sanctioned
+        # human-initiated sends are allowed but logged. Never raises.
+        args_tuple = tuple(args)
+        gate = send_gate.evaluate(args_tuple)
+        if gate is not None:
+            send_gate.record_suppression(gate)
+            if gate.get("suppressed"):
+                self.last_send_gate_result = gate
+                return ""
+        resolved_args = self._resolve_tmux_args(args_tuple)
         proc = subprocess.run(
             [self.tmux_binary, *resolved_args],
             text=True,
@@ -302,8 +320,8 @@ class TmuxAdapter:
     def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
         return self.run("capture-pane", "-t", pane_id, "-p", "-S", str(-lines), allow_failure=True)
 
-    def send_keys(self, target: str, *keys: str) -> None:
-        self.run("send-keys", "-t", target, *keys)
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
     def send_text_then_submit(
         self,

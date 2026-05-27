@@ -27,10 +27,22 @@ def test_quiet_hours_morning_latch_released_by_day_start(app_env):
 
     assert app_env.main._is_quiet_hours(morning) is True
 
-    state = app_env.shared.set_day_started_at_sync(
-        source="test",
+    # A non-official source (the automated schedule_fallback wake-anchor) must
+    # NOT release the morning latch — that was the overnight-bypass regression.
+    app_env.shared.set_day_started_at_sync(
+        source="schedule_fallback",
         at=morning,
         db_path=app_env.db_path,
+        force=True,
+    )
+    assert app_env.main._is_quiet_hours(morning) is True
+
+    # The official morning system (e.g. alarm_silenced) releases it early.
+    state = app_env.shared.set_day_started_at_sync(
+        source="alarm_silenced",
+        at=morning,
+        db_path=app_env.db_path,
+        force=True,
     )
 
     assert state["date"] == "2026-05-10"

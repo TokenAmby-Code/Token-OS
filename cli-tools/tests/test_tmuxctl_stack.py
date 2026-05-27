@@ -25,6 +25,10 @@ class FakeLegionAdapter:
             return "true" if self.guard else self.window_options.get(option, "false")
         return self.window_options.get(option, "")
 
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        # Mirror TmuxAdapter.send_keys so the universal-gate routing is exercised.
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.commands.append(args)
         if args[0] == "display-message":

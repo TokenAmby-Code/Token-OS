@@ -95,6 +95,26 @@ resolve_target() {
     return 1
 }
 
+# Universal send gate (shell entrypoint). This shim is the chokepoint every bare
+# `tmux send-keys` in the repo resolves to via PATH, so gating here closes the
+# shell escape hatch around TmuxAdapter.run()'s Python gate — together they make
+# the sentinel inescapable across both languages. Only the mutating send verbs
+# are gated (reads pass through). Sanctioned human-initiated sends
+# (TMUX_SEND_GATE_ALLOW set) skip the gate; any check error fails open so a
+# transient fault never bricks all pane writes. Returns 0 (true) to SUPPRESS.
+send_gate_suppresses() {
+    case "${1:-}" in
+        send-keys|send-key|send|paste-buffer) ;;
+        *) return 1 ;;  # not a mutating send verb — never gated
+    esac
+    [[ -n "${TMUX_SEND_GATE_ALLOW:-}" ]] && return 1  # sanctioned human send
+    local lib_dir rc=0
+    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || return 1
+    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.send_gate check "$@" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 100 ]]
+}
+
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_launch_command "$@"; then
     exec "$_TX_BIN" start
 fi
@@ -118,6 +138,9 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
             i=$((i+1))
         fi
     done
+    if send_gate_suppresses "${args[@]}"; then
+        exit 0  # quiet hours OR typing guard active — silent no-op, no PTY write
+    fi
     exec "$_REAL_TMUX" "${args[@]}"
 fi
 
