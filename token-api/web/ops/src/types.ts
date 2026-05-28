@@ -216,6 +216,10 @@ export type TimerHistoryPoint = {
   phone_app?: string | null;
   sample_source?: string | null;
   gap_before?: boolean;
+  gap_reason?: string;
+  anomaly?: boolean;
+  anomaly_reason?: string;
+  delta_balance_ms?: number;
   mode: TimerMode;
 };
 
@@ -246,7 +250,14 @@ export type TimerHistory = {
   points: TimerHistoryPoint[];
   segments: TimerHistorySegment[];
   annotations?: TimerHistoryAnnotation[];
-  gaps?: Array<{ start: string; end: string; reason: string }>;
+  gaps?: Array<{ start: string; end: string; reason: string; anomaly_reason?: string }>;
+  anomalies?: Array<Record<string, unknown>>;
+  anomaly_summary?: {
+    count: number;
+    gap_count: number;
+    gap_count_by_reason?: Record<string, number>;
+    latest?: Record<string, unknown> | null;
+  };
   source?: string;
 };
 

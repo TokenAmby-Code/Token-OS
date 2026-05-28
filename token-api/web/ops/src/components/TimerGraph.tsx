@@ -32,6 +32,8 @@ export function TimerGraph({ history }: Props) {
   }, []);
 
   const { points, segments, gaps = [] } = history;
+  const anomalyCount = history.anomaly_summary?.count ?? history.anomalies?.length ?? 0;
+  const gapCount = history.anomaly_summary?.gap_count ?? gaps.length;
 
   const geom = useMemo(() => {
     if (points.length === 0) return null;
@@ -138,11 +140,17 @@ export function TimerGraph({ history }: Props) {
           const ex = x(Math.min(t0 + span, Date.parse(gap.end)));
           const w = Math.max(0, ex - sx);
           if (w <= 0) return null;
+          const labelX = sx + Math.min(Math.max(w / 2, 18), Math.max(18, w - 18));
           return (
             <g key={`gap-${i}`} aria-label={`telemetry gap: ${gap.reason}`}>
               <rect x={sx} y={PAD.top} width={w} height={plotH} fill="var(--hazard)" opacity={0.07} />
               <line x1={sx} x2={sx} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="var(--hazard)" strokeOpacity={0.35} strokeDasharray="3 4" />
               <line x1={ex} x2={ex} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="var(--hazard)" strokeOpacity={0.25} strokeDasharray="3 4" />
+              {w > 42 ? (
+                <text x={labelX} y={PAD.top + 14} className="gap-label" textAnchor="middle">
+                  {gap.anomaly_reason ?? gap.reason}
+                </text>
+              ) : null}
             </g>
           );
         })}
@@ -184,6 +192,17 @@ export function TimerGraph({ history }: Props) {
           </g>
         ))}
 
+        {/* Point markers keep sparse fallback samples visible even when every run is isolated. */}
+        {points.map((point, i) => (
+          <circle
+            key={`pt-${i}`}
+            cx={x(Date.parse(point.t))}
+            cy={y(point.break_balance_ms)}
+            r={point.anomaly ? 4.2 : point.gap_before ? 3.4 : 2.6}
+            className={`sample-dot${point.gap_before ? ' sample-dot--gap' : ''}${point.anomaly ? ' sample-dot--anomaly' : ''}`}
+          />
+        ))}
+
         {/* X axis — tape-measure: labeled hour marks, medium :30, minor :15/:45 */}
         {tape.map((tk) => {
           const tx = x(tk.t);
@@ -221,6 +240,15 @@ export function TimerGraph({ history }: Props) {
         />
       </svg>
 
+      {gapCount > 0 || anomalyCount > 0 ? (
+        <div className={`chart-warning${anomalyCount > 0 ? ' chart-warning--bad' : ''}`}>
+          {anomalyCount > 0
+            ? `${anomalyCount} timer anomaly${anomalyCount === 1 ? '' : 'ies'}`
+            : `${gapCount} telemetry gap${gapCount === 1 ? '' : 's'}`}
+          {gapCount > 0 ? ` · graph line split at missing telemetry` : ''}
+        </div>
+      ) : null}
+
       {hoverPoint ? (
         <div
           className="chart-tip"
@@ -237,6 +265,11 @@ export function TimerGraph({ history }: Props) {
             {hoverPoint.desktop_mode ? ` · ${hoverPoint.desktop_mode}` : ''}
             {hoverPoint.phone_app ? ` · 📱${hoverPoint.phone_app}` : ''}
           </div>
+          {hoverPoint.gap_before ? (
+            <div className="chart-tip__row chart-tip__warn">
+              gap: {hoverPoint.anomaly_reason ?? hoverPoint.gap_reason ?? 'telemetry'}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

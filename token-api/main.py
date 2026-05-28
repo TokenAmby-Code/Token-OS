@@ -173,6 +173,11 @@ from timer import (
     TimerMode,
     format_timer_time,
 )
+from timer_telemetry import (
+    GAP_THRESHOLD_SECONDS,
+    annotate_timer_telemetry,
+    parse_timer_timestamp,
+)
 
 DESKFLOW_SERVER_PORT = 24800
 DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
@@ -11617,6 +11622,7 @@ async def handle_break_exhausted():
 @app.post("/api/timer/set-break")
 async def set_break_time(seconds: int):
     """Debug: directly set accumulated break time (in seconds). Negative values set backlog."""
+    old_mode = timer_engine.current_mode.value
     timer_engine._break_balance_ms = seconds * 1000
     await log_event(
         "timer_debug_set_break",
@@ -11628,6 +11634,13 @@ async def set_break_time(seconds: int):
         },
     )
     await timer_save_to_db()
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="manual_set",
+        source="api",
+        details={"seconds": seconds, "debug_override": True},
+    )
     return {
         "break_balance_ms": timer_engine._break_balance_ms,
         "break_balance_seconds": seconds,
@@ -11938,6 +11951,7 @@ async def reset_timer():
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
 
     # Reset timer state using force_daily_reset
+    old_mode = timer_engine.current_mode.value
     timer_engine.force_daily_reset(now_ms, today)
     timer_engine._break_balance_ms = DEFAULT_BREAK_BUFFER_MS
 
@@ -11946,6 +11960,14 @@ async def reset_timer():
     _session_start_ms = now_ms
 
     await log_event("timer_reset", details={"date": today})
+    await timer_save_to_db()
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="manual_reset",
+        source="api",
+        details={"date": today},
+    )
     return {
         "status": "reset",
         "total_work_time": "0h 0m",
@@ -12181,10 +12203,18 @@ async def handle_location_event(request: LocationEventRequest):
     # Gym bounty: +30 min break on gym exit
     if location == "gym" and action == "exit":
         now_ms = int(time.monotonic() * 1000)
+        old_mode = timer_engine.current_mode.value
         timer_engine.apply_gym_bounty(now_ms)
         bounty_min = round(timer_engine.break_balance_ms / 60000, 1)
         print(f">>> Gym bounty applied: +30min break (total: {bounty_min}min)")
         await log_event("gym_bounty", details={"break_minutes": bounty_min})
+        await timer_log_shift(
+            old_mode,
+            timer_engine.current_mode.value,
+            trigger="gym_bounty",
+            source="location",
+            details={"break_minutes": bounty_min},
+        )
 
     await log_event(
         "location_event",
@@ -13605,27 +13635,37 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     """Return live timer history for the ops graph.
 
     Timer samples are the authoritative line-series read model. Timer shifts
-    are rendered only as annotations/events; sparse shifts are not extrapolated
-    into long balance arcs.
+    are annotations and, only when samples are absent, sparse fallback points.
+    Sparse/impossible deltas break the line instead of drawing false arcs.
     """
     now = datetime.now()
     window_seconds = max(15 * 60, min(_ops_parse_duration_seconds(window, 6 * 3600), 48 * 3600))
     bucket_seconds = max(10, min(_ops_parse_duration_seconds(bucket, 60), 15 * 60))
-    gap_threshold_seconds = 90
+    gap_threshold_seconds = GAP_THRESHOLD_SECONDS
     start = now - timedelta(seconds=window_seconds)
 
+    samples: list[dict] = []
+    shift_rows: list[dict] = []
+    samples_available = True
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT *
-            FROM timer_samples
-            WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)
-            ORDER BY timestamp ASC, id ASC
-            """,
-            (start.isoformat(), now.isoformat()),
-        )
-        samples = [dict(row) for row in await cursor.fetchall()]
+        try:
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM timer_samples
+                WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)
+                ORDER BY timestamp ASC, id ASC
+                """,
+                (start.isoformat(), now.isoformat()),
+            )
+            samples = [dict(row) for row in await cursor.fetchall()]
+        except Exception as exc:
+            if "timer_samples" not in str(exc):
+                raise
+            samples_available = False
+            samples = []
+
         cursor = await db.execute(
             """
             SELECT *
@@ -13645,12 +13685,8 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     current_phone_app = PHONE_STATE.get("current_app")
     current_desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
 
-    gaps: list[dict] = []
-    points: list[dict] = []
-    segments = []
-
-    def _sample_point(row: dict, *, gap_before: bool = False) -> dict:
-        point = {
+    def _sample_point(row: dict) -> dict:
+        return {
             "t": row.get("timestamp"),
             "break_balance_ms": int(row.get("break_balance_ms") or 0),
             "mode": row.get("mode") or "unknown",
@@ -13663,83 +13699,35 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
             "phone_app": row.get("phone_app"),
             "sample_source": row.get("source"),
         }
-        if gap_before:
+
+    def _shift_point(row: dict) -> dict:
+        return {
+            "t": row.get("timestamp"),
+            "break_balance_ms": int(row.get("break_balance_ms") or 0),
+            "mode": row.get("new_mode") or "unknown",
+            "activity": None,
+            "productivity_active": False,
+            "active_instance_count": int(row.get("active_instances") or 0),
+            "processing_recent_count": 0,
+            "observed_agent_count": int(row.get("active_instances") or 0),
+            "desktop_mode": None,
+            "phone_app": row.get("phone_app"),
+            "sample_source": "timer_shift",
+            "shift_trigger": row.get("trigger"),
+        }
+
+    points = [_sample_point(row) for row in samples]
+    fallback_reason = "no_timer_samples"
+    if not samples_available:
+        fallback_reason = "no_timer_samples_table"
+    using_sparse_shift_fallback = not points
+    if using_sparse_shift_fallback:
+        # Sparse fallback: show raw shift balances as isolated points, but never
+        # reconstruct continuous arcs from mode shifts.
+        points = [_shift_point(row) for row in shift_rows]
+        for point in points:
             point["gap_before"] = True
-        return point
-
-    previous_point: dict | None = None
-    previous_time: datetime | None = None
-    for row in samples:
-        sample_time = _ops_parse_datetime(row.get("timestamp"))
-        if sample_time is None:
-            continue
-        gap_before = False
-        if previous_time is None:
-            if (sample_time - start).total_seconds() > gap_threshold_seconds:
-                gaps.append(
-                    {
-                        "start": start.isoformat(),
-                        "end": sample_time.isoformat(),
-                        "reason": "no_timer_samples",
-                    }
-                )
-                gap_before = True
-        else:
-            spacing_seconds = (sample_time - previous_time).total_seconds()
-            if spacing_seconds > gap_threshold_seconds:
-                gaps.append(
-                    {
-                        "start": previous_time.isoformat(),
-                        "end": sample_time.isoformat(),
-                        "reason": "sample_gap",
-                    }
-                )
-                gap_before = True
-            elif previous_point:
-                segments.append(
-                    {
-                        "start": previous_time.isoformat(),
-                        "end": sample_time.isoformat(),
-                        "mode": previous_point["mode"],
-                        "activity": previous_point["activity"],
-                        "productivity_active": previous_point["productivity_active"],
-                        "source": previous_point.get("sample_source"),
-                    }
-                )
-        point = _sample_point(row, gap_before=gap_before)
-        points.append(point)
-        previous_point = point
-        previous_time = sample_time
-
-    # Always include an exact live endpoint as the final point.
-    live_gap_before = False
-    if previous_time is None:
-        gaps.append(
-            {"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_samples"}
-        )
-        live_gap_before = True
-    else:
-        live_spacing_seconds = (now - previous_time).total_seconds()
-        if live_spacing_seconds > gap_threshold_seconds:
-            gaps.append(
-                {
-                    "start": previous_time.isoformat(),
-                    "end": now.isoformat(),
-                    "reason": "sample_gap",
-                }
-            )
-            live_gap_before = True
-        elif previous_point:
-            segments.append(
-                {
-                    "start": previous_time.isoformat(),
-                    "end": now.isoformat(),
-                    "mode": previous_point["mode"],
-                    "activity": previous_point["activity"],
-                    "productivity_active": previous_point["productivity_active"],
-                    "source": previous_point.get("sample_source"),
-                }
-            )
+            point["gap_reason"] = fallback_reason
 
     live_point = {
         "t": now.isoformat(),
@@ -13754,9 +13742,46 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "phone_app": current_phone_app,
         "sample_source": "live_timer_engine",
     }
-    if live_gap_before:
+    if using_sparse_shift_fallback:
         live_point["gap_before"] = True
+        live_point["gap_reason"] = fallback_reason
     points.append(live_point)
+
+    points.sort(key=lambda point: parse_timer_timestamp(point.get("t")) or now)
+    gaps, anomalies = annotate_timer_telemetry(
+        points,
+        window_start=start,
+        window_end=now,
+        reset_events=shift_rows,
+        gap_threshold_seconds=gap_threshold_seconds,
+        no_sample_reason=fallback_reason,
+    )
+
+    segments = []
+    previous_point: dict | None = None
+    previous_time: datetime | None = None
+    for point in points:
+        point_time = parse_timer_timestamp(point.get("t"))
+        if point_time is None:
+            continue
+        if previous_point is not None and previous_time is not None and not point.get("gap_before"):
+            segments.append(
+                {
+                    "start": previous_time.isoformat(),
+                    "end": point_time.isoformat(),
+                    "mode": previous_point.get("mode"),
+                    "activity": previous_point.get("activity"),
+                    "productivity_active": previous_point.get("productivity_active"),
+                    "source": previous_point.get("sample_source"),
+                }
+            )
+        previous_point = point
+        previous_time = point_time
+
+    gap_count_by_reason: dict[str, int] = {}
+    for gap in gaps:
+        reason = str(gap.get("reason") or "unknown")
+        gap_count_by_reason[reason] = gap_count_by_reason.get(reason, 0) + 1
 
     return {
         "generated_at": now.isoformat(),
@@ -13767,9 +13792,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "segments": segments,
         "annotations": [_ops_shift_to_annotation(row) for row in shift_rows],
         "gaps": gaps,
+        "anomalies": anomalies,
+        "anomaly_summary": {
+            "count": len(anomalies),
+            "gap_count": len(gaps),
+            "gap_count_by_reason": gap_count_by_reason,
+            "latest": anomalies[-1] if anomalies else None,
+        },
         "source": "timer_samples+timer_shifts+live_timer_engine",
     }
-
 
 async def _ops_read_cron_summary() -> dict:
     if cron_engine is not None:
