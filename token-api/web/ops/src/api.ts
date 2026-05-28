@@ -70,18 +70,19 @@ export function useOpsState(intervalMs = 2000): Feed<OpsState> {
   return usesPolling<OpsState>((signal) => getJson<OpsState>('/api/ui/ops/state', signal), intervalMs);
 }
 
-/** Hour the operator's day begins; the timer graph anchors here. */
+/** Time the operator's day graph begins; the timer graph anchors here. */
 const DAY_START_HOUR = 7;
+const DAY_START_MINUTE = 20;
 
-/** Seconds elapsed since today's day-start (07:00) — the graph window. */
+/** Seconds elapsed since today's day-start (07:20) — the graph window. */
 function secondsSinceDayStart(): number {
   const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), DAY_START_HOUR);
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), DAY_START_HOUR, DAY_START_MINUTE);
   return Math.max(900, Math.floor((now.getTime() - start.getTime()) / 1000));
 }
 
 /**
- * Timer history feed. The window spans from the start of the day (07:00) to
+ * Timer history feed. The window spans from the start of the day (07:20) to
  * now, so the graph compresses as the day fills rather than scrolling a fixed
  * window. The window is recomputed every fetch. This is live telemetry from
  * `GET /api/ui/ops/timer/history`; no mock fallback, because fake timer data is

@@ -94,8 +94,24 @@ tmux_wait_for_clear() {
     local timeout="${2:-10}"
     local elapsed=0
     local interval=0.5
+    local marked_work=0
 
     while tmux_pane_has_input "$pane"; do
+        if [[ "$marked_work" == "0" ]]; then
+            # Pending human input is a short-lived work signal. This bridges the
+            # gap between typing a prompt and submitting it, but Token-API's
+            # productivity layer will decay after its normal 3-minute work
+            # activity grace if the draft is abandoned.
+            if command -v work-action >/dev/null 2>&1; then
+                work-action --source tmux-typing-guard --note "pane=${pane}" >/dev/null 2>&1 || true
+            elif [[ -n "${TOKEN_API_URL:-}" ]]; then
+                curl -fsS -m 1 \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"source\":\"tmux-typing-guard\",\"note\":\"pane=${pane}\"}" \
+                    "${TOKEN_API_URL%/}/api/work-action" >/dev/null 2>&1 || true
+            fi
+            marked_work=1
+        fi
         sleep "$interval"
         elapsed=$(echo "$elapsed + $interval" | bc)
         if (( $(echo "$elapsed >= $timeout" | bc -l) )); then

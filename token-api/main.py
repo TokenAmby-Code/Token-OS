@@ -9,6 +9,7 @@ This server provides:
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -535,6 +536,12 @@ class WorkStateResponse(BaseModel):
     activity: str
     desktop_mode: str
     phone_app: str | None = None
+    productivity_hold: str = "none"  # active_process | typing_guard | work_action_buffer | none
+    work_action_source: str | None = None
+    work_action_note: str | None = None
+    work_action_age_seconds: int | None = None
+    work_action_buffer_remaining_seconds: int | None = None
+    typing_active: bool = False
     generated_at: str
 
 
@@ -1185,6 +1192,14 @@ _RESTART_STATE_DENYLIST = {
     "startup_grace_secs",  # config, reset per boot
     "ahk_reachable",  # live heartbeat — unknown until AHK checks in
     "ahk_last_heartbeat",  # live heartbeat
+    # Live desktop attention must be republished by AHK after restart. Persisting
+    # these caused stale/phone-inherited YouTube state to appear as desktop video.
+    "current_mode",
+    "last_detection",
+    "steam_app_id",
+    "steam_app_name",
+    "steam_exe",
+    "in_meeting",
 }
 
 
@@ -1362,6 +1377,15 @@ async def lifespan(app: FastAPI):
     else:
         timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
         print(f"TIMER: Synced activity=WORKING (desktop={desktop_mode})")
+    try:
+        startup_work_state = await compute_work_state()
+        timer_engine.set_productivity(startup_work_state.productivity_active, now_ms)
+        await shared.timer_write_sample(
+            source="startup",
+            work_state=startup_work_state.model_dump(),
+        )
+    except Exception as exc:
+        logger.warning(f"Timer startup sample failed: {exc}")
     # Stash cleanup on startup + hourly
     stash_cleanup()
     scheduler.add_job(
@@ -3654,6 +3678,7 @@ async def enter_quiet_mode_internal(
         _current_session_id = await timer_start_session("quiet", today)
         _session_start_ms = now_ms
         await timer_log_mode_change(old_mode, "quiet", is_automatic=True)
+        await shared.timer_write_sample(source=source)
         await log_event(
             "timer_quiet_entered",
             details={"source": source, "context": context, "old_mode": old_mode},
@@ -3686,6 +3711,7 @@ async def exit_quiet_mode_internal(*, source: str, reason: str) -> dict:
         _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
         await timer_log_mode_change("quiet", new_mode, is_automatic=True)
+        await shared.timer_write_sample(source=source)
         await log_event(
             "timer_quiet_exited",
             details={
@@ -4429,9 +4455,27 @@ def _activity_icons() -> list[ActivityIconState]:
     ]
 
 
+WORK_ACTION_BUFFER_SECONDS = 3 * 60
+TYPING_GUARD_ACTIVE_SECONDS = 15
+
+
+def _format_countdown_seconds(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}:{secs:02d}"
+
+
 async def compute_work_state() -> WorkStateResponse:
     now = datetime.now()
-    cutoff = now - timedelta(minutes=30)
+    # Work should decay quickly. A live/idle agent pane is not, by itself,
+    # evidence of ongoing work for half an hour; it is only a short bridge
+    # between a human work action (typing/prompt/Stream Deck) and the agent
+    # actually getting moving. After 3 minutes with no qualifying activity, the
+    # productivity layer should drop to IDLE; TimerEngine then gives IDLE 7
+    # more minutes before auto-break. Total grace from last work action: 10 min.
+    work_activity_cutoff = now - timedelta(minutes=3)
     active_instances: list[AgentRuntime] = []
     processing_recent_count = 0
     tracked_panes: set[str] = set()
@@ -4465,12 +4509,26 @@ async def compute_work_state() -> WorkStateResponse:
             for r in await pane_activity_cursor.fetchall()
             if r["last_activity"]
         }
+        recent_work_action_cursor = await db.execute(
+            """
+            SELECT
+                created_at,
+                details,
+                CAST((julianday('now') - julianday(created_at)) * 86400 AS INTEGER) AS age_seconds
+            FROM events
+            WHERE event_type = 'work_action'
+              AND datetime(created_at) >= datetime('now', '-3 minutes')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        recent_work_action = await recent_work_action_cursor.fetchone()
 
     for row in rows:
         last_activity = row["last_activity"]
         is_recent = False
         try:
-            is_recent = datetime.fromisoformat(last_activity) >= cutoff
+            is_recent = datetime.fromisoformat(last_activity) >= work_activity_cutoff
         except Exception:
             pass
         live_pane = None
@@ -4497,6 +4555,8 @@ async def compute_work_state() -> WorkStateResponse:
                 pane_is_agent = False
         if row["status"] == "processing" and is_recent:
             processing_recent_count += 1
+        if not is_recent:
+            continue
         if row["device_id"] == LOCAL_DEVICE_NAME and not pane_is_agent:
             continue
         if row["device_id"] != LOCAL_DEVICE_NAME and not is_recent:
@@ -4536,7 +4596,7 @@ async def compute_work_state() -> WorkStateResponse:
         if not pane_last_activity_str:
             continue
         try:
-            if datetime.fromisoformat(pane_last_activity_str) < cutoff:
+            if datetime.fromisoformat(pane_last_activity_str) < work_activity_cutoff:
                 continue
         except Exception:
             continue
@@ -4554,8 +4614,46 @@ async def compute_work_state() -> WorkStateResponse:
                 live_pane=True,
             )
         )
-    productivity_active = bool(active_instances or observed_agents)
-    reason = "tracked_or_observed_agent" if productivity_active else "no_live_agent"
+    recent_work_action_details: dict = {}
+    work_action_source = None
+    work_action_note = None
+    work_action_age_seconds = None
+    work_action_buffer_remaining_seconds = None
+    typing_active = False
+    if recent_work_action:
+        try:
+            recent_work_action_details = json.loads(recent_work_action["details"] or "{}")
+        except Exception:
+            recent_work_action_details = {}
+        work_action_source = recent_work_action_details.get("source")
+        work_action_note = recent_work_action_details.get("note")
+        try:
+            work_action_age_seconds = max(0, int(recent_work_action["age_seconds"] or 0))
+        except Exception:
+            work_action_age_seconds = None
+        if work_action_age_seconds is not None:
+            work_action_buffer_remaining_seconds = max(
+                0, WORK_ACTION_BUFFER_SECONDS - work_action_age_seconds
+            )
+        typing_active = (
+            work_action_source == "tmux-typing-guard"
+            and work_action_age_seconds is not None
+            and work_action_age_seconds <= TYPING_GUARD_ACTIVE_SECONDS
+        )
+
+    productivity_active = bool(active_instances or observed_agents or recent_work_action)
+    if active_instances or observed_agents:
+        reason = "recent_tracked_or_observed_agent"
+        productivity_hold = "active_process"
+    elif typing_active:
+        reason = "typing_guard_active"
+        productivity_hold = "typing_guard"
+    elif recent_work_action:
+        reason = "recent_work_action"
+        productivity_hold = "work_action_buffer"
+    else:
+        reason = "no_recent_work_activity"
+        productivity_hold = "none"
     return WorkStateResponse(
         productivity_active=productivity_active,
         reason=reason,
@@ -4569,6 +4667,12 @@ async def compute_work_state() -> WorkStateResponse:
         activity=timer_engine.activity.value,
         desktop_mode=DESKTOP_STATE.get("current_mode", "silence"),
         phone_app=PHONE_STATE.get("current_app"),
+        productivity_hold=productivity_hold,
+        work_action_source=work_action_source,
+        work_action_note=work_action_note,
+        work_action_age_seconds=work_action_age_seconds,
+        work_action_buffer_remaining_seconds=work_action_buffer_remaining_seconds,
+        typing_active=typing_active,
         generated_at=now.isoformat(),
     )
 
@@ -8854,7 +8958,7 @@ PHONE_DISTRACTION_ACK_AFTER_SECONDS = int(
     os.environ.get("PHONE_DISTRACTION_ACK_AFTER_SECONDS", "60")
 )
 PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS = int(
-    os.environ.get("PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS", str(15 * 60))
+    os.environ.get("PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS", str(4 * 60 * 60))
 )
 
 # Human-readable display names for phone apps (key = lowercased app name or package)
@@ -8916,23 +9020,24 @@ def _backlog_distraction_still_active(ack: dict) -> bool:
 
 
 def _sync_activity_from_remaining_distraction_signals(now_mono_ms: int) -> bool:
-    """Recompute the activity layer after one distraction source is cleared."""
+    """Recompute timer activity from independent attention substates.
+
+    Desktop and phone attention are non-exclusive. Clearing or changing one source
+    must not erase the other; the composite timer activity is DISTRACTION if any
+    active attention source is distracting, otherwise WORKING.
+    """
     desktop_mode = DESKTOP_STATE.get("current_mode")
     phone_app = (PHONE_STATE.get("current_app") or "").lower()
     phone_mode = PHONE_DISTRACTION_APPS.get(phone_app) if PHONE_STATE.get("is_distracted") else None
+    desktop_distracting = desktop_mode in ("video", "scrolling", "gaming")
+    phone_distracting = bool(phone_mode)
 
-    if phone_mode:
+    if phone_distracting or desktop_distracting:
         result = timer_engine.set_activity(
             Activity.DISTRACTION,
-            is_scrolling_gaming=phone_mode in ("scrolling", "gaming"),
-            now_mono_ms=now_mono_ms,
-        )
-        return TimerEvent.MODE_CHANGED in result.events
-
-    if desktop_mode in ("video", "scrolling", "gaming"):
-        result = timer_engine.set_activity(
-            Activity.DISTRACTION,
-            is_scrolling_gaming=desktop_mode in ("scrolling", "gaming"),
+            is_scrolling_gaming=(
+                phone_mode in ("scrolling", "gaming") or desktop_mode in ("scrolling", "gaming")
+            ),
             now_mono_ms=now_mono_ms,
         )
         return TimerEvent.MODE_CHANGED in result.events
@@ -9223,13 +9328,7 @@ async def recover_recent_phone_distraction_state() -> bool:
     PHONE_STATE["app_opened_at"] = opened_at.isoformat()
     PHONE_STATE["last_activity"] = datetime.now().isoformat()
     PHONE_STATE["is_distracted"] = True
-    DESKTOP_STATE["current_mode"] = distraction_mode
-    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-    timer_engine.set_activity(
-        Activity.DISTRACTION,
-        is_scrolling_gaming=distraction_mode in ("scrolling", "gaming"),
-        now_mono_ms=int(time.monotonic() * 1000),
-    )
+    _sync_activity_from_remaining_distraction_signals(int(time.monotonic() * 1000))
     await log_event(
         "phone_distraction_state_recovered",
         details={
@@ -10340,10 +10439,11 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             result = timer_engine.set_activity(
                 Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms
             )
+            timer_updated = TimerEvent.MODE_CHANGED in result.events
         else:
-            result = timer_engine.set_activity(
-                Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms
-            )
+            # Desktop clear/music/meeting is only a desktop substate update. Do
+            # not assert WORKING blindly; preserve phone distraction if present.
+            timer_updated = _sync_activity_from_remaining_distraction_signals(now_ms)
 
         # Log focus auto-exit on distraction
         if was_focused and not timer_engine.focus_active:
@@ -10363,7 +10463,6 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 None, speak_tts, f"Focus broken by {detected_mode}. {focus_min} minutes earned."
             )
 
-        timer_updated = TimerEvent.MODE_CHANGED in result.events
         if timer_updated:
             await timer_log_shift(
                 old_timer_mode,
@@ -10371,8 +10470,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 trigger="desktop_detection",
                 source="ahk",
             )
-            if timer_engine.current_mode == TimerMode.WORKING:
-                _mark_mewgenics_work_action("timer_mode_working", "desktop_detection")
+            # Do not mark a work action from desktop attention clearing. Work
+            # substates are fed by explicit work inputs only.
 
         ack = None
         if reason == "backlog_violation":
@@ -10817,6 +10916,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 )
             except Exception:
                 duration_seconds = None
+        old_timer_mode = timer_engine.current_mode.value
         if close_matches_current:
             PHONE_STATE["current_app"] = None
             PHONE_STATE["app_opened_at"] = None
@@ -10831,13 +10931,24 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             timer_engine._clear_manual_mode()
             print("    Twitter closed, manual mode cleared")
 
-        # Phone close is observational; server-side work/activity derivation owns timer state.
+        # Phone close only clears the phone substate, then recomputes composite
+        # timer activity from any remaining independent attention sources.
         timer_updated = False
+        if close_matches_current:
+            now_ms = int(time.monotonic() * 1000)
+            timer_updated = _sync_activity_from_remaining_distraction_signals(now_ms)
+            if timer_updated:
+                await timer_log_shift(
+                    old_timer_mode,
+                    timer_engine.current_mode.value,
+                    trigger="phone_close",
+                    source="macrodroid",
+                    phone_app=app_name,
+                )
         acknowledged_acks = await acknowledge_phone_acks(app_name)
         stop_enforcement_cascade(reason=f"negative_edge_close:{app_name}")
         if close_matches_current:
-            timer_updated = False
-            print(f"    Phone close -> working | timer={timer_updated}")
+            print(f"    Phone close -> recomputed activity | timer={timer_updated}")
         elif old_app:
             print(f"    Ignoring close for {app_name}; current_app remains {old_app}")
 
@@ -10950,8 +11061,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         now_ms = int(time.monotonic() * 1000)
         old_timer_mode = timer_engine.current_mode.value
         old_activity = timer_engine.activity.value
-        if productivity_active is not None:
-            timer_engine.set_productivity(productivity_active, now_ms)
+        # Phone attention input updates only the attention/activity layer. It
+        # must not write the productivity substate; timer_worker/work-action
+        # own that layer. `productivity_active` is decision evidence only.
         was_focused = timer_engine.focus_active
         is_sg = distraction_mode in ("scrolling", "gaming")
         result = timer_engine.set_activity(
@@ -11871,15 +11983,10 @@ async def work_action(request: WorkActionRequest | None = None):
     acknowledged_acks = await acknowledge_pending_work_action_acks()
     _mark_mewgenics_work_action(request.source, request.note)
     stop_enforcement_cascade(reason=f"work_action:{request.source}")
-    if PHONE_STATE.get("is_distracted"):
-        PHONE_STATE["current_app"] = None
-        PHONE_STATE["app_opened_at"] = None
-        PHONE_STATE["is_distracted"] = False
-        PHONE_STATE["distraction_ack_app"] = None
-        PHONE_STATE["distraction_ack_id"] = None
-        PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-        _sync_activity_from_remaining_distraction_signals(now_ms)
+    # A work action proves productivity resumed; it does not prove phone/desktop
+    # distraction ended. Preserve attention-source state so productivity + YouTube
+    # becomes MULTITASKING instead of falsely clearing to WORKING. Phone app state
+    # must be ended by explicit close/new-app telemetry or a dedicated correction.
 
     await log_event(
         "work_action",
@@ -13497,15 +13604,14 @@ def _ops_shift_to_annotation(row: dict) -> dict:
 async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = "60s") -> dict:
     """Return live timer history for the ops graph.
 
-    The existing timer persistence stores exact shift rows plus current engine
-    state, not 1Hz samples. This read model reconstructs a bucketed line from
-    the last known shift, the TimerEngine's signed mode rates, and the current
-    live snapshot. It is real telemetry, not frontend mock data; gaps are
-    explicitly marked when no shift row anchors the requested window.
+    Timer samples are the authoritative line-series read model. Timer shifts
+    are rendered only as annotations/events; sparse shifts are not extrapolated
+    into long balance arcs.
     """
     now = datetime.now()
     window_seconds = max(15 * 60, min(_ops_parse_duration_seconds(window, 6 * 3600), 48 * 3600))
     bucket_seconds = max(10, min(_ops_parse_duration_seconds(bucket, 60), 15 * 60))
+    gap_threshold_seconds = 90
     start = now - timedelta(seconds=window_seconds)
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -13513,14 +13619,13 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         cursor = await db.execute(
             """
             SELECT *
-            FROM timer_shifts
-            WHERE datetime(timestamp) < datetime(?)
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 1
+            FROM timer_samples
+            WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)
+            ORDER BY timestamp ASC, id ASC
             """,
-            (start.isoformat(),),
+            (start.isoformat(), now.isoformat()),
         )
-        previous = await cursor.fetchone()
+        samples = [dict(row) for row in await cursor.fetchall()]
         cursor = await db.execute(
             """
             SELECT *
@@ -13530,7 +13635,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
             """,
             (start.isoformat(), now.isoformat()),
         )
-        rows = [dict(row) for row in await cursor.fetchall()]
+        shift_rows = [dict(row) for row in await cursor.fetchall()]
 
     work_state = await get_cached_work_state()
     current_mode = timer_engine.current_mode.value
@@ -13540,175 +13645,129 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     current_phone_app = PHONE_STATE.get("current_app")
     current_desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
 
-    anchors: list[dict] = []
     gaps: list[dict] = []
-    data_start = start
-
-    if previous:
-        prev = dict(previous)
-        prev_t = _ops_parse_datetime(prev.get("timestamp")) or start
-        prev_mode = prev.get("new_mode") or current_mode
-        prev_balance = int(prev.get("break_balance_ms") or 0)
-        start_balance = _ops_advance_timer_balance(
-            prev_balance, prev_mode, max(0, (start - prev_t).total_seconds())
-        )
-        anchors.append(
-            {
-                "t": start,
-                "mode": prev_mode,
-                "activity": "distraction"
-                if prev_mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": start_balance,
-                "active_instance_count": int(prev.get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": prev.get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(prev.get("active_instances") or 0),
-            }
-        )
-    elif rows:
-        first_t = _ops_parse_datetime(rows[0].get("timestamp")) or start
-        data_start = first_t
-        anchors.append(
-            {
-                "t": first_t,
-                "mode": rows[0].get("new_mode") or rows[0].get("old_mode") or current_mode,
-                "activity": "distraction"
-                if (rows[0].get("new_mode") or rows[0].get("old_mode"))
-                in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": int(rows[0].get("break_balance_ms") or 0),
-                "active_instance_count": int(rows[0].get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": rows[0].get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(rows[0].get("active_instances") or 0),
-            }
-        )
-        if first_t > start + timedelta(seconds=bucket_seconds):
-            gaps.append(
-                {"start": start.isoformat(), "end": first_t.isoformat(), "reason": "no_anchor"}
-            )
-    else:
-        # No persisted shifts in the window. Use a flat live line rather than
-        # fabricating a plausible arc.
-        anchors.append(
-            {
-                "t": start,
-                "mode": current_mode,
-                "activity": timer_engine.activity.value,
-                "break_balance_ms": current_balance,
-                "active_instance_count": current_active,
-                "processing_recent_count": current_processing,
-                "phone_app": current_phone_app,
-                "desktop_mode": current_desktop_mode,
-                "productivity_active": work_state.productivity_active,
-            }
-        )
-        gaps.append(
-            {"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_shifts"}
-        )
-
-    for row in rows:
-        mode = row.get("new_mode") or current_mode
-        anchors.append(
-            {
-                "t": _ops_parse_datetime(row.get("timestamp")) or now,
-                "mode": mode,
-                "activity": "distraction"
-                if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": int(row.get("break_balance_ms") or 0),
-                "active_instance_count": int(row.get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": row.get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(row.get("active_instances") or 0),
-            }
-        )
-
-    anchors.append(
-        {
-            "t": now,
-            "mode": current_mode,
-            "activity": timer_engine.activity.value,
-            "break_balance_ms": current_balance,
-            "active_instance_count": current_active,
-            "processing_recent_count": current_processing,
-            "phone_app": current_phone_app,
-            "desktop_mode": current_desktop_mode,
-            "productivity_active": work_state.productivity_active,
-        }
-    )
-    anchors.sort(key=lambda item: item["t"])
-
+    points: list[dict] = []
     segments = []
-    for i, anchor in enumerate(anchors[:-1]):
-        next_anchor = anchors[i + 1]
-        if next_anchor["t"] <= anchor["t"]:
-            continue
-        segments.append(
-            {
-                "start": anchor["t"].isoformat(),
-                "end": next_anchor["t"].isoformat(),
-                "mode": anchor["mode"],
-                "activity": anchor["activity"],
-                "productivity_active": anchor["productivity_active"],
-                "source": None,
-            }
-        )
 
-    points = []
-    bucket_delta = timedelta(seconds=bucket_seconds)
-    cursor = data_start
-    anchor_index = 0
-    while cursor < now:
-        while anchor_index + 1 < len(anchors) and anchors[anchor_index + 1]["t"] <= cursor:
-            anchor_index += 1
-        anchor = anchors[anchor_index]
-        elapsed = max(0, (cursor - anchor["t"]).total_seconds())
-        points.append(
-            {
-                "t": cursor.isoformat(),
-                "break_balance_ms": _ops_advance_timer_balance(
-                    int(anchor["break_balance_ms"]), anchor["mode"], elapsed
-                ),
-                "mode": anchor["mode"],
-                "activity": anchor["activity"],
-                "productivity_active": anchor["productivity_active"],
-                "active_instance_count": anchor["active_instance_count"],
-                "processing_recent_count": anchor["processing_recent_count"],
-                "desktop_mode": anchor.get("desktop_mode"),
-                "phone_app": anchor.get("phone_app"),
-            }
-        )
-        cursor += bucket_delta
+    def _sample_point(row: dict, *, gap_before: bool = False) -> dict:
+        point = {
+            "t": row.get("timestamp"),
+            "break_balance_ms": int(row.get("break_balance_ms") or 0),
+            "mode": row.get("mode") or "unknown",
+            "activity": row.get("activity"),
+            "productivity_active": bool(row.get("productivity_active")),
+            "active_instance_count": int(row.get("active_instance_count") or 0),
+            "processing_recent_count": int(row.get("processing_recent_count") or 0),
+            "observed_agent_count": int(row.get("observed_agent_count") or 0),
+            "desktop_mode": row.get("desktop_mode"),
+            "phone_app": row.get("phone_app"),
+            "sample_source": row.get("source"),
+        }
+        if gap_before:
+            point["gap_before"] = True
+        return point
+
+    previous_point: dict | None = None
+    previous_time: datetime | None = None
+    for row in samples:
+        sample_time = _ops_parse_datetime(row.get("timestamp"))
+        if sample_time is None:
+            continue
+        gap_before = False
+        if previous_time is None:
+            if (sample_time - start).total_seconds() > gap_threshold_seconds:
+                gaps.append(
+                    {
+                        "start": start.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "reason": "no_timer_samples",
+                    }
+                )
+                gap_before = True
+        else:
+            spacing_seconds = (sample_time - previous_time).total_seconds()
+            if spacing_seconds > gap_threshold_seconds:
+                gaps.append(
+                    {
+                        "start": previous_time.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "reason": "sample_gap",
+                    }
+                )
+                gap_before = True
+            elif previous_point:
+                segments.append(
+                    {
+                        "start": previous_time.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "mode": previous_point["mode"],
+                        "activity": previous_point["activity"],
+                        "productivity_active": previous_point["productivity_active"],
+                        "source": previous_point.get("sample_source"),
+                    }
+                )
+        point = _sample_point(row, gap_before=gap_before)
+        points.append(point)
+        previous_point = point
+        previous_time = sample_time
 
     # Always include an exact live endpoint as the final point.
-    points.append(
-        {
-            "t": now.isoformat(),
-            "break_balance_ms": current_balance,
-            "mode": current_mode,
-            "activity": timer_engine.activity.value,
-            "productivity_active": work_state.productivity_active,
-            "active_instance_count": current_active,
-            "processing_recent_count": current_processing,
-            "desktop_mode": current_desktop_mode,
-            "phone_app": current_phone_app,
-        }
-    )
+    live_gap_before = False
+    if previous_time is None:
+        gaps.append(
+            {"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_samples"}
+        )
+        live_gap_before = True
+    else:
+        live_spacing_seconds = (now - previous_time).total_seconds()
+        if live_spacing_seconds > gap_threshold_seconds:
+            gaps.append(
+                {
+                    "start": previous_time.isoformat(),
+                    "end": now.isoformat(),
+                    "reason": "sample_gap",
+                }
+            )
+            live_gap_before = True
+        elif previous_point:
+            segments.append(
+                {
+                    "start": previous_time.isoformat(),
+                    "end": now.isoformat(),
+                    "mode": previous_point["mode"],
+                    "activity": previous_point["activity"],
+                    "productivity_active": previous_point["productivity_active"],
+                    "source": previous_point.get("sample_source"),
+                }
+            )
+
+    live_point = {
+        "t": now.isoformat(),
+        "break_balance_ms": current_balance,
+        "mode": current_mode,
+        "activity": timer_engine.activity.value,
+        "productivity_active": work_state.productivity_active,
+        "active_instance_count": current_active,
+        "processing_recent_count": current_processing,
+        "observed_agent_count": work_state.observed_agent_count,
+        "desktop_mode": current_desktop_mode,
+        "phone_app": current_phone_app,
+        "sample_source": "live_timer_engine",
+    }
+    if live_gap_before:
+        live_point["gap_before"] = True
+    points.append(live_point)
 
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
         "bucket_seconds": bucket_seconds,
+        "gap_threshold_seconds": gap_threshold_seconds,
         "points": points,
         "segments": segments,
-        "annotations": [_ops_shift_to_annotation(row) for row in rows],
+        "annotations": [_ops_shift_to_annotation(row) for row in shift_rows],
         "gaps": gaps,
-        "source": "timer_shifts+live_timer_engine",
+        "source": "timer_samples+timer_shifts+live_timer_engine",
     }
 
 
@@ -13973,6 +14032,104 @@ def _ops_assertion(
     }
 
 
+def _ops_ui_build_id() -> str | None:
+    """Stable-ish build id for browser auto-refresh.
+
+    It changes when committed `/ui/ops` assets change, without requiring a Node
+    runtime or a separate manifest endpoint.
+    """
+    root = UI_DIR / "ops"
+    if not root.exists():
+        return None
+    try:
+        files = [p for p in root.rglob("*") if p.is_file()]
+        if not files:
+            return None
+        newest = max(p.stat().st_mtime_ns for p in files)
+        names = ",".join(sorted(str(p.relative_to(root)) for p in files))
+        return hashlib.sha1(f"{newest}:{names}".encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> dict:
+    """Human-facing idle/work-action timer state for assertions.
+
+    Productivity and attention are independent. This describes why the
+    productivity door is open, and only shows a countdown when the door is
+    being held by a finite buffer rather than live work/typing.
+    """
+    mode = timer_engine.current_mode
+    hold = work_state.productivity_hold
+
+    if mode in (TimerMode.WORKING, TimerMode.MULTITASKING):
+        if hold == "active_process":
+            return {
+                "visible": False,
+                "state": "held_open",
+                "label": "held open",
+                "reason": "active_process",
+                "remaining_seconds": None,
+            }
+        if hold == "typing_guard" or work_state.typing_active:
+            return {
+                "visible": False,
+                "state": "typing",
+                "label": "typing",
+                "reason": "tmux_typing_guard",
+                "remaining_seconds": None,
+            }
+        if (
+            hold == "work_action_buffer"
+            and work_state.work_action_buffer_remaining_seconds is not None
+        ):
+            remaining = max(0, int(work_state.work_action_buffer_remaining_seconds))
+            return {
+                "visible": True,
+                "state": "work_action_buffer",
+                "label": f"idle in {_format_countdown_seconds(remaining)}",
+                "reason": work_state.work_action_source or "work_action",
+                "remaining_seconds": remaining,
+            }
+        return {
+            "visible": False,
+            "state": "active",
+            "label": None,
+            "reason": work_state.reason,
+            "remaining_seconds": None,
+        }
+
+    if mode == TimerMode.IDLE:
+        if timer_engine.idle_timeout_exempt:
+            return {
+                "visible": True,
+                "state": "idle_exempt",
+                "label": "idle · exempt",
+                "reason": "idle_timeout_exempt",
+                "remaining_seconds": None,
+            }
+        remaining_ms = timer_engine.idle_remaining_ms(now_mono_ms)
+        remaining = None if remaining_ms is None else max(0, int(remaining_ms // 1000))
+        return {
+            "visible": True,
+            "state": "idle_timeout",
+            "label": f"break in {_format_countdown_seconds(remaining)}"
+            if remaining is not None
+            else "break timer unknown",
+            "reason": "idle_timeout",
+            "remaining_seconds": remaining,
+            "timeout_seconds": int(timer_engine.idle_timeout_ms // 1000),
+        }
+
+    return {
+        "visible": False,
+        "state": mode.value,
+        "label": None,
+        "reason": "mode_not_work_or_idle",
+        "remaining_seconds": None,
+    }
+
+
 def _ops_build_state_assertions(
     *,
     generated_at: datetime,
@@ -13997,6 +14154,11 @@ def _ops_build_state_assertions(
     phone_age = _ops_seconds_since(phone_last, now=generated_at)
     phone_heartbeat_age = _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen"))
     mode = timer_engine.current_mode.value
+    now_mono_ms = int(time.monotonic() * 1000)
+    idle_timer = _ops_timer_idle_status(work_state, now_mono_ms)
+    timer_value = mode.upper()
+    if idle_timer.get("label"):
+        timer_value = f"{timer_value} · {idle_timer['label']}"
     break_balance = int(timer_engine.break_balance_ms)
     stale_count = int((instances.get("counts") or {}).get("stale") or 0)
     active_count = int((instances.get("counts") or {}).get("active") or 0)
@@ -14025,7 +14187,7 @@ def _ops_build_state_assertions(
         _ops_assertion(
             "timer_mode",
             "Timer mode",
-            mode.upper(),
+            timer_value,
             "bad"
             if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
             else "warn"
@@ -14036,12 +14198,16 @@ def _ops_build_state_assertions(
             evidence=[
                 f"activity={timer_engine.activity.value}",
                 f"productivity_active={work_state.productivity_active}",
+                f"hold={work_state.productivity_hold}",
+                f"idle_timer={idle_timer.get('label') or idle_timer.get('state')}",
                 f"manual_mode={timer_engine.manual_mode.value if timer_engine.manual_mode else 'none'}",
             ],
             correction_hint="If wrong, use timer-mode resume/pause/break or correct the attention source.",
             details={
                 "activity": timer_engine.activity.value,
                 "productivity_active": work_state.productivity_active,
+                "productivity_hold": work_state.productivity_hold,
+                "idle_timer": idle_timer,
                 "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
             },
         ),
@@ -14275,6 +14441,7 @@ async def get_ops_display_state():
     break_balance_ms = timer_engine.break_balance_ms
     return {
         "surface": "ops",
+        "ui_build_id": _ops_ui_build_id(),
         "generated_at": now.isoformat(),
         "timer": {
             "mode": timer_engine.current_mode.value,
@@ -14291,6 +14458,7 @@ async def get_ops_display_state():
             "total_work_time_ms": timer_engine.total_work_time_ms,
             "total_break_time_ms": timer_engine.total_break_time_ms,
             "daily_start_date": timer_engine.daily_start_date,
+            "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
         },
         "assertions": assertions,
         "attention": {
@@ -14348,6 +14516,7 @@ async def timer_worker():
     global _current_session_id, _session_start_ms, _mode_change_count
     last_daily_update = 0.0
     last_db_save = 0.0
+    last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -14509,6 +14678,7 @@ async def timer_worker():
                         timer_engine.current_mode.value,
                         is_automatic=False,
                     )
+                    await shared.timer_write_sample(source="timer_worker")
                     _mode_change_count += 1
                     _current_session_id = await timer_start_session(
                         timer_engine.current_mode.value, today
@@ -14524,29 +14694,11 @@ async def timer_worker():
                         push_phone_widget_async(timer_engine.current_mode.value, _active)
                     )
 
-            # Phone current_app staleness check: if last_activity is >3 min old,
-            # it's a phantom open (real usage would get refreshed by the debounce
-            # or by a close event). Clear it to prevent false enforcement.
-            _phone_last = PHONE_STATE.get("last_activity")
-            _phone_app = PHONE_STATE.get("current_app")
-            if _phone_app and _phone_last:
-                try:
-                    _phone_age = (
-                        datetime.now() - datetime.fromisoformat(_phone_last)
-                    ).total_seconds()
-                    if _phone_age > 180:  # 3 minutes stale
-                        print(
-                            f"TIMER: Clearing stale phone_app={_phone_app!r} (last_activity {_phone_age:.0f}s ago)"
-                        )
-                        PHONE_STATE["current_app"] = None
-                        PHONE_STATE["is_distracted"] = False
-                        if _phone_app in ("twitter", "x", "com.twitter.android"):
-                            PHONE_STATE["twitter_open_since"] = None
-                        _sync_activity_from_remaining_distraction_signals(
-                            int(time.monotonic() * 1000)
-                        )
-                except Exception:
-                    pass
+            # Do not clear phone current_app merely because the last telemetry
+            # heartbeat is old. Long-running video apps often emit one open event
+            # and no refresh while they remain on screen. Staleness is represented
+            # as lower assertion confidence; the source is cleared only by explicit
+            # close/new-app telemetry or an intentional correction endpoint.
 
             # Twitter 7-minute enforcement
             twitter_since = PHONE_STATE.get("twitter_open_since")
@@ -14641,6 +14793,15 @@ async def timer_worker():
             if now - last_daily_update >= 30:
                 await timer_update_daily_note()
                 last_daily_update = now
+
+            # Persist faithful graph samples independently from sparse shift events.
+            if now - last_sample_save >= 30:
+                work_state = await get_cached_work_state()
+                await shared.timer_write_sample(
+                    source="timer_worker",
+                    work_state=work_state.model_dump(),
+                )
+                last_sample_save = now
 
             # Save to DB every 10s
             if now - last_db_save >= 10:

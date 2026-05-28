@@ -2590,6 +2590,10 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # Signal productivity — active tool use = real work
     now_ms = int(time.monotonic() * 1000)
     shared.timer_engine.set_productivity(True, now_ms)
+    if tool_name == "AskUserQuestion" and _work_action_callback:
+        await _work_action_callback(
+            source="ask_user_question_answered", note=f"session_id={session_id}"
+        )
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 

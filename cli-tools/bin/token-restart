@@ -12,6 +12,7 @@
 #   token-restart --status     # All-device status
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
+# After healthy restart, reloads any open /ui/ops browser tabs on Mac.
 # NAS era: no git sync needed — all devices read from /Volumes/Imperium/Token-OS.
 
 set -euo pipefail
@@ -66,6 +67,7 @@ Notes:
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
+    - Open /ui/ops browser tabs are reloaded after a healthy restart
 EOF
 }
 
@@ -287,6 +289,86 @@ restart_wsl() {
     return 0
 }
 
+
+# ============ Ops Browser UI ============
+
+refresh_ops_browser_gui() {
+    # Best-effort Mac GUI refresh. This replaces legacy TUI restart signaling:
+    # the cockpit is a browser surface, so existing /ui/ops tabs should reload
+    # after Token-API comes back healthy. Frontend build-id polling handles
+    # Android/other browsers that this local AppleScript cannot reach.
+    if ! command -v osascript >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo -e "${BLUE}→${NC} Refreshing Ops browser tabs..."
+    local total=0
+    local count
+    local app
+
+    for app in "Helium" "Vivaldi" "Google Chrome" "Chromium" "Brave Browser" "Microsoft Edge"; do
+        count=$(osascript 2>/dev/null <<OSA || echo 0
+tell application "System Events"
+    set isRunning to (exists process "$app")
+end tell
+if isRunning then
+    tell application "$app"
+        set reloadCount to 0
+        repeat with w in windows
+            repeat with t in tabs of w
+                try
+                    if ((URL of t) as text) contains "/ui/ops" then
+                        reload t
+                        set reloadCount to reloadCount + 1
+                    end if
+                end try
+            end repeat
+        end repeat
+    end tell
+    return reloadCount
+else
+    return 0
+end if
+OSA
+)
+        count="${count//$'\n'/}"
+        [[ "$count" =~ ^[0-9]+$ ]] || count=0
+        total=$((total + count))
+    done
+
+    count=$(osascript 2>/dev/null <<'OSA' || echo 0
+tell application "System Events"
+    set isRunning to (exists process "Safari")
+end tell
+if isRunning then
+    tell application "Safari"
+        set reloadCount to 0
+        repeat with d in documents
+            try
+                if ((URL of d) as text) contains "/ui/ops" then
+                    do JavaScript "window.location.reload()" in d
+                    set reloadCount to reloadCount + 1
+                end if
+            end try
+        end repeat
+    end tell
+    return reloadCount
+else
+    return 0
+end if
+OSA
+)
+    count="${count//$'\n'/}"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    total=$((total + count))
+
+    if [[ "$total" -gt 0 ]]; then
+        echo -e "  ${GREEN}✓${NC} Reloaded ${total} Ops browser tab(s)"
+    else
+        echo -e "  ${YELLOW}○${NC} No open /ui/ops browser tabs found"
+    fi
+}
+
 # ============ Phone ============
 
 get_phone_status() {
@@ -330,7 +412,7 @@ update_plist() {
     fi
 
     echo -e "${BLUE}→${NC} Updating plist: $service_dir"
-    python3 - "$PLIST" "$python_path" "$service_dir" << 'PYEOF'
+    /usr/bin/python3 - "$PLIST" "$python_path" "$service_dir" << 'PYEOF'
 import sys, plistlib
 plist_path, python_path, working_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(plist_path, 'rb') as f:
@@ -359,7 +441,12 @@ full_restart() {
 
     wait $wsl_pid 2>/dev/null || true
 
-    # 3. Summary
+    # 3. Browser cockpit refresh (replaces legacy TUI restart signaling)
+    if check_mac_health; then
+        refresh_ops_browser_gui || true
+    fi
+
+    # 4. Summary
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
     if check_mac_health; then

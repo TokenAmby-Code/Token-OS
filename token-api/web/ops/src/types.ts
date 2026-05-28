@@ -101,6 +101,7 @@ export type StateAssertion = {
 
 export type OpsState = {
   surface: 'ops';
+  ui_build_id: string | null;
   generated_at: string;
   timer: {
     mode: TimerMode;
@@ -114,6 +115,14 @@ export type OpsState = {
     is_in_backlog: boolean;
     total_work_time_ms: number;
     total_break_time_ms: number;
+    idle_timer?: {
+      visible: boolean;
+      state: string;
+      label: string | null;
+      reason: string;
+      remaining_seconds: number | null;
+      timeout_seconds?: number;
+    };
   };
   assertions: StateAssertion[];
   attention: {
@@ -144,6 +153,12 @@ export type OpsState = {
     timer_mode: string;
     desktop_mode: string;
     phone_app: string | null;
+    productivity_hold?: string;
+    work_action_source?: string | null;
+    work_action_note?: string | null;
+    work_action_age_seconds?: number | null;
+    work_action_buffer_remaining_seconds?: number | null;
+    typing_active?: boolean;
   };
   instances: {
     active: OpsInstance[];
@@ -193,8 +208,14 @@ export type TimerHistoryPoint = {
   break_balance_ms: number; // left axis
   total_work_time_ms?: number;
   productivity_active: boolean;
+  activity?: string | null;
+  active_instance_count?: number;
+  processing_recent_count?: number;
+  observed_agent_count?: number;
   desktop_mode?: string | null;
   phone_app?: string | null;
+  sample_source?: string | null;
+  gap_before?: boolean;
   mode: TimerMode;
 };
 
@@ -221,6 +242,7 @@ export type TimerHistory = {
   generated_at: string;
   window_seconds: number;
   bucket_seconds: number;
+  gap_threshold_seconds?: number;
   points: TimerHistoryPoint[];
   segments: TimerHistorySegment[];
   annotations?: TimerHistoryAnnotation[];

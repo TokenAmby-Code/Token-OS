@@ -151,7 +151,7 @@ Each row/card should show:
 A compact explanation panel for derived system state:
 
 - Timer mode derivation: activity layer, productivity layer, manual layer.
-- Work-state evidence: active registered agents, observed panes, processing recent count.
+- Work-state evidence: recent work action, recent processing/pane activity within 3 minutes, observed panes, processing recent count.
 - Attention evidence: desktop detector, phone foreground app, heartbeat age, geofence.
 - Data freshness: generated-at and age of the most important source signals.
 
@@ -269,3 +269,16 @@ Use arrowheads for all directed edges. Use edge color/status for active, stale, 
 3. Evidence panel for derived state.
 4. Event stream with filters/lanes.
 5. Directed graph viewer with small scoped graphs first.
+
+
+## Work activity decay policy
+
+As of 2026-05-26, productivity should not remain active just because an idle agent pane exists. Qualifying work signals have a 3-minute grace window:
+
+- `/api/work-action` (Stream Deck / CLI / manual signal),
+- PromptSubmit hook,
+- AskUserQuestion answer hook,
+- recent processing/agent pane activity,
+- tmux typing guard detecting pending input.
+
+After 3 minutes without a qualifying signal, TimerEngine receives `set_productivity(False)` and enters IDLE if activity is otherwise working. IDLE then has a 7-minute timeout before auto-break. Total normal grace from last work signal to break is about 10 minutes. If activity is still a distraction when productivity drops, TimerEngine's v2 rules may derive BREAK immediately because `inactive + distraction => BREAK`.

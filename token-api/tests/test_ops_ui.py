@@ -67,6 +67,7 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env):
 
 
 def test_ops_timer_history_returns_live_shape(client, app_env):
+    now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """INSERT INTO timer_shifts
@@ -74,7 +75,20 @@ def test_ops_timer_history_returns_live_shape(client, app_env):
             break_backlog_ms, work_time_ms, active_instances, phone_app, details)
            VALUES (?, 'idle', 'working', 'test',
                    'pytest', 60000, 0, 0, 1, NULL, NULL)""",
-        ((datetime.now() - timedelta(minutes=5)).isoformat(),),
+        ((now - timedelta(minutes=5)).isoformat(),),
+    )
+    conn.executemany(
+        """INSERT INTO timer_samples
+           (timestamp, mode, activity, productivity_active, break_balance_ms,
+            break_backlog_ms, work_time_ms, active_instance_count,
+            processing_recent_count, observed_agent_count, desktop_mode,
+            phone_app, source)
+           VALUES (?, 'working', 'working', 1, ?, 0, 0, 1, 1, 1,
+                   'silence', NULL, 'pytest')""",
+        [
+            ((now - timedelta(seconds=60)).isoformat(), 60000),
+            ((now - timedelta(seconds=30)).isoformat(), 90000),
+        ],
     )
     conn.commit()
     conn.close()
@@ -83,13 +97,103 @@ def test_ops_timer_history_returns_live_shape(client, app_env):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["source"] == "timer_shifts+live_timer_engine"
+    assert body["source"] == "timer_samples+timer_shifts+live_timer_engine"
     assert body["window_seconds"] == 900
     assert body["bucket_seconds"] == 60
     assert len(body["points"]) >= 2
+    assert body["points"][0]["sample_source"] == "pytest"
     assert body["points"][-1]["break_balance_ms"] == app_env.main.timer_engine.break_balance_ms
     assert body["segments"]
     assert body["annotations"][0]["type"] == "test"
+
+
+def test_ops_timer_history_does_not_interpolate_sparse_shifts(client, app_env):
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    conn.executemany(
+        """INSERT INTO timer_shifts
+           (timestamp, old_mode, new_mode, trigger, source, break_balance_ms,
+            break_backlog_ms, work_time_ms, active_instances, phone_app, details)
+           VALUES (?, ?, ?, 'restart_regression', 'pytest', ?, 0, 0, 1, NULL, NULL)""",
+        [
+            ((now - timedelta(minutes=82)).isoformat(), "working", "break", 300000),
+            ((now - timedelta(minutes=1)).isoformat(), "break", "working", -4560000),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/timer/history?window=2h&bucket=60s")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["annotations"]) == 2
+    assert len(body["points"]) == 1
+    assert body["points"][0]["sample_source"] == "live_timer_engine"
+    assert body["gaps"]
+    assert body["gaps"][0]["reason"] == "no_timer_samples"
+    assert body["segments"] == []
+
+
+def test_ops_timer_history_marks_restart_sample_gap(client, app_env):
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    conn.executemany(
+        """INSERT INTO timer_samples
+           (timestamp, mode, activity, productivity_active, break_balance_ms,
+            break_backlog_ms, work_time_ms, active_instance_count,
+            processing_recent_count, observed_agent_count, desktop_mode,
+            phone_app, source)
+           VALUES (?, 'working', 'working', 1, ?, 0, 0, 1, 1, 1,
+                   'silence', NULL, 'pytest')""",
+        [
+            ((now - timedelta(minutes=4)).isoformat(), 60000),
+            ((now - timedelta(seconds=30)).isoformat(), 90000),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/timer/history?window=15m&bucket=60s")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert any(gap["reason"] == "sample_gap" for gap in body["gaps"])
+    assert body["points"][1].get("gap_before") is True
+
+
+def test_work_state_ignores_stale_idle_instances(client, app_env):
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO claude_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id,
+            status, tmux_pane, engine, registered_at, last_activity)
+           VALUES (?, ?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',
+                   'idle', '%44', 'codex',
+                   datetime('now', '-20 minutes'), datetime('now', '-10 minutes'))""",
+        (str(uuid.uuid4()), str(uuid.uuid4())),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/work-state")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["productivity_active"] is False
+    assert body["reason"] == "no_recent_work_activity"
+
+
+def test_work_action_sets_short_productivity_window(client):
+    resp = client.post("/api/work-action", json={"source": "pytest", "note": "state assertion"})
+    assert resp.status_code == 200, resp.text
+
+    state_resp = client.get("/api/work-state")
+
+    assert state_resp.status_code == 200, state_resp.text
+    body = state_resp.json()
+    assert body["productivity_active"] is True
+    assert body["reason"] == "recent_work_action"
 
 
 def test_ops_ui_serves_index_html(client):
