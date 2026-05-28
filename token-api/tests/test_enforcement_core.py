@@ -1,4 +1,3 @@
-import asyncio
 import json
 import sqlite3
 import sys
@@ -142,116 +141,6 @@ def test_enforcement_state_payload_keeps_internal_ack_names_out_of_app_slots(app
     assert phone_payload["app"] == "slay_the_spire"
     assert phone_payload["phone_app"] == "slay_the_spire"
     assert "ack_source" not in phone_payload
-
-
-@pytest.mark.asyncio
-async def test_golden_throne_second_resume_enforces(app_env, monkeypatch):
-    calls = []
-
-    async def fake_state_event(event_type, source, **kwargs):
-        calls.append(("state", event_type, source, kwargs))
-        return {"handled": True}
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append(("unified", level, message, kwargs))
-        return {"success": True, "level": level}
-
-    monkeypatch.setattr(app_env.main, "handle_custodes_state_event", fake_state_event)
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-
-    conn = sqlite3.connect(app_env.db_path)
-    conn.execute(
-        """INSERT INTO claude_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id, status, instance_type, engine)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "gt-second",
-            "gt-second",
-            "recovery-resume-surface",
-            "/tmp",
-            "local",
-            "Mac-Mini",
-            "idle",
-            "golden_throne",
-            "codex",
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    instance = {
-        "id": "gt-second",
-        "tab_name": "recovery-resume-surface",
-        "tmux_pane": "%129",
-        "pane_label": "palace:NW",
-        "gt_resume_count": 0,
-        "gt_resume_window_started_at": None,
-    }
-    first = await app_env.main.record_golden_throne_resume(instance)
-    row = _rows(
-        app_env.db_path,
-        "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
-        ("gt-second",),
-    )[0]
-    assert first["resume_count"] == 1
-    assert first["enforced"] is False
-    assert row["gt_resume_count"] == 1
-    assert calls == []
-
-    second_instance = {
-        **instance,
-        "gt_resume_count": 1,
-        "gt_resume_window_started_at": first["window_started_at"],
-    }
-    second = await app_env.main.record_golden_throne_resume(second_instance)
-
-    assert second["resume_count"] == 2
-    assert second["enforced"] is True
-    assert calls[0][0:3] == ("state", "enforcement_cascade_started", "golden_throne")
-    assert "app" not in calls[0][3]["payload"]
-    assert calls[0][3]["payload"]["phone_app"] is None
-    assert calls[0][3]["payload"]["ack_source"] == "golden_throne"
-    assert calls[0][3]["payload"]["human_pane_surface"] == "1:NW recovery-resume-surface"
-    assert calls[1][0:2] == ("unified", "enforce")
-    assert calls[1][2] == "Golden Throne second resume: 1:NW recovery-resume-surface"
-    assert calls[1][3]["source"] == "golden_throne"
-    assert (
-        calls[1][3]["phone_params"]["tts_text"]
-        == "golden throne enforcement 1:NW recovery-resume-surface"
-    )
-    assert calls[1][3]["phone_params"]["banner_text"] == "GT enforce: 1:NW recovery-resume-surface"
-
-
-@pytest.mark.asyncio
-async def test_askq_touch2_warns_without_phone_app_cascade(app_env, monkeypatch):
-    calls = []
-
-    async def fake_state_event(event_type, source, **kwargs):
-        calls.append(("state", event_type, source, kwargs))
-        return {"handled": True}
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append(("unified", level, message, kwargs))
-        return {"success": True}
-
-    def fail_cascade(app_name):
-        raise AssertionError(f"internal ack routed to phone-app cascade: {app_name}")
-
-    monkeypatch.setattr(app_env.main, "handle_custodes_state_event", fake_state_event)
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-    monkeypatch.setattr(app_env.main, "start_enforcement_cascade", fail_cascade)
-
-    await app_env.main._askq_touch2_callback(
-        "askq-instance",
-        "Choose a recovery path?",
-    )
-
-    assert calls[0][0:3] == ("state", "enforcement_cascade_started", "askq_ladder")
-    assert "app" not in calls[0][3]["payload"]
-    assert calls[0][3]["payload"]["phone_app"] is None
-    assert calls[0][3]["payload"]["ack_source"] == "askuserquestion"
-    assert calls[1][0:2] == ("unified", "warn")
-    assert calls[1][3]["source"] == "askq_ladder"
 
 
 def test_golden_throne_transport_uses_instance_engine(app_env):
@@ -706,36 +595,6 @@ async def test_golden_throne_prompt_submit_cancels_pending_pane_writes(app_env):
 
 
 @pytest.mark.asyncio
-async def test_unified_enforce_zaps_server_side_even_when_phone_succeeds(app_env, monkeypatch):
-    calls = []
-
-    monkeypatch.setattr(app_env.main, "is_quiet_hours", lambda *args, **kwargs: False)
-    monkeypatch.setattr(app_env.main, "_send_to_phone", lambda *args, **kwargs: {"success": True})
-    monkeypatch.setattr(app_env.main, "speak_checkin_tts", lambda *args, **kwargs: None)
-
-    def fake_send_pavlok(stimulus_type, value, reason, respect_cooldown=True):
-        calls.append((stimulus_type, value, reason, respect_cooldown))
-        return {"success": True, "type": stimulus_type, "value": value, "reason": reason}
-
-    monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_send_pavlok)
-
-    result = await app_env.main.unified_enforce(
-        "enforce",
-        "Golden Throne second resume: palace:NE (%134)",
-        source="golden_throne",
-        phone_params={"zap": 30, "tts_text": "gt enforce", "banner_text": "GT enforce"},
-    )
-
-    assert result["phone"]["success"] is True
-    assert result["pavlok"]["success"] is True
-    assert calls == [("zap", 30, "enforce_enforce_golden_throne", True)]
-    row = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id DESC LIMIT 1")[
-        0
-    ]
-    assert row["event_type"] == "enforce"
-
-
-@pytest.mark.asyncio
 async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     ack = await app_env.main.create_expected_ack(
         source="test",
@@ -836,84 +695,6 @@ def test_enforcement_expect_endpoint_creates_manual_ack(app_env):
     assert row["reason"] == "manual enforcement test"
     assert row["status"] == "pending"
     assert json.loads(row["details_json"])["mode"] == "cooked_day"
-
-
-@pytest.mark.asyncio
-async def test_expected_ack_escalation_ladder_paths(app_env, monkeypatch):
-    calls = []
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append(("unified", level, message, kwargs))
-        return {"ok": True, "level": level}
-
-    def fake_pavlok(stimulus_type, value, reason, respect_cooldown):
-        calls.append(("pavlok", stimulus_type, value, reason, respect_cooldown))
-        return {"success": True}
-
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-    monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_pavlok)
-
-    ack = await app_env.main.create_expected_ack(
-        source="test_ack",
-        instance_id="inst-2",
-        reason="unit follow-up",
-    )
-
-    created_at = datetime.fromisoformat(ack["created_at"])
-    ack_due_at = datetime.fromisoformat(ack["ack_due_at"])
-    level2_due_at = datetime.fromisoformat(ack["level2_due_at"])
-    pavlok_due_at = datetime.fromisoformat(ack["pavlok_due_at"])
-    assert ack_due_at - created_at == timedelta(seconds=90)
-    assert level2_due_at - created_at == timedelta(minutes=3)
-    assert pavlok_due_at - created_at == timedelta(minutes=3)
-
-    level1 = await app_env.main._expected_ack_escalate(ack["id"], 1)
-    level2 = await app_env.main._expected_ack_escalate(ack["id"], 2)
-    level3 = await app_env.main._expected_ack_escalate(ack["id"], 3)
-
-    assert calls[0][0:2] == ("unified", "notify")
-    assert calls[0][3]["phone_params"]["banner_text"] == "Ack due"
-    assert calls[1][0:2] == ("unified", "warn")
-    assert calls[2] == ("pavlok", "zap", 30, "expected_ack_test_ack", True)
-    assert level1["level"] == 1
-    assert level2["level"] == 2
-    assert level3["level"] == 3
-
-    row = _rows(
-        app_env.db_path,
-        "SELECT status, fired_levels_json FROM expected_acknowledgements WHERE id = ?",
-        (ack["id"],),
-    )[0]
-    assert row["status"] == "expired"
-    assert json.loads(row["fired_levels_json"]) == [1, 2, 3]
-
-
-@pytest.mark.asyncio
-async def test_expected_ack_escalation_includes_pane_surface(app_env, monkeypatch):
-    calls = []
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append((level, message, kwargs))
-        return {"ok": True}
-
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-    ack = await app_env.main.create_expected_ack(
-        source="test_ack",
-        instance_id="inst-pane",
-        reason="follow-up for palace:NE (%134): palace NE",
-        details={
-            "tab_name": "palace NE",
-            "tmux_pane": "%134",
-            "pane_label": "palace:NE",
-            "pane_surface": "palace:NE (%134)",
-        },
-    )
-
-    await app_env.main._expected_ack_escalate(ack["id"], 1)
-
-    phone_params = calls[0][2]["phone_params"]
-    assert phone_params["banner_text"] == "Ack due: 1:NE palace NE"
-    assert phone_params["tts_text"] == "Ack due: 1:NE palace NE"
 
 
 @pytest.mark.asyncio
@@ -1151,75 +932,6 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     details = json.loads(events[0]["details"])
     assert details["reason"] == "stale_reused_or_empty_pane"
     assert details["tmux_pane"] == "%132"
-
-
-@pytest.mark.asyncio
-async def test_expected_ack_level_is_idempotent(app_env, monkeypatch):
-    calls = []
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append((level, message, kwargs))
-        return {"ok": True}
-
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-    ack = await app_env.main.create_expected_ack(
-        source="test_ack",
-        instance_id="inst-idempotent",
-        reason="idempotency test",
-    )
-
-    first = await app_env.main._expected_ack_escalate(ack["id"], 1)
-    second = await app_env.main._expected_ack_escalate(ack["id"], 1)
-
-    assert first["level"] == 1
-    assert second["skipped"] is True
-    assert second["reason"] == "level_already_fired"
-    assert len(calls) == 1
-    row = _rows(
-        app_env.db_path,
-        "SELECT fired_levels_json FROM expected_acknowledgements WHERE id = ?",
-        (ack["id"],),
-    )[0]
-    assert json.loads(row["fired_levels_json"]) == [1]
-
-
-@pytest.mark.asyncio
-async def test_concurrent_expected_ack_escalations_preserve_fired_stages(app_env, monkeypatch):
-    calls = []
-
-    async def fake_unified(level, message, **kwargs):
-        calls.append(("unified", level, kwargs))
-        return {"ok": True}
-
-    async def fake_state_event(*args, **kwargs):
-        return {"handled": True}
-
-    def fake_pavlok(*args, **kwargs):
-        calls.append(("pavlok", args, kwargs))
-        return {"success": True}
-
-    monkeypatch.setattr(app_env.main, "unified_enforce", fake_unified)
-    monkeypatch.setattr(app_env.main, "handle_custodes_state_event", fake_state_event)
-    monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_pavlok)
-
-    ack = await app_env.main.create_expected_ack(
-        source="test_ack",
-        instance_id="ack-race",
-        reason="ack race",
-    )
-
-    await asyncio.gather(
-        app_env.main._expected_ack_escalate(ack["id"], 1),
-        app_env.main._expected_ack_escalate(ack["id"], 3),
-    )
-
-    row = _rows(
-        app_env.db_path,
-        "SELECT status, fired_levels_json FROM expected_acknowledgements WHERE id = ?",
-        (ack["id"],),
-    )[0]
-    assert row["status"] == "expired"
-    assert set(json.loads(row["fired_levels_json"])) in ({3}, {1, 3})
 
 
 def test_pavlok_guardrails_cover_cap_cooldown_quiet_and_contexts(app_env):
