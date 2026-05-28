@@ -9,7 +9,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "skills-sync"
 
 
-def _write_skill(root: pathlib.Path, folder: str, name: str | None = None, filename: str = "SKILL.md"):
+def _write_skill(
+    root: pathlib.Path, folder: str, name: str | None = None, filename: str = "SKILL.md"
+):
     d = root / folder
     d.mkdir(parents=True)
     (d / filename).write_text(
@@ -24,9 +26,9 @@ def _write_openai_yaml(skill: pathlib.Path, allow_implicit: bool):
     agents.mkdir(parents=True, exist_ok=True)
     (agents / "openai.yaml").write_text(
         "interface:\n"
-        f"  display_name: \"{skill.name}\"\n"
-        f"  short_description: \"Test skill {skill.name}\"\n"
-        f"  default_prompt: \"${skill.name} test\"\n"
+        f'  display_name: "{skill.name}"\n'
+        f'  short_description: "Test skill {skill.name}"\n'
+        f'  default_prompt: "${skill.name} test"\n'
         "\n"
         "policy:\n"
         f"  allow_implicit_invocation: {str(allow_implicit).lower()}\n",
@@ -62,7 +64,9 @@ def test_skills_sync_install_preserves_system_and_links_shared_skills(tmp_path):
     assert (tmp_path / "home" / ".codex" / "skills" / "preplan").resolve() == skill.resolve()
     assert (tmp_path / "home" / ".agents" / "skills" / "preplan").resolve() == skill.resolve()
     assert (commands / "preplan.md").resolve() == (skill / "SKILL.md").resolve()
-    assert (canonical.parent / "commands" / "preplan.md").resolve() == (skill / "SKILL.md").resolve()
+    assert (canonical.parent / "commands" / "preplan.md").resolve() == (
+        skill / "SKILL.md"
+    ).resolve()
     assert (tmp_path / "home" / ".codex" / "skills" / "aux").resolve() == aux.resolve()
 
     check = _run(tmp_path, canonical, "--check", "--json")
@@ -88,7 +92,10 @@ def test_skills_sync_check_rejects_preplan_hidden_from_codex_literal_invocation(
     canonical.mkdir()
     skill = _write_skill(canonical, "preplan")
     text = (skill / "SKILL.md").read_text(encoding="utf-8")
-    text = text.replace("description: Test skill preplan\n", "description: Test skill preplan\ndisable-model-invocation: true\n")
+    text = text.replace(
+        "description: Test skill preplan\n",
+        "description: Test skill preplan\ndisable-model-invocation: true\n",
+    )
     (skill / "SKILL.md").write_text(text, encoding="utf-8")
     _write_openai_yaml(skill, allow_implicit=False)
 

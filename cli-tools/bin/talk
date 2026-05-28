@@ -151,12 +151,21 @@ def main(argv: list[str]) -> int:
     status = send.get("status")
     talk_id = send.get("talk_id")
     if status == "returned":
-        # Caller hit the explicit-return shortcut — we ARE the return.
+        # Caller hit the explicit-return shortcut — we ARE the return. The
+        # server still attempts to inject the payload into the original caller's
+        # pane; that delivery can fail independently of the pair-return.
+        delivery = send.get("delivery") or {}
+        delivered_ok = delivery.get("status") != "failed"
         if args.json_out:
             print(json.dumps(send, indent=2, sort_keys=True))
-        else:
+        elif delivered_ok:
             print(f"[talk:returned] delivered to {args.pane}")
-        return 0
+        else:
+            _err(
+                f"[talk:returned] delivery failed to {args.pane}: "
+                f"{delivery.get('error') or delivery.get('status')}"
+            )
+        return 0 if delivered_ok else 1
     if args.no_wait:
         if args.json_out:
             print(json.dumps(send, indent=2, sort_keys=True))
