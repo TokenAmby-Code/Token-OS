@@ -159,10 +159,7 @@ def annotate_timer_telemetry(
                 current_point,
                 anomaly_reason="impossible_rate",
             )
-        elif (
-            elapsed_ms > gap_threshold_seconds * 1000
-            and abs(delta_ms) >= material_delta_ms
-        ):
+        elif elapsed_ms > gap_threshold_seconds * 1000 and abs(delta_ms) >= material_delta_ms:
             add_gap(
                 previous_time,
                 current_time,

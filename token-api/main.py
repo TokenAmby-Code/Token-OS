@@ -13838,6 +13838,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "source": "timer_samples+timer_shifts+live_timer_engine",
     }
 
+
 async def _ops_read_cron_summary() -> dict:
     if cron_engine is not None:
         try:
