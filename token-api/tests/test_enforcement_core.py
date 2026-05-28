@@ -1,4 +1,3 @@
-import asyncio
 import json
 import sqlite3
 import sys
@@ -1562,7 +1561,6 @@ def test_phone_close_acknowledges_pending_phone_ack(app_env):
     assert row["acknowledged_at"]
 
 
-
 def test_desktop_clear_preserves_active_phone_distraction(app_env):
     from fastapi.testclient import TestClient
 
@@ -1658,6 +1656,7 @@ def test_phone_close_returns_to_working_when_no_attention_sources_remain(app_env
     assert app_env.main.PHONE_STATE["is_distracted"] is False
     assert app_env.main.timer_engine.activity == app_env.main.Activity.WORKING
     assert app_env.main.timer_engine.current_mode == app_env.main.TimerMode.WORKING
+
 
 def test_mewgenics_turn_legacy_endpoint_does_not_create_ack(app_env):
     from fastapi.testclient import TestClient

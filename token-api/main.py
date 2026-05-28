@@ -8993,8 +8993,7 @@ def _sync_activity_from_remaining_distraction_signals(now_mono_ms: int) -> bool:
         result = timer_engine.set_activity(
             Activity.DISTRACTION,
             is_scrolling_gaming=(
-                phone_mode in ("scrolling", "gaming")
-                or desktop_mode in ("scrolling", "gaming")
+                phone_mode in ("scrolling", "gaming") or desktop_mode in ("scrolling", "gaming")
             ),
             now_mono_ms=now_mono_ms,
         )
@@ -13672,7 +13671,9 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     # Always include an exact live endpoint as the final point.
     live_gap_before = False
     if previous_time is None:
-        gaps.append({"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_samples"})
+        gaps.append(
+            {"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_samples"}
+        )
         live_gap_before = True
     else:
         live_spacing_seconds = (now - previous_time).total_seconds()
@@ -14003,7 +14004,7 @@ def _ops_ui_build_id() -> str | None:
             return None
         newest = max(p.stat().st_mtime_ns for p in files)
         names = ",".join(sorted(str(p.relative_to(root)) for p in files))
-        return hashlib.sha1(f"{newest}:{names}".encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha1(f"{newest}:{names}".encode()).hexdigest()[:12]
     except Exception:
         return None
 
@@ -14035,7 +14036,10 @@ def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> d
                 "reason": "tmux_typing_guard",
                 "remaining_seconds": None,
             }
-        if hold == "work_action_buffer" and work_state.work_action_buffer_remaining_seconds is not None:
+        if (
+            hold == "work_action_buffer"
+            and work_state.work_action_buffer_remaining_seconds is not None
+        ):
             remaining = max(0, int(work_state.work_action_buffer_remaining_seconds))
             return {
                 "visible": True,
@@ -14066,7 +14070,9 @@ def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> d
         return {
             "visible": True,
             "state": "idle_timeout",
-            "label": f"break in {_format_countdown_seconds(remaining)}" if remaining is not None else "break timer unknown",
+            "label": f"break in {_format_countdown_seconds(remaining)}"
+            if remaining is not None
+            else "break timer unknown",
             "reason": "idle_timeout",
             "remaining_seconds": remaining,
             "timeout_seconds": int(timer_engine.idle_timeout_ms // 1000),
@@ -14131,9 +14137,7 @@ def _ops_build_state_assertions(
     latest_phone_label = "none"
     if isinstance(latest_phone_details, dict):
         latest_phone_label = str(
-            latest_phone_details.get("display_name")
-            or latest_phone_details.get("app")
-            or "unknown"
+            latest_phone_details.get("display_name") or latest_phone_details.get("app") or "unknown"
         )
 
     assertions = [
@@ -14217,7 +14221,9 @@ def _ops_build_state_assertions(
             "phone_attention",
             "Phone attention",
             str(phone_app or "clear"),
-            "bad" if phone_distracted else "warn"
+            "bad"
+            if phone_distracted
+            else "warn"
             if timer_engine.activity == Activity.DISTRACTION and latest_phone_distraction
             else "neutral",
             confidence="low"
@@ -14286,15 +14292,18 @@ def _ops_build_state_assertions(
         ),
     ]
 
-    if timer_engine.activity == Activity.DISTRACTION and desktop_mode not in {
-        "video",
-        "scrolling",
-        "gaming",
-    } and not phone_distracted:
+    if (
+        timer_engine.activity == Activity.DISTRACTION
+        and desktop_mode
+        not in {
+            "video",
+            "scrolling",
+            "gaming",
+        }
+        and not phone_distracted
+    ):
         latest = latest_phone_distraction or latest_desktop_detection
-        latest_details = (
-            _ops_parse_event_details(latest.get("details")) if latest else None
-        )
+        latest_details = _ops_parse_event_details(latest.get("details")) if latest else None
         latest_label = "unknown"
         if isinstance(latest_details, dict):
             latest_label = str(
@@ -16428,7 +16437,6 @@ async def alarm_dismiss(delay_minutes: int = 0):
 # [MOVED to routes/hooks.py or shared.py] — was: # ============ Claude Code Hook Handlers =========
 
 # ============ Stash: Cross-Machine Clipboard & File Sharing ============
-
 
 
 def stash_cleanup():

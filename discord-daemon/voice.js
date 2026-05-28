@@ -180,6 +180,7 @@ export function createVoiceManager(botClients, config, logger) {
         player: null,       // AudioPlayer for playback
         playing: false,      // Currently playing audio
         leaveTimer: null,
+        routeEpoch: 0,
       });
     }
     return botStates.get(botName);
@@ -547,67 +548,171 @@ export function createVoiceManager(botClients, config, logger) {
     return { unmuted: true, userId, botName, channelId: member.voice.channelId };
   }
 
+  let operatorVoiceChannelId = null;
+
+  function botNameForChannel(channelId) {
+    if (!channelId) return null;
+    const match = Object.entries(voiceChannels).find(([, assignedChannel]) => assignedChannel === channelId);
+    return match ? match[0] : null;
+  }
+
+  async function joinAndListenIfCurrent(botName, channelId, routeEpoch) {
+    const state = getBotState(botName);
+    try {
+      await joinChannel(channelId, botName);
+      if (state.routeEpoch !== routeEpoch || operatorVoiceChannelId !== channelId) {
+        logger.warn(
+          `Voice auto-join [${botName}]: stale join completed for ${channelId}; ` +
+          `operator now in ${operatorVoiceChannelId || 'none'}, leaving immediately`
+        );
+        await leaveChannel(botName);
+        return;
+      }
+      startListening(botName);
+      logger.info(`Voice auto-join [${botName}]: joined and listening`);
+    } catch (err) {
+      logger.error(`Voice auto-join [${botName}]: failed to join: ${err.message}`);
+    }
+  }
+
+  async function leaveBotNow(botName, reason) {
+    const state = getBotState(botName);
+    state.routeEpoch += 1;
+    if (state.leaveTimer) {
+      clearTimeout(state.leaveTimer);
+      state.leaveTimer = null;
+    }
+    if (!connectionUsable(state)) {
+      if (state.joining) {
+        logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
+      }
+      return;
+    }
+    logger.info(`Voice auto-join [${botName}]: leaving immediately (${reason})`);
+    try {
+      await leaveChannel(botName);
+    } catch (err) {
+      logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
+    }
+  }
+
+  function scheduleBotLeave(botName, channelId, reason) {
+    const state = getBotState(botName);
+    state.routeEpoch += 1;
+    const graceMs = Number(config.voice_auto_leave_grace_ms ?? 5000);
+    if (state.leaveTimer) clearTimeout(state.leaveTimer);
+    if (!connectionUsable(state)) {
+      if (state.joining) {
+        logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
+      }
+      return;
+    }
+    logger.info(`Voice auto-join [${botName}]: operator left ${channelId}, disconnecting after ${graceMs}ms grace...`);
+    state.leaveTimer = setTimeout(async () => {
+      state.leaveTimer = null;
+      if (!connectionUsable(state)) return;
+      try {
+        await leaveChannel(botName);
+      } catch (err) {
+        logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
+      }
+    }, Math.max(0, graceMs));
+  }
+
+  async function syncAutoJoinForOperatorChannel(trigger, { immediateLeave = false } = {}) {
+    const desiredBotName = botNameForChannel(operatorVoiceChannelId);
+
+    for (const [botName, channelId] of Object.entries(voiceChannels)) {
+      const state = getBotState(botName);
+      const desired = desiredBotName === botName;
+
+      if (desired) {
+        if (state.leaveTimer) {
+          clearTimeout(state.leaveTimer);
+          state.leaveTimer = null;
+        }
+        if (connectionUsable(state) && state.channelId === channelId) {
+          logger.debug(`Voice auto-join [${botName}]: already connected to current channel (${trigger})`);
+          continue;
+        }
+        if (state.joining) {
+          logger.debug(`Voice auto-join [${botName}]: already joining current channel (${trigger})`);
+          continue;
+        }
+        state.routeEpoch += 1;
+        const routeEpoch = state.routeEpoch;
+        logger.info(`Voice auto-join [${botName}]: operator joined ${channelId}, following... (${trigger})`);
+        void joinAndListenIfCurrent(botName, channelId, routeEpoch);
+        continue;
+      }
+
+      const connectedElsewhere = connectionUsable(state);
+      const joiningElsewhere = state.joining;
+      if (!connectedElsewhere && !joiningElsewhere) continue;
+
+      if (immediateLeave || operatorVoiceChannelId) {
+        void leaveBotNow(botName, `operator in ${operatorVoiceChannelId || 'no assigned channel'} via ${trigger}`);
+      } else {
+        scheduleBotLeave(botName, channelId, trigger);
+      }
+    }
+  }
+
   /**
    * Set up auto-join/leave for all bots that have voice_channels configured.
-   * Each bot watches for the operator joining/leaving its assigned VC.
+   * A single operator voice-state listener owns the routing state for every bot.
+   * This matters for direct VC hops: Discord can deliver "joined B" while the
+   * old bot is still joining/leaving A, so stale joins are invalidated and any
+   * non-current bot leaves immediately instead of waiting for the normal grace.
    */
   function setupAutoJoin() {
+    const eventClient = Object.values(botClients).find(c => c?.client);
+    if (!eventClient?.client) {
+      logger.warn('Voice auto-join: no bot clients available, skipping');
+      return;
+    }
+
     for (const [botName, channelId] of Object.entries(voiceChannels)) {
       const client = getClient(botName);
       if (!client?.client) {
         logger.warn(`Voice auto-join: bot '${botName}' not available, skipping`);
         continue;
       }
-
-      // Need GuildVoiceStates intent to receive voiceStateUpdate
-      client.client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-        // Only care about the operator
-        if (newState.member?.id !== operatorUserId && oldState.member?.id !== operatorUserId) return;
-
-        const joinedChannel = newState.channelId;
-        const leftChannel = oldState.channelId;
-        const state = getBotState(botName);
-
-        // Operator joined our assigned channel
-        if (joinedChannel === channelId && leftChannel !== channelId) {
-          if (state.leaveTimer) {
-            clearTimeout(state.leaveTimer);
-            state.leaveTimer = null;
-          }
-          if (connectionUsable(state) || state.joining) {
-            logger.debug(`Voice auto-join [${botName}]: already connected or joining`);
-            return;
-          }
-          logger.info(`Voice auto-join [${botName}]: operator joined ${channelId}, following...`);
-          try {
-            await joinChannel(channelId, botName);
-            startListening(botName);
-            logger.info(`Voice auto-join [${botName}]: joined and listening`);
-          } catch (err) {
-            logger.error(`Voice auto-join [${botName}]: failed to join: ${err.message}`);
-          }
-        }
-
-        // Operator left our assigned channel
-        if (leftChannel === channelId && joinedChannel !== channelId) {
-          if (!connectionUsable(state)) return;
-          const graceMs = Number(config.voice_auto_leave_grace_ms ?? 5000);
-          if (state.leaveTimer) clearTimeout(state.leaveTimer);
-          logger.info(`Voice auto-join [${botName}]: operator left ${channelId}, disconnecting after ${graceMs}ms grace...`);
-          state.leaveTimer = setTimeout(async () => {
-            state.leaveTimer = null;
-            if (!connectionUsable(state)) return;
-            try {
-              await leaveChannel(botName);
-            } catch (err) {
-              logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
-            }
-          }, Math.max(0, graceMs));
-        }
-      });
-
       logger.info(`Voice auto-join [${botName}]: watching for operator in channel ${channelId}`);
     }
+
+    // Need GuildVoiceStates intent to receive voiceStateUpdate.
+    eventClient.client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+      // Only care about the operator.
+      if (newState.member?.id !== operatorUserId && oldState.member?.id !== operatorUserId) return;
+
+      const joinedChannel = newState.channelId;
+      const leftChannel = oldState.channelId;
+      const previousChannel = operatorVoiceChannelId;
+
+      // Treat "joined a different VC" as a hop even when Discord did not give
+      // the expected oldState channel. This covers hot swaps and cache misses.
+      const connectedNonCurrentBot = Object.entries(voiceChannels).some(([botName, channelId]) => {
+        const state = getBotState(botName);
+        return channelId !== joinedChannel && (connectionUsable(state) || state.joining);
+      });
+      const isHop = Boolean(
+        joinedChannel &&
+        joinedChannel !== leftChannel &&
+        (leftChannel || (previousChannel && previousChannel !== joinedChannel) || connectedNonCurrentBot)
+      );
+
+      operatorVoiceChannelId = joinedChannel || null;
+
+      logger.info(
+        `Voice auto-join: operator voice update left=${leftChannel || 'none'} ` +
+        `joined=${joinedChannel || 'none'} previous=${previousChannel || 'none'} hop=${isHop}`
+      );
+
+      await syncAutoJoinForOperatorChannel(isHop ? 'vc-hop' : 'voice-state-update', {
+        immediateLeave: isHop || Boolean(joinedChannel),
+      });
+    });
   }
 
   /**
@@ -642,29 +747,25 @@ export function createVoiceManager(botClients, config, logger) {
       return { joined: false, reason: 'operator_not_in_voice' };
     }
 
+    operatorVoiceChannelId = currentChannelId;
     const match = Object.entries(voiceChannels).find(([, channelId]) => channelId === currentChannelId);
     if (!match) {
-      logger.info(`Voice startup sync: operator is in unassigned channel ${currentChannelId}; waiting for auto-join event`);
+      logger.info(`Voice startup sync: operator is in unassigned channel ${currentChannelId}; leaving assigned bots idle`);
+      await syncAutoJoinForOperatorChannel('startup-unassigned', { immediateLeave: true });
       return { joined: false, reason: 'unassigned_channel', channelId: currentChannelId };
     }
 
     const [botName, channelId] = match;
     const state = getBotState(botName);
-    if (connectionUsable(state) || state.joining) {
+    if (connectionUsable(state) && state.channelId === channelId) {
       logger.info(`Voice startup sync [${botName}]: already connected to ${state.channelId}`);
+      await syncAutoJoinForOperatorChannel('startup-current', { immediateLeave: true });
       return { joined: false, reason: 'already_connected', botName, channelId: state.channelId };
     }
 
-    logger.info(`Voice startup sync [${botName}]: operator already in ${channelId}, joining...`);
-    try {
-      await joinChannel(channelId, botName);
-      startListening(botName);
-      logger.info(`Voice startup sync [${botName}]: joined and listening`);
-      return { joined: true, botName, channelId };
-    } catch (err) {
-      logger.error(`Voice startup sync [${botName}]: failed to join: ${err.message}`);
-      return { joined: false, reason: 'join_failed', botName, channelId, error: err.message };
-    }
+    logger.info(`Voice startup sync [${botName}]: operator already in ${channelId}, reconciling...`);
+    await syncAutoJoinForOperatorChannel('startup-sync', { immediateLeave: true });
+    return { joined: true, botName, channelId };
   }
 
   // --- Audio Playback ---

@@ -267,9 +267,15 @@ async def init_database_async(db_path: Path | None = None) -> None:
         cursor = await db.execute("PRAGMA table_info(stop_hook_subscriptions)")
         sub_columns = {col[1] for col in await cursor.fetchall()}
         sub_migrations = [
-            ("purpose", "ALTER TABLE stop_hook_subscriptions ADD COLUMN purpose TEXT NOT NULL DEFAULT 'generic'"),
+            (
+                "purpose",
+                "ALTER TABLE stop_hook_subscriptions ADD COLUMN purpose TEXT NOT NULL DEFAULT 'generic'",
+            ),
             ("payload", "ALTER TABLE stop_hook_subscriptions ADD COLUMN payload TEXT"),
-            ("oneshot", "ALTER TABLE stop_hook_subscriptions ADD COLUMN oneshot INTEGER NOT NULL DEFAULT 0"),
+            (
+                "oneshot",
+                "ALTER TABLE stop_hook_subscriptions ADD COLUMN oneshot INTEGER NOT NULL DEFAULT 0",
+            ),
         ]
         for column_name, sql in sub_migrations:
             if column_name not in sub_columns:

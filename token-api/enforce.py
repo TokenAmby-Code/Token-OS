@@ -9,7 +9,6 @@ Golden Throne — not here.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from pydantic import BaseModel
 
@@ -25,10 +24,10 @@ ENFORCE_MIN_INTENSITY = 25
 class EnforceRequest(BaseModel):
     message: str
     intensity: int = 50
-    distraction_source: Optional[str] = None
-    force_device: Optional[str] = None
+    distraction_source: str | None = None
+    force_device: str | None = None
     source: str = "api"
-    context: Optional[dict] = None
+    context: dict | None = None
 
 
 _is_quiet_hours = None

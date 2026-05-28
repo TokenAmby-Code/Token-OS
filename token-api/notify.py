@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from typing import Optional
 
 from pydantic import BaseModel
 
@@ -39,12 +38,12 @@ DEFAULT_DEVICE_ORDER = ("wsl", "mac", "phone")
 class NotifyRequest(BaseModel):
     message: str
     type: str = "tts"  # "tts" | "sound" | "banner" | "music"
-    distraction_source: Optional[str] = None
-    force_device: Optional[str] = None
-    voice: Optional[str] = None
-    rate: Optional[int] = None
-    sound: Optional[str] = None
-    instance_id: Optional[str] = None
+    distraction_source: str | None = None
+    force_device: str | None = None
+    voice: str | None = None
+    rate: int | None = None
+    sound: str | None = None
+    instance_id: str | None = None
 
 
 _send_to_phone = None
@@ -73,7 +72,9 @@ def _select_devices(req: NotifyRequest) -> list[str]:
     return [d for d in DEFAULT_DEVICE_ORDER if d != req.distraction_source]
 
 
-def _resolve_wsl_voice(instance_id: Optional[str], explicit_voice: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+def _resolve_wsl_voice(
+    instance_id: str | None, explicit_voice: str | None
+) -> tuple[str | None, int | None]:
     """Pick a WSL voice + rate either from the explicit override or fall back."""
     if explicit_voice:
         for p in PROFILES + FALLBACK_VOICES:
@@ -173,9 +174,7 @@ async def dispatch_notification(request: NotifyRequest) -> dict:
     for device in targets:
         # Never fall back to the distraction device, ever.
         if request.distraction_source and device == request.distraction_source:
-            attempts.append(
-                {"device": device, "skipped": True, "reason": "distraction_source"}
-            )
+            attempts.append({"device": device, "skipped": True, "reason": "distraction_source"})
             continue
 
         if not _device_reachable(device):

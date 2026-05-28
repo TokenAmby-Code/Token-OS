@@ -7,10 +7,11 @@ import { createHttpServer } from './http-server.js';
 import { createMessageStore } from './message-store.js';
 import { createVoiceManager } from './voice.js';
 import { createTranscriber } from './transcribe.js';
-import { writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'fs';
+import { writeFileSync, unlinkSync, mkdirSync, appendFileSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SlashCommandBuilder, Events } from 'discord.js';
+import { execFile, execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -22,12 +23,177 @@ mkdirSync(LOG_DIR, { recursive: true });
 
 // --- Logger ---
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const FIXER_INSTANCE_ENV = 'DISCORD_VOICE_FIXER_INSTANCE_ID';
+const FIXER_INSTANCE_TMUX_OPTION = '@DISCORD_VOICE_FIXER_INSTANCE_ID';
+const FIXER_PANE_TMUX_OPTION = '@DISCORD_VOICE_FIXER_PANE';
+
+function tmuxExecOptions(extra = {}) {
+  const { TMUX, ...env } = process.env;
+  return { ...extra, env };
+}
+
+function classifyErrorCode(msg, meta = {}) {
+  if (meta.errorCode) return meta.errorCode;
+  const text = String(msg || '').toLowerCase();
+  if (text.includes('input audio buffer') || text.includes('buffer too small')) return 'realtime_input_audio_buffer_commit';
+  if (text.includes('/voice/tts')) return 'voice_tts_route_error';
+  if (text.includes('cannot perform ip discovery')) return 'discord_voice_ip_discovery';
+  if (text.includes('not connected to a voice channel')) return 'voice_bot_not_connected';
+  if (text.includes('websocket')) return 'realtime_websocket_error';
+  if (text.includes('unhandled rejection')) return 'unhandled_rejection';
+  if (text.includes('uncaught exception')) return 'uncaught_exception';
+  return 'discord_daemon_error';
+}
+
+function tailFile(path, maxLines = 80) {
+  try {
+    const data = readFileSync(path, 'utf8');
+    return data.split(/\r?\n/).filter(Boolean).slice(-maxLines).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function createDiscordFixerHook() {
+  const recent = new Map();
+  const RECENT_TTL_MS = 10 * 60_000;
+  const RECENT_MAX = 500;
+  const agentCmd = join(BASE_DIR, 'cli-tools', 'bin', 'agent-cmd');
+
+  function resolveFixerInstanceId() {
+    const envValue = process.env[FIXER_INSTANCE_ENV];
+    if (envValue) return envValue.trim();
+    try {
+      return execFileSync('tmux', ['show-options', '-gqv', FIXER_INSTANCE_TMUX_OPTION], tmuxExecOptions({
+        encoding: 'utf8',
+        timeout: 3000,
+      })).trim();
+    } catch {
+      return '';
+    }
+  }
+
+  function resolveFixerPane(fixerInstanceId) {
+    try {
+      const explicitPane = execFileSync('tmux', ['show-options', '-gqv', FIXER_PANE_TMUX_OPTION], tmuxExecOptions({
+        encoding: 'utf8',
+        timeout: 3000,
+      })).trim();
+      if (explicitPane?.startsWith?.('%')) return explicitPane;
+    } catch {}
+
+    if (!fixerInstanceId) return '';
+    try {
+      const out = execFileSync('tmux', [
+        'list-panes',
+        '-a',
+        '-F',
+        `#{pane_id}\t#{session_name}\t#{${FIXER_INSTANCE_TMUX_OPTION}}`,
+      ], tmuxExecOptions({ encoding: 'utf8', timeout: 3000 }));
+      for (const line of out.split(/\r?\n/)) {
+        if (!line) continue;
+        const [pane, sessionName, marker] = line.split('\t');
+        if (sessionName === 'discord-daemon') continue;
+        if (marker?.trim() === fixerInstanceId && pane?.startsWith?.('%')) return pane;
+      }
+    } catch {
+      return '';
+    }
+    return '';
+  }
+
+  function pasteFixerPromptToPane(pane, prompt, logFile) {
+    const bufferName = `discord-fixer-hook-${process.pid}`;
+    try {
+      execFileSync('tmux', ['set-buffer', '-b', bufferName, prompt], tmuxExecOptions({ timeout: 5000 }));
+      execFileSync('tmux', ['paste-buffer', '-d', '-b', bufferName, '-t', pane], tmuxExecOptions({ timeout: 5000 }));
+      execFileSync('tmux', ['send-keys', '-t', pane, 'Enter'], tmuxExecOptions({ timeout: 5000 }));
+    } catch (err) {
+      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook raw tmux paste failed pane=${pane}: ${err.message}`;
+      console.log(failLine);
+      try { appendFileSync(logFile, failLine + '\n'); } catch {}
+    }
+  }
+
+  function sendFixerPrompt(args, prompt, logFile, fallback = null) {
+    execFile(agentCmd, [...args, prompt], {
+      env: {
+        ...process.env,
+        PATH: [
+          join(BASE_DIR, 'cli-tools', 'bin'),
+          '/opt/homebrew/bin',
+          '/usr/local/bin',
+          process.env.PATH || '',
+        ].join(':'),
+      },
+      timeout: 45_000,
+      maxBuffer: 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      if (!err) return;
+      if (fallback) {
+        fallback(`${err.message}; ${String(stderr || stdout || '').slice(0, 240)}`);
+        return;
+      }
+      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook failed: ${err.message}; ${String(stderr || stdout || '').slice(0, 240)}`;
+      console.log(failLine);
+      try { appendFileSync(logFile, failLine + '\n'); } catch {}
+    });
+  }
+
+  return function hookDiscordError(line, msg, meta = {}, logFile) {
+    const fixerInstanceId = resolveFixerInstanceId();
+    if (!fixerInstanceId) return;
+
+    const errorCode = classifyErrorCode(msg, meta);
+    const key = `${errorCode}:${String(msg).slice(0, 180)}`;
+    const now = Date.now();
+    for (const [k, ts] of recent) {
+      if (now - ts > RECENT_TTL_MS) recent.delete(k);
+    }
+    if (recent.size > RECENT_MAX) {
+      const oldestKey = recent.keys().next().value;
+      if (oldestKey) recent.delete(oldestKey);
+    }
+    const last = recent.get(key) || 0;
+    if (now - last < 30_000) return;
+    recent.set(key, now);
+
+    const recentLog = tailFile(logFile, 80);
+    const prompt = [
+      'Discord voice routing state hook to active fixer.',
+      '',
+      `error_code: ${errorCode}`,
+      `fixer_instance_id: ${fixerInstanceId}`,
+      `timestamp: ${new Date(now).toISOString()}`,
+      `trigger: ${msg}`,
+      '',
+      'Recent discord-daemon log:',
+      '```text',
+      recentLog || line,
+      '```',
+    ].join('\n');
+
+    sendFixerPrompt(['--instance', fixerInstanceId], prompt, logFile, (instanceError) => {
+      const fixerPane = resolveFixerPane(fixerInstanceId);
+      if (!fixerPane) {
+        const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook failed: ${instanceError}; no pane marked ${FIXER_INSTANCE_TMUX_OPTION}=${fixerInstanceId}`;
+        console.log(failLine);
+        try { appendFileSync(logFile, failLine + '\n'); } catch {}
+        return;
+      }
+      const fallbackPrompt = `${prompt}\n\n(instance delivery failed, raw tmux pane fallback used: ${instanceError})`;
+      pasteFixerPromptToPane(fixerPane, fallbackPrompt, logFile);
+    });
+  };
+}
+
+const discordFixerHook = createDiscordFixerHook();
 
 function createLogger(level = 'info') {
   const minLevel = LOG_LEVELS[level] ?? 1;
   const logFile = join(LOG_DIR, `daemon-${new Date().toISOString().slice(0, 10)}.log`);
 
-  function log(lvl, msg) {
+  function log(lvl, msg, meta = {}) {
     if (LOG_LEVELS[lvl] < minLevel) return;
     const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
     console.log(line);
@@ -36,13 +202,16 @@ function createLogger(level = 'info') {
     } catch {
       // Don't crash on log write failure
     }
+    if (lvl === 'error') {
+      try { discordFixerHook(line, msg, meta, logFile); } catch {}
+    }
   }
 
   return {
-    debug: (msg) => log('debug', msg),
-    info: (msg) => log('info', msg),
-    warn: (msg) => log('warn', msg),
-    error: (msg) => log('error', msg),
+    debug: (msg, meta) => log('debug', msg, meta),
+    info: (msg, meta) => log('info', msg, meta),
+    warn: (msg, meta) => log('warn', msg, meta),
+    error: (msg, meta) => log('error', msg, meta),
   };
 }
 
@@ -89,8 +258,8 @@ async function main() {
   const transcriber = createTranscriber(config, logger);
 
   // Wire live decoded Discord PCM frames into OpenAI Realtime transcription.
-  voiceManager.setAudioFrameCallback((userId, pcmChunk, botName) => {
-    return transcriber.handleAudioFrame?.(userId, pcmChunk, botName);
+  voiceManager.setAudioFrameCallback((userId, pcmChunk, botName, meta) => {
+    return transcriber.handleAudioFrame?.(userId, pcmChunk, botName, meta);
   });
   voiceManager.setAudioEndCallback((userId, botName) => {
     return transcriber.closeUser?.(userId, botName);

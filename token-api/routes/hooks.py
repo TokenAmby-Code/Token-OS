@@ -157,9 +157,11 @@ _auto_name_instance: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
 _golden_throne_activity_callback: Callable[..., Any] | None = None
-# AskUserQuestion ladder L1 only — L2/L3 warn-stage callbacks were removed
-# when the cascade was collapsed. Golden Throne now owns missed-ack escalation.
+# AskUserQuestion ladder callbacks. Optional injection points (default None);
+# the ladder skips any stage whose callback is unset. Tests wire fakes directly.
 _askq_level1_callback: Callable[..., Any] | None = None
+_askq_touch2_callback: Callable[..., Any] | None = None
+_askq_level3_callback: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -2589,7 +2591,9 @@ async def handle_post_tool_use(payload: dict) -> dict:
     now_ms = int(time.monotonic() * 1000)
     shared.timer_engine.set_productivity(True, now_ms)
     if tool_name == "AskUserQuestion" and _work_action_callback:
-        await _work_action_callback(source="ask_user_question_answered", note=f"session_id={session_id}")
+        await _work_action_callback(
+            source="ask_user_question_answered", note=f"session_id={session_id}"
+        )
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
@@ -2722,7 +2726,7 @@ async def handle_stop(payload: dict) -> dict:
         )
         # Signal TUI that evaluators are running for this instance
         _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
-        _tui_signal_dir.mkdir(exist_ok=True)
+        _tui_signal_dir.mkdir(parents=True, exist_ok=True)
         (_tui_signal_dir / f"evaluating-{session_id}").touch()
         asyncio.create_task(
             _require_dep("run_stop_evaluators", _run_stop_evaluators)(
