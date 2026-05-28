@@ -89,7 +89,6 @@ from phone_service import (
     _persist_twitter_zap_cooldown,
     _restore_twitter_zap_cooldown,
     _send_to_phone,
-    check_instance_count_pavlok,
     push_phone_widget_async,
     send_pavlok_stimulus,
 )
@@ -1851,13 +1850,6 @@ async def stop_instance(instance_id: str):
 
         is_subagent = row[2]
 
-        # Count non-subagent active instances BEFORE stopping
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
-        )
-        count_row = await cursor.fetchone()
-        was_active = count_row[0] if count_row else 0
-
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
@@ -1884,10 +1876,6 @@ async def stop_instance(instance_id: str):
 
     # Log event
     await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
-
-    # Instance count Pavlok signals (skip subagents)
-    if not is_subagent:
-        await check_instance_count_pavlok(remaining_non_sub, was_active)
 
     # Push updated instance count to phone widget
     if not is_subagent:
@@ -3652,6 +3640,54 @@ async def _dispatch_timer_intervention(
             source,
         )
         return False
+
+
+# Spoken on a genuine productivity_inactive -> IDLE transition. Kept short to
+# survive the wsl_sapi ~50-char truncation; worded to assert the impending shift
+# (IDLE's 7-min grace is the "impending" before the auto-flip to BREAK).
+ALL_INSTANCES_STOPPED_TTS = "All Claude instances stopped, going idle"
+
+
+async def _announce_idle_if_all_stopped(
+    old_mode: str, new_mode: str, productivity_active: bool
+) -> bool:
+    """Speak the "all Claude instances stopped" state assertion when the timer's
+    productivity oracle shifts WORKING -> IDLE (work has genuinely stopped).
+
+    This is the re-homed replacement for the deleted parallel
+    ``check_instance_count_pavlok`` detector. It carries NO independent detection
+    logic: it is a pure derived output of ``compute_work_state()`` (live panes +
+    observed/unregistered agents + recent work-action buffer), so it cannot fire
+    while agents are visibly alive — eliminating the session-churn false fire.
+
+    Emitted only on the productivity_inactive WORKING -> IDLE transition (mode
+    ``idle``); a distraction-driven inactive transition lands in BREAK, a
+    different signal, and is intentionally silent here. The spoken assertion is
+    routed through ``speak_tts`` — the geofence-first core that ``/api/notify/tts``
+    delegates to (Discord VC -> geofence/phone-when-away -> WSL -> phone -> Mac) —
+    NOT phone-direct. There is no debounce: MODE_CHANGED fires exactly once per
+    transition, so the assertion is inherently single-shot. Returns True if it
+    spoke. Never raises into the timer loop.
+    """
+    if productivity_active or new_mode != TimerMode.IDLE.value:
+        return False
+    # Record the state transition unconditionally (it is a real timer event),
+    # then gate only the spoken assertion on quiet hours — parity with the
+    # /api/notify/tts quiet-hours behaviour and _dispatch_timer_intervention.
+    await log_event(
+        "all_instances_stopped",
+        details={"old_mode": old_mode, "new_mode": new_mode},
+    )
+    try:
+        if is_quiet_hours() or shared.get_quiet_hours_status().get("active"):
+            return False
+    except Exception:
+        # Fail safe: do not speak when quiet state cannot be evaluated.
+        logger.exception("all-stopped quiet-guard failed; suppressing assertion")
+        return False
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, speak_tts, ALL_INSTANCES_STOPPED_TTS)
+    return True
 
 
 QUIET_RESUME_JOB_ID = "quiet-resume-after-state-buster"
@@ -14805,6 +14841,9 @@ async def timer_worker():
                     _current_session_id = await timer_start_session(new_mode, today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
+                    # Re-homed "all Claude instances stopped" assertion — derived
+                    # from the productivity oracle, not a parallel count detector.
+                    await _announce_idle_if_all_stopped(old_mode, new_mode, productivity_active)
 
                 current_phone_app = (PHONE_STATE.get("current_app") or "").lower()
                 current_phone_mode = (

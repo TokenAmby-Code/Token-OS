@@ -27,10 +27,8 @@ logger = logging.getLogger("token_api")
 
 TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
 TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
-INSTANCE_ZERO_NOTIFY_DEBOUNCE_SECS = 60
 
 _last_widget_push = {"mode": None, "active": None}
-_last_instance_zero_notify_at = 0.0
 _PAVLOK_STIMULUS_TYPES = ("zap", "beep", "vibe")
 _pavlok_dispatch_lock = threading.Lock()
 _last_pavlok_dispatch_monotonic: float | None = None
@@ -471,70 +469,3 @@ def _log_pavlok_guardrail_block(result: dict) -> None:
             asyncio.run(log_event("pavlok_blocked_by_guardrail", details=result))
     except Exception as exc:
         logger.warning(f"PAVLOK: guardrail block logging failed: {exc}")
-
-
-async def check_instance_count_pavlok(remaining_active: int, was_active: int):
-    """Send Pavlok signals when Claude instance count drops critically."""
-    global _last_instance_zero_notify_at
-
-    if remaining_active == 1 and was_active >= 2:
-        print(f"INSTANCE COUNT: Dropped to 1 (from {was_active}), double vibe")
-        result = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 50,
-                "banner_text": f"1 Claude remaining (was {was_active})",
-            },
-        )
-        if not result["success"]:
-            send_pavlok_stimulus(
-                stimulus_type="vibe",
-                value=50,
-                reason="one_claude_remaining",
-                respect_cooldown=False,
-            )
-        await asyncio.sleep(3)
-        result = await asyncio.to_thread(_send_to_phone, "/notify", {"vibe": 50})
-        if not result["success"]:
-            send_pavlok_stimulus(
-                stimulus_type="vibe",
-                value=50,
-                reason="one_claude_remaining",
-                respect_cooldown=False,
-            )
-        await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
-    elif remaining_active == 0 and was_active >= 1:
-        now = time.monotonic()
-        elapsed = now - _last_instance_zero_notify_at
-        if elapsed < INSTANCE_ZERO_NOTIFY_DEBOUNCE_SECS:
-            print(
-                "INSTANCE COUNT: All Claude instances stopped, "
-                f"suppressed duplicate ({elapsed:.1f}s since last)"
-            )
-            await log_event(
-                "instance_count_zero_suppressed",
-                details={"was": was_active, "elapsed_seconds": round(elapsed, 1)},
-            )
-            return
-
-        _last_instance_zero_notify_at = now
-        print("INSTANCE COUNT: All Claude instances stopped, zap")
-        result = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 80,
-                "beep": 50,
-                "tts_text": "All Claude instances stopped",
-                "banner_text": "All Claudes stopped",
-            },
-        )
-        if not result["success"]:
-            send_pavlok_stimulus(
-                stimulus_type="zap",
-                value=50,
-                reason="all_claudes_stopped",
-                respect_cooldown=False,
-            )
-        await log_event("instance_count_zero", details={"was": was_active})
