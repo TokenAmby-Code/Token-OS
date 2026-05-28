@@ -11,7 +11,13 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .api import fetch_instance_registry, log_event, patch_instance, stop_instance, update_instance_activity
+from .api import (
+    fetch_instance_registry,
+    log_event,
+    patch_instance,
+    stop_instance,
+    update_instance_activity,
+)
 from .custodes import _pane_pid, pane_has_active_claude
 from .enums import InstanceStatus
 from .resolver import resolve_pane
@@ -86,7 +92,9 @@ def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
     return pane_has_active_claude(_pane_pid(adapter, pane_id))
 
 
-def _dispatch_args(pane_id: str, upsert: dict[str, Any], prompt_file: Path | None = None) -> list[str]:
+def _dispatch_args(
+    pane_id: str, upsert: dict[str, Any], prompt_file: Path | None = None
+) -> list[str]:
     engine = str(upsert.get("engine") or "claude")
     args = [DISPATCH_BIN, "--engine", engine, "--pane", pane_id]
     if persona := upsert.get("persona"):
@@ -201,8 +209,13 @@ def _read_persona_guard(adapter: TmuxAdapter, pane_id: str) -> dict[str, Any]:
 
 def _write_persona_guard(adapter: TmuxAdapter, pane_id: str, payload: dict[str, Any]) -> None:
     adapter.run(
-        "set-option", "-p", "-t", pane_id, PERSONA_GUARD_OPTION,
-        json.dumps(payload, sort_keys=True), allow_failure=True,
+        "set-option",
+        "-p",
+        "-t",
+        pane_id,
+        PERSONA_GUARD_OPTION,
+        json.dumps(payload, sort_keys=True),
+        allow_failure=True,
     )
 
 
@@ -247,11 +260,17 @@ def _guarded_send_persona_command(
                         "instance_id": getattr(row, "instance_id", "") if row is not None else "",
                         "legion": getattr(row, "legion", "") if row is not None else "",
                         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
-                        "instance_type": getattr(row, "instance_type", "") if row is not None else "",
+                        "instance_type": getattr(row, "instance_type", "")
+                        if row is not None
+                        else "",
                     },
                 },
             )
-            return False, f"persona_assert_suppressed_stuck attempts={attempts}", "persona_correction_suppressed"
+            return (
+                False,
+                f"persona_assert_suppressed_stuck attempts={attempts}",
+                "persona_correction_suppressed",
+            )
         # Backoff elapsed — the pane may have recovered in a way we cannot observe
         # (e.g. live runtime healthy but registry write lagging). Allow one more
         # attempt, preserving the escalating attempt count.
@@ -278,13 +297,23 @@ def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
             log_event(
                 "assert_instance_repaired",
                 instance_id=row.instance_id,
-                details={"pane": pane_id, "pane_label": pane_label, "repair": "stopped", "reason": reason},
+                details={
+                    "pane": pane_id,
+                    "pane_label": pane_label,
+                    "repair": "stopped",
+                    "reason": reason,
+                },
             )
         except Exception as exc:
             log_event(
                 "assert_instance_mismatch",
                 instance_id=row.instance_id,
-                details={"pane": pane_id, "pane_label": pane_label, "reason": reason, "stop_error": str(exc)},
+                details={
+                    "pane": pane_id,
+                    "pane_label": pane_label,
+                    "reason": reason,
+                    "stop_error": str(exc),
+                },
             )
 
 
@@ -304,7 +333,9 @@ def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
     if current == pane_id:
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
-    adapter.run("set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True)
+    adapter.run(
+        "set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True
+    )
     for option in (
         "@CC_STATE",
         "@TTS_STATE",
@@ -390,7 +421,9 @@ def _assert_instance_impl(
         spec = persona_spec(pane_label)
         if not runtime_ok:
             if rows:
-                _stop_rows(rows, pane_id=pane_id, pane_label=pane_label, reason="persona_runtime_dead")
+                _stop_rows(
+                    rows, pane_id=pane_id, pane_label=pane_label, reason="persona_runtime_dead"
+                )
             launch_upsert = {
                 "engine": spec.engine,
                 "persona": spec.persona,
@@ -400,7 +433,9 @@ def _assert_instance_impl(
                 "no_gt": not spec.sync,
             }
             ok, reason = _launch(pane_id, launch_upsert, str((upsert or {}).get("prompt") or ""))
-            result.update({"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason})
+            result.update(
+                {"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason}
+            )
             return finish(result, clear_failed=False)
         if row is not None and not _row_matches_persona(row, spec):
             sent, reason, action = _guarded_send_persona_command(adapter, pane_id, spec, row)
@@ -420,7 +455,15 @@ def _assert_instance_impl(
             return finish(result, clear_failed=False)
         if row is None:
             stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
-            stopped_match = next((candidate for candidate in stopped_rows if candidate.status is InstanceStatus.STOPPED and _row_matches_persona(candidate, spec)), None)
+            stopped_match = next(
+                (
+                    candidate
+                    for candidate in stopped_rows
+                    if candidate.status is InstanceStatus.STOPPED
+                    and _row_matches_persona(candidate, spec)
+                ),
+                None,
+            )
             if stopped_match is not None:
                 try:
                     update_instance_activity(stopped_match.instance_id, "prompt_submit")
@@ -432,12 +475,14 @@ def _assert_instance_impl(
                         patch_instance(stopped_match.instance_id, "legion", {"legion": "custodes"})
                     _assert_persona_color(adapter, pane_id, spec)
                     _clear_persona_guard(adapter, pane_id)
-                    result.update({
-                        "ok": True,
-                        "instance_id": stopped_match.instance_id,
-                        "action": "registry_reactivated",
-                        "reason": "live_runtime_stopped_registry_row_reactivated",
-                    })
+                    result.update(
+                        {
+                            "ok": True,
+                            "instance_id": stopped_match.instance_id,
+                            "action": "registry_reactivated",
+                            "reason": "live_runtime_stopped_registry_row_reactivated",
+                        }
+                    )
                     return finish(result, clear_failed=False)
                 except Exception as exc:
                     log_event(
@@ -472,7 +517,9 @@ def _assert_instance_impl(
     if pane_type == "stack-worker":
         if not runtime_ok:
             if rows:
-                _stop_rows(rows, pane_id=pane_id, pane_label=pane_label, reason="stack_worker_runtime_dead")
+                _stop_rows(
+                    rows, pane_id=pane_id, pane_label=pane_label, reason="stack_worker_runtime_dead"
+                )
             adapter.run("set-option", "-pu", "-t", pane_id, "@PANE_ID", allow_failure=True)
             adapter.run("set-option", "-pu", "-t", pane_id, "@PANE_TYPE", allow_failure=True)
             adapter.run("kill-pane", "-t", pane_id, allow_failure=True)
@@ -485,11 +532,20 @@ def _assert_instance_impl(
     if not runtime_ok and rows:
         _stop_rows(rows, pane_id=pane_id, pane_label=pane_label, reason="structured_runtime_dead")
     ok = runtime_ok and row is not None
-    result.update({"ok": ok, "reason": "live" if ok else ("no_runtime_instance" if not runtime_ok else "no_registry_instance")})
+    result.update(
+        {
+            "ok": ok,
+            "reason": "live"
+            if ok
+            else ("no_runtime_instance" if not runtime_ok else "no_registry_instance"),
+        }
+    )
     return finish(result)
 
 
-def assert_persona(adapter: TmuxAdapter, pane_label: str, *, prompt: str = "", session: str = "main") -> dict[str, Any]:
+def assert_persona(
+    adapter: TmuxAdapter, pane_label: str, *, prompt: str = "", session: str = "main"
+) -> dict[str, Any]:
     # Compatibility helper for in-process callers; public CLI surface is assert-instance.
     persona_spec(pane_label)
     try:
@@ -503,7 +559,14 @@ def assert_persona(adapter: TmuxAdapter, pane_label: str, *, prompt: str = "", s
     result = assert_instance(adapter, pane_id)
     if result.get("ok") and prompt:
         ok, reason = _upsert_prompt(pane_id, prompt)
-        result.update({"ok": ok, "dispatched": ok, "action": "prompt_sent" if ok else "prompt_failed", "reason": reason})
+        result.update(
+            {
+                "ok": ok,
+                "dispatched": ok,
+                "action": "prompt_sent" if ok else "prompt_failed",
+                "reason": reason,
+            }
+        )
     else:
         result["dispatched"] = False
     return result

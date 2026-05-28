@@ -6,8 +6,12 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.stack import STACK_COLLAPSED_HEIGHT, enforce_stack_layout, focus_selected
-from tmuxctl.stack import dispatch_stack_command
+from tmuxctl.stack import (
+    STACK_COLLAPSED_HEIGHT,
+    dispatch_stack_command,
+    enforce_stack_layout,
+    focus_selected,
+)
 
 
 class FakeLegionAdapter:

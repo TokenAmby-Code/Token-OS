@@ -157,9 +157,11 @@ _auto_name_instance: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
 _golden_throne_activity_callback: Callable[..., Any] | None = None
-# AskUserQuestion ladder L1 only — L2/L3 warn-stage callbacks were removed
-# when the cascade was collapsed. Golden Throne now owns missed-ack escalation.
+# AskUserQuestion ladder callbacks. Optional injection points (default None);
+# the ladder skips any stage whose callback is unset. Tests wire fakes directly.
 _askq_level1_callback: Callable[..., Any] | None = None
+_askq_touch2_callback: Callable[..., Any] | None = None
+_askq_level3_callback: Callable[..., Any] | None = None
 
 
 def init_deps(

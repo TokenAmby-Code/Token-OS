@@ -843,9 +843,7 @@ def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
     file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
 
 
-async def resolve_or_create_today_daily_note_session_doc(
-    db, date_str: str | None = None
-) -> int:
+async def resolve_or_create_today_daily_note_session_doc(db, date_str: str | None = None) -> int:
     """Return today's Custodes daily note, creating note and DB row if absent."""
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
     fp = (DAILY_NOTES_DIR / f"{date_str}.md").resolve()

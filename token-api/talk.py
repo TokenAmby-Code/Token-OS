@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import time
 import uuid
@@ -167,9 +166,7 @@ async def register_talk(
     event = asyncio.Event()
     now = _now_iso()
     resolved_engine = (
-        engine
-        or (target_instance.get("engine") if target_instance else None)
-        or "claude"
+        engine or (target_instance.get("engine") if target_instance else None) or "claude"
     )
     record = {
         "talk_id": talk_id,
@@ -235,7 +232,7 @@ async def await_talk(talk_id: str, *, timeout: float) -> dict[str, Any] | None:
     event: asyncio.Event = record["event"]
     try:
         await asyncio.wait_for(event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _public_view(record)
     return _public_view(record)
 
@@ -469,9 +466,7 @@ def _extract_codex_assistant_text_after(path: Path, since_ts: float) -> str:
                 flush()
             continue
         payload = event.get("payload") or {}
-        is_assistant_msg = (
-            payload.get("type") == "message" and payload.get("role") == "assistant"
-        )
+        is_assistant_msg = payload.get("type") == "message" and payload.get("role") == "assistant"
         if not is_assistant_msg:
             if in_assistant_run:
                 flush()
@@ -507,8 +502,7 @@ def _capture_pane_fallback(pane_id: str) -> str:
     try:
         proc = subprocess.run(
             ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-200"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=5,
             check=False,
         )
@@ -553,15 +547,13 @@ async def slash_copy_target(
         if path is None:
             session_id = record.get("target_instance_id")
             working_dir = record.get("target_working_dir")
-            path = await asyncio.to_thread(
-                _claude_jsonl_path, session_id or "", working_dir
-            )
+            path = await asyncio.to_thread(_claude_jsonl_path, session_id or "", working_dir)
 
     text = ""
     if path:
         # The Stop hook can fire before the assistant turn is flushed to the
         # JSONL transcript (same race on claude and codex). Retry briefly.
-        for attempt in range(8):
+        for _attempt in range(8):
             text = await asyncio.to_thread(extractor, path, since_ts)
             if text:
                 break
