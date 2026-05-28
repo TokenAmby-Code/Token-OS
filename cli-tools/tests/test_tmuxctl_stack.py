@@ -8,11 +8,11 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.stack import (
     STACK_COLLAPSED_HEIGHT,
+    dispatch_stack_command,
     enforce_stack_layout,
     focus_selected,
     sweep_stack_assertions,
 )
-from tmuxctl.stack import dispatch_stack_command
 
 
 class FakeLegionAdapter:
@@ -296,8 +296,7 @@ def test_mechanicus_stack_dispatch_no_focus_does_not_select_worker():
     assert pane == "%N"
     assert not any(command[0] == "select-window" for command in adapter.commands)
     assert not any(
-        command[0] == "select-pane" and "-T" not in command
-        for command in adapter.commands
+        command[0] == "select-pane" and "-T" not in command for command in adapter.commands
     )
 
 
@@ -321,7 +320,20 @@ def test_stale_stored_stack_focus_falls_back_to_live_worker():
         settle_seconds=0,
     )
 
-    assert ("split-window", "-v", "-t", "%1", "-d", "-P", "-F", "#{pane_id}", "-l", "3", "-c", "/tmp") in adapter.commands
+    assert (
+        "split-window",
+        "-v",
+        "-t",
+        "%1",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-l",
+        "3",
+        "-c",
+        "/tmp",
+    ) in adapter.commands
 
 
 def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():

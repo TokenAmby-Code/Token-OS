@@ -94,7 +94,10 @@ def test_focus_guard_allow_env_opens_override_and_executes(monkeypatch):
 
     adapter.run("select-pane", "-t", "%42")
 
-    assert any(cmd[:4] == ["tmux", "set-option", "-g", "@IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL"] for cmd in calls)
+    assert any(
+        cmd[:4] == ["tmux", "set-option", "-g", "@IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL"]
+        for cmd in calls
+    )
     assert ["tmux", "select-pane", "-t", "%42"] in calls
 
 

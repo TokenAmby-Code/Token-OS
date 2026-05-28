@@ -17,7 +17,6 @@ from tmuxctl.assertions import (
     _row_matches_persona,
 )
 
-
 FG_LABEL = "mechanicus:fabricator-general"
 
 
@@ -128,7 +127,9 @@ def test_guard_allows_resend_after_row_changes():
         patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
         patch.object(assertions, "log_event"),
     ):
-        _guarded_send_persona_command(adapter, "%27", spec, _row(tab_name="state-a", legion="astartes"))
+        _guarded_send_persona_command(
+            adapter, "%27", spec, _row(tab_name="state-a", legion="astartes")
+        )
         # Observed state mutated → a fresh attempt is warranted.
         sent2, _, action2 = _guarded_send_persona_command(
             adapter, "%27", spec, _row(tab_name="state-b", legion="astartes")

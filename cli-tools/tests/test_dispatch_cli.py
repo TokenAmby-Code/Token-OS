@@ -417,10 +417,18 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+    tmux_log = tmp_path / "tmux.log"
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$TMUX_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
     env = os.environ.copy()
     env["IMPERIUM"] = str(tmp_path)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
+    env["TMUX_LOG"] = str(tmux_log)
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -472,9 +480,18 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--prompt-file" in result.stdout
     launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
     assert "stack dispatch legion --session main" in launched
-    assert "--command . " in launched
+    # tmuxctl now spawns the pane with a throwaway `clear` warmup that absorbs
+    # any leading-char loss from the upstream type-check guard; the real
+    # `bash <staged>` is sent via a follow-up tmux send-keys after a settle.
+    assert "--command clear" in launched
     assert "%aspirant-pane" not in launched
-    staged_path = Path(launched.rsplit("--command . ", 1)[1].strip())
+    tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
+    assert "send-keys -t %aspirant-pane bash " in tmux_text
+    assert "Enter" in tmux_text
+    send_line = next(
+        line for line in tmux_text.splitlines() if "send-keys -t %aspirant-pane bash " in line
+    )
+    staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "--append-system-prompt" in staged
     assert "Aspirant Session Startup" in staged
@@ -537,7 +554,7 @@ def test_tmux_prefix_space_launcher_uses_large_popup_without_enter_newline_hang(
 
     launcher = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt").read_text(encoding="utf-8")
     assert "TOKEN_API_DISPATCH_ORIGIN=d" in launcher
-    assert '${SCRIPT_DIR}/dispatch' in launcher
+    assert "${SCRIPT_DIR}/dispatch" in launcher
     assert 'LAUNCH_CMD="cd ~ && d ' not in launcher
     assert "c --prompt-file" not in launcher
 
@@ -559,10 +576,10 @@ def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
     fake_bin.mkdir()
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
-        '#!/usr/bin/env bash\n'
+        "#!/usr/bin/env bash\n"
         'if [[ "$*" == "resolve-pane --format id 2:NE" ]]; then echo somnium:NE; exit 0; fi\n'
         'if [[ "$*" == "resolve-pane --format physical 2:NE" ]]; then echo %22; exit 0; fi\n'
-        'exit 1\n',
+        "exit 1\n",
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)

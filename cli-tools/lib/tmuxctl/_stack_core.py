@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
 
 from .labels import canonical_pane_role
@@ -192,9 +192,7 @@ def _orchestrator_and_workers(
     return orchestrator, workers
 
 
-def _secondary_persona_panes(
-    panes: list[StackPane], spec: StackPageSpec
-) -> dict[str, StackPane]:
+def _secondary_persona_panes(panes: list[StackPane], spec: StackPageSpec) -> dict[str, StackPane]:
     return {pane.role: pane for pane in panes if _is_secondary_persona_role(pane.role, spec)}
 
 
@@ -263,9 +261,7 @@ def _worker_ordinal(role: str, spec: StackPageSpec) -> int | None:
 
 def _lowest_available_worker_ordinal(workers: list[StackPane], spec: StackPageSpec) -> int:
     used = {
-        value
-        for worker in workers
-        if (value := _worker_ordinal(worker.role, spec)) is not None
+        value for worker in workers if (value := _worker_ordinal(worker.role, spec)) is not None
     }
     ordinal = 1
     while ordinal in used:
@@ -344,10 +340,14 @@ def _dock_secondary_personas_under_orchestrator(
         )
     win_h = int(_show(adapter, target, "#{window_height}") or "0")
     persona_h = max(1, (win_h - len(personas)) // (len(personas) + 1)) if win_h else 1
-    adapter.run("resize-pane", "-t", orchestrator.pane_id, "-x", str(orchestrator_w), allow_failure=True)
+    adapter.run(
+        "resize-pane", "-t", orchestrator.pane_id, "-x", str(orchestrator_w), allow_failure=True
+    )
     adapter.run("resize-pane", "-t", orchestrator.pane_id, "-y", str(persona_h), allow_failure=True)
     for pane in personas:
-        adapter.run("resize-pane", "-t", pane.pane_id, "-x", str(orchestrator_w), allow_failure=True)
+        adapter.run(
+            "resize-pane", "-t", pane.pane_id, "-x", str(orchestrator_w), allow_failure=True
+        )
     if selected_before and not (spec.base == "mechanicus" and not _mechanicus_focus_allowed()):
         adapter.run("select-pane", "-t", selected_before, allow_failure=True)
 
@@ -523,9 +523,7 @@ def _enforce_stack_layout_impl(
             logger.warning("stack persona assertion failed target=%s: %s", target, exc)
 
     assigned_ordinals = {
-        value
-        for worker in workers
-        if (value := _worker_ordinal(worker.role, spec)) is not None
+        value for worker in workers if (value := _worker_ordinal(worker.role, spec)) is not None
     }
 
     def claim_ordinal() -> int:
@@ -656,9 +654,7 @@ def _enforce_stack_layout_impl(
     try:
         _tag_orchestrator(adapter, orchestrator.pane_id, spec)
         assigned_ordinals = {
-            value
-            for worker in workers
-            if (value := _worker_ordinal(worker.role, spec)) is not None
+            value for worker in workers if (value := _worker_ordinal(worker.role, spec)) is not None
         }
         for worker in workers:
             ordinal = _worker_ordinal(worker.role, spec)

@@ -10,14 +10,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import tmuxctl.skill_invoke as skill_invoke
+from tmuxctl.enums import InstanceStatus
+from tmuxctl.models import InstanceRegistryEntry, InstanceRegistrySnapshot
 from tmuxctl.skill_invoke import (
     invoke_skill_in_pane,
     normalize_skill_name,
     skill_invocation_text,
 )
 from tmuxctl.tmux_adapter import TmuxAdapter
-from tmuxctl.models import InstanceRegistryEntry, InstanceRegistrySnapshot
-from tmuxctl.enums import InstanceStatus
 
 
 class RecordingAdapter(TmuxAdapter):
@@ -122,6 +122,8 @@ def test_resolve_agent_for_pane_prefers_live_process_over_stopped_stale_row(monk
 def test_resolve_agent_for_pane_falls_back_to_pane_hint(monkeypatch):
     adapter = RecordingAdapter()
     adapter.options[("%42", "@PLANNING_AGENT")] = "codex"
-    monkeypatch.setattr(skill_invoke, "fetch_instance_registry", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(
+        skill_invoke, "fetch_instance_registry", lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    )
 
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "codex"

@@ -48,6 +48,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       pendingAudio: [],
       pendingCommitMeta: null,
       lastCommitMeta: null,
+      lockedTmuxPane: null,
       committed: false,
       cleanupTimer: null,
     };
@@ -94,7 +95,14 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
       if (event.type === 'error') {
         const message = event.error?.message || JSON.stringify(event.error || event);
-        logger.error(`Realtime [${botName}]: ${message}`);
+        const errorCode = event.error?.code || event.error?.type || 'realtime_error';
+        logger.error(`Realtime [${botName}]: ${message}`, {
+          errorCode,
+          provider: 'openai-realtime',
+          botName,
+          userId,
+          eventType: event.type,
+        });
         return;
       }
 
@@ -111,6 +119,12 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       }
 
       if (event.type === 'input_audio_buffer.committed') {
+        // Server VAD can commit before our local silence timer fires. Mark the
+        // session committed so subsequent PCM frames immediately start a fresh
+        // Realtime session instead of being appended to an already-committed
+        // input buffer. The Discord receiver itself stays subscribed, so new
+        // speech is still captured while the prior transcript completes.
+        session.committed = true;
         logger.info(
           `Realtime [${botName}]: input committed item=${event.item_id || '?'} ` +
           `previous=${event.previous_item_id || 'none'}`
@@ -158,7 +172,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           startedAt: session.startedAt,
           firstDeltaAt: session.lastDeltaAt,
           commitMeta: session.lastCommitMeta || null,
-          lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || null,
+          lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || session.lockedTmuxPane || null,
         });
         scheduleCleanup(session, 1000, 'completed');
       }
@@ -237,10 +251,11 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     return output;
   }
 
-  function appendPCM(userId, pcmChunk, botName) {
+  function appendPCM(userId, pcmChunk, botName, meta = {}) {
     if (!pcmChunk || pcmChunk.length === 0) return;
     const session = getSession(botName, userId);
     if (!session || session.closed) return;
+    if (meta?.lockedTmuxPane) session.lockedTmuxPane = meta.lockedTmuxPane;
     const audio = downsample48kTo24k(session, pcmChunk);
     if (!audio || audio.length === 0) return;
     if (!session.ready) {

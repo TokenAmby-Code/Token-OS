@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .api import build_client_attachments, fetch_instance_registry, fetch_session_doc_for_pane_label
-from .labels import canonical_pane_role
 from .audience import audience_return, audience_toggle
 from .builder import (
     PALACE_WINDOW,
@@ -21,6 +20,7 @@ from .inspect import (
     render_window,
     render_workspace,
 )
+from .labels import canonical_pane_role
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan

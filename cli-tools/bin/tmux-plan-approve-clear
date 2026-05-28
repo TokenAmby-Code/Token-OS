@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# tmux-plan-approve-clear — approve only clear-context plan approval modals
+# TAGS: tmux, plan, approval
+# AUDIENCE: system
+#
+# One-shot, time-limited screen watcher. It only sends keys when captured pane
+# text contains a clear-context approval modal. Claude gets Enter (option 1).
+# Codex gets Down, Enter (option 2). If no matching modal appears, it exits.
+
+set -euo pipefail
+
+PANE=""
+AGENT="auto"
+TIMEOUT=10
+INTERVAL="0.25"
+CAPTURE_FILE=""
+DRY_RUN=false
+UPDATE_STATE=true
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${_script_dir}/../lib/nas-path.sh" >/dev/null 2>&1 || true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="$2"; shift 2 ;;
+        --agent) AGENT="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --interval) INTERVAL="$2"; shift 2 ;;
+        --capture-file) CAPTURE_FILE="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --no-state) UPDATE_STATE=false; shift ;;
+        -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$PANE" && -z "$CAPTURE_FILE" ]]; then
+    PANE="${TMUX_PANE:-}"
+fi
+if [[ -z "$PANE" && -z "$CAPTURE_FILE" ]]; then
+    echo "tmux-plan-approve-clear: --pane or --capture-file required" >&2
+    exit 2
+fi
+
+json_escape() {
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+set_planning_state() {
+    local state="$1"
+    if ! $UPDATE_STATE || $DRY_RUN || [[ -n "$CAPTURE_FILE" || -z "$PANE" || -z "${TOKEN_API_URL:-}" ]]; then
+        return 0
+    fi
+    local body
+    body="{\"tmux_pane\":$(json_escape "$PANE"),\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-approve-clear\"}"
+    curl -sf --max-time 1 -X POST "${TOKEN_API_URL}/api/planning/state" \
+        -H 'Content-Type: application/json' \
+        -d "$body" >/dev/null || true
+}
+
+capture() {
+    if [[ -n "$CAPTURE_FILE" ]]; then
+        cat "$CAPTURE_FILE" 2>/dev/null || true
+    else
+        tmux capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
+    fi
+}
+
+classify() {
+    python3 -c 'import re,sys
+agent=sys.argv[1]
+text=sys.stdin.read()
+low=text.lower()
+clear = "clear context" in low or "clear the context" in low or "clear current context" in low
+approval = any(s in low for s in ["auto-accept edits", "approve edits", "manually approve", "manual approval", "start fresh", "fresh context"])
+if not (clear and approval):
+    print("none")
+    raise SystemExit
+if agent == "auto":
+    if "codex" in low:
+        agent = "codex"
+    else:
+        agent = "claude"
+print(agent)' "$AGENT"
+}
+
+send_action() {
+    local detected="$1"
+    if $DRY_RUN || [[ -n "$CAPTURE_FILE" ]]; then
+        if [[ "$detected" == "codex" ]]; then
+            echo "action=codex option-2 Down Enter"
+        else
+            echo "action=claude option-1 Enter"
+        fi
+        return 0
+    fi
+    if [[ "$detected" == "codex" ]]; then
+        tmux send-keys -t "$PANE" Down Enter
+    else
+        tmux send-keys -t "$PANE" Enter
+    fi
+}
+
+set_planning_state approving
+
+start=$(date +%s)
+while true; do
+    content="$(capture)"
+    detected="$(classify "$AGENT" <<<"$content")"
+    if [[ "$detected" != "none" ]]; then
+        send_action "$detected"
+        set_planning_state none
+        exit 0
+    fi
+    now=$(date +%s)
+    if (( now - start >= TIMEOUT )); then
+        set_planning_state planning
+        $DRY_RUN && echo "action=none timeout"
+        exit 0
+    fi
+    sleep "$INTERVAL"
+done

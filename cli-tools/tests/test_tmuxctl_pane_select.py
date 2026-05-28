@@ -65,7 +65,9 @@ class FakePaneSelectAdapter:
                 target = self.current
             pane = self._pane(target)
             if fmt == "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}":
-                return f"{pane['pane_id']}\t{self.session}\t{self.window_index}\t{self.window_name}\n"
+                return (
+                    f"{pane['pane_id']}\t{self.session}\t{self.window_index}\t{self.window_name}\n"
+                )
             if fmt == "#{pane_id}":
                 return f"{pane['pane_id']}\n"
             if fmt == "#{session_name}":

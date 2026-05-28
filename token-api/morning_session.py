@@ -464,6 +464,14 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
             text=True,
             timeout=45,
         )
+        if result.returncode != 0:
+            # A failed assert may still print stale/partial JSON to stdout; don't
+            # let it be parsed into a false "ok". Gate on the exit code first.
+            return {
+                "ok": False,
+                "reason": f"assert_failed rc={result.returncode}",
+                "stderr": result.stderr.strip()[:200],
+            }
         try:
             return json.loads(result.stdout.strip() or "{}")
         except json.JSONDecodeError:

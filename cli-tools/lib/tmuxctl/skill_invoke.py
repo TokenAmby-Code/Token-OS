@@ -38,7 +38,9 @@ def skill_invocation_text(skill: str, agent: str | None) -> str:
 
 def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
     try:
-        tty = adapter.run("display-message", "-t", pane, "-p", "#{pane_tty}", allow_failure=True).strip()
+        tty = adapter.run(
+            "display-message", "-t", pane, "-p", "#{pane_tty}", allow_failure=True
+        ).strip()
     except Exception:
         return "auto"
     if not tty:
@@ -74,7 +76,9 @@ def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "au
         resolved_pane = pane
     else:
         resolved_pane = (
-            adapter.run("display-message", "-t", pane, "-p", "#{pane_id}", allow_failure=True).strip()
+            adapter.run(
+                "display-message", "-t", pane, "-p", "#{pane_id}", allow_failure=True
+            ).strip()
             or pane
         )
 
@@ -105,7 +109,9 @@ def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "au
     return "claude"
 
 
-def insert_at_prompt_start(adapter: TmuxAdapter, pane: str, text: str, *, settle_seconds: float = 0.05) -> None:
+def insert_at_prompt_start(
+    adapter: TmuxAdapter, pane: str, text: str, *, settle_seconds: float = 0.05
+) -> None:
     for _ in range(50):
         adapter.send_keys(pane, "PgUp")
     adapter.send_keys(pane, "Home")
