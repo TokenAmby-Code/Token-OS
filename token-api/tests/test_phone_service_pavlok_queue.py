@@ -123,7 +123,9 @@ def test_concurrent_style_zap_and_beep_serialize_through_one_lane(phone_service_
         return {"success": True, "status_code": 200}
 
     monkeypatch.setattr(phone_service, "_send_to_phone_raw", fake_phone)
-    monkeypatch.setattr(phone_service.time, "sleep", lambda delay: call_order.append(("sleep", delay)))
+    monkeypatch.setattr(
+        phone_service.time, "sleep", lambda delay: call_order.append(("sleep", delay))
+    )
 
     zap = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
     beep = phone_service.send_pavlok_stimulus("beep", 30, "pytest", respect_cooldown=False)
@@ -171,16 +173,17 @@ def test_send_to_phone_strips_enforce_zap_and_keeps_notification_params(
     monkeypatch.setattr(
         phone_service,
         "send_pavlok_stimulus",
-        lambda stimulus_type, value, reason, respect_cooldown=True: pavlok_calls.append(
-            (stimulus_type, value, reason, respect_cooldown)
-        )
-        or {"success": True},
+        lambda stimulus_type, value, reason, respect_cooldown=True: (
+            pavlok_calls.append((stimulus_type, value, reason, respect_cooldown))
+            or {"success": True}
+        ),
     )
     monkeypatch.setattr(
         phone_service,
         "_send_to_phone_raw",
-        lambda endpoint, params: raw_calls.append((endpoint, params))
-        or {"success": True, "status_code": 200},
+        lambda endpoint, params: (
+            raw_calls.append((endpoint, params)) or {"success": True, "status_code": 200}
+        ),
     )
 
     result = phone_service._send_to_phone(
@@ -190,7 +193,9 @@ def test_send_to_phone_strips_enforce_zap_and_keeps_notification_params(
 
     assert result["success"] is True
     assert pavlok_calls == [("zap", 50, "phone_params_enforce", True)]
-    assert raw_calls == [("/enforce", {"tts_text": "close it", "banner_text": "enforcement active"})]
+    assert raw_calls == [
+        ("/enforce", {"tts_text": "close it", "banner_text": "enforcement active"})
+    ]
 
 
 def test_guardrails_block_before_queue_dispatch(phone_service_env, monkeypatch):

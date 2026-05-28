@@ -153,22 +153,33 @@ def _send_to_phone(endpoint: str, params: dict | None) -> dict:
     if notification_params:
         phone_result = _send_to_phone_raw(endpoint, notification_params)
 
+    pavlok_success = (
+        all(bool(result.get("success")) for result in pavlok_results) if pavlok_results else True
+    )
+
     if phone_result is None:
-        success = all(bool(result.get("success")) for result in pavlok_results) if pavlok_results else True
+        # Pavlok-only (no phone banner/TTS). There is no phone transport, so the
+        # Pavlok lane *is* the transport result here.
         return {
-            "success": success,
+            "success": pavlok_success,
+            "pavlok_success": pavlok_success,
+            "overall_success": pavlok_success,
             "status_code": None,
             "phone_skipped": True,
             "reason": "pavlok_only" if pavlok_results else "empty_params",
             "pavlok": pavlok_results,
         }
 
+    # `success` stays the phone *transport* result so callers that gate a
+    # fallback stimulus on it don't fire a redundant zap when only the Pavlok
+    # lane failed (the in-band stimulus was already attempted). `overall_success`
+    # carries the combined verdict for callers that want it.
     if pavlok_results:
         phone_result = {
             **phone_result,
             "pavlok": pavlok_results,
-            "success": bool(phone_result.get("success"))
-            and all(bool(result.get("success")) for result in pavlok_results),
+            "pavlok_success": pavlok_success,
+            "overall_success": bool(phone_result.get("success")) and pavlok_success,
         }
     return phone_result
 
