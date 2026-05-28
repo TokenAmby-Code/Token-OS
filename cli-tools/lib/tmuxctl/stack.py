@@ -186,22 +186,23 @@ def dispatch_stack_command(
     adapter.run("send-keys", "-t", pane, command, "Enter")
     return pane
 
+
 # Generic persona-pane stack page implementation. Imported at module end so the
 # implementation can reuse stack_base_of()/spill helpers above without a cycle.
 from ._stack_core import (  # noqa: E402,F401
     CUSTODES_ROLE,
     FABRICATOR_ROLE,
     LEGACY_WORKER_ROLES,
+    REGIMENT_ROLE,
     STACK_COLLAPSED_HEIGHT,
     STACK_ORCHESTRATOR_RATIO,
-    REGIMENT_ROLE,
     STACK_PAGE_SPECS,
-    StackPane,
     PersonaPaneSpec,
     StackPageSpec,
+    StackPane,
     add_orchestrator_stack_pane,
     add_stack_worker_pane,
-    enforce_stack_page_layout,
     enforce_stack_layout,
+    enforce_stack_page_layout,
     focus_selected,
 )

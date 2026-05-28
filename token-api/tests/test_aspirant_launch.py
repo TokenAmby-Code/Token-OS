@@ -29,7 +29,12 @@ class _FakeHTTPClient:
 
 
 class _FakeProc:
-    def __init__(self, returncode=0, stdout=b"dispatched claude to legion:new", stderr=b""):
+    def __init__(
+        self,
+        returncode: int = 0,
+        stdout: bytes = b"dispatched claude to legion:new",
+        stderr: bytes = b"",
+    ) -> None:
         self.returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
@@ -129,7 +134,7 @@ def test_inbox_create_launches_managed_legion_session(aspirant_env, monkeypatch)
     ).fetchone()
     conn.close()
     assert row[0] == "Aspirant: Test Aspirant"
-    assert Path(row[1]).name == "Aspirant - Test Aspirant.md"
+    assert Path(row[1]).name == "aspirant-test-aspirant.md"
     assert row[2] == "aspirants"
     assert row[3] == "active"
 

@@ -1,0 +1,11 @@
+interface:
+  display_name: "Preplan"
+  short_description: "Prepare a session-doc-backed planning handoff without implementation."
+  default_prompt: "$preplan prepare the planning handoff"
+
+policy:
+  # Must stay true: skills-sync flags preplan_not_model_visible otherwise, because
+  # Codex Shift+Tab inserts literal $preplan text and the skill must be model-visible
+  # to accept it. The explicit-only contract is enforced by SKILL.md/description,
+  # not by hiding the skill. See cli-tools/bin/skills-sync (_openai_allow_implicit).
+  allow_implicit_invocation: true

@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -56,7 +56,7 @@ def _log(event: str, **fields: object) -> None:
         _write_log(GENERAL_LOG_PATH, payload)
 
 
-def capture_focus(adapter: "TmuxAdapter") -> FocusSnapshot:
+def capture_focus(adapter: TmuxAdapter) -> FocusSnapshot:
     raw = adapter.run(
         "display-message",
         "-p",
@@ -74,7 +74,7 @@ def capture_focus(adapter: "TmuxAdapter") -> FocusSnapshot:
     return FocusSnapshot(window=window, pane=pane)
 
 
-def _focus_exists(adapter: "TmuxAdapter", snapshot: FocusSnapshot) -> bool:
+def _focus_exists(adapter: TmuxAdapter, snapshot: FocusSnapshot) -> bool:
     if not snapshot.pane:
         return False
     return bool(
@@ -90,7 +90,7 @@ def _focus_exists(adapter: "TmuxAdapter", snapshot: FocusSnapshot) -> bool:
 
 
 def restore_focus(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     snapshot: FocusSnapshot,
     *,
     source: str,
@@ -151,7 +151,7 @@ def restore_focus(
 
 @contextmanager
 def preserve_focus(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     source: str,
     attempted_target: str = "",
@@ -171,19 +171,19 @@ def preserve_focus(
             )
 
 
-def show_global_option(adapter: "TmuxAdapter", option: str) -> str:
+def show_global_option(adapter: TmuxAdapter, option: str) -> str:
     return adapter.run("show-options", "-gqv", option, allow_failure=True).strip()
 
 
-def set_global_option(adapter: "TmuxAdapter", option: str, value: str) -> None:
+def set_global_option(adapter: TmuxAdapter, option: str, value: str) -> None:
     adapter.run("set-option", "-g", option, value, allow_failure=True)
 
 
-def unset_global_option(adapter: "TmuxAdapter", option: str) -> None:
+def unset_global_option(adapter: TmuxAdapter, option: str) -> None:
     adapter.run("set-option", "-gu", option, allow_failure=True)
 
 
-def target_window_name(adapter: "TmuxAdapter", target: str) -> str:
+def target_window_name(adapter: TmuxAdapter, target: str) -> str:
     if not target:
         return ""
     # Fast path for stable logical/window targets.
@@ -195,7 +195,7 @@ def target_window_name(adapter: "TmuxAdapter", target: str) -> str:
     )
 
 
-def target_is_mechanicus(adapter: "TmuxAdapter", target: str) -> bool:
+def target_is_mechanicus(adapter: TmuxAdapter, target: str) -> bool:
     if not target:
         return False
     if target.startswith("mechanicus:"):
@@ -203,16 +203,16 @@ def target_is_mechanicus(adapter: "TmuxAdapter", target: str) -> bool:
     return target_window_name(adapter, target).startswith("mechanicus")
 
 
-def current_pane(adapter: "TmuxAdapter") -> str:
+def current_pane(adapter: TmuxAdapter) -> str:
     return adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
 
 
-def current_client(adapter: "TmuxAdapter") -> str:
+def current_client(adapter: TmuxAdapter) -> str:
     return adapter.run("display-message", "-p", "#{client_tty}", allow_failure=True).strip()
 
 
 def allow_temporarily(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     seconds: float = DEFAULT_ALLOW_SECONDS,
     reason: str = "explicit",
@@ -226,7 +226,7 @@ def allow_temporarily(
 
 
 def allow_human_focus(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     client: str = "",
     reason: str = "explicit-human-navigation",
@@ -251,7 +251,7 @@ def allow_human_focus(
     )
 
 
-def clear_human_focus(adapter: "TmuxAdapter", *, client: str = "", reason: str = "") -> None:
+def clear_human_focus(adapter: TmuxAdapter, *, client: str = "", reason: str = "") -> None:
     stored_client = show_global_option(adapter, HUMAN_FOCUS_CLIENT_OPTION)
     if not stored_client:
         return
@@ -262,14 +262,14 @@ def clear_human_focus(adapter: "TmuxAdapter", *, client: str = "", reason: str =
     _log("human-focus-cleared", action="cleared", current_client=client, reason=reason)
 
 
-def human_focus_active(adapter: "TmuxAdapter", *, client: str = "") -> bool:
+def human_focus_active(adapter: TmuxAdapter, *, client: str = "") -> bool:
     stored_client = show_global_option(adapter, HUMAN_FOCUS_CLIENT_OPTION)
     if not stored_client:
         return False
     return stored_client == "*" or not client or stored_client == client
 
 
-def override_active(adapter: "TmuxAdapter") -> bool:
+def override_active(adapter: TmuxAdapter) -> bool:
     if os.environ.get("IMPERIUM_ALLOW_MECHANICUS_FOCUS") == "1":
         return True
     raw = show_global_option(adapter, ALLOW_UNTIL_OPTION)
@@ -289,7 +289,7 @@ def override_active(adapter: "TmuxAdapter") -> bool:
 
 
 def maybe_open_override_from_env(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     target: str,
     command: str,
@@ -312,7 +312,7 @@ def maybe_open_override_from_env(
 
 
 def log_blocked(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     target: str,
     command: str,
@@ -338,7 +338,7 @@ def log_blocked(
 
 
 def remember_or_bounce(
-    adapter: "TmuxAdapter",
+    adapter: TmuxAdapter,
     *,
     pane: str = "",
     client: str = "",
@@ -398,7 +398,11 @@ def remember_or_bounce(
             break
 
     stored_previous = show_global_option(adapter, LAST_NON_MECH_OPTION)
-    if not previous and stored_previous.startswith("%") and not target_is_mechanicus(adapter, stored_previous):
+    if (
+        not previous
+        and stored_previous.startswith("%")
+        and not target_is_mechanicus(adapter, stored_previous)
+    ):
         previous = stored_previous
 
     if not previous.startswith("%") or target_is_mechanicus(adapter, previous):
