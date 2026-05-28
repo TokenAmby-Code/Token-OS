@@ -13544,7 +13544,9 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
             }
         )
         if first_t > start + timedelta(seconds=bucket_seconds):
-            gaps.append({"start": start.isoformat(), "end": first_t.isoformat(), "reason": "no_anchor"})
+            gaps.append(
+                {"start": start.isoformat(), "end": first_t.isoformat(), "reason": "no_anchor"}
+            )
     else:
         # No persisted shifts in the window. Use a flat live line rather than
         # fabricating a plausible arc.
@@ -13561,7 +13563,9 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
                 "productivity_active": work_state.productivity_active,
             }
         )
-        gaps.append({"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_shifts"})
+        gaps.append(
+            {"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_shifts"}
+        )
 
     for row in rows:
         mode = row.get("new_mode") or current_mode
@@ -13971,9 +13975,7 @@ def _ops_build_state_assertions(
     latest_phone_label = "none"
     if isinstance(latest_phone_details, dict):
         latest_phone_label = str(
-            latest_phone_details.get("display_name")
-            or latest_phone_details.get("app")
-            or "unknown"
+            latest_phone_details.get("display_name") or latest_phone_details.get("app") or "unknown"
         )
 
     assertions = [
@@ -14053,7 +14055,9 @@ def _ops_build_state_assertions(
             "phone_attention",
             "Phone attention",
             str(phone_app or "clear"),
-            "bad" if phone_distracted else "warn"
+            "bad"
+            if phone_distracted
+            else "warn"
             if timer_engine.activity == Activity.DISTRACTION and latest_phone_distraction
             else "neutral",
             confidence="low"
@@ -14122,15 +14126,18 @@ def _ops_build_state_assertions(
         ),
     ]
 
-    if timer_engine.activity == Activity.DISTRACTION and desktop_mode not in {
-        "video",
-        "scrolling",
-        "gaming",
-    } and not phone_distracted:
+    if (
+        timer_engine.activity == Activity.DISTRACTION
+        and desktop_mode
+        not in {
+            "video",
+            "scrolling",
+            "gaming",
+        }
+        and not phone_distracted
+    ):
         latest = latest_phone_distraction or latest_desktop_detection
-        latest_details = (
-            _ops_parse_event_details(latest.get("details")) if latest else None
-        )
+        latest_details = _ops_parse_event_details(latest.get("details")) if latest else None
         latest_label = "unknown"
         if isinstance(latest_details, dict):
             latest_label = str(
@@ -16269,7 +16276,6 @@ async def alarm_dismiss(delay_minutes: int = 0):
 # [MOVED to routes/hooks.py or shared.py] — was: # ============ Claude Code Hook Handlers =========
 
 # ============ Stash: Cross-Machine Clipboard & File Sharing ============
-
 
 
 def stash_cleanup():

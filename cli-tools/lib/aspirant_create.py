@@ -123,7 +123,6 @@ def yaml_starter_questions(key: str = "questions") -> list[str]:
     return out
 
 
-
 def questions_panel_lines(max_rows: int = 8) -> list[str]:
     lines = [
         "> [!question]- Questions Gate — frontmatter editor",
