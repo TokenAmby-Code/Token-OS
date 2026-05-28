@@ -106,16 +106,35 @@ tmux_wait_for_clear() {
     return 0
 }
 
+# Canonical typing-guard predicate — thin reader of the ONE implementation in
+# tmuxctl.send_gate.typing_guard_active (which reads tmux #{client_activity}).
+# No second source of truth: the status segment, this guard, and the universal
+# send gate all consult the same predicate. Returns 0 if the human typed within
+# the client_activity window, non-zero otherwise (or on error → fail-open).
+tmux_typing_guard_active() {
+    local lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.send_gate typing >/dev/null 2>&1
+}
+
 # Guarded send-keys: waits for the pane to be clear, then sends.
 # Accepts the same arguments as `tmux send-keys`.
 # Extracts -t TARGET from args to know which pane to guard.
 #
+# These sends are human-initiated (dictation, pedal-enter, resume), so they are
+# marked sanctioned via TMUX_SEND_GATE_ALLOW: the universal send gate then lets
+# them through and audits them as send_gate_override rather than suppressing
+# them as automated traffic. The pane-clear wait below is a complementary
+# protection (don't inject into a half-typed prompt) and stays.
+#
 # Special env vars:
-#   TMUX_GUARD_TIMEOUT  — max seconds to wait (default: 10)
-#   TMUX_GUARD_SKIP     — set to "1" to bypass guard entirely
+#   TMUX_GUARD_TIMEOUT   — max seconds to wait (default: 10)
+#   TMUX_GUARD_SKIP      — set to "1" to bypass guard entirely
+#   TMUX_SEND_GATE_ALLOW — sanctioned-send reason (default "tmux-guard")
 tmux_send_guarded() {
+    local allow="${TMUX_SEND_GATE_ALLOW:-tmux-guard}"
     # Bypass if guard is disabled
-    [[ "${TMUX_GUARD_SKIP:-}" == "1" ]] && { "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"; return; }
+    [[ "${TMUX_GUARD_SKIP:-}" == "1" ]] && { TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"; return; }
 
     # Extract pane target from args
     local pane=""
@@ -134,7 +153,7 @@ tmux_send_guarded() {
 
     # If we still can't identify the pane, send without guarding
     if [[ -z "$pane" ]]; then
-        "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
+        TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
         return
     fi
 
@@ -146,5 +165,5 @@ tmux_send_guarded() {
     fi
 
     # Use real binary directly to avoid double-guarding through the wrapper function
-    "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
+    TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
 }

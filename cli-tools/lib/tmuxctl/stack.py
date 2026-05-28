@@ -189,7 +189,8 @@ def dispatch_stack_command(
                     enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
         if settle_seconds > 0:
             time.sleep(settle_seconds)
-        adapter.run("send-keys", "-t", pane, command, "Enter")
+        # Gated send: send_keys routes through TmuxAdapter.run()'s universal gate.
+        adapter.send_keys(pane, command, "Enter")
         return pane
 
 

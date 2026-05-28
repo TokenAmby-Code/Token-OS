@@ -95,6 +95,28 @@ resolve_target() {
     return 1
 }
 
+# Universal send gate (shell entrypoint). This shim is the chokepoint every bare
+# `tmux send-keys` in the repo resolves to via PATH, so gating here closes the
+# shell escape hatch around TmuxAdapter.run()'s Python gate — together they make
+# the sentinel inescapable across both languages. Only the mutating send verbs
+# are gated (reads pass through). Sanctioned human-initiated sends
+# (TMUX_SEND_GATE_ALLOW set) are still routed through the canonical predicate so
+# the override is allowed AND audited (send_gate_override) — never silently
+# bypassed. Any check error fails open so a transient fault never bricks all
+# pane writes. Returns 0 (true) to SUPPRESS.
+send_gate_suppresses() {
+    case "${1:-}" in
+        send-keys|send-key|send|paste-buffer) ;;
+        *) return 1 ;;  # not a mutating send verb — never gated
+    esac
+    local lib_dir rc=0
+    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || return 1
+    # TMUX_SEND_GATE_ALLOW (if set) is inherited by the child, which logs the
+    # override and returns allow (rc 0); only rc 100 means suppress.
+    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.send_gate check "$@" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 100 ]]
+}
 
 build_pane_id_map() {
     "$_REAL_TMUX" list-panes -a -F '#{pane_id}	#{@PANE_ID}' 2>/dev/null | awk -F '\t' 'NF>=2 && $2 != "" { print $1 "\t" $2 }'
@@ -309,6 +331,9 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
             i=$((i+1))
         fi
     done
+    if send_gate_suppresses "${args[@]}"; then
+        exit 0  # quiet hours OR typing guard active — silent no-op, no PTY write
+    fi
     exec "$_REAL_TMUX" "${args[@]}"
 fi
 

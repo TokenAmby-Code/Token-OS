@@ -296,7 +296,8 @@ def _spawn_tombstone(
         },
     )
     cmd = f"exec tmux-tombstone {shlex.quote(source_role)} {shlex.quote(target_pane)}"
-    adapter.run("send-keys", "-t", tombstone, cmd, "Enter", allow_failure=True)
+    # Gated send: send_keys routes through TmuxAdapter.run()'s universal gate.
+    adapter.send_keys(tombstone, cmd, "Enter", allow_failure=True)
     return tombstone
 
 

@@ -3582,6 +3582,49 @@ async def log_quiet_hours_suppressed(
     return payload
 
 
+async def _dispatch_timer_intervention(
+    event_name: str,
+    source: str,
+    *,
+    severity: int | None = None,
+    payload: dict | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Emit a timer-originated Custodes intervention unless quiet hours blocks it.
+
+    Defence in depth ABOVE the universal send gate (which catches pane writes):
+    the timer must not even ORIGINATE idle/distraction/break-exhausted
+    interventions while quiet hours is active — whether by the session QUIET
+    latch (``is_quiet_hours``) or the clock window
+    (``shared.get_quiet_hours_status``). Returns True if dispatched, False if
+    suppressed. Never raises into the timer loop.
+    """
+    try:
+        if is_quiet_hours(now) or shared.get_quiet_hours_status(now).get("active"):
+            await log_quiet_hours_suppressed(
+                source=source,
+                event_type=event_name,
+                details={"suppressed_by": "timer_quiet_guard", "severity": severity},
+            )
+            return False
+        kwargs: dict = {}
+        if severity is not None:
+            kwargs["severity"] = severity
+        if payload is not None:
+            kwargs["payload"] = payload
+        asyncio.create_task(handle_custodes_state_event(event_name, source, **kwargs))
+        return True
+    except Exception:
+        # Never let a quiet-guard failure leak into the timer loop. Fail safe:
+        # do NOT originate an intervention when we cannot evaluate quiet state.
+        logger.exception(
+            "timer intervention guard failed; suppressing (event=%s source=%s)",
+            event_name,
+            source,
+        )
+        return False
+
+
 QUIET_RESUME_JOB_ID = "quiet-resume-after-state-buster"
 
 
@@ -14333,18 +14376,17 @@ async def timer_worker():
                     await timer_log_shift(
                         "idle", "break", trigger="idle_timeout", source="timer_worker"
                     )
-                    asyncio.create_task(
-                        handle_custodes_state_event(
-                            "idle_timeout",
-                            "timer_worker",
-                            payload={"timer_mode": "break"},
-                        )
+                    dispatched = await _dispatch_timer_intervention(
+                        "idle_timeout",
+                        "timer_worker",
+                        payload={"timer_mode": "break"},
                     )
                     _current_session_id = await timer_start_session("break", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
-                    loop = asyncio.get_event_loop()
-                    loop.run_in_executor(None, speak_tts, "break mode")
+                    if dispatched:
+                        loop = asyncio.get_event_loop()
+                        loop.run_in_executor(None, speak_tts, "break mode")
                     continue
                 elif event == TimerEvent.DISTRACTION_TIMEOUT:
                     print("TIMER: Distraction timeout — scrolling/gaming ≥10min → DISTRACTED")
@@ -14357,32 +14399,31 @@ async def timer_worker():
                         trigger="distraction_timeout",
                         source="timer_worker",
                     )
-                    asyncio.create_task(
-                        handle_custodes_state_event(
-                            "distraction_timeout",
-                            "timer_worker",
-                            severity=2,
-                            payload={"timer_mode": "distracted"},
-                        )
+                    dispatched = await _dispatch_timer_intervention(
+                        "distraction_timeout",
+                        "timer_worker",
+                        severity=2,
+                        payload={"timer_mode": "distracted"},
                     )
                     _current_session_id = await timer_start_session("distracted", today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
-                    # Enforce: close distraction windows + Pavlok + phone notify
-                    close_distraction_windows()
-                    send_pavlok_stimulus(reason="distraction_timeout")
-                    asyncio.create_task(
-                        asyncio.to_thread(
-                            _send_to_phone,
-                            "/notify",
-                            {
-                                "vibe": 30,
-                                "banner_text": "distraction logged",
-                            },
+                    if dispatched:
+                        # Enforce: close distraction windows + Pavlok + phone notify
+                        close_distraction_windows()
+                        send_pavlok_stimulus(reason="distraction_timeout")
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                _send_to_phone,
+                                "/notify",
+                                {
+                                    "vibe": 30,
+                                    "banner_text": "distraction logged",
+                                },
+                            )
                         )
-                    )
-                    loop = asyncio.get_event_loop()
-                    loop.run_in_executor(None, speak_tts, "distraction logged")
+                        loop = asyncio.get_event_loop()
+                        loop.run_in_executor(None, speak_tts, "distraction logged")
                     continue
                 elif event == TimerEvent.MODE_CHANGED and (
                     has_idle_timeout or has_distraction_timeout
@@ -14395,15 +14436,14 @@ async def timer_worker():
                         trigger="enforcement",
                         source="timer_worker",
                     )
-                    asyncio.create_task(
-                        handle_custodes_state_event(
-                            "break_exhausted",
-                            "timer_worker",
-                            severity=2,
-                            payload={"break_balance_ms": timer_engine.break_balance_ms},
-                        )
+                    dispatched = await _dispatch_timer_intervention(
+                        "break_exhausted",
+                        "timer_worker",
+                        severity=2,
+                        payload={"break_balance_ms": timer_engine.break_balance_ms},
                     )
-                    asyncio.create_task(_async_enforce_break_exhausted())
+                    if dispatched:
+                        asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
                     print(
                         f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}"
@@ -14435,6 +14475,16 @@ async def timer_worker():
                         timer_engine.current_mode.value, today
                     )
                     _session_start_ms = now_ms
+                    # Defence in depth: the 7AM (and any) daily reset must not
+                    # knock the timer out of quiet while the clock window is
+                    # still active. The overnight incident's hourly idle/break
+                    # events traced to DAILY_RESET leaving quiet at midnight.
+                    # Re-latch quiet if still in-window (an explicit morning
+                    # day-start releases the latch, so a genuine wake is honored).
+                    if shared.get_quiet_hours_status().get("active"):
+                        await enter_quiet_mode_internal(
+                            context="sleeping", source="daily_reset_quiet_relatch"
+                        )
                 elif event == TimerEvent.MODE_CHANGED and result.old_mode:
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
