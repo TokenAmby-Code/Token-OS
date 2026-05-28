@@ -602,6 +602,28 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 details TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                activity TEXT,
+                productivity_active INTEGER,
+                break_balance_ms INTEGER,
+                break_backlog_ms INTEGER,
+                work_time_ms INTEGER,
+                active_instance_count INTEGER,
+                processing_recent_count INTEGER,
+                observed_agent_count INTEGER,
+                desktop_mode TEXT,
+                phone_app TEXT,
+                source TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timer_samples_timestamp ON timer_samples(timestamp)"
+        )
 
         await CronEngine.init_tables(db)
 

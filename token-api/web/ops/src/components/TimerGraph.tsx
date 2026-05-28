@@ -31,12 +31,16 @@ export function TimerGraph({ history }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  const { points, segments } = history;
+  const { points, segments, gaps = [] } = history;
 
   const geom = useMemo(() => {
     if (points.length === 0) return null;
-    const t0 = Date.parse(points[0].t);
-    const t1 = Date.parse(points[points.length - 1].t);
+    const generatedAt = Date.parse(history.generated_at);
+    const windowStart = generatedAt - history.window_seconds * 1000;
+    const firstPoint = Date.parse(points[0].t);
+    const lastPoint = Date.parse(points[points.length - 1].t);
+    const t0 = Number.isFinite(windowStart) ? Math.min(windowStart, firstPoint) : firstPoint;
+    const t1 = Number.isFinite(generatedAt) ? Math.max(generatedAt, lastPoint) : lastPoint;
     const span = Math.max(1, t1 - t0);
 
     const balances = points.map((p) => p.break_balance_ms);
@@ -60,7 +64,7 @@ export function TimerGraph({ history }: Props) {
     const y = (v: number) => PAD.top + (1 - (v - lo) / (hi - lo)) * plotH;
 
     return { t0, t1, span, lo, hi, stepMs, plotW, plotH, x, y };
-  }, [points, width]);
+  }, [history.generated_at, history.window_seconds, points, width]);
 
   if (!geom) {
     return (
@@ -71,11 +75,18 @@ export function TimerGraph({ history }: Props) {
   const { t0, span, lo, hi, stepMs, plotW, plotH, x, y } = geom;
   const zeroY = y(0);
 
-  // Balance path + a baseline-to-line fill, split at the zero crossing so the
-  // area reads green above / hazard below.
-  const linePath = points
-    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${x(Date.parse(p.t)).toFixed(1)} ${y(p.break_balance_ms).toFixed(1)}`)
-    .join(' ');
+  // Balance paths are split on explicit sample gaps. A restart/data gap must
+  // not draw a straight line between the last pre-restart sample and the first
+  // recovered/live point.
+  const runs = splitPointRuns(points);
+  const linePaths = runs
+    .map((run) => ({
+      points: run,
+      d: run
+        .map((p, i) => `${i === 0 ? 'M' : 'L'} ${x(Date.parse(p.t)).toFixed(1)} ${y(p.break_balance_ms).toFixed(1)}`)
+        .join(' '),
+    }))
+    .filter((run) => run.d.length > 0);
 
   const yTicks = quarterHourTicks(lo, hi, stepMs);
   const tape = hourTapeTicks(t0, t0 + span);
@@ -121,6 +132,21 @@ export function TimerGraph({ history }: Props) {
           );
         })}
 
+        {/* Explicit telemetry gaps */}
+        {gaps.map((gap, i) => {
+          const sx = x(Math.max(t0, Date.parse(gap.start)));
+          const ex = x(Math.min(t0 + span, Date.parse(gap.end)));
+          const w = Math.max(0, ex - sx);
+          if (w <= 0) return null;
+          return (
+            <g key={`gap-${i}`} aria-label={`telemetry gap: ${gap.reason}`}>
+              <rect x={sx} y={PAD.top} width={w} height={plotH} fill="var(--hazard)" opacity={0.07} />
+              <line x1={sx} x2={sx} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="var(--hazard)" strokeOpacity={0.35} strokeDasharray="3 4" />
+              <line x1={ex} x2={ex} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="var(--hazard)" strokeOpacity={0.25} strokeDasharray="3 4" />
+            </g>
+          );
+        })}
+
         {/* Y gridlines + labels */}
         {yTicks.map((v) => (
           <g key={v}>
@@ -132,15 +158,31 @@ export function TimerGraph({ history }: Props) {
         ))}
 
         {/* Filled areas split at zero */}
-        <path d={`${linePath} L ${x(t0 + span).toFixed(1)} ${zeroY} L ${x(t0).toFixed(1)} ${zeroY} Z`} fill="url(#tg-fill-pos)" clipPath="url(#tg-above)" />
-        <path d={`${linePath} L ${x(t0 + span).toFixed(1)} ${zeroY} L ${x(t0).toFixed(1)} ${zeroY} Z`} fill="url(#tg-fill-neg)" clipPath="url(#tg-below)" />
+        {linePaths.map((run, i) => {
+          const first = run.points[0];
+          const last = run.points[run.points.length - 1];
+          if (!first || !last) return null;
+          const startX = x(Date.parse(first.t)).toFixed(1);
+          const endX = x(Date.parse(last.t)).toFixed(1);
+          const areaPath = `${run.d} L ${endX} ${zeroY} L ${startX} ${zeroY} Z`;
+          return (
+            <g key={`area-${i}`}>
+              <path d={areaPath} fill="url(#tg-fill-pos)" clipPath="url(#tg-above)" />
+              <path d={areaPath} fill="url(#tg-fill-neg)" clipPath="url(#tg-below)" />
+            </g>
+          );
+        })}
 
         {/* Zero line — prominent */}
         <line x1={PAD.left} x2={width - PAD.right} y1={zeroY} y2={zeroY} className="zero-line" />
 
         {/* Balance line, threshold colored */}
-        <path d={linePath} className="bal-line bal-line--pos" clipPath="url(#tg-above)" />
-        <path d={linePath} className="bal-line bal-line--neg" clipPath="url(#tg-below)" />
+        {linePaths.map((run, i) => (
+          <g key={`line-${i}`}>
+            <path d={run.d} className="bal-line bal-line--pos" clipPath="url(#tg-above)" />
+            <path d={run.d} className="bal-line bal-line--neg" clipPath="url(#tg-below)" />
+          </g>
+        ))}
 
         {/* X axis — tape-measure: labeled hour marks, medium :30, minor :15/:45 */}
         {tape.map((tk) => {
@@ -202,6 +244,18 @@ export function TimerGraph({ history }: Props) {
 }
 
 // ── tick helpers ──────────────────────────────────────────────────────────
+
+function splitPointRuns(points: TimerHistory['points']) {
+  const runs: TimerHistory['points'][] = [];
+  for (const point of points) {
+    if (runs.length === 0 || point.gap_before) {
+      runs.push([point]);
+    } else {
+      runs[runs.length - 1].push(point);
+    }
+  }
+  return runs;
+}
 
 // Ladder of quarter-hour multiples (minutes). The Y step is whichever rung
 // keeps the gridline count reasonable — chosen, not computed by division, so

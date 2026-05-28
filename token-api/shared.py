@@ -841,11 +841,124 @@ def _serialize_timer_shift_details(details):
     return str(details)
 
 
+def _timer_value(name: str, default=None):
+    value = getattr(timer_engine, name, default)
+    if hasattr(value, "value"):
+        return value.value
+    return value
+
+
+def _coerce_work_state_value(work_state, name: str, default=None):
+    if work_state is None:
+        return default
+    if isinstance(work_state, dict):
+        return work_state.get(name, default)
+    return getattr(work_state, name, default)
+
+
+def _ensure_timer_samples_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS timer_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            activity TEXT,
+            productivity_active INTEGER,
+            break_balance_ms INTEGER,
+            break_backlog_ms INTEGER,
+            work_time_ms INTEGER,
+            active_instance_count INTEGER,
+            processing_recent_count INTEGER,
+            observed_agent_count INTEGER,
+            desktop_mode TEXT,
+            phone_app TEXT,
+            source TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_timer_samples_timestamp ON timer_samples(timestamp)"
+    )
+
+
+def _sync_write_timer_sample(source: str, work_state=None, timestamp: str | None = None) -> None:
+    """Persist a point-in-time timer read-model sample."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        _sync_insert_timer_sample(conn, source=source, work_state=work_state, timestamp=timestamp)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sync_insert_timer_sample(
+    conn,
+    source: str,
+    work_state=None,
+    timestamp: str | None = None,
+    active_instances: int | None = None,
+) -> None:
+    """Insert a timer sample using the current in-memory timer/attention state."""
+    _ensure_timer_samples_table(conn)
+
+    if active_instances is None:
+        active_instances = _coerce_work_state_value(work_state, "active_instance_count")
+    if active_instances is None:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        active_instances = int(cursor.fetchone()[0] or 0)
+
+    processing_recent = _coerce_work_state_value(work_state, "processing_recent_count")
+    if processing_recent is None:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'processing' AND COALESCE(is_subagent, 0) = 0"
+        )
+        processing_recent = int(cursor.fetchone()[0] or 0)
+
+    observed_agents = _coerce_work_state_value(work_state, "observed_agent_count")
+    if observed_agents is None:
+        observed_agents = active_instances
+
+    productivity_active = _coerce_work_state_value(
+        work_state, "productivity_active", _timer_value("productivity_active", None)
+    )
+
+    conn.execute(
+        """
+        INSERT INTO timer_samples (
+            timestamp, mode, activity, productivity_active,
+            break_balance_ms, break_backlog_ms, work_time_ms,
+            active_instance_count, processing_recent_count, observed_agent_count,
+            desktop_mode, phone_app, source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            timestamp or datetime.now().isoformat(),
+            _timer_value("current_mode", "unknown"),
+            _timer_value("activity", None),
+            1 if productivity_active else 0,
+            int(_timer_value("break_balance_ms", 0) or 0),
+            abs(min(0, int(_timer_value("break_balance_ms", 0) or 0))),
+            int(_timer_value("total_work_time_ms", 0) or 0),
+            int(active_instances or 0),
+            int(processing_recent or 0),
+            int(observed_agents or 0),
+            DESKTOP_STATE.get("current_mode", "silence"),
+            PHONE_STATE.get("current_app"),
+            source,
+        ),
+    )
+
+
 def _sync_log_shift(
     old_mode, new_mode: str, trigger: str, source: str, phone_app=None, details=None
 ):
     """Log a timer mode shift to the analytics table (sync, for thread offload)."""
-    import sqlite3
     from datetime import datetime as _dt
 
     conn = sqlite3.connect(DB_PATH)
@@ -874,8 +987,19 @@ def _sync_log_shift(
             _serialize_timer_shift_details(details),
         ),
     )
+    _sync_insert_timer_sample(conn, source=source, active_instances=active_instances)
     conn.commit()
     conn.close()
+
+
+async def timer_write_sample(source: str = "timer_worker", work_state=None):
+    """Persist a timer sample asynchronously."""
+    import asyncio
+
+    try:
+        await asyncio.to_thread(_sync_write_timer_sample, source, work_state)
+    except Exception as e:
+        print(f"TIMER: Failed to write sample: {e}")
 
 
 async def timer_log_shift(

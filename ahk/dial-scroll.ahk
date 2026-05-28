@@ -24,8 +24,11 @@ global dialTimerRunning := false
 global dialLastInputTime := 0
 global dialLastDir := 0
 
-F13::DialInput(1)
-F14::DialInput(-1)
+; Wildcard (*) so the dial fires even while Ctrl/Shift/Alt/Win are held —
+; a bare F13:: would be bypassed as a distinct Ctrl+F13 combo. Blind-mode
+; Send in DialInput then carries the held modifier into the wheel event.
+*F13::DialInput(1)
+*F14::DialInput(-1)
 
 DialInput(dir) {
     global dialAccum, dialAccelMultiplier, dialTimerRunning, dialLastInputTime, dialLastDir
@@ -52,11 +55,12 @@ DialInput(dir) {
     if (timeSinceLast < DIAL_ACCEL_WINDOW_MS && timeSinceLast > 0)
         dialAccelMultiplier := Min(dialAccelMultiplier * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
 
-    ; Every input guarantees at least 1 scroll line immediately
+    ; Every input guarantees at least 1 scroll line immediately.
+    ; Blind mode keeps any held modifier down so Ctrl+dial → Ctrl+scroll (zoom), etc.
     if (dir > 0)
-        MouseClick("WheelUp",,, 1)
+        Send("{Blind}{WheelUp}")
     else
-        MouseClick("WheelDown",,, 1)
+        Send("{Blind}{WheelDown}")
 
     ; Add surplus to accumulator for momentum (subtract the 1 we already sent)
     surplus := (DIAL_BASE_AMOUNT * dialAccelMultiplier) - 1
@@ -81,11 +85,11 @@ DialScrollTick() {
     if (dialAccum >= 1) {
         outputAmount := Min(8, Max(1, Integer(dialAccum)))
         dialAccum -= outputAmount
-        MouseClick("WheelUp",,, outputAmount)
+        Send("{Blind}{WheelUp " outputAmount "}")
     } else if (dialAccum <= -1) {
         outputAmount := Min(8, Max(1, Integer(-dialAccum)))
         dialAccum += outputAmount
-        MouseClick("WheelDown",,, outputAmount)
+        Send("{Blind}{WheelDown " outputAmount "}")
     }
 
     ; Stop when nothing left

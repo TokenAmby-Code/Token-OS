@@ -1377,6 +1377,15 @@ async def lifespan(app: FastAPI):
     else:
         timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
         print(f"TIMER: Synced activity=WORKING (desktop={desktop_mode})")
+    try:
+        startup_work_state = await compute_work_state()
+        timer_engine.set_productivity(startup_work_state.productivity_active, now_ms)
+        await shared.timer_write_sample(
+            source="startup",
+            work_state=startup_work_state.model_dump(),
+        )
+    except Exception as exc:
+        logger.warning(f"Timer startup sample failed: {exc}")
     # Stash cleanup on startup + hourly
     stash_cleanup()
     scheduler.add_job(
@@ -3626,6 +3635,7 @@ async def enter_quiet_mode_internal(
         _current_session_id = await timer_start_session("quiet", today)
         _session_start_ms = now_ms
         await timer_log_mode_change(old_mode, "quiet", is_automatic=True)
+        await shared.timer_write_sample(source=source)
         await log_event(
             "timer_quiet_entered",
             details={"source": source, "context": context, "old_mode": old_mode},
@@ -3658,6 +3668,7 @@ async def exit_quiet_mode_internal(*, source: str, reason: str) -> dict:
         _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
         await timer_log_mode_change("quiet", new_mode, is_automatic=True)
+        await shared.timer_write_sample(source=source)
         await log_event(
             "timer_quiet_exited",
             details={
@@ -13551,15 +13562,14 @@ def _ops_shift_to_annotation(row: dict) -> dict:
 async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = "60s") -> dict:
     """Return live timer history for the ops graph.
 
-    The existing timer persistence stores exact shift rows plus current engine
-    state, not 1Hz samples. This read model reconstructs a bucketed line from
-    the last known shift, the TimerEngine's signed mode rates, and the current
-    live snapshot. It is real telemetry, not frontend mock data; gaps are
-    explicitly marked when no shift row anchors the requested window.
+    Timer samples are the authoritative line-series read model. Timer shifts
+    are rendered only as annotations/events; sparse shifts are not extrapolated
+    into long balance arcs.
     """
     now = datetime.now()
     window_seconds = max(15 * 60, min(_ops_parse_duration_seconds(window, 6 * 3600), 48 * 3600))
     bucket_seconds = max(10, min(_ops_parse_duration_seconds(bucket, 60), 15 * 60))
+    gap_threshold_seconds = 90
     start = now - timedelta(seconds=window_seconds)
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -13567,14 +13577,13 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         cursor = await db.execute(
             """
             SELECT *
-            FROM timer_shifts
-            WHERE datetime(timestamp) < datetime(?)
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 1
+            FROM timer_samples
+            WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)
+            ORDER BY timestamp ASC, id ASC
             """,
-            (start.isoformat(),),
+            (start.isoformat(), now.isoformat()),
         )
-        previous = await cursor.fetchone()
+        samples = [dict(row) for row in await cursor.fetchall()]
         cursor = await db.execute(
             """
             SELECT *
@@ -13584,7 +13593,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
             """,
             (start.isoformat(), now.isoformat()),
         )
-        rows = [dict(row) for row in await cursor.fetchall()]
+        shift_rows = [dict(row) for row in await cursor.fetchall()]
 
     work_state = await get_cached_work_state()
     current_mode = timer_engine.current_mode.value
@@ -13594,171 +13603,127 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     current_phone_app = PHONE_STATE.get("current_app")
     current_desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
 
-    anchors: list[dict] = []
     gaps: list[dict] = []
-    data_start = start
-
-    if previous:
-        prev = dict(previous)
-        prev_t = _ops_parse_datetime(prev.get("timestamp")) or start
-        prev_mode = prev.get("new_mode") or current_mode
-        prev_balance = int(prev.get("break_balance_ms") or 0)
-        start_balance = _ops_advance_timer_balance(
-            prev_balance, prev_mode, max(0, (start - prev_t).total_seconds())
-        )
-        anchors.append(
-            {
-                "t": start,
-                "mode": prev_mode,
-                "activity": "distraction"
-                if prev_mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": start_balance,
-                "active_instance_count": int(prev.get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": prev.get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(prev.get("active_instances") or 0),
-            }
-        )
-    elif rows:
-        first_t = _ops_parse_datetime(rows[0].get("timestamp")) or start
-        data_start = first_t
-        anchors.append(
-            {
-                "t": first_t,
-                "mode": rows[0].get("new_mode") or rows[0].get("old_mode") or current_mode,
-                "activity": "distraction"
-                if (rows[0].get("new_mode") or rows[0].get("old_mode"))
-                in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": int(rows[0].get("break_balance_ms") or 0),
-                "active_instance_count": int(rows[0].get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": rows[0].get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(rows[0].get("active_instances") or 0),
-            }
-        )
-        if first_t > start + timedelta(seconds=bucket_seconds):
-            gaps.append({"start": start.isoformat(), "end": first_t.isoformat(), "reason": "no_anchor"})
-    else:
-        # No persisted shifts in the window. Use a flat live line rather than
-        # fabricating a plausible arc.
-        anchors.append(
-            {
-                "t": start,
-                "mode": current_mode,
-                "activity": timer_engine.activity.value,
-                "break_balance_ms": current_balance,
-                "active_instance_count": current_active,
-                "processing_recent_count": current_processing,
-                "phone_app": current_phone_app,
-                "desktop_mode": current_desktop_mode,
-                "productivity_active": work_state.productivity_active,
-            }
-        )
-        gaps.append({"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_shifts"})
-
-    for row in rows:
-        mode = row.get("new_mode") or current_mode
-        anchors.append(
-            {
-                "t": _ops_parse_datetime(row.get("timestamp")) or now,
-                "mode": mode,
-                "activity": "distraction"
-                if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
-                else "working",
-                "break_balance_ms": int(row.get("break_balance_ms") or 0),
-                "active_instance_count": int(row.get("active_instances") or 0),
-                "processing_recent_count": 0,
-                "phone_app": row.get("phone_app"),
-                "desktop_mode": None,
-                "productivity_active": bool(row.get("active_instances") or 0),
-            }
-        )
-
-    anchors.append(
-        {
-            "t": now,
-            "mode": current_mode,
-            "activity": timer_engine.activity.value,
-            "break_balance_ms": current_balance,
-            "active_instance_count": current_active,
-            "processing_recent_count": current_processing,
-            "phone_app": current_phone_app,
-            "desktop_mode": current_desktop_mode,
-            "productivity_active": work_state.productivity_active,
-        }
-    )
-    anchors.sort(key=lambda item: item["t"])
-
+    points: list[dict] = []
     segments = []
-    for i, anchor in enumerate(anchors[:-1]):
-        next_anchor = anchors[i + 1]
-        if next_anchor["t"] <= anchor["t"]:
-            continue
-        segments.append(
-            {
-                "start": anchor["t"].isoformat(),
-                "end": next_anchor["t"].isoformat(),
-                "mode": anchor["mode"],
-                "activity": anchor["activity"],
-                "productivity_active": anchor["productivity_active"],
-                "source": None,
-            }
-        )
 
-    points = []
-    bucket_delta = timedelta(seconds=bucket_seconds)
-    cursor = data_start
-    anchor_index = 0
-    while cursor < now:
-        while anchor_index + 1 < len(anchors) and anchors[anchor_index + 1]["t"] <= cursor:
-            anchor_index += 1
-        anchor = anchors[anchor_index]
-        elapsed = max(0, (cursor - anchor["t"]).total_seconds())
-        points.append(
-            {
-                "t": cursor.isoformat(),
-                "break_balance_ms": _ops_advance_timer_balance(
-                    int(anchor["break_balance_ms"]), anchor["mode"], elapsed
-                ),
-                "mode": anchor["mode"],
-                "activity": anchor["activity"],
-                "productivity_active": anchor["productivity_active"],
-                "active_instance_count": anchor["active_instance_count"],
-                "processing_recent_count": anchor["processing_recent_count"],
-                "desktop_mode": anchor.get("desktop_mode"),
-                "phone_app": anchor.get("phone_app"),
-            }
-        )
-        cursor += bucket_delta
+    def _sample_point(row: dict, *, gap_before: bool = False) -> dict:
+        point = {
+            "t": row.get("timestamp"),
+            "break_balance_ms": int(row.get("break_balance_ms") or 0),
+            "mode": row.get("mode") or "unknown",
+            "activity": row.get("activity"),
+            "productivity_active": bool(row.get("productivity_active")),
+            "active_instance_count": int(row.get("active_instance_count") or 0),
+            "processing_recent_count": int(row.get("processing_recent_count") or 0),
+            "observed_agent_count": int(row.get("observed_agent_count") or 0),
+            "desktop_mode": row.get("desktop_mode"),
+            "phone_app": row.get("phone_app"),
+            "sample_source": row.get("source"),
+        }
+        if gap_before:
+            point["gap_before"] = True
+        return point
+
+    previous_point: dict | None = None
+    previous_time: datetime | None = None
+    for row in samples:
+        sample_time = _ops_parse_datetime(row.get("timestamp"))
+        if sample_time is None:
+            continue
+        gap_before = False
+        if previous_time is None:
+            if (sample_time - start).total_seconds() > gap_threshold_seconds:
+                gaps.append(
+                    {
+                        "start": start.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "reason": "no_timer_samples",
+                    }
+                )
+                gap_before = True
+        else:
+            spacing_seconds = (sample_time - previous_time).total_seconds()
+            if spacing_seconds > gap_threshold_seconds:
+                gaps.append(
+                    {
+                        "start": previous_time.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "reason": "sample_gap",
+                    }
+                )
+                gap_before = True
+            elif previous_point:
+                segments.append(
+                    {
+                        "start": previous_time.isoformat(),
+                        "end": sample_time.isoformat(),
+                        "mode": previous_point["mode"],
+                        "activity": previous_point["activity"],
+                        "productivity_active": previous_point["productivity_active"],
+                        "source": previous_point.get("sample_source"),
+                    }
+                )
+        point = _sample_point(row, gap_before=gap_before)
+        points.append(point)
+        previous_point = point
+        previous_time = sample_time
 
     # Always include an exact live endpoint as the final point.
-    points.append(
-        {
-            "t": now.isoformat(),
-            "break_balance_ms": current_balance,
-            "mode": current_mode,
-            "activity": timer_engine.activity.value,
-            "productivity_active": work_state.productivity_active,
-            "active_instance_count": current_active,
-            "processing_recent_count": current_processing,
-            "desktop_mode": current_desktop_mode,
-            "phone_app": current_phone_app,
-        }
-    )
+    live_gap_before = False
+    if previous_time is None:
+        gaps.append({"start": start.isoformat(), "end": now.isoformat(), "reason": "no_timer_samples"})
+        live_gap_before = True
+    else:
+        live_spacing_seconds = (now - previous_time).total_seconds()
+        if live_spacing_seconds > gap_threshold_seconds:
+            gaps.append(
+                {
+                    "start": previous_time.isoformat(),
+                    "end": now.isoformat(),
+                    "reason": "sample_gap",
+                }
+            )
+            live_gap_before = True
+        elif previous_point:
+            segments.append(
+                {
+                    "start": previous_time.isoformat(),
+                    "end": now.isoformat(),
+                    "mode": previous_point["mode"],
+                    "activity": previous_point["activity"],
+                    "productivity_active": previous_point["productivity_active"],
+                    "source": previous_point.get("sample_source"),
+                }
+            )
+
+    live_point = {
+        "t": now.isoformat(),
+        "break_balance_ms": current_balance,
+        "mode": current_mode,
+        "activity": timer_engine.activity.value,
+        "productivity_active": work_state.productivity_active,
+        "active_instance_count": current_active,
+        "processing_recent_count": current_processing,
+        "observed_agent_count": work_state.observed_agent_count,
+        "desktop_mode": current_desktop_mode,
+        "phone_app": current_phone_app,
+        "sample_source": "live_timer_engine",
+    }
+    if live_gap_before:
+        live_point["gap_before"] = True
+    points.append(live_point)
 
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
         "bucket_seconds": bucket_seconds,
+        "gap_threshold_seconds": gap_threshold_seconds,
         "points": points,
         "segments": segments,
-        "annotations": [_ops_shift_to_annotation(row) for row in rows],
+        "annotations": [_ops_shift_to_annotation(row) for row in shift_rows],
         "gaps": gaps,
-        "source": "timer_shifts+live_timer_engine",
+        "source": "timer_samples+timer_shifts+live_timer_engine",
     }
 
 
@@ -14499,6 +14464,7 @@ async def timer_worker():
     global _current_session_id, _session_start_ms, _mode_change_count
     last_daily_update = 0.0
     last_db_save = 0.0
+    last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -14653,6 +14619,7 @@ async def timer_worker():
                         timer_engine.current_mode.value,
                         is_automatic=False,
                     )
+                    await shared.timer_write_sample(source="timer_worker")
                     _mode_change_count += 1
                     _current_session_id = await timer_start_session(
                         timer_engine.current_mode.value, today
@@ -14767,6 +14734,15 @@ async def timer_worker():
             if now - last_daily_update >= 30:
                 await timer_update_daily_note()
                 last_daily_update = now
+
+            # Persist faithful graph samples independently from sparse shift events.
+            if now - last_sample_save >= 30:
+                work_state = await get_cached_work_state()
+                await shared.timer_write_sample(
+                    source="timer_worker",
+                    work_state=work_state.model_dump(),
+                )
+                last_sample_save = now
 
             # Save to DB every 10s
             if now - last_db_save >= 10:

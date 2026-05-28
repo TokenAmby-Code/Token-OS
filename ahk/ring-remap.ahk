@@ -662,12 +662,13 @@ ScrollCallback(state) {
     if (state == 0)
         return
 
-    ; Immediate output if fresh start (velocity is 0)
+    ; Immediate output if fresh start (velocity is 0).
+    ; Blind mode keeps any held modifier down so Ctrl+scroll (zoom), etc. pass through.
     if (scrollVelocity == 0) {
         if (state > 0)
-            MouseClick("WheelUp",,, 1)
+            Send("{Blind}{WheelUp}")
         else
-            MouseClick("WheelDown",,, 1)
+            Send("{Blind}{WheelDown}")
     }
 
     ; Add to velocity (state is +1 or -1)
@@ -706,11 +707,11 @@ SmoothScrollTick() {
     if (scrollAccum >= 1) {
         outputAmount := Min(5, Max(1, Integer(scrollAccum / 2)))
         scrollAccum -= outputAmount
-        MouseClick("WheelUp",,, outputAmount)
+        Send("{Blind}{WheelUp " outputAmount "}")
     } else if (scrollAccum <= -1) {
         outputAmount := Min(5, Max(1, Integer(-scrollAccum / 2)))
         scrollAccum += outputAmount
-        MouseClick("WheelDown",,, outputAmount)
+        Send("{Blind}{WheelDown " outputAmount "}")
     }
 }
 
