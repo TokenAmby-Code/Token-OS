@@ -66,12 +66,17 @@ Server-driven endpoints on the phone use the MacroDroid HTTP server:
 ```text
 /notify?<params>   notification + TTS + Pavlok vibe/beep
 /enforce?<params>  notification + TTS + Pavlok zap + Spotify redirect
-/zap?<params>      direct Pavlok zap
+/zap?<params>      direct single Pavlok stimulus (zap/beep/vibe)
 /pause             pause active YouTube/media playback
 /heartbeat         reachability
 /list-exports      export/list support
 /sshd              starts Termux sshd
 ```
+
+`/zap` accepts both the legacy `?zap=30` form and the generic
+`?action=zap|beep|vibe&intensity=1-100` form. The Zappa macro must contain
+exactly one `SendIntentAction` so Pavlok stimuli cannot be bundled in one phone
+request.
 
 ## Official Edit Workflow
 
