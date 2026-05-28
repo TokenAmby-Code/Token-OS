@@ -2722,7 +2722,7 @@ async def handle_stop(payload: dict) -> dict:
         )
         # Signal TUI that evaluators are running for this instance
         _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
-        _tui_signal_dir.mkdir(exist_ok=True)
+        _tui_signal_dir.mkdir(parents=True, exist_ok=True)
         (_tui_signal_dir / f"evaluating-{session_id}").touch()
         asyncio.create_task(
             _require_dep("run_stop_evaluators", _run_stop_evaluators)(
