@@ -37,7 +37,7 @@ from instance_mutation import (
     sanctioned_update_instance,
 )
 from pane_surface import human_pane_surface
-from phone_service import _send_to_phone, check_instance_count_pavlok
+from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import play_sound, queue_tts
 from session_doc_helpers import (
@@ -2304,13 +2304,6 @@ async def handle_session_end(payload: dict) -> dict:
                         pass
                     await asyncio.to_thread(update_frontmatter, fp, fm_updates)
 
-        # Count non-subagent active instances BEFORE stopping
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
-        )
-        count_row = await cursor.fetchone()
-        was_active = count_row[0] if count_row else 0
-
         workflow_events = [
             {
                 "workflow_state": "closed",
@@ -2367,13 +2360,6 @@ async def handle_session_end(payload: dict) -> dict:
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
 
-        # Count remaining non-subagent active instances
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
-        )
-        count_row = await cursor.fetchone()
-        remaining_non_sub = count_row[0] if count_row else 0
-
     # Golden Throne: cancel any pending follow-up (session terminated)
     try:
         shared.scheduler.remove_job(f"golden-throne-{session_id}")
@@ -2385,10 +2371,6 @@ async def handle_session_end(payload: dict) -> dict:
     await log_event(
         "instance_stopped", instance_id=session_id, device_id=row[1], details={"source": "hook"}
     )
-
-    # Instance count Pavlok signals (skip subagents)
-    if not is_subagent:
-        await check_instance_count_pavlok(remaining_non_sub, was_active)
 
     # Spawn stop_hook.py to generate transcript + wikilink (session doc or daily note fallback)
     if not is_subagent:

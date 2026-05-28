@@ -16,6 +16,7 @@ _MODULES_TO_RELOAD = [
     "stop_hook",
     "init_db",
     "temp_message",
+    "timer_telemetry",
     "main",
 ]
 

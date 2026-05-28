@@ -241,13 +241,31 @@ h1 {
 .tick--mid { stroke: var(--line-bright); stroke-width: 1.1; }
 .tick--minor { stroke: var(--line); stroke-width: 1; }
 .band-label { font-size: 8.5px; letter-spacing: 0.12em; opacity: 0.85; font-family: 'Chakra Petch', sans-serif; }
+.gap-label {
+  fill: var(--hazard);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.72;
+  font-family: 'IBM Plex Mono', monospace;
+}
 
 .bal-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .bal-line--pos { stroke: var(--m-working); filter: drop-shadow(0 0 4px rgba(147, 217, 79, 0.4)); }
 .bal-line--neg { stroke: var(--hazard); filter: drop-shadow(0 0 4px rgba(255, 91, 61, 0.4)); }
+.sample-dot { fill: var(--brass); stroke: var(--bg-deep); stroke-width: 1.5; opacity: 0.82; }
+.sample-dot--gap { fill: var(--hazard); opacity: 0.72; }
+.sample-dot--anomaly { fill: var(--hazard); stroke: var(--brass-bright); stroke-width: 1.8; }
 
 .crosshair { stroke: var(--brass-bright); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.7; }
 .cursor-dot { fill: var(--brass-bright); stroke: var(--bg-deep); stroke-width: 2; }
+.chart-warning {
+  margin: -4px 0 6px 52px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.chart-warning--bad { color: var(--hazard); }
 
 .chart-tip {
   position: absolute; top: 6px; pointer-events: none;
@@ -259,6 +277,7 @@ h1 {
 .chart-tip__time { color: var(--brass-bright); font-size: 11px; margin-bottom: 4px; }
 .chart-tip__row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
 .chart-tip__muted { color: var(--muted); font-size: 10.5px; }
+.chart-tip__warn { color: var(--hazard); font-size: 10.5px; }
 .dot-sm { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
 
 /* ── state assertions ───────────────────────────────────────────────── */
