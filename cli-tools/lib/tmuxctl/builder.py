@@ -219,6 +219,7 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _pane_tag(adapter, admin, "mechanicus:admin")
     _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
 
+
 def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     """Build the full somnium workspace from an empty server.
 

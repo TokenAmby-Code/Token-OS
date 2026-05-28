@@ -23,7 +23,11 @@ class FakeFocusAdapter:
             fmt = args[-1]
             if fmt == "#{session_name}:#{window_index}\t#{pane_id}":
                 if target:
-                    return f"{self.pane_window.get(target, '')}\t{target}\n" if target in self.pane_window else ""
+                    return (
+                        f"{self.pane_window.get(target, '')}\t{target}\n"
+                        if target in self.pane_window
+                        else ""
+                    )
                 return f"{self.current_window}\t{self.current_pane}\n"
             if fmt == "#{pane_id}":
                 if target:
