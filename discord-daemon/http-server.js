@@ -457,6 +457,22 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         return json(res, result);
       }
 
+      // POST /voice/mute — Server-mute a voice member (defaults to operator)
+      if (method === 'POST' && path === '/voice/mute') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = await voiceManager.muteMember(body.user_id, body.bot || 'mechanicus', body.duration_ms);
+        return json(res, result);
+      }
+
+      // POST /voice/unmute — Server-unmute a voice member (defaults to operator)
+      if (method === 'POST' && path === '/voice/unmute') {
+        if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
+        const body = await parseBody(req);
+        const result = await voiceManager.unmuteMember(body.user_id, body.bot || 'mechanicus');
+        return json(res, result);
+      }
+
       // 404
       json(res, { error: 'Not found' }, 404);
 
