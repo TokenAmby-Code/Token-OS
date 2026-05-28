@@ -154,6 +154,7 @@ def _clear_cached_label(pane: str) -> None:
 def main() -> int:
     pane = sys.argv[1] if len(sys.argv) > 1 else ""
     pane_title = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+    suppress_title = (sys.argv[3].strip().lower() if len(sys.argv) > 3 else "") == "true"
     if not pane:
         return 0
 
@@ -164,7 +165,7 @@ def main() -> int:
         match = next((inst for inst in pane_matches if inst.get("status") != "stopped"), None)
     if not match:
         _clear_cached_label(pane)
-        if pane_title:
+        if pane_title and not suppress_title:
             print(f"#[fg=colour231,bg=colour31,bold] {pane_title} #[default]")
         return 0
 

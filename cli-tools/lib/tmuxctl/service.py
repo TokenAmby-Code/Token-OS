@@ -24,7 +24,8 @@ from .labels import canonical_pane_role
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
-from .resolver import resolve_pane
+from .resolver import resolve_pane, resolve_to_physical, resolve_to_public
+from .skill_invoke import invoke_skill_in_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
 from .tombstone import install_tombstone, jump_tombstone
@@ -97,10 +98,11 @@ class TmuxControlPlane:
 
     def resolve_pane(self, target: str) -> str:
         resolved = resolve_pane(self.adapter, target)
+        public_id = canonical_pane_role(resolved.pane_role) if resolved.pane_role else ""
         chain = " -> ".join(resolved.chain)
         lines = [
             f"requested: {resolved.requested}",
-            f"pane_id: {resolved.pane_id}",
+            f"pane_id: {public_id or '(unset)'}",
             f"role: {resolved.pane_role or '(unset)'}",
             f"kind: {resolved.pane_kind.value}",
         ]
@@ -120,14 +122,20 @@ class TmuxControlPlane:
             raise ValueError("current pane has no cardinal @PANE_ID")
         if target.startswith("%"):
             raise ValueError("raw tmux %pane ids are not valid cardinal ids")
-        resolved = resolve_pane(self.adapter, target)
-        if not resolved.pane_role:
-            raise ValueError(f"pane target has no cardinal @PANE_ID: {target}")
-        return canonical_pane_role(resolved.pane_role)
+        return resolve_to_public(self.adapter, target)
+
+    def physical_pane_id(self, target: str) -> str:
+        return resolve_to_physical(self.adapter, target)
+
+    def public_pane_id(self, target: str) -> str:
+        return resolve_to_public(self.adapter, target)
 
     def session_doc_for_pane(self, target: str) -> dict:
         pane_label = self.cardinal_pane_label(target)
         return fetch_session_doc_for_pane_label(pane_label)
+
+    def invoke_skill(self, target: str, skill: str, *, agent: str = "auto") -> str:
+        return invoke_skill_in_pane(self.adapter, target, skill, agent=agent)
 
     def audience_toggle(self, target: str, *, client: str = "") -> str:
         return audience_toggle(self.adapter, target, client=client)

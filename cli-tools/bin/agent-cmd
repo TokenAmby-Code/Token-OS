@@ -71,7 +71,7 @@ resolve_instance_id() {
 }
 
 resolve_pane() {
-    "${_BIN_DIR}/tmux-resolve-pane" --format id "$1" 2>/dev/null || echo "$1"
+    "${_BIN_DIR}/tmux-resolve-pane" --format physical "$1" 2>/dev/null || echo "$1"
 }
 
 payload_hash() {

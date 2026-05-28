@@ -29,7 +29,10 @@ case "${1:-}" in
         ;;
 esac
 
-# Run the command, capture combined stdout+stderr
+# Run the command, capture combined stdout+stderr. tmux run-shell invocations
+# are automation, not direct human navigation; downstream tmuxctl/tmux guards
+# use this to avoid stealing the operator's camera (notably mechanicus panes).
+export IMPERIUM_TMUX_AUTOMATION="${IMPERIUM_TMUX_AUTOMATION:-1}"
 output=$("$@" 2>&1) || true
 
 # Only log if there's actual output

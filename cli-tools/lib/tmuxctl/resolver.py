@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .enums import GridState, PaneKind
-from .labels import canonical_pane_role, indexable_pane_roles, pane_role_aliases
+from .labels import canonical_pane_role, indexable_pane_roles
 from .models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
 from .tmux_adapter import TmuxAdapter
 
@@ -98,6 +98,15 @@ def _window_base(window_name: str) -> str:
     return window_name.split("(", 1)[0]
 
 
+DEPRECATED_PUBLIC_POSITIONS = {"TL", "TR", "BL", "BR", "NW", "SW"}
+
+
+def _is_deprecated_public_target(target: str) -> bool:
+    if target.startswith("%") or ":" not in target:
+        return False
+    return target.rsplit(":", 1)[1] in DEPRECATED_PUBLIC_POSITIONS
+
+
 def _role_position_aliases(role: str) -> tuple[str, ...]:
     if not role or ":" not in role:
         return ()
@@ -105,11 +114,7 @@ def _role_position_aliases(role: str) -> tuple[str, ...]:
     if canonical.endswith(":custodes") or canonical.endswith(":fabricator-general"):
         return tuple(dict.fromkeys((canonical.rsplit(":", 1)[1], "0")))
     position = canonical.rsplit(":", 1)[1]
-    aliases = [position]
-    for alias in pane_role_aliases(canonical):
-        if ":" in alias:
-            aliases.append(alias.rsplit(":", 1)[1])
-    return tuple(dict.fromkeys(alias for alias in aliases if alias))
+    return (position,) if position else ()
 
 
 def _add_unique(index: dict[str, PaneSnapshot], key: str, pane: PaneSnapshot) -> None:
@@ -168,6 +173,10 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
 
     def lookup(value: str) -> PaneSnapshot | None:
         if value.startswith("%"):
+            return by_physical.get(value)
+        if _is_deprecated_public_target(value):
+            # No explicit legacy rejection: old position labels are simply not
+            # part of the public address space, so they miss the canonical index.
             return by_physical.get(value)
         canonical = canonical_pane_role(value)
         return (
@@ -230,3 +239,14 @@ def resolve_pane(adapter: TmuxAdapter, target: str) -> PaneResolution:
 
     workspace = build_workspace_snapshot(adapter, session_name)
     return resolve_pane_in_snapshot(workspace, target)
+
+
+def resolve_to_public(adapter: TmuxAdapter, target: str) -> str:
+    resolved = resolve_pane(adapter, target)
+    if not resolved.pane_role:
+        raise ValueError(f"pane target has no public @PANE_ID: {target}")
+    return canonical_pane_role(resolved.pane_role)
+
+
+def resolve_to_physical(adapter: TmuxAdapter, target: str) -> str:
+    return resolve_pane(adapter, target).pane_id

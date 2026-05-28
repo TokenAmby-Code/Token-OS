@@ -544,11 +544,13 @@ def test_tmux_prefix_space_launcher_uses_large_popup_without_enter_newline_hang(
     assert "command-prompt" not in bind_line
 
     popup = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt-popup").read_text(encoding="utf-8")
-    assert "IFS= read -r PROMPT_TEXT" in popup
-    assert "run-shell -b" in popup
+    assert "IFS= read -e -r -p" in popup
+    assert "TOKEN_API_DISPATCH_ORIGIN=d" in popup
+    assert "--target legion:new" in popup
+    assert "trap soft_cancel INT TERM" in popup
     assert "tmux-legion-prompt-popup.log" in popup
+    assert "tmux run-shell" not in popup
     assert "stty -echo -icanon" not in popup
-    assert 'tmux run-shell -b "tmux-run tmux-legion-prompt --prompt-file' in popup
 
     launcher = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt").read_text(encoding="utf-8")
     assert "TOKEN_API_DISPATCH_ORIGIN=d" in launcher
@@ -567,3 +569,32 @@ def test_fzf_launcher_expands_and_cli_prompt_retracts_idempotently():
     assert "--expand" in expand
     assert 'if [[ "$EXPAND" == true ]]' in expand
     assert 'if [[ "$WINDOW_ZOOMED" != "1" ]]' in expand
+
+
+def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == "resolve-pane --format id 2:NE" ]]; then echo somnium:NE; exit 0; fi\n'
+        'if [[ "$*" == "resolve-pane --format physical 2:NE" ]]; then echo %22; exit 0; fi\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "--target", "2:NE", "prompt"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "target:          2:NE" in result.stdout
+    assert "resolved_target: somnium:NE" in result.stdout
+    assert "%22" not in result.stdout

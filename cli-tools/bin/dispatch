@@ -45,6 +45,7 @@ Options:
   --gt | --no-gt               Golden Throne lane toggle (default: --gt)
   --zealotry <1-10>            Golden Throne zealotry (default: 5 with --gt, 3 with --no-gt)
   --sync                       Sync-session lane
+  --instance-type <type>        Explicit instance type (one_off, sync, golden_throne, hook_driven)
   --with-browser               Request browser MCP/profile metadata
   --with-desktop               Request desktop MCP/profile metadata
   --with-mcp <list>            Comma-separated MCP request metadata
@@ -86,6 +87,7 @@ TARGET=""
 GT_MODE=true
 ZEALOTRY=""
 SYNC=false
+INSTANCE_TYPE_OVERRIDE=""
 WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
@@ -129,6 +131,7 @@ while [[ $# -gt 0 ]]; do
     --no-gt) GT_MODE=false; shift ;;
     --zealotry) ZEALOTRY="${2:-}"; shift 2 ;;
     --sync) SYNC=true; shift ;;
+    --instance-type) INSTANCE_TYPE_OVERRIDE="${2:-}"; shift 2 ;;
     --with-browser) WITH_BROWSER=true; shift ;;
     --with-desktop) WITH_DESKTOP=true; shift ;;
     --with-mcp) WITH_MCP="${2:-}"; shift 2 ;;
@@ -227,6 +230,22 @@ sqlite_query_usv() {
 
 sql_literal() {
   printf "%s" "$1" | sed "s/'/''/g"
+}
+
+resolve_caller_instance_id() {
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  local pane_sql row
+  pane_sql="$(sql_literal "$TMUX_PANE")"
+  row="$(sqlite_query "
+    SELECT id
+    FROM claude_instances
+    WHERE tmux_pane = '${pane_sql}'
+      AND COALESCE(status, '') != 'stopped'
+    ORDER BY last_activity DESC
+    LIMIT 1;
+  ")"
+  [[ -n "$row" ]] && printf '%s' "$row"
+  return 0
 }
 
 infer_engine() {
@@ -625,7 +644,9 @@ fi
 
 dispatch_retract_after_cli_prompt
 
-if [[ -n "$RESUME_INSTANCE_TYPE" ]]; then
+if [[ -n "$INSTANCE_TYPE_OVERRIDE" ]]; then
+  INSTANCE_TYPE="$INSTANCE_TYPE_OVERRIDE"
+elif [[ -n "$RESUME_INSTANCE_TYPE" ]]; then
   INSTANCE_TYPE="$RESUME_INSTANCE_TYPE"
 elif $SYNC; then
   INSTANCE_TYPE="sync"
@@ -634,6 +655,8 @@ elif $GT_MODE; then
 else
   INSTANCE_TYPE="one_off"
 fi
+case "$INSTANCE_TYPE" in one_off|sync|golden_throne|hook_driven|archived) ;; *) err "--instance-type must be one of one_off, sync, golden_throne, hook_driven, archived"; exit 64 ;; esac
+if [[ "$INSTANCE_TYPE" == "hook_driven" ]]; then GT_MODE=false; SYNC=false; fi
 if [[ -z "$ZEALOTRY" ]]; then
   if $GT_MODE; then ZEALOTRY=5; else ZEALOTRY=3; fi
 fi
@@ -810,6 +833,57 @@ if [[ -n "$RESUME_ID" ]]; then
   fi
 fi
 
+resolve_dispatch_public_target() {
+  local target="$1" resolved
+  [[ -n "$target" ]] || return 0
+  [[ "$target" == *:new ]] && return 0
+  if command -v tmuxctl >/dev/null 2>&1; then
+    resolved="$(tmuxctl resolve-pane --format id "$target" 2>/dev/null || true)"
+    [[ -n "$resolved" ]] && printf '%s' "$resolved"
+  fi
+}
+
+resolve_dispatch_physical_target() {
+  local target="$1" resolved
+  [[ -n "$target" ]] || return 1
+  if command -v tmuxctl >/dev/null 2>&1; then
+    resolved="$(tmuxctl resolve-pane --format physical "$target" 2>/dev/null || true)"
+    [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
+  fi
+  printf '%s' "$target"
+}
+
+assert_dispatch_target_unoccupied() {
+  local pane="$1" meta cmd title
+  [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
+  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}' 2>/dev/null || true)"
+  [[ -n "$meta" ]] || return 0
+  cmd="${meta%%|*}"
+  title="${meta#*|}"
+  case "$cmd" in
+    node|claude|codex)
+      err "target pane $TARGET appears occupied (command=$cmd, title=$title); refusing to inject dispatch command"
+      err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
+      exit 73
+      ;;
+  esac
+  case "$title" in
+    ✳*|⠼*)
+      err "target pane $TARGET appears occupied (command=$cmd, title=$title); refusing to inject dispatch command"
+      err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
+      exit 73
+      ;;
+  esac
+}
+
+if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
+  public_resolved="$(resolve_dispatch_public_target "$TARGET")"
+  [[ -n "$public_resolved" ]] && RESOLVED_TARGET="$public_resolved"
+  physical_resolved="$(resolve_dispatch_physical_target "$TARGET")"
+  [[ -n "$physical_resolved" ]] && RESOLVED_PHYSICAL_TARGET="$physical_resolved"
+fi
+
+
 DISCORD_BOT=""
 if [[ -n "$DISCORD_CHANNEL" ]]; then
   PERSONA_LOWER="$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')"
@@ -829,6 +903,11 @@ if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
   MCP_DECISION="requested: $(IFS=,; echo "${MCP_REQUESTS[*]}")"
 fi
 
+AUTO_PARENT_INSTANCE_ID="${TOKEN_API_PARENT_INSTANCE_ID:-}"
+if [[ -z "$AUTO_PARENT_INSTANCE_ID" && -z "$RESUME_ID" ]]; then
+  AUTO_PARENT_INSTANCE_ID="$(resolve_caller_instance_id)"
+fi
+
 WRAPPER_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
 COMMON_ENV=(
   "TOKEN_API_LAUNCHER=dispatch"
@@ -843,7 +922,7 @@ COMMON_ENV=(
   "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
   "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
   "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
-  "TOKEN_API_PARENT_INSTANCE_ID=${TOKEN_API_PARENT_INSTANCE_ID:-}"
+  "TOKEN_API_PARENT_INSTANCE_ID=${AUTO_PARENT_INSTANCE_ID}"
   "TOKEN_API_DISPATCH_MCP=${MCP_DECISION}"
   "TOKEN_API_DISPATCH_WITH_BROWSER=${WITH_BROWSER}"
   "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
@@ -859,7 +938,7 @@ fi
 if [[ -n "$RESUME_PRIMARCH" ]]; then
   COMMON_ENV+=("TOKEN_API_PRIMARCH=${RESUME_PRIMARCH}")
 fi
-if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "${TOKEN_API_PARENT_INSTANCE_ID:-}" ]]; then
+if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "$AUTO_PARENT_INSTANCE_ID" ]]; then
   COMMON_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${RESUME_PARENT_INSTANCE_ID}")
 fi
 if [[ -n "$RESUME_DISCORD_CHANNEL" && -z "$DISCORD_CHANNEL" ]]; then
@@ -873,8 +952,9 @@ fi
 build_agent_command() {
   local -a cmd envs
   envs=("${COMMON_ENV[@]}")
-  if [[ -n "${RESOLVED_TARGET:-}" && "$RESOLVED_TARGET" != *:* ]]; then
-    envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_TARGET}" "TMUX_PANE=${RESOLVED_TARGET}")
+  if [[ -n "${RESOLVED_PHYSICAL_TARGET:-${RESOLVED_TARGET:-}}" ]]; then
+    envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_PHYSICAL_TARGET:-$RESOLVED_TARGET}")
+    envs+=("TMUX_PANE=${RESOLVED_PHYSICAL_TARGET:-$RESOLVED_TARGET}")
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
@@ -940,7 +1020,7 @@ build_dispatch_command() {
     [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
     [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
   fi
-  if $SYNC; then args+=(--sync); elif $GT_MODE; then args+=(--gt); else args+=(--no-gt); fi
+  if [[ -n "$INSTANCE_TYPE_OVERRIDE" ]]; then args+=(--instance-type "$INSTANCE_TYPE_OVERRIDE"); elif $SYNC; then args+=(--sync); elif $GT_MODE; then args+=(--gt); else args+=(--no-gt); fi
   args+=(--zealotry "$ZEALOTRY")
   $WITH_BROWSER && args+=(--with-browser)
   $WITH_DESKTOP && args+=(--with-desktop)
@@ -1002,7 +1082,9 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # via our own send-keys after a settle — mirroring the tmux_target dance
   # below. Without this, `source <tmpfile>` arrives as e.g. `ur <tmpfile>`
   # and the agent never launches.
-  pane_id="$(tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --command "clear")"
+  # Automated dispatch should not steal the operator's camera/focus. The new pane
+  # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
+  pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   tmux send-keys -t "$pane_id" "$STAGED_COMMAND" Enter
@@ -1017,11 +1099,13 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
     err "tmux is required for target $TARGET"
     exit 69
   fi
-  tmux send-keys -t "$TARGET" "clear" Enter
+  PHYSICAL_TARGET="${RESOLVED_PHYSICAL_TARGET:-$(resolve_dispatch_physical_target "$TARGET")}"
+  assert_dispatch_target_unoccupied "$PHYSICAL_TARGET"
+  tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  tmux send-keys -t "$TARGET" "$STAGED_COMMAND" Enter
-  target_display="$TARGET"
+  tmux send-keys -t "$PHYSICAL_TARGET" "$STAGED_COMMAND" Enter
+  target_display="${RESOLVED_TARGET:-$TARGET}"
   if [[ "$TARGET" == %* ]]; then
     if command -v pane_id_of >/dev/null 2>&1; then
       human_target="$(pane_id_of "$TARGET" 2>/dev/null || true)"

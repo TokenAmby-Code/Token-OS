@@ -6,7 +6,7 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 - **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
 - **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
-- **Ops cockpit**: rich live visualization work belongs in the TypeScript web cockpit; tmux owns active-pane operational keybindings
+- **Ops cockpit**: Terminus pilot TypeScript web cockpit is live at `/ui/ops`, polling `/api/ui/ops/state` every 2s; tmux owns active-pane operational keybindings
 - **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
 
 ### Multi-Device Network
@@ -20,7 +20,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
 - **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
 - `token-restart` orchestrates Mac restart → WSL restart
-- Android/browser clients can reach the Mac API over Tailscale. New rich visualization work should target the TypeScript web cockpit.
+- Android/browser clients can reach the Mac API over Tailscale. New rich visualization work should target the local TypeScript web cockpit at `/ui/ops`.
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
 
 ### Ops Cockpit Direction
@@ -29,11 +29,12 @@ High-level directive: see `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Somnium
 
 The current direction is:
 
-- The TypeScript web cockpit is the primary rich visualization surface for dashboards, graphs, timelines, and cohesive state views.
+- The Terminus pilot TypeScript web cockpit at `/ui/ops` is the primary live rich visualization surface for dashboards, graphs, timelines, and cohesive state views. It is backed by `GET /api/ui/ops/state` and has been live-verified to update on distraction/attention changes.
+- Desktop browser, Android browser over Tailscale, and optionally Obsidian iframe/webview are viewing frames.
 - tmux owns active-pane operator keybindings for the somnium pane/window.
-- Token-API remains the authoritative state/mutation backend.
+- Token-API remains the initial authoritative state/mutation backend and read-model aggregator, with eventual state migration governed by the Terminus Decree.
 
-New actions should be Token-API/CLI mutations invoked from tmux keybindings. New rich display work should target the TypeScript cockpit.
+Do not build parallel live surfaces. New actions should be Token-API/CLI mutations invoked from tmux keybindings. New rich display work should target the TypeScript cockpit.
 
 ## Key Files
 
@@ -44,6 +45,9 @@ New actions should be Token-API/CLI mutations invoked from tmux keybindings. New
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
 | `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
+| `web/ops/` | Vite React TypeScript source for the Terminus ops cockpit |
+| `ui/ops/` | Committed Vite build served at `/ui/ops` by FastAPI |
+| `docs/ops-cockpit.md` | Ops cockpit route, state contract, and dev workflow |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
 
@@ -195,6 +199,16 @@ POST   /satellite/restart               # Proxy restart to WSL satellite
 GET    /health                          # Health check (includes tts_backend status)
 ```
 
+### Ops Cockpit
+
+```text
+GET    /ui/ops                          # Terminus Vite React cockpit shell
+GET    /ui/ops/{asset_path}             # Built cockpit assets only; path traversal guarded
+GET    /api/ui/ops/state                # Aggregate read model for cockpit UI
+```
+
+`/api/ui/ops/state` is the browser cockpit boundary. It aggregates timer/break state, desktop+phone attention state, work-state evidence, active instances with session-doc/stale/zealotry/Golden-Throne fields, recent events, cron summary, and TTS/enforcement summaries. Frontend code must consume this aggregate instead of reading SQLite or stitching many legacy endpoints together. See `docs/ops-cockpit.md`.
+
 ### Satellite Endpoints (WSL, port 7777)
 ```
 GET    /health                          # Heartbeat (includes tts_engine + kvm_watchdog status)
@@ -345,7 +359,7 @@ Preferred model:
 - tmux key tables own active-pane operator shortcuts for the somnium pane/window
 - CLI/API commands perform mutations
 - the TUI publishes selected UI object state, for example `~/.claude/tui-state/somnium.json`
-- HTML/Obsidian renders rich dashboards and graphs from Token-API read models
+- TypeScript web cockpit at `/ui/ops` renders rich dashboards and graphs from Token-API aggregate read models initially, later from Terminus type-safe state where appropriate
 
 Selection-state files are operator UI state only. Commands consuming them must validate referenced instances/jobs against Token-API before mutating anything.
 
@@ -610,7 +624,8 @@ Location: `main.py` - `handle_post_tool_use()`, `clear_stale_processing_flags()`
 ## Development Notes
 
 - Server runs on port 7777 (hardcoded in `main.py`)
-- New rich dashboards should be implemented in the TypeScript cockpit.
+- The live rich dashboard route is `/ui/ops`; source is `web/ops`, built assets are committed in `ui/ops`, and the state boundary is `/api/ui/ops/state`.
+- Do not create new static/legacy HTML dashboards; use the TypeScript cockpit.
 - New operational shortcuts should be tmux active-pane bindings calling CLI/API commands.
 
 ## Potential Future Tools/Skills
