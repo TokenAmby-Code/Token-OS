@@ -24,8 +24,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .stack import CUSTODES_ROLE, add_orchestrator_stack_pane
 from .resolver import resolve_pane
+from .stack import CUSTODES_ROLE, add_orchestrator_stack_pane
 from .tmux_adapter import TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
