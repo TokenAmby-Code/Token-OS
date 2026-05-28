@@ -279,6 +279,17 @@ def _restore_expanded_grid(
 
 
 def normalize_window(adapter: TmuxAdapter, session_name: str, window_index: int) -> str:
+    from .focus_guard import preserve_focus
+
+    with preserve_focus(
+        adapter,
+        source="tmuxctl normalize",
+        attempted_target=f"{session_name}:{window_index}",
+    ):
+        return _normalize_window_impl(adapter, session_name, window_index)
+
+
+def _normalize_window_impl(adapter: TmuxAdapter, session_name: str, window_index: int) -> str:
     target = f"{session_name}:{window_index}"
     window_name = _show(adapter, target, "#{window_name}")
     window_base = _window_base(window_name)

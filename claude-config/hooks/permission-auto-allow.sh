@@ -12,9 +12,8 @@ INPUT=$(cat 2>/dev/null || echo "{}")
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 
 # Tools that must reach the user — no auto-allow
-# ExitPlanMode MUST stay here: plan-gatekeeper.sh's second pass outputs nothing
-# (yielding to native dialog). Without passthrough, this hook races gatekeeper
-# and auto-approves ExitPlanMode, bypassing the "clear context" dialog entirely.
+# ExitPlanMode MUST stay here: plan-gatekeeper.sh yields to the native
+# clear-context dialog and only a time-boxed modal watcher may approve it.
 PASSTHROUGH_TOOLS="AskUserQuestion ExitPlanMode"
 
 for pt in $PASSTHROUGH_TOOLS; do

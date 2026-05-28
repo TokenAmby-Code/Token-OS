@@ -66,6 +66,20 @@ link "$CONFIG_DIR/commands" "$CLAUDE_HOME/commands"  "commands/"
 link "$CONFIG_DIR/skills"   "$CLAUDE_HOME/skills"    "skills/"
 link "$CONFIG_DIR/CLAUDE.md" "$HOME/CLAUDE.md"       "~/CLAUDE.md"
 
+# 1b. Expose the same canonical skills to Codex without touching bundled .system skills.
+echo ""
+echo "--- Shared Skills ---"
+SKILLS_SYNC="$CONFIG_DIR/../cli-tools/bin/skills-sync"
+if [[ -x "$SKILLS_SYNC" ]]; then
+  if "$SKILLS_SYNC" --install; then
+    echo "  OK: Claude/Codex shared skills synced"
+  else
+    echo "  WARN: skills-sync reported issues; run: $SKILLS_SYNC --check"
+  fi
+else
+  echo "  WARN: skills-sync not found at $SKILLS_SYNC"
+fi
+
 # 2. Install settings.json (copy, not symlink — Claude Code writes to it)
 echo ""
 echo "--- Settings ---"

@@ -43,6 +43,17 @@ test "hello" --dry-run    # Show payload
 See `test --help` for full documentation.
 
 
+
+### Shared agent skills (`skills-sync`)
+
+`skills-sync --check` verifies that the NAS-backed canonical skills in `claude-config/skills` are visible to Claude and Codex and resolve to the same real paths. `skills-sync --install` repairs symlinks only: it keeps `~/.codex/skills/.system` intact and exposes shared skills under both `~/.agents/skills` and `~/.codex/skills`.
+
+```bash
+skills-sync --check
+skills-sync --install
+skills-sync --check --json
+```
+
 ### Live agent pane prompt delivery (`agent-cmd`)
 
 `agent-cmd` is the canonical command for submitting text into an existing Claude/Codex prompt pane. It normalizes payloads and uses the hardened literal-send + delayed double-submit sequence through `tmuxctl`; `claude-cmd` remains as a compatibility wrapper. Use this for live prompt injection instead of raw `tmux send-keys ... Enter`. See `cli-tools/docs/pane-prompt-delivery.md`.
@@ -50,6 +61,14 @@ See `test --help` for full documentation.
 ### Managed tmux stack dispatch (`tmuxctl stack`)
 
 `tmuxctl` is the single pane-backed dispatch primitive for managed stack pages. Use `tmuxctl stack add legion` to allocate a typed worker pane, or `tmuxctl stack dispatch legion --command ...` to allocate and launch in one step. Entry points such as `dispatch`, Prefix+Space (`tmux-legion-prompt`), Golden Throne resume fallback, `work-loop`, and pane demotion route through this tmuxctl stack code instead of raw `tmux split-window`. See `cli-tools/docs/managed-stack-dispatch.md`.
+
+### tmux focus guard (`tmuxctl focus_guard`)
+
+Automation must never steal the operator's tmux focus. Use `preserve_focus(...)` around tmux cleanup/layout paths that can change selection, and use `tmuxctl allow-human-mechanicus-focus --client '#{client_tty}'` for explicit UI navigation into mechanicus. Do not use timeout-based overrides for normal mouse/key navigation. See `cli-tools/docs/tmux-focus-guard.md`.
+
+### Pane-bound assertion (`tmuxctl assert-instance`)
+
+`tmuxctl assert-instance --pane <target>` is the public assertion/check-and-repair primitive for pane-backed agents. It is pane-type-bound: persona panes self-heal or receive `/persona <expected>`, stack workers are retired/pruned when dead, and palace/somnium panes only report truth while cleaning stale registry rows. Use it before automated injection; if it returns `action=persona_correction_sent`, settle and retry before sending the real payload. See `cli-tools/docs/managed-stack-dispatch.md`.
 
 ### Subagents (`subagent`)
 

@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# brief - One-shot inter-persona message primitive (fire-and-forget).
+# TAGS: trinity, ipc, brief
+# AUDIENCE: agent
+"""Fire-and-forget inter-persona message delivery.
+
+Usage:
+    brief --pane <id> "message"               # one pane
+    brief --pane <id> --pane <id2> "..."      # multiple panes (deduped)
+    brief --page <name|index|all> "..."       # whole page/window
+    brief --pane <id> --page palace "..."     # mixed (deduped across)
+    brief --ephemeral --pane <id> "..."       # side-channel (/btw or /side)
+    brief --json --pane <id> "..."            # machine-readable JSON
+
+Pane addressing accepts raw ids (``%23``), position ids (``somnium:SE``),
+or full triples (``main:2:SE``). Page names map to tmux window names:
+``palace``, ``somnium``, ``legion``, ``mechanicus``, ``all``, or a window
+index like ``2``.
+
+Duplicate prevention: a pane targeted by both ``--pane`` and a ``--page``
+that contains it receives the brief once.
+
+Spec: Mars/Tasks/trinity-chunk-1-talk-cli.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+
+
+def _err(msg: str) -> None:
+    print(f"brief: {msg}", file=sys.stderr)
+
+
+def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
+    url = f"{TOKEN_API_URL}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="brief",
+        description="Fire-and-forget inter-persona message delivery.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--pane",
+        action="append",
+        default=[],
+        help="Target pane (repeatable; raw id or position id)",
+    )
+    parser.add_argument(
+        "--page",
+        action="append",
+        default=[],
+        help="Target page/window (repeatable; palace|somnium|legion|mechanicus|all|<index>)",
+    )
+    parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Use the side-channel (/btw or /side) — no context burn on target",
+    )
+    parser.add_argument(
+        "--caller",
+        default=None,
+        help="Caller pane id (defaults to $TMUX_PANE)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_out",
+        action="store_true",
+        help="Emit JSON result instead of human text",
+    )
+    parser.add_argument("message", help="The message body")
+    args = parser.parse_args(argv)
+
+    if not args.pane and not args.page:
+        parser.error("at least one --pane or --page is required")
+
+    body = {
+        "caller_pane": args.caller or os.environ.get("TMUX_PANE"),
+        "panes": args.pane,
+        "pages": args.page,
+        "payload": args.message,
+        "ephemeral": args.ephemeral,
+    }
+    try:
+        result = _post("/api/brief/send", body, timeout=60.0)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+        except Exception:
+            detail = str(exc)
+        _err(f"send failed: {detail}")
+        return 1
+    except urllib.error.URLError as exc:
+        _err(f"Token-API unreachable at {TOKEN_API_URL}: {exc.reason}")
+        return 1
+
+    if args.json_out:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("status") == "ok" else 1
+
+    status = result.get("status")
+    delivered = result.get("delivered", 0)
+    resolved = result.get("resolved", []) or []
+    unresolved = result.get("unresolved", []) or []
+
+    if status == "no_targets":
+        _err("no targets resolved" + (f" (unresolved: {unresolved})" if unresolved else ""))
+        return 1
+
+    targets = ", ".join(
+        f"{r.get('position_id') or r.get('pane_id')}"
+        for r in resolved
+    )
+    eph = " (ephemeral)" if args.ephemeral else ""
+    print(f"[brief{eph}] delivered={delivered}/{len(resolved)} → {targets}")
+    for r in resolved:
+        if r.get("status") not in {"sent", "pending"}:
+            _err(
+                f"  {r.get('position_id') or r.get('pane_id')}: "
+                f"status={r.get('status')} error={r.get('error') or ''}"
+            )
+    if unresolved:
+        for u in unresolved:
+            _err(f"  unresolved {u.get('source')}={u.get('spec')} ({u.get('reason')})")
+    return 0 if delivered > 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

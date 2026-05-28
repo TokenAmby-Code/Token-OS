@@ -241,7 +241,9 @@ def test_mechanicus_spillover_worker_reconciles_without_numeric_label(app_env, m
         return None
 
     async def run():
-        result = await hooks.reconcile_hook_subscriptions(hooks.HookReconcileRequest(page="mechanicus"))
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
         assert result["created"] == 1
         assert result["subscriptions"][0]["target_instance_id"] == "worker-spill"
 
@@ -260,7 +262,9 @@ def test_mechanicus_fg_and_admin_are_never_subscription_targets(app_env):
     _insert_instance(app_env.db_path, "admin-1", pane="%51", pane_label="mechanicus:admin")
 
     async def run():
-        result = await hooks.reconcile_hook_subscriptions(hooks.HookReconcileRequest(page="mechanicus"))
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
         assert result["created"] == 0
         assert result["skipped"] == 2
 
@@ -283,8 +287,12 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
     _insert_instance(app_env.db_path, "worker-4", pane="%61", pane_label="mechanicus:1")
 
     async def run():
-        first = await hooks.reconcile_hook_subscriptions(hooks.HookReconcileRequest(page="mechanicus"))
-        second = await hooks.reconcile_hook_subscriptions(hooks.HookReconcileRequest(page="mechanicus"))
+        first = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
+        second = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
         assert first["created"] == 1
         assert second["existing"] == 1
 

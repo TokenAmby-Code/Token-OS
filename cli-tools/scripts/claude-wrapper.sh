@@ -161,9 +161,10 @@ if $PRINT_MODE; then
 
   tmuxctl_bin="$(cd "$(dirname "$0")/../bin" && pwd)/tmuxctl"
   pane_id="$(
-    "$tmuxctl_bin" stack dispatch "$dispatch_base" \
+    IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" stack dispatch "$dispatch_base" \
       --session "$dispatch_session" \
       --cwd "$WORKING_DIR" \
+      --no-focus \
       --command "$cmd" 2>/dev/null
   )" || {
     echo "failed to dispatch print-mode agent to $DISPATCH_TARGET_WINDOW" >&2

@@ -100,10 +100,21 @@ if [[ -n "$RESUME_ID" ]]; then
     RESUME_CMD="dispatch --id ${RESUME_ID}"
     [[ -n "$PANE" ]] && RESUME_CMD+=" --pane ${PANE}"
 fi
+OLD_PWD="$(_tmux display-message -p '#{pane_current_path}' 2>/dev/null || printf '%s' "$HOME")"
+[[ -z "$OLD_PWD" ]] && OLD_PWD="$HOME"
+HISTORY_CMD=""
+if [[ -n "$RESUME_CMD" ]]; then
+    HISTORY_CMD="cd $(printf '%q' "$OLD_PWD") && $RESUME_CMD"
+fi
 
-# Stage resume command in shell history, then clear
+# Move the visible shell home, clear, then stage a history command that returns
+# to the old pane directory before resuming.
 PANE_SHELL=$(_tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo "")
-case "$PANE_SHELL" in
-    *zsh*)  _tmux send-keys "print -s $(printf '%q' "$RESUME_CMD") && clear" Enter ;;
-    *)      _tmux send-keys "history -s $(printf '%q' "$RESUME_CMD") && clear" Enter ;;
-esac
+if [[ -z "$HISTORY_CMD" ]]; then
+    _tmux send-keys "cd ~ && clear" Enter
+else
+    case "$PANE_SHELL" in
+        *zsh*)  _tmux send-keys "cd ~ && clear && print -s $(printf '%q' "$HISTORY_CMD")" Enter ;;
+        *)      _tmux send-keys "cd ~ && clear && history -s $(printf '%q' "$HISTORY_CMD")" Enter ;;
+    esac
+fi

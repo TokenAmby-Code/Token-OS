@@ -36,6 +36,10 @@ _PANE_TARGET_COMMANDS = {
 _PANE_OPTION_COMMANDS = {"set-option", "set", "show-options", "show"}
 _PANE_TARGET_FLAGS = {"-t", "-s"}
 _SLOT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+_AUTOMATION_FOCUS_ENVS = {
+    "IMPERIUM_TMUX_AUTOMATION",
+    "TOKEN_API_INTERNAL_DISPATCH",
+}
 
 
 def normalize_prompt_payload(text: str) -> str:
@@ -114,6 +118,19 @@ def _command_has_pane_option_scope(args: tuple[str, ...]) -> bool:
     return any(arg.startswith("-") and "p" in arg for arg in args[1:])
 
 
+def _target_arg(args: list[str], flag: str = "-t") -> str:
+    for idx, arg in enumerate(args):
+        if arg == flag and idx + 1 < len(args):
+            return args[idx + 1]
+        if arg.startswith(flag) and arg != flag:
+            return arg[len(flag) :]
+    return ""
+
+
+def _has_flag(args: list[str], flag: str) -> bool:
+    return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
+
+
 class TmuxAdapter:
     """Small wrapper around raw tmux commands.
 
@@ -156,6 +173,62 @@ class TmuxAdapter:
             idx += 1
         return resolved
 
+    def _mechanicus_focus_guard_blocks(self, args: list[str]) -> bool:
+        """Fail-closed: no focus move into mechanicus without an explicit short override."""
+        if not args:
+            return False
+        if os.environ.get("IMPERIUM_TMUX_FOCUS_RESTORE") == "1":
+            return False
+        command = args[0]
+        target = ""
+        focus_command = False
+        if command == "select-pane":
+            # select-pane -P/-T changes pane style/title, not the active camera.
+            if any(arg == "-P" or arg == "-T" for arg in args[1:]):
+                return False
+            target = _target_arg(args)
+            if not target:
+                return False
+            focus_command = True
+        elif command in {"select-window", "switch-client"}:
+            target = _target_arg(args)
+            if not target:
+                return False
+            focus_command = True
+        elif command in {"split-window", "new-window"}:
+            # Detached creation is safe; foreground creation in mechanicus changes camera.
+            if _has_flag(args, "-d"):
+                return False
+            target = _target_arg(args)
+            if not target:
+                return False
+            focus_command = True
+        else:
+            return False
+
+        from .focus_guard import (
+            log_blocked,
+            maybe_open_override_from_env,
+            override_active,
+            target_is_mechanicus,
+        )
+
+        automation = any(os.environ.get(name) for name in _AUTOMATION_FOCUS_ENVS)
+        mechanicus = target_is_mechanicus(self, target)
+        if not mechanicus and not (automation and focus_command):
+            return False
+        if os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") == "1":
+            return False
+        if mechanicus and (
+            maybe_open_override_from_env(
+                self, target=target, command=command, surface="tmux-adapter"
+            )
+            or override_active(self)
+        ):
+            return False
+        log_blocked(self, target=target, command=command, surface="tmux-adapter", argv=args)
+        return True
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
@@ -174,6 +247,8 @@ class TmuxAdapter:
                 self.last_send_gate_result = gate
                 return ""
         resolved_args = self._resolve_tmux_args(args_tuple)
+        if self._mechanicus_focus_guard_blocks(resolved_args):
+            return ""
         proc = subprocess.run(
             [self.tmux_binary, *resolved_args],
             text=True,

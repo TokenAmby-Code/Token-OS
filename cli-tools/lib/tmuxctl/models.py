@@ -79,6 +79,9 @@ class InstanceRegistryEntry:
     pre_stop_status: InstanceStatus
     is_subagent: bool = False
     legion: str = ""
+    tab_name: str = ""
+    instance_type: str = ""
+    engine: str = ""
     last_activity: str = ""
     stopped_at: str = ""
 

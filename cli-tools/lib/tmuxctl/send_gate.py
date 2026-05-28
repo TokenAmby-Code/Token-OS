@@ -41,7 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -108,6 +108,7 @@ def _quiet_config() -> tuple[int, int, str]:
 def _local_now(now: datetime | None = None) -> datetime:
     _, _, tz_name = _quiet_config()
     # Fail-open: a misconfigured timezone must never raise out of the gate.
+    tz: tzinfo
     try:
         tz = ZoneInfo(tz_name)
     except Exception:

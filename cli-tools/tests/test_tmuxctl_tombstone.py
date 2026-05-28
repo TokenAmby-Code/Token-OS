@@ -66,34 +66,34 @@ def _workspace(*panes: PaneSnapshot) -> WorkspaceSnapshot:
 
 
 def test_direct_physical_pane_resolves_to_itself():
-    workspace = _workspace(_pane("%1", "palace:SW"))
+    workspace = _workspace(_pane("%1", "palace:S"))
 
     resolved = resolve_pane_in_snapshot(workspace, "%1")
 
     assert resolved.pane_id == "%1"
-    assert resolved.chain == ("palace:SW",)
+    assert resolved.chain == ("palace:S",)
 
 
 def test_logical_slot_resolves_to_physical_pane():
-    workspace = _workspace(_pane("%1", "palace:SW"))
+    workspace = _workspace(_pane("%1", "palace:S"))
 
-    resolved = resolve_pane_in_snapshot(workspace, "palace:SW")
-
-    assert resolved.pane_id == "%1"
-
-
-def test_legacy_logical_slot_alias_resolves_to_canonical_pane():
-    workspace = _workspace(_pane("%1", "palace:NW"))
-
-    resolved = resolve_pane_in_snapshot(workspace, "palace:TL")
+    resolved = resolve_pane_in_snapshot(workspace, "palace:S")
 
     assert resolved.pane_id == "%1"
 
 
-def test_canonical_logical_slot_resolves_to_legacy_pane_before_mutation():
-    workspace = _workspace(_pane("%1", "palace:TL"))
+def test_canonical_logical_slot_resolves_to_canonical_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
 
-    resolved = resolve_pane_in_snapshot(workspace, "palace:NW")
+    resolved = resolve_pane_in_snapshot(workspace, "palace:N")
+
+    assert resolved.pane_id == "%1"
+
+
+def test_canonical_logical_slot_resolves_existing_pane():
+    workspace = _workspace(_pane("%1", "palace:N"))
+
+    resolved = resolve_pane_in_snapshot(workspace, "palace:N")
 
     assert resolved.pane_id == "%1"
 
@@ -106,10 +106,10 @@ def test_positional_window_index_slot_resolves_live_pane():
     assert resolved.pane_id == "%1"
 
 
-def test_positional_window_index_legacy_slot_resolves_canonical_pane():
+def test_positional_window_index_canonical_slot_resolves_canonical_pane():
     workspace = _workspace(_pane("%1", "palace:N"))
 
-    resolved = resolve_pane_in_snapshot(workspace, "1:NW")
+    resolved = resolve_pane_in_snapshot(workspace, "1:N")
 
     assert resolved.pane_id == "%1"
 
@@ -117,51 +117,51 @@ def test_positional_window_index_legacy_slot_resolves_canonical_pane():
 def test_positional_window_name_slot_resolves_live_pane():
     workspace = _workspace(_pane("%2", "somnium:SE", window="somnium"))
 
-    resolved = resolve_pane_in_snapshot(workspace, "somnium:BR")
+    resolved = resolve_pane_in_snapshot(workspace, "somnium:SE")
 
     assert resolved.pane_id == "%2"
 
 
 def test_single_tombstone_resolves_to_target():
     workspace = _workspace(
-        _pane("%1", "palace:SW", kind=PaneKind.TOMBSTONE, target="%9"),
-        _pane("%9", "audience:palace:SW", window="_palace_audience"),
+        _pane("%1", "palace:S", kind=PaneKind.TOMBSTONE, target="%9"),
+        _pane("%9", "audience:palace:S", window="_palace_audience"),
     )
 
-    resolved = resolve_pane_in_snapshot(workspace, "palace:SW")
+    resolved = resolve_pane_in_snapshot(workspace, "palace:S")
 
     assert resolved.pane_id == "%9"
-    assert resolved.chain == ("palace:SW", "audience:palace:SW")
+    assert resolved.chain == ("palace:S", "audience:palace:S")
 
 
 def test_double_tombstone_resolves_to_final_target():
     workspace = _workspace(
-        _pane("%1", "legion:custodes", kind=PaneKind.TOMBSTONE, target="palace:NE"),
-        _pane("%2", "palace:NE", kind=PaneKind.TOMBSTONE, target="%9"),
-        _pane("%9", "audience:palace:NE", window="_palace_audience"),
+        _pane("%1", "legion:custodes", kind=PaneKind.TOMBSTONE, target="palace:N"),
+        _pane("%2", "palace:N", kind=PaneKind.TOMBSTONE, target="%9"),
+        _pane("%9", "audience:palace:N", window="_palace_audience"),
     )
 
     resolved = resolve_pane_in_snapshot(workspace, "legion:custodes")
 
     assert resolved.pane_id == "%9"
-    assert resolved.chain == ("legion:custodes", "palace:NE", "audience:palace:NE")
+    assert resolved.chain == ("legion:custodes", "palace:N", "audience:palace:N")
 
 
 def test_missing_tombstone_target_errors_clearly():
-    workspace = _workspace(_pane("%1", "palace:SW", kind=PaneKind.TOMBSTONE, target="%404"))
+    workspace = _workspace(_pane("%1", "palace:S", kind=PaneKind.TOMBSTONE, target="%404"))
 
     with pytest.raises(ValueError, match="target not found: %404"):
-        resolve_pane_in_snapshot(workspace, "palace:SW")
+        resolve_pane_in_snapshot(workspace, "palace:S")
 
 
 def test_tombstone_cycle_errors_clearly():
     workspace = _workspace(
-        _pane("%1", "palace:SW", kind=PaneKind.TOMBSTONE, target="palace:NE"),
-        _pane("%2", "palace:NE", kind=PaneKind.TOMBSTONE, target="palace:SW"),
+        _pane("%1", "palace:S", kind=PaneKind.TOMBSTONE, target="palace:N"),
+        _pane("%2", "palace:N", kind=PaneKind.TOMBSTONE, target="palace:S"),
     )
 
     with pytest.raises(ValueError, match="tombstone cycle detected"):
-        resolve_pane_in_snapshot(workspace, "palace:SW")
+        resolve_pane_in_snapshot(workspace, "palace:S")
 
 
 def test_audience_window_base_strips_stack_spill_suffixes():
@@ -178,7 +178,7 @@ def test_audience_window_base_does_not_strip_non_audience_names():
 def test_audience_window_warns_when_slot_is_split():
     warnings = _window_warnings(
         "_palace_audience",
-        ["audience:palace:SW", "audience:palace:NE"],
+        ["audience:palace:S", "audience:palace:N"],
         ["%1", "%2"],
         focused=False,
         grid_expanded="none",
@@ -208,7 +208,7 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
     class FakeAdapter:
         def show_pane_option(self, pane_id: str, option: str) -> str:
             if pane_id == "%9" and option == "@PANE_ID":
-                return "audience:palace:NE"
+                return "audience:palace:N"
             return ""
 
     selected: list[str] = []
@@ -219,9 +219,9 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
         lambda _adapter, _target: PaneResolution(
             requested="%1",
             pane_id="%9",
-            pane_role="audience:palace:NE",
+            pane_role="audience:palace:N",
             pane_kind=PaneKind.AUDIENCE,
-            chain=("palace:NE", "audience:palace:NE"),
+            chain=("palace:N", "audience:palace:N"),
         ),
     )
     monkeypatch.setattr(
@@ -232,7 +232,7 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
 
     result = audience_module.audience_jump(FakeAdapter(), "%1")
 
-    assert result == "selected palace:N via palace:NE -> palace:NE"
+    assert result == "selected palace:N via palace:N -> palace:N"
     assert "%9" not in result
     assert selected == ["%9"]
 

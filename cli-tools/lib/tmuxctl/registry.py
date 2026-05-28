@@ -48,6 +48,9 @@ def build_registry_snapshot(
                 ),
                 is_subagent=bool(row.get("is_subagent", False)),
                 legion=str(row.get("legion", "") or ""),
+                tab_name=str(row.get("tab_name", "") or ""),
+                instance_type=str(row.get("instance_type", "") or ""),
+                engine=str(row.get("engine", "") or ""),
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
             )

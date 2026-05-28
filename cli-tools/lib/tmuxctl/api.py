@@ -116,19 +116,27 @@ def update_instance_activity(instance_id: str, action: str = "prompt_submit") ->
 
 def log_event(event_type: str, *, instance_id: str = "", details: dict | None = None) -> None:
     api_url = _token_api_url().rstrip("/")
-    payload = json.dumps(
-        {"event_type": event_type, "instance_id": instance_id or None, "details": details or {}}
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{api_url}/api/events/log",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
+        # Serialize inside the try: telemetry is best-effort, so a
+        # non-serializable `details` payload must not raise into callers.
+        # `default=str` coerces stragglers (Paths, datetimes, etc.).
+        payload = json.dumps(
+            {
+                "event_type": event_type,
+                "instance_id": instance_id or None,
+                "details": details or {},
+            },
+            default=str,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{api_url}/api/events/log",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=3):
             return
-    except (OSError, urllib.error.URLError):
+    except (OSError, urllib.error.URLError, TypeError, ValueError):
         return
 
 

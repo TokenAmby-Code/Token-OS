@@ -80,8 +80,8 @@ fi
 target="${TMUX_SESSION}:${TMUX_WINDOW}"
 pane_id="$(tmux split-window -t "$target" -d -P -F '#{pane_id}' -c "$WORKDIR")"
 tmux select-layout -t "$target" tiled >/dev/null 2>&1 || true
-tmux select-window -t "$target"
-tmux select-pane -t "$pane_id"
+IMPERIUM_ALLOW_TMUX_FOCUS=1 IMPERIUM_ALLOW_MECHANICUS_FOCUS=1 tmux select-window -t "$target"
+IMPERIUM_ALLOW_TMUX_FOCUS=1 IMPERIUM_ALLOW_MECHANICUS_FOCUS=1 tmux select-pane -t "$pane_id"
 
 prompt="A quiet-mode state buster fired tonight (${hit}). Resume the quiet-hours implementation thread. Start by checking the Token-API worktree, current tests, and recent quiet_state_buster events. Keep the work scoped to the quiet timer state, state-buster resume behavior, and any verification needed from the previous context."
 
