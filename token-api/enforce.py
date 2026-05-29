@@ -24,8 +24,6 @@ ENFORCE_MIN_INTENSITY = 25
 class EnforceRequest(BaseModel):
     message: str
     intensity: int = 50
-    distraction_source: str | None = None
-    force_device: str | None = None
     source: str = "api"
     context: dict | None = None
 
@@ -85,8 +83,6 @@ async def enforce(request: EnforceRequest) -> dict:
         NotifyRequest(
             message=request.message,
             type="tts",
-            distraction_source=request.distraction_source,
-            force_device=request.force_device,
         )
     )
 
@@ -95,8 +91,6 @@ async def enforce(request: EnforceRequest) -> dict:
         details={
             "source": request.source,
             "intensity": intensity,
-            "distraction_source": request.distraction_source,
-            "force_device": request.force_device,
             "message": request.message[:200],
             "pavlok": pavlok_result,
             "notify": notify_result,
