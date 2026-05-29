@@ -1457,6 +1457,54 @@ def test_state_validate_accepts_query_params(app_env):
     resp = client.post("/api/state/validate?app=youtube&assert=true")
     assert resp.status_code == 409
     assert resp.json()["match"] is False
+    assert resp.json()["status_code"] == 409
+
+
+def test_state_validate_accepts_youtube_state_alias_and_expected(app_env):
+    from fastapi.testclient import TestClient
+
+    app_env.main.PHONE_STATE.update(
+        {"current_app": "com.google.android.youtube", "is_distracted": True}
+    )
+    client = TestClient(app_env.main.app)
+
+    resp = client.post(
+        "/api/state/validate",
+        json={"state": "youtube", "expected": "true"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["match"] is True
+    assert body["key"] == "app.youtube"
+    assert body["status_code"] == 200
+
+
+def test_state_validate_backfills_false_app_assertion(app_env):
+    from fastapi.testclient import TestClient
+
+    app_env.main.PHONE_STATE.update(
+        {
+            "current_app": "youtube",
+            "app_opened_at": datetime.now().isoformat(),
+            "is_distracted": True,
+            "last_activity": datetime.now().isoformat(),
+        }
+    )
+    client = TestClient(app_env.main.app)
+
+    resp = client.post(
+        "/api/state/validate",
+        json={"app": "youtube", "assert": "false", "backfill": True, "source": "pytest"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["match"] is True
+    assert body["observed"] is False
+    assert body["backfilled"] is True
+    assert app_env.main.PHONE_STATE["current_app"] is None
+    assert app_env.main.PHONE_STATE["is_distracted"] is False
 
 
 @pytest.mark.asyncio
