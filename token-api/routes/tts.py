@@ -48,6 +48,7 @@ from shared import (
     is_phone_reachable,
     is_satellite_tts_available,
     log_event,
+    resolve_tmux_pane_id,
 )
 
 logger = logging.getLogger("token_api")
@@ -614,6 +615,148 @@ def _set_tts_state(pane_id: str | None, state: str):
         pass  # fire and forget
 
 
+# ============ Playback Focus Snap ============
+# When a TTS item begins playback (the moment the dispatcher transitions
+# tts_current None -> item), snap the operator's tmux focus to the originating
+# pane and zoom it. Speaking implies "respond to me" — focus should follow.
+# See: Mars/Tasks/TTS Playback Focus Snap.md. Local-only (v1): only the machine
+# that owns the pane snaps; cross-machine speakers do not trigger remote focus.
+
+
+@functools.lru_cache(maxsize=1)
+def _local_device_name() -> str | None:
+    """This machine's device identity (e.g. "Mac-Mini", "TokenPC").
+
+    Lazily imported from imperium_config: routes.tts is imported before main.py
+    inserts cli-tools/lib onto sys.path, so a module-level import would fail.
+    """
+    try:
+        from imperium_config import cfg
+
+        return cfg("device_name")
+    except Exception:
+        return None
+
+
+def _tmux(args: list[str], timeout: float = 2) -> subprocess.CompletedProcess | None:
+    """Run a tmux command, returning the CompletedProcess (or None on error).
+
+    Centralizes tmux invocation so the focus-snap path is monkeypatchable and
+    never raises into playback. Run off the event loop via asyncio.to_thread.
+    """
+    try:
+        return subprocess.run(
+            ["tmux", *args], capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except Exception:
+        return None
+
+
+async def _focus_and_zoom_pane(pane_id: str) -> dict:
+    """Focus `pane_id` and ensure it is the zoomed pane in its window.
+
+    Zoom-dedup rules (ticket): if the speaker is already the zoomed pane, leave
+    it (don't toggle off). If a *different* pane is zoomed, unzoom it first, then
+    zoom the speaker — never stack zooms.
+    """
+    actions: list[str] = []
+
+    # Inspect the target's window: which pane is active, and is it zoomed.
+    info = await asyncio.to_thread(
+        _tmux,
+        ["list-panes", "-t", pane_id, "-F", "#{pane_active} #{pane_id} #{window_zoomed_flag}"],
+    )
+    active_pane: str | None = None
+    zoomed = False
+    if info is not None and getattr(info, "returncode", 1) == 0:
+        for line in (info.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                is_active, pid, zflag = parts[0], parts[1], parts[2]
+                if zflag == "1":
+                    zoomed = True
+                if is_active == "1":
+                    active_pane = pid
+
+    already_zoomed_on_target = zoomed and active_pane == pane_id
+
+    # A different pane holds the zoom — unzoom it before focusing the speaker.
+    if zoomed and not already_zoomed_on_target:
+        await asyncio.to_thread(_tmux, ["resize-pane", "-Z", "-t", active_pane or pane_id])
+        actions.append("unzoom_other")
+
+    await asyncio.to_thread(_tmux, ["select-pane", "-t", pane_id])
+    actions.append("select")
+
+    if not already_zoomed_on_target:
+        await asyncio.to_thread(_tmux, ["resize-pane", "-Z", "-t", pane_id])
+        actions.append("zoom")
+
+    return {"focused": True, "actions": actions}
+
+
+async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
+    """Snap tmux focus + zoom to the pane that originated this TTS item.
+
+    Fire-and-forget: NEVER raises into the playback path. A snap miss (dead
+    pane, remote machine, no pane, voice-chat/Discord backend) silently skips
+    while playback proceeds. Resolves the pane via the standard pane-identity
+    surface (canonical target -> live %id), not raw %NN hand-rolling.
+    """
+    try:
+        if item is None or not getattr(item, "instance_id", None):
+            return {"snapped": False, "reason": "no_instance"}
+
+        # Look up the live instance identity at playback time (handles the
+        # "instance died between queue and playback" case naturally).
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT device_id, tmux_pane, tts_mode FROM claude_instances WHERE id = ?",
+                (item.instance_id,),
+            )
+            row = await cursor.fetchone()
+
+        if not row:
+            return {"snapped": False, "reason": "instance_gone"}
+
+        device_id = row["device_id"]
+        tmux_pane = row["tmux_pane"]
+        tts_mode = row["tts_mode"]
+
+        # Voice-chat: the operator is conversing by voice, not reading the pane.
+        if tts_mode == "voice-chat":
+            return {"snapped": False, "reason": "voice_chat"}
+
+        # Local-only snap: only the machine that owns the pane may snap focus.
+        local = _local_device_name()
+        if not local or device_id != local:
+            return {"snapped": False, "reason": "remote_pane", "device_id": device_id}
+
+        # Custodes/cron-originated TTS with no real pane: nothing to snap to.
+        if not tmux_pane:
+            return {"snapped": False, "reason": "no_pane"}
+
+        # Discord voice backend: audio plays in the VC, not at a tmux pane.
+        try:
+            routing = resolve_tts_device(instance_id=item.instance_id)
+            if routing.get("device") == "discord":
+                return {"snapped": False, "reason": "discord_backend"}
+        except Exception:
+            pass  # routing probe is best-effort; never block the snap on it
+
+        pane_id = await resolve_tmux_pane_id(tmux_pane)
+        if not pane_id:
+            return {"snapped": False, "reason": "pane_dead"}
+
+        result = await _focus_and_zoom_pane(pane_id)
+        logger.info(f"TTS focus snap -> {pane_id} ({result.get('actions')})")
+        return {"snapped": True, "pane_id": pane_id, **result}
+    except Exception as e:
+        logger.warning(f"TTS focus snap failed (non-fatal): {e}")
+        return {"snapped": False, "reason": "error", "error": str(e)}
+
+
 async def tts_queue_worker():
     """Background worker that processes TTS hot queue sequentially.
 
@@ -633,6 +776,10 @@ async def tts_queue_worker():
                     tts_current = None
 
             if tts_current:
+                # Playback start (None -> item): snap operator focus + zoom to
+                # the speaking pane. Best-effort; never fails the playback path.
+                await _snap_focus_to_speaker(tts_current)
+
                 # Log TTS starting
                 await log_event(
                     "tts_playing",
@@ -737,7 +884,7 @@ async def tts_queue_worker():
                 await asyncio.sleep(0.1)
 
         except Exception as e:
-            print(f"TTS worker error: {e}")
+            logger.error(f"TTS worker error: {e}")
             await asyncio.sleep(1)
 
 
