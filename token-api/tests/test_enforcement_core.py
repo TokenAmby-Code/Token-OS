@@ -1899,7 +1899,10 @@ async def test_negative_break_first_fire_is_rep1_intensity40(app_env, monkeypatc
     assert len(calls) == 1
     req = calls[0]
     assert req.intensity == 40
-    assert req.distraction_source == "negative_break"
+    # distraction_source/force_device were retired with the comms-router
+    # unification — there is one geofence-first router and no per-call device
+    # override (the old "negative_break" value was not even a real device).
+    assert not hasattr(req, "distraction_source")
     assert req.source == "negative_break_loop"
     assert req.context["rep"] == 1
     assert req.context["break_balance_ms"] == -5_000
