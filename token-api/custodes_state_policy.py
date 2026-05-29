@@ -193,8 +193,8 @@ def evaluate_state_event(
         f"State hook: {event.event_type}. Observed {observed}. "
         f"{direction} Be direct; do not over-explain. "
         "AFK rule: state hooks imply the Emperor is not watching this thread. "
-        "Reach him out-of-band — TTS (`tts ...` / /api/notify/tts), "
-        "phone notification (/api/notify/push), or the Discord daily thread. "
+        "Reach him out-of-band — TTS (`tts ...` / /api/notify), "
+        "or the Discord daily thread. "
         "Do NOT reply with in-thread text only; in-thread text is invisible until he returns."
     )
     return CustodesIntervention(

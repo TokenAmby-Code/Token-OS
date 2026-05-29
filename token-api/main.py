@@ -107,8 +107,8 @@ from routes.hooks import (
 )
 from routes.tts import (
     _is_quiet_hours,
+    dispatch_notify,
     get_tts_queue_status,
-    play_sound,
     speak_tts,
     tts_queue_worker,
 )
@@ -751,6 +751,11 @@ class StateValidateRequest(BaseModel):
     name: str | None = None
     app: str | None = None
     assert_: str | bool | int | float | None = Field(default=None, alias="assert")
+    expected: str | bool | int | float | None = None
+    value: str | bool | int | float | None = None
+    assertion: str | bool | int | float | None = None
+    backfill: bool = False
+    source: str | None = None
 
 
 # ============ Phone Activity Models ============
@@ -3663,9 +3668,10 @@ async def _announce_idle_if_all_stopped(
     Emitted only on the productivity_inactive WORKING -> IDLE transition (mode
     ``idle``); a distraction-driven inactive transition lands in BREAK, a
     different signal, and is intentionally silent here. The spoken assertion is
-    routed through ``speak_tts`` — the geofence-first core that ``/api/notify/tts``
-    delegates to (Discord VC -> geofence/phone-when-away -> WSL -> phone -> Mac) —
-    NOT phone-direct. There is no debounce: MODE_CHANGED fires exactly once per
+    routed through ``speak_tts`` — the geofence-first router core (Discord VC ->
+    geofence/phone-when-away -> WSL -> phone -> Mac) that the comms middleware
+    (``dispatch_notify`` / ``/api/notify``) uses — NOT phone-direct. There is no
+    debounce: MODE_CHANGED fires exactly once per
     transition, so the assertion is inherently single-shot. Returns True if it
     spoke. Never raises into the timer loop.
     """
@@ -3673,7 +3679,7 @@ async def _announce_idle_if_all_stopped(
         return False
     # Record the state transition unconditionally (it is a real timer event),
     # then gate only the spoken assertion on quiet hours — parity with the
-    # /api/notify/tts quiet-hours behaviour and _dispatch_timer_intervention.
+    # dispatch_notify quiet-hours behaviour and _dispatch_timer_intervention.
     await log_event(
         "all_instances_stopped",
         details={"old_mode": old_mode, "new_mode": new_mode},
@@ -5595,14 +5601,13 @@ async def _golden_throne_handle_ready_for_ack(
     banner_body = _golden_throne_ready_for_ack_banner(human_pane_surface)
     phone_result = None
     try:
-        phone_result = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 30,
-                "tts_text": tts_body,
-                "banner_text": banner_body,
-            },
+        # Route through the comms middleware: spoken part follows geofence
+        # (home → WSL/Discord, away → phone); the buzz + banner ride along.
+        phone_result = await dispatch_notify(
+            tts_body,
+            vibe=30,
+            banner=banner_body,
+            instance_id=session_id,
         )
     except Exception as e:
         phone_result = {"success": False, "error": str(e)}
@@ -6086,14 +6091,12 @@ async def golden_throne_followup(session_id: str):
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
         try:
-            phone_result = await asyncio.to_thread(
-                _send_to_phone,
-                "/notify",
-                {
-                    "vibe": vibe_intensity,
-                    "tts_text": _golden_throne_tts_text(tab_name, human_pane_surface),
-                    "banner_text": _golden_throne_banner_text(tab_name, human_pane_surface),
-                },
+            # Comms middleware owns routing: TTS by geofence, buzz + banner ride along.
+            phone_result = await dispatch_notify(
+                _golden_throne_tts_text(tab_name, human_pane_surface),
+                vibe=vibe_intensity,
+                banner=_golden_throne_banner_text(tab_name, human_pane_surface),
+                instance_id=session_id,
             )
         except Exception as e:
             phone_result = {"success": False, "error": str(e)}
@@ -10139,13 +10142,13 @@ from routes.tts import init_deps as tts_init_deps
 
 tts_init_deps(send_to_phone=_send_to_phone)
 
-# Wire enforce + notify dependencies (atomic emitter + device-aware dispatcher)
+# Wire enforce dependencies (atomic emitter). The notify path is the unified
+# router core (dispatch_notify); notify.py is a thin typed shim over it and
+# needs no device wiring of its own.
 from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
-from notify import init_deps as notify_init_deps
 
-notify_init_deps(send_to_phone=_send_to_phone)
 enforce_init_deps(is_quiet_hours=is_quiet_hours)
 
 # Wire voice route dependencies
@@ -10223,7 +10226,6 @@ def start_enforcement_cascade(app_name: str) -> None:
                 EnforceRequest(
                     message=f"Close {app_name}",
                     intensity=50,
-                    distraction_source="phone",
                     source=f"phone_distraction_{app_name}",
                 )
             )
@@ -10629,15 +10631,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
         enforce_result = close_distraction_windows()
         send_pavlok_stimulus(reason="desktop_distraction_blocked")
+        # Buzz + banner attention signal through the comms middleware (no speech).
         asyncio.create_task(
-            asyncio.to_thread(
-                _send_to_phone,
-                "/notify",
-                {
-                    "vibe": 30,
-                    "banner_text": f"Desktop blocked: {detected_mode}",
-                },
-            )
+            dispatch_notify("", tts=False, vibe=30, banner=f"Desktop blocked: {detected_mode}")
         )
 
         await log_event(
@@ -13817,6 +13813,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         reset_events=shift_rows,
         gap_threshold_seconds=gap_threshold_seconds,
         no_sample_reason=fallback_reason,
+        break_penalty_multiplier=BREAK_PENALTY_MULTIPLIER,
     )
 
     segments = []
@@ -14664,7 +14661,6 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
             EnforceRequest(
                 message=_negative_break_message(prospective_rep, bal),
                 intensity=intensity,
-                distraction_source="negative_break",
                 source="negative_break_loop",
                 context={"rep": prospective_rep, "break_balance_ms": bal},
             )
@@ -14745,21 +14741,16 @@ async def timer_worker():
                     _session_start_ms = now_ms
                     _mode_change_count += 1
                     if dispatched:
-                        # Enforce: close distraction windows + Pavlok + phone notify
+                        # Enforce: close distraction windows + Pavlok, then one
+                        # comms-router call — spoken part geofence-routed, buzz +
+                        # banner ride along (no callsite-level split).
                         close_distraction_windows()
                         send_pavlok_stimulus(reason="distraction_timeout")
                         asyncio.create_task(
-                            asyncio.to_thread(
-                                _send_to_phone,
-                                "/notify",
-                                {
-                                    "vibe": 30,
-                                    "banner_text": "distraction logged",
-                                },
+                            dispatch_notify(
+                                "distraction logged", vibe=30, banner="distraction logged"
                             )
                         )
-                        loop = asyncio.get_event_loop()
-                        loop.run_in_executor(None, speak_tts, "distraction logged")
                     continue
                 elif event == TimerEvent.MODE_CHANGED and (
                     has_idle_timeout or has_distraction_timeout
@@ -15006,14 +14997,7 @@ async def _async_enforce_twitter_timeout():
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
 
-    # Desktop: notification sound + TTS
-    play_sound()
-    try:
-        await asyncio.to_thread(subprocess.Popen, ["say", "-v", "Daniel", "twitter timeout"])
-    except Exception:
-        pass
-
-    # Pavlok is queued separately; /enforce is notification/TTS/Spotify only.
+    # Pavlok zap is device-control (the watch is geofence-agnostic).
     pavlok_result = await asyncio.to_thread(
         send_pavlok_stimulus,
         "zap",
@@ -15021,13 +15005,14 @@ async def _async_enforce_twitter_timeout():
         "twitter_timeout",
         True,
     )
-    result = await asyncio.to_thread(
-        _send_to_phone,
-        "/enforce",
-        {
-            "tts_text": "twitter timeout",
-            "banner_text": "Twitter timeout",
-        },
+    # Spoken alert + banner go through the comms middleware (geofence-routed).
+    # NOTE: the legacy phone `/enforce` call also triggered a phone-side Spotify
+    # redirect/pause; that side effect is deferred to the granular `/play`
+    # endpoint (see the comms-router follow-up ticket) rather than re-bypassing
+    # the router with a phone-direct enforce payload.
+    result = await dispatch_notify(
+        "twitter timeout",
+        banner="Twitter timeout",
     )
 
     # Force timer into BREAK mode (clear any existing manual mode first)
@@ -15111,16 +15096,13 @@ async def enforce_break_exhausted_impl() -> dict:
         enforced_any = True
 
     if enforced_any:
-        # Phone prompt only; Pavlok is handled by the backlog ack parry deadline.
-        phone_notify = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 60,
-                "beep": 40,
-                "tts_text": "break exhausted",
-                "banner_text": "break exhausted",
-            },
+        # Through the comms middleware: spoken part geofence-routed, buzz/beep +
+        # banner ride along. Pavlok zap is handled by the backlog ack parry deadline.
+        phone_notify = await dispatch_notify(
+            "break exhausted",
+            vibe=60,
+            beep=40,
+            banner="break exhausted",
         )
 
     return {
@@ -21298,20 +21280,61 @@ def _normalize_state_assertion(value) -> str | bool | int | float | None:
     return value
 
 
+def _state_app_aliases(app_name: str | None) -> set[str]:
+    raw = (app_name or "").strip().lower()
+    aliases = {raw} if raw else set()
+    canonical = MACRODROID_TRIGGER_APP_MAP.get(raw)
+    if canonical:
+        aliases.add(canonical.lower())
+    if raw in PHONE_APP_DISPLAY_NAMES:
+        display = PHONE_APP_DISPLAY_NAMES.get(raw)
+        if display:
+            aliases.add(display.lower())
+    # Common YouTube aliases seen from MacroDroid/ReVanced/package telemetry.
+    if raw in PHONE_YOUTUBE_APP_KEYS or raw in {"revanced", "app.revanced.android.youtube"}:
+        aliases.update(PHONE_YOUTUBE_APP_KEYS)
+        aliases.add("app.revanced.android.youtube")
+    return {alias for alias in aliases if alias}
+
+
 def _state_app_matches(app_name: str | None) -> bool:
-    expected = (app_name or "").strip().lower()
-    current = (PHONE_STATE.get("current_app") or "").strip().lower()
-    if not expected:
+    expected_aliases = _state_app_aliases(app_name)
+    current_aliases = _state_app_aliases(PHONE_STATE.get("current_app"))
+    if not expected_aliases:
         return False
-    return PHONE_STATE.get("is_distracted", False) and current == expected
+    return PHONE_STATE.get("is_distracted", False) and bool(expected_aliases & current_aliases)
+
+
+def _state_assertion_expected(assertion: StateValidateRequest):
+    for value in (assertion.assert_, assertion.expected, assertion.value, assertion.assertion):
+        if value is not None:
+            return _normalize_state_assertion(value)
+    return None
+
+
+def _state_validate_app_name(request: StateValidateRequest, key: str | None) -> str | None:
+    if request.app:
+        return request.app
+    if not key:
+        return None
+    lowered = key.strip().lower()
+    if lowered.startswith("app."):
+        return lowered.split(".", 1)[1]
+    if lowered in PHONE_DISTRACTION_APPS or lowered in MACRODROID_TRIGGER_APP_MAP:
+        return lowered
+    if lowered in PHONE_YOUTUBE_APP_KEYS or lowered in {"revanced", "app.revanced.android.youtube"}:
+        return lowered
+    return None
 
 
 async def _state_validator_observed(request: StateValidateRequest):
     key = request.state or request.var or request.name
-    if request.app and not key:
+    app_name = _state_validate_app_name(request, key)
+    if app_name:
         return {
-            "key": f"app.{request.app}",
-            "observed": _state_app_matches(request.app),
+            "key": f"app.{app_name}",
+            "app": app_name,
+            "observed": _state_app_matches(app_name),
             "details": {
                 "current_app": PHONE_STATE.get("current_app"),
                 "is_distracted": PHONE_STATE.get("is_distracted", False),
@@ -21350,9 +21373,6 @@ async def _state_validator_observed(request: StateValidateRequest):
                 "work_state.productivity_active": work_state.productivity_active,
             }
         )
-    if key.startswith("app."):
-        app_name = key.split(".", 1)[1]
-        observed_map[key] = _state_app_matches(app_name)
     if key.startswith("activity."):
         icon_key = key.split(".", 1)[1]
         observed_map[key] = next(
@@ -21365,6 +21385,40 @@ async def _state_validator_observed(request: StateValidateRequest):
     return {"key": key, "observed": observed_map[key], "details": {}}
 
 
+async def _state_backfill_app_assertion(
+    assertion: StateValidateRequest, observed: dict, expected: str | bool | int | float | None
+) -> dict | None:
+    if not assertion.backfill or not isinstance(expected, bool):
+        return None
+    app_name = observed.get("app") or _state_validate_app_name(
+        assertion, assertion.state or assertion.var or assertion.name
+    )
+    if not app_name:
+        return None
+    if _normalize_state_assertion(observed.get("observed")) == expected:
+        return None
+    action = "open" if expected else "close"
+    before = {
+        "current_app": PHONE_STATE.get("current_app"),
+        "is_distracted": PHONE_STATE.get("is_distracted", False),
+    }
+    result = await handle_phone_activity(
+        PhoneActivityRequest(app=app_name, action=action, package=app_name)
+    )
+    after = {
+        "current_app": PHONE_STATE.get("current_app"),
+        "is_distracted": PHONE_STATE.get("is_distracted", False),
+    }
+    return {
+        "action": action,
+        "app": app_name,
+        "source": assertion.source or "state_validate",
+        "before": before,
+        "after": after,
+        "decision": result.model_dump() if hasattr(result, "model_dump") else result.dict(),
+    }
+
+
 def _state_validate_request_from_query(request: Request) -> StateValidateRequest:
     params = request.query_params
     return StateValidateRequest.model_validate(
@@ -21374,31 +21428,51 @@ def _state_validate_request_from_query(request: Request) -> StateValidateRequest
             "name": params.get("name"),
             "app": params.get("app"),
             "assert": params.get("assert"),
+            "expected": params.get("expected"),
+            "value": params.get("value"),
+            "assertion": params.get("assertion"),
+            "backfill": _normalize_state_assertion(params.get("backfill")) is True,
+            "source": params.get("source"),
         }
     )
 
 
 async def _validate_state_response(request: Request, assertion: StateValidateRequest):
     observed = await _state_validator_observed(assertion)
-    expected = _normalize_state_assertion(assertion.assert_)
+    expected = _state_assertion_expected(assertion)
     actual = _normalize_state_assertion(observed["observed"])
     matched = actual == expected
+    backfill = None
+
+    if not matched:
+        backfill = await _state_backfill_app_assertion(assertion, observed, expected)
+        if backfill:
+            observed = await _state_validator_observed(assertion)
+            actual = _normalize_state_assertion(observed["observed"])
+            matched = actual == expected
+
+    status_code = 200 if matched else 409
     payload = {
         "match": matched,
         "key": observed["key"],
         "expected": expected,
         "observed": actual,
         "details": observed["details"],
+        "status_code": status_code,
+        "backfilled": backfill is not None,
     }
+    if backfill:
+        payload["backfill"] = backfill
     await log_event(
         "state_validate",
         details={
             **payload,
             "method": request.method,
             "client": request.client.host if request.client else None,
+            "source": assertion.source,
         },
     )
-    return JSONResponse(status_code=200 if matched else 409, content=payload)
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @app.api_route("/api/state/validate", methods=["GET", "POST"])

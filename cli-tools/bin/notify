@@ -227,10 +227,12 @@ def main():
         if not args["message"]:
             print(f"{RED}Error: message required for --tts-only{RESET}", file=sys.stderr)
             sys.exit(1)
-        body = {"message": args["message"]}
+        # /api/notify is the single authoritative entry; with no tactile/banner
+        # fields it is a TTS-only request, routed by the geofence-first router.
+        body = {"message": args["message"], "tts": True}
         if args["voice"]:
             body["voice"] = args["voice"]
-        status, data = request("POST", "/api/notify/tts", body)
+        status, data = request("POST", "/api/notify", body)
         print_result(status, data, raw=args["raw"])
         return
 

@@ -77,18 +77,22 @@ def init_deps(*, send_to_phone=None):
 
 
 class NotifyRequest(BaseModel):
-    message: str
-    device_id: str | None = None  # If None, notify based on active instances
-    instance_id: str | None = None  # Notify specific instance's device
-    voice: str | None = None  # Override TTS voice
-    sound: str | None = None  # Override sound file
+    """Unified comms intent for the authoritative `POST /api/notify` entry.
 
+    Callers express intent — message + optional tactile/banner — and the router
+    (`dispatch_notify` → `resolve_tts_device`) owns device selection,
+    quiet-hours gating, and fanout. Callers do NOT pick a device/transport; the
+    retired `device_id`/`force_device`/`distraction_source` knobs let feature
+    code circumvent the geofence-first router, which is always a violation.
+    """
 
-class TTSRequest(BaseModel):
-    message: str
-    voice: str | None = None
-    rate: int = 0  # -10 to 10, 0 is normal speed
-    instance_id: str | None = None  # Track which instance triggered TTS
+    message: str = ""
+    tts: bool = True  # speak `message` via the geofence-first router
+    vibe: int | None = None  # phone/Pavlok tactile attention signal
+    beep: int | None = None  # phone/Pavlok tactile attention signal
+    banner: str | None = None  # phone banner text (defaults to message head)
+    voice: str | None = None  # optional TTS voice override
+    instance_id: str | None = None  # instance whose voice profile to use
 
 
 class SoundRequest(BaseModel):
@@ -561,6 +565,124 @@ def speak_tts(
 
     # device == "mac" (or unknown)
     return _finish(speak_tts_mac(message, voice, rate))
+
+
+async def dispatch_notify(
+    message: str,
+    *,
+    tts: bool = True,
+    vibe: int | None = None,
+    beep: int | None = None,
+    banner: str | None = None,
+    voice: str | None = None,
+    instance_id: str | None = None,
+    context: dict | None = None,
+) -> dict:
+    """Authoritative comms entry — the single front door to the router.
+
+    Feature code calls this in-process to notify the Emperor. One call carries
+    the whole intent (message + optional tactile/banner); the router owns:
+      * geofence-first TTS routing (Discord VC → WSL/phone-by-geofence → Mac)
+        via speak_tts()/resolve_tts_device();
+      * tactile (vibe/beep) + banner delivery as the phone attention signal;
+      * quiet-hours gating across the whole notification.
+
+    Spoken text NEVER goes phone-direct from here — it always flows through the
+    router, which decides the audible device. The phone leg below carries only
+    tactile + banner (device-control), never a tts_text payload. Splitting "TTS
+    to the router, banner straight to the phone" at a callsite, or reaching the
+    transport internals (_send_to_phone, speak_tts_{mac,wsl,discord}) directly,
+    circumvents this middleware and is always a violation.
+    """
+    if _is_quiet_hours():
+        logger.info(f"Notify suppressed (quiet hours): {(message or banner or '')[:80]}")
+        return {
+            "delivered": False,
+            "suppressed": True,
+            "reason": "quiet_hours",
+            "route": "suppressed",
+        }
+
+    loop = asyncio.get_event_loop()
+
+    # Resolve the instance's voice profile when one is named and no explicit
+    # voice override was given (mirrors the retired /api/notify/tts behavior).
+    wsl_voice = None
+    wsl_rate = None
+    if tts and message and instance_id and not voice:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT tts_voice FROM claude_instances WHERE id = ?", (instance_id,)
+                )
+                row = await cursor.fetchone()
+            if row and row["tts_voice"]:
+                wsl_voice = row["tts_voice"]
+                for p in PROFILES + FALLBACK_VOICES:
+                    if p["wsl_voice"] == wsl_voice:
+                        voice = p.get("mac_voice", "Daniel")
+                        wsl_rate = p.get("wsl_rate", 0)
+                        break
+        except Exception as e:
+            logger.warning(f"notify: voice profile lookup failed for {instance_id}: {e}")
+
+    tts_result = None
+    if tts and message:
+        tts_result = await loop.run_in_executor(
+            None,
+            functools.partial(speak_tts, message, voice, 0, instance_id, wsl_voice, wsl_rate),
+        )
+
+    # Tactile + banner are the phone attention signal. This is a *router*
+    # policy (the phone is currently the only tactile/banner surface), kept in
+    # the middleware — never decided at a callsite. When notif routing grows
+    # (e.g. Discord banners), it changes here, not at every caller.
+    phone_params: dict = {}
+    if vibe is not None:
+        phone_params["vibe"] = vibe
+    if beep is not None:
+        phone_params["beep"] = beep
+    banner_text = banner if banner is not None else (message[:100] if message else None)
+    if banner_text:
+        phone_params["banner_text"] = banner_text
+
+    tactile_result = None
+    if phone_params and _send_to_phone is not None:
+        tactile_result = await loop.run_in_executor(
+            None,
+            functools.partial(_send_to_phone, "/notify", phone_params),
+        )
+
+    delivered = bool(
+        (tts_result and tts_result.get("success"))
+        or (
+            tactile_result
+            and (tactile_result.get("success") or tactile_result.get("overall_success"))
+        )
+    )
+    route = tts_result.get("route") if tts_result else None
+    result = {
+        "delivered": delivered,
+        "route": route,
+        "tts": tts_result,
+        "tactile": tactile_result,
+    }
+    await log_event(
+        "notify",
+        instance_id=instance_id,
+        details={
+            "message": (message or "")[:200],
+            "tts": bool(tts and message),
+            "vibe": vibe,
+            "beep": beep,
+            "banner": banner_text,
+            "route": route,
+            "delivered": delivered,
+            "context": context,
+        },
+    )
+    return result
 
 
 # ============ TTS Queue System ============
@@ -1197,174 +1319,23 @@ async def get_tts_routing():
 
 @router.post("/api/notify")
 async def send_notification(request: NotifyRequest):
-    """Send notification to a device (sound + TTS or webhook)."""
-    results = {"sound": None, "tts": None, "webhook": None}
+    """Authoritative comms entry — the single public notification endpoint.
 
-    # Determine target device
-    device_id = request.device_id
-
-    if not device_id and request.instance_id:
-        # Look up instance to get device
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT device_id FROM claude_instances WHERE id = ?", (request.instance_id,)
-            )
-            row = await cursor.fetchone()
-            if row:
-                device_id = row["device_id"]
-
-    if not device_id:
-        device_id = "Mac-Mini"  # Default
-
-    # Get device config
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
-        device = await cursor.fetchone()
-
-    if not device:
-        raise HTTPException(status_code=404, detail=f"Device not found: {device_id}")
-
-    device = dict(device)
-    method = device.get("notification_method", "tts_sound")
-
-    if method == "tts_sound":
-        # Suppress sound + TTS during quiet hours (11 PM - 9 AM)
-        if _is_quiet_hours():
-            logger.info(f"Notification suppressed (quiet hours): {request.message[:80]}")
-            results["sound"] = {"success": True, "suppressed": True, "reason": "quiet_hours"}
-            results["tts"] = {"success": True, "suppressed": True, "reason": "quiet_hours"}
-        else:
-            # Desktop: play sound and speak
-            await log_event(
-                "tts_starting",
-                instance_id=request.instance_id,
-                device_id=device_id,
-                details={"message": request.message[:100], "voice": request.voice or "default"},
-            )
-            results["sound"] = play_sound(request.sound)
-            results["tts"] = speak_tts(request.message, request.voice)
-    elif method == "webhook":
-        # Mobile: v3 /notify with TTS + banner
-        notify_params = {
-            "tts_text": request.message[:300],
-            "banner_text": request.message[:100],
-            "vibe": 30,
-        }
-        if _send_to_phone:
-            results["webhook"] = _send_to_phone("/notify", notify_params)
-        else:
-            results["webhook"] = {"success": False, "error": "phone sender not initialized"}
-
-    # Derive a truthful top-level success/reason from the component that owns
-    # delivery for this device. Callers route on this without having to know the
-    # per-component envelope shape. `route` reflects where audio actually went.
-    if method == "webhook":
-        primary = results.get("webhook") or {}
-    else:
-        primary = results.get("tts") or {}
-    success = bool(primary.get("success"))
-    reason = primary.get("reason") if not success else None
-    route = primary.get("route") or (primary.get("method") if success else None)
-
-    # Log the notification event
-    await log_event(
-        "notification_sent",
-        device_id=device_id,
-        details={"message": request.message[:100], "results": results},
-    )
-
-    return {
-        "device_id": device_id,
-        "method": method,
-        "success": success,
-        "route": route,
-        "reason": reason,
-        "results": results,
-    }
-
-
-@router.post("/api/notify/tts")
-async def notify_tts(request: TTSRequest):
-    """Speak a message using TTS only — TTS-only sibling of the canonical
-    `POST /api/notify`.
-
-    Both endpoints delegate to the same routing core (`speak_tts`), so the TTS
-    result here matches `/api/notify`'s `results.tts`. `/api/notify` is the
-    canonical entry point (it also handles sound + device webhook + quiet-hours
-    fanout); use this one only when you want speech with no sound/banner.
-
-    The response always carries populated `success` / `method` / `route` /
-    `reason` so observability is never a null-triple (regression
-    `regression-notify-tts-endpoint-null-triple-2026-05-25`).
-
-    When instance_id is provided and no explicit voice is set, uses the
-    instance's assigned voice profile (WSL voice + Mac fallback).
+    Thin wrapper over the in-process `dispatch_notify` router core. Callers
+    express intent (message + optional tactile/banner); the router owns
+    geofence-first TTS routing, quiet-hours gating, and device fanout. There is
+    no caller-picks-a-device knob and no TTS-only sibling endpoint — speech
+    always goes through the same routing brain.
     """
-    if not request.message:
-        return {"success": False, "method": None, "route": None, "reason": "no_message"}
-
-    if _is_quiet_hours():
-        logger.info(f"TTS suppressed (quiet hours): {request.message[:80]}")
-        return {
-            "success": True,
-            "suppressed": True,
-            "method": "suppressed",
-            "route": "suppressed",
-            "reason": "quiet_hours",
-        }
-
-    # Resolve voice from instance profile when instance_id provided and no explicit voice
-    voice = request.voice
-    wsl_voice = None
-    wsl_rate = None
-    if request.instance_id and not request.voice:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE id = ?", (request.instance_id,)
-            )
-            row = await cursor.fetchone()
-        if row and row["tts_voice"]:
-            wsl_voice = row["tts_voice"]
-            # Look up full profile for Mac fallback and WSL rate
-            for p in PROFILES + FALLBACK_VOICES:
-                if p["wsl_voice"] == wsl_voice:
-                    voice = p.get("mac_voice", "Daniel")
-                    wsl_rate = p.get("wsl_rate", 0)
-                    break
-
-    # Log TTS starting
-    await log_event(
-        "tts_starting",
+    return await dispatch_notify(
+        request.message,
+        tts=request.tts,
+        vibe=request.vibe,
+        beep=request.beep,
+        banner=request.banner,
+        voice=request.voice,
         instance_id=request.instance_id,
-        details={"message": request.message[:100], "voice": wsl_voice or voice or "default"},
     )
-
-    # Run in executor to allow skip API to interrupt
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        functools.partial(
-            speak_tts,
-            request.message,
-            voice,
-            request.rate,
-            request.instance_id,
-            wsl_voice,
-            wsl_rate,
-        ),
-    )
-
-    # Log TTS result
-    await log_event(
-        "tts_completed",
-        instance_id=request.instance_id,
-        details={"message": request.message[:50], "success": result.get("success", False)},
-    )
-
-    return result
 
 
 @router.post("/api/notify/sound")
