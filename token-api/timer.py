@@ -59,6 +59,13 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
     TimerMode.SLEEPING: (0, 1),  # neutral
 }
 
+# Break-time burn penalty for undeclared/slacked break. Declared rest (manual
+# trigger == 'user') debits at 1.0x; everything else (idle_timeout / auto-break /
+# trigger None) debits at this rational multiplier. Held as (numerator,
+# denominator) so break_balance_ms stays an exact int. main.py reads the env
+# value and injects it — timer.py stays I/O-free per the module docstring.
+DEFAULT_BREAK_PENALTY_MULTIPLIER: tuple[int, int] = (3, 2)  # 1.5x
+
 # Timeouts
 IDLE_TIMEOUT_FROM_WORKING_MS = 420_000  # 7 minutes after productivity goes inactive
 IDLE_TIMEOUT_FROM_MULTITASKING_MS = 420_000  # 7 minutes after productivity goes inactive
@@ -94,7 +101,14 @@ class TimerEngine:
     State is three independent layers that compose into an effective mode.
     """
 
-    def __init__(self, now_mono_ms: int, reset_hour: int = 7):
+    def __init__(
+        self,
+        now_mono_ms: int,
+        reset_hour: int = 7,
+        break_penalty_multiplier: tuple[int, int] = DEFAULT_BREAK_PENALTY_MULTIPLIER,
+    ):
+        # Burn penalty for undeclared/slacked break, as an integer rational.
+        self._break_penalty_num, self._break_penalty_den = break_penalty_multiplier
         # Layer state
         self._activity: Activity = Activity.WORKING
         self._productivity_active: bool = True
@@ -803,7 +817,17 @@ class TimerEngine:
 
         elif mode == TimerMode.BREAK:
             self._total_break_time_ms += elapsed_ms
-            self._apply_break_delta(-elapsed_ms, result)
+            # Declared rest (trigger 'user') burns at base rate; undeclared /
+            # idle-timeout / auto-break (trigger 'idle_timeout' / None / other)
+            # burns at the penalty multiplier. Fail toward enforcement: treat a
+            # missing trigger as the slacked case. Integer rational keeps the
+            # balance exact.
+            trigger = self._manual_substate.get("trigger") if self._manual_substate else None
+            if trigger == "user":
+                break_debit_ms = elapsed_ms
+            else:
+                break_debit_ms = elapsed_ms * self._break_penalty_num // self._break_penalty_den
+            self._apply_break_delta(-break_debit_ms, result)
 
         # QUIET/SLEEPING: no accumulation
 

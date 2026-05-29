@@ -8539,7 +8539,33 @@ VALID_DETECTION_MODES = [
 ]
 
 # ============ Timer Engine ============
-timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
+# Break-time burn penalty for undeclared/slacked break (declared rest burns at
+# base rate). Read as a float here (I/O lives in main.py) and convert to an
+# integer rational (num, den) so break_balance_ms stays an exact int — the
+# engine divides it for productivity_score. Default 1.5x per the
+# Negative-Balance Break Enforcement Loop spec; Emperor may retune via env.
+BREAK_PENALTY_MULTIPLIER = float(os.environ.get("BREAK_PENALTY_MULTIPLIER", "1.5"))
+# Re-fire interval for the negative-break enforce loop (default 10 minutes).
+NEGATIVE_BREAK_REFIRE_INTERVAL_MS = int(
+    os.environ.get("NEGATIVE_BREAK_REFIRE_INTERVAL_MS", str(10 * 60 * 1000))
+)
+
+
+def _break_penalty_rational(multiplier: float) -> tuple[int, int]:
+    """Convert a decimal multiplier to an exact integer (num, den) rational.
+
+    Held over /1000 so the engine's `elapsed_ms * num // den` stays exact-int
+    for any millisecond tick (no float leak into break_balance_ms).
+    """
+    den = 1000
+    num = max(1, round(multiplier * den))
+    return num, den
+
+
+timer_engine = TimerEngine(
+    now_mono_ms=int(time.monotonic() * 1000),
+    break_penalty_multiplier=_break_penalty_rational(BREAK_PENALTY_MULTIPLIER),
+)
 shared.timer_engine = timer_engine
 
 
@@ -14578,6 +14604,79 @@ _current_session_id = 0
 _session_start_ms = 0
 _mode_change_count = 0
 
+# Caller-owned situation record for the negative-balance break enforce loop.
+# rep is owned here (per the Enforcement Repetition Counter decree), never on the
+# engine. In-memory; resets to rep0 on process restart (accepted — a restart
+# re-seeds and re-fires rep1 +10min later if still negative + on break).
+_negative_break_situation = {"rep": 0, "last_fire_mono_ms": None}
+
+
+def _negative_break_message(rep: int, balance_ms: int) -> str:
+    """Short spoken line for a negative-break enforce (kept terse for wsl_sapi)."""
+    debt_min = abs(balance_ms) // 60_000
+    return f"Break debt {debt_min} minutes. Back to work now."
+
+
+async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
+    """Negative-balance break enforce gate, evaluated once per timer tick.
+
+    Enforces (Pavlok zap + TTS) when the break balance is negative and the timer
+    is on break, escalating rep/intensity every NEGATIVE_BREAK_REFIRE_INTERVAL_MS.
+    Returns the enforce result dict when it fires, else None. Never raises into
+    the tick loop. See: Negative-Balance Break Enforcement Loop spec.
+    """
+    try:
+        sit = _negative_break_situation
+
+        # Double-fire avoidance: on the tick where balance crosses 0 → negative,
+        # the BREAK_EXHAUSTED handler fires the rep0 entry vibe. Seed the record
+        # (rep0, last_fire=now) and skip — the first zap (rep1) lands +10min later.
+        if TimerEvent.BREAK_EXHAUSTED in result.events:
+            sit["rep"] = 0
+            sit["last_fire_mono_ms"] = now_ms
+            return None
+
+        in_break = timer_engine.current_mode == TimerMode.BREAK
+        bal = timer_engine.break_balance_ms
+
+        # Reset: balance recovered, or left break (into working / any non-break).
+        if bal >= 0 or not in_break:
+            sit["rep"] = 0
+            sit["last_fire_mono_ms"] = None
+            return None
+
+        # Fire path: bal < 0 AND on break. Compute the prospective rep but only
+        # commit it (and last_fire) when the enforce actually fires — a blocked
+        # suppress-window must not silently escalate intensity (rep held).
+        last = sit["last_fire_mono_ms"]
+        if last is None:
+            # First fire of this situation. If we got here without a fresh
+            # BREAK_EXHAUSTED this tick, the entry vibe already happened earlier
+            # (e.g. idle-timeout into an already-negative balance) → zap at rep1.
+            prospective_rep = 1
+        elif now_ms - last >= NEGATIVE_BREAK_REFIRE_INTERVAL_MS:
+            prospective_rep = sit["rep"] + 1
+        else:
+            return None  # inside the re-fire interval — no-op this tick
+
+        intensity = min(30 + 10 * prospective_rep, 100)
+        enforce_result = await enforce(
+            EnforceRequest(
+                message=_negative_break_message(prospective_rep, bal),
+                intensity=intensity,
+                distraction_source="negative_break",
+                source="negative_break_loop",
+                context={"rep": prospective_rep, "break_balance_ms": bal},
+            )
+        )
+        if enforce_result.get("fired"):
+            sit["rep"] = prospective_rep
+            sit["last_fire_mono_ms"] = now_ms
+        return enforce_result
+    except Exception as exc:
+        print(f"TIMER: negative-break enforce gate error: {exc}")
+        return None
+
 
 async def timer_worker():
     """Background worker: ticks timer every 1s, persists state periodically."""
@@ -14761,6 +14860,13 @@ async def timer_worker():
                     asyncio.create_task(
                         push_phone_widget_async(timer_engine.current_mode.value, _active)
                     )
+
+            # Negative-balance break enforce loop — evaluated once per tick AFTER
+            # the event for-loop (the IDLE/DISTRACTION handlers `continue` it, so
+            # the gate must live outside it). Fires a zap + TTS while the break
+            # balance is negative and the timer is on break, escalating every
+            # 10 min. See: Negative-Balance Break Enforcement Loop spec.
+            await _negative_break_enforce_tick(now_ms, result)
 
             # Do not clear phone current_app merely because the last telemetry
             # heartbeat is old. Long-running video apps often emit one open event

@@ -934,25 +934,27 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     assert details["tmux_pane"] == "%132"
 
 
-def test_pavlok_guardrails_cover_cap_cooldown_quiet_and_contexts(app_env):
+def test_pavlok_guardrails_drop_cap_cooldown_keep_quiet_and_contexts(app_env):
+    """Cap + cooldown removed per Enforcement Dedup Removal; context guards kept."""
     fixed = datetime(2026, 5, 1, 14, 0, 0)
     phone_service = sys.modules["phone_service"]
+
+    # Old daily cap is gone — well past the former 6/day still allowed.
     phone_service.PAVLOK_STATE.update(
         {
             "zap_count_date": "2026-05-01",
-            "zap_count": 6,
+            "zap_count": 99,
             "last_zap_at": None,
             "last_soft_at": None,
         }
     )
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "daily_zap_cap"
+    assert phone_service._pavlok_guardrail_block("zap", fixed, True) is None
 
+    # Old cooldown is gone — a zap one minute after the last is still allowed.
     phone_service.PAVLOK_STATE.update({"zap_count": 0, "last_zap_at": fixed.isoformat()})
-    assert (
-        phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=5), True)["reason"]
-        == "cooldown"
-    )
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1), True) is None
 
+    # Context suppress-windows remain.
     phone_service.PAVLOK_STATE["last_zap_at"] = None
     phone_service.TTS_GLOBAL_MODE["mode"] = "silent"
     assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "quiet_mode"
@@ -961,6 +963,10 @@ def test_pavlok_guardrails_cover_cap_cooldown_quiet_and_contexts(app_env):
     phone_service.DESKTOP_STATE["in_meeting"] = True
     assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "meeting"
     phone_service.DESKTOP_STATE["in_meeting"] = False
+
+    phone_service.DESKTOP_STATE["club_context"] = True
+    assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "club_context"
+    phone_service.DESKTOP_STATE["club_context"] = False
 
 
 def test_phone_slay_the_spire_break_mode_does_not_create_ack(app_env):
@@ -1806,3 +1812,223 @@ def test_media_pause_falls_back_to_tts_when_phone_youtube_inactive(app_env, monk
     assert body["target"] == "tts"
     assert body["handled"] is True
     assert calls == ["toggle"]
+
+
+# ---- Negative-balance break enforcement loop ----
+
+
+def _patch_enforce(main, monkeypatch, fired=True):
+    """Record enforce() calls instead of firing a real Pavlok/TTS."""
+    calls = []
+
+    async def fake_enforce(request):
+        calls.append(request)
+        return {"fired": fired, "intensity": request.intensity}
+
+    monkeypatch.setattr(main, "enforce", fake_enforce)
+    return calls
+
+
+def _force_negative_break(main, balance_ms=-5_000):
+    """Put the timer engine into BREAK with a negative balance."""
+    main.timer_engine.enter_break(0)
+    main.timer_engine._break_balance_ms = balance_ms
+
+
+def _tick_result(*events):
+    return SimpleNamespace(events=list(events))
+
+
+@pytest.mark.asyncio
+async def test_negative_break_first_fire_is_rep1_intensity40(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -5_000)
+
+    out = await main._negative_break_enforce_tick(1_000, _tick_result())
+
+    assert out["fired"] is True
+    assert len(calls) == 1
+    req = calls[0]
+    assert req.intensity == 40
+    assert req.distraction_source == "negative_break"
+    assert req.source == "negative_break_loop"
+    assert req.context["rep"] == 1
+    assert req.context["break_balance_ms"] == -5_000
+    assert main._negative_break_situation["rep"] == 1
+    assert main._negative_break_situation["last_fire_mono_ms"] == 1_000
+
+
+@pytest.mark.asyncio
+async def test_negative_break_no_double_fire_on_break_exhausted_tick(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -500)
+
+    out = await main._negative_break_enforce_tick(
+        1_000, _tick_result(main.TimerEvent.BREAK_EXHAUSTED)
+    )
+
+    assert out is None
+    assert calls == []
+    # Entry tick seeds rep0 (the entry vibe), arming the +10min first zap.
+    assert main._negative_break_situation["rep"] == 0
+    assert main._negative_break_situation["last_fire_mono_ms"] == 1_000
+
+
+@pytest.mark.asyncio
+async def test_negative_break_first_zap_lands_ten_min_after_exhausted(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -50_000)
+    interval = main.NEGATIVE_BREAK_REFIRE_INTERVAL_MS
+
+    await main._negative_break_enforce_tick(1_000, _tick_result(main.TimerEvent.BREAK_EXHAUSTED))
+    # Still inside the interval — no zap yet.
+    await main._negative_break_enforce_tick(1_000 + interval - 1, _tick_result())
+    assert calls == []
+    # +10min after entry → first zap at rep1.
+    await main._negative_break_enforce_tick(1_000 + interval, _tick_result())
+    assert len(calls) == 1
+    assert calls[0].intensity == 40
+    assert calls[0].context["rep"] == 1
+
+
+@pytest.mark.asyncio
+async def test_negative_break_idle_timeout_into_negative_fires_rep1_immediately(
+    app_env, monkeypatch
+):
+    """No fresh zero-crossing (already negative) → entry fires rep1 at once."""
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -5_000)
+
+    out = await main._negative_break_enforce_tick(1_000, _tick_result())
+
+    assert out["fired"] is True
+    assert calls[0].context["rep"] == 1
+
+
+@pytest.mark.asyncio
+async def test_negative_break_refire_escalates_every_ten_min(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -600_000)
+    interval = main.NEGATIVE_BREAK_REFIRE_INTERVAL_MS
+
+    await main._negative_break_enforce_tick(1_000, _tick_result())  # rep1
+    await main._negative_break_enforce_tick(1_000 + 1_000, _tick_result())  # within interval → noop
+    await main._negative_break_enforce_tick(1_000 + interval, _tick_result())  # rep2
+    await main._negative_break_enforce_tick(1_000 + 2 * interval, _tick_result())  # rep3
+
+    assert [c.intensity for c in calls] == [40, 50, 60]
+    assert [c.context["rep"] for c in calls] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_negative_break_intensity_clamps_at_rep7(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -10_000_000)
+    interval = main.NEGATIVE_BREAK_REFIRE_INTERVAL_MS
+
+    t = 0
+    for _ in range(9):  # rep1..rep9
+        await main._negative_break_enforce_tick(t, _tick_result())
+        t += interval
+
+    assert [c.intensity for c in calls] == [40, 50, 60, 70, 80, 90, 100, 100, 100]
+    # rep counter itself may exceed 7 even though intensity is clamped.
+    assert calls[-1].context["rep"] == 9
+
+
+@pytest.mark.asyncio
+async def test_negative_break_resets_when_balance_recovers(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -5_000)
+
+    await main._negative_break_enforce_tick(1_000, _tick_result())  # rep1
+    assert main._negative_break_situation["rep"] == 1
+
+    main.timer_engine._break_balance_ms = 5_000  # recovered
+    out = await main._negative_break_enforce_tick(2_000, _tick_result())
+    assert out is None
+    assert main._negative_break_situation["rep"] == 0
+    assert main._negative_break_situation["last_fire_mono_ms"] is None
+
+    main.timer_engine._break_balance_ms = -5_000  # negative again → restart at rep1
+    await main._negative_break_enforce_tick(3_000, _tick_result())
+    assert main._negative_break_situation["rep"] == 1
+    assert calls[-1].intensity == 40
+
+
+@pytest.mark.asyncio
+async def test_negative_break_resets_when_leaving_break_for_working(app_env, monkeypatch):
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch)
+    _force_negative_break(main, -5_000)
+
+    await main._negative_break_enforce_tick(1_000, _tick_result())  # rep1
+    assert main._negative_break_situation["rep"] == 1
+
+    main.timer_engine._clear_manual_mode()  # leave break → WORKING
+    assert main.timer_engine.current_mode != main.TimerMode.BREAK
+    out = await main._negative_break_enforce_tick(2_000, _tick_result())
+
+    assert out is None
+    assert main._negative_break_situation["rep"] == 0
+    assert main._negative_break_situation["last_fire_mono_ms"] is None
+
+
+@pytest.mark.asyncio
+async def test_negative_break_blocked_enforce_holds_rep_and_last_fire(app_env, monkeypatch):
+    """Suppress-window block: rep held, last_fire not advanced — no silent escalation."""
+    main = app_env.main
+    calls = _patch_enforce(main, monkeypatch, fired=False)
+    _force_negative_break(main, -600_000)
+    interval = main.NEGATIVE_BREAK_REFIRE_INTERVAL_MS
+
+    await main._negative_break_enforce_tick(1_000, _tick_result())  # blocked first fire
+    assert main._negative_break_situation["rep"] == 0
+    assert main._negative_break_situation["last_fire_mono_ms"] is None
+
+    # A re-fire attempt well past the interval is still rep1 (no escalation while blocked).
+    await main._negative_break_enforce_tick(1_000 + 5 * interval, _tick_result())
+    assert [c.context["rep"] for c in calls] == [1, 1]
+    assert [c.intensity for c in calls] == [40, 40]
+
+
+def test_enforce_fires_past_old_daily_zap_cap(app_env):
+    """Keystone: cap removed — guardrail allows zaps far beyond the old 6/day."""
+    phone_service = sys.modules["phone_service"]
+    fixed = datetime(2026, 5, 1, 14, 0, 0)
+    phone_service.TTS_GLOBAL_MODE["mode"] = "verbose"
+    phone_service.DESKTOP_STATE.update(
+        {"in_meeting": False, "work_mode": "clocked_in", "location_zone": ""}
+    )
+    phone_service.PAVLOK_STATE.update(
+        {
+            "zap_count_date": "2026-05-01",
+            "zap_count": 50,
+            "last_zap_at": None,
+            "last_soft_at": None,
+        }
+    )
+
+    assert phone_service._pavlok_guardrail_block("zap", fixed, False) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed, True) is None
+
+
+def test_enforce_ignores_old_cooldown_window(app_env):
+    """Two zaps inside the old cooldown both pass — cooldown removed."""
+    phone_service = sys.modules["phone_service"]
+    fixed = datetime(2026, 5, 1, 14, 0, 0)
+    phone_service.TTS_GLOBAL_MODE["mode"] = "verbose"
+    phone_service.DESKTOP_STATE.update({"in_meeting": False, "location_zone": ""})
+    phone_service.PAVLOK_STATE.update(
+        {"zap_count": 0, "zap_count_date": "2026-05-01", "last_zap_at": fixed.isoformat()}
+    )
+
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1), True) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=2), True) is None

@@ -498,6 +498,81 @@ class TestBreakExhaustion:
         assert engine.break_balance_ms == 0
 
 
+# ---- Break-rate penalty multiplier (declared vs slacked) ----
+
+
+def _enter_break_slacked(engine, now_ms):
+    """Force an undeclared/idle-timeout break entry (trigger != 'user')."""
+    engine._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_ms)
+
+
+class TestBreakPenaltyMultiplier:
+    def test_declared_break_debits_base_rate(self):
+        """Declared break (trigger='user') debits at 1.0x — exact elapsed ms."""
+        engine = make_engine(0)
+        advance(engine, 0, 60)  # +60_000 earned
+        engine.enter_break(60_000)  # declared
+        advance(engine, 60_000, 40)  # consume 40s declared
+        assert engine.break_balance_ms == 60_000 - 40_000
+
+    def test_slacked_break_debits_penalty_rate(self):
+        """Slacked/idle-timeout break debits at 1.5x (N*3//2)."""
+        engine = make_engine(0)
+        advance(engine, 0, 60)  # +60_000 earned
+        _enter_break_slacked(engine, 60_000)
+        advance(engine, 60_000, 40)  # 40_000*3//2 = 60_000 debit
+        assert engine.break_balance_ms == 60_000 - 60_000
+
+    def test_declared_goes_negative_slower_than_slacked(self):
+        """For equal elapsed, declared rest stays less negative than slacking."""
+        declared = make_engine(0)
+        slacked = make_engine(0)
+        declared.enter_break(0)
+        _enter_break_slacked(slacked, 0)
+        advance(declared, 0, 30)
+        advance(slacked, 0, 30)
+        assert declared.break_balance_ms == -30_000
+        assert slacked.break_balance_ms == -45_000
+        assert declared.break_balance_ms > slacked.break_balance_ms
+
+    def test_multiplier_configurable(self):
+        """Penalty multiplier is injectable — (2, 1) → 2x burn."""
+        engine = TimerEngine(now_mono_ms=0, break_penalty_multiplier=(2, 1))
+        engine.tick(0, "2026-02-11")
+        _enter_break_slacked(engine, 0)
+        advance(engine, 0, 30)  # 30_000*2 = 60_000 debit
+        assert engine.break_balance_ms == -60_000
+
+    def test_none_trigger_fails_toward_penalty(self):
+        """Auto-break with no manual substate (trigger=None) burns at penalty rate."""
+        engine = make_engine(0)
+        # Inactive + distraction → BREAK via layers (no manual mode, trigger None)
+        engine.set_productivity(False, 0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        assert engine.current_mode == TimerMode.BREAK
+        assert engine.manual_trigger is None
+        advance(engine, 0, 20)  # 20_000*3//2 = 30_000 debit
+        assert engine.break_balance_ms == -30_000
+
+    def test_penalty_keeps_balance_exact_int(self):
+        """Penalty arithmetic stays integer — no float leak."""
+        engine = make_engine(0)
+        _enter_break_slacked(engine, 0)
+        advance(engine, 0, 7)  # 7_000*3//2 = 10_500
+        assert engine.break_balance_ms == -10_500
+        assert isinstance(engine.break_balance_ms, int)
+
+    def test_break_exhausted_fires_once_with_penalty(self):
+        """Penalty path still fires BREAK_EXHAUSTED exactly once on the zero-crossing."""
+        engine = make_engine(0)
+        advance(engine, 0, 10)  # +10_000
+        engine.tick(10_500, "2026-02-11")  # +500 → 10_500 balance
+        _enter_break_slacked(engine, 10_500)
+        events = collect_events(engine, 10_500, 20)  # 1.5x burn crosses zero
+        assert events.count(TimerEvent.BREAK_EXHAUSTED) == 1
+        assert engine.break_balance_ms < 0
+
+
 # ---- Backlog mechanics ----
 
 

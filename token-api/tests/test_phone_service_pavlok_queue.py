@@ -219,24 +219,29 @@ def test_guardrails_block_before_queue_dispatch(phone_service_env, monkeypatch):
     assert result["reason"] == "quiet_mode"
 
 
-def test_daily_zap_cap_still_blocks(phone_service_env, monkeypatch):
+def test_daily_zap_cap_removed_zap_dispatches_past_old_cap(phone_service_env, monkeypatch):
+    """Cap removed per Enforcement Dedup Removal — a zap past the old 6/day fires."""
     phone_service = phone_service_env
     now = datetime.now()
     phone_service.PAVLOK_STATE.update(
         {
             "zap_count_date": now.date().isoformat(),
             "zap_count": 6,
-            "last_zap_at": (now - timedelta(days=1)).isoformat(),
+            "last_zap_at": (now - timedelta(minutes=1)).isoformat(),
             "last_stimulus_at": None,
         }
     )
-    monkeypatch.setattr(
-        phone_service,
-        "_send_to_phone_raw",
-        lambda *args, **kwargs: pytest.fail("daily cap block must not dispatch"),
-    )
+    dispatched = []
+
+    def fake_phone(endpoint, params):
+        dispatched.append((endpoint, params))
+        return {"success": True, "status_code": 200}
+
+    monkeypatch.setattr(phone_service, "_send_to_phone_raw", fake_phone)
 
     result = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
 
-    assert result["success"] is False
-    assert result["reason"] == "daily_zap_cap"
+    assert result["success"] is True
+    assert dispatched == [("/zap", {"action": "zap", "intensity": 30})]
+    # Telemetry counter keeps climbing even though the gate is gone.
+    assert phone_service.PAVLOK_STATE["zap_count"] == 7

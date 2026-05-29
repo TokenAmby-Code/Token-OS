@@ -419,28 +419,13 @@ def _pavlok_guardrail_block(
         if active or location_zone == context:
             return {"reason": f"{context}_context"}
 
-    if stimulus_type == "zap":
-        _roll_daily_zap_count(now)
-        cap = int(PAVLOK_CONFIG.get("daily_zap_cap", 6))
-        if int(PAVLOK_STATE.get("zap_count") or 0) >= cap:
-            return {"reason": "daily_zap_cap", "cap": cap}
-
-    if not respect_cooldown:
-        return None
-
-    if stimulus_type == "zap":
-        last_key = "last_zap_at"
-        cooldown = int(PAVLOK_CONFIG.get("zap_cooldown_seconds", 20 * 60))
-    else:
-        last_key = "last_soft_at"
-        cooldown = int(PAVLOK_CONFIG.get("soft_cooldown_seconds", 3 * 60))
-
-    last_at = PAVLOK_STATE.get(last_key) or PAVLOK_STATE.get("last_stimulus_at")
-    if last_at:
-        elapsed = (now - datetime.fromisoformat(last_at)).total_seconds()
-        if elapsed < cooldown:
-            return {"reason": "cooldown", "remaining": round(cooldown - elapsed)}
-
+    # Daily zap cap, zap/soft cooldowns, and dedup windows were removed per the
+    # Enforcement Dedup Removal decree — they masked false-fires and silently
+    # killed escalating enforce loops (e.g. negative-break would die at zap #6).
+    # Only the context suppress-windows above (quiet/meeting/sleep/club/driving/
+    # medical) and the typing-guard mutex remain. `respect_cooldown` is now
+    # vestigial; kept in the signature to avoid touching every caller.
+    _ = respect_cooldown
     return None
 
 
