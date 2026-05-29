@@ -106,7 +106,7 @@ class TimerEngine:
         now_mono_ms: int,
         reset_hour: int = 7,
         break_penalty_multiplier: tuple[int, int] = DEFAULT_BREAK_PENALTY_MULTIPLIER,
-    ):
+    ) -> None:
         # Burn penalty for undeclared/slacked break, as an integer rational.
         self._break_penalty_num, self._break_penalty_den = break_penalty_multiplier
         # Layer state

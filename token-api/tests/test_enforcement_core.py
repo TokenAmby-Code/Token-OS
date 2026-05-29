@@ -1966,7 +1966,7 @@ async def test_negative_break_resets_when_balance_recovers(app_env, monkeypatch)
 @pytest.mark.asyncio
 async def test_negative_break_resets_when_leaving_break_for_working(app_env, monkeypatch):
     main = app_env.main
-    calls = _patch_enforce(main, monkeypatch)
+    _patch_enforce(main, monkeypatch)
     _force_negative_break(main, -5_000)
 
     await main._negative_break_enforce_tick(1_000, _tick_result())  # rep1

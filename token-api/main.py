@@ -14673,8 +14673,8 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
             sit["rep"] = prospective_rep
             sit["last_fire_mono_ms"] = now_ms
         return enforce_result
-    except Exception as exc:
-        print(f"TIMER: negative-break enforce gate error: {exc}")
+    except Exception:
+        logger.exception("TIMER: negative-break enforce gate error")
         return None
 
 
