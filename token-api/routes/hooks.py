@@ -39,7 +39,7 @@ from instance_mutation import (
 from pane_surface import human_pane_surface
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
-from routes.tts import play_sound, queue_tts
+from routes.tts import dispatch_notify, play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
     read_frontmatter,
@@ -2873,14 +2873,17 @@ async def handle_stop(payload: dict) -> dict:
         tts_text = re.sub(r" +", " ", tts_text)
         tts_text = tts_text.strip()
 
-    # Mobile path: v3 /notify with TTS + banner + vibe
+    # Host-device delivery: this session is HOSTED on the phone (Token-S24), so
+    # its own final TTS belongs on its host, not on the geofence-routed comms
+    # bus. This is host delivery, not an Emperor notification — it does not go
+    # through dispatch_notify. (See the comms-router invariant guard test.)
     if device_id == "Token-S24":
         notify_params = {
             "banner_text": f"[{notify_surface}] finished",
             "vibe": 30,
         }
         if tts_text:
-            notify_params["tts_text"] = tts_text[:300]
+            notify_params["tts_text"] = tts_text[:300]  # comms-router-allow: phone-hosted session host delivery
         phone_result = await asyncio.to_thread(_send_to_phone, "/notify", notify_params)
         result["notification"] = phone_result
         logger.info(
@@ -3471,16 +3474,13 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                             discord_channel, discord_bot, f"**Question:** {q_text}"
                         )
                     )
-                    # Also phone notify so Emperor knows to check Discord
+                    # Also notify so Emperor knows to check Discord — through the
+                    # comms middleware (spoken part geofence-routed, buzz rides along).
                     asyncio.create_task(
-                        asyncio.to_thread(
-                            _send_to_phone,
-                            "/notify",
-                            {
-                                "vibe": 40,
-                                "tts_text": "Claude is asking a question in Discord.",
-                                "banner_text": q_parts[0][:80],
-                            },
+                        dispatch_notify(
+                            "Claude is asking a question in Discord.",
+                            vibe=40,
+                            banner=q_parts[0][:80],
                         )
                     )
                     logger.info(
@@ -3498,16 +3498,14 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         if questions:
             q_text = questions[0].get("question", "")[:200]
             if q_text:
+                # Through the comms middleware: spoken part geofence-routed,
+                # buzz + beep + banner ride along (no callsite-level split).
                 asyncio.create_task(
-                    asyncio.to_thread(
-                        _send_to_phone,
-                        "/notify",
-                        {
-                            "vibe": 40,
-                            "beep": 30,
-                            "tts_text": f"Claude is asking: {q_text}",
-                            "banner_text": q_text[:80],
-                        },
+                    dispatch_notify(
+                        f"Claude is asking: {q_text}",
+                        vibe=40,
+                        beep=30,
+                        banner=q_text[:80],
                     )
                 )
                 logger.info(

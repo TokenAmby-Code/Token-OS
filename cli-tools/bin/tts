@@ -154,8 +154,10 @@ if [[ -n "$INSTANCE_ID" && "$DIRECT" == "false" ]]; then
         --arg iid "$INSTANCE_ID" \
         '{"instance_id": $iid, "message": $msg}')
 else
-    # Fallback: direct TTS on Mac (no queue, no voice profile)
-    ENDPOINT="/api/notify/tts"
+    # Fallback: speak through the authoritative comms router (no queue).
+    # /api/notify is the single entry; tts defaults on, so a message-only body
+    # is a TTS-only request routed by geofence.
+    ENDPOINT="/api/notify"
     if [[ -n "$INSTANCE_ID" ]]; then
         JSON=$(jq -cn \
             --arg msg "$MESSAGE" \

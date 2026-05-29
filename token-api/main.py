@@ -107,8 +107,8 @@ from routes.hooks import (
 )
 from routes.tts import (
     _is_quiet_hours,
+    dispatch_notify,
     get_tts_queue_status,
-    play_sound,
     speak_tts,
     tts_queue_worker,
 )
@@ -5600,14 +5600,13 @@ async def _golden_throne_handle_ready_for_ack(
     banner_body = _golden_throne_ready_for_ack_banner(human_pane_surface)
     phone_result = None
     try:
-        phone_result = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 30,
-                "tts_text": tts_body,
-                "banner_text": banner_body,
-            },
+        # Route through the comms middleware: spoken part follows geofence
+        # (home → WSL/Discord, away → phone); the buzz + banner ride along.
+        phone_result = await dispatch_notify(
+            tts_body,
+            vibe=30,
+            banner=banner_body,
+            instance_id=session_id,
         )
     except Exception as e:
         phone_result = {"success": False, "error": str(e)}
@@ -6091,14 +6090,12 @@ async def golden_throne_followup(session_id: str):
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
         try:
-            phone_result = await asyncio.to_thread(
-                _send_to_phone,
-                "/notify",
-                {
-                    "vibe": vibe_intensity,
-                    "tts_text": _golden_throne_tts_text(tab_name, human_pane_surface),
-                    "banner_text": _golden_throne_banner_text(tab_name, human_pane_surface),
-                },
+            # Comms middleware owns routing: TTS by geofence, buzz + banner ride along.
+            phone_result = await dispatch_notify(
+                _golden_throne_tts_text(tab_name, human_pane_surface),
+                vibe=vibe_intensity,
+                banner=_golden_throne_banner_text(tab_name, human_pane_surface),
+                instance_id=session_id,
             )
         except Exception as e:
             phone_result = {"success": False, "error": str(e)}
@@ -10144,13 +10141,13 @@ from routes.tts import init_deps as tts_init_deps
 
 tts_init_deps(send_to_phone=_send_to_phone)
 
-# Wire enforce + notify dependencies (atomic emitter + device-aware dispatcher)
+# Wire enforce dependencies (atomic emitter). The notify path is the unified
+# router core (dispatch_notify); notify.py is a thin typed shim over it and
+# needs no device wiring of its own.
 from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
-from notify import init_deps as notify_init_deps
 
-notify_init_deps(send_to_phone=_send_to_phone)
 enforce_init_deps(is_quiet_hours=is_quiet_hours)
 
 # Wire voice route dependencies
@@ -10228,7 +10225,6 @@ def start_enforcement_cascade(app_name: str) -> None:
                 EnforceRequest(
                     message=f"Close {app_name}",
                     intensity=50,
-                    distraction_source="phone",
                     source=f"phone_distraction_{app_name}",
                 )
             )
@@ -10634,15 +10630,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
         enforce_result = close_distraction_windows()
         send_pavlok_stimulus(reason="desktop_distraction_blocked")
+        # Buzz + banner attention signal through the comms middleware (no speech).
         asyncio.create_task(
-            asyncio.to_thread(
-                _send_to_phone,
-                "/notify",
-                {
-                    "vibe": 30,
-                    "banner_text": f"Desktop blocked: {detected_mode}",
-                },
-            )
+            dispatch_notify("", tts=False, vibe=30, banner=f"Desktop blocked: {detected_mode}")
         )
 
         await log_event(
@@ -14670,7 +14660,6 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
             EnforceRequest(
                 message=_negative_break_message(prospective_rep, bal),
                 intensity=intensity,
-                distraction_source="negative_break",
                 source="negative_break_loop",
                 context={"rep": prospective_rep, "break_balance_ms": bal},
             )
@@ -14751,21 +14740,16 @@ async def timer_worker():
                     _session_start_ms = now_ms
                     _mode_change_count += 1
                     if dispatched:
-                        # Enforce: close distraction windows + Pavlok + phone notify
+                        # Enforce: close distraction windows + Pavlok, then one
+                        # comms-router call — spoken part geofence-routed, buzz +
+                        # banner ride along (no callsite-level split).
                         close_distraction_windows()
                         send_pavlok_stimulus(reason="distraction_timeout")
                         asyncio.create_task(
-                            asyncio.to_thread(
-                                _send_to_phone,
-                                "/notify",
-                                {
-                                    "vibe": 30,
-                                    "banner_text": "distraction logged",
-                                },
+                            dispatch_notify(
+                                "distraction logged", vibe=30, banner="distraction logged"
                             )
                         )
-                        loop = asyncio.get_event_loop()
-                        loop.run_in_executor(None, speak_tts, "distraction logged")
                     continue
                 elif event == TimerEvent.MODE_CHANGED and (
                     has_idle_timeout or has_distraction_timeout
@@ -15012,14 +14996,7 @@ async def _async_enforce_twitter_timeout():
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
 
-    # Desktop: notification sound + TTS
-    play_sound()
-    try:
-        await asyncio.to_thread(subprocess.Popen, ["say", "-v", "Daniel", "twitter timeout"])
-    except Exception:
-        pass
-
-    # Pavlok is queued separately; /enforce is notification/TTS/Spotify only.
+    # Pavlok zap is device-control (the watch is geofence-agnostic).
     pavlok_result = await asyncio.to_thread(
         send_pavlok_stimulus,
         "zap",
@@ -15027,13 +15004,14 @@ async def _async_enforce_twitter_timeout():
         "twitter_timeout",
         True,
     )
-    result = await asyncio.to_thread(
-        _send_to_phone,
-        "/enforce",
-        {
-            "tts_text": "twitter timeout",
-            "banner_text": "Twitter timeout",
-        },
+    # Spoken alert + banner go through the comms middleware (geofence-routed).
+    # NOTE: the legacy phone `/enforce` call also triggered a phone-side Spotify
+    # redirect/pause; that side effect is deferred to the granular `/play`
+    # endpoint (see the comms-router follow-up ticket) rather than re-bypassing
+    # the router with a phone-direct enforce payload.
+    result = await dispatch_notify(
+        "twitter timeout",
+        banner="Twitter timeout",
     )
 
     # Force timer into BREAK mode (clear any existing manual mode first)
@@ -15117,16 +15095,13 @@ async def enforce_break_exhausted_impl() -> dict:
         enforced_any = True
 
     if enforced_any:
-        # Phone prompt only; Pavlok is handled by the backlog ack parry deadline.
-        phone_notify = await asyncio.to_thread(
-            _send_to_phone,
-            "/notify",
-            {
-                "vibe": 60,
-                "beep": 40,
-                "tts_text": "break exhausted",
-                "banner_text": "break exhausted",
-            },
+        # Through the comms middleware: spoken part geofence-routed, buzz/beep +
+        # banner ride along. Pavlok zap is handled by the backlog ack parry deadline.
+        phone_notify = await dispatch_notify(
+            "break exhausted",
+            vibe=60,
+            beep=40,
+            banner="break exhausted",
         )
 
     return {
