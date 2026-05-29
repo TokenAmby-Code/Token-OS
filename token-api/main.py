@@ -3668,9 +3668,10 @@ async def _announce_idle_if_all_stopped(
     Emitted only on the productivity_inactive WORKING -> IDLE transition (mode
     ``idle``); a distraction-driven inactive transition lands in BREAK, a
     different signal, and is intentionally silent here. The spoken assertion is
-    routed through ``speak_tts`` — the geofence-first core that ``/api/notify/tts``
-    delegates to (Discord VC -> geofence/phone-when-away -> WSL -> phone -> Mac) —
-    NOT phone-direct. There is no debounce: MODE_CHANGED fires exactly once per
+    routed through ``speak_tts`` — the geofence-first router core (Discord VC ->
+    geofence/phone-when-away -> WSL -> phone -> Mac) that the comms middleware
+    (``dispatch_notify`` / ``/api/notify``) uses — NOT phone-direct. There is no
+    debounce: MODE_CHANGED fires exactly once per
     transition, so the assertion is inherently single-shot. Returns True if it
     spoke. Never raises into the timer loop.
     """
@@ -3678,7 +3679,7 @@ async def _announce_idle_if_all_stopped(
         return False
     # Record the state transition unconditionally (it is a real timer event),
     # then gate only the spoken assertion on quiet hours — parity with the
-    # /api/notify/tts quiet-hours behaviour and _dispatch_timer_intervention.
+    # dispatch_notify quiet-hours behaviour and _dispatch_timer_intervention.
     await log_event(
         "all_instances_stopped",
         details={"old_mode": old_mode, "new_mode": new_mode},

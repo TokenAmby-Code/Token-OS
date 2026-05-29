@@ -296,8 +296,12 @@ these are fair game.
 
 
 def send_tts(message: str):
-    """Send a message via TTS to the Emperor's phone."""
-    _post("/api/notify/tts", {"message": message})
+    """Speak a message to the Emperor via the authoritative comms router.
+
+    /api/notify is the single entry; with no tactile/banner fields this is a
+    TTS-only request, routed by geofence (no longer phone-pinned).
+    """
+    _post("/api/notify", {"message": message, "tts": True})
 
 
 def get_daily_thread_id(today: str) -> str | None:
