@@ -12,8 +12,11 @@ from datetime import datetime
 from typing import Any
 
 GAP_THRESHOLD_SECONDS = 90
-RATE_TOLERANCE_MS = 5_000
-MATERIAL_DELTA_MS = 60_000
+# Graph anomaly detection is an alerting/display guard, not accounting. Keep
+# enough slack for scheduler jitter, delayed writes, and integer rounding so
+# normal penalized break burn doesn't fragment the graph into point soup.
+RATE_TOLERANCE_MS = 30_000
+MATERIAL_DELTA_MS = 5 * 60_000
 
 RESET_DISCONTINUITY_TRIGGERS = {
     "daily_reset",
@@ -68,6 +71,7 @@ def annotate_timer_telemetry(
     rate_tolerance_ms: int = RATE_TOLERANCE_MS,
     material_delta_ms: int = MATERIAL_DELTA_MS,
     no_sample_reason: str = "no_timer_samples",
+    break_penalty_multiplier: float = 1.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Mark point gaps/anomalies and return ``(gaps, anomalies)``.
 
@@ -86,6 +90,32 @@ def annotate_timer_telemetry(
     parsed.sort(key=lambda item: item[0])
     gaps: list[dict[str, Any]] = []
     anomalies: list[dict[str, Any]] = []
+    penalty_rate = max(1.0, float(break_penalty_multiplier or 1.0))
+
+    def expected_abs_rate(
+        previous_point: dict[str, Any],
+        current_point: dict[str, Any],
+        interval_events: list[dict[str, Any]],
+    ) -> float:
+        """Return the maximum plausible absolute ms/ms balance rate.
+
+        Manual/user break burns at 1.0x, but idle-timeout / undeclared break
+        burns at the configured penalty multiplier. Samples do not currently
+        persist the manual-break trigger, so any interval touching BREAK gets
+        the penalty ceiling. This prevents legitimate 1.5x burn from becoming
+        "impossible_rate" spam.
+        """
+
+        modes = {
+            str(previous_point.get("mode") or "").lower(),
+            str(current_point.get("mode") or "").lower(),
+        }
+        if "break" in modes:
+            return penalty_rate
+        for event in interval_events:
+            if str(event.get("new_mode") or "").lower() == "break":
+                return penalty_rate
+        return 1.0
 
     def add_gap(
         start: datetime,
@@ -138,11 +168,13 @@ def annotate_timer_telemetry(
         delta_ms = current_balance - previous_balance
         current_point["delta_balance_ms"] = delta_ms
 
-        resets = [
-            event
-            for event in _events_between(reset_events, previous_time, current_time)
-            if timer_event_is_reset_discontinuity(event)
-        ]
+        interval_events = _events_between(reset_events, previous_time, current_time)
+        resets = [event for event in interval_events if timer_event_is_reset_discontinuity(event)]
+        allowed_rate = expected_abs_rate(previous_point, current_point, interval_events)
+        allowed_delta_ms = int(elapsed_ms * allowed_rate)
+        # Small samples can be noisy; long samples should tolerate a small
+        # percent error as well as the fixed jitter budget.
+        tolerance_ms = max(rate_tolerance_ms, int(elapsed_ms * 0.20))
         if resets:
             add_gap(
                 previous_time,
@@ -151,7 +183,8 @@ def annotate_timer_telemetry(
                 current_point,
                 reset_event=resets[-1],
             )
-        elif elapsed_ms > 0 and abs(delta_ms) > elapsed_ms + rate_tolerance_ms:
+        elif elapsed_ms > 0 and abs(delta_ms) > allowed_delta_ms + tolerance_ms:
+            current_point["expected_abs_rate"] = allowed_rate
             add_gap(
                 previous_time,
                 current_time,

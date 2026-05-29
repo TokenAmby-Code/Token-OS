@@ -13822,6 +13822,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         reset_events=shift_rows,
         gap_threshold_seconds=gap_threshold_seconds,
         no_sample_reason=fallback_reason,
+        break_penalty_multiplier=BREAK_PENALTY_MULTIPLIER,
     )
 
     segments = []

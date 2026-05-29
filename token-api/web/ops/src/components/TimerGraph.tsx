@@ -81,6 +81,9 @@ export function TimerGraph({ history }: Props) {
   // not draw a straight line between the last pre-restart sample and the first
   // recovered/live point.
   const runs = splitPointRuns(points);
+  const markerPoints = points.filter(
+    (point) => point.anomaly || point.gap_before || point.sample_source === 'timer_shift',
+  );
   const linePaths = runs
     .map((run) => ({
       points: run,
@@ -192,8 +195,8 @@ export function TimerGraph({ history }: Props) {
           </g>
         ))}
 
-        {/* Point markers keep sparse fallback samples visible even when every run is isolated. */}
-        {points.map((point, i) => (
+        {/* Only mark gaps/anomalies/sparse fallback points. Normal samples should read as a line. */}
+        {markerPoints.map((point, i) => (
           <circle
             key={`pt-${i}`}
             cx={x(Date.parse(point.t))}
