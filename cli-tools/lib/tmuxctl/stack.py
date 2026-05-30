@@ -24,8 +24,13 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections.abc import Iterable
 
+from .api import fetch_instance_rows_raw, rebind_instance_pane
 from .tmux_adapter import TmuxAdapter, TmuxError
+
+# Instance statuses that denote a live, drive-able runtime worth rebinding.
+_LIVE_STATUSES = frozenset({"processing", "idle"})
 
 STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig")
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
@@ -194,6 +199,135 @@ def dispatch_stack_command(
         return pane
 
 
+def _is_token_pane(value: str) -> bool:
+    """True if a ``tmux_pane`` value is an allocation token (``mechanicus:new``)
+    rather than a concrete tmux pane id (``%NN``).
+
+    Concrete pane ids always start with ``%``; the dispatch launch path used to
+    bake the allocation request token as the pane, leaving the registry row
+    unresolvable by pane_truth / assert-instance / agent-cmd.
+    """
+    return bool(value) and not value.startswith("%")
+
+
+def _descendant_pids(root_pid: int, children_by_ppid: dict[int, list[int]]) -> set[int]:
+    """All pids in `root_pid`'s process subtree, including `root_pid` itself."""
+    seen: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children_by_ppid.get(pid, []))
+    return seen
+
+
+def reconcile_token_valued_panes(
+    worker_pane_pids: dict[str, int],
+    rows: Iterable[dict],
+    children_by_ppid: dict[int, list[int]],
+    *,
+    rebind,
+) -> list[tuple[str, str]]:
+    """Rebind drifted instance rows to the concrete pane their process runs in.
+
+    A row is rebindable when its ``tmux_pane`` is an allocation token, its status
+    is live, and its recorded ``pid`` lives in the process subtree of exactly one
+    live stack-worker pane. PID is the only correlation key reliably present on
+    both sides (the row carries the wrapper pid; the pane carries its pane_pid),
+    so it handles both rows that drifted before the launch-path fix and any future
+    regression — no extra pane tagging required.
+
+    Returns the ``(instance_id, pane_id)`` rebinds performed.
+    """
+    pane_pid_sets = {
+        pane_id: _descendant_pids(pane_pid, children_by_ppid)
+        for pane_id, pane_pid in worker_pane_pids.items()
+    }
+
+    rebinds: list[tuple[str, str]] = []
+    for row in rows:
+        if not _is_token_pane(str(row.get("tmux_pane") or "")):
+            continue
+        if str(row.get("status") or "") not in _LIVE_STATUSES:
+            continue
+        try:
+            pid = int(row.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        instance_id = str(row.get("id") or "")
+        if not instance_id:
+            continue
+        for pane_id, pid_set in pane_pid_sets.items():
+            if pid in pid_set:
+                rebind(instance_id, pane_id)
+                rebinds.append((instance_id, pane_id))
+                break
+    return rebinds
+
+
+def _stack_worker_pane_pids(adapter: TmuxAdapter, session: str) -> dict[str, int]:
+    """Map live stack-worker pane ids -> pane_pid across all stack windows."""
+    from ._stack_core import _stack_panes
+    from .custodes import _pane_pid
+
+    out: dict[str, int] = {}
+    rows = adapter.run(
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_index}\t#{window_name}",
+        allow_failure=True,
+    ).splitlines()
+    for row in rows:
+        if "\t" not in row:
+            continue
+        index, raw_name = row.split("\t", 1)
+        name = raw_name.split("(", 1)[0]
+        if not is_stack_base(name):
+            continue
+        for pane in _stack_panes(adapter, f"{session}:{index}"):
+            if pane.pane_type != "stack-worker":
+                continue
+            pid = _pane_pid(adapter, pane.pane_id)
+            if pid:
+                out[pane.pane_id] = pid
+    return out
+
+
+def reconcile_stack_pane_registry(adapter: TmuxAdapter, session: str = "main") -> list[tuple[str, str]]:
+    """Self-heal instance rows whose ``tmux_pane`` is an allocation token.
+
+    Best-effort backstop for the dispatch pane-registry wedge: rebinds rows that
+    drifted before the launch-env fix shipped (and any future regression) to the
+    concrete pane their process runs in. Gathers live stack-worker panes first so
+    a session with no workers never touches the registry; never raises — registry
+    or tmux IO failures degrade to a no-op.
+    """
+    try:
+        worker_pane_pids = _stack_worker_pane_pids(adapter, session)
+        if not worker_pane_pids:
+            return []
+        drifted = [
+            row
+            for row in fetch_instance_rows_raw()
+            if _is_token_pane(str(row.get("tmux_pane") or ""))
+            and str(row.get("status") or "") in _LIVE_STATUSES
+        ]
+        if not drifted:
+            return []
+        from .custodes import _process_tree
+
+        children_by_ppid, _ = _process_tree()
+        return reconcile_token_valued_panes(
+            worker_pane_pids, drifted, children_by_ppid, rebind=rebind_instance_pane
+        )
+    except Exception:
+        return []
+
+
 def sweep_stack_assertions(
     adapter: TmuxAdapter,
     session: str = "main",
@@ -243,6 +377,8 @@ def sweep_stack_assertions(
                 )
             except Exception as exc:
                 results.append(f"sweep failed {target}: {exc}")
+        for instance_id, pane_id in reconcile_stack_pane_registry(adapter, session):
+            results.append(f"rebound {instance_id[:12]} -> {pane_id}")
         return "\n".join(results) if results else f"no stack windows in {session}"
 
 

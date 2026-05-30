@@ -592,3 +592,37 @@ class TestCronEngineLegion:
         loop = asyncio.new_event_loop()
         loop.run_until_complete(_check())
         loop.close()
+
+
+# ── PATCH /api/instances/{id}/tmux-pane ──────────────────────
+
+
+class TestSetTmuxPane:
+    """Rebind a drifted instance row's tmux_pane to a concrete pane id.
+
+    Self-heal surface for the dispatch pane-registry wedge: a row launched via
+    `:new` could register the allocation token (mechanicus:new) as its tmux_pane;
+    the stack sweep correlates it to the live pane and rebinds it here.
+    """
+
+    def test_rebind_tmux_pane_valid(self, client):
+        iid = _insert_instance(tmux_pane="mechanicus:new", status="processing")
+        resp = client.patch(f"/api/instances/{iid}/tmux-pane", json={"tmux_pane": "%16"})
+        assert resp.status_code == 200
+        assert resp.json()["tmux_pane"] == "%16"
+        assert _get_instance(iid)["tmux_pane"] == "%16"
+
+    def test_rebind_tmux_pane_rejects_non_pane_value(self, client):
+        iid = _insert_instance(tmux_pane="mechanicus:new", status="processing")
+        resp = client.patch(
+            f"/api/instances/{iid}/tmux-pane", json={"tmux_pane": "mechanicus:new"}
+        )
+        assert resp.status_code == 400
+        # Row is left untouched on a rejected value.
+        assert _get_instance(iid)["tmux_pane"] == "mechanicus:new"
+
+    def test_rebind_tmux_pane_not_found(self, client):
+        resp = client.patch(
+            "/api/instances/nonexistent-id/tmux-pane", json={"tmux_pane": "%16"}
+        )
+        assert resp.status_code == 404
