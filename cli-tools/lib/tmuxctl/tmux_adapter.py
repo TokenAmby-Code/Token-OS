@@ -15,6 +15,20 @@ class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
 
 
+class TmuxSendGated(TmuxError):
+    """Raised when the universal send gate suppressed a pane write.
+
+    Distinct from a genuine tmux failure: NO bytes were written to the pane,
+    so the caller may safely re-queue the write for delivery once the gate
+    (quiet hours / typing guard) clears. Carries the structured gate result.
+    """
+
+    def __init__(self, gate: dict | None = None) -> None:
+        self.gate = gate or {}
+        reason = self.gate.get("reason", "gated")
+        super().__init__(f"send suppressed by gate: {reason}")
+
+
 DEFAULT_SUBMIT_SETTLE_SECONDS = 1.0
 DEFAULT_PRE_SUBMIT_SETTLE_SECONDS = 1.0
 
@@ -426,6 +440,14 @@ class TmuxAdapter:
         if clear_prompt:
             self.send_keys(target, "C-u")
         self.run("send-keys", "-t", target, "-l", payload)
+        # The literal payload is the byte-bearing send. If the universal gate
+        # suppressed it (quiet hours / typing guard) run() wrote nothing and
+        # left the structured result on last_send_gate_result. Abort the whole
+        # submit atomically rather than firing a bare C-m at an empty prompt —
+        # zero bytes issued means the caller can re-queue cleanly.
+        gate = getattr(self, "last_send_gate_result", None)
+        if gate and gate.get("suppressed"):
+            raise TmuxSendGated(gate)
         if submit_settle_seconds > 0:
             time.sleep(submit_settle_seconds)
         self.send_keys(target, "C-m")

@@ -36,7 +36,7 @@ CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
 STASH_MAX_AGE_HOURS = 24
 QUIET_HOURS_START = int(os.environ.get("TOKEN_API_QUIET_START_HOUR", "23"))
-QUIET_HOURS_END = int(os.environ.get("TOKEN_API_QUIET_END_HOUR", "9"))
+QUIET_HOURS_END = int(os.environ.get("TOKEN_API_QUIET_END_HOUR", "7"))
 QUIET_HOURS_TIMEZONE = os.environ.get("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
 # Only an explicit/official morning action releases the morning quiet latch
 # early. day_state is written by exactly two paths: the automated

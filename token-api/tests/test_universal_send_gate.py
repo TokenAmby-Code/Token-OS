@@ -32,9 +32,9 @@ def _insert_day_state(db_path: str | Path, date: str, day_started_at: str, sourc
 
 def test_schedule_fallback_does_not_release_morning_latch(app_env: Any, monkeypatch: Any) -> None:
     shared = app_env.shared
-    monkeypatch.setenv("TOKEN_API_QUIET_START_HOUR", "23")
-    monkeypatch.setenv("TOKEN_API_QUIET_END_HOUR", "9")
-    monkeypatch.setenv("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
+    # QUIET_HOURS_END is captured at import; setenv after the reload is inert, so
+    # pin the boundary on the module to test the latch source rule at a fixed 9.
+    monkeypatch.setattr(shared, "QUIET_HOURS_END", 9)
     shared.ensure_day_state_table_sync()
     _insert_day_state(
         app_env.db_path, "2026-05-27", "2026-05-27T08:30:00-07:00", "schedule_fallback"
@@ -46,14 +46,39 @@ def test_schedule_fallback_does_not_release_morning_latch(app_env: Any, monkeypa
 
 def test_official_morning_source_releases_morning_latch(app_env: Any, monkeypatch: Any) -> None:
     shared = app_env.shared
-    monkeypatch.setenv("TOKEN_API_QUIET_START_HOUR", "23")
-    monkeypatch.setenv("TOKEN_API_QUIET_END_HOUR", "9")
-    monkeypatch.setenv("TOKEN_API_QUIET_TIMEZONE", "America/Phoenix")
+    monkeypatch.setattr(shared, "QUIET_HOURS_END", 9)
     shared.ensure_day_state_table_sync()
     _insert_day_state(app_env.db_path, "2026-05-27", "2026-05-27T08:30:00-07:00", "morning")
 
     status = shared.get_quiet_hours_status(now=datetime(2026, 5, 27, 7, 0, tzinfo=PHX))
     assert status["active"] is False
+
+
+# ---- (c2) default quiet-end is 7: morning quiet is over by 7:15 -------------
+
+
+def test_default_quiet_end_is_seven(app_env: Any) -> None:
+    # Emperor directive 2026-05-30: "past 7:15 am quiet hours should be over."
+    assert app_env.shared.QUIET_HOURS_END == 7
+
+
+def test_quiet_over_after_seven_fifteen_by_default(app_env: Any) -> None:
+    shared = app_env.shared
+    shared.ensure_day_state_table_sync()
+    # No day_state row, no early release — relies purely on the clock boundary.
+    status = shared.get_quiet_hours_status(now=datetime(2026, 5, 27, 7, 15, tzinfo=PHX))
+    assert status["active"] is False, "quiet must be over by 7:15 with the default 7am boundary"
+
+
+def test_quiet_still_active_before_seven_holds_latch(app_env: Any) -> None:
+    shared = app_env.shared
+    shared.ensure_day_state_table_sync()
+    # A schedule_fallback wake-anchor before the 7am boundary must NOT release.
+    _insert_day_state(
+        app_env.db_path, "2026-05-27", "2026-05-27T06:15:00-07:00", "schedule_fallback"
+    )
+    status = shared.get_quiet_hours_status(now=datetime(2026, 5, 27, 6, 30, tzinfo=PHX))
+    assert status["active"] is True, "schedule_fallback must not end quiet before the boundary"
 
 
 # ---- (d) timer does not originate interventions during quiet ---------------

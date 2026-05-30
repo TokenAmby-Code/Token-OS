@@ -66,7 +66,7 @@ _QUIET_START_ENV = "TOKEN_API_QUIET_START_HOUR"
 _QUIET_END_ENV = "TOKEN_API_QUIET_END_HOUR"
 _QUIET_TZ_ENV = "TOKEN_API_QUIET_TIMEZONE"
 _DEFAULT_QUIET_START = 23
-_DEFAULT_QUIET_END = 9
+_DEFAULT_QUIET_END = 7
 _DEFAULT_QUIET_TZ = "America/Phoenix"
 
 # Only an explicit/official morning action may release the morning quiet latch

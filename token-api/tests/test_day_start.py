@@ -22,7 +22,8 @@ def test_day_state_table_exists(app_env):
 
 def test_quiet_hours_morning_latch_released_by_day_start(app_env):
     tz = ZoneInfo("America/Phoenix")
-    morning = datetime(2026, 5, 10, 8, 30, tzinfo=tz)
+    # Inside the morning-latch window under the default 7am quiet boundary.
+    morning = datetime(2026, 5, 10, 6, 30, tzinfo=tz)
     night = datetime(2026, 5, 10, 23, 30, tzinfo=tz)
 
     assert app_env.main._is_quiet_hours(morning) is True

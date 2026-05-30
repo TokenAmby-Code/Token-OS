@@ -101,6 +101,18 @@ def test_official_morning_source_releases_latch(db):
     assert ctx["morning_latch_released"] is True
 
 
+def test_default_quiet_end_is_seven(db, monkeypatch):
+    # Emperor directive 2026-05-30: quiet must be over by 7:15. Drop the explicit
+    # override so the gate falls back to its compiled default (7), not 9.
+    monkeypatch.delenv("TOKEN_API_QUIET_END_HOUR", raising=False)
+    active, _ = send_gate.quiet_hours_active(now=datetime(2026, 5, 27, 7, 15, tzinfo=PHX))
+    assert active is False, "default boundary 7 → quiet over by 7:15"
+    # Just before the boundary the morning latch still holds (no official release).
+    active2, ctx2 = send_gate.quiet_hours_active(now=datetime(2026, 5, 27, 6, 30, tzinfo=PHX))
+    assert active2 is True
+    assert ctx2["clock_segment"] == "morning_latch"
+
+
 def test_session_quiet_latch_holds_outside_window(db):
     # Nightly debrief latched QUIET; even at midday the gate stays closed.
     _set_timer_quiet(db)

@@ -4110,7 +4110,7 @@ async def _tmux_send_payload_then_submit(
     clear_prompt: bool = False,
 ) -> dict:
     """Send text and submit through tmuxctl's pane-write primitive."""
-    from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+    from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
 
     adapter = TmuxAdapter()
     try:
@@ -4123,6 +4123,25 @@ async def _tmux_send_payload_then_submit(
             ),
             timeout=10,
         )
+    except TmuxSendGated as exc:
+        # The universal gate suppressed the send: NO bytes reached the pane.
+        # This is NOT a delivery and NOT a failure — surface it as gated so the
+        # queue keeps the item pending and the periodic worker re-drains it once
+        # the gate clears. Never report this as "sent".
+        gate = exc.gate or {}
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctl.send_text_then_submit",
+            "gated": True,
+            "gate_reason": gate.get("reason"),
+            "gate": gate,
+            "verification_status": "gated",
+            "verified_by": None,
+            "pane": tmux_pane,
+            "instance_id": None,
+        }
     except TmuxError as exc:
         return {
             "returncode": 1,
@@ -4136,6 +4155,9 @@ async def _tmux_send_payload_then_submit(
     import uuid
 
     normalized = re.sub(r"[\r\n]+", " ", payload).rstrip()
+    # Bytes were issued, but delivery is NOT proven here — never default to
+    # "sent". The proof belt (UserPromptSubmit correlation) upgrades this to a
+    # confirmed delivery; until then it is "unverified".
     return {
         "returncode": 0,
         "stdout": "",
@@ -4143,8 +4165,9 @@ async def _tmux_send_payload_then_submit(
         "operation": "tmuxctl.send_text_then_submit",
         "dispatch_id": str(uuid.uuid4()),
         "payload_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
-        "verification_status": "sent",
-        "verified_by": "tmuxctl",
+        "gated": False,
+        "verification_status": "unverified",
+        "verified_by": None,
         "pane": tmux_pane,
         "instance_id": None,
     }
@@ -4196,6 +4219,25 @@ async def process_pane_write_queue_once(
                 results.append(result)
                 continue
             send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
+            if send_result.get("gated"):
+                # Gate suppressed the send (no bytes issued). Keep the item
+                # pending so the periodic worker flushes it when the gate
+                # clears — the typing guard queues, it does not bounce.
+                gate_reason = send_result.get("gate_reason") or "gated"
+                result = {
+                    **base,
+                    "status": PANE_WRITE_PENDING,
+                    "reason": f"send_gated:{gate_reason}",
+                    **send_result,
+                }
+                await _mark_pane_write(
+                    item["id"],
+                    status=PANE_WRITE_PENDING,
+                    result=result,
+                    error=f"send_gated:{gate_reason}",
+                )
+                results.append(result)
+                continue
             result = {
                 **base,
                 "status": PANE_WRITE_SENT if send_result["returncode"] == 0 else PANE_WRITE_FAILED,
