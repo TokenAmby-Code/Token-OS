@@ -614,15 +614,11 @@ class TestSetTmuxPane:
 
     def test_rebind_tmux_pane_rejects_non_pane_value(self, client):
         iid = _insert_instance(tmux_pane="mechanicus:new", status="processing")
-        resp = client.patch(
-            f"/api/instances/{iid}/tmux-pane", json={"tmux_pane": "mechanicus:new"}
-        )
+        resp = client.patch(f"/api/instances/{iid}/tmux-pane", json={"tmux_pane": "mechanicus:new"})
         assert resp.status_code == 400
         # Row is left untouched on a rejected value.
         assert _get_instance(iid)["tmux_pane"] == "mechanicus:new"
 
     def test_rebind_tmux_pane_not_found(self, client):
-        resp = client.patch(
-            "/api/instances/nonexistent-id/tmux-pane", json={"tmux_pane": "%16"}
-        )
+        resp = client.patch("/api/instances/nonexistent-id/tmux-pane", json={"tmux_pane": "%16"})
         assert resp.status_code == 404
