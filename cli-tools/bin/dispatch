@@ -22,7 +22,7 @@ Usage:
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
-  --id, --resume, -r <id>      Resume an existing agent session by session_id
+  --id, --resume, -r <id>      Resume an existing agent session by instance id or session_id
   --aspirant                  Create an aspirant instead of launching directly
   --aspirant-kind <kind>      dispatch, deploy_p, or deploy_d (with --aspirant)
   --intake-only               With dispatch aspirants, create note/session only
@@ -102,7 +102,7 @@ while [[ $# -gt 0 ]]; do
     --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
     --id|--resume|-r)
       if [[ $# -lt 2 || "${2:-}" == --* ]]; then
-        err "--id/--resume/-r requires a session_id"
+        err "--id/--resume/-r requires an instance id or session_id"
         exit 64
       fi
       RESUME_REQUESTED=true
@@ -171,7 +171,7 @@ elif ! $INTERACTIVE && dispatch_origin_is_human_surface; then
 fi
 
 if $RESUME_REQUESTED && { [[ -z "$RESUME_ID" ]] || [[ "$RESUME_ID" == --* ]]; }; then
-  err "--id/--resume/-r requires a session_id"
+  err "--id/--resume/-r requires an instance id or session_id"
   exit 64
 fi
 
@@ -557,8 +557,8 @@ resolve_resume_id() {
       COALESCE(ci.discord_bot, '')
     FROM claude_instances ci
     LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-    WHERE ci.session_id = '${sid_sql}'
-    ORDER BY ci.last_activity DESC
+    WHERE ci.id = '${sid_sql}' OR ci.session_id = '${sid_sql}'
+    ORDER BY (ci.id = '${sid_sql}') DESC, ci.last_activity DESC
     LIMIT 1;
   ")"
 
@@ -841,6 +841,10 @@ resolve_dispatch_public_target() {
     resolved="$(tmuxctl resolve-pane --format id "$target" 2>/dev/null || true)"
     [[ -n "$resolved" ]] && printf '%s' "$resolved"
   fi
+  # Raw %pane ids (and anything tmuxctl can't map) have no public cardinal — that
+  # is fine; callers fall back to the physical target. Return success explicitly so
+  # the empty-resolution case does not trip `set -e` in the caller's assignment.
+  return 0
 }
 
 resolve_dispatch_physical_target() {
@@ -964,6 +968,10 @@ build_agent_command() {
     else
       cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions --resume "$RESUME_ID")
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
+      # Forward an initial prompt into the resumed interactive session (e.g. a
+      # Golden Throne follow-up SOP). Codex resume already forwards PROMPT above;
+      # without this, `dispatch --id <id> --prompt-file <sop>` silently dropped it.
+      [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
     cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY")

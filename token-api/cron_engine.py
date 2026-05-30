@@ -465,6 +465,14 @@ class CronEngine:
           'isolated'   — fresh instance every run (default, original behavior)
           'persistent' — resume same session indefinitely across runs
           'daily'      — persistent within a day, fresh session each morning
+
+        DEPRECATED execution model: the `claude -p` headless invocation below is a
+        banned anti-pattern everywhere EXCEPT here, where it survives only because
+        cron runs headless and captures stdout into `cron_runs`. The cron system is
+        currently inert (jobs disabled to avoid spend) and is slated to migrate onto
+        the same `dispatch` pane infra as the rest of the fleet — at which point cron
+        runs will launch into managed panes (non-headless) and these `-p` strings go
+        away. Do NOT extend the `-p` path; fold any new work into the dispatch migration.
         """
         model = job["model"]
         prompt_path = job["prompt_path"]
