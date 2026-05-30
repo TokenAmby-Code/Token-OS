@@ -7013,6 +7013,9 @@ async def _find_administratum_tmux_pane() -> str | None:
             continue
         if pane_marker != ADMINISTRATUM_PANE_MARKER:
             continue
+        # Match "claude" directly, or a node-version-style command column
+        # (e.g. "20.11.0") that Claude can surface as in tmux's
+        # #{pane_current_command}.
         cmd_is_claude = "claude" in current_cmd.lower() or (
             current_cmd[0:1].isdigit() and "." in current_cmd
         )
@@ -7045,12 +7048,11 @@ async def _resolve_administratum_instance() -> dict | None:
         return None
     instance = dict(row)
 
-    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME:
-        recovered = await _find_administratum_tmux_pane()
-        if not recovered:
-            return None
-        instance["tmux_pane"] = recovered
-    elif not instance.get("tmux_pane"):
+    # Recover the pane when the row is on another device or has no pane recorded.
+    if (
+        instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME
+        or not instance.get("tmux_pane")
+    ):
         recovered = await _find_administratum_tmux_pane()
         if not recovered:
             return None
