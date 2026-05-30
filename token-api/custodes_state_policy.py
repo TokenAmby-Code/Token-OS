@@ -20,6 +20,28 @@ V1_TRIGGERS = {
     "expected_ack_escalated",
 }
 
+# Hooks that carry a physical enforcement action (Pavlok / window-close / ack
+# ladder). These remain Custodes' surface (the escalation tier) — everything
+# else in V1_TRIGGERS is pure state and routes to Administratum only.
+# Boundary chosen by the Emperor 2026-05-30: "Pavlok-fired = enforcement."
+# See Terra/Ultramar/{Custodes Trinity, Inter-Persona Communication}.
+ENFORCEMENT_TRIGGERS = {
+    "enforcement_cascade_started",
+    "enforcement_cascade_escalate",
+    "expected_ack_escalated",
+    "phone_distraction_blocked",
+    "desktop_mode_blocked",
+}
+
+
+def classify_trigger(event_type: str) -> str:
+    """Classify a recognized trigger as 'enforcement' or 'state'.
+
+    State hooks → Administratum (recorder). Enforcement hooks → Custodes
+    (escalator), with a record-keeping copy to Administratum.
+    """
+    return "enforcement" if event_type in ENFORCEMENT_TRIGGERS else "state"
+
 
 @dataclass(frozen=True)
 class StateEvent:
@@ -38,6 +60,11 @@ class CustodesIntervention:
     prompt: str
     reason: str
     payload: dict[str, Any]
+    # `observed` is the raw metadata line (record-keeping → Administratum).
+    # `behavioral_prompt` is the metadata-stripped directive sent to Custodes
+    # for enforcement hooks. Defaults keep older constructors working.
+    observed: str = ""
+    behavioral_prompt: str = ""
 
 
 def normalize_severity(value: int | str | None) -> int:
@@ -197,6 +224,15 @@ def evaluate_state_event(
         "or the Discord daily thread. "
         "Do NOT reply with in-thread text only; in-thread text is invisible until he returns."
     )
+    # Metadata-stripped variant for Custodes: behavioral directive only, no
+    # observed-state dump. The full metadata lives in the Administratum record.
+    behavioral_prompt = (
+        f"Enforcement hook: {event.event_type}. {direction} "
+        "Be direct; do not over-explain. "
+        "AFK rule: the Emperor is not watching this thread — reach him out-of-band "
+        "(TTS via `tts ...` / /api/notify, or the Discord daily thread). "
+        "Do NOT reply with in-thread text only; it is invisible until he returns."
+    )
     return CustodesIntervention(
         event_type=event.event_type,
         dedupe_key=dedupe_key,
@@ -204,4 +240,6 @@ def evaluate_state_event(
         prompt=prompt,
         reason="v1_trigger",
         payload=payload,
+        observed=observed,
+        behavioral_prompt=behavioral_prompt,
     )

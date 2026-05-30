@@ -52,8 +52,10 @@ import talk as talk_service
 import temp_message as temp_message_service
 from cron_engine import CronEngine
 from custodes_state_policy import (
+    CustodesIntervention,
     StateEvent,
     build_dedupe_key,
+    classify_trigger,
     evaluate_state_event,
     normalize_severity,
 )
@@ -6973,6 +6975,194 @@ async def _dispatch_custodes_intervention_maybe_cancel(prompt: str, cancel_check
     return await dispatch(prompt)
 
 
+# ── Administratum: the state-hook recorder ────────────────────────────
+# Trinity (Terra/Ultramar/Custodes Trinity, Inter-Persona Communication):
+# state hooks belong to Administratum, not Custodes. `_dispatch_administratum_record`
+# is the single centralized sink every recognized hook flows through — the
+# chokepoint where a buffer (pool ~30m, flushed by an inbound enforcement hook)
+# slots in later. For now (Emperor 2026-05-30) records send immediately so the
+# test signal isn't obscured by buffering.
+
+ADMINISTRATUM_PANE_MARKER = "mechanicus:admin"
+
+
+async def _find_administratum_tmux_pane() -> str | None:
+    """Recover the live Administratum pane from tmux (@PANE_ID = mechanicus:admin)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except Exception as exc:
+        logger.warning(f"Administratum record: tmux pane recovery failed: {exc}")
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    for line in stdout.decode().splitlines():
+        try:
+            pane_id, pane_marker, current_cmd = line.split("\t", 2)
+        except ValueError:
+            continue
+        if pane_marker != ADMINISTRATUM_PANE_MARKER:
+            continue
+        cmd_is_claude = "claude" in current_cmd.lower() or (
+            current_cmd[0:1].isdigit() and "." in current_cmd
+        )
+        if cmd_is_claude:
+            return pane_id
+    return None
+
+
+async def _resolve_administratum_instance() -> dict | None:
+    """Resolve the live local Administratum singleton row (the recorder).
+
+    Administratum is registered with `primarch='administratum'` (its class is
+    not an allowed `legion` value). Returns None when no live local recorder
+    exists — callers then no-op rather than spawning one (Admin is a passive
+    recorder, never auto-launched by the dispatcher).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, device_id, dispatch_session_doc_path
+               FROM claude_instances
+               WHERE primarch = 'administratum'
+                 AND status IN ('idle', 'processing')
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        return None
+    instance = dict(row)
+
+    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME:
+        recovered = await _find_administratum_tmux_pane()
+        if not recovered:
+            return None
+        instance["tmux_pane"] = recovered
+    elif not instance.get("tmux_pane"):
+        recovered = await _find_administratum_tmux_pane()
+        if not recovered:
+            return None
+        instance["tmux_pane"] = recovered
+
+    return instance
+
+
+def _administratum_log_path(instance: dict | None) -> Path:
+    """Canonical Administratum record-keeping log for today."""
+    if instance and instance.get("dispatch_session_doc_path"):
+        return Path(instance["dispatch_session_doc_path"])
+    date = datetime.now().strftime("%Y-%m-%d")
+    return OBSIDIAN_VAULT_PATH / "Mars" / "Logs" / f"administratum-{date}.md"
+
+
+async def _append_administratum_log(
+    instance: dict,
+    *,
+    classification: str,
+    event: StateEvent,
+    intervention: CustodesIntervention,
+) -> None:
+    """Deterministically append a state-hook record to the Administratum log.
+
+    The DISPATCHER writes this log; Administratum READS it. This split is the
+    load-bearing trick that lets Admin run on Sonnet without burning context on
+    rote logging (Trinity Realization, 2026-05-20).
+    """
+    path = _administratum_log_path(instance)
+    stamp = datetime.now().strftime("%H:%M:%S")
+    line = (
+        f"- `{stamp}` **{classification}** `{intervention.event_type}` "
+        f"sev={intervention.severity} src=`{event.source}` — "
+        f"observed: {intervention.observed} "
+        f"(dedupe `{intervention.dedupe_key}`)\n"
+    )
+
+    def _write():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = ""
+        if not path.exists():
+            date = datetime.now().strftime("%Y-%m-%d")
+            header = (
+                f"---\ntitle: Administratum {date}\ntype: log/administratum\n---\n\n"
+                f"# Administratum — {date}\n\n"
+                "Deterministic state-hook record (written by the dispatcher; "
+                "Administratum reads).\n\n## State-hook stream\n\n"
+            )
+        with open(path, "a", encoding="utf-8") as fh:
+            if header:
+                fh.write(header)
+            fh.write(line)
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception as exc:
+        logger.warning(f"Administratum record: log append failed: {exc}")
+
+
+async def _dispatch_administratum_record(
+    event: StateEvent,
+    intervention: CustodesIntervention,
+    classification: str,
+) -> dict:
+    """Centralized Administratum sink for the state-hook stream.
+
+    Every recognized state hook (and a record-keeping copy of every enforcement
+    hook) flows through here. Today it (1) writes the deterministic log and
+    (2) injects the full record into the Administratum pane immediately — no
+    dedupe, no quiet-hours suppression (the recorder runs 24/7).
+
+    FUTURE (Emperor 2026-05-30): a buffer slots in right here — state hooks pool
+    for ~30 min, then flush; an inbound enforcement hook pushes the pool through
+    with it. More hook sources (stop-hook records, work events) funnel through
+    this single chokepoint as they're added.
+    """
+    instance = await _resolve_administratum_instance()
+    if not instance:
+        logger.info(
+            "Administratum record: no live recorder pane; "
+            f"{classification}:{intervention.event_type} not recorded to pane"
+        )
+        return {"dispatched": False, "reason": "no_administratum_pane"}
+
+    await _append_administratum_log(
+        instance,
+        classification=classification,
+        event=event,
+        intervention=intervention,
+    )
+
+    custodes_note = (
+        " (enforcement — behavioral copy also routed to Custodes)"
+        if classification == "enforcement"
+        else ""
+    )
+    record_prompt = (
+        f"State-hook record · {classification} · {intervention.event_type} "
+        f"(severity {intervention.severity}, source {event.source}){custodes_note}. "
+        f"Observed: {intervention.observed}. dedupe={intervention.dedupe_key}. "
+        "Logged to your record. You are the recorder: add it to the pile and stay "
+        "silent unless it breaks state coherence (false positive, spam, cascade, "
+        "same failure N× today)."
+    )
+    return await _inject_custodes_prompt_to_pane(
+        record_prompt,
+        instance["tmux_pane"],
+        instance_id=instance["id"],
+    )
+
+
 async def handle_custodes_state_event(
     event_type: str,
     source: str,
@@ -7014,6 +7204,42 @@ async def handle_custodes_state_event(
             "reason": "no_policy_match",
         }
 
+    classification = classify_trigger(intervention.event_type)
+
+    # Administratum seizes the full state-hook stream: every recognized hook is
+    # recorded + pushed to the recorder's pane immediately, ungated by quiet-hours
+    # or dedupe (the recorder runs 24/7). Trinity: state hooks → Administratum.
+    administratum_delivery = await _dispatch_administratum_record(
+        event, intervention, classification
+    )
+
+    if classification == "state":
+        # Pure state hooks no longer interrupt Custodes — Administratum owns them.
+        await log_event(
+            "administratum_record",
+            instance_id=instance_id,
+            device_id=source,
+            details={
+                "event_type": intervention.event_type,
+                "dedupe_key": intervention.dedupe_key,
+                "severity": intervention.severity,
+                "classification": "state",
+                "audience_instance_id": "administratum",
+                "delivery": administratum_delivery,
+            },
+        )
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "routed_to": "administratum",
+            "classification": "state",
+            "dedupe_key": intervention.dedupe_key,
+            "reason": "routed_to_administratum",
+            "administratum_delivery": administratum_delivery,
+        }
+
+    # Enforcement hooks still escalate to Custodes — but stripped to behavioral
+    # info only; the full metadata lives in the Administratum record above.
     if is_quiet_hours():
         suppression = await log_quiet_hours_suppressed(
             source=source,
@@ -7033,7 +7259,8 @@ async def handle_custodes_state_event(
                 "dedupe_key": intervention.dedupe_key,
                 "severity": intervention.severity,
                 "audience_instance_id": "custodes",
-                "prompt": intervention.prompt,
+                "classification": "enforcement",
+                "prompt": intervention.behavioral_prompt,
                 "delivery": {
                     "dispatched": False,
                     "reason": "quiet_hours",
@@ -7079,7 +7306,7 @@ async def handle_custodes_state_event(
         )
 
     delivery = await _dispatch_custodes_intervention_maybe_cancel(
-        intervention.prompt,
+        intervention.behavioral_prompt,
         cancel_check,
     )
     if delivery.get("canceled"):
@@ -7105,7 +7332,8 @@ async def handle_custodes_state_event(
             "dedupe_key": intervention.dedupe_key,
             "severity": intervention.severity,
             "audience_instance_id": delivery.get("instance_id") or "custodes",
-            "prompt": intervention.prompt,
+            "classification": "enforcement",
+            "prompt": intervention.behavioral_prompt,
             "delivery": delivery,
         },
     )
@@ -7113,8 +7341,11 @@ async def handle_custodes_state_event(
     return {
         "received": True,
         "intervention_dispatched": bool(delivery.get("dispatched")),
+        "routed_to": "custodes",
+        "classification": "enforcement",
         "dedupe_key": intervention.dedupe_key,
         "reason": delivery.get("reason", intervention.reason),
+        "administratum_delivery": administratum_delivery,
     }
 
 

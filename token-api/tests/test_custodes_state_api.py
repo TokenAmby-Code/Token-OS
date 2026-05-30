@@ -84,9 +84,14 @@ def test_no_live_custodes_launches_replacement(client, monkeypatch):
     monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find)
     monkeypatch.setattr(main, "_launch_custodes_for_intervention", fake_launch)
 
+    # Enforcement hook (phone_distraction_blocked) still escalates to Custodes.
     resp = client.post(
         "/api/custodes/state-event",
-        json={"event_type": "idle_timeout", "source": "timer_worker"},
+        json={
+            "event_type": "phone_distraction_blocked",
+            "source": "phone",
+            "payload": {"app": "youtube"},
+        },
     )
 
     assert resp.status_code == 200
@@ -121,9 +126,14 @@ def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
     monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fake_inject)
     monkeypatch.setattr(main, "_launch_custodes_for_intervention", fake_launch)
 
+    # Enforcement hook recovers + injects into the live Custodes pane.
     resp = client.post(
         "/api/custodes/state-event",
-        json={"event_type": "idle_timeout", "source": "timer_worker"},
+        json={
+            "event_type": "desktop_mode_blocked",
+            "source": "desktop",
+            "payload": {"desktop_mode": "video"},
+        },
     )
 
     assert resp.status_code == 200
@@ -133,7 +143,7 @@ def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
     assert injections[0][1] == "%310"
 
 
-def test_live_custodes_dispatches_once(client, monkeypatch):
+def test_enforcement_dispatches_behavioral_prompt_once(client, monkeypatch):
     _insert_instance()
     calls = []
 
@@ -146,6 +156,35 @@ def test_live_custodes_dispatches_once(client, monkeypatch):
     resp = client.post(
         "/api/custodes/state-event",
         json={
+            "event_type": "phone_distraction_blocked",
+            "source": "phone",
+            "payload": {"app": "slay_the_spire"},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is True
+    assert data["routed_to"] == "custodes"
+    assert data["classification"] == "enforcement"
+    assert len(calls) == 1
+    # Custodes gets the behavioral directive, NOT the observed-state metadata.
+    assert "Enforcement hook: phone_distraction_blocked." in calls[0]
+    assert "Observed" not in calls[0]
+    assert "phone_app=" not in calls[0]
+
+
+def test_state_event_routes_to_administratum_not_custodes(client, monkeypatch):
+    _insert_instance()
+
+    async def fail_dispatch(prompt):
+        raise AssertionError("state hook must not reach Custodes")
+
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fail_dispatch)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
             "event_type": "idle_timeout",
             "source": "timer_worker",
             "payload": {"phone_app": "slay_the_spire"},
@@ -153,9 +192,16 @@ def test_live_custodes_dispatches_once(client, monkeypatch):
     )
 
     assert resp.status_code == 200
-    assert resp.json()["intervention_dispatched"] is True
-    assert len(calls) == 1
-    assert "State hook: idle_timeout." in calls[0]
+    data = resp.json()
+    assert data["intervention_dispatched"] is False
+    assert data["routed_to"] == "administratum"
+    assert data["classification"] == "state"
+    assert data["reason"] == "routed_to_administratum"
+    # No live recorder pane in the test DB → record is a no-op, not an error.
+    assert data["administratum_delivery"]["reason"] == "no_administratum_pane"
+    # State events are logged under administratum_record, never custodes_intervention.
+    assert len(_events("administratum_record")) == 1
+    assert len(_events("custodes_intervention")) == 0
 
 
 def test_duplicate_event_within_debounce_is_suppressed(client, monkeypatch):
