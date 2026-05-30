@@ -16,7 +16,6 @@ import logging
 import mimetypes
 import os
 import re
-import shlex
 import signal
 import socket
 import time
@@ -5596,7 +5595,7 @@ async def _dispatch_resume_into_pane(
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Don't leak the dispatch child: if it survives the timeout it could
         # resume the agent in the background while this path records a failure,
         # desyncing Golden Throne state. Kill and reap before re-raising.
