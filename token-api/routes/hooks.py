@@ -2883,7 +2883,7 @@ async def handle_stop(payload: dict) -> dict:
             "vibe": 30,
         }
         if tts_text:
-            notify_params["tts_text"] = tts_text[:300]  # comms-router-allow: phone-hosted session host delivery
+            notify_params["tts_text"] = tts_text[:300]  # comms-router-allow: phone host delivery
         phone_result = await asyncio.to_thread(_send_to_phone, "/notify", notify_params)
         result["notification"] = phone_result
         logger.info(
