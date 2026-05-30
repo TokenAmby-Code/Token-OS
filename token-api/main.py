@@ -7444,6 +7444,42 @@ async def set_instance_legion(instance_id: str, request: Request):
     return {"instance_id": instance_id, "legion": legion}
 
 
+@app.patch("/api/instances/{instance_id}/tmux-pane")
+async def rebind_instance_tmux_pane(instance_id: str, request: Request):
+    """Repoint a drifted instance row's tmux_pane to a concrete tmux pane id.
+
+    Self-heal surface for the dispatch pane-registry wedge: a `:new` stack launch
+    could register the allocation token (e.g. `mechanicus:new`) as tmux_pane,
+    leaving the row unresolvable by pane_truth / assert-instance / agent-cmd. The
+    stack sweep correlates such a row to its live pane (by pid) and rebinds it
+    here. Only concrete `%NN` pane ids are accepted — never another token.
+    """
+    body = await request.json()
+    tmux_pane = (body.get("tmux_pane") or "").strip()
+    if not (tmux_pane.startswith("%") and tmux_pane[1:].isdigit()):
+        raise HTTPException(
+            status_code=400,
+            detail="tmux_pane must be a concrete tmux pane id (e.g. %16)",
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"tmux_pane": tmux_pane},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="rebind-tmux-pane",
+        )
+        await db.commit()
+
+    logger.info(f"Tmux pane: {instance_id[:12]} → {tmux_pane}")
+    return {"instance_id": instance_id, "tmux_pane": tmux_pane}
+
+
 @app.patch("/api/instances/{instance_id}/synced")
 async def set_instance_synced(instance_id: str, request: Request):
     """Set synced flag for an instance. Enforces one synced session per legion."""

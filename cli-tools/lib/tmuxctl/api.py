@@ -149,6 +149,22 @@ def _api_get_json(path: str) -> dict | list:
         raise RegistryError(f"failed to fetch {path} from {api_url}") from exc
 
 
+def fetch_instance_rows_raw() -> list[dict]:
+    """Fetch raw instance rows (full JSON), including correlation columns.
+
+    The typed :class:`InstanceRegistryEntry` model omits columns like ``pid`` and
+    ``session_id``; callers that need them (e.g. stack-sweep pane reconciliation)
+    read the raw dicts instead of the parsed snapshot.
+    """
+    data = _api_get_json("/api/instances")
+    return data if isinstance(data, list) else []
+
+
+def rebind_instance_pane(instance_id: str, pane_id: str) -> None:
+    """Repoint a drifted instance row's ``tmux_pane`` to a concrete pane id."""
+    patch_instance(instance_id, "tmux-pane", {"tmux_pane": pane_id})
+
+
 def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
     """Resolve a cardinal pane label to its linked session document.
 

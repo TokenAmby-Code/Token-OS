@@ -413,7 +413,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     tmuxctl_log = tmp_path / "tmuxctl.log"
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
-        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%aspirant-pane\\n"\n',
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%83\\n"\n',
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
@@ -461,7 +461,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert data["dispatch_ready"] is False
     assert data["operator_approved_dispatch"] is False
     assert "dispatched claude to legion:new" in result.stdout
-    assert "%aspirant-pane" not in result.stdout
+    assert "%83" not in result.stdout
 
     note = next((vault / "Aspirants").glob("implement-safely*.md"))
     note_text = note.read_text(encoding="utf-8")
@@ -484,13 +484,11 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     # any leading-char loss from the upstream type-check guard; the real
     # `bash <staged>` is sent via a follow-up tmux send-keys after a settle.
     assert "--command clear" in launched
-    assert "%aspirant-pane" not in launched
+    assert "%83" not in launched
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
-    assert "send-keys -t %aspirant-pane bash " in tmux_text
+    assert "send-keys -t %83 bash " in tmux_text
     assert "Enter" in tmux_text
-    send_line = next(
-        line for line in tmux_text.splitlines() if "send-keys -t %aspirant-pane bash " in line
-    )
+    send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %83 bash " in line)
     staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "--append-system-prompt" in staged
@@ -598,3 +596,74 @@ def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
     assert "target:          2:NE" in result.stdout
     assert "resolved_target: somnium:NE" in result.stdout
     assert "%22" not in result.stdout
+
+
+def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
+    """A :new stack launch must register the concrete pane the agent lands in.
+
+    Regression guard for the pane-registry wedge: dispatch builds FINAL_COMMAND
+    before the pane exists, baking the allocation token (mechanicus:new) into
+    TMUX_PANE / TOKEN_API_DISPATCH_RESOLVED_PANE. After the pane is allocated the
+    env must be rebuilt with the concrete %NN id so the agent's first
+    SessionStart registers a tmux_pane that pane_truth / assert-instance /
+    agent-cmd can resolve. TOKEN_API_DISPATCH_TARGET keeps the request token.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    rec = tmp_path / "tmux_calls.txt"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    # Skip the caller-instance resolution network hop so the test is hermetic.
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
+    # The staged launcher is sent via `tmux send-keys -t %77 'bash /tmp/...' Enter`.
+    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
+    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
+    staged_path = Path(staged_arg.split(" ", 1)[1])
+    content = staged_path.read_text(encoding="utf-8")
+
+    assert "TMUX_PANE=%77" in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%77" in content, content
+    assert "TMUX_PANE=mechanicus:new" not in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=mechanicus:new" not in content, content
+    # The allocation token remains the semantic request target.
+    assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
