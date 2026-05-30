@@ -1093,6 +1093,21 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # Automated dispatch should not steal the operator's camera/focus. The new pane
   # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
   pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
+  pane_id="$(printf '%s' "$pane_id" | tr -d '[:space:]')"
+  # FINAL_COMMAND was built (above) before this pane existed, so it baked the
+  # allocation token (e.g. mechanicus:new) into TMUX_PANE and
+  # TOKEN_API_DISPATCH_RESOLVED_PANE. Now that the concrete pane is known, rebuild
+  # the launch env with it so the agent's first SessionStart registers the real
+  # pane id — otherwise pane_truth / assert-instance / agent-cmd cannot resolve
+  # pane→instance and the orchestrator cannot drive its own child. The request
+  # token stays in TOKEN_API_DISPATCH_TARGET (the row's dispatch_target field);
+  # only the pane fields become concrete.
+  if [[ ! "$pane_id" =~ ^%[0-9]+$ ]]; then
+    err "stack dispatch returned a non-pane id for $stack: '${pane_id}'"
+    exit 1
+  fi
+  RESOLVED_PHYSICAL_TARGET="$pane_id"
+  FINAL_COMMAND="$(build_agent_command)"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   tmux send-keys -t "$pane_id" "$STAGED_COMMAND" Enter
