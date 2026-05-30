@@ -36,7 +36,7 @@ from instance_mutation import (
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from pane_surface import human_pane_surface
+from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
@@ -399,13 +399,9 @@ def _instance_name_base_from_session_doc(title: str | None, file_path: str | Non
 
 
 def _is_unnamed_session_doc_base(base: str | None) -> bool:
-    return (base or "") in {
-        "needs-name",
-        "needs-session-name",
-        "unnamed-session",
-        "session",
-        "session-doc",
-    }
+    # Centralized in pane_surface so all four placeholder detectors agree and
+    # numbered variants (needs-session-name-345) cannot leak into instance names.
+    return bool(PLACEHOLDER_TAB_NAME_RX.match(base or ""))
 
 
 async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int) -> str:
@@ -1516,6 +1512,9 @@ async def handle_session_start(payload: dict) -> dict:
 
     # Detect primarch (env var) and transplant-from (file-based handoff injected by hook)
     primarch_name = env.get("TOKEN_API_PRIMARCH", "")
+    dispatch_legion = _normalize_text(
+        payload.get("dispatch_legion") or env.get("TOKEN_API_LEGION", "")
+    )
     transplant_from = payload.get("transplant_from", "")
     launcher = _normalize_text(payload.get("launcher") or env.get("TOKEN_API_LAUNCHER", ""))
     engine = _normalize_text(payload.get("engine") or env.get("TOKEN_API_ENGINE", ""))
@@ -1564,6 +1563,19 @@ async def handle_session_start(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
+
+        # Cron-launched custodes carries its legion on the cron_jobs row, not in
+        # the dispatch env. Resolve it up front so resolve_session_doc_for_start
+        # can take the daily-note branch for cron jobs too.
+        if not dispatch_legion and origin_type == "cron":
+            cron_job_id = env.get("CRON_JOB_ID")
+            if cron_job_id:
+                cursor = await db.execute(
+                    "SELECT legion FROM cron_jobs WHERE id = ?", (cron_job_id,)
+                )
+                cron_legion_row = await cursor.fetchone()
+                if cron_legion_row and cron_legion_row[0]:
+                    dispatch_legion = _normalize_text(cron_legion_row[0])
 
         # Check if already registered
         cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
@@ -1631,7 +1643,12 @@ async def handle_session_start(payload: dict) -> dict:
             if supplant_id and supplant_id == session_id:
                 resolved_session_doc_id = None
                 resolved_session_doc_policy = None
-                if dispatch_session_doc_path or primarch_name or origin_type == "cron":
+                if (
+                    dispatch_session_doc_path
+                    or primarch_name
+                    or dispatch_legion
+                    or origin_type == "cron"
+                ):
                     (
                         resolved_session_doc_id,
                         resolved_session_doc_policy,
@@ -1644,6 +1661,7 @@ async def handle_session_start(payload: dict) -> dict:
                         cron_job_name=env.get("CRON_JOB_NAME", "cron"),
                         working_dir=working_dir,
                         is_subagent=bool(is_subagent),
+                        legion=dispatch_legion or None,
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
                 workflow_state = _derive_launch_workflow_state(
@@ -1884,7 +1902,12 @@ async def handle_session_start(payload: dict) -> dict:
                 internal_session_id = str(uuid.uuid4())
                 resolved_session_doc_id = None
                 resolved_session_doc_policy = None
-                if dispatch_session_doc_path or primarch_name or origin_type == "cron":
+                if (
+                    dispatch_session_doc_path
+                    or primarch_name
+                    or dispatch_legion
+                    or origin_type == "cron"
+                ):
                     (
                         resolved_session_doc_id,
                         resolved_session_doc_policy,
@@ -1897,6 +1920,7 @@ async def handle_session_start(payload: dict) -> dict:
                         cron_job_name=env.get("CRON_JOB_NAME", "cron"),
                         working_dir=working_dir,
                         is_subagent=bool(is_subagent),
+                        legion=dispatch_legion or None,
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
                 workflow_state = _derive_launch_workflow_state(
@@ -2217,8 +2241,25 @@ async def handle_session_start(payload: dict) -> dict:
             cron_job_name=env.get("CRON_JOB_NAME", "cron"),
             working_dir=working_dir,
             is_subagent=bool(is_subagent),
+            legion=dispatch_legion or None,
         )
         session_doc_policy = resolved_session_doc_policy or session_doc_policy
+        # Automated launch that couldn't resolve a doc: leave session_doc_id NULL
+        # (no placeholder minted) and surface the miss for the orchestrator.
+        if session_doc_id is None and resolved_session_doc_policy == "unresolved_dispatch":
+            await log_event(
+                "session_doc_unresolved",
+                instance_id=session_id,
+                device_id=device_id,
+                details={
+                    "launcher": launcher,
+                    "dispatch_target": dispatch_target,
+                    "legion": dispatch_legion,
+                    "primarch": primarch_name,
+                    "origin_type": origin_type,
+                    "dispatch_session_doc_path": dispatch_session_doc_path,
+                },
+            )
         workflow_state = _derive_launch_workflow_state(
             dispatch_target=dispatch_target,
             engine=engine,

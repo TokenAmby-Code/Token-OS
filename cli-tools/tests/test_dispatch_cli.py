@@ -572,6 +572,76 @@ def test_fzf_launcher_expands_and_cli_prompt_retracts_idempotently():
     assert 'if [[ "$WINDOW_ZOOMED" != "1" ]]' in expand
 
 
+def test_dispatch_emits_token_api_legion_for_custodes_persona():
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--persona",
+            "custodes",
+            "--target",
+            "legion:new",
+            "--dir",
+            str(ROOT),
+            "custodes work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_LEGION=custodes" in result.stdout
+
+
+def test_dispatch_emits_token_api_legion_for_custodes_slot_target():
+    # State-hook dispatcher targets the legion:custodes slot without a persona.
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--target",
+            "legion:custodes",
+            "--dir",
+            str(ROOT),
+            "custodes work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_LEGION=custodes" in result.stdout
+
+
+def test_dispatch_omits_legion_for_non_custodes_target():
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_LEGION=\n" in result.stdout or "TOKEN_API_LEGION=" in result.stdout
+    assert "TOKEN_API_LEGION=custodes" not in result.stdout
+
+
 def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

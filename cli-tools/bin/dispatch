@@ -994,6 +994,24 @@ if [[ -n "$DISCORD_CHANNEL" ]]; then
   esac
 fi
 
+# Derive the instance legion so automated launches (GT/state-hook dispatch,
+# cron) that bypass --persona still bind Custodes to its shared daily note.
+# This is an independent signal in COMMON_ENV: it survives even when the
+# primarch wrapper fails to propagate TOKEN_API_PRIMARCH.
+LEGION="${TOKEN_API_LEGION:-}"
+if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
+  case "$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')" in
+    custodes) LEGION="custodes" ;;
+    inquisitor|inquisition) LEGION="inquisition" ;;
+  esac
+fi
+# The state-hook dispatcher targets the `legion:custodes` slot without a persona.
+if [[ -z "$LEGION" ]]; then
+  case "$(printf '%s' "$DISPATCH_SLOT" | tr '[:upper:]' '[:lower:]')" in
+    custodes) LEGION="custodes" ;;
+  esac
+fi
+
 MCP_DECISION="default"
 MCP_REQUESTS=()
 $WITH_BROWSER && MCP_REQUESTS+=("browser")
@@ -1014,6 +1032,7 @@ COMMON_ENV=(
   "TOKEN_API_ENGINE=${ENGINE}"
   "TOKEN_API_WRAPPER_LAUNCH_ID=${WRAPPER_ID}"
   "TOKEN_API_DISPATCH_TARGET=${TARGET}"
+  "TOKEN_API_LEGION=${LEGION}"
   "TOKEN_API_DISPATCH_WINDOW=${DISPATCH_WINDOW}"
   "TOKEN_API_DISPATCH_MODE=${DISPATCH_MODE}"
   "TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}"

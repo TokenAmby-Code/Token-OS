@@ -14,18 +14,19 @@ def _insert_instance(
     workflow_blocked_reason=None,
 ):
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        INSERT INTO session_documents (id, file_path, title, project)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            session_doc_id,
-            "/Volumes/Imperium/Imperium-ENV/Mars/Sessions/2026-05-10-anti-archaeology-chunk-a-naming-nudge.md",
-            "Anti-Archaeology Chunk A",
-            "anti-archaeology-v2",
-        ),
-    )
+    if session_doc_id is not None:
+        conn.execute(
+            """
+            INSERT INTO session_documents (id, file_path, title, project)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                session_doc_id,
+                "/Volumes/Imperium/Imperium-ENV/Mars/Sessions/2026-05-10-anti-archaeology-chunk-a-naming-nudge.md",
+                "Anti-Archaeology Chunk A",
+                "anti-archaeology-v2",
+            ),
+        )
     conn.execute(
         """
         INSERT INTO claude_instances (
@@ -165,3 +166,46 @@ async def test_naming_nudge_does_not_duplicate_pending_queue_item(app_env, monke
     )
 
     assert result["action"] == "noop_pending_nudge"
+
+
+@pytest.mark.asyncio
+async def test_naming_nudge_sends_for_numbered_placeholder(app_env, monkeypatch):
+    """Numbered placeholder variants (needs-session-name-345) are now caught by
+    the centralized regex and must be nudged, not silently treated as named."""
+    _insert_instance(app_env.db_path, tab_name="needs-session-name-345")
+    enqueued = []
+
+    async def fake_enqueue(**kwargs):
+        enqueued.append(kwargs)
+        return {"id": "queue-1", **kwargs, "status": "pending"}
+
+    async def fake_process(queue_id):
+        return [{"queue_id": queue_id, "status": "sent"}]
+
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fake_enqueue)
+    monkeypatch.setattr(app_env.main, "process_pane_write_queue_once", fake_process)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(session_id="inst-naming")
+    )
+
+    assert result["action"] == "nudge_sent"
+    assert enqueued and enqueued[0]["source"] == "naming_nudge"
+
+
+@pytest.mark.asyncio
+async def test_naming_nudge_noops_for_null_doc_instance(app_env, monkeypatch):
+    """An automated launch left with NULL session_doc_id and no placeholder tab
+    name must not be infinitely nudged — the gate keys on tab_name."""
+    _insert_instance(app_env.db_path, tab_name=None, session_doc_id=None)
+
+    async def fail_enqueue(**_kwargs):
+        raise AssertionError("NULL-doc instance must not be nudged")
+
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fail_enqueue)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(session_id="inst-naming")
+    )
+
+    assert result["action"] == "noop_named"

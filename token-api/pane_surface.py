@@ -11,6 +11,11 @@ from __future__ import annotations
 import re
 
 DEFAULT_TAB_NAME_RX = re.compile(r"^Claude\s+\d{1,2}:\d{2}$")
+# Placeholder stems with optional numeric collision/monotonic suffix:
+# needs-name, needs-name-2, needs-session-name-345, unnamed-session-3, session-doc-12, session
+PLACEHOLDER_TAB_NAME_RX = re.compile(
+    r"^(?:needs-name|needs-session-name|unnamed-session|session-doc|session)(?:-\d+)?$"
+)
 RAW_TMUX_PANE_RX = re.compile(r"%\d+")
 
 _PANE_PAGE_NUMBERS = {

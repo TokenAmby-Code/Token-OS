@@ -78,6 +78,7 @@ from instance_mutation import (
 )
 from pane_surface import (
     DEFAULT_TAB_NAME_RX,
+    PLACEHOLDER_TAB_NAME_RX,
 )
 from pane_surface import (
     human_pane_surface as _format_human_pane_surface,
@@ -16730,7 +16731,7 @@ def _is_placeholder_tab_name(tab_name: str | None) -> bool:
     cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
     if not cleaned:
         return False
-    if cleaned in {"needs-name", "needs-session-name"}:
+    if PLACEHOLDER_TAB_NAME_RX.match(cleaned):
         return True
     return bool(DEFAULT_TAB_NAME_RX.match(cleaned))
 

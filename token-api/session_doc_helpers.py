@@ -29,7 +29,7 @@ if _VAULT_ROOT is None:
     _VAULT_ROOT = _IMPERIUM_ROOT / "Imperium-ENV"
 TERRA_SESSIONS_DIR = _VAULT_ROOT / "Terra" / "Sessions"
 MARS_SESSIONS_DIR = _VAULT_ROOT / "Mars" / "Sessions"
-DAILY_NOTES_DIR = _VAULT_ROOT / "Terra" / "Journal"
+DAILY_NOTES_DIR = _VAULT_ROOT / "Terra" / "Journal" / "Daily"
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
 
 
@@ -872,17 +872,25 @@ async def resolve_session_doc_for_start(
     cron_job_name: str | None,
     working_dir: str | None,
     is_subagent: bool,
+    legion: str | None = None,
 ) -> tuple[int | None, str | None]:
     """Resolve launch-time session doc ownership with explicit precedence.
 
     Precedence:
-    1. explicit dispatch doc
-    2. Custodes daily note
+    1. Custodes daily note
+    2. explicit dispatch doc
     3. active primarch doc
     4. active cron doc (or create one)
     5. generic interactive doc (top-level only)
+
+    Automated/dispatched launches (legion/primarch/cron/explicit-but-unresolved)
+    never fall through to the placeholder factory; they return
+    ``(None, "unresolved_dispatch")`` so the orchestrator surfaces the miss
+    instead of accumulating blank ``needs-session-name-N.md`` docs.
     """
-    if primarch_name == "custodes":
+    # Legion-aware so automated custodes launches (cron, GT/state-hook dispatch,
+    # resume) that never set TOKEN_API_PRIMARCH still bind to the shared daily note.
+    if primarch_name == "custodes" or legion == "custodes":
         doc_id = await resolve_or_create_today_daily_note_session_doc(db)
         return doc_id, "daily_note_custodes"
 
@@ -923,6 +931,14 @@ async def resolve_session_doc_for_start(
 
     if is_subagent:
         return None, None
+
+    # Automated/dispatched launches must not mint a placeholder. The generic
+    # interactive branch below is the "name your own doc" flow for genuine human
+    # sessions only (no dispatch metadata, no legion, no primarch, not cron). A
+    # dispatched launch that reaches here either failed to resolve its explicit
+    # doc or is a primarch with no active doc — surface that, don't paper over it.
+    if dispatch_session_doc_path or legion or primarch_name or origin_type == "cron":
+        return None, "unresolved_dispatch"
 
     now_ts = datetime.now().isoformat()
     # No cwd/date fallback names. A new interactive session gets a placeholder
