@@ -22,7 +22,7 @@ Usage:
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
-  --id, --resume, -r <id>      Resume an existing agent session by session_id
+  --id, --resume, -r <id>      Resume an existing agent session by instance id or session_id
   --aspirant                  Create an aspirant instead of launching directly
   --aspirant-kind <kind>      dispatch, deploy_p, or deploy_d (with --aspirant)
   --intake-only               With dispatch aspirants, create note/session only
@@ -102,7 +102,7 @@ while [[ $# -gt 0 ]]; do
     --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
     --id|--resume|-r)
       if [[ $# -lt 2 || "${2:-}" == --* ]]; then
-        err "--id/--resume/-r requires a session_id"
+        err "--id/--resume/-r requires an instance id or session_id"
         exit 64
       fi
       RESUME_REQUESTED=true
@@ -171,7 +171,7 @@ elif ! $INTERACTIVE && dispatch_origin_is_human_surface; then
 fi
 
 if $RESUME_REQUESTED && { [[ -z "$RESUME_ID" ]] || [[ "$RESUME_ID" == --* ]]; }; then
-  err "--id/--resume/-r requires a session_id"
+  err "--id/--resume/-r requires an instance id or session_id"
   exit 64
 fi
 

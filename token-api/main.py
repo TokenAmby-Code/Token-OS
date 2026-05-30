@@ -5594,7 +5594,15 @@ async def _dispatch_resume_into_pane(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        # Don't leak the dispatch child: if it survives the timeout it could
+        # resume the agent in the background while this path records a failure,
+        # desyncing Golden Throne state. Kill and reap before re-raising.
+        proc.kill()
+        await proc.communicate()
+        raise
     return {
         "command": " ".join(args),
         "returncode": proc.returncode,
@@ -5973,17 +5981,30 @@ async def golden_throne_followup(session_id: str):
             # print-mode redirect host-pane is spawned.
             try:
                 resume_pane = await _get_or_create_legion_pane()
-                # Write SOP to temp file (avoids shell escaping issues); dispatch
-                # reads it via --prompt-file and forwards it as the resume prompt.
-                sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
-                Path(sop_file).write_text(sop_prompt)
-                resume_result = await _dispatch_resume_into_pane(
-                    session_id=session_id,
-                    pane=resume_pane,
-                    sop_file=sop_file,
-                    working_dir=working_dir,
-                    engine=engine,
-                )
+                # Write SOP to a unique, short-lived temp file (avoids shell escaping
+                # and predictable-path symlink/collision risk); dispatch reads it via
+                # --prompt-file and inlines it as the resume prompt, then we remove it
+                # so the SOP does not persist on disk.
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".md",
+                    prefix=f"golden-throne-sop-{session_id[:8]}-",
+                    dir="/tmp",
+                    delete=False,
+                ) as tmp:
+                    tmp.write(sop_prompt)
+                    sop_file = tmp.name
+                try:
+                    resume_result = await _dispatch_resume_into_pane(
+                        session_id=session_id,
+                        pane=resume_pane,
+                        sop_file=sop_file,
+                        working_dir=working_dir,
+                        engine=engine,
+                    )
+                finally:
+                    Path(sop_file).unlink(missing_ok=True)
                 dispatch_details.update(
                     {
                         "transport": "dispatch-resume",

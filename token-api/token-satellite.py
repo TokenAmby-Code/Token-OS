@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -1993,13 +1994,26 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                         "session_id": req.session_id,
                     }
                 working_dir = os.path.expanduser(req.working_dir)
-                # Write SOP to temp file (avoids shell escaping); dispatch reads it
-                # via --prompt-file and forwards it as the resume prompt.
-                sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
-                Path(sop_file).write_text(req.prompt)
-                resume_proc = _dispatch_resume_into_pane(
-                    req.session_id, kreig_pane, sop_file, working_dir, engine
-                )
+                # Write SOP to a unique, short-lived temp file (avoids shell escaping
+                # and predictable-path collisions between parallel retries); dispatch
+                # reads it via --prompt-file and forwards it as the resume prompt, then
+                # we remove it so the SOP does not persist on disk.
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".md",
+                    prefix=f"golden-throne-sop-{req.session_id[:8]}-",
+                    dir="/tmp",
+                    delete=False,
+                ) as tmp:
+                    tmp.write(req.prompt)
+                    sop_file = tmp.name
+                try:
+                    resume_proc = _dispatch_resume_into_pane(
+                        req.session_id, kreig_pane, sop_file, working_dir, engine
+                    )
+                finally:
+                    Path(sop_file).unlink(missing_ok=True)
                 if resume_proc.returncode != 0:
                     raise RuntimeError(
                         f"dispatch resume rc={resume_proc.returncode}: "
