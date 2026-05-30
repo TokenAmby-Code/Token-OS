@@ -76,7 +76,8 @@ _DEFAULT_QUIET_TZ = "America/Phoenix"
 # /api/day-start/fire endpoint (the documented "single morning latch") whose
 # human/official sources are alarm_silenced|manual|custodes. The automated
 # "schedule"/"schedule_fallback" sources are deliberately excluded. If early
-# release never fires, the 09:00 clock boundary still ends quiet hours.
+# release never fires, the 07:00 clock boundary (the _DEFAULT_QUIET_END default
+# below) still ends quiet hours.
 # Overridable via env (TOKEN_API_MORNING_SOURCES) and kept in sync with shared.py.
 _OFFICIAL_MORNING_SOURCES = frozenset(
     s.strip()

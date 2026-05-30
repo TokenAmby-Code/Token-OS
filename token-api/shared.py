@@ -44,8 +44,9 @@ QUIET_HOURS_TIMEZONE = os.environ.get("TOKEN_API_QUIET_TIMEZONE", "America/Phoen
 # the Emperor slept and must NOT release quiet — and /api/day-start/fire (the
 # documented "single morning latch") whose human/official sources are
 # alarm_silenced|manual|custodes. The automated "schedule"/"schedule_fallback"
-# are deliberately excluded; if early release never fires the 09:00 clock
-# boundary still ends quiet hours. Kept in sync with tmuxctl.send_gate.
+# are deliberately excluded; if early release never fires the 07:00 clock
+# boundary (TOKEN_API_QUIET_END_HOUR default) still ends quiet hours. Kept in
+# sync with tmuxctl.send_gate.
 OFFICIAL_MORNING_SOURCES = frozenset(
     s.strip()
     for s in os.environ.get(

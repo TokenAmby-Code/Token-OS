@@ -20,7 +20,7 @@ async def _no_pending_input(_pane: str) -> bool:
     return False
 
 
-def _fetch_status(db_path: Any, queue_id: str) -> str:
+def _fetch_status(db_path: Any, queue_id: str) -> str | None:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             "SELECT status FROM pane_write_queue WHERE id = ?", (queue_id,)
