@@ -3166,28 +3166,6 @@ async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str |
     return "stale_reused_or_empty_pane"
 
 
-def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
-    quoted_working_dir = shlex.quote(working_dir)
-    quoted_session_id = shlex.quote(session_id)
-    quoted_sop_file = shlex.quote(sop_file)
-    if engine == "codex":
-        dispatch_bin = shlex.quote(
-            os.environ.get("CODEX_DISPATCH_BIN")
-            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
-        )
-        return (
-            f"cd {quoted_working_dir} && {dispatch_bin} "
-            f"--resume-session {quoted_session_id} "
-            f"--launcher golden-throne --launch-mode golden-throne-resume "
-            f"{quoted_working_dir} "
-            f'"$(cat {quoted_sop_file})"'
-        )
-    return (
-        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
-        f"--resume {quoted_session_id} --dangerously-skip-permissions"
-    )
-
-
 def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
     total_seconds = int(round((hour_float % 24) * 3600)) % 86400
     midnight = datetime.combine(
@@ -5574,6 +5552,57 @@ async def _get_or_create_legion_pane() -> str:
     return pane_id
 
 
+async def _dispatch_resume_into_pane(
+    session_id: str,
+    pane: str,
+    sop_file: str,
+    working_dir: str,
+    engine: str,
+) -> dict:
+    """Resume a dead-agent instance into an allocated worker pane via `dispatch`.
+
+    The canonical launcher resumes the agent INTERACTIVELY (`claude --resume` /
+    codex resume) — never `claude -p`. `claude -p` is a banned anti-pattern here:
+    the wrapper intercepts print-mode and re-redirects it into a second pane,
+    leaving an empty host pane and breaking tmux automation. Targeting an
+    already-allocated pane with `--pane` keeps the whole resume in ONE pane and
+    lets dispatch re-bind the instance with correct env/zealotry/session-doc.
+    """
+    dispatch_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "dispatch"
+    args = [
+        str(dispatch_bin),
+        "--direct",
+        "--id",
+        session_id,
+        "--pane",
+        pane,
+        "--engine",
+        engine,
+        "--dir",
+        working_dir,
+        "--prompt-file",
+        sop_file,
+    ]
+    # Strip any inherited tmux context so dispatch resolves --pane as the target
+    # rather than assuming it runs inside a specific pane; mark the origin so the
+    # interactive fzf selector stays off for this automated launch.
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    env["TOKEN_API_DISPATCH_ORIGIN"] = "golden_throne"
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    return {
+        "command": " ".join(args),
+        "returncode": proc.returncode,
+        "stdout": stdout.decode(errors="replace"),
+        "stderr": stderr.decode(errors="replace"),
+    }
+
+
 async def _log_golden_throne_dispatch_failed(session_id: str, details: dict) -> None:
     await log_event("golden_throne_dispatch_failed", instance_id=session_id, details=details)
     logger.error(
@@ -5938,51 +5967,49 @@ async def golden_throne_followup(session_id: str):
                 )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Agent not running — resume in a managed legion worker pane with SOP prompt
+            # Agent not running — resume into a single managed legion worker pane
+            # via the canonical `dispatch` launcher. dispatch resumes the agent
+            # INTERACTIVELY (no `claude -p`), so tmux automation stays intact and no
+            # print-mode redirect host-pane is spawned.
             try:
                 resume_pane = await _get_or_create_legion_pane()
-                # Write SOP to temp file (avoids shell escaping issues)
+                # Write SOP to temp file (avoids shell escaping issues); dispatch
+                # reads it via --prompt-file and forwards it as the resume prompt.
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                resume_cmd = _agent_resume_command(engine, session_id, working_dir, sop_file)
-                queued = await enqueue_pane_write(
-                    instance_id=session_id,
-                    tmux_pane=resume_pane,
-                    source="golden_throne",
-                    purpose="followup",
-                    payload=resume_cmd,
+                resume_result = await _dispatch_resume_into_pane(
+                    session_id=session_id,
+                    pane=resume_pane,
+                    sop_file=sop_file,
+                    working_dir=working_dir,
+                    engine=engine,
                 )
-                queue_results = await process_pane_write_queue_once(queued["id"])
-                queue_result = queue_results[0] if queue_results else queued
                 dispatch_details.update(
                     {
-                        "transport": "resume",
+                        "transport": "dispatch-resume",
                         "target_pane": resume_pane,
                         "legion_worker_pane": resume_pane,
-                        "resume_command": resume_cmd,
-                        "returncode": queue_result.get("returncode"),
-                        "stdout": queue_result.get("stdout", ""),
-                        "stderr": queue_result.get("stderr", ""),
-                        "queue_id": queued["id"],
-                        "queue_status": queue_result.get("status"),
-                        "defer_reason": queue_result.get("reason"),
+                        "resume_command": resume_result["command"],
+                        "returncode": resume_result["returncode"],
+                        "stdout": _snippet(resume_result["stdout"]),
+                        "stderr": _snippet(resume_result["stderr"]),
                         "tmux_pane_exists": await _tmux_pane_exists(resume_pane),
                     }
                 )
-                if queue_result.get("status") == PANE_WRITE_SENT:
+                if resume_result["returncode"] == 0:
                     logger.info(
-                        f"Golden Throne: resumed {session_id[:12]} in managed legion worker "
-                        f"pane={resume_pane} via {engine} resume"
+                        f"Golden Throne: resumed {session_id[:12]} via dispatch in managed "
+                        f"legion worker pane={resume_pane} ({engine}, interactive)"
                     )
-                elif queue_result.get("reason") == "dispatch_deferred":
-                    logger.info(
-                        f"Golden Throne: resume deferred for {session_id[:12]} "
-                        f"because pane has pending user input"
+                else:
+                    logger.error(
+                        f"Golden Throne: dispatch resume failed for {session_id[:12]}: "
+                        f"rc={resume_result['returncode']} {resume_result['stderr'][:200]}"
                     )
             except Exception as e:
                 dispatch_details.update(
                     {
-                        "transport": "resume",
+                        "transport": "dispatch-resume",
                         "error": str(e),
                         "tmux_pane_exists": False,
                     }

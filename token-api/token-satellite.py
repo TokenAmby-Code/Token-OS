@@ -1436,25 +1436,42 @@ def _tmux_pane_has_agent_process(pane: str, engine: str) -> bool:
     return False
 
 
-def _agent_resume_command(engine: str, session_id: str, working_dir: str, sop_file: str) -> str:
-    quoted_working_dir = shlex.quote(working_dir)
-    quoted_session_id = shlex.quote(session_id)
-    quoted_sop_file = shlex.quote(sop_file)
-    if engine == "codex":
-        dispatch_bin = shlex.quote(
-            os.environ.get("CODEX_DISPATCH_BIN")
-            or str(Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "codex-dispatch")
-        )
-        return (
-            f"cd {quoted_working_dir} && {dispatch_bin} "
-            f"--resume-session {quoted_session_id} "
-            f"--launcher golden-throne --launch-mode golden-throne-resume "
-            f"{quoted_working_dir} "
-            f'"$(cat {quoted_sop_file})"'
-        )
-    return (
-        f'cd {quoted_working_dir} && claude -p "$(cat {quoted_sop_file})" '
-        f"--resume {quoted_session_id} --dangerously-skip-permissions"
+def _dispatch_resume_into_pane(
+    session_id: str,
+    pane: str,
+    sop_file: str,
+    working_dir: str,
+    engine: str,
+) -> subprocess.CompletedProcess:
+    """Resume a dead-agent instance into an allocated kreig pane via `dispatch`.
+
+    Mirrors the Mac path: dispatch resumes the agent INTERACTIVELY (no `claude -p`),
+    so the whole resume stays in ONE pane with tmux automation intact. `claude -p`
+    is a banned anti-pattern — the wrapper re-redirects print-mode into a second
+    pane, leaving an empty host pane behind.
+    """
+    dispatch_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "dispatch"
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    env["TOKEN_API_DISPATCH_ORIGIN"] = "golden_throne"
+    return subprocess.run(
+        [
+            str(dispatch_bin),
+            "--direct",
+            "--id",
+            session_id,
+            "--pane",
+            pane,
+            "--engine",
+            engine,
+            "--dir",
+            working_dir,
+            "--prompt-file",
+            sop_file,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
     )
 
 
@@ -1976,15 +1993,22 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                         "session_id": req.session_id,
                     }
                 working_dir = os.path.expanduser(req.working_dir)
-                # Write SOP to temp file (avoids shell escaping)
+                # Write SOP to temp file (avoids shell escaping); dispatch reads it
+                # via --prompt-file and forwards it as the resume prompt.
                 sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
                 Path(sop_file).write_text(req.prompt)
-                resume_cmd = _agent_resume_command(engine, req.session_id, working_dir, sop_file)
-                _tmux_send_payload_then_submit(kreig_pane, resume_cmd)
-                transport = "resume"
+                resume_proc = _dispatch_resume_into_pane(
+                    req.session_id, kreig_pane, sop_file, working_dir, engine
+                )
+                if resume_proc.returncode != 0:
+                    raise RuntimeError(
+                        f"dispatch resume rc={resume_proc.returncode}: "
+                        f"{(resume_proc.stderr or '').strip()[:200]}"
+                    )
+                transport = "dispatch-resume"
                 logger.info(
-                    f"Golden Throne: resumed {req.session_id[:12]} in kreig "
-                    f"pane={kreig_pane} via {engine} resume"
+                    f"Golden Throne: resumed {req.session_id[:12]} via dispatch in kreig "
+                    f"pane={kreig_pane} ({engine}, interactive)"
                 )
             except Exception as e:
                 logger.error(f"Golden Throne: resume failed for {req.session_id[:12]}: {e}")
