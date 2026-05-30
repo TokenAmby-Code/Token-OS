@@ -7049,9 +7049,8 @@ async def _resolve_administratum_instance() -> dict | None:
     instance = dict(row)
 
     # Recover the pane when the row is on another device or has no pane recorded.
-    if (
-        instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME
-        or not instance.get("tmux_pane")
+    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME or not instance.get(
+        "tmux_pane"
     ):
         recovered = await _find_administratum_tmux_pane()
         if not recovered:
