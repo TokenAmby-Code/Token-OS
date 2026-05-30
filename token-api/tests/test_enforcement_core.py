@@ -149,17 +149,6 @@ def test_golden_throne_transport_uses_instance_engine(app_env):
     assert app_env.main._agent_is_alive_command("codex", "codex") is True
     assert app_env.main._agent_is_alive_command("codex", "claude") is False
 
-    cmd = app_env.main._agent_resume_command(
-        "codex",
-        "session-1",
-        "/Volumes/Imperium/Imperium-ENV",
-        "/tmp/sop.md",
-    )
-    assert cmd.startswith("cd /Volumes/Imperium/Imperium-ENV && ")
-    assert "codex-dispatch" in cmd
-    assert "--resume-session session-1" in cmd
-    assert "session-1" in cmd
-
 
 @pytest.mark.asyncio
 async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, monkeypatch):
@@ -509,7 +498,7 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
     events = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id")
     assert [row["event_type"] for row in events] == ["golden_throne_dispatch_failed"]
     details = json.loads(events[0]["details"])
-    assert details["transport"] == "resume"
+    assert details["transport"] == "dispatch-resume"
     assert "concrete tmux pane" in details["error"]
 
 

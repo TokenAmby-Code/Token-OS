@@ -5980,6 +5980,13 @@ async def golden_throne_followup(session_id: str):
             # print-mode redirect host-pane is spawned.
             try:
                 resume_pane = await _get_or_create_legion_pane()
+                # Fail closed if allocation returned no pane — dispatching with an
+                # empty --pane target would resume into nowhere (or the wrong pane).
+                if not (resume_pane or "").strip():
+                    raise RuntimeError(
+                        "Golden Throne resume requires a concrete tmux pane target; "
+                        "legion worker allocation returned empty"
+                    )
                 # Write SOP to a unique, short-lived temp file (avoids shell escaping
                 # and predictable-path symlink/collision risk); dispatch reads it via
                 # --prompt-file and inlines it as the resume prompt, then we remove it
