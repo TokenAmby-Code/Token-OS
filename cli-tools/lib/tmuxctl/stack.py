@@ -297,7 +297,9 @@ def _stack_worker_pane_pids(adapter: TmuxAdapter, session: str) -> dict[str, int
     return out
 
 
-def reconcile_stack_pane_registry(adapter: TmuxAdapter, session: str = "main") -> list[tuple[str, str]]:
+def reconcile_stack_pane_registry(
+    adapter: TmuxAdapter, session: str = "main"
+) -> list[tuple[str, str]]:
     """Self-heal instance rows whose ``tmux_pane`` is an allocation token.
 
     Best-effort backstop for the dispatch pane-registry wedge: rebinds rows that

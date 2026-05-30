@@ -106,7 +106,9 @@ def test_sweep_reconcile_noops_when_no_stack_workers(monkeypatch):
             if args[0] == "list-windows":
                 return "4\tmechanicus\n"
             if args[0] == "list-panes":
-                return "%F\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse"
+                return (
+                    "%F\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse"
+                )
             return ""
 
     # If the registry were consulted this would raise; assert it is not reached.

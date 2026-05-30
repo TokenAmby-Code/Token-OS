@@ -488,9 +488,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
     assert "send-keys -t %83 bash " in tmux_text
     assert "Enter" in tmux_text
-    send_line = next(
-        line for line in tmux_text.splitlines() if "send-keys -t %83 bash " in line
-    )
+    send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %83 bash " in line)
     staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "--append-system-prompt" in staged
@@ -625,9 +623,7 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
-        "#!/usr/bin/env bash\n"
-        f'for a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\n'
-        "exit 0\n",
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\nexit 0\n',
         encoding="utf-8",
     )
     fake_tmux.chmod(0o755)
@@ -639,7 +635,16 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
 
     result = subprocess.run(
-        [str(DISPATCH), "--target", "mechanicus:new", "--dir", str(ROOT), "--no-gt", "--prompt", "noop"],
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
         capture_output=True,
         text=True,
         check=False,
