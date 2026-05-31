@@ -116,7 +116,8 @@ def _break_mode_note(timer_mode: Any) -> str:
     defense); an ``idle_break`` (or legacy ``break``) is undeclared/auto and gets
     no amnesty. Non-break modes annotate to empty string.
     """
-    mode = str(timer_mode or "").lower()
+    raw_mode = getattr(timer_mode, "value", timer_mode)
+    mode = str(raw_mode or "").lower()
     if mode == "declared_break":
         return " (declared rest)"
     if mode in ("idle_break", "break"):

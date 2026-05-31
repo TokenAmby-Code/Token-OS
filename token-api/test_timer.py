@@ -1044,6 +1044,9 @@ class TestBreakModeSplitBackCompat:
         engine.from_dict(row, now_mono_ms=0)
         # Fail toward enforcement: an unknown trigger is treated as idle/undeclared.
         assert engine.manual_mode == TimerMode.IDLE_BREAK
+        # ...and the substate trigger must not fall back to "user", or the break
+        # would bill at the declared base rate despite being classified idle.
+        assert engine.manual_trigger != "user"
 
     def test_declared_break_round_trips(self):
         engine = make_engine(0)

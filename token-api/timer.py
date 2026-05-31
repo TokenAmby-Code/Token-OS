@@ -638,7 +638,14 @@ class TimerEngine:
         if self._manual_mode is not None:
             has_lock = data.get("manual_mode_lock", False)
             remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
-            trigger = data.get("quiet_context") or data.get("manual_trigger", "user")
+            # Fail toward enforcement: a break with no recorded trigger has
+            # already resolved to IDLE_BREAK above, so its substate trigger must
+            # not default to "user" — that would bill the undeclared break at the
+            # declared base rate (see the break-debit branch in _tick_counters).
+            default_trigger = (
+                "idle_timeout" if self._manual_mode == TimerMode.IDLE_BREAK else "user"
+            )
+            trigger = data.get("quiet_context") or data.get("manual_trigger", default_trigger)
             self._manual_substate = {
                 "trigger": trigger,
                 "lock_until_ms": now_mono_ms + remaining if has_lock and remaining > 0 else None,
