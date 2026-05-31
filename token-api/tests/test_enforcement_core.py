@@ -1123,6 +1123,205 @@ async def test_sustained_phone_distraction_creates_ack_even_with_break_time(app_
     assert "YouTube" in rows[0]["reason"]
 
 
+# ---- Declared-break amnesty vs idle-break enforcement (mode split) ----
+
+
+def _distracted_phone_state(main, app="youtube", minutes_open=2):
+    main.DESKTOP_STATE["work_mode"] = "clocked_in"
+    main.PHONE_STATE.update(
+        {
+            "current_app": app,
+            "app_opened_at": (datetime.now() - timedelta(minutes=minutes_open)).isoformat(),
+            "is_distracted": True,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_declared_break_in_budget_distraction_is_amnestied(app_env):
+    """Distraction during a DECLARED_BREAK with positive balance → no ack, and a
+    declared_break_amnesty event is logged."""
+    main = app_env.main
+    _distracted_phone_state(main)
+    main.timer_engine._break_balance_ms = 10 * 60 * 1000
+    main.timer_engine.enter_break(0)
+    assert main.timer_engine.current_mode == main.TimerMode.DECLARED_BREAK
+
+    ack = await main.maybe_create_phone_distraction_ack(
+        app_name="youtube",
+        display_name="YouTube",
+        package="com.google.android.youtube",
+        distraction_mode="video",
+        trigger="unit_test",
+        productivity_active=False,
+    )
+
+    assert ack is None
+    assert _rows(app_env.db_path, "SELECT id FROM expected_acknowledgements") == []
+    amnesty = _rows(
+        app_env.db_path, "SELECT event_type FROM events WHERE event_type = 'declared_break_amnesty'"
+    )
+    assert len(amnesty) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_break_distraction_still_creates_ack(app_env):
+    """An IDLE_BREAK gets no amnesty — distraction creates the ack as before."""
+    main = app_env.main
+    _distracted_phone_state(main)
+    main.timer_engine._break_balance_ms = 10 * 60 * 1000
+    main.timer_engine._set_manual_mode(main.TimerMode.IDLE_BREAK, "idle_timeout", 0)
+    assert main.timer_engine.current_mode == main.TimerMode.IDLE_BREAK
+
+    ack = await main.maybe_create_phone_distraction_ack(
+        app_name="youtube",
+        display_name="YouTube",
+        package="com.google.android.youtube",
+        distraction_mode="video",
+        trigger="unit_test",
+        productivity_active=False,
+    )
+
+    assert ack is not None
+    rows = _rows(app_env.db_path, "SELECT source FROM expected_acknowledgements")
+    assert rows[0]["source"] == "phone_distraction"
+    assert (
+        _rows(app_env.db_path, "SELECT id FROM events WHERE event_type = 'declared_break_amnesty'")
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_declared_break_overrun_graduates_to_backlog_ack(app_env):
+    """Once a declared break overruns (balance < 0) the amnesty ends: the
+    distraction routes to a backlog-violation ack — graduation on the ack
+    surface."""
+    main = app_env.main
+    _distracted_phone_state(main)
+    main.timer_engine.enter_break(0)
+    main.timer_engine._break_balance_ms = -5_000  # overrun
+    assert main.timer_engine.current_mode == main.TimerMode.DECLARED_BREAK
+
+    ack = await main.maybe_create_phone_distraction_ack(
+        app_name="youtube",
+        display_name="YouTube",
+        package="com.google.android.youtube",
+        distraction_mode="video",
+        trigger="unit_test",
+        productivity_active=False,
+    )
+
+    assert ack is not None
+    rows = _rows(app_env.db_path, "SELECT source FROM expected_acknowledgements")
+    assert rows[0]["source"] == "backlog_violation"
+    assert (
+        _rows(app_env.db_path, "SELECT id FROM events WHERE event_type = 'declared_break_amnesty'")
+        == []
+    )
+
+
+def test_gaming_ack_suppressed_only_for_in_budget_declared_break(app_env, monkeypatch):
+    """In-budget DECLARED_BREAK suppresses the gaming ack; an IDLE_BREAK does
+    not (the old blanket break amnesty is gone)."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    main = app_env.main
+    main.DESKTOP_STATE["work_mode"] = "clocked_in"
+
+    # Pin the monotonic clock so break entry and the request-time tick observe
+    # zero elapsed. enter_break(0)/_set_manual_mode(..., 0) would otherwise stamp
+    # _last_tick_ms=0 while the handler reads the real time.monotonic(); on a
+    # low-uptime host (a fresh CI runner) that small delta drains the zero
+    # balance negative and spuriously creates a backlog ack, whereas a long-
+    # uptime host trips the clock-jump guard and skips the spend. Production
+    # always enters break with the real clock, so the gap is a test artifact.
+    fixed_mono_ms = 10_000_000
+    monkeypatch.setattr(time, "monotonic", lambda: fixed_mono_ms / 1000)
+
+    # Declared break, balance at zero (in budget) → gaming ack suppressed.
+    main.timer_engine._break_balance_ms = 0
+    main.timer_engine.enter_break(fixed_mono_ms)
+    assert main.timer_engine.current_mode == main.TimerMode.DECLARED_BREAK
+    client = TestClient(main.app)
+    resp = client.post(
+        "/phone",
+        json={"app": "slay the spire", "action": "open", "package": "com.humble.slaythespire"},
+    )
+    assert resp.status_code == 200
+    assert _rows(app_env.db_path, "SELECT id FROM expected_acknowledgements") == []
+
+    # Reset phone tracking so the next open is not deduped as "already current_app".
+    main.PHONE_STATE.update(
+        {
+            "current_app": None,
+            "is_distracted": False,
+            "distraction_ack_app": None,
+            "distraction_ack_id": None,
+        }
+    )
+
+    # Same balance but an IDLE_BREAK → gaming ack created.
+    main.timer_engine._break_balance_ms = 0
+    main.timer_engine._set_manual_mode(main.TimerMode.IDLE_BREAK, "idle_timeout", fixed_mono_ms)
+    assert main.timer_engine.current_mode == main.TimerMode.IDLE_BREAK
+    resp = client.post(
+        "/phone",
+        json={"app": "slay the spire", "action": "open", "package": "com.humble.slaythespire"},
+    )
+    assert resp.status_code == 200
+    rows = _rows(app_env.db_path, "SELECT source FROM expected_acknowledgements")
+    assert any(r["source"] == "phone_gaming" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_enforcement_stand_down_resolves_ack_and_flips_to_declared_break(app_env):
+    """Stand-down bails out the pending ack and flips the window into a declared
+    break; a subsequent in-budget distraction is then honoured."""
+    main = app_env.main
+    main.DESKTOP_STATE["work_mode"] = "clocked_in"
+    main.timer_engine._break_balance_ms = 10 * 60 * 1000
+
+    instance_id = "phone_distraction:phone:youtube"
+    await main.create_expected_ack(
+        source="phone_distraction",
+        instance_id=instance_id,
+        reason="Phone distraction during work: YouTube",
+        details={},
+    )
+
+    body = await main.enforcement_stand_down(
+        main.EnforcementStandDownRequest(source="phone_distraction", instance_id=instance_id)
+    )
+
+    assert body["stood_down"] is True
+    assert body["ack_resolved"] is True
+    assert body["mode_changed"] is True
+    assert body["timer_mode"] == "declared_break"
+    assert main.timer_engine.current_mode == main.TimerMode.DECLARED_BREAK
+
+    rows = _rows(
+        app_env.db_path,
+        "SELECT status, bailout_reason FROM expected_acknowledgements WHERE instance_id = ?",
+        (instance_id,),
+    )
+    assert rows[0]["status"] == "bailed_out"
+    assert rows[0]["bailout_reason"] == "sanctioned"
+
+    # Subsequent in-budget distraction during the now-declared break is honoured.
+    _distracted_phone_state(main)
+    ack = await main.maybe_create_phone_distraction_ack(
+        app_name="youtube",
+        display_name="YouTube",
+        package="com.google.android.youtube",
+        distraction_mode="video",
+        trigger="post_stand_down",
+        productivity_active=False,
+    )
+    assert ack is None
+
+
 def test_phone_open_in_backlog_creates_compressed_backlog_ack(app_env, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -1748,7 +1947,8 @@ def test_mewgenics_space_break_mode_logs_without_zap(app_env, monkeypatch):
     assert calls == []
     rows = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id DESC LIMIT 1")
     assert rows[0]["event_type"] == "mewgenics_space"
-    assert json.loads(rows[0]["details"])["timer_mode"] == "break"
+    # enter_break() now lands in the first-class declared_break mode.
+    assert json.loads(rows[0]["details"])["timer_mode"] == "declared_break"
 
 
 def test_mewgenics_space_second_working_press_zaps_directly(app_env, monkeypatch):
@@ -2013,7 +2213,7 @@ async def test_negative_break_resets_when_leaving_break_for_working(app_env, mon
     assert main._negative_break_situation["rep"] == 1
 
     main.timer_engine._clear_manual_mode()  # leave break → WORKING
-    assert main.timer_engine.current_mode != main.TimerMode.BREAK
+    assert main.timer_engine.current_mode not in main.BREAK_MODES
     out = await main._negative_break_enforce_tick(2_000, _tick_result())
 
     assert out is None

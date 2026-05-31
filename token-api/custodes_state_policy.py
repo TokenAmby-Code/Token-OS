@@ -108,6 +108,23 @@ def _format_minutes(ms: Any) -> str | None:
     return f"-{minutes}m" if int(ms) < 0 else f"{minutes}m"
 
 
+def _break_mode_note(timer_mode: Any) -> str:
+    """Annotate a break-flavored timer mode so the escalation tier reads the
+    defense-vs-violation distinction structurally.
+
+    A ``declared_break`` is an appeal-on-file (the Emperor declared rest — a
+    defense); an ``idle_break`` (or legacy ``break``) is undeclared/auto and gets
+    no amnesty. Non-break modes annotate to empty string.
+    """
+    raw_mode = getattr(timer_mode, "value", timer_mode)
+    mode = str(raw_mode or "").lower()
+    if mode == "declared_break":
+        return " (declared rest)"
+    if mode in ("idle_break", "break"):
+        return " (undeclared/idle)"
+    return ""
+
+
 PHONE_APP_SOURCES = {
     "phone",
     "phone_detection",
@@ -142,6 +159,8 @@ def _snapshot_items(
             app = payload_app
     if not phone_app and not app and _source_allows_app_as_phone_app(source):
         phone_app = phone.get("current_app")
+    # Recognises the split break modes (declared_break / idle_break) as well as
+    # the legacy "break"; the value flows through verbatim and is annotated below.
     timer_mode = payload.get("timer_mode") or timer.get("current_mode") or timer.get("mode")
     desktop_mode = payload.get("desktop_mode") or desktop.get("current_mode")
     break_balance = (
@@ -159,7 +178,7 @@ def _snapshot_items(
     if ack_source:
         items.append(f"ack_source={ack_source}")
     if timer_mode:
-        items.append(f"timer_mode={timer_mode}")
+        items.append(f"timer_mode={timer_mode}{_break_mode_note(timer_mode)}")
     if desktop_mode:
         items.append(f"desktop_mode={desktop_mode}")
     formatted_balance = _format_minutes(break_balance)

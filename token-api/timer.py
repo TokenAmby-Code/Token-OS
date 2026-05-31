@@ -26,9 +26,17 @@ class TimerMode(str, Enum):
     MULTITASKING = "multitasking"
     DISTRACTED = "distracted"
     IDLE = "idle"
-    BREAK = "break"
+    BREAK = "break"  # legacy — retained for deserialization only; new code sets one below
+    DECLARED_BREAK = "declared_break"  # user-initiated rest (appeal-on-file)
+    IDLE_BREAK = "idle_break"  # auto / idle-timeout break (no amnesty)
     QUIET = "quiet"
     SLEEPING = "sleeping"
+
+
+# All break-flavored modes. Membership checks (burn rate, telemetry) use this so
+# DECLARED_BREAK and IDLE_BREAK are treated uniformly where the distinction does
+# not matter. BREAK is included only so legacy-persisted state still matches.
+BREAK_MODES = frozenset({TimerMode.BREAK, TimerMode.DECLARED_BREAK, TimerMode.IDLE_BREAK})
 
 
 class TimerEvent(Enum):
@@ -55,6 +63,8 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
     TimerMode.IDLE: (0, 1),  # neutral
     TimerMode.DISTRACTED: (-1, 1),  # -60 min/hr (penalty)
     TimerMode.BREAK: (-1, 1),  # -60 min/hr (consuming break)
+    TimerMode.DECLARED_BREAK: (-1, 1),  # -60 min/hr (consuming break)
+    TimerMode.IDLE_BREAK: (-1, 1),  # -60 min/hr (consuming break)
     TimerMode.QUIET: (0, 1),  # neutral
     TimerMode.SLEEPING: (0, 1),  # neutral
 }
@@ -152,9 +162,9 @@ class TimerEngine:
         if self._manual_mode is not None:
             return self._manual_mode
 
-        # 2. Inactive + distraction → BREAK
+        # 2. Inactive + distraction → IDLE_BREAK (auto-break, no amnesty)
         if not self._productivity_active and self._activity == Activity.DISTRACTION:
-            return TimerMode.BREAK
+            return TimerMode.IDLE_BREAK
 
         # 3-4. Active + distraction
         if self._productivity_active and self._activity == Activity.DISTRACTION:
@@ -360,12 +370,10 @@ class TimerEngine:
             # Becoming active — clear idle state
             self._productivity_active = active
             sub["idle_entered_ms"] = None
-            # Auto-clear break if it was set by idle timeout (user is back)
-            if (
-                self._manual_mode == TimerMode.BREAK
-                and self._manual_substate
-                and self._manual_substate.get("trigger") == "idle_timeout"
-            ):
+            # Auto-clear break if it was an idle-timeout break (user is back).
+            # A DECLARED_BREAK persists — the user explicitly rested, so we don't
+            # silently end it just because productivity resumed.
+            if self._manual_mode == TimerMode.IDLE_BREAK:
                 self._clear_manual_mode()
         elif not active and was_active:
             # Becoming inactive — parameterize idle timeout based on CURRENT mode
@@ -386,14 +394,19 @@ class TimerEngine:
         return result
 
     def enter_break(self, now_mono_ms: int) -> tuple[bool, TickResult]:
-        """Manual break entry. Returns (changed, result)."""
-        if self._manual_mode == TimerMode.BREAK:
+        """Manual break entry. Returns (changed, result).
+
+        A manual break is a DECLARED_BREAK (trigger 'user'). Calling this while
+        in an IDLE_BREAK promotes it to a declared break — the user is now
+        explicitly resting, which is exactly the reactive stand-down case.
+        """
+        if self._manual_mode == TimerMode.DECLARED_BREAK:
             return False, TickResult()
 
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
 
-        self._set_manual_mode(TimerMode.BREAK, "user", now_mono_ms)
+        self._set_manual_mode(TimerMode.DECLARED_BREAK, "user", now_mono_ms)
 
         new_mode = self.effective_mode
         if new_mode != old_mode:
@@ -595,6 +608,15 @@ class TimerEngine:
         self._activity = Activity(data.get("activity", "working"))
         self._productivity_active = data.get("productivity_active", True)
         manual = data.get("manual_mode")
+        if manual == TimerMode.BREAK.value:
+            # Back-compat: legacy single "break" mode splits by its trigger —
+            # a user-declared rest becomes DECLARED_BREAK, everything else
+            # (idle_timeout / None / other) becomes IDLE_BREAK.
+            manual = (
+                TimerMode.DECLARED_BREAK.value
+                if data.get("manual_trigger") == "user"
+                else TimerMode.IDLE_BREAK.value
+            )
         self._manual_mode = TimerMode(manual) if manual else None
 
         # Focus layer
@@ -616,7 +638,14 @@ class TimerEngine:
         if self._manual_mode is not None:
             has_lock = data.get("manual_mode_lock", False)
             remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
-            trigger = data.get("quiet_context") or data.get("manual_trigger", "user")
+            # Fail toward enforcement: a break with no recorded trigger has
+            # already resolved to IDLE_BREAK above, so its substate trigger must
+            # not default to "user" — that would bill the undeclared break at the
+            # declared base rate (see the break-debit branch in _tick_counters).
+            default_trigger = (
+                "idle_timeout" if self._manual_mode == TimerMode.IDLE_BREAK else "user"
+            )
+            trigger = data.get("quiet_context") or data.get("manual_trigger", default_trigger)
             self._manual_substate = {
                 "trigger": trigger,
                 "lock_until_ms": now_mono_ms + remaining if has_lock and remaining > 0 else None,
@@ -676,7 +705,8 @@ class TimerEngine:
         elif old_mode == "break":
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._set_manual_mode(TimerMode.BREAK, "user", now_mono_ms)
+            # v1 "break" was always a user-declared rest.
+            self._set_manual_mode(TimerMode.DECLARED_BREAK, "user", now_mono_ms)
         elif old_mode == "pause":
             self._activity = Activity.WORKING
             self._productivity_active = False
@@ -809,13 +839,13 @@ class TimerEngine:
                 psub["idle_entered_ms"] = now_mono_ms
             elif idle_timed_out:
                 old_mode = self.effective_mode
-                self._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_mono_ms)
+                self._set_manual_mode(TimerMode.IDLE_BREAK, "idle_timeout", now_mono_ms)
                 psub["idle_entered_ms"] = None
                 result.events.append(TimerEvent.IDLE_TIMEOUT)
                 result.events.append(TimerEvent.MODE_CHANGED)
                 result.old_mode = old_mode
 
-        elif mode == TimerMode.BREAK:
+        elif mode in BREAK_MODES:
             self._total_break_time_ms += elapsed_ms
             # Declared rest (trigger 'user') burns at base rate; undeclared /
             # idle-timeout / auto-break (trigger 'idle_timeout' / None / other)
