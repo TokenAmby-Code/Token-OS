@@ -124,17 +124,17 @@ class TestEffectiveMode:
         assert engine.effective_mode == TimerMode.MULTITASKING
 
     def test_distraction_inactive_break(self):
-        """Activity=distraction, prod=inactive → BREAK (auto)."""
+        """Activity=distraction, prod=inactive → IDLE_BREAK (auto, no amnesty)."""
         engine = make_engine(0)
         engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
         engine.set_productivity(False, 0)
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
 
     def test_manual_break_overrides_all(self):
-        """Manual BREAK override takes priority."""
+        """Manual break override (DECLARED_BREAK) takes priority."""
         engine = make_engine(0)
         engine.enter_break(0)
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.DECLARED_BREAK
         # Even with working + active, still BREAK
         assert engine.activity == Activity.WORKING
         assert engine.productivity_active
@@ -267,7 +267,7 @@ class TestDistracted:
         assert TimerEvent.DISTRACTION_TIMEOUT not in events
 
     def test_distracted_prod_loss_becomes_break(self):
-        """DISTRACTED → prod expires → BREAK (rule 2: inactive+distraction=BREAK)."""
+        """DISTRACTED → prod expires → IDLE_BREAK (rule 2: inactive+distraction)."""
         engine = make_engine(0)
         # Earn break, enter distraction, wait for DISTRACTED
         advance(engine, 0, 120)
@@ -279,7 +279,7 @@ class TestDistracted:
         # Now lose productivity
         t = 120_000 + timeout_secs * 1000
         result = engine.set_productivity(False, t)
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
         assert TimerEvent.MODE_CHANGED in result.events
         assert result.old_mode == TimerMode.DISTRACTED
 
@@ -319,7 +319,7 @@ class TestParameterizedIdle:
         timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
         events = collect_events(engine, 0, timeout_secs)
         assert TimerEvent.IDLE_TIMEOUT in events
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
 
     def test_idle_timeout_from_multitasking_triggers_break_fast(self):
         """After 2 minutes of IDLE (from MULTITASKING), auto-transition to BREAK."""
@@ -351,8 +351,8 @@ class TestParameterizedIdle:
         assert engine.effective_mode == TimerMode.MULTITASKING
         # Prod goes inactive while multitasking → timeout parameterized to 2min
         engine.set_productivity(False, 700)
-        # effective = BREAK (inactive + distraction), but idle_timeout_ms was set to 2min
-        assert engine.effective_mode == TimerMode.BREAK
+        # effective = IDLE_BREAK (inactive + distraction), but idle_timeout_ms was set to 2min
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
         # Now switch activity back to working → effective = IDLE (inactive + working)
         engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=800)
         assert engine.effective_mode == TimerMode.IDLE
@@ -361,7 +361,7 @@ class TestParameterizedIdle:
         timeout_secs = IDLE_TIMEOUT_FROM_MULTITASKING_MS // 1000
         events = collect_events(engine, 800, timeout_secs)
         assert TimerEvent.IDLE_TIMEOUT in events
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
 
     def test_idle_no_accumulation(self):
         """IDLE mode: no break earned, no work time change."""
@@ -503,7 +503,7 @@ class TestBreakExhaustion:
 
 def _enter_break_slacked(engine, now_ms):
     """Force an undeclared/idle-timeout break entry (trigger != 'user')."""
-    engine._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_ms)
+    engine._set_manual_mode(TimerMode.IDLE_BREAK, "idle_timeout", now_ms)
 
 
 class TestBreakPenaltyMultiplier:
@@ -546,10 +546,10 @@ class TestBreakPenaltyMultiplier:
     def test_none_trigger_fails_toward_penalty(self):
         """Auto-break with no manual substate (trigger=None) burns at penalty rate."""
         engine = make_engine(0)
-        # Inactive + distraction → BREAK via layers (no manual mode, trigger None)
+        # Inactive + distraction → IDLE_BREAK via layers (no manual mode, trigger None)
         engine.set_productivity(False, 0)
         engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
-        assert engine.current_mode == TimerMode.BREAK
+        assert engine.current_mode == TimerMode.IDLE_BREAK
         assert engine.manual_trigger is None
         advance(engine, 0, 20)  # 20_000*3//2 = 30_000 debit
         assert engine.break_balance_ms == -30_000
@@ -690,7 +690,7 @@ class TestManualMode:
         engine = make_engine(0)
         changed, result = engine.enter_break(0)
         assert changed
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.DECLARED_BREAK
         assert TimerEvent.MODE_CHANGED in result.events
 
     def test_enter_sleeping(self):
@@ -760,21 +760,21 @@ class TestManualMode:
         assert engine.manual_trigger == "user"
 
     def test_idle_timeout_break_trigger(self):
-        """Idle timeout sets trigger='idle_timeout'."""
+        """Idle timeout sets IDLE_BREAK with trigger='idle_timeout'."""
         engine = make_engine(0)
         engine.set_productivity(False, 0)
         timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
         advance(engine, 0, timeout_secs)
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
         assert engine.manual_trigger == "idle_timeout"
 
     def test_idle_timeout_break_auto_clears_on_productivity(self):
-        """set_productivity(True) auto-clears BREAK if trigger was 'idle_timeout'."""
+        """set_productivity(True) auto-clears an IDLE_BREAK (idle-timeout break)."""
         engine = make_engine(0)
         engine.set_productivity(False, 0)
         timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
         advance(engine, 0, timeout_secs)
-        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
         assert engine.manual_trigger == "idle_timeout"
         # Becoming productive again should auto-clear the idle-timeout break
         engine.set_productivity(True, timeout_secs * 1000 + 1000)
@@ -783,13 +783,13 @@ class TestManualMode:
         assert engine.manual_trigger is None
 
     def test_user_break_not_auto_cleared_on_productivity(self):
-        """set_productivity(True) does NOT auto-clear BREAK if trigger was 'user'."""
+        """set_productivity(True) does NOT auto-clear a DECLARED_BREAK (trigger 'user')."""
         engine = make_engine(0)
         engine.enter_break(0)
         assert engine.manual_trigger == "user"
         engine.set_productivity(True, 1000)
-        # User break should persist
-        assert engine.effective_mode == TimerMode.BREAK
+        # Declared break should persist
+        assert engine.effective_mode == TimerMode.DECLARED_BREAK
         assert engine.manual_trigger == "user"
 
     def test_resume_clears_trigger(self):
@@ -845,7 +845,7 @@ class TestSerialization:
         restored = TimerEngine(now_mono_ms=100_000)
         restored.from_dict(data, now_mono_ms=100_000)
         assert restored.manual_mode_lock
-        assert restored.effective_mode == TimerMode.BREAK
+        assert restored.effective_mode == TimerMode.DECLARED_BREAK
 
     def test_expired_lock_cleared_on_restore(self):
         """Lock that expired during downtime is cleared on restore."""
@@ -954,8 +954,9 @@ class TestLegacyMigration:
         }
         engine = TimerEngine(now_mono_ms=0)
         engine.from_dict(old_data, now_mono_ms=0)
-        assert engine.manual_mode == TimerMode.BREAK
-        assert engine.effective_mode == TimerMode.BREAK
+        # v1 "break" was always a user-declared rest → DECLARED_BREAK.
+        assert engine.manual_mode == TimerMode.DECLARED_BREAK
+        assert engine.effective_mode == TimerMode.DECLARED_BREAK
         assert engine.manual_mode_lock is True
 
     def test_sleeping_migration(self):
@@ -1003,6 +1004,61 @@ class TestLegacyMigration:
         engine.from_dict(old_data, now_mono_ms=0)
         assert engine.break_balance_ms == 60000
         assert engine.total_work_time_ms == 120000
+
+
+# ---- Break-mode split back-compat ----
+
+
+class TestBreakModeSplitBackCompat:
+    """A v2 row persisted before the split stored manual_mode=='break'. On load
+    it must split by its trigger: user → DECLARED_BREAK, else → IDLE_BREAK."""
+
+    def _v2_break_row(self, trigger):
+        return {
+            "format_version": 2,
+            "manual_mode": "break",
+            "manual_trigger": trigger,
+            "manual_mode_lock": True,
+            "manual_mode_lock_remaining_ms": 300_000,
+            "break_balance_ms": 50_000,
+        }
+
+    def test_legacy_v2_break_user_maps_to_declared(self):
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(self._v2_break_row("user"), now_mono_ms=0)
+        assert engine.manual_mode == TimerMode.DECLARED_BREAK
+        assert engine.effective_mode == TimerMode.DECLARED_BREAK
+        assert engine.manual_trigger == "user"
+
+    def test_legacy_v2_break_idle_timeout_maps_to_idle_break(self):
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(self._v2_break_row("idle_timeout"), now_mono_ms=0)
+        assert engine.manual_mode == TimerMode.IDLE_BREAK
+        assert engine.effective_mode == TimerMode.IDLE_BREAK
+        assert engine.manual_trigger == "idle_timeout"
+
+    def test_legacy_v2_break_missing_trigger_fails_toward_idle_break(self):
+        row = self._v2_break_row("user")
+        del row["manual_trigger"]
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(row, now_mono_ms=0)
+        # Fail toward enforcement: an unknown trigger is treated as idle/undeclared.
+        assert engine.manual_mode == TimerMode.IDLE_BREAK
+
+    def test_declared_break_round_trips(self):
+        engine = make_engine(0)
+        engine.enter_break(0)
+        restored = TimerEngine(now_mono_ms=10_000)
+        restored.from_dict(engine.to_dict(now_mono_ms=0), now_mono_ms=10_000)
+        assert restored.manual_mode == TimerMode.DECLARED_BREAK
+
+    def test_idle_break_round_trips(self):
+        engine = make_engine(0)
+        engine._set_manual_mode(TimerMode.IDLE_BREAK, "idle_timeout", 0)
+        restored = TimerEngine(now_mono_ms=10_000)
+        restored.from_dict(engine.to_dict(now_mono_ms=0), now_mono_ms=10_000)
+        assert restored.manual_mode == TimerMode.IDLE_BREAK
+        assert restored.manual_trigger == "idle_timeout"
 
 
 # ---- Edge cases ----

@@ -106,14 +106,18 @@ def annotate_timer_telemetry(
         "impossible_rate" spam.
         """
 
+        # Match any break-flavored mode: legacy "break" plus the split
+        # "declared_break" / "idle_break" — all contain the substring "break".
+        # An interval touching any of them gets the penalty ceiling so a
+        # legitimate 1.5x idle-break burn is not flagged as impossible_rate.
         modes = {
             str(previous_point.get("mode") or "").lower(),
             str(current_point.get("mode") or "").lower(),
         }
-        if "break" in modes:
+        if any("break" in m for m in modes):
             return penalty_rate
         for event in interval_events:
-            if str(event.get("new_mode") or "").lower() == "break":
+            if "break" in str(event.get("new_mode") or "").lower():
                 return penalty_rate
         return 1.0
 

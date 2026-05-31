@@ -166,6 +166,7 @@ from shared import (
     resolve_device_from_ip,
 )
 from timer import (
+    BREAK_MODES,
     DEFAULT_BREAK_BUFFER_MS,
     Activity,
     TimerEngine,
@@ -173,6 +174,11 @@ from timer import (
     TimerMode,
     format_timer_time,
 )
+
+# String values of all break-flavored modes, for comparing against mode strings
+# persisted in timer_shifts / timer_samples (which now store declared_break /
+# idle_break, plus legacy "break").
+BREAK_MODE_VALUES = frozenset(m.value for m in BREAK_MODES)
 from timer_telemetry import (
     GAP_THRESHOLD_SECONDS,
     annotate_timer_telemetry,
@@ -736,6 +742,16 @@ class EnforcementExpectRequest(BaseModel):
 
 class EnforcementBailoutRequest(BaseModel):
     reason: str
+    ack_id: str | None = None
+    source: str | None = None
+    instance_id: str | None = None
+
+
+class EnforcementStandDownRequest(BaseModel):
+    # Reactive "sanctioned, stand down" appeal. Identifiers are optional: when
+    # given, the matching expected ack is bailed out (Pavlok disabled for it);
+    # the window is flipped into a declared break either way.
+    reason: str = "sanctioned"
     ack_id: str | None = None
     source: str | None = None
     instance_id: str | None = None
@@ -9606,6 +9622,24 @@ async def maybe_create_phone_distraction_ack(
             },
         )
         return None
+    # Declared-break amnesty (balance-bounded). A DECLARED_BREAK is an
+    # appeal-on-file: the user said "I'm resting", so distraction pressure is
+    # honoured — but only while in budget. Once break_balance goes negative the
+    # break has overrun and we fall through to the backlog-violation path below
+    # (the graduation on the ack surface). IDLE_BREAK gets no amnesty.
+    if timer_engine.current_mode == TimerMode.DECLARED_BREAK and timer_engine.break_balance_ms >= 0:
+        await log_event(
+            "declared_break_amnesty",
+            details={
+                "app": app_name,
+                "display_name": display_name,
+                "package": package,
+                "distraction_mode": distraction_mode,
+                "trigger": trigger,
+                "break_balance_ms": timer_engine.break_balance_ms,
+            },
+        )
+        return None
     if timer_engine.break_balance_ms < 0:
         return await maybe_create_backlog_violation_ack(
             surface="phone",
@@ -10744,7 +10778,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
     # Get current mode
     current_mode = DESKTOP_STATE["current_mode"]
-    was_timer_break_mode = timer_engine.current_mode == TimerMode.BREAK
+    was_timer_break_mode = timer_engine.current_mode in BREAK_MODES
 
     # Check if mode change is needed
     if detected_mode == current_mode:
@@ -11092,7 +11126,7 @@ async def handle_mewgenics_space_telemetry(request: MewgenicsSpaceTelemetryReque
     reason = "telemetry_only"
     pavlok_result = None
 
-    if timer_engine.current_mode == TimerMode.BREAK:
+    if timer_engine.current_mode in BREAK_MODES:
         reason = "break_mode"
         _reset_mewgenics_space_pair(reason)
     elif timer_engine.current_mode in (TimerMode.WORKING, TimerMode.MULTITASKING):
@@ -11554,12 +11588,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Check work mode
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
-    was_break_mode = timer_engine.current_mode == TimerMode.BREAK
+    # Only an in-budget DECLARED_BREAK suppresses the gaming ack — the user is
+    # resting on their own declared time. IDLE_BREAK and an overrun declared
+    # break (balance < 0) no longer get the old blanket break amnesty.
+    declared_break_amnesty = (
+        timer_engine.current_mode == TimerMode.DECLARED_BREAK and timer_engine.break_balance_ms >= 0
+    )
 
     async def _create_phone_gaming_ack(timer_updated: bool) -> dict | None:
         if distraction_mode != "gaming" or work_mode != "clocked_in":
             return None
-        if was_break_mode:
+        if declared_break_amnesty:
             return None
         if is_quiet_hours():
             await log_quiet_hours_suppressed(
@@ -12233,16 +12272,19 @@ async def enter_break_mode():
     changed, tick_result = timer_engine.enter_break(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_mode_change(old_mode, "break", is_automatic=False)
-        await timer_log_shift(old_mode, "break", trigger="manual", source="api")
+        # Log the concrete mode the engine landed in (declared_break) so shifts,
+        # sessions, and the mode-change log carry the first-class value.
+        new_mode = timer_engine.current_mode.value
+        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
+        await timer_log_shift(old_mode, new_mode, trigger="manual", source="api")
         await timer_end_session(
             _current_session_id,
             now_ms - _session_start_ms,
             break_used_ms=timer_engine.total_break_time_ms,
         )
-        _current_session_id = await timer_start_session("break", today)
+        _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
-        await log_event("timer_mode_change", details={"new_mode": "break", "source": "api"})
+        await log_event("timer_mode_change", details={"new_mode": new_mode, "source": "api"})
     return {
         "status": "break",
         "changed": changed,
@@ -14013,7 +14055,7 @@ def _ops_timer_mode_rate(mode: str | None) -> int:
     normalized = (mode or "").lower()
     if normalized == TimerMode.WORKING.value:
         return 1
-    if normalized in (TimerMode.DISTRACTED.value, TimerMode.BREAK.value):
+    if normalized == TimerMode.DISTRACTED.value or normalized in BREAK_MODE_VALUES:
         return -1
     return 0
 
@@ -14031,7 +14073,7 @@ def _ops_shift_to_annotation(row: dict) -> dict:
     elif trigger in {"enforcement", "break_exhausted"}:
         lane = "enforcement"
     severity = "info"
-    if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}:
+    if mode == TimerMode.DISTRACTED.value or mode in BREAK_MODE_VALUES:
         severity = "warn"
     if trigger in {"enforcement", "break_exhausted"}:
         severity = "bad"
@@ -14644,7 +14686,7 @@ def _ops_build_state_assertions(
             "Timer mode",
             timer_value,
             "bad"
-            if mode in {TimerMode.DISTRACTED.value, TimerMode.BREAK.value}
+            if (mode == TimerMode.DISTRACTED.value or mode in BREAK_MODE_VALUES)
             else "warn"
             if mode == TimerMode.MULTITASKING.value
             else "good"
@@ -14997,7 +15039,7 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
             sit["last_fire_mono_ms"] = now_ms
             return None
 
-        in_break = timer_engine.current_mode == TimerMode.BREAK
+        in_break = timer_engine.current_mode in BREAK_MODES
         bal = timer_engine.break_balance_ms
 
         # Reset: balance recovered, or left break (into working / any non-break).
@@ -15066,18 +15108,23 @@ async def timer_worker():
             for event in result.events:
                 if event == TimerEvent.IDLE_TIMEOUT:
                     print("TIMER: Idle timeout — auto-transitioning to BREAK")
+                    # tick() set IDLE_BREAK on the idle-timeout transition; surface
+                    # that concrete mode (not the legacy "break") so the shift log
+                    # and the Custodes intervention carry the defense-vs-violation
+                    # signal the mode split exists to provide.
+                    idle_break_mode = timer_engine.current_mode.value
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
                     await timer_log_shift(
-                        "idle", "break", trigger="idle_timeout", source="timer_worker"
+                        "idle", idle_break_mode, trigger="idle_timeout", source="timer_worker"
                     )
                     dispatched = await _dispatch_timer_intervention(
                         "idle_timeout",
                         "timer_worker",
-                        payload={"timer_mode": "break"},
+                        payload={"timer_mode": idle_break_mode},
                     )
-                    _current_session_id = await timer_start_session("break", today)
+                    _current_session_id = await timer_start_session(idle_break_mode, today)
                     _session_start_ms = now_ms
                     _mode_change_count += 1
                     if dispatched:
@@ -15385,12 +15432,13 @@ async def _async_enforce_twitter_timeout():
     changed, _ = timer_engine.enter_break(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_mode_change(old_mode, "break", is_automatic=False)
+        new_mode = timer_engine.current_mode.value
+        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
         await timer_log_shift(
-            old_mode, "break", trigger="enforcement", source="timer_worker", phone_app="twitter"
+            old_mode, new_mode, trigger="enforcement", source="timer_worker", phone_app="twitter"
         )
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
-        _current_session_id = await timer_start_session("break", today)
+        _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
 
     await log_event(
@@ -16658,6 +16706,76 @@ async def enforcement_bailout(request: EnforcementBailoutRequest):
         status="bailed_out",
         bailout_reason=reason,
     )
+
+
+@app.post("/api/enforcement/stand-down")
+async def enforcement_stand_down(request: EnforcementStandDownRequest):
+    """Sanctioned stand-down: resolve the active ack and flip into a declared break.
+
+    The reactive counterpart to the standing (pre-declared) appeal — entering a
+    DECLARED_BREAK via POST /api/timer/break. It reuses the bailout primitive to
+    resolve the pending expected ack (disabling Pavlok for it), then promotes the
+    window to DECLARED_BREAK so the remainder is honoured until break_balance runs
+    out, at which point the existing BREAK_EXHAUSTED graduation takes over. Ack
+    resolution is best-effort: a sanctioned stand-down still flips the mode even
+    if no matching pending ack exists.
+    """
+    global _current_session_id, _session_start_ms
+    reason = (request.reason or "sanctioned").strip() or "sanctioned"
+
+    resolved: dict | None = None
+    if request.ack_id or (request.source and request.instance_id):
+        try:
+            resolved = await _resolve_expected_ack(
+                ack_id=request.ack_id,
+                source=request.source,
+                instance_id=request.instance_id,
+                status="bailed_out",
+                bailout_reason=reason,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            resolved = None
+
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    changed, _ = timer_engine.enter_break(now_ms)
+    if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        new_mode = timer_engine.current_mode.value
+        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
+        await timer_log_shift(old_mode, new_mode, trigger="stand_down", source="api")
+        await timer_end_session(
+            _current_session_id,
+            now_ms - _session_start_ms,
+            break_used_ms=timer_engine.total_break_time_ms,
+        )
+        _current_session_id = await timer_start_session(new_mode, today)
+        _session_start_ms = now_ms
+
+    ack_resolved = bool(resolved and resolved.get("updated"))
+    resolved_ack = (resolved or {}).get("ack")
+    await log_event(
+        "enforcement_stand_down",
+        details={
+            "reason": reason,
+            "ack_id": (resolved_ack or {}).get("id") if resolved_ack else request.ack_id,
+            "ack_resolved": ack_resolved,
+            "timer_mode": timer_engine.current_mode.value,
+            "mode_changed": changed,
+            "break_balance_ms": timer_engine.break_balance_ms,
+        },
+    )
+
+    return {
+        "stood_down": True,
+        "ack_resolved": ack_resolved,
+        "ack": resolved_ack,
+        "timer_mode": timer_engine.current_mode.value,
+        "mode_changed": changed,
+        "break_available_seconds": round(max(0, timer_engine.break_balance_ms) / 1000),
+    }
 
 
 @app.get("/api/enforcement/status")
