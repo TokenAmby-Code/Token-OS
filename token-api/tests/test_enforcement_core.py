@@ -1220,17 +1220,29 @@ async def test_declared_break_overrun_graduates_to_backlog_ack(app_env):
     )
 
 
-def test_gaming_ack_suppressed_only_for_in_budget_declared_break(app_env):
+def test_gaming_ack_suppressed_only_for_in_budget_declared_break(app_env, monkeypatch):
     """In-budget DECLARED_BREAK suppresses the gaming ack; an IDLE_BREAK does
     not (the old blanket break amnesty is gone)."""
+    import time
+
     from fastapi.testclient import TestClient
 
     main = app_env.main
     main.DESKTOP_STATE["work_mode"] = "clocked_in"
 
+    # Pin the monotonic clock so break entry and the request-time tick observe
+    # zero elapsed. enter_break(0)/_set_manual_mode(..., 0) would otherwise stamp
+    # _last_tick_ms=0 while the handler reads the real time.monotonic(); on a
+    # low-uptime host (a fresh CI runner) that small delta drains the zero
+    # balance negative and spuriously creates a backlog ack, whereas a long-
+    # uptime host trips the clock-jump guard and skips the spend. Production
+    # always enters break with the real clock, so the gap is a test artifact.
+    fixed_mono_ms = 10_000_000
+    monkeypatch.setattr(time, "monotonic", lambda: fixed_mono_ms / 1000)
+
     # Declared break, balance at zero (in budget) → gaming ack suppressed.
     main.timer_engine._break_balance_ms = 0
-    main.timer_engine.enter_break(0)
+    main.timer_engine.enter_break(fixed_mono_ms)
     assert main.timer_engine.current_mode == main.TimerMode.DECLARED_BREAK
     client = TestClient(main.app)
     resp = client.post(
@@ -1252,7 +1264,7 @@ def test_gaming_ack_suppressed_only_for_in_budget_declared_break(app_env):
 
     # Same balance but an IDLE_BREAK → gaming ack created.
     main.timer_engine._break_balance_ms = 0
-    main.timer_engine._set_manual_mode(main.TimerMode.IDLE_BREAK, "idle_timeout", 0)
+    main.timer_engine._set_manual_mode(main.TimerMode.IDLE_BREAK, "idle_timeout", fixed_mono_ms)
     assert main.timer_engine.current_mode == main.TimerMode.IDLE_BREAK
     resp = client.post(
         "/phone",
