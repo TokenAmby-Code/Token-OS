@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import signal
 import socket
 import time
@@ -1410,10 +1411,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True
     )
-    # 7 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
-    scheduler.add_job(
-        timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True
-    )
+    # Timer reset is driven by the alarm-ack day-start hook; no scheduled reset.
     scheduler.add_job(
         _scheduled_quiet_enter_sync,
         CronTrigger(hour=shared.QUIET_HOURS_START, minute=0),
@@ -8673,6 +8671,130 @@ async def orchestrator_pane_truth():
     return out
 
 
+# --- Pane stdout tap (T3 fleet mirror) --------------------------------------
+#
+# A non-destructive mirror of an agent pane's stdout for the T3 Code fleet
+# surface. ``tmux pipe-pane -o`` adds an additive byte tap that leaves the
+# interactive TUI untouched. Raw ``%N`` pane ids are resolved internally from
+# the durable ``instance_id`` and never surfaced — the log file is named by
+# ``instance_id`` (a UUID) because tmux recycles ``%N``.
+
+PANE_TAP_DIR = Path.home() / ".claude" / "tmp" / "panes"
+
+
+async def _resolve_instance_pane(instance_id: str) -> str | None:
+    """Resolve a durable ``instance_id`` to its tmux pane (``%N``), or None.
+
+    Same source of truth ``pane_truth`` joins against — ``claude_instances``.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    pane = (row["tmux_pane"] or "").strip()
+    return pane or None
+
+
+async def _tmux_pane_pipe_active(tmux_pane: str) -> bool:
+    """Return True when the pane currently has an open ``pipe-pane`` sink."""
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_pipe}"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return False
+        return proc.stdout.decode(errors="replace").strip() == "1"
+    except Exception:
+        return False
+
+
+@app.post("/api/panes/{instance_id}/tap")
+async def arm_pane_tap(instance_id: str):
+    """Arm a non-destructive stdout mirror for an agent pane.
+
+    Resolves ``instance_id`` → live tmux pane, then runs
+    ``tmux pipe-pane -o 'cat >> <log>'``. The ``-o`` flag only opens a new
+    pipe when none exists, so repeated calls are idempotent additive no-ops;
+    the interactive TUI is unaffected (``pane_current_command`` unchanged).
+
+    Returns the log path and arm state. Never surfaces the raw ``%N``.
+    """
+    tmux_pane = await _resolve_instance_pane(instance_id)
+    if not tmux_pane:
+        raise HTTPException(status_code=404, detail="instance has no live pane")
+    panes = await _read_tmux_panes()
+    if panes is None or tmux_pane not in panes:
+        raise HTTPException(status_code=404, detail="pane is not live in tmux")
+
+    PANE_TAP_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = PANE_TAP_DIR / f"{instance_id}.log"
+
+    already_armed = await _tmux_pane_pipe_active(tmux_pane)
+    if not already_armed:
+        command = f"cat >> {shlex.quote(str(log_path))}"
+        proc = await _run_subprocess_offloop(
+            ("tmux", "pipe-pane", "-o", "-t", tmux_pane, command),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip() or "pipe-pane failed"
+            raise HTTPException(status_code=500, detail=f"failed to arm tap: {detail}")
+
+    armed = await _tmux_pane_pipe_active(tmux_pane)
+    return {
+        "instance_id": instance_id,
+        "log_path": str(log_path),
+        "armed": armed,
+        "already_armed": already_armed,
+    }
+
+
+@app.delete("/api/panes/{instance_id}/tap")
+async def disarm_pane_tap(instance_id: str):
+    """Disarm the stdout mirror and delete its log file.
+
+    Closes the ``pipe-pane`` sink (a bare ``pipe-pane`` toggles the current
+    pipe closed) and removes ``<instance_id>.log``. Idempotent: missing pane
+    or missing log are not errors. Called from the stop-hook / orphan sweep.
+    """
+    tmux_pane = await _resolve_instance_pane(instance_id)
+    disarmed = False
+    if tmux_pane:
+        panes = await _read_tmux_panes()
+        if panes and tmux_pane in panes and await _tmux_pane_pipe_active(tmux_pane):
+            proc = await _run_subprocess_offloop(
+                ("tmux", "pipe-pane", "-t", tmux_pane),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                timeout=5,
+            )
+            disarmed = proc.returncode == 0
+
+    log_path = PANE_TAP_DIR / f"{instance_id}.log"
+    log_deleted = log_path.exists()
+    try:
+        log_path.unlink(missing_ok=True)
+    except OSError:
+        log_deleted = False
+
+    return {
+        "instance_id": instance_id,
+        "log_path": str(log_path),
+        "disarmed": disarmed,
+        "log_deleted": log_deleted,
+    }
+
+
 # --- Trinity Chunk 1: talk / brief inter-persona comm primitives ------------
 
 
@@ -9848,7 +9970,19 @@ def normalize_bool_param(value: bool | str | int | float | None) -> bool | None:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y", "on", "open", "play", "playing"}:
         return True
-    if text in {"0", "false", "no", "n", "off", "close", "closed", "pause", "paused", "stop", "stopped"}:
+    if text in {
+        "0",
+        "false",
+        "no",
+        "n",
+        "off",
+        "close",
+        "closed",
+        "pause",
+        "paused",
+        "stop",
+        "stopped",
+    }:
         return False
     return None
 
@@ -12255,14 +12389,9 @@ async def get_timer_shifts():
     """Get today's timer shift analytics for TUI visualization."""
     from collections import defaultdict
 
-    # Only show shifts since 9 AM today (daily reset time)
-    from datetime import time as _time
-
+    # Show all shifts since midnight today (reset is alarm-driven, not scheduled).
     now = datetime.now()
-    reset_today = datetime.combine(now.date(), _time(9, 0))
-    if now < reset_today:
-        reset_today -= timedelta(days=1)
-    cutoff = reset_today.isoformat()
+    cutoff = datetime.combine(now.date(), datetime.min.time()).isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -14995,11 +15124,21 @@ def _ops_build_state_assertions(
 
 @app.get("/ui/ops")
 async def ops_ui():
-    """Serve the Terminus ops cockpit shell."""
+    """Serve the Terminus ops cockpit shell.
+
+    The shell HTML must never be cached: it carries the hashed asset URLs, so a
+    cached copy keeps loading a stale bundle even after a rebuild (the soft
+    auto-reload then re-serves the same stale shell from cache). `no-store`
+    forces a fresh shell on every load; the hashed assets stay cacheable.
+    """
     index_path = UI_DIR / "ops" / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Ops UI build not found")
-    return FileResponse(index_path, media_type="text/html")
+    return FileResponse(
+        index_path,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
 
 
 @app.get("/ui/ops/{asset_path:path}")
@@ -15041,6 +15180,7 @@ async def get_ops_display_state():
     )
 
     break_balance_ms = timer_engine.break_balance_ms
+    day_state_row = await shared.get_day_state()
     return {
         "surface": "ops",
         "ui_build_id": _ops_ui_build_id(),
@@ -15090,6 +15230,7 @@ async def get_ops_display_state():
         "cron": cron_summary,
         "tts": {
             "current": tts_summary.get("current"),
+            "routing": tts_summary.get("routing"),
             "hot_queue": tts_summary.get("hot_queue", []),
             "pause_queue": tts_summary.get("pause_queue", []),
             "hot_queue_length": tts_summary.get("hot_queue_length", 0),
@@ -15103,6 +15244,159 @@ async def get_ops_display_state():
             _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
         ],
         "enforcement": enforcement_summary,
+        "alarm": {
+            "acked": bool(day_state_row and day_state_row.get("day_started_at")),
+            "day_started_at": day_state_row.get("day_started_at") if day_state_row else None,
+            "source": day_state_row.get("source") if day_state_row else None,
+        },
+    }
+
+
+def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
+    """First meaningful prose line of a session-doc body — a *head*, never the
+    whole document. The cockpit is a glance surface; Obsidian renders the doc.
+
+    Skips blank lines, markdown heading/quote/list markers, and HTML comments,
+    then returns one trimmed line capped at `limit` chars.
+    """
+    if not body:
+        return None
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("<!--", "%%", "---", "![", "|")):
+            continue
+        # strip leading markdown markers (#, >, -, *, +, digits.) so the head
+        # reads as prose rather than syntax
+        line = re.sub(r"^([#>\-*+]+\s*|\d+\.\s+)", "", line).strip()
+        if not line:
+            continue
+        return (line[: limit - 1] + "…") if len(line) > limit else line
+    return None
+
+
+@app.get("/api/ui/ops/session-docs")
+async def get_ops_session_docs(
+    include_archived: bool = False,
+    limit_per_lane: int = 12,
+):
+    """Read-only pipeline-board feed for the ops cockpit.
+
+    Groups DB-registered session docs into status lanes, each doc carrying a
+    one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
+    renders more than the head — the document is authored and read in Obsidian
+    (the single writer of `status:`). This endpoint performs no mutations.
+
+    `archived` docs are excluded by default (there are hundreds). Each lane is
+    capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
+    carries the true per-status counts so the board reports what it dropped
+    rather than silently truncating. Ordering is by `created_at` because
+    `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
+    surfaces docs that have been open a long time.
+    """
+    from urllib.parse import quote
+
+    vault_root = Path(
+        os.environ.get("IMPERIUM_ENV")
+        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
+    )
+    vault_name = vault_root.name
+    now = datetime.now()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = (
+            "SELECT id, file_path, title, project, primarch_name, cron_job_id, "
+            "status, created_at, updated_at FROM session_documents"
+        )
+        if not include_archived:
+            query += " WHERE status != 'archived'"
+        query += " ORDER BY created_at DESC"
+        cursor = await db.execute(query)
+        rows = await cursor.fetchall()
+        linked: dict[int, int] = {}
+        cnt = await db.execute(
+            "SELECT session_doc_id, COUNT(*) FROM claude_instances "
+            "WHERE session_doc_id IS NOT NULL GROUP BY session_doc_id"
+        )
+        for r in await cnt.fetchall():
+            linked[r[0]] = r[1]
+
+    # True per-lane totals (pre-cap) so the board never lies about coverage.
+    lane_totals: dict[str, int] = {}
+    for row in rows:
+        status = (row["status"] or "unknown").lower()
+        lane_totals[status] = lane_totals.get(status, 0) + 1
+
+    # Cap each lane to the most-recent N. Reading frontmatter is the only
+    # filesystem cost, so it happens *after* the cap — never on hundreds of docs.
+    per_lane_count: dict[str, int] = {}
+    docs = []
+    for row in rows:
+        d = dict(row)
+        status = (d.get("status") or "unknown").lower()
+        if per_lane_count.get(status, 0) >= max(1, limit_per_lane):
+            continue
+        per_lane_count[status] = per_lane_count.get(status, 0) + 1
+
+        fp_str = d.get("file_path")
+        head: str | None = None
+        fm: dict = {}
+        note_rel: str | None = None
+        if fp_str:
+            fp = Path(fp_str)
+            if not fp.is_absolute():
+                fp = vault_root / fp_str  # file_path is stored vault-relative
+            try:
+                if fp.is_file():
+                    fm, body = await asyncio.to_thread(read_frontmatter, fp)
+                    head = _ops_session_doc_head(body)
+            except Exception:
+                fm, head = {}, None
+            try:
+                note_rel = str(fp.relative_to(vault_root))
+            except ValueError:
+                note_rel = str(fp_str)
+
+        obsidian_uri = None
+        if note_rel:
+            note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
+            obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
+
+        created = d.get("created_at")
+        age_seconds = None
+        if created:
+            try:
+                parsed = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.replace(tzinfo=None)
+                age_seconds = max(0, int((now - parsed).total_seconds()))
+            except Exception:
+                age_seconds = None
+
+        docs.append(
+            {
+                "id": d.get("id"),
+                "title": d.get("title") or (Path(str(fp_str)).stem if fp_str else None),
+                "path": fp_str,
+                "vault_rel": note_rel,
+                "obsidian_uri": obsidian_uri,
+                "status": status,
+                "project": d.get("project") or fm.get("project"),
+                "primarch": d.get("primarch_name") or fm.get("primarch"),
+                "legion": fm.get("legion"),
+                "instance_type": fm.get("instance_type"),
+                "head": head,
+                "created_at": created,
+                "age_seconds": age_seconds,
+                "linked_instances": linked.get(d.get("id"), 0),
+            }
+        )
+
+    return {
+        "generated_at": now.isoformat(),
+        "lane_totals": lane_totals,
+        "limit_per_lane": max(1, limit_per_lane),
+        "docs": docs,
     }
 
 
@@ -16889,96 +17183,8 @@ class MorningBriefRequest(BaseModel):
 
 @app.post("/api/custodes/morning-brief")
 async def custodes_morning_brief(request: MorningBriefRequest | None = None):
-    """Morning-session-as-compaction proxy.
-
-    If a Custodes singleton is alive, inject a 3-step prompt (handoff blurb →
-    /compact → morning brief) into its pane to preserve continuity. Otherwise
-    fall back to the existing spawn path via run_morning_session().
-    """
-    from morning_session import (
-        build_prompt,
-        gather_context,
-        get_daily_thread_id,
-        run_morning_session,
-    )
-
-    today = request.date if request and request.date else datetime.now().strftime("%Y-%m-%d")
-
-    # Resolve alive Custodes singleton
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND status IN ('idle', 'processing')
-                 AND stopped_at IS NULL
-               ORDER BY last_activity DESC
-               LIMIT 1"""
-        )
-        row = await cursor.fetchone()
-
-    target_pane: str | None = None
-    target_instance: str | None = None
-    if row and (row["tmux_pane"] or "").strip():
-        if await _tmux_pane_exists(row["tmux_pane"]):
-            target_pane = row["tmux_pane"]
-            target_instance = row["id"]
-    if not target_pane:
-        # DB stale — try recovering from tmux directly
-        recovered = await _find_custodes_tmux_pane()
-        if recovered:
-            target_pane = recovered
-
-    if target_pane:
-        # Build the morning brief body from the same source the standalone launcher uses
-        ctx = gather_context()
-        ctx["trigger"] = "alarm"
-        ctx["daily_thread_id"] = get_daily_thread_id(today) or ""
-        morning_brief_body = build_prompt(ctx)
-
-        injection = (
-            f"Morning session — running into existing Custodes pane.\n\n"
-            f"Step 1 — write today's handoff blurb to Terra/Journal/Daily/{today}.md.\n"
-            f"The blurb should cover: yesterday's open carryover (cascades, pending decisions, anything mid-flight),\n"
-            f"harness regressions surfaced overnight, and any persistent state that compaction would lose.\n"
-            f"Write it as a tight section (not a stream-of-consciousness dump). Keep <500 words.\n\n"
-            f"Step 2 — /compact\n\n"
-            f"Step 3 — morning session brief follows.\n\n"
-            f"{morning_brief_body}"
-        )
-
-        delivery = await _inject_custodes_prompt_to_pane(
-            injection, target_pane, instance_id=target_instance
-        )
-        await log_event(
-            "custodes_morning_brief_dispatched",
-            details={
-                "mode": "inject",
-                "target_pane": target_pane,
-                "instance_id": target_instance,
-                "date": today,
-                "dispatched": delivery.get("dispatched", False),
-                "reason": delivery.get("reason"),
-            },
-        )
-        return {
-            "mode": "inject",
-            "target_pane": target_pane,
-            "instance_id": target_instance,
-            "date": today,
-            "delivery": delivery,
-        }
-
-    # Fallback: no live Custodes — spawn fresh via existing synchronous path
-    # without blocking the event loop.
-    asyncio.create_task(asyncio.to_thread(run_morning_session))
-    _register_morning_expected_response("morning_session")
-    await log_event(
-        "custodes_morning_brief_dispatched",
-        details={"mode": "spawn", "target_pane": None, "instance_id": None, "date": today},
-    )
-    return {"mode": "spawn", "date": today}
+    """Delegates entirely to /api/morning/start — single path."""
+    return await start_morning_session()
 
 
 @app.post("/api/morning/start")
@@ -17141,6 +17347,12 @@ async def alarm_dismiss(delay_minutes: int = 0):
         misfire_grace_time=300,
     )
 
+    # Latch day-start immediately so the ops cockpit alarm ring goes green now.
+    await fire_day_start_internal(
+        source="alarm_silenced",
+        details={"trigger": "alarm_dismiss", "delay_minutes": delay_minutes},
+    )
+
     logger.info(
         f"alarm-dismiss: morning session scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)"
     )
@@ -17157,6 +17369,18 @@ async def alarm_dismiss(delay_minutes: int = 0):
         "scheduled_at": now.isoformat(),
         "fires_at": fires_at.isoformat(),
     }
+
+
+@app.post("/api/alarm/ack")
+async def alarm_ack(source: str = "alarm_silenced"):
+    """Physical alarm dismiss → day-start + timer reset. Idempotent."""
+    now_ms = int(time.monotonic() * 1000)
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = await fire_day_start_internal(source=source, details={"trigger": "alarm_ack"})
+    timer_engine.force_daily_reset(now_ms, today)
+    await timer_save_to_db()
+    await log_event("alarm_ack", details={"source": source, "day_state": result.get("day_state")})
+    return {"acked": True, "source": source, "day_state": result.get("day_state")}
 
 
 # ── Notifications ──────────────────────────────────────────
@@ -18044,7 +18268,10 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
         _discord_voice_drafts[key] = state
         logger.info(f"Voice draft [{bot}/{author_id}]: locked {pane}")
 
-    segment = text if not state.get("utterances") else f" {text}"
+    # Append a trailing space to every dictation: if it ends up trailing the
+    # whole utterance it costs one token; otherwise it cleanly separates this
+    # segment from the next in a multi-segment dictation.
+    segment = f"{text} "
     ok = await _discord_voice_type(state["pane"], segment)
     if ok:
         state["utterances"] = int(state.get("utterances") or 0) + 1

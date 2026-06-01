@@ -1,0 +1,64 @@
+# Overnight validation: Discord Channel Redesign + Cron Fix + Thread Support
+# Format: <shell_command> | <assertion>
+
+# === Discord Channel Structure (10 checks) ===
+curl -sf http://127.0.0.1:7779/channels | jq '.channels | length' | should be exactly 6
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should contain "fleet"
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should contain "forge"
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should contain "chat"
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should contain "briefing"
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should NOT contain "general" or "claw-chat" or "tasks" or "meta" or "research"
+curl -sf http://127.0.0.1:7779/channels | jq -r '.channels[].name' | should contain both "approvals" and "alerts"
+jq '.channels | keys | length' ~/.discord-cli/config.json | should be exactly 6
+jq -r '.channels | keys[]' ~/.discord-cli/config.json | should contain fleet, forge, approvals, alerts, briefing, chat
+jq -r '.channels.fleet' ~/.discord-cli/config.json | should be 1473184628155088918
+
+# === Discord CLI Tool Updates (8 checks) ===
+grep -A1 'Channel aliases' ~/Scripts/cli-tools/bin/discord | should contain "fleet" and "briefing" and NOT "general" or "operations"
+grep -c 'cmd_thread' ~/Scripts/cli-tools/bin/discord | should be greater than 0 (thread function exists)
+grep 'thread)' ~/Scripts/cli-tools/bin/discord | should exist (thread in case dispatch)
+grep -c '\-\-thread' ~/Scripts/cli-tools/bin/discord | should be greater than 0 (--thread flag exists in send)
+grep 'CHANNELS=' ~/Scripts/cli-tools/bin/discord-context | should contain "fleet forge approvals alerts briefing chat"
+grep -c 'fleet)' ~/Scripts/cli-tools/bin/discord-context | should be greater than 0 (fleet in legacy case)
+grep -c 'briefing)' ~/Scripts/cli-tools/bin/discord-context | should be greater than 0 (briefing in legacy case)
+grep -c 'general)' ~/Scripts/cli-tools/bin/discord-context | should be 0 (no general in legacy case)
+
+# === Thread Support Daemon (8 checks) ===
+grep -c "thread/create" ~/.discord-cli/node/http-server.js | should be greater than 0
+grep -c "thread/send" ~/.discord-cli/node/http-server.js | should be greater than 0
+grep -c "thread_id" ~/.discord-cli/node/http-server.js | should be greater than 0 (thread_id in /send)
+curl -sf http://127.0.0.1:7779/status | jq '.connected' | should be true
+grep -c "channel/create" ~/.discord-cli/node/http-server.js | should be greater than 0
+grep -c "channel/rename" ~/.discord-cli/node/http-server.js | should be greater than 0
+grep "auto_archive_duration" ~/.discord-cli/node/http-server.js | should exist (thread archive config)
+grep "PublicThread" ~/.discord-cli/node/http-server.js || grep "type: 11" ~/.discord-cli/node/http-server.js | should exist (thread type)
+
+# === Cron Engine Race Condition Fix (7 checks) ===
+grep -A2 "Pop AFTER DB write" ~/Scripts/token-api/cron_engine.py | should contain "_running_jobs.pop"
+grep -B5 "_running_jobs.pop" ~/Scripts/token-api/cron_engine.py | should contain "finally:" (pop is inside finally block)
+grep 'discord.*send.*fleet' ~/Scripts/token-api/cron_engine.py | should contain "fleet" not "operations"
+grep -c '"operations"' ~/Scripts/token-api/cron_engine.py | should be 0 (no operations references)
+curl -sf localhost:7777/health | jq '.status' | should be "healthy"
+curl -sf localhost:7777/api/cron/status | jq '.total_jobs' | should be a number greater than 0
+curl -sf localhost:7777/api/cron/status | jq '.enabled' | should be greater than 5
+
+# === Worker Prompt Updates (10 checks) ===
+grep -c '#fleet' ~/.openclaw/workspace/memory/prompts/fabricator-general.md | should be greater than 0
+grep -c 'chronic timeout' ~/.openclaw/workspace/memory/prompts/fabricator-general.md | should be greater than 0
+grep -c 'triple confirmation' ~/.openclaw/workspace/memory/prompts/fabricator-general.md || grep -c 'all three' ~/.openclaw/workspace/memory/prompts/fabricator-general.md | should be greater than 0
+grep -c '#fleet' ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md | should be greater than 0
+grep -c '#briefing' ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md | should be greater than 0
+grep -c 'operations' ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md | should be 0 (no operations references)
+grep -c '#forge' ~/.openclaw/workspace/memory/prompts/mechanicus-cli-tools.md | should be greater than 0
+grep -c '#forge' ~/.openclaw/workspace/memory/prompts/mechanicus-token-api.md | should be greater than 0
+grep -c '#forge' ~/.openclaw/workspace/memory/prompts/mechanicus-vault.md | should be greater than 0
+grep -c '#fleet' ~/.openclaw/workspace/memory/prompts/mechanicus-classifier.md | should be greater than 0
+
+# === System Health (7 checks) ===
+curl -sf localhost:7777/health | jq . | should be valid JSON with status field
+curl -sf http://127.0.0.1:7779/status | jq '.connected' | should be true
+test -x ~/Scripts/cli-tools/bin/guardsman && echo "executable" | should say "executable"
+grep -c 'recover_orphaned_runs' ~/Scripts/token-api/cron_engine.py | should be greater than 0
+curl -sf localhost:7777/api/cron/status | jq '.enabled' | should be at least 5
+grep -c 'TestVictoryDetection\|TestQuota\|TestQuietHours\|TestExecution' ~/Scripts/token-api/test_cron_engine.py | should be at least 4
+curl -sf localhost:7777/api/timer | jq '.effective_mode' | should return a valid mode string

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Work session: temporarily reset break balance to a "local 0", then on end
+# fold the break accrued during the session back into the real balance.
+# TAGS: token-api
+# AUDIENCE: agent,human
+#
+# Why: when the break balance is deeply negative, "playing it out" to dig the
+# whole hole back can be demoralizing. A work session lets you declare a fresh
+# slate (treated as break-even from this moment), work, and on end the break you
+# earned during the session is added to your *original* balance. You still owe
+# the original debt — but you bank progress in human-sized chunks.
+#
+# This is the timer-test "set to X, snapback after" pattern with a twist:
+#   start -> save real balance, set to 0
+#   end   -> set balance = saved_original + (break earned since start)
+#
+# Usage:
+#   work-session start     # save real break, reset to local 0, begin
+#   work-session status    # show session + what `end` would produce
+#   work-session end       # fold accrued break into the original, finish
+#   work-session cancel    # abort: restore original break, discard accrual
+
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+API="${TOKEN_API_URL:-http://localhost:7777}"
+# Durable across reboots (unlike /tmp): losing this mid-session would silently
+# erase the backlog you were digging out of.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/token-api"
+STATE_FILE="$STATE_DIR/work-session.json"
+
+die() { echo "error: $1" >&2; exit 1; }
+
+# Signed break balance in seconds (negative = backlog/debt). timer-test reads
+# accumulated_break_seconds, which is clamped to >= 0 and CANNOT see backlog —
+# the exact case this tool exists for — so we read break_balance_ms directly.
+get_break_seconds() {
+    curl -sf "$API/api/timer" \
+        | python3 -c "import sys,json; print(round(json.load(sys.stdin)['break_balance_ms']/1000))" \
+        || die "could not reach Token-API at $API"
+}
+
+set_break_seconds() {
+    curl -sf -X POST "$API/api/timer/set-break?seconds=$1" >/dev/null \
+        || die "could not set break time"
+}
+
+# Pretty-print a signed second count as e.g. "-1h30m" / "+45m" / "0".
+fmt() {
+    python3 - "$1" <<'PY'
+import sys
+s = int(sys.argv[1])
+sign = "-" if s < 0 else "+" if s > 0 else ""
+s = abs(s)
+h, rem = divmod(s, 3600)
+m, _ = divmod(rem, 60)
+if h and m: out = f"{h}h{m}m"
+elif h:     out = f"{h}h"
+elif m:     out = f"{m}m"
+else:       out = f"{s}s" if s else "0"
+print(f"{sign}{out}" if out != "0" else "0")
+PY
+}
+
+session_active() { [[ -f "$STATE_FILE" ]]; }
+
+read_state() {
+    python3 -c "import json;d=json.load(open('$STATE_FILE'));print(d['$1'])"
+}
+
+case "${1:-}" in
+    -h|--help|"")
+        sed -n '2,21p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+
+    start)
+        session_active && die "a work session is already active (use 'work-session status')"
+        original=$(get_break_seconds)
+        mkdir -p "$STATE_DIR"
+        started_at=$(date -Iseconds)
+        started_epoch=$(date +%s)
+        python3 - "$STATE_FILE" "$original" "$started_at" "$started_epoch" <<'PY'
+import json, sys
+path, original, started_at, started_epoch = sys.argv[1:5]
+json.dump({
+    "original_break_seconds": int(original),
+    "started_at": started_at,
+    "started_epoch": int(started_epoch),
+}, open(path, "w"))
+PY
+        set_break_seconds 0
+        echo "Work session started."
+        echo "  Real balance saved: $(fmt "$original")"
+        echo "  You are now at local 0 (break-even). Go work."
+        if [[ "$original" -ge 0 ]]; then
+            echo "  note: balance was not negative — you had nothing to dig out of."
+        fi
+        ;;
+
+    status)
+        session_active || { echo "No active work session."; exit 0; }
+        original=$(read_state original_break_seconds)
+        started_at=$(read_state started_at)
+        started_epoch=$(read_state started_epoch)
+        accrued=$(get_break_seconds)          # since we reset to 0, this IS the diff
+        projected=$(( original + accrued ))
+        elapsed=$(( $(date +%s) - started_epoch ))
+        ago="$(fmt "$elapsed")"; [[ "$ago" == "0" ]] && ago="just now" || ago="$ago ago"
+        echo "Work session ACTIVE (since $started_at, $ago)"
+        echo "  Original balance:  $(fmt "$original")"
+        echo "  Earned this session: $(fmt "$accrued")"
+        echo "  If you end now ->  $(fmt "$projected")"
+        ;;
+
+    end)
+        session_active || die "no active work session"
+        original=$(read_state original_break_seconds)
+        accrued=$(get_break_seconds)
+        projected=$(( original + accrued ))
+        set_break_seconds "$projected"
+        rm -f "$STATE_FILE"
+        echo "Work session ended."
+        echo "  Original:        $(fmt "$original")"
+        echo "  Earned:          $(fmt "$accrued")"
+        echo "  New balance:     $(fmt "$projected")"
+        ;;
+
+    cancel)
+        session_active || die "no active work session"
+        original=$(read_state original_break_seconds)
+        accrued=$(get_break_seconds)
+        set_break_seconds "$original"
+        rm -f "$STATE_FILE"
+        echo "Work session cancelled — restored original balance: $(fmt "$original")"
+        echo "  (discarded $(fmt "$accrued") earned during the session)"
+        ;;
+
+    *)
+        die "unknown command '$1' (use start|status|end|cancel)"
+        ;;
+esac

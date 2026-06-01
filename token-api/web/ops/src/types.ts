@@ -64,11 +64,29 @@ export type OpsInstance = {
 export type TtsQueueItem = {
   instance_id: string;
   tab_name: string | null;
-  message: string;
+  message: string; // full text — UI clamps with CSS, expands on click
   voice: string | null;
   queue: string; // "hot" | "pause"
+  status?: string; // queued | playing | completed
   queued_at: string; // ISO timestamp
 };
+
+export type TtsCurrent = {
+  instance_id: string;
+  tab_name: string | null;
+  message: string;
+  voice: string | null;
+  backend?: string | null;
+  started_at?: string | null; // ISO; present when cheaply available
+};
+
+export type TtsRouting = {
+  device: string; // wsl | phone | mac | discord
+  reason: string; // why this device
+  context?: Record<string, unknown>;
+};
+
+export type TtsGlobalMode = 'verbose' | 'muted' | 'silent';
 
 export type VoiceDraft = {
   bot_name: string;
@@ -181,7 +199,8 @@ export type OpsState = {
     error?: string;
   };
   tts: {
-    current: Record<string, unknown> | null;
+    current: TtsCurrent | null;
+    routing?: TtsRouting | null;
     hot_queue: TtsQueueItem[];
     pause_queue: TtsQueueItem[];
     hot_queue_length: number;
@@ -198,6 +217,11 @@ export type OpsState = {
     pending: Array<Record<string, unknown>>;
     pavlok: Record<string, unknown>;
     error?: string;
+  };
+  alarm?: {
+    acked: boolean;
+    day_started_at: string | null;
+    source: string | null;
   };
 };
 
@@ -259,6 +283,35 @@ export type TimerHistory = {
     latest?: Record<string, unknown> | null;
   };
   source?: string;
+};
+
+// ── Session-doc pipeline read-model (GET /api/ui/ops/session-docs) ────────
+// Read-only board feed. The cockpit groups these into status lanes and never
+// renders more than `head` (one line); the document itself lives in Obsidian.
+
+export type PipelineDoc = {
+  id: number | null;
+  title: string | null;
+  path: string | null;
+  vault_rel: string | null;
+  obsidian_uri: string | null;
+  status: string;
+  project: string | null;
+  primarch: string | null;
+  legion: string | null;
+  instance_type: string | null;
+  head: string | null; // one-line excerpt only — never the full document
+  created_at: string | null;
+  age_seconds: number | null; // since creation — surfaces long-open docs honestly
+  linked_instances: number;
+};
+
+export type SessionDocsFeed = {
+  generated_at: string;
+  /** true per-status counts before per-lane capping — so the board never lies */
+  lane_totals: Record<string, number>;
+  limit_per_lane: number;
+  docs: PipelineDoc[];
 };
 
 // ── Arbitrary node/edge graph read-model (GET /api/ui/ops/graph/{name}) ───

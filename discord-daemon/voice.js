@@ -77,30 +77,41 @@ export function createVoiceManager(botClients, config, logger) {
 
   function resolveFallbackTmuxPane() {
     try {
-      const windowsOut = execFileSync('tmux', [
-        'list-windows',
+      const panesOut = execFileSync('tmux', [
+        'list-panes',
         '-a',
         '-F',
-        '#{session_name}\t#{window_active}\t#{window_index}\t#{pane_id}',
+        '#{pane_id}\t#{session_name}\t#{window_active}\t#{pane_active}\t#{window_index}\t#{pane_index}',
       ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
 
       const candidates = [];
-      for (const line of windowsOut.split(/\r?\n/)) {
+      for (const line of panesOut.split(/\r?\n/)) {
         if (!line) continue;
-        const [sessionName, rawActive, rawIndex, pane] = line.split('\t');
+        const [pane, sessionName, rawWindowActive, rawPaneActive, rawWindowIndex, rawPaneIndex] = line.split('\t');
         if (!pane?.startsWith?.('%')) continue;
         if (sessionName === 'discord-daemon' || sessionName?.startsWith?.('tx_test_')) continue;
         if (!isRoutablePane(pane)) continue;
-        const active = rawActive === '1' ? 1 : 0;
-        const index = Number.parseInt(rawIndex || '9999', 10);
-        candidates.push({ sessionName, pane, active, index: Number.isFinite(index) ? index : 9999 });
+        const windowActive = rawWindowActive === '1' ? 1 : 0;
+        const paneActive = rawPaneActive === '1' ? 1 : 0;
+        const windowIndex = Number.parseInt(rawWindowIndex || '9999', 10);
+        const paneIndex = Number.parseInt(rawPaneIndex || '9999', 10);
+        candidates.push({
+          sessionName,
+          pane,
+          windowActive,
+          paneActive,
+          windowIndex: Number.isFinite(windowIndex) ? windowIndex : 9999,
+          paneIndex: Number.isFinite(paneIndex) ? paneIndex : 9999,
+        });
       }
 
       candidates.sort((a, b) => {
         if (a.sessionName === 'main' && b.sessionName !== 'main') return -1;
         if (b.sessionName === 'main' && a.sessionName !== 'main') return 1;
-        if (b.active !== a.active) return b.active - a.active;
-        return a.index - b.index;
+        if (b.windowActive !== a.windowActive) return b.windowActive - a.windowActive;
+        if (b.paneActive !== a.paneActive) return b.paneActive - a.paneActive;
+        if (a.windowIndex !== b.windowIndex) return a.windowIndex - b.windowIndex;
+        return a.paneIndex - b.paneIndex;
       });
 
       if (candidates.length > 0) {
@@ -108,6 +119,7 @@ export function createVoiceManager(botClients, config, logger) {
         logger.warn(`Voice: falling back to active ${chosen.sessionName} pane ${chosen.pane}`);
         return chosen.pane;
       }
+      logger.warn('Voice: fallback tmux pane resolve found no routable panes');
     } catch (err) {
       logger.warn(`Voice: fallback tmux pane resolve failed: ${err.message}`);
     }
@@ -181,6 +193,7 @@ export function createVoiceManager(botClients, config, logger) {
         playing: false,      // Currently playing audio
         leaveTimer: null,
         routeEpoch: 0,
+        routePane: null,
       });
     }
     return botStates.get(botName);
@@ -353,7 +366,7 @@ export function createVoiceManager(botClients, config, logger) {
     decoder.on('data', (chunk) => {
       // First real audio frame of a local utterance: lock the active pane now.
       if (!hasAudioSinceCommit) {
-        lockedTmuxPane = resolveSelectedTmuxPane();
+        lockedTmuxPane = resolveSelectedTmuxPane() || state.routePane || null;
         if (lockedTmuxPane) {
           logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
         } else {
@@ -421,6 +434,7 @@ export function createVoiceManager(botClients, config, logger) {
     try { state.connection.destroy(); } catch (err) { logger.warn(`Voice [${botName}]: destroy during leave ignored: ${err.message}`); }
     state.connection = null;
     state.listening = false;
+    state.routePane = null;
     const leftChannel = state.channelId;
     state.channelId = null;
 
@@ -559,6 +573,10 @@ export function createVoiceManager(botClients, config, logger) {
   async function joinAndListenIfCurrent(botName, channelId, routeEpoch) {
     const state = getBotState(botName);
     try {
+      state.routePane = resolveSelectedTmuxPane();
+      if (state.routePane) {
+        logger.info(`Voice auto-join [${botName}]: route pane snapshot ${state.routePane}`);
+      }
       await joinChannel(channelId, botName);
       if (state.routeEpoch !== routeEpoch || operatorVoiceChannelId !== channelId) {
         logger.warn(
@@ -584,6 +602,7 @@ export function createVoiceManager(botClients, config, logger) {
     }
     if (!connectionUsable(state)) {
       if (state.joining) {
+        state.routePane = null;
         logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
       }
       return;
@@ -603,6 +622,7 @@ export function createVoiceManager(botClients, config, logger) {
     if (state.leaveTimer) clearTimeout(state.leaveTimer);
     if (!connectionUsable(state)) {
       if (state.joining) {
+        state.routePane = null;
         logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
       }
       return;

@@ -139,6 +139,21 @@ async def _consumer_phone_reachability(_: dict) -> dict:
     return {"status": "ok", "reachable": reachable}
 
 
+async def _consumer_custodes_morning_session() -> dict:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "http://localhost:7777/api/morning/start",
+                timeout=10,
+            )
+            data = resp.json()
+            return {"status": "ok", "result": data.get("status"), "pane_id": data.get("pane_id")}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
 async def _consumer_stub(name: str, follow_up: str) -> dict:
     return {"status": "stubbed", "consumer": name, "follow_up": follow_up}
 
@@ -165,13 +180,7 @@ async def _day_start_fanout(day_state: dict) -> list[dict]:
     consumers = [
         ("quiet_hours", _consumer_quiet_hours(day_state)),
         ("tts_suppression", _consumer_tts_suppression(day_state)),
-        (
-            "custodes_morning_session",
-            _consumer_stub(
-                "custodes_morning_session",
-                "spawn/resume Custodes singleton with day-start continuity context",
-            ),
-        ),
+        ("custodes_morning_session", _consumer_custodes_morning_session()),
         (
             "pavlok_daily_warmup",
             _consumer_stub(

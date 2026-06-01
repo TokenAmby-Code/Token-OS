@@ -826,7 +826,7 @@ class TimerEngine:
         result.productivity_score = productivity_score
         result.reset_date = self._daily_start_date or today_date
 
-        self._reset_state(now_mono_ms, today_date, with_buffer=False)
+        self._reset_state(now_mono_ms, today_date, with_buffer=True)
         return result
 
     # ---- Internal ----
