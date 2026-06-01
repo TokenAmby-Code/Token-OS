@@ -33,7 +33,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 
 [Telemetry — 1 unified macro, 36 triggers]
   All apps open/close  ──>  Token-Ping  ──>  POST /phone/event
-  YouTube special (YT/YT_BG/YT_BTN)         (parses trigger name)
+  YouTube special (YT/YT_BG/YT_BTN)         (app=Youtube play=true/false)
   Spotify (clears yt_bg)                          │
   Geofence (Home/Gym/Campus)                      ▼
                                            Server analyzes context
@@ -55,7 +55,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 | `/enforce?zap=N&tts_text=X&banner_text=X&type=T` | Same + Pavlok zap + Spotify redirect |
 | `/zap?zap=30` or `/zap?action=zap\|beep\|vibe&intensity=1-100` | Direct single Pavlok stimulus (lightweight) |
 | `/token-ping` | Local relay → Token-API with Discord fallback |
-| `/heartbeat` | Health check |
+| `/server-heartbeat` | Inbound server heartbeat / health check |
 | `/sshd` | Start Termux SSH daemon |
 | `/list-exports` | Trigger macro export |
 
@@ -64,7 +64,7 @@ Phone (MacroDroid)                    Desktop Server (Token-API)
 | Category | Count | Purpose |
 |----------|-------|---------|
 | Telemetry | 1 | Unified app open/close (36 triggers, 18 apps) |
-| YouTube | 3 | YT + YT_BG + YT_BTN (background audio tracking) |
+| YouTube | 3 | YT + YT_BG + YT_BTN (background audio tracking via `{"app":"Youtube","play":"true"|"false"}`) |
 | Spotify | 1 | Cross-app state (clears yt_bg) |
 | Token-Ping | 1 | Local HTTP relay with Discord fallback |
 | Notify/Enforce | 3 | Notify, Enforce, Zappa (v3 unified params) |

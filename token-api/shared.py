@@ -564,9 +564,9 @@ def is_phone_reachable() -> bool:
     host = PHONE_TTS_CONFIG["host"]
     port = PHONE_TTS_CONFIG["port"]
     try:
-        # Use /heartbeat — hitting /notify fires the Notify macro (vibrate + TTS)
+        # Use /server-heartbeat — hitting /notify fires the Notify macro (vibrate + TTS)
         # which produced spurious vibrations on every health probe.
-        resp = requests.get(f"http://{host}:{port}/heartbeat", timeout=2)
+        resp = requests.get(f"http://{host}:{port}/server-heartbeat", timeout=2)
         available = resp.status_code == 200
     except Exception:
         available = False

@@ -812,6 +812,7 @@ class PhoneSystemEventRequest(BaseModel):
     Supports two formats:
       Full:    {"event": "app_open", "app": "Application Launched (X)"}
       Minimal: {"app": "Application Launched (X)"}  (event inferred from trigger name)
+      YouTube: {"app": "Youtube", "play": "true"|"false"}  (playback edge)
     """
 
     event: str | None = None  # Optional — inferred from trigger name if absent
@@ -819,6 +820,7 @@ class PhoneSystemEventRequest(BaseModel):
     server: str | None = None  # heartbeat: server response code
     shizuku_dead: str | None = None  # heartbeat: current shizuku state
     app: str | None = None  # trigger name (e.g. "Application Launched (X)")
+    play: bool | str | int | None = None  # YouTube playback state from granular YT macros
     notification: str | None = None  # discord_fallback_received: original notification text
 
 
@@ -10330,6 +10332,9 @@ async def recover_recent_phone_distraction_state() -> bool:
 MACRODROID_TRIGGER_APP_MAP = {
     "x": "twitter",
     "youtube": "youtube",
+    "yt": "youtube",
+    "yt_bg": "youtube",
+    "youtube background": "youtube",
     "thronefall": "game",
     "slice & dice": "game",
     "20 minutes till dawn": "game",
@@ -10342,6 +10347,30 @@ MACRODROID_TRIGGER_APP_MAP = {
 
 _APP_TRIGGER_RE = re.compile(r"Application (?:Launched|Closed) \((.+)\)", re.IGNORECASE)
 _GEO_TRIGGER_RE = re.compile(r"Geofence (Entry|Exit) \((.+)\)", re.IGNORECASE)
+
+
+def normalize_macrodroid_app_key(raw: str | None) -> str:
+    """Normalize a MacroDroid display/package app name to Token-API's app key."""
+    if not raw:
+        return ""
+    stripped = raw.strip().lower()
+    return MACRODROID_TRIGGER_APP_MAP.get(stripped, stripped)
+
+
+def normalize_bool_param(value: bool | str | int | float | None) -> bool | None:
+    """Parse MacroDroid-friendly boolean strings without treating garbage as false."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "open", "play", "playing"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "close", "closed", "pause", "paused", "stop", "stopped"}:
+        return False
+    return None
 
 
 def parse_macrodroid_trigger(raw: str) -> dict:
@@ -10370,8 +10399,8 @@ def parse_macrodroid_trigger(raw: str) -> dict:
     # App trigger
     m = _APP_TRIGGER_RE.match(stripped)
     if m:
-        display_name = m.group(1).strip().lower()
-        app_key = MACRODROID_TRIGGER_APP_MAP.get(display_name, display_name)
+        display_name = m.group(1)
+        app_key = normalize_macrodroid_app_key(display_name)
         action = "open" if "launched" in stripped.lower() else "close"
         return {"type": "app", "app": app_key, "action": action}
 
@@ -11158,7 +11187,7 @@ def stop_enforcement_cascade(reason: str = "app_close") -> None:
 
 def check_phone_reachable() -> dict:
     """
-    Check if phone is reachable via heartbeat endpoint.
+    Check if phone is reachable via MacroDroid's inbound server heartbeat endpoint.
 
     Returns:
         dict with reachable status
@@ -11167,7 +11196,7 @@ def check_phone_reachable() -> dict:
     port = PHONE_CONFIG["port"]
     timeout = PHONE_CONFIG["timeout"]
 
-    url = f"http://{host}:{port}/heartbeat"
+    url = f"http://{host}:{port}/server-heartbeat"
 
     try:
         response = requests.get(url, timeout=timeout)
@@ -12428,6 +12457,7 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     Events:
     - app_open: v2 telemetry — app opened (routes through distraction detection)
     - app_close: v2 telemetry — app closed (stops enforcement cascade)
+    - app_playback: YouTube playback edge via {"app":"Youtube","play":true|false}
     - discord_fallback_received: phone confirmed it received Discord relay
     - shizuku_died: Shizuku service stopped (legacy, kept for transition)
     - shizuku_restored: Shizuku came back (legacy)
@@ -12443,6 +12473,51 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         parse_macrodroid_trigger(raw_trigger) if raw_trigger else {"type": "unknown", "raw": ""}
     )
     event = request.event
+    play_state = normalize_bool_param(request.play)
+
+    if request.play is not None and play_state is None:
+        return {
+            "received": True,
+            "error": "invalid play param; expected true/false",
+            "app": raw_trigger,
+            "play": request.play,
+        }
+
+    # YouTube's MacroDroid macros have a better signal than generic foreground
+    # open/close: the playback edge. Accept the compact shape
+    #   {"app": "Youtube", "play": "true"|"false"}
+    # and translate it into the existing phone activity open/close pipeline.
+    if play_state is not None:
+        play_app_key = (
+            parsed.get("app")
+            if parsed.get("type") == "app"
+            else normalize_macrodroid_app_key(raw_trigger)
+        )
+        if play_app_key not in PHONE_YOUTUBE_APP_KEYS:
+            return {
+                "received": True,
+                "error": "play param only supported for YouTube telemetry",
+                "app": play_app_key or raw_trigger,
+                "play": request.play,
+            }
+        parsed = {
+            "type": "app",
+            "app": "youtube",
+            "action": "open" if play_state else "close",
+            "play": play_state,
+        }
+        if not event or event == "app_telemetry":
+            event = "app_playback"
+
+    # Also support explicit event+direct-app bodies, e.g.
+    # {"event":"app_open","app":"Youtube"}, without requiring MacroDroid's
+    # "Application Launched (...)" trigger text.
+    if parsed.get("type") == "unknown" and event in ("app_open", "app_close") and raw_trigger:
+        parsed = {
+            "type": "app",
+            "app": normalize_macrodroid_app_key(raw_trigger),
+            "action": "open" if event == "app_open" else "close",
+        }
 
     # Infer event from trigger name if not provided
     if not event:
@@ -12458,24 +12533,31 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
 
     # Log non-app events here; app open/close are logged downstream by handle_phone_activity
     # with richer details (phone_app_closed, phone_distraction_allowed, phone_distraction_blocked)
-    if event not in ("app_open", "app_close", "app_telemetry"):
+    if event not in ("app_open", "app_close", "app_telemetry", "app_playback"):
         await log_event(
             f"phone_{event}",
             device_id="phone",
             details={
                 "time": request.time,
                 "app": request.app,
+                "play": request.play,
                 "server": request.server,
                 "shizuku_dead": request.shizuku_dead,
             },
         )
 
     # ---- App telemetry (open/close) ----
-    if event in ("app_open", "app_close", "app_telemetry") and parsed["type"] == "app":
+    if (
+        event in ("app_open", "app_close", "app_telemetry", "app_playback")
+        and parsed["type"] == "app"
+    ):
         app_key = parsed["app"]
         action = parsed["action"] or ("close" if event == "app_close" else "open")
 
-        print(f">>> /phone/event {event}: raw={raw_trigger!r} -> app={app_key!r} action={action!r}")
+        print(
+            f">>> /phone/event {event}: raw={raw_trigger!r} -> app={app_key!r} "
+            f"action={action!r} play={play_state!r}"
+        )
 
         if action == "close":
             stop_enforcement_cascade(reason="app_close")
@@ -12487,6 +12569,7 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
             "event": event,
             "app": app_key,
             "action": action,
+            "play": play_state,
             "raw": raw_trigger,
             "decision": result.dict(),
         }
@@ -18632,7 +18715,11 @@ async def receive_discord_message(request: DiscordMessageRequest):
                     body = _json.loads(raw_body)
                     app_raw = body.get("app", "")
                     if app_raw:
-                        req = PhoneSystemEventRequest(app=app_raw)
+                        req = PhoneSystemEventRequest(
+                            event=body.get("event"),
+                            app=app_raw,
+                            play=body.get("play"),
+                        )
                         result = await handle_phone_system_event(req)
                         logger.info(f"Fallback replayed: {app_raw} -> {result}")
                 except Exception as e:
