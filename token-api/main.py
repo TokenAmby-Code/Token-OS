@@ -5859,6 +5859,19 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
+    # Read the linked session doc rubric and classify the fire state. This is
+    # the one genuinely new line of data flow: the fire path now sees the
+    # rubric and can name the specific unmet condition instead of a flat SOP.
+    # None status / scalar-string rubric / no linked doc → 'legacy' (unchanged).
+    rubric_status, doc_meta = await _read_instance_session_doc_rubric(instance)
+    rubric_state = _golden_throne_rubric_state(rubric_status)
+    if rubric_state == "acknowledged":
+        # The Emperor already acked this doc (schedule-time gate normally
+        # removes the job; this catches an ack that landed between schedule
+        # and fire). A victorious, acked instance must not be re-prompted.
+        logger.info(f"Golden Throne: {session_id[:12]} rubric acknowledged, skipping")
+        return
+
     quiet_hours = shared.get_quiet_hours_status()
     if quiet_hours.get("active"):
         rescheduled = await schedule_golden_throne_followup(
@@ -5908,7 +5921,9 @@ async def golden_throne_followup(session_id: str):
     # (Sync retrigger path removed — sync instances now self-evaluate via StopValidate.)
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
+    doc_path = doc_meta.get("file_path")
     if custom_sop_path:
+        # Explicit per-instance override wins over the rubric-derived prompt.
         expanded = Path(custom_sop_path).expanduser()
         if expanded.exists():
             sop_prompt = expanded.read_text()
@@ -5916,6 +5931,14 @@ async def golden_throne_followup(session_id: str):
         else:
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
+    elif rubric_state == "incomplete":
+        # The Voice: name the specific unmet rubric conditions instead of the
+        # flat SOP. Falls back to legacy SOP for any non-incomplete state.
+        sop_prompt = _golden_throne_accountability_prompt(rubric_status, doc_path)
+        logger.info(
+            f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
+            f"(missing: {rubric_status.missing})"
+        )
     else:
         sop_prompt = _load_golden_throne_sop()
     tmux_pane = instance.get("tmux_pane")
@@ -5928,6 +5951,39 @@ async def golden_throne_followup(session_id: str):
     instance["pane_label"] = pane_label
     instance["pane_surface"] = pane_surface
     instance["human_pane_surface"] = human_pane_surface
+
+    # Terminal rubric states do NOT re-prompt the agent. A victorious instance
+    # must not be hounded with a "keep working" send-keys.
+    if rubric_state == "ready_for_ack":
+        # Rubric just went complete, Emperor not yet notified → notify-only.
+        result = await _golden_throne_handle_ready_for_ack(
+            instance, rubric_status, doc_meta, human_pane_surface
+        )
+        await log_event(
+            "golden_throne_followup",
+            instance_id=session_id,
+            details={
+                "engine": engine,
+                "rubric_state": rubric_state,
+                "handler_result": result,
+            },
+        )
+        return
+    if rubric_state == "victorious_bug":
+        # Complete + already notified, yet GT fired again → bug-event (shock).
+        result = await _golden_throne_handle_victorious_bug(
+            instance, rubric_status, doc_meta, human_pane_surface
+        )
+        await log_event(
+            "golden_throne_followup",
+            instance_id=session_id,
+            details={
+                "engine": engine,
+                "rubric_state": rubric_state,
+                "handler_result": result,
+            },
+        )
+        return
 
     # Dispatch: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
@@ -6204,12 +6260,20 @@ async def golden_throne_followup(session_id: str):
     if instance_type != "sync":
         zealotry = instance.get("zealotry") or 4
         vibe_intensity = min(20 + (zealotry - 4) * 10, 80)  # 20 at z4, 80 at z10
+        # Specific TTS/banner naming the missing condition for incomplete
+        # rubrics; generic resume text for legacy (no-rubric) instances.
+        if rubric_state == "incomplete" and rubric_status is not None:
+            tts_text = _golden_throne_tts_text_for_rubric(human_pane_surface, rubric_status)
+            banner_text = _golden_throne_banner_text_for_rubric(human_pane_surface, rubric_status)
+        else:
+            tts_text = _golden_throne_tts_text(tab_name, human_pane_surface)
+            banner_text = _golden_throne_banner_text(tab_name, human_pane_surface)
         try:
             # Comms middleware owns routing: TTS by geofence, buzz + banner ride along.
             phone_result = await dispatch_notify(
-                _golden_throne_tts_text(tab_name, human_pane_surface),
+                tts_text,
                 vibe=vibe_intensity,
-                banner=_golden_throne_banner_text(tab_name, human_pane_surface),
+                banner=banner_text,
                 instance_id=session_id,
             )
         except Exception as e:
