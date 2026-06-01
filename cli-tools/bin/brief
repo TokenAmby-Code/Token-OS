@@ -117,7 +117,6 @@ def main(argv: list[str]) -> int:
         return 0 if result.get("status") == "ok" else 1
 
     status = result.get("status")
-    delivered = result.get("delivered", 0)
     resolved = result.get("resolved", []) or []
     unresolved = result.get("unresolved", []) or []
 
@@ -125,22 +124,33 @@ def main(argv: list[str]) -> int:
         _err("no targets resolved" + (f" (unresolved: {unresolved})" if unresolved else ""))
         return 1
 
+    # Report the TRUE send result, not a never-satisfied verification: only a
+    # confirmed "sent" counts as delivered. A "pending" target was accepted but
+    # NOT yet delivered (gated by quiet hours / typing guard, or deferred) and
+    # is surfaced distinctly so a queued brief never reads as a delivery.
+    sent = sum(1 for r in resolved if r.get("status") == "sent")
+    pending = sum(1 for r in resolved if r.get("status") == "pending")
+
     targets = ", ".join(
         f"{r.get('position_id') or r.get('pane_id')}"
         for r in resolved
     )
     eph = " (ephemeral)" if args.ephemeral else ""
-    print(f"[brief{eph}] delivered={delivered}/{len(resolved)} → {targets}")
+    suffix = f" ({pending} pending — not yet delivered)" if pending else ""
+    print(f"[brief{eph}] delivered={sent}/{len(resolved)}{suffix} → {targets}")
     for r in resolved:
-        if r.get("status") not in {"sent", "pending"}:
-            _err(
-                f"  {r.get('position_id') or r.get('pane_id')}: "
-                f"status={r.get('status')} error={r.get('error') or ''}"
-            )
+        st = r.get("status")
+        label = r.get("position_id") or r.get("pane_id")
+        if st == "sent":
+            continue
+        if st == "pending":
+            _err(f"  {label}: pending ({r.get('reason') or 'queued'}) — not yet delivered")
+        else:
+            _err(f"  {label}: status={st} error={r.get('error') or ''}")
     if unresolved:
         for u in unresolved:
             _err(f"  unresolved {u.get('source')}={u.get('spec')} ({u.get('reason')})")
-    return 0 if delivered > 0 else 1
+    return 0 if (sent + pending) > 0 else 1
 
 
 if __name__ == "__main__":

@@ -4153,6 +4153,21 @@ async def _tmux_send_payload_then_submit(
     # Bytes were issued, but delivery is NOT proven here — never default to
     # "sent". The proof belt (UserPromptSubmit correlation) upgrades this to a
     # confirmed delivery; until then it is "unverified".
+    verification_status = "unverified"
+    verified_by = None
+    # Submission confirmation (clear/replace senders, i.e. brief): after the
+    # double-C-m submit + settle, the composer should be empty if the prompt
+    # actually submitted. If it cleared, that is positive evidence the submit
+    # took — upgrade to "submitted". A composer that still holds text (submit
+    # swallowed) stays "unverified" so the truth is reported, not a default.
+    if clear_prompt:
+        try:
+            still_pending = await _tmux_pane_has_pending_input(tmux_pane)
+        except Exception:  # noqa: BLE001
+            still_pending = True
+        if not still_pending:
+            verification_status = "submitted"
+            verified_by = "composer_cleared"
     return {
         "returncode": 0,
         "stdout": "",
@@ -4161,8 +4176,8 @@ async def _tmux_send_payload_then_submit(
         "dispatch_id": str(uuid.uuid4()),
         "payload_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
         "gated": False,
-        "verification_status": "unverified",
-        "verified_by": None,
+        "verification_status": verification_status,
+        "verified_by": verified_by,
         "pane": tmux_pane,
         "instance_id": None,
     }
@@ -4202,8 +4217,16 @@ async def process_pane_write_queue_once(
             "source": item["source"],
             "purpose": item["purpose"],
         }
+        is_brief = item["source"] == "brief"
         try:
-            if await _tmux_pane_has_pending_input(pane):
+            # brief clears/replaces a stale composer rather than deferring on it
+            # forever. Its live symptom: a leftover draft in the target composer
+            # wedged delivery permanently (the additive deferral never cleared).
+            # The universal send gate still suppresses the C-u clear AND the
+            # payload when a human is actively typing (same client_activity
+            # predicate), so clear/replace never clobbers a live human draft —
+            # it only replaces stale/abandoned text, matching agent-cmd.
+            if not is_brief and await _tmux_pane_has_pending_input(pane):
                 result = {**base, "status": PANE_WRITE_PENDING, "reason": "dispatch_deferred"}
                 await _mark_pane_write(
                     item["id"],
@@ -4213,7 +4236,12 @@ async def process_pane_write_queue_once(
                 )
                 results.append(result)
                 continue
-            send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
+            if is_brief:
+                send_result = await _tmux_send_payload_then_submit(
+                    pane, item["payload"], clear_prompt=True
+                )
+            else:
+                send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
             if send_result.get("gated"):
                 # Gate suppressed the send (no bytes issued). Keep the item
                 # pending so the periodic worker flushes it when the gate
