@@ -339,6 +339,8 @@ def test_dispatch_human_origin_forces_interactive_even_with_direct(monkeypatch):
     assert "dispatch aspirant dry-run" not in result.stdout
     assert "engine:          codex" in result.stdout
     assert "instance_type:   one_off" in result.stdout
+    assert "dispatch_codex_launch_inline" in result.stdout
+    assert "codex-dispatch" not in result.stdout
 
 
 def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
@@ -544,6 +546,7 @@ def test_tmux_prefix_space_launcher_uses_large_popup_without_enter_newline_hang(
     popup = (ROOT / "cli-tools" / "bin" / "tmux-legion-prompt-popup").read_text(encoding="utf-8")
     assert "IFS= read -e -r -p" in popup
     assert "TOKEN_API_DISPATCH_ORIGIN=d" in popup
+    assert "--direct" in popup
     assert "--target legion:new" in popup
     assert "trap soft_cancel INT TERM" in popup
     assert "tmux-legion-prompt-popup.log" in popup

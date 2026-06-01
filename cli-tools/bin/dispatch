@@ -953,6 +953,197 @@ if [[ -n "$RESUME_DISCORD_CHANNEL" && -z "$DISCORD_CHANNEL" ]]; then
   )
 fi
 
+dispatch_codex_launch_inline() {
+  local resume_session_id="${1:-}"
+  local prompt="${2:-}"
+  local working_dir="${TOKEN_API_TARGET_WORKING_DIR:-$PWD}"
+  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
+  local launcher="${TOKEN_API_LAUNCHER:-dispatch}"
+  local session_doc="${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}"
+  local dispatch_target="${TOKEN_API_DISPATCH_TARGET:-}"
+  local dispatch_window="${TOKEN_API_DISPATCH_WINDOW:-}"
+  local dispatch_mode="${TOKEN_API_DISPATCH_MODE:-}"
+  local dispatch_slot="${TOKEN_API_DISPATCH_SLOT:-}"
+  local launch_mode="${TOKEN_API_LAUNCH_MODE:-}"
+  local resolved_tmux_pane="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
+  local instance_type="${TOKEN_API_INSTANCE_TYPE:-golden_throne}"
+  local zealotry="${TOKEN_API_ZEALOTRY:-5}"
+  local parent_instance_id="${TOKEN_API_PARENT_INSTANCE_ID:-}"
+  local codex_profile="${TOKEN_API_CODEX_PROFILE:-}"
+
+  [[ -d "$working_dir" ]] || { echo "dispatch: working directory does not exist: $working_dir" >&2; return 65; }
+
+  local codex_bin
+  codex_bin="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+  [[ -n "$codex_bin" ]] || { echo "dispatch: codex not found in PATH" >&2; return 66; }
+  command -v jq >/dev/null 2>&1 || { echo "dispatch: jq not found in PATH" >&2; return 67; }
+
+  local session_id bridge_id bridge_dir
+  session_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  bridge_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  bridge_dir="${HOME}/.codex/session-bridges"
+  mkdir -p "$bridge_dir"
+  rm -f "${bridge_dir}/${bridge_id}.session_id"
+
+  dispatch_codex_post_hook() {
+    local action_type="$1"
+    local payload="$2"
+    curl -s --connect-timeout 2 --max-time 5 \
+      -X POST "${api_url}/api/hooks/${action_type}" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null 2>&1 || true
+  }
+
+  dispatch_codex_build_env_object() {
+    local env_obj="{}"
+    [[ -n "${SSH_CLIENT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
+    [[ -n "${TMUX:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
+    [[ -n "${resolved_tmux_pane:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$resolved_tmux_pane" '. + {TMUX_PANE: $v}')
+    [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
+    [[ -n "${codex_profile:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$codex_profile" '. + {TOKEN_API_CODEX_PROFILE: $v}')
+    [[ -n "${parent_instance_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$parent_instance_id" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_MCP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP" '. + {TOKEN_API_DISPATCH_MCP: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_BROWSER" '. + {TOKEN_API_DISPATCH_WITH_BROWSER: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_DESKTOP" '. + {TOKEN_API_DISPATCH_WITH_DESKTOP: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP_LIST" '. + {TOKEN_API_DISPATCH_MCP_LIST: $v}')
+    [[ -n "${TOKEN_API_DISCORD_HOSTED:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_HOSTED" '. + {TOKEN_API_DISCORD_HOSTED: $v}')
+    [[ -n "${TOKEN_API_DISCORD_CHANNEL:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_CHANNEL" '. + {TOKEN_API_DISCORD_CHANNEL: $v}')
+    [[ -n "${TOKEN_API_DISCORD_BOT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_BOT" '. + {TOKEN_API_DISCORD_BOT: $v}')
+    echo "$env_obj"
+  }
+
+  local env_obj wrapper_start_payload
+  env_obj="$(dispatch_codex_build_env_object)"
+  wrapper_start_payload="$(jq -nc \
+    --arg wrapper_launch_id "$bridge_id" \
+    --arg launcher "$launcher" \
+    --arg engine "codex" \
+    --arg wd "$working_dir" \
+    --arg tmux_pane "$resolved_tmux_pane" \
+    --arg instance_type "$instance_type" \
+    --argjson zealotry "$zealotry" \
+    --argjson pid "$$" \
+    --argjson env "$env_obj" \
+    '{
+      wrapper_launch_id: $wrapper_launch_id,
+      launcher: $launcher,
+      engine: $engine,
+      cwd: $wd,
+      tmux_pane: $tmux_pane,
+      instance_type: $instance_type,
+      zealotry: $zealotry,
+      pid: $pid,
+      env: $env
+    }')"
+  dispatch_codex_post_hook "WrapperStart" "$wrapper_start_payload"
+
+  dispatch_codex_cleanup() {
+    local exit_code="${1:-$?}"
+    local codex_session_id="$session_id"
+    local wrapper_end_payload end_payload
+    if [[ -s "${bridge_dir}/${bridge_id}.session_id" ]]; then
+      codex_session_id="$(cat "${bridge_dir}/${bridge_id}.session_id" 2>/dev/null || printf '%s' "$session_id")"
+    fi
+    rm -f "${bridge_dir}/${bridge_id}.session_id"
+    wrapper_end_payload="$(jq -nc \
+      --arg wrapper_launch_id "$bridge_id" \
+      --arg launcher "$launcher" \
+      --arg engine "codex" \
+      --arg wd "$working_dir" \
+      --arg tmux_pane "$resolved_tmux_pane" \
+      --argjson pid "$$" \
+      --argjson code "$exit_code" \
+      --argjson env "$env_obj" \
+      '{
+        wrapper_launch_id: $wrapper_launch_id,
+        launcher: $launcher,
+        engine: $engine,
+        cwd: $wd,
+        tmux_pane: $tmux_pane,
+        pid: $pid,
+        exit_code: $code,
+        env: $env
+      }')"
+    dispatch_codex_post_hook "WrapperEnd" "$wrapper_end_payload"
+    end_payload="$(jq -nc \
+      --arg sid "$codex_session_id" \
+      --arg wrapper_launch_id "$bridge_id" \
+      --arg wd "$working_dir" \
+      --arg launcher "$launcher" \
+      --arg engine "codex" \
+      --arg tmux_pane "$resolved_tmux_pane" \
+      --argjson code "$exit_code" \
+      '{
+        session_id: $sid,
+        wrapper_launch_id: $wrapper_launch_id,
+        cwd: $wd,
+        launcher: $launcher,
+        engine: $engine,
+        tmux_pane: $tmux_pane,
+        exit_code: $code
+      }')"
+    dispatch_codex_post_hook "SessionEnd" "$end_payload"
+  }
+  dispatch_codex_signal_cleanup() {
+    local exit_code=$?
+    dispatch_codex_cleanup "$exit_code"
+    exit "$exit_code"
+  }
+  trap dispatch_codex_signal_cleanup INT TERM HUP
+
+  local bypass_flag=""
+  if [[ "${CODEX_DANGEROUS_BYPASS:-1}" == "1" ]]; then
+    bypass_flag="--dangerously-bypass-approvals-and-sandbox"
+  else
+    bypass_flag="--full-auto"
+  fi
+
+  local -a codex_env codex_profile_args
+  codex_env=(
+    "TOKEN_API_SESSION_ID=${session_id}"
+    "TOKEN_API_CODEX_BRIDGE_ID=${bridge_id}"
+    "TOKEN_API_WRAPPER_LAUNCH_ID=${bridge_id}"
+    "TOKEN_API_LAUNCHER=${launcher}"
+    "TOKEN_API_ENGINE=codex"
+    "TOKEN_API_DISPATCH_TARGET=${dispatch_target}"
+    "TOKEN_API_DISPATCH_WINDOW=${dispatch_window}"
+    "TOKEN_API_DISPATCH_MODE=${dispatch_mode}"
+    "TOKEN_API_DISPATCH_SLOT=${dispatch_slot}"
+    "TOKEN_API_PARENT_INSTANCE_ID=${parent_instance_id}"
+    "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${session_doc}"
+    "TOKEN_API_TARGET_WORKING_DIR=${working_dir}"
+    "TOKEN_API_LAUNCH_MODE=${launch_mode}"
+    "TOKEN_API_TRANSPLANT_EXPECTED=${TOKEN_API_TRANSPLANT_EXPECTED:-false}"
+    "TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_tmux_pane}"
+    "TMUX_PANE=${resolved_tmux_pane}"
+    "TOKEN_API_CODEX_PROFILE=${codex_profile}"
+    "TOKEN_API_INSTANCE_TYPE=${instance_type}"
+    "TOKEN_API_ZEALOTRY=${zealotry}"
+    "TOKEN_API_DISPATCH_MCP=${TOKEN_API_DISPATCH_MCP:-}"
+    "TOKEN_API_DISPATCH_WITH_BROWSER=${TOKEN_API_DISPATCH_WITH_BROWSER:-}"
+    "TOKEN_API_DISPATCH_WITH_DESKTOP=${TOKEN_API_DISPATCH_WITH_DESKTOP:-}"
+    "TOKEN_API_DISPATCH_MCP_LIST=${TOKEN_API_DISPATCH_MCP_LIST:-}"
+    "TOKEN_API_DISCORD_HOSTED=${TOKEN_API_DISCORD_HOSTED:-}"
+    "TOKEN_API_DISCORD_CHANNEL=${TOKEN_API_DISCORD_CHANNEL:-}"
+    "TOKEN_API_DISCORD_BOT=${TOKEN_API_DISCORD_BOT:-}"
+  )
+  codex_profile_args=()
+  [[ -n "$codex_profile" ]] && codex_profile_args=(--profile "$codex_profile")
+
+  local codex_exit_code=0
+  if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
+    local output_file="/tmp/codex-${session_id}.md"
+    env "${codex_env[@]}" "$codex_bin" exec ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file" || codex_exit_code=$?
+  elif [[ -n "$resume_session_id" ]]; then
+    env "${codex_env[@]}" "$codex_bin" resume -C "$working_dir" "$bypass_flag" ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$resume_session_id" "$prompt" || codex_exit_code=$?
+  else
+    env "${codex_env[@]}" "$codex_bin" ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$prompt" -C "$working_dir" "$bypass_flag" || codex_exit_code=$?
+  fi
+  dispatch_codex_cleanup "$codex_exit_code"
+  trap - INT TERM HUP
+  return "$codex_exit_code"
+}
+
 build_agent_command() {
   local -a cmd envs
   envs=("${COMMON_ENV[@]}")
@@ -962,9 +1153,7 @@ build_agent_command() {
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
-      cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY" --resume-session "$RESUME_ID")
-      $GT_MODE || cmd+=(--no-gt)
-      cmd+=(-- "$WORK_DIR" "${PROMPT:-}")
+      cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "$RESUME_ID" "${PROMPT:-}")
     else
       cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions --resume "$RESUME_ID")
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
@@ -974,9 +1163,7 @@ build_agent_command() {
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
-    cmd=("${SCRIPT_DIR}/codex-dispatch" --launcher dispatch --session-doc "$SESSION_DOC" --dispatch-target "$TARGET" --dispatch-window "$DISPATCH_WINDOW" --dispatch-mode "$DISPATCH_MODE" --dispatch-slot "$DISPATCH_SLOT" --launch-mode "$LAUNCH_MODE" --zealotry "$ZEALOTRY")
-    $GT_MODE || cmd+=(--no-gt)
-    cmd+=(-- "$WORK_DIR" "${PROMPT:-}")
+    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "" "${PROMPT:-}")
   elif [[ -n "$PERSONA" ]]; then
     cmd=("${SCRIPT_DIR}/primarch" "$PERSONA")
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
