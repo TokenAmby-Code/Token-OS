@@ -32,7 +32,7 @@ from .tmux_adapter import TmuxAdapter, TmuxError
 # Instance statuses that denote a live, drive-able runtime worth rebinding.
 _LIVE_STATUSES = frozenset({"processing", "idle"})
 
-STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig")
+STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig", "reservists")
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 
 

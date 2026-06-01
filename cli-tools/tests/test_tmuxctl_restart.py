@@ -408,7 +408,13 @@ def test_builder_creates_canonical_workspace_roles():
 
     build_workspace(adapter, "main")  # type: ignore[arg-type]
 
-    assert adapter.windows["main"] == ["palace", "somnium", "legion", "mechanicus"]
+    assert adapter.windows["main"] == [
+        "palace",
+        "somnium",
+        "legion",
+        "mechanicus",
+        "reservists",
+    ]
     roles = {
         target: options.get("@PANE_ID")
         for target, options in adapter.pane_options.items()
@@ -429,7 +435,11 @@ def test_builder_creates_canonical_workspace_roles():
     } <= set(roles.values())
     assert roles["main:legion.1"] == "legion:custodes"
     assert roles["main:mechanicus.1"] == "mechanicus:fabricator-general"
+    assert roles["main:reservists.1"] == "reservists:civic"
     assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
     assert adapter.pane_options["main:mechanicus.1"]["@PANE_TYPE"] == "mechanicus"
+    assert adapter.pane_options["main:reservists.1"]["@PANE_TYPE"] == "reservists"
+    # The civic reservist pane carries the hook the civic-thread fallthrough resolves.
+    assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
     pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
     assert "tui" not in pane_types
