@@ -51,6 +51,17 @@ YouTube uses multiple macros because background playback/PiP must be distinguish
 - `YT_BG` — music-playing state changes while YouTube is in background mode
 - `YT_BTN` — manual/floating-button closure path
 
+Preferred Token-API event shape for granular YouTube playback edges:
+
+```json
+{"app":"Youtube","play":"true"}
+{"app":"Youtube","play":"false"}
+```
+
+`play=true` is treated as a YouTube open/active edge; `play=false` is treated
+as a close/inactive edge. The server also accepts JSON booleans (`true`/`false`)
+and keeps legacy `Application Launched/Closed (Youtube)` telemetry compatible.
+
 ### Spotify
 
 Spotify clears YouTube background state when Spotify playback starts and reports Spotify events.
