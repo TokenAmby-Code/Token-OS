@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import signal
 import socket
 import time
@@ -9201,6 +9202,130 @@ async def orchestrator_pane_truth():
         )
 
     return out
+
+
+# --- Pane stdout tap (T3 fleet mirror) --------------------------------------
+#
+# A non-destructive mirror of an agent pane's stdout for the T3 Code fleet
+# surface. ``tmux pipe-pane -o`` adds an additive byte tap that leaves the
+# interactive TUI untouched. Raw ``%N`` pane ids are resolved internally from
+# the durable ``instance_id`` and never surfaced — the log file is named by
+# ``instance_id`` (a UUID) because tmux recycles ``%N``.
+
+PANE_TAP_DIR = Path.home() / ".claude" / "tmp" / "panes"
+
+
+async def _resolve_instance_pane(instance_id: str) -> str | None:
+    """Resolve a durable ``instance_id`` to its tmux pane (``%N``), or None.
+
+    Same source of truth ``pane_truth`` joins against — ``claude_instances``.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    pane = (row["tmux_pane"] or "").strip()
+    return pane or None
+
+
+async def _tmux_pane_pipe_active(tmux_pane: str) -> bool:
+    """Return True when the pane currently has an open ``pipe-pane`` sink."""
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_pipe}"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return False
+        return proc.stdout.decode(errors="replace").strip() == "1"
+    except Exception:
+        return False
+
+
+@app.post("/api/panes/{instance_id}/tap")
+async def arm_pane_tap(instance_id: str):
+    """Arm a non-destructive stdout mirror for an agent pane.
+
+    Resolves ``instance_id`` → live tmux pane, then runs
+    ``tmux pipe-pane -o 'cat >> <log>'``. The ``-o`` flag only opens a new
+    pipe when none exists, so repeated calls are idempotent additive no-ops;
+    the interactive TUI is unaffected (``pane_current_command`` unchanged).
+
+    Returns the log path and arm state. Never surfaces the raw ``%N``.
+    """
+    tmux_pane = await _resolve_instance_pane(instance_id)
+    if not tmux_pane:
+        raise HTTPException(status_code=404, detail="instance has no live pane")
+    panes = await _read_tmux_panes()
+    if panes is None or tmux_pane not in panes:
+        raise HTTPException(status_code=404, detail="pane is not live in tmux")
+
+    PANE_TAP_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = PANE_TAP_DIR / f"{instance_id}.log"
+
+    already_armed = await _tmux_pane_pipe_active(tmux_pane)
+    if not already_armed:
+        command = f"cat >> {shlex.quote(str(log_path))}"
+        proc = await _run_subprocess_offloop(
+            ("tmux", "pipe-pane", "-o", "-t", tmux_pane, command),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip() or "pipe-pane failed"
+            raise HTTPException(status_code=500, detail=f"failed to arm tap: {detail}")
+
+    armed = await _tmux_pane_pipe_active(tmux_pane)
+    return {
+        "instance_id": instance_id,
+        "log_path": str(log_path),
+        "armed": armed,
+        "already_armed": already_armed,
+    }
+
+
+@app.delete("/api/panes/{instance_id}/tap")
+async def disarm_pane_tap(instance_id: str):
+    """Disarm the stdout mirror and delete its log file.
+
+    Closes the ``pipe-pane`` sink (a bare ``pipe-pane`` toggles the current
+    pipe closed) and removes ``<instance_id>.log``. Idempotent: missing pane
+    or missing log are not errors. Called from the stop-hook / orphan sweep.
+    """
+    tmux_pane = await _resolve_instance_pane(instance_id)
+    disarmed = False
+    if tmux_pane:
+        panes = await _read_tmux_panes()
+        if panes and tmux_pane in panes and await _tmux_pane_pipe_active(tmux_pane):
+            proc = await _run_subprocess_offloop(
+                ("tmux", "pipe-pane", "-t", tmux_pane),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                timeout=5,
+            )
+            disarmed = proc.returncode == 0
+
+    log_path = PANE_TAP_DIR / f"{instance_id}.log"
+    log_deleted = log_path.exists()
+    try:
+        log_path.unlink(missing_ok=True)
+    except OSError:
+        log_deleted = False
+
+    return {
+        "instance_id": instance_id,
+        "log_path": str(log_path),
+        "disarmed": disarmed,
+        "log_deleted": log_deleted,
+    }
 
 
 # --- Trinity Chunk 1: talk / brief inter-persona comm primitives ------------
