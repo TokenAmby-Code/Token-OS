@@ -168,12 +168,15 @@ def test_mechanicus_worker_session_start_auto_subscribes_to_live_fg(app_env):
                 "env": {
                     "TMUX_PANE": "%41",
                     "TOKEN_API_PANE_LABEL": "mechanicus:1",
+                    "TOKEN_API_PARENT_INSTANCE_ID": "fg-1",
                     "TOKEN_API_ENGINE": "claude",
                 },
             }
         )
         mech = result["mechanicus_stop_subscription"]
-        assert mech["created"] == 1
+        # A verified FG child subscribes to FG. The parent→child auto-subscribe
+        # may create the row first, so accept created OR existing.
+        assert mech["created"] + mech["existing"] == 1
         assert mech["subscriptions"][0]["subscriber_pane"] == "%40"
 
     asyncio.run(run())
@@ -189,8 +192,16 @@ def test_mechanicus_worker_session_start_auto_subscribes_to_live_fg(app_env):
 
 def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "worker-2", pane="%42", pane_label="mechanicus:2")
-    _insert_instance(app_env.db_path, "worker-3", pane="%43", pane_label="mechanicus:worker-7")
+    _insert_instance(
+        app_env.db_path, "worker-2", pane="%42", pane_label="mechanicus:2", parent="fg-2"
+    )
+    _insert_instance(
+        app_env.db_path,
+        "worker-3",
+        pane="%43",
+        pane_label="mechanicus:worker-7",
+        parent="fg-2",
+    )
 
     async def run():
         result = await hooks.handle_session_start(
@@ -233,6 +244,7 @@ def test_mechanicus_spillover_worker_reconciles_without_numeric_label(app_env, m
         app_env.db_path,
         "worker-spill",
         pane="%46",
+        parent="fg-spill",
         dispatch_target="mechanicus:new",
         dispatch_window="mechanicus-2",
     )
@@ -284,7 +296,9 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
         pane="%60",
         pane_label="mechanicus:fabricator-general",
     )
-    _insert_instance(app_env.db_path, "worker-4", pane="%61", pane_label="mechanicus:1")
+    _insert_instance(
+        app_env.db_path, "worker-4", pane="%61", pane_label="mechanicus:1", parent="fg-4"
+    )
 
     async def run():
         first = await hooks.reconcile_hook_subscriptions(
@@ -338,7 +352,9 @@ def test_hook_reconcile_api_reports_counts(app_env):
         pane="%80",
         pane_label="mechanicus:fabricator-general",
     )
-    _insert_instance(app_env.db_path, "worker-5", pane="%81", pane_label="mechanicus:5")
+    _insert_instance(
+        app_env.db_path, "worker-5", pane="%81", pane_label="mechanicus:5", parent="fg-5"
+    )
     client = TestClient(app_env.main.app)
 
     resp = client.post("/api/hooks/reconcile", json={"page": "mechanicus"})
@@ -377,6 +393,34 @@ def test_hook_reconcile_cli_calls_api(monkeypatch, capsys):
     assert "created=1 existing=2 skipped=3" in out
 
 
+def test_hook_gc_cli_calls_prune_api(monkeypatch, capsys):
+    path = Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "hook"
+    loader = importlib.machinery.SourceFileLoader("hook_cli", str(path))
+    spec = importlib.util.spec_from_loader("hook_cli", loader)
+    hook_cli = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(hook_cli)
+    calls = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        return {
+            "success": True,
+            "action": "prune_preview",
+            "confirmed": False,
+            "count": 2,
+            "active_remaining": 5,
+            "removed": [],
+        }
+
+    monkeypatch.setattr(hook_cli, "_request", fake_request)
+    rc = hook_cli.main(["gc"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == [("POST", "/api/hooks/prune", {"confirm": False, "event": "stop"})]
+    assert "would remove=2" in out
+
+
 def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "self-plan", pane="%90")
@@ -411,6 +455,244 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     ).fetchone()
     conn.close()
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
+
+
+def _insert_subscription(
+    db_path,
+    *,
+    target_instance_id,
+    target_pane,
+    subscriber_instance_id,
+    subscriber_pane,
+    status="active",
+    purpose="generic",
+):
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+            event, delivery, status, purpose)
+           VALUES (?, ?, ?, ?, 'stop', 'prompt', ?, ?)""",
+        (
+            target_instance_id,
+            target_pane,
+            subscriber_instance_id,
+            subscriber_pane,
+            status,
+            purpose,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _active_subscription_ids(db_path):
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT id FROM stop_hook_subscriptions WHERE status='active' ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+# ---- Bug B: reconcile subscribes ONLY verified live FG children -------------
+
+
+def test_reconcile_skips_worker_with_dead_parent(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path, "fg-dead", pane="%70", pane_label="mechanicus:fabricator-general"
+    )
+    # parent FK points at a phantom uuid with no instance row.
+    _insert_instance(
+        app_env.db_path,
+        "worker-orphan",
+        pane="%71",
+        pane_label="mechanicus:3",
+        parent="ghost-uuid",
+    )
+
+    async def run():
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
+        assert result["created"] == 0
+        reasons = {s["reason"] for s in result["skipped_targets"]}
+        assert "parent_not_live" in reasons
+
+    asyncio.run(run())
+    assert _active_subscription_ids(app_env.db_path) == []
+
+
+def test_reconcile_skips_worker_parented_to_other_live_instance(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path, "fg-other", pane="%72", pane_label="mechanicus:fabricator-general"
+    )
+    # A different LIVE commander owns this worker — it is NOT an FG child.
+    _insert_instance(app_env.db_path, "custodes-live", pane="%73", pane_label="legion:custodes")
+    _insert_instance(
+        app_env.db_path,
+        "worker-elsewhere",
+        pane="%74",
+        pane_label="mechanicus:6",
+        parent="custodes-live",
+    )
+
+    async def run():
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
+        assert result["created"] == 0
+        reasons = {s["reason"] for s in result["skipped_targets"]}
+        assert "parent_not_fg" in reasons
+
+    asyncio.run(run())
+    assert _active_subscription_ids(app_env.db_path) == []
+
+
+def test_reconcile_skips_parentless_worker(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path, "fg-lonely", pane="%75", pane_label="mechanicus:fabricator-general"
+    )
+    _insert_instance(app_env.db_path, "worker-parentless", pane="%76", pane_label="mechanicus:7")
+
+    async def run():
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
+        assert result["created"] == 0
+        reasons = {s["reason"] for s in result["skipped_targets"]}
+        assert "parent_not_live" in reasons
+
+    asyncio.run(run())
+    assert _active_subscription_ids(app_env.db_path) == []
+
+
+# ---- Bug A: unsubscribe matches by instance-id OR pane ----------------------
+
+
+def test_unsubscribe_matches_by_instance_uuid_in_pane_slot(app_env):
+    """`unsubscribe --pane <uuid> --notify <uuid>` must match+delete.
+
+    The CLI feeds UUIDs into the pane slots; the watched pane is live and the
+    notify UUID is exact. The old clause only matched the *_pane columns (which
+    hold %NN), so it removed nothing.
+    """
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "watched-live", pane="%30")
+    _insert_instance(app_env.db_path, "notify-live", pane="%31")
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="watched-live",
+        target_pane="%30",
+        subscriber_instance_id="notify-live",
+        subscriber_pane="%31",
+    )
+
+    async def run():
+        unsub = await hooks.unsubscribe_hook(
+            hooks.HookUnsubscribeRequest(target_pane="watched-live", subscriber_pane="notify-live")
+        )
+        assert unsub["count"] == 1
+
+    asyncio.run(run())
+    assert _active_subscription_ids(app_env.db_path) == []
+
+
+def test_unsubscribe_matches_phantom_notify_uuid(app_env):
+    """Notify target is a phantom UUID with no instance row — still unsubscribable."""
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "watched-2", pane="%36")
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="watched-2",
+        target_pane="%36",
+        subscriber_instance_id="phantom-uuid",
+        subscriber_pane="%32",
+    )
+
+    async def run():
+        unsub = await hooks.unsubscribe_hook(
+            hooks.HookUnsubscribeRequest(target_pane="watched-2", subscriber_pane="phantom-uuid")
+        )
+        assert unsub["count"] == 1
+
+    asyncio.run(run())
+    assert _active_subscription_ids(app_env.db_path) == []
+
+
+# ---- Prune: GC dangling watched/notify references ---------------------------
+
+
+def test_prune_removes_dangling_keeps_live(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "live-a", pane="%14")
+    _insert_instance(app_env.db_path, "live-b", pane="%10")
+    # keep: both endpoints live
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="live-a",
+        target_pane="%14",
+        subscriber_instance_id="live-b",
+        subscriber_pane="%10",
+    )
+    # remove: watched instance is dead/stopped
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="dead-watched",
+        target_pane="%99",
+        subscriber_instance_id="live-b",
+        subscriber_pane="%10",
+    )
+    # remove: notify instance is a phantom uuid
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="live-a",
+        target_pane="%14",
+        subscriber_instance_id="phantom",
+        subscriber_pane="%32",
+    )
+
+    async def run():
+        import aiosqlite
+
+        async with aiosqlite.connect(app_env.db_path) as db:
+            preview = await hooks._prune_dangling_stop_subscriptions(db, confirm=False)
+            assert preview["action"] == "prune_preview"
+            assert preview["count"] == 2
+            applied = await hooks._prune_dangling_stop_subscriptions(db, confirm=True)
+            assert applied["action"] == "pruned"
+            assert applied["count"] == 2
+            assert applied["active_remaining"] == 1
+
+    # dry-run leaves all 3 active; confirm leaves only the live one
+    asyncio.run(run())
+    assert len(_active_subscription_ids(app_env.db_path)) == 1
+
+
+def test_prune_endpoint_dry_run_default(app_env):
+    from fastapi.testclient import TestClient
+
+    _insert_instance(app_env.db_path, "live-c", pane="%10")
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="dead-x",
+        target_pane="%99",
+        subscriber_instance_id="live-c",
+        subscriber_pane="%10",
+    )
+    client = TestClient(app_env.main.app)
+
+    resp = client.post("/api/hooks/prune", json={})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["action"] == "prune_preview"
+    assert data["confirmed"] is False
+    assert data["count"] == 1
+    # nothing removed on dry-run
+    assert len(_active_subscription_ids(app_env.db_path)) == 1
 
 
 def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env):

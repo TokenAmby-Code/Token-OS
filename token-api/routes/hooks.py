@@ -260,6 +260,11 @@ class HookReconcileRequest(BaseModel):
     page: str = "mechanicus"
 
 
+class HookPruneRequest(BaseModel):
+    confirm: bool = False
+    event: str = "stop"
+
+
 # ============ Hook Handler State ============
 # Debouncing for PostToolUse to avoid excessive API calls
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
@@ -689,6 +694,32 @@ async def _resolve_instance_by_id(db, instance_id: str | None) -> dict | None:
     return dict(row) if row else {"id": raw}
 
 
+async def _resolve_live_instance(db, instance_id: str | None) -> dict | None:
+    """Return the instance row for ``instance_id`` ONLY if it is a live row.
+
+    Live = present in claude_instances with an active runtime status and a
+    bound pane. Unlike ``_resolve_instance_by_id`` this never fabricates a
+    ``{"id": raw}`` placeholder — a missing/dead/phantom id returns None, which
+    is exactly what reconcile and prune need to verify true parentage and to
+    detect dangling references.
+    """
+    raw = _normalize_text(instance_id)
+    if not raw:
+        return None
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT id, tmux_pane, pane_label, status
+           FROM claude_instances
+           WHERE id = ?
+             AND status IN ('idle', 'processing')
+             AND tmux_pane IS NOT NULL
+           LIMIT 1""",
+        (raw,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
 async def _upsert_stop_subscription(
     db,
     *,
@@ -836,7 +867,7 @@ async def _active_hook_instances(db) -> list[dict]:
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(
         """SELECT id, tmux_pane, pane_label, tab_name, status, last_activity,
-                  dispatch_target, dispatch_window
+                  dispatch_target, dispatch_window, parent_instance_id
            FROM claude_instances
            WHERE status IN ('idle', 'processing')
              AND tmux_pane IS NOT NULL
@@ -908,6 +939,36 @@ async def _reconcile_mechanicus_stop_subscriptions(
             )
             continue
 
+        # Only subscribe VERIFIED true children of FG. A mechanicus-labelled pane
+        # is NOT proof of parentage: the additive reconcile used to wire every
+        # worker to FG, mis-attributing orphans (parent FK = dead/phantom uuid)
+        # and workers owned by a different live commander. Require the worker's
+        # parent FK to resolve to a LIVE row that IS this FG before subscribing.
+        parent_id = _normalize_text(row.get("parent_instance_id"))
+        parent = await _resolve_live_instance(db, parent_id)
+        if not parent:
+            counts["skipped"] += 1
+            skipped.append(
+                {
+                    "instance_id": target_id,
+                    "pane_label": label,
+                    "reason": "parent_not_live",
+                    "parent_instance_id": parent_id,
+                }
+            )
+            continue
+        if parent.get("id") != fg.get("id"):
+            counts["skipped"] += 1
+            skipped.append(
+                {
+                    "instance_id": target_id,
+                    "pane_label": label,
+                    "reason": "parent_not_fg",
+                    "parent_instance_id": parent_id,
+                }
+            )
+            continue
+
         existing_id = await _active_stop_subscription_id(
             db,
             target_instance_id=target_id,
@@ -950,6 +1011,73 @@ async def _reconcile_mechanicus_stop_subscriptions(
         },
         "subscriptions": subscriptions,
         "skipped_targets": skipped,
+    }
+
+
+async def _prune_dangling_stop_subscriptions(
+    db,
+    *,
+    confirm: bool,
+    event: str = "stop",
+) -> dict:
+    """Remove active subscriptions that reference a non-live instance.
+
+    A subscription is dangling when its WATCHED (target) or NOTIFY (subscriber)
+    instance_id has no live instance row — the watched pane was stopped, or the
+    notify target is a phantom UUID with no instance row. `hook reconcile` is
+    additive and never removes these, so they accumulate forever, inflate
+    `hook list`, and resolve to nothing (false "passive/dead" reads). Dry-run by
+    default: nothing is removed unless ``confirm`` is set.
+    """
+    db.row_factory = aiosqlite.Row
+    live_cursor = await db.execute(
+        """SELECT id FROM claude_instances
+           WHERE status IN ('idle', 'processing') AND tmux_pane IS NOT NULL"""
+    )
+    live_ids = {row["id"] for row in await live_cursor.fetchall()}
+
+    cursor = await db.execute(
+        """SELECT id, target_instance_id, target_pane, subscriber_instance_id,
+                  subscriber_pane, purpose
+           FROM stop_hook_subscriptions
+           WHERE status = 'active' AND event = ?
+           ORDER BY id""",
+        (event,),
+    )
+    rows = [dict(row) for row in await cursor.fetchall()]
+
+    removable: list[dict] = []
+    for row in rows:
+        target_id = _normalize_text(row.get("target_instance_id"))
+        sub_id = _normalize_text(row.get("subscriber_instance_id"))
+        reasons: list[str] = []
+        if not target_id or target_id not in live_ids:
+            reasons.append("watched_not_live")
+        # subscriber_instance_id may legitimately be NULL (pane-only notify);
+        # only a NON-null id that resolves to no live row is a dangling ref.
+        if sub_id and sub_id not in live_ids:
+            reasons.append("notify_not_live")
+        if reasons:
+            removable.append({**row, "reasons": reasons})
+
+    if confirm and removable:
+        now = datetime.now().isoformat()
+        await db.executemany(
+            """UPDATE stop_hook_subscriptions
+               SET status = 'unsubscribed', unsubscribed_at = ?, updated_at = ?
+               WHERE id = ?""",
+            [(now, now, row["id"]) for row in removable],
+        )
+        await db.commit()
+
+    return {
+        "success": True,
+        "action": "pruned" if confirm else "prune_preview",
+        "confirmed": confirm,
+        "event": event,
+        "count": len(removable),
+        "active_remaining": len(rows) - (len(removable) if confirm else 0),
+        "removed": removable,
     }
 
 
@@ -3953,30 +4081,38 @@ async def unsubscribe_hook(request: HookUnsubscribeRequest) -> dict:
         if not subscriber or not subscriber.get("tmux_pane"):
             subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
         target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
+        target_pane = (target or {}).get("tmux_pane") or _normalize_text(request.target_pane)
         subscriber_id = (subscriber or {}).get("id") or _normalize_text(
             request.subscriber_instance_id
         )
         subscriber_pane = (subscriber or {}).get("tmux_pane") or _normalize_text(
             request.subscriber_pane
         )
+        # A selector value (--pane / --notify) is ambiguous: it can be a tmux
+        # pane id OR an instance UUID. The old code only ever built a *_pane
+        # clause, so `unsubscribe --pane <uuid> --notify <uuid>` matched nothing
+        # (stored panes are %NN, never UUIDs) and silently removed zero rows even
+        # when the watched pane was live and the notify UUID was exact. Match each
+        # side on instance_id OR pane, and surface a bare UUID passed in the pane
+        # slot as an id candidate so it matches the instance_id column (covers
+        # live-watched + exact-notify UUIDs and dead/phantom stored ids).
+        target_id_match = target_id or _normalize_text(request.target_pane)
+        subscriber_id_match = subscriber_id or _normalize_text(request.subscriber_pane)
         clauses = ["event = ?", "status = 'active'"]
-        params: list[str] = [request.event]
-        if target_id:
-            clauses.append("target_instance_id = ?")
-            params.append(target_id)
-        if _normalize_text(request.target_pane):
-            clauses.append("target_pane = ?")
-            params.append(_normalize_text(request.target_pane))
-        if subscriber_id:
-            clauses.append("subscriber_instance_id = ?")
-            params.append(subscriber_id)
-        if subscriber_pane:
-            clauses.append("subscriber_pane = ?")
-            params.append(subscriber_pane)
+        params: list[str | None] = [request.event]
+        have_selector = False
+        if target_id_match or target_pane:
+            have_selector = True
+            clauses.append("(target_instance_id = ? OR target_pane = ?)")
+            params.extend([target_id_match, target_pane])
+        if subscriber_id_match or subscriber_pane:
+            have_selector = True
+            clauses.append("(subscriber_instance_id = ? OR subscriber_pane = ?)")
+            params.extend([subscriber_id_match, subscriber_pane])
         if request.purpose:
             clauses.append("purpose = ?")
             params.append(request.purpose)
-        if len(clauses) == 2:
+        if not have_selector:
             return {"success": False, "action": "no_selector"}
         now = datetime.now().isoformat()
         cursor = await db.execute(
@@ -4041,6 +4177,15 @@ async def reconcile_hook_subscriptions(request: HookReconcileRequest) -> dict:
         if result.get("created") or result.get("existing"):
             await db.commit()
     return result
+
+
+@router.post("/api/hooks/prune")
+async def prune_hook_subscriptions(request: HookPruneRequest) -> dict:
+    """Garbage-collect active subscriptions with dead watched/notify instances."""
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        return await _prune_dangling_stop_subscriptions(
+            db, confirm=request.confirm, event=request.event
+        )
 
 
 # Hook dispatcher endpoint

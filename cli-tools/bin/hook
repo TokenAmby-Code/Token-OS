@@ -58,6 +58,21 @@ def _print_result(result: dict, json_out: bool) -> int:
                 f"created={result.get('created', 0)} existing={result.get('existing', 0)} "
                 f"skipped={result.get('skipped', 0)}"
             )
+        elif result.get("action") in {"pruned", "prune_preview"}:
+            verb = "removed" if result.get("confirmed") else "would remove"
+            print(
+                f"[hook:{result.get('action')}] {verb}={result.get('count', 0)} "
+                f"active_remaining={result.get('active_remaining', 0)}"
+            )
+            for row in result.get("removed") or []:
+                print(
+                    f"  #{row.get('id')} {row.get('target_instance_id')} "
+                    f"({row.get('target_pane') or '-'}) -> "
+                    f"{row.get('subscriber_instance_id') or '-'} "
+                    f"({row.get('subscriber_pane')}) [{','.join(row.get('reasons') or [])}]"
+                )
+            if not result.get("confirmed") and result.get("count"):
+                print("  (dry-run — re-run with --confirm to apply)")
         else:
             print(json.dumps(result, sort_keys=True))
     return 0 if result.get("success", True) else 1
@@ -92,6 +107,16 @@ def main(argv: list[str]) -> int:
 
     p_rec = sub.add_parser("reconcile", help="Repair hook subscriptions for a page")
     p_rec.add_argument("--page", default="mechanicus", choices=["mechanicus"])
+
+    p_gc = sub.add_parser(
+        "gc", help="Prune dangling subscriptions (dead watched/notify instance)"
+    )
+    p_gc.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Apply the prune (default: dry-run preview only)",
+    )
+    p_gc.add_argument("--on", default="stop", choices=["stop"])
 
     args = parser.parse_args(argv)
     try:
@@ -131,6 +156,10 @@ def main(argv: list[str]) -> int:
             result = _request("GET", f"/api/hooks/subscriptions?{urllib.parse.urlencode(q)}")
         elif args.cmd == "reconcile":
             result = _request("POST", "/api/hooks/reconcile", {"page": args.page})
+        elif args.cmd == "gc":
+            result = _request(
+                "POST", "/api/hooks/prune", {"confirm": args.confirm, "event": args.on}
+            )
         else:
             _err(f"unknown command: {args.cmd}")
             return 1
