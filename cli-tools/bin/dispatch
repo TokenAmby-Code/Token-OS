@@ -141,7 +141,11 @@ while [[ $# -gt 0 ]]; do
     --with-mcp) WITH_MCP="${2:-}"; shift 2 ;;
     --discord) DISCORD_CHANNEL="${2:-}"; shift 2 ;;
     --no-worktree) NO_WORKTREE=true; shift ;;
-    --worktree) WORKTREE_BRANCH="${2:-}"; shift 2 ;;
+    --worktree)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        err "--worktree requires a branch name"; exit 64
+      fi
+      WORKTREE_BRANCH="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --interactive) INTERACTIVE=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -826,25 +830,35 @@ slugify_branch() {
 }
 
 enter_worktree_for_project() {
-  local proj="$1" parent="$2" branch=""
+  local proj="$1" parent="$2" secrets="$3" branch=""
   branch="$WORKTREE_BRANCH"
   [[ -z "$branch" && -n "$SESSION_DOC" ]] && branch="$(slugify_branch "$(basename "${SESSION_DOC%.*}")")"
   [[ -z "$branch" && -n "$TITLE" && "$TITLE" != "Dispatch aspirant" ]] && branch="$(slugify_branch "$TITLE")"
   [[ -z "$branch" && -n "$OBJECTIVE" ]] && branch="$(slugify_branch "$OBJECTIVE")"
   [[ -z "$branch" && -n "$PROMPT" ]] && branch="$(slugify_branch "$PROMPT")"
   if [[ -z "$branch" ]]; then
-    err "worktree isolation wanted for shared checkout but no branch name derivable; pass --worktree <branch> or --no-worktree"
+    # No name to isolate under. NEVER fall through to the shared checkout — that
+    # is exactly the clobber we are preventing. Report in dry-run, else refuse.
     WORKTREE_DECISION="SKIPPED (no derivable branch — pass --worktree or --no-worktree)"
-    return 0
+    $DRY_RUN && return 0
+    err "worktree isolation wanted for shared checkout but no branch name derivable; pass --worktree <branch> or --no-worktree"
+    exit 64
   fi
+  # Preserve any nested cwd under the shared checkout (repo/subdir → wt/subdir).
+  local rel="${WORK_DIR#"$secrets"}"; rel="${rel#/}"
   local wt_path="$parent/wt-$branch"
+  local dest="$wt_path"; [[ -n "$rel" ]] && dest="$wt_path/$rel"
   if $DRY_RUN; then
-    WORKTREE_DECISION="would create+enter $wt_path (branch $branch)"
+    WORKTREE_DECISION="would create+enter $dest (branch $branch)"
     return 0
   fi
   if worktree-setup "$branch" --project "$proj" --no-transplant --require-free --skip-sync >&2; then
-    WORK_DIR="$(cd "$wt_path" && pwd)"
-    WORKTREE_DECISION="created+entered $wt_path (branch $branch)"
+    if [[ -n "$rel" && -d "$wt_path/$rel" ]]; then
+      WORK_DIR="$(cd "$wt_path/$rel" && pwd)"
+    else
+      WORK_DIR="$(cd "$wt_path" && pwd)"
+    fi
+    WORKTREE_DECISION="created+entered $WORK_DIR (branch $branch)"
   else
     err "worktree-setup refused/failed for branch '$branch' (already claimed?); refusing to dispatch into shared checkout $WORK_DIR"
     err "pass --worktree <new-branch> or --no-worktree"
@@ -868,7 +882,7 @@ maybe_enter_worktree() {
       return 0
     fi
     if [[ -n "$secrets" && ( "$WORK_DIR" == "$secrets" || "$WORK_DIR" == "$secrets"/* ) ]]; then
-      enter_worktree_for_project "$proj" "$parent"
+      enter_worktree_for_project "$proj" "$parent" "$secrets"
       return 0
     fi
   done

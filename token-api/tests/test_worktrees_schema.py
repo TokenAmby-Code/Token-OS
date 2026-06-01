@@ -17,7 +17,7 @@ def _init(tmp_path: Path) -> Path:
     return db_path
 
 
-def test_worktrees_table_created(tmp_path):
+def test_worktrees_table_created(tmp_path: Path) -> None:
     db_path = _init(tmp_path)
     conn = sqlite3.connect(db_path)
     try:
@@ -29,7 +29,7 @@ def test_worktrees_table_created(tmp_path):
         conn.close()
 
 
-def test_active_unique_index_created(tmp_path):
+def test_active_unique_index_created(tmp_path: Path) -> None:
     db_path = _init(tmp_path)
     conn = sqlite3.connect(db_path)
     try:
@@ -42,7 +42,7 @@ def test_active_unique_index_created(tmp_path):
         conn.close()
 
 
-def test_partial_unique_blocks_two_active_same_branch(tmp_path):
+def test_partial_unique_blocks_two_active_same_branch(tmp_path: Path) -> None:
     db_path = _init(tmp_path)
     conn = sqlite3.connect(db_path)
     try:
@@ -61,7 +61,7 @@ def test_partial_unique_blocks_two_active_same_branch(tmp_path):
         conn.close()
 
 
-def test_partial_unique_allows_active_plus_inactive(tmp_path):
+def test_partial_unique_allows_active_plus_inactive(tmp_path: Path) -> None:
     db_path = _init(tmp_path)
     conn = sqlite3.connect(db_path)
     try:

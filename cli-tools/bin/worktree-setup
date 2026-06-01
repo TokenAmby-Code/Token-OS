@@ -122,8 +122,14 @@ acquire_claim_lock() {
     local key="$1" timeout="${2:-10}"
     local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/imperium/worktree-claims"
     mkdir -p "$state_dir"
-    local safe_key="${key//\//-}"
-    if command -v flock &>/dev/null; then
+    # Hash the full (project, branch) key so distinct refs never share a lock
+    # file (e.g. `feature/foo` vs `feature-foo`). git hash-object is always present.
+    local safe_key
+    safe_key="$(printf '%s' "$key" | git hash-object --stdin 2>/dev/null)"
+    [[ -n "$safe_key" ]] || safe_key="${key//[^a-zA-Z0-9]/_}"
+    # WORKTREE_CLAIM_NO_FLOCK forces the portable mkdir path (used by tests to
+    # exercise the macOS fallback deterministically on a flock-equipped CI).
+    if [[ -z "${WORKTREE_CLAIM_NO_FLOCK:-}" ]] && command -v flock &>/dev/null; then
         exec 8>"$state_dir/${safe_key}.lock"
         flock -w "$timeout" 8 && return 0
         return 1
@@ -292,7 +298,8 @@ if [[ "$REQUIRE_FREE" == "true" ]]; then
         exit 75
     fi
     EXISTING_WT="$(git --git-dir="$BARE_REPO" worktree list --porcelain 2>/dev/null \
-        | awk -v b="refs/heads/$BRANCH_NAME" '/^worktree /{p=substr($0,10)} /^branch /{if (substr($0,8)==b) print p}')"
+        | awk -v b="refs/heads/$BRANCH_NAME" '/^worktree /{p=substr($0,10)} /^branch /{if (substr($0,8)==b) print p}' \
+        || true)"
     if [[ -n "$EXISTING_WT" && "$FORCE" != "true" ]]; then
         log_error "Branch '$BRANCH_NAME' is already claimed by a live worktree: $EXISTING_WT"
         log_error "1 branch = 1 worktree = 1 PR. Pass --force to override."

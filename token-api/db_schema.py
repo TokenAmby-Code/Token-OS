@@ -709,7 +709,8 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 instance_id TEXT,
                 dispatch_id TEXT,
                 owner_pane  TEXT,
-                status      TEXT DEFAULT 'active',
+                status      TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active', 'orphaned', 'quarantined', 'deleted')),
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 claimed_at  TIMESTAMP,
                 last_seen_at TIMESTAMP

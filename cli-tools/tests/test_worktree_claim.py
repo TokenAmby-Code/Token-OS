@@ -9,8 +9,11 @@ so nothing touches the real NAS, ~/.config, or live worktrees.
 """
 
 import os
+import shutil
 import subprocess
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -18,13 +21,22 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_SETUP = ROOT / "cli-tools" / "bin" / "worktree-setup"
 
+RunFn = Callable[..., subprocess.CompletedProcess[str]]
 
-def _git(*args, cwd=None, env=None):
+
+@dataclass
+class Project:
+    parent: Path
+    env: dict[str, str]
+    run: RunFn
+
+
+def _git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True)
 
 
 @pytest.fixture
-def project(tmp_path):
+def project(tmp_path: Path) -> Project:
     """A self-contained throwaway worktree project rooted at a temp HOME."""
     home = tmp_path / "home"
     home.mkdir()
@@ -60,40 +72,43 @@ def project(tmp_path):
         encoding="utf-8",
     )
 
-    def run(*args, timeout=60):
+    def run(
+        *args: str, timeout: int = 60, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(base_env)
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [str(WORKTREE_SETUP), *args, "--project", "clmtest", "--no-transplant", "--skip-sync"],
-            env=base_env,
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
 
-    return type("Project", (), {"run": staticmethod(run), "parent": parent, "env": base_env})
+    return Project(parent=parent, env=base_env, run=run)
 
 
-def test_require_free_flag_accepted(project):
+def test_require_free_flag_accepted(project: Project) -> None:
     """--require-free is a real flag and creates the first worktree cleanly."""
     res = project.run("alpha", "--require-free")
     assert res.returncode == 0, res.stderr
     assert (project.parent / "wt-alpha" / ".git").exists()
 
 
-def test_force_flag_accepted(project):
+def test_force_flag_accepted(project: Project) -> None:
     """--force is a real flag and does not break a normal create."""
     res = project.run("solo", "--require-free", "--force")
     assert res.returncode == 0, res.stderr
 
 
-def test_require_free_refuses_second_claim_without_force(project):
+def test_require_free_refuses_second_claim_without_force(project: Project) -> None:
     """A 2nd worktree on a live branch is refused without --force (D1)."""
     first = project.run("beta", "--require-free")
     assert first.returncode == 0, first.stderr
 
     # Drop the dir but leave the git worktree registration (a live claim that
     # the plain dir-existence guard would miss) to prove the claim is real.
-    import shutil
-
     shutil.rmtree(project.parent / "wt-beta")
 
     second = project.run("beta", "--require-free")
@@ -101,28 +116,21 @@ def test_require_free_refuses_second_claim_without_force(project):
     assert "claim" in second.stderr.lower() or "already" in second.stderr.lower()
 
 
-def test_force_overrides_live_claim(project):
+def test_force_overrides_live_claim(project: Project) -> None:
     """--force lets a dispatch reclaim a branch already checked out (D1)."""
     first = project.run("gamma", "--require-free")
     assert first.returncode == 0, first.stderr
-    import shutil
-
     shutil.rmtree(project.parent / "wt-gamma")
 
     forced = project.run("gamma", "--require-free", "--force")
     assert forced.returncode == 0, forced.stderr
 
 
-def test_concurrent_create_race_serializes(project):
-    """Two concurrent --require-free creates of one branch: exactly one wins.
+def _assert_race_serializes(project: Project, branch: str, extra_env: dict[str, str]) -> None:
+    results: dict[int, subprocess.CompletedProcess[str]] = {}
 
-    The (project, branch) lock serializes the race; the loser sees the claim
-    and refuses cleanly rather than corrupting git state.
-    """
-    results = {}
-
-    def worker(idx):
-        results[idx] = project.run("race", "--require-free")
+    def worker(idx: int) -> None:
+        results[idx] = project.run(branch, "--require-free", extra_env=extra_env)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
     for t in threads:
@@ -133,4 +141,21 @@ def test_concurrent_create_race_serializes(project):
     codes = sorted(r.returncode for r in results.values())
     assert codes[0] == 0, "exactly one create should succeed"
     assert codes[1] != 0, "the racing create should be refused, not also succeed"
-    assert (project.parent / "wt-race" / ".git").exists()
+    assert (project.parent / f"wt-{branch}" / ".git").exists()
+
+
+def test_concurrent_create_race_serializes(project: Project) -> None:
+    """Two concurrent --require-free creates of one branch: exactly one wins.
+
+    Exercises whichever lock primitive the runner has (flock on Linux/CI).
+    """
+    _assert_race_serializes(project, "race", {})
+
+
+def test_concurrent_create_race_serializes_mkdir_fallback(project: Project) -> None:
+    """Same guarantee via the portable mkdir lock (the only macOS path).
+
+    WORKTREE_CLAIM_NO_FLOCK forces the fallback so it is proven deterministically
+    even on a flock-equipped CI runner.
+    """
+    _assert_race_serializes(project, "race-mkdir", {"WORKTREE_CLAIM_NO_FLOCK": "1"})
