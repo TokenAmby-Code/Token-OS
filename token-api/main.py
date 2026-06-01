@@ -1910,12 +1910,20 @@ async def stop_instance(instance_id: str):
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
 
+        # Has another live instance already taken over this pane? If so, leave its
+        # tint alone — only clear when the vacated pane is genuinely unowned.
+        pane_still_owned = False
+        if stopped_tmux_pane:
+            cursor = await db.execute(
+                "SELECT 1 FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' AND id != ? LIMIT 1",
+                (stopped_tmux_pane, instance_id),
+            )
+            pane_still_owned = (await cursor.fetchone()) is not None
+
     # Event-driven tint: the persona vacated this pane — clear its legion tint
     # back to default. No queue, no poll.
-    if stopped_tmux_pane:
-        await asyncio.to_thread(
-            shared.clear_pane_tint, stopped_tmux_pane, source="stop-instance"
-        )
+    if stopped_tmux_pane and not pane_still_owned:
+        await asyncio.to_thread(shared.clear_pane_tint, stopped_tmux_pane, source="stop-instance")
 
     # Log event
     await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
@@ -10414,7 +10422,19 @@ def normalize_bool_param(value: bool | str | int | float | None) -> bool | None:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y", "on", "open", "play", "playing"}:
         return True
-    if text in {"0", "false", "no", "n", "off", "close", "closed", "pause", "paused", "stop", "stopped"}:
+    if text in {
+        "0",
+        "false",
+        "no",
+        "n",
+        "off",
+        "close",
+        "closed",
+        "pause",
+        "paused",
+        "stop",
+        "stopped",
+    }:
         return False
     return None
 

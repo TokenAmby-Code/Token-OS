@@ -1617,18 +1617,26 @@ async def handle_session_start(payload: dict) -> dict:
                     if hasattr(existing_row, "__getitem__") and existing_row["legion"]
                     else "astartes"
                 )
-                if _transplant_legion != "astartes":
-                    if old_tmux_pane and old_tmux_pane != tmux_pane:
-                        await asyncio.to_thread(
-                            shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
-                        )
-                    if tmux_pane:
-                        await asyncio.to_thread(
-                            shared.apply_pane_tint,
-                            tmux_pane,
-                            _transplant_legion,
-                            source="transplant",
-                        )
+                # Tint is cosmetic — best-effort, never fail registration on it.
+                try:
+                    if _transplant_legion != "astartes":
+                        if old_tmux_pane and old_tmux_pane != tmux_pane:
+                            await asyncio.to_thread(
+                                shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
+                            )
+                        if tmux_pane:
+                            await asyncio.to_thread(
+                                shared.apply_pane_tint,
+                                tmux_pane,
+                                _transplant_legion,
+                                source="transplant",
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "Hook: SessionStart transplant tint repaint failed for %s: %s",
+                        session_id[:12],
+                        exc,
+                    )
                 await db.commit()
 
                 # Resolve preserved profile for color
@@ -1894,18 +1902,26 @@ async def handle_session_start(payload: dict) -> dict:
                 # Event-driven tint: the persona moved panes. Clear the vacated
                 # pane and paint the new one for its legion (no recolor queue).
                 _supplant_legion = old_inst["legion"] if old_inst["legion"] else "astartes"
-                if _supplant_legion != "astartes":
-                    if old_tmux_pane and old_tmux_pane != tmux_pane:
-                        await asyncio.to_thread(
-                            shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
-                        )
-                    if tmux_pane:
-                        await asyncio.to_thread(
-                            shared.apply_pane_tint,
-                            tmux_pane,
-                            _supplant_legion,
-                            source="supplant",
-                        )
+                # Tint is cosmetic — best-effort, never fail registration on it.
+                try:
+                    if _supplant_legion != "astartes":
+                        if old_tmux_pane and old_tmux_pane != tmux_pane:
+                            await asyncio.to_thread(
+                                shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
+                            )
+                        if tmux_pane:
+                            await asyncio.to_thread(
+                                shared.apply_pane_tint,
+                                tmux_pane,
+                                _supplant_legion,
+                                source="supplant",
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "Hook: SessionStart supplant tint repaint failed for %s: %s",
+                        session_id[:12],
+                        exc,
+                    )
                 await db.commit()
 
                 # Resolve cc_color from preserved profile

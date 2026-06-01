@@ -3,6 +3,7 @@
 import sqlite3
 import sys
 import uuid
+from typing import Any
 
 import pytest
 
@@ -242,7 +243,9 @@ class TestReconciliation:
         assert latest["mutation_type"] == "instance_stopped"
         assert latest["actor"] == "stop-hook"
 
-    def test_primarch_supplant_repaints_panes_event_driven(self, client, app_env, monkeypatch):
+    def test_primarch_supplant_repaints_panes_event_driven(
+        self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Supplant paints panes via the event-driven tint path (no recolor queue):
         the new pane is painted for the preserved legion and the vacated pane cleared."""
         import shared
