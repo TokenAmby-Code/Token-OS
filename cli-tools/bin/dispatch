@@ -50,6 +50,8 @@ Options:
   --with-desktop               Request desktop MCP/profile metadata
   --with-mcp <list>            Comma-separated MCP request metadata
   --discord <id>               Discord thread/channel id hosted by this launch
+  --worktree <branch>          Isolate this dispatch into a fresh per-branch worktree
+  --no-worktree                Opt out of default worktree isolation (run in --dir as-is)
   --dry-run                    Resolve and print without mutating state
   --interactive                Minimal interactive launcher
   --help, -h                   Show this help
@@ -92,6 +94,8 @@ WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
 DISCORD_CHANNEL=""
+NO_WORKTREE=false
+WORKTREE_BRANCH=""
 DRY_RUN=false
 INTERACTIVE=false
 DISPATCH_AUTO_EXPANDED_PANE=""
@@ -136,6 +140,8 @@ while [[ $# -gt 0 ]]; do
     --with-desktop) WITH_DESKTOP=true; shift ;;
     --with-mcp) WITH_MCP="${2:-}"; shift 2 ;;
     --discord) DISCORD_CHANNEL="${2:-}"; shift 2 ;;
+    --no-worktree) NO_WORKTREE=true; shift ;;
+    --worktree) WORKTREE_BRANCH="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --interactive) INTERACTIVE=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -795,6 +801,82 @@ EOF_ASPIRANT_DRY
   exit $?
 fi
 
+# ── Default-on worktree isolation (super-workflow Gap 1, D3) ──────────────────
+# A code-touching dispatch — one whose working dir IS a configured project's
+# shared prod checkout — creates and enters a fresh per-branch worktree instead
+# of piling work onto the shared tree (yesterday's clobber). Opt out with
+# --no-worktree. Dirs already under a worktree parent (isolated), resumes,
+# aspirants, and non-project dirs are left untouched. Creation goes through
+# `worktree-setup --require-free`, so a 2nd dispatch on a live branch is refused
+# (the agent passes --worktree <new> or --no-worktree).
+WORKTREE_DECISION="n/a (not a code checkout)"
+
+dispatch_conf_var() {
+  ( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""
+    # shellcheck disable=SC1090
+    source "$1" 2>/dev/null || true
+    eval "printf '%s' \"\${$2:-}\"" )
+}
+
+slugify_branch() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's#[^a-z0-9]+#-#g; s#^-+##; s#-+$##' \
+    | cut -c1-48
+}
+
+enter_worktree_for_project() {
+  local proj="$1" parent="$2" branch=""
+  branch="$WORKTREE_BRANCH"
+  [[ -z "$branch" && -n "$SESSION_DOC" ]] && branch="$(slugify_branch "$(basename "${SESSION_DOC%.*}")")"
+  [[ -z "$branch" && -n "$TITLE" && "$TITLE" != "Dispatch aspirant" ]] && branch="$(slugify_branch "$TITLE")"
+  [[ -z "$branch" && -n "$OBJECTIVE" ]] && branch="$(slugify_branch "$OBJECTIVE")"
+  [[ -z "$branch" && -n "$PROMPT" ]] && branch="$(slugify_branch "$PROMPT")"
+  if [[ -z "$branch" ]]; then
+    err "worktree isolation wanted for shared checkout but no branch name derivable; pass --worktree <branch> or --no-worktree"
+    WORKTREE_DECISION="SKIPPED (no derivable branch — pass --worktree or --no-worktree)"
+    return 0
+  fi
+  local wt_path="$parent/wt-$branch"
+  if $DRY_RUN; then
+    WORKTREE_DECISION="would create+enter $wt_path (branch $branch)"
+    return 0
+  fi
+  if worktree-setup "$branch" --project "$proj" --no-transplant --require-free --skip-sync >&2; then
+    WORK_DIR="$(cd "$wt_path" && pwd)"
+    WORKTREE_DECISION="created+entered $wt_path (branch $branch)"
+  else
+    err "worktree-setup refused/failed for branch '$branch' (already claimed?); refusing to dispatch into shared checkout $WORK_DIR"
+    err "pass --worktree <new-branch> or --no-worktree"
+    exit 1
+  fi
+}
+
+maybe_enter_worktree() {
+  $NO_WORKTREE && { WORKTREE_DECISION="opt-out (--no-worktree)"; return 0; }
+  $ASPIRANT && { WORKTREE_DECISION="n/a (aspirant)"; return 0; }
+  [[ -n "$RESUME_ID" ]] && { WORKTREE_DECISION="n/a (resume reuses existing dir)"; return 0; }
+
+  local conf proj parent secrets
+  for conf in "$HOME"/.config/worktrees/*.conf; do
+    [[ -f "$conf" ]] || continue
+    proj="$(basename "$conf" .conf)"
+    parent="$(dispatch_conf_var "$conf" WORKTREE_PARENT)"
+    secrets="$(dispatch_conf_var "$conf" SECRETS_DIR)"
+    if [[ -n "$parent" && ( "$WORK_DIR" == "$parent" || "$WORK_DIR" == "$parent"/* ) ]]; then
+      WORKTREE_DECISION="n/a (already isolated worktree)"
+      return 0
+    fi
+    if [[ -n "$secrets" && ( "$WORK_DIR" == "$secrets" || "$WORK_DIR" == "$secrets"/* ) ]]; then
+      enter_worktree_for_project "$proj" "$parent"
+      return 0
+    fi
+  done
+  return 0
+}
+
+maybe_enter_worktree
+
 DISPATCH_WINDOW=""
 DISPATCH_MODE=""
 DISPATCH_SLOT=""
@@ -1056,6 +1138,7 @@ dispatch dry-run
   resume_id:       ${RESUME_ID:-none}
   resume_db:       $RESUME_ROW_FOUND
   dir:             $WORK_DIR
+  worktree:        $WORKTREE_DECISION
   target:          $(printf '%s' "${TARGET:-current}" | redact_tmux_panes_for_display)
   resolved_target: $(printf '%s' "${RESOLVED_TARGET:-current}" | redact_tmux_panes_for_display)
   persona:         $PERSONA_DISPLAY
