@@ -1300,6 +1300,17 @@ redact_tmux_panes_for_display() {
   sed -E 's/%[0-9]+/<tmux-pane>/g'
 }
 
+stamp_resume_instance_id() {
+  # On resume, stamp the allocated pane with the instance UUID immediately so
+  # tmuxctl resolve-instance finds it before the agent re-registers — closing
+  # the pane-alloc -> SessionStart gap. No-op for fresh launches (the
+  # registration hook stamps those). Cleared on agent death by the wrapper.
+  local pane="$1"
+  [[ -n "$RESUME_ID" && -n "$pane" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux set-option -p -t "$pane" @INSTANCE_ID "$RESUME_ID" >/dev/null 2>&1 || true
+}
+
 stage_agent_command() {
   local cmd="$1" stage
   stage="$(mktemp -t dispatch-agent.XXXXXX)"
@@ -1410,6 +1421,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
     exit 1
   fi
   RESOLVED_PHYSICAL_TARGET="$pane_id"
+  stamp_resume_instance_id "$pane_id"
   FINAL_COMMAND="$(build_agent_command)"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
@@ -1427,6 +1439,7 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   fi
   PHYSICAL_TARGET="${RESOLVED_PHYSICAL_TARGET:-$(resolve_dispatch_physical_target "$TARGET")}"
   assert_dispatch_target_unoccupied "$PHYSICAL_TARGET"
+  stamp_resume_instance_id "$PHYSICAL_TARGET"
   tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
@@ -1443,4 +1456,5 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   exit 0
 fi
 
+stamp_resume_instance_id "${RESOLVED_PHYSICAL_TARGET:-${TMUX_PANE:-}}"
 exec bash -lc "$FINAL_COMMAND"

@@ -250,3 +250,66 @@ def resolve_to_public(adapter: TmuxAdapter, target: str) -> str:
 
 def resolve_to_physical(adapter: TmuxAdapter, target: str) -> str:
     return resolve_pane(adapter, target).pane_id
+
+
+@dataclass(frozen=True)
+class InstanceResolution:
+    """Live resolution of an agent instance UUID to its tmux pane.
+
+    The association is read purely from tmux: the agent's pane self-identifies
+    via the ``@INSTANCE_ID`` user option (stamped at registration, unset on
+    teardown). There is no DB involvement — when the agent process ends, the
+    stamp is gone and ``found`` is False. This is the fail-closed primitive that
+    replaces stored ``tmux_pane``/``pane_label`` columns.
+    """
+
+    instance_id: str
+    pane_id: str | None
+    pane_role: str | None
+
+    @property
+    def found(self) -> bool:
+        return self.pane_id is not None
+
+
+def _instance_pane_index(adapter: TmuxAdapter) -> dict[str, tuple[str, str]]:
+    """Single global tmux scan → {instance_id: (pane_id, canonical_role)}.
+
+    Panes without an ``@INSTANCE_ID`` stamp are skipped. The role is
+    canonicalized; an unset ``@PANE_ID`` yields an empty role string.
+    """
+    raw = adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        "\t".join(["#{pane_id}", "#{@INSTANCE_ID}", "#{@PANE_ID}"]),
+        allow_failure=True,
+    )
+    index: dict[str, tuple[str, str]] = {}
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        pane_id, instance_id, pane_role = parts
+        instance_id = instance_id.strip()
+        if not instance_id:
+            continue
+        role = canonical_pane_role(pane_role.strip()) if pane_role.strip() else ""
+        # First writer wins; a UUID should only ever stamp one live pane, but if
+        # geometry is mid-move prefer the earliest enumerated pane deterministically.
+        index.setdefault(instance_id, (pane_id, role))
+    return index
+
+
+def resolve_instance(adapter: TmuxAdapter, instance_id: str) -> InstanceResolution:
+    """Resolve an instance UUID to its live pane via a single global tmux scan.
+
+    Fails closed: if no live pane carries ``@INSTANCE_ID == instance_id`` the
+    result has ``pane_id is None`` (``found`` is False). Pure tmux, no DB.
+    """
+    pane_id, role = _instance_pane_index(adapter).get(instance_id, (None, None))
+    return InstanceResolution(
+        instance_id=instance_id,
+        pane_id=pane_id,
+        pane_role=role or None,
+    )

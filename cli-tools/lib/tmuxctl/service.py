@@ -24,7 +24,7 @@ from .labels import canonical_pane_role
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
-from .resolver import resolve_pane, resolve_to_physical, resolve_to_public
+from .resolver import resolve_instance, resolve_pane, resolve_to_physical, resolve_to_public
 from .skill_invoke import invoke_skill_in_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
@@ -109,6 +109,21 @@ class TmuxControlPlane:
         if chain:
             lines.append(f"chain: {chain}")
         return "\n".join(lines)
+
+    def resolve_instance(self, instance_id: str) -> dict:
+        """Resolve an instance UUID to its live pane (pure tmux, fail-closed).
+
+        Returns ``{instance_id, pane_id, pane_role, found}``. When no live pane
+        carries the stamp, ``found`` is False and ``pane_id``/``pane_role`` are
+        empty strings.
+        """
+        resolved = resolve_instance(self.adapter, instance_id)
+        return {
+            "instance_id": resolved.instance_id,
+            "pane_id": resolved.pane_id or "",
+            "pane_role": resolved.pane_role or "",
+            "found": resolved.found,
+        }
 
     def cardinal_pane_label(self, target: str) -> str:
         """Resolve a target to its stable cardinal @PANE_ID label.

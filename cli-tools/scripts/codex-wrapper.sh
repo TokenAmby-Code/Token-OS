@@ -60,7 +60,15 @@ strip_ansi() {
 }
 
 TEMP_LOG=$(mktemp)
-trap 'rm -f "$TEMP_LOG"' EXIT
+codex_cleanup() {
+  rm -f "$TEMP_LOG"
+  # Clear the instance->pane stamp on agent death so tmuxctl resolve-instance
+  # fails closed the instant codex exits (mirrors claude-wrapper cleanup).
+  if [[ -n "${TMUX_PANE:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux set-option -p -u -t "$TMUX_PANE" @INSTANCE_ID >/dev/null 2>&1 || true
+  fi
+}
+trap codex_cleanup EXIT
 
 script -a -f -e -c "$codex_path $(printf '%q' "$command_str")" "$TEMP_LOG"
 status=$?

@@ -594,6 +594,44 @@ def clear_pane_tint(tmux_pane: str | None, *, source: str = "pane-tint-clear") -
     apply_pane_tint(tmux_pane, "astartes", source=source)
 
 
+async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
+    """Resolve an instance UUID to its live ``(pane_id, role)`` via tmuxctl.
+
+    tmuxctl is the sole owner of ``instance_id -> pane`` resolution, computed
+    live from the pane's ``@INSTANCE_ID`` stamp. token-api stores no tmux pane
+    perspective; this is the only bridge. Fails closed: any miss, error, or
+    unstamped/dead pane returns ``(None, None)`` so callers never send to — or
+    speak the position of — a pane that no longer exists.
+    """
+    if not instance_id:
+        return (None, None)
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = await _run_subprocess_offloop(
+            ("python3", "-m", "tmuxctl.cli", "resolve-instance", instance_id, "--format", "json"),
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=3,
+        )
+    except Exception:
+        return (None, None)
+    # Exit 1 is the not-found sentinel; --format json still prints the payload on
+    # both exit codes, so parse stdout regardless and trust the `found` flag.
+    try:
+        payload = json.loads(proc.stdout.decode(errors="ignore").strip() or "{}")
+    except (ValueError, json.JSONDecodeError):
+        return (None, None)
+    if not payload.get("found"):
+        return (None, None)
+    pane_id = (payload.get("pane_id") or "").strip() or None
+    role = (payload.get("pane_role") or "").strip() or None
+    return (pane_id, role)
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
