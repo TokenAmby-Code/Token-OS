@@ -175,6 +175,7 @@ from timer import (
     TimerEvent,
     TimerMode,
     format_timer_time,
+    work_session_enforcement_action,
 )
 
 # String values of all break-flavored modes, for comparing against mode strings
@@ -9477,6 +9478,17 @@ NEGATIVE_BREAK_REFIRE_INTERVAL_MS = int(
     os.environ.get("NEGATIVE_BREAK_REFIRE_INTERVAL_MS", str(10 * 60 * 1000))
 )
 
+# Work session: dipping the break balance below local 0 is a failure. Any dip
+# below 0 zaps at full intensity + redirects; reaching this threshold (-30s of
+# debt) auto-cancels the session (restore original balance, forfeit earned break).
+try:
+    WORK_SESSION_CANCEL_THRESHOLD_MS = int(
+        os.environ.get("WORK_SESSION_CANCEL_THRESHOLD_MS", str(-30 * 1000))
+    )
+except ValueError:
+    logger.warning("Invalid WORK_SESSION_CANCEL_THRESHOLD_MS; using default -30000")
+    WORK_SESSION_CANCEL_THRESHOLD_MS = -30 * 1000
+
 
 def _break_penalty_rational(multiplier: float) -> tuple[int, int]:
     """Convert a decimal multiplier to an exact integer (num, den) rational.
@@ -10396,7 +10408,19 @@ def normalize_bool_param(value: bool | str | int | float | None) -> bool | None:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y", "on", "open", "play", "playing"}:
         return True
-    if text in {"0", "false", "no", "n", "off", "close", "closed", "pause", "paused", "stop", "stopped"}:
+    if text in {
+        "0",
+        "false",
+        "no",
+        "n",
+        "off",
+        "close",
+        "closed",
+        "pause",
+        "paused",
+        "stop",
+        "stopped",
+    }:
         return False
     return None
 
@@ -12735,6 +12759,92 @@ async def set_break_time(seconds: int):
     }
 
 
+def _work_session_state() -> dict:
+    """Shared work-session view. `earned` is the current balance because start
+    zeroed it, so `projected` is what `end` would leave the real balance at."""
+    active = timer_engine.work_session_active
+    original_ms = timer_engine.work_session_original_break_ms if active else 0
+    earned_ms = timer_engine.break_balance_ms if active else 0
+    return {
+        "active": active,
+        "original_break_ms": original_ms,
+        "original_break_seconds": round(original_ms / 1000),
+        "earned_ms": earned_ms,
+        "earned_seconds": round(earned_ms / 1000),
+        "projected_break_ms": original_ms + earned_ms,
+        "projected_break_seconds": round((original_ms + earned_ms) / 1000),
+        "started_at": timer_engine.work_session_started_at if active else None,
+        "cancel_threshold_seconds": round(WORK_SESSION_CANCEL_THRESHOLD_MS / 1000),
+    }
+
+
+@app.get("/api/timer/work-session")
+async def get_work_session():
+    """Current work-session state (active flag + projection)."""
+    return _work_session_state()
+
+
+@app.post("/api/timer/work-session/start")
+async def start_work_session_endpoint():
+    """Begin a work session: save the real balance and reset to a local 0."""
+    if timer_engine.work_session_active:
+        raise HTTPException(status_code=409, detail="work session already active")
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    old_mode = timer_engine.current_mode.value
+    info = timer_engine.start_work_session(started_at=started_at)
+    _work_session_situation["zapped"] = False
+    await log_event("work_session_start", details=info)
+    await timer_save_to_db()
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="work_session_start",
+        source="api",
+        details=info,
+    )
+    return _work_session_state()
+
+
+@app.post("/api/timer/work-session/end")
+async def end_work_session_endpoint():
+    """End a work session: fold break earned during it into the saved original."""
+    if not timer_engine.work_session_active:
+        raise HTTPException(status_code=409, detail="no active work session")
+    old_mode = timer_engine.current_mode.value
+    info = timer_engine.end_work_session()
+    _work_session_situation["zapped"] = False
+    await log_event("work_session_end", details=info)
+    await timer_save_to_db()
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="work_session_end",
+        source="api",
+        details=info,
+    )
+    return info
+
+
+@app.post("/api/timer/work-session/cancel")
+async def cancel_work_session_endpoint():
+    """Cancel a work session: restore the saved original, forfeit earned break."""
+    if not timer_engine.work_session_active:
+        raise HTTPException(status_code=409, detail="no active work session")
+    old_mode = timer_engine.current_mode.value
+    info = timer_engine.cancel_work_session()
+    _work_session_situation["zapped"] = False
+    await log_event("work_session_cancel", details=info)
+    await timer_save_to_db()
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="work_session_cancel",
+        source="api",
+        details=info,
+    )
+    return info
+
+
 @app.get("/api/widget/break")
 async def get_widget_break():
     """Slim break-time endpoint for phone widget on-demand pull."""
@@ -12794,6 +12904,7 @@ async def get_timer_state():
         "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
         # On-the-clock (billable Civic) vs personal-dev (Imperium) shadow accounting.
         "billable": _ops_billable_summary(work_state),
+        "work_session": _work_session_state(),
     }
 
 
@@ -15693,6 +15804,14 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
     try:
         sit = _negative_break_situation
 
+        # During an active work session the work-session gate owns negative-balance
+        # enforcement (stricter: straight to 100 + redirect + auto-cancel). Defer
+        # and keep this loop reset so it carries no stale escalation afterward.
+        if timer_engine.work_session_active:
+            sit["rep"] = 0
+            sit["last_fire_mono_ms"] = None
+            return None
+
         # Double-fire avoidance: on the tick where balance crosses 0 → negative,
         # the BREAK_EXHAUSTED handler fires the rep0 entry vibe. Seed the record
         # (rep0, last_fire=now) and skip — the first zap (rep1) lands +10min later.
@@ -15739,6 +15858,92 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
         return enforce_result
     except Exception:
         logger.exception("TIMER: negative-break enforce gate error")
+        return None
+
+
+# Latch so the strict dip-zap fires once per dip below local 0, not every tick.
+_work_session_situation = {"zapped": False}
+
+
+async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
+    """Work-session negative-balance gate, evaluated once per timer tick.
+
+    A declared work session treats local 0 as break-even; dipping below it is a
+    failure. On the first dip below 0 we zap at full intensity (100) and redirect
+    (close active distractions), latched until the balance recovers. If the
+    balance falls to WORK_SESSION_CANCEL_THRESHOLD_MS (-30s) the session is
+    auto-cancelled — the saved original balance is restored and the earned break
+    is forfeited — with a final 100 zap + redirect. Never raises into the tick
+    loop. Runs AFTER the negative-break gate (which defers while a session is
+    active), so the two never enforce on the same tick.
+    """
+    try:
+        sit = _work_session_situation
+        bal = timer_engine.break_balance_ms
+        action = work_session_enforcement_action(
+            active=timer_engine.work_session_active,
+            balance_ms=bal,
+            cancel_threshold_ms=WORK_SESSION_CANCEL_THRESHOLD_MS,
+            already_zapped=sit["zapped"],
+        )
+
+        if action == "none":
+            # Clear the latch only on genuine recovery / no session, so a later
+            # dip re-zaps; a held latch mid-dip must survive (also "none").
+            if not timer_engine.work_session_active or bal >= 0:
+                sit["zapped"] = False
+            return None
+
+        # Failure threshold reached: cancel the session (forfeit earned break),
+        # zap at 100, redirect, announce. After cancel the engine flag is False,
+        # so the normal negative-break loop resumes next tick — seed its situation
+        # so it waits a full re-fire interval before its own next zap.
+        if action == "cancel":
+            original_ms = timer_engine.work_session_original_break_ms
+            cancel_info = timer_engine.cancel_work_session()
+            sit["zapped"] = False
+            await timer_save_to_db()
+            await log_event(
+                "work_session_failed",
+                details={"break_balance_ms": bal, **cancel_info},
+            )
+            _negative_break_situation["rep"] = 1
+            _negative_break_situation["last_fire_mono_ms"] = now_ms
+            debt_min = abs(original_ms) // 60_000
+            enforce_result = await enforce(
+                EnforceRequest(
+                    message=f"Work session failed. You went negative. Break debt back to {debt_min} minutes.",
+                    intensity=100,
+                    source="work_session_failed",
+                    context={"break_balance_ms": bal, "original_break_ms": original_ms},
+                )
+            )
+            await enforce_break_exhausted_impl()  # redirect: close active distractions
+            await handle_custodes_state_event(
+                "work_session_failed",
+                "timer_worker",
+                severity=2,
+                payload={"break_balance_ms": bal, "original_break_ms": original_ms},
+            )
+            return enforce_result
+
+        # Dipped below local 0 but not yet to the cancel threshold: strict single
+        # zap at 100 + redirect on the crossing, latched until recovery.
+        if action == "zap":
+            sit["zapped"] = True
+            enforce_result = await enforce(
+                EnforceRequest(
+                    message="You dipped negative in a work session. Redirect now or it fails.",
+                    intensity=100,
+                    source="work_session_negative",
+                    context={"break_balance_ms": bal},
+                )
+            )
+            await enforce_break_exhausted_impl()  # redirect: close active distractions
+            return enforce_result
+        return None
+    except Exception:
+        logger.exception("TIMER: work-session enforce gate error")
         return None
 
 
@@ -15930,7 +16135,13 @@ async def timer_worker():
             # the gate must live outside it). Fires a zap + TTS while the break
             # balance is negative and the timer is on break, escalating every
             # 10 min. See: Negative-Balance Break Enforcement Loop spec.
+            # Negative-break runs first; it defers while a work session is active,
+            # so it and the work-session gate never enforce on the same tick.
             await _negative_break_enforce_tick(now_ms, result)
+
+            # Work-session gate: a declared work session fails if the balance dips
+            # below local 0 (zap@100 + redirect; auto-cancel at -30s of debt).
+            await _work_session_enforce_tick(now_ms, result)
 
             # Do not clear phone current_app merely because the last telemetry
             # heartbeat is old. Long-running video apps often emit one open event

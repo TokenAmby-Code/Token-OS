@@ -104,6 +104,31 @@ def format_timer_time(ms: int) -> str:
     return f"{sign}{hours}h {minutes}m"
 
 
+def work_session_enforcement_action(
+    *,
+    active: bool,
+    balance_ms: int,
+    cancel_threshold_ms: int,
+    already_zapped: bool,
+) -> str:
+    """Pure policy for the work-session negative-balance gate (no I/O).
+
+    A declared work session treats local 0 as break-even; dipping below it is a
+    failure. Returns the action the timer tick should take:
+      "cancel" — balance hit the failure threshold → cancel + zap@100 + redirect
+      "zap"    — first dip below local 0 → zap@100 + redirect (caller latches)
+      "none"   — nothing to do (inactive, break-even, or already latched)
+
+    `cancel_threshold_ms` is negative (e.g. -30000). Effect (the actual zap,
+    redirect, and cancel) lives in main.py's _work_session_enforce_tick.
+    """
+    if not active or balance_ms >= 0:
+        return "none"
+    if balance_ms <= cancel_threshold_ms:
+        return "cancel"
+    return "zap" if not already_zapped else "none"
+
+
 class TimerEngine:
     """Encapsulates all timer state and logic.
 
@@ -163,6 +188,15 @@ class TimerEngine:
         self._daily_start_date: str | None = None
         self._last_tick_ms: int = now_mono_ms
         self._reset_hour: int = reset_hour
+
+        # Work session: a temporary "local 0" reset. start() saves the real
+        # balance and zeroes it so the user is treated as break-even; end()
+        # folds the break earned during the session back into the saved balance.
+        # Going negative during an active session is a failure — enforced and
+        # auto-cancelled by _work_session_enforce_tick in main.py.
+        self._work_session_active: bool = False
+        self._work_session_original_break_ms: int = 0
+        self._work_session_started_at: str | None = None  # opaque ISO, for display
 
     # ---- Read-only properties ----
 
@@ -574,6 +608,72 @@ class TimerEngine:
 
         return self._advance(now_mono_ms, suppress_idle_timeout=suppress_idle_timeout)
 
+    # ---- Work session (local-0 reset) ----
+
+    @property
+    def work_session_active(self) -> bool:
+        return self._work_session_active
+
+    @property
+    def work_session_original_break_ms(self) -> int:
+        return self._work_session_original_break_ms
+
+    @property
+    def work_session_started_at(self) -> str | None:
+        return self._work_session_started_at
+
+    def start_work_session(self, started_at: str | None = None) -> dict:
+        """Save the real balance and reset to a local 0 (break-even).
+
+        Overwrites any previously-saved original, so guard double-start upstream.
+        """
+        self._work_session_original_break_ms = self._break_balance_ms
+        self._break_balance_ms = 0
+        self._work_session_active = True
+        self._work_session_started_at = started_at
+        return {
+            "original_break_ms": self._work_session_original_break_ms,
+            "started_at": started_at,
+        }
+
+    def end_work_session(self) -> dict:
+        """Fold break earned since start into the saved original and finish.
+
+        start() zeroed the balance, so the current balance IS the diff earned
+        during the session: new balance = original + current.
+        """
+        earned_ms = self._break_balance_ms
+        original_ms = self._work_session_original_break_ms
+        new_ms = original_ms + earned_ms
+        self._break_balance_ms = new_ms
+        self._clear_work_session()
+        return {
+            "original_break_ms": original_ms,
+            "earned_ms": earned_ms,
+            "break_balance_ms": new_ms,
+        }
+
+    def cancel_work_session(self) -> dict:
+        """Abort: restore the saved original balance, discard earned break.
+
+        Used for a manual cancel and for the negative-balance failure
+        auto-cancel — a failed session forfeits whatever break it earned.
+        """
+        forfeited_ms = self._break_balance_ms
+        original_ms = self._work_session_original_break_ms
+        self._break_balance_ms = original_ms
+        self._clear_work_session()
+        return {
+            "original_break_ms": original_ms,
+            "forfeited_ms": forfeited_ms,
+            "break_balance_ms": original_ms,
+        }
+
+    def _clear_work_session(self) -> None:
+        self._work_session_active = False
+        self._work_session_original_break_ms = 0
+        self._work_session_started_at = None
+
     # ---- Serialization ----
 
     def to_dict(self, now_mono_ms: int) -> dict:
@@ -621,6 +721,10 @@ class TimerEngine:
             "work_split": dict(self._work_split),
             "class_work_ms": dict(self._class_work_ms),
             "class_break_ms": dict(self._class_break_ms),
+            # Work session (local-0 reset)
+            "work_session_active": self._work_session_active,
+            "work_session_original_break_ms": self._work_session_original_break_ms,
+            "work_session_started_at": self._work_session_started_at,
             # Timing
             "daily_start_date": self._daily_start_date,
             # Productivity substate
@@ -657,6 +761,9 @@ class TimerEngine:
             "classBreakSeconds": {
                 cls: round(ms / 1000) for cls, ms in self._class_break_ms.items()
             },
+            "workSessionActive": self._work_session_active,
+            "workSessionOriginalBreakSeconds": round(self._work_session_original_break_ms / 1000),
+            "workSessionStartedAt": self._work_session_started_at,
         }
 
     def from_dict(self, data: dict, now_mono_ms: int) -> None:
@@ -708,6 +815,12 @@ class TimerEngine:
         self._class_break_ms = _load_class_map("class_break_ms")
 
         self._daily_start_date = data.get("daily_start_date")
+
+        # Work session (absent in pre-feature states → inactive). Survives
+        # restarts so a server bounce mid-session keeps the saved original.
+        self._work_session_active = bool(data.get("work_session_active", False))
+        self._work_session_original_break_ms = int(data.get("work_session_original_break_ms", 0))
+        self._work_session_started_at = data.get("work_session_started_at")
 
         # Manual substate
         if self._manual_mode is not None:
@@ -1011,6 +1124,7 @@ class TimerEngine:
         self._activity = Activity.WORKING
         self._productivity_active = True
         self._clear_manual_mode()
+        self._clear_work_session()
         self._activity_substate = {"distraction_started_ms": None, "is_scrolling_gaming": False}
         self._productivity_substate = {
             "idle_entered_ms": None,
