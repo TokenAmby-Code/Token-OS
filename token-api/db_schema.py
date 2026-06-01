@@ -693,6 +693,34 @@ async def init_database_async(db_path: Path | None = None) -> None:
               ON primarch_session_docs(primarch_name) WHERE unlinked_at IS NULL
         """)
 
+        # ── Per-branch worktree registry (super-workflow Gap 1, D2 backstop) ──
+        # DORMANT: merged as schema, not yet written to by any code path. Takes
+        # effect only when init runs at startup. The partial-UNIQUE index is the
+        # durable concurrency backstop behind worktree-setup's local-FS lock:
+        # at most one active worktree per (project, branch) — 1 branch = 1
+        # worktree = 1 PR. Matches the additive/idempotent house style and the
+        # partial-index precedent above (idx_primarch_active).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS worktrees (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project     TEXT NOT NULL,
+                branch      TEXT NOT NULL,
+                path        TEXT NOT NULL,
+                instance_id TEXT,
+                dispatch_id TEXT,
+                owner_pane  TEXT,
+                status      TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active', 'orphaned', 'quarantined', 'deleted')),
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                claimed_at  TIMESTAMP,
+                last_seen_at TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_active_unique
+              ON worktrees(project, branch) WHERE status='active'
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS primarchs (
                 name            TEXT PRIMARY KEY,

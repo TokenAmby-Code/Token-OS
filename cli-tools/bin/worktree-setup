@@ -47,6 +47,8 @@ DRY_RUN=false
 USE_EXISTING_BRANCH=false
 SKIP_SYNC=false
 NO_TRANSPLANT=false
+REQUIRE_FREE=false
+FORCE=false
 PROJECT="$(detect_default_project)"
 INIT_MODE=false
 
@@ -66,6 +68,9 @@ Options:
   -n, --dry-run         Show what would happen without making changes
   -s, --skip-sync       Skip running uv sync / npm install
   --no-transplant       Skip session transplant (for subagents or non-interactive use)
+  --require-free        Claim the branch atomically; refuse if a live worktree
+                        already holds it (1 branch = 1 worktree = 1 PR)
+  -f, --force           Override an existing claim / reuse an existing branch
   --init                Print template config for a new project
   -h, --help            Show this help message
 
@@ -98,6 +103,56 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}✗${NC} $1" >&2
+}
+
+# ── Per-branch worktree claim lock (super-workflow Gap 1, D2 — LIVE guard) ──
+# Serializes the (project, branch) create race so two concurrent worktree-setup
+# runs cannot both create/claim the same branch. Prefers flock(1) where present
+# (Linux/CI); falls back to an atomic mkdir lock on macOS, where flock is not
+# installed and the worktree-ports precedent silently no-ops — this guard must
+# stay live on the Mac too. Held until the process exits. Uses fd 8 to avoid
+# clashing with the ports lib's fd 9.
+CLAIM_LOCK_HELD=""
+release_claim_lock() {
+    if [[ -n "$CLAIM_LOCK_HELD" ]]; then
+        rm -rf "$CLAIM_LOCK_HELD" 2>/dev/null || true
+    fi
+}
+acquire_claim_lock() {
+    local key="$1" timeout="${2:-10}"
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/imperium/worktree-claims"
+    mkdir -p "$state_dir"
+    # Hash the full (project, branch) key so distinct refs never share a lock
+    # file (e.g. `feature/foo` vs `feature-foo`). git hash-object is always present.
+    local safe_key
+    safe_key="$(printf '%s' "$key" | git hash-object --stdin 2>/dev/null)"
+    [[ -n "$safe_key" ]] || safe_key="${key//[^a-zA-Z0-9]/_}"
+    # WORKTREE_CLAIM_NO_FLOCK forces the portable mkdir path (used by tests to
+    # exercise the macOS fallback deterministically on a flock-equipped CI).
+    if [[ -z "${WORKTREE_CLAIM_NO_FLOCK:-}" ]] && command -v flock &>/dev/null; then
+        exec 8>"$state_dir/${safe_key}.lock"
+        flock -w "$timeout" 8 && return 0
+        return 1
+    fi
+    # Portable fallback: atomic mkdir lock with bounded wait + stale-owner steal.
+    local lockdir="$state_dir/${safe_key}.lockd"
+    local waited=0 owner
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        owner="$(cat "$lockdir/pid" 2>/dev/null || true)"
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$lockdir" 2>/dev/null || true
+            continue
+        fi
+        if (( waited >= timeout * 10 )); then
+            return 1
+        fi
+        sleep 0.1
+        waited=$(( waited + 1 ))
+    done
+    printf '%s' "$$" > "$lockdir/pid"
+    CLAIM_LOCK_HELD="$lockdir"
+    trap release_claim_lock EXIT
+    return 0
 }
 
 load_config() {
@@ -190,6 +245,14 @@ while [[ $# -gt 0 ]]; do
             NO_TRANSPLANT=true
             shift
             ;;
+        --require-free)
+            REQUIRE_FREE=true
+            shift
+            ;;
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
         -*)
             log_error "Unknown option: $1"
             echo "Use --help for usage information"
@@ -225,6 +288,25 @@ load_config "$PROJECT"
 
 WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
+# Per-branch claim (Gap 1, D1/D2): with --require-free, serialize the create
+# race under a local-FS lock, then refuse a 2nd worktree on a branch already
+# checked out in a live worktree (1 branch = 1 worktree = 1 PR) unless --force.
+# The lock is held until exit, so it also covers the `git worktree add` below.
+if [[ "$REQUIRE_FREE" == "true" ]]; then
+    if ! acquire_claim_lock "${PROJECT}-${BRANCH_NAME}" 10; then
+        log_error "Could not acquire worktree claim lock for ${PROJECT}/${BRANCH_NAME} (another worktree-setup creating it?)"
+        exit 75
+    fi
+    EXISTING_WT="$(git --git-dir="$BARE_REPO" worktree list --porcelain 2>/dev/null \
+        | awk -v b="refs/heads/$BRANCH_NAME" '/^worktree /{p=substr($0,10)} /^branch /{if (substr($0,8)==b) print p}' \
+        || true)"
+    if [[ -n "$EXISTING_WT" && "$FORCE" != "true" ]]; then
+        log_error "Branch '$BRANCH_NAME' is already claimed by a live worktree: $EXISTING_WT"
+        log_error "1 branch = 1 worktree = 1 PR. Pass --force to override."
+        exit 1
+    fi
+fi
+
 # Check if worktree already exists
 if [[ -d "$WORKTREE_DIR" ]]; then
     log_error "Directory already exists: $WORKTREE_DIR"
@@ -237,8 +319,13 @@ REMOTE_EXISTS=$(git --git-dir="$BARE_REPO" branch -r --list "origin/$BRANCH_NAME
 
 if [[ "$USE_EXISTING_BRANCH" == "false" ]]; then
     if [[ $BRANCH_EXISTS -gt 0 ]] || [[ $REMOTE_EXISTS -gt 0 ]]; then
-        log_error "Branch '$BRANCH_NAME' already exists. Use --existing to use it."
-        exit 1
+        if [[ "$FORCE" == "true" ]]; then
+            log_warn "Branch '$BRANCH_NAME' already exists; --force → reusing it"
+            USE_EXISTING_BRANCH=true
+        else
+            log_error "Branch '$BRANCH_NAME' already exists. Use --existing to use it."
+            exit 1
+        fi
     fi
 else
     if [[ $BRANCH_EXISTS -eq 0 ]] && [[ $REMOTE_EXISTS -eq 0 ]]; then
@@ -347,10 +434,15 @@ fi
 
 # Execute
 log_info "Creating worktree..."
-# --force for main/master: allows both WSL and Mac to have wt-main simultaneously
+# --force for main/master: allows both WSL and Mac to have wt-main simultaneously.
+# Explicit --force (Gap 1 claim override) also maps through, and prunes any stale
+# worktree registration left by a removed-but-unpruned dir so the re-add succeeds.
 FORCE_FLAG=""
-if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" ]]; then
+if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" || "$FORCE" == "true" ]]; then
     FORCE_FLAG="--force"
+fi
+if [[ "$FORCE" == "true" ]]; then
+    git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
 fi
 if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then
     git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG "$WORKTREE_DIR" "$BRANCH_NAME"
