@@ -7,6 +7,7 @@
 Usage:
     timer-status                      # One-line status
     timer-status --layers             # One-line status + layer breakdown
+    timer-status --billable           # One-line status + on-the-clock (Civic) vs personal-dev (Imperium)
     timer-status --balance            # Compact single-line: mode + colored balance only
     timer-status --shifts             # One-line status + session mode distribution + sparkline
     timer-status --sparkline          # One-line status + balance trajectory sparkline only
@@ -177,6 +178,46 @@ def display(data, show_layers=False):
         print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}  Focus: {focus_layer}")
 
 
+def display_billable(data):
+    """On-the-clock (billable Civic) vs personal-dev (Imperium) breakdown.
+
+    Reads the `billable` shadow-accounting block from /api/timer. Descriptive
+    only — this does not reflect any change to the live break balance.
+    """
+    b = data.get("billable") or {}
+    if not b:
+        print(color("  (billable accounting unavailable)", "90"))
+        return
+    counts = b.get("active_counts", {})
+    work = b.get("work_seconds", {})
+    brk = b.get("break_seconds", {})
+    bc = counts.get("billable", 0)
+    pc = counts.get("personal", 0)
+    uc = counts.get("unknown", 0)
+    clock = color("● ON THE CLOCK", "32") if b.get("on_the_clock") else color("○ off the clock", "90")
+    extra = f" · unknown {uc}" if uc else ""
+    print(f"  {clock}   (Civic {bc} · Imperium {pc}{extra} active)")
+
+    def cls_line(label, key, code):
+        w = fmt_seconds_hm(work.get(key, 0))
+        d = brk.get(key, 0)
+        sign = "+" if d >= 0 else "-"
+        return f"    {color(label, code)}  work {w}  break {sign}{fmt_seconds_hm(abs(d))}"
+
+    print(cls_line("Civic   (billable)", "billable", "32"))
+    print(cls_line("Imperium (personal)", "personal", "36"))
+    if uc or work.get("unknown", 0):
+        print(cls_line("unknown            ", "unknown", "90"))
+    x = b.get("x_work_instances", 0)
+    y = b.get("y_distraction", 0)
+    wgt = b.get("accrual_weight", 0)
+    trickle = b.get("trickle_numerator", 0)
+    print(
+        f"    {color('x/y', '90')} work={x} (weight {wgt}x) / distraction={y}"
+        f"   trickle {trickle} {color('[phase-2 preview]', '90')}"
+    )
+
+
 def sparkline(series, width=50):
     """Render a balance trajectory as a colored ASCII spark line.
 
@@ -292,6 +333,7 @@ def main():
 
     show_balance = "--balance" in args
     show_layers = "--layers" in args
+    show_billable = "--billable" in args
     show_shifts = "--shifts" in args
     show_sparkline = "--sparkline" in args
 
@@ -315,6 +357,8 @@ def main():
                         display_balance(data)
                     else:
                         display(data, show_layers=show_layers)
+                    if show_billable:
+                        display_billable(data)
                     if show_shifts or show_sparkline:
                         shifts = get_shifts()
                         if shifts:
@@ -337,6 +381,8 @@ def main():
             display_balance(data)
         else:
             display(data, show_layers=show_layers)
+        if show_billable:
+            display_billable(data)
         if show_shifts or show_sparkline:
             shifts = get_shifts()
             if shifts:

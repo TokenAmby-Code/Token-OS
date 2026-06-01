@@ -50,6 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import shared
 import talk as talk_service
 import temp_message as temp_message_service
+from billable import accrual_weight, classify_work_class, trickle_numerator
 from cron_engine import CronEngine
 from custodes_state_policy import (
     CustodesIntervention,
@@ -525,6 +526,8 @@ class AgentRuntime(BaseModel):
     last_activity: str | None = None
     registered: bool = True
     live_pane: bool | None = None
+    # Billable-vs-personal tag (billable=Civic/askCivic, personal=Imperium). See billable.py.
+    work_class: str | None = None
 
 
 class ActivityIconState(BaseModel):
@@ -541,6 +544,10 @@ class WorkStateResponse(BaseModel):
     active_instance_count: int
     processing_recent_count: int
     observed_agent_count: int
+    # Per-class active-instance counts (billable Civic vs personal Imperium).
+    billable_active_count: int = 0
+    personal_active_count: int = 0
+    unknown_active_count: int = 0
     active_instances: list[AgentRuntime]
     observed_agents: list[AgentRuntime]
     activity_icons: list[ActivityIconState]
@@ -4587,7 +4594,8 @@ async def compute_work_state() -> WorkStateResponse:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id, last_activity
+            SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id,
+                   last_activity, legion
             FROM claude_instances
             WHERE status IN ('processing', 'idle')
               AND COALESCE(is_subagent, 0) = 0
@@ -4677,6 +4685,7 @@ async def compute_work_state() -> WorkStateResponse:
                 last_activity=last_activity,
                 registered=True,
                 live_pane=live_pane,
+                work_class=classify_work_class(row["working_dir"], row["legion"]).value,
             )
         )
 
@@ -4712,6 +4721,7 @@ async def compute_work_state() -> WorkStateResponse:
                 last_activity=pane_last_activity_str,
                 registered=False,
                 live_pane=True,
+                work_class=classify_work_class(cwd, None).value,
             )
         )
     recent_work_action_details: dict = {}
@@ -4742,6 +4752,21 @@ async def compute_work_state() -> WorkStateResponse:
         )
 
     productivity_active = bool(active_instances or observed_agents or recent_work_action)
+
+    # Per-class active-instance counts (billable Civic vs personal Imperium).
+    # Both registered actives and observed agents count toward the work split
+    # the same way they count toward productivity above.
+    billable_active_count = 0
+    personal_active_count = 0
+    unknown_active_count = 0
+    for agent in (*active_instances, *observed_agents):
+        if agent.work_class == "billable":
+            billable_active_count += 1
+        elif agent.work_class == "personal":
+            personal_active_count += 1
+        else:
+            unknown_active_count += 1
+
     if active_instances or observed_agents:
         reason = "recent_tracked_or_observed_agent"
         productivity_hold = "active_process"
@@ -4760,6 +4785,9 @@ async def compute_work_state() -> WorkStateResponse:
         active_instance_count=len(active_instances),
         processing_recent_count=processing_recent_count,
         observed_agent_count=len(observed_agents),
+        billable_active_count=billable_active_count,
+        personal_active_count=personal_active_count,
+        unknown_active_count=unknown_active_count,
         active_instances=active_instances,
         observed_agents=observed_agents,
         activity_icons=_activity_icons(),
@@ -12764,6 +12792,8 @@ async def get_timer_state():
         "steam_exe": DESKTOP_STATE.get("steam_exe"),
         "phone_app": PHONE_STATE.get("current_app"),
         "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
+        # On-the-clock (billable Civic) vs personal-dev (Imperium) shadow accounting.
+        "billable": _ops_billable_summary(work_state),
     }
 
 
@@ -15001,15 +15031,19 @@ async def _ops_read_instances(now: datetime) -> dict:
     status_counts: dict[str, int] = {}
     engine_counts: dict[str, int] = {}
     legion_counts: dict[str, int] = {}
+    work_class_counts: dict[str, int] = {}
     stale_count = 0
     for row in rows:
         inst = dict(row)
         status = inst.get("status") or "unknown"
         engine = inst.get("engine") or "claude"
         legion = inst.get("legion") or inst.get("instance_type") or "unassigned"
+        # Billable Civic vs personal Imperium tag (working_dir primary, legion override).
+        work_class = classify_work_class(inst.get("working_dir"), inst.get("legion")).value
         status_counts[status] = status_counts.get(status, 0) + 1
         engine_counts[engine] = engine_counts.get(engine, 0) + 1
         legion_counts[legion] = legion_counts.get(legion, 0) + 1
+        work_class_counts[work_class] = work_class_counts.get(work_class, 0) + 1
         activity_anchor = inst.get("last_activity") or inst.get("registered_at")
         age_seconds = _ops_seconds_since(activity_anchor, now=now)
         staleness = _ops_instance_staleness(status, age_seconds)
@@ -15034,6 +15068,7 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "age_minutes": None if age_seconds is None else age_seconds // 60,
                 "is_subagent": bool(inst.get("is_subagent") or 0),
                 "legion": inst.get("legion"),
+                "work_class": work_class,
                 "instance_type": inst.get("instance_type"),
                 "workflow_state": inst.get("workflow_state"),
                 "next_required_action": inst.get("next_required_action"),
@@ -15073,6 +15108,7 @@ async def _ops_read_instances(now: datetime) -> dict:
             "by_status": status_counts,
             "by_engine": engine_counts,
             "by_legion": legion_counts,
+            "by_work_class": work_class_counts,
         },
     }
 
@@ -15144,6 +15180,34 @@ def _ops_ui_build_id() -> str | None:
         return hashlib.sha1(f"{newest}:{names}".encode()).hexdigest()[:12]
     except Exception:
         return None
+
+
+def _ops_billable_summary(work_state: WorkStateResponse) -> dict:
+    """On-the-clock (billable Civic) vs personal-dev (Imperium) read model.
+
+    Descriptive shadow accounting from the per-class accrual layer — it does NOT
+    drive enforcement or the live break balance. ``on_the_clock`` is true when a
+    billable Civic instance is provably working; the x/y fields and the
+    accrual_weight / trickle previews surface the Phase-2 fractional model (still
+    flagged off) so the cockpit can show the split distinctly. See billable.py.
+    """
+    export = timer_engine.to_export_dict()
+    b = work_state.billable_active_count
+    p = work_state.personal_active_count
+    u = work_state.unknown_active_count
+    x = b + p + u  # provable-work numerator (active working instances)
+    y = 1 if timer_engine.activity == Activity.DISTRACTION else 0  # distraction signal
+    weighted_x = accrual_weight(x)
+    return {
+        "on_the_clock": b > 0,
+        "active_counts": {"billable": b, "personal": p, "unknown": u},
+        "work_seconds": export.get("classWorkSeconds", {}),
+        "break_seconds": export.get("classBreakSeconds", {}),
+        "x_work_instances": x,
+        "y_distraction": y,
+        "accrual_weight": round(weighted_x, 3),
+        "trickle_numerator": round(trickle_numerator(weighted_x, y), 3),
+    }
 
 
 def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> dict:
@@ -15554,6 +15618,7 @@ async def get_ops_display_state():
             "daily_start_date": timer_engine.daily_start_date,
             "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
         },
+        "billable": _ops_billable_summary(work_state),
         "assertions": assertions,
         "attention": {
             "desktop": {
@@ -15921,6 +15986,15 @@ async def timer_worker():
             if now - last_db_save >= 10:  # piggyback on DB save interval
                 work_state = await compute_work_state()
                 productivity_active = work_state.productivity_active
+
+                # Feed per-class active counts for shadow accrual (billable vs
+                # personal). Pure accounting input — does not affect enforcement.
+                timer_engine.set_work_split(
+                    work_state.billable_active_count,
+                    work_state.personal_active_count,
+                    work_state.unknown_active_count,
+                    now_ms,
+                )
 
                 old_mode = timer_engine.current_mode.value
                 prod_result = timer_engine.set_productivity(productivity_active, now_ms)
