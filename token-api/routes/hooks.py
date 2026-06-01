@@ -1610,22 +1610,25 @@ async def handle_session_start(payload: dict) -> dict:
                 ):
                     await db.commit()
 
-                # Queue old-pane clear. The new pane recolor is handled by
-                # trg_tmux_pane_recolor when tmux_pane changes.
+                # Event-driven tint: the persona moved panes. Clear the vacated
+                # pane and paint the new one for its legion (no recolor queue).
                 _transplant_legion = (
                     existing_row["legion"]
                     if hasattr(existing_row, "__getitem__") and existing_row["legion"]
                     else "astartes"
                 )
-                if (
-                    old_tmux_pane
-                    and old_tmux_pane != tmux_pane
-                    and _transplant_legion != "astartes"
-                ):
-                    await db.execute(
-                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
-                        (session_id, old_tmux_pane),
-                    )
+                if _transplant_legion != "astartes":
+                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
+                        )
+                    if tmux_pane:
+                        await asyncio.to_thread(
+                            shared.apply_pane_tint,
+                            tmux_pane,
+                            _transplant_legion,
+                            source="transplant",
+                        )
                 await db.commit()
 
                 # Resolve preserved profile for color
@@ -1888,14 +1891,21 @@ async def handle_session_start(payload: dict) -> dict:
                 ):
                     await db.commit()
 
-                # Queue old-pane clear. The new pane recolor is handled by
-                # trg_tmux_pane_recolor when tmux_pane changes via supplant.
+                # Event-driven tint: the persona moved panes. Clear the vacated
+                # pane and paint the new one for its legion (no recolor queue).
                 _supplant_legion = old_inst["legion"] if old_inst["legion"] else "astartes"
-                if old_tmux_pane and old_tmux_pane != tmux_pane and _supplant_legion != "astartes":
-                    await db.execute(
-                        "INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane) VALUES (?, 'astartes', ?)",
-                        (session_id, old_tmux_pane),
-                    )
+                if _supplant_legion != "astartes":
+                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
+                        )
+                    if tmux_pane:
+                        await asyncio.to_thread(
+                            shared.apply_pane_tint,
+                            tmux_pane,
+                            _supplant_legion,
+                            source="supplant",
+                        )
                 await db.commit()
 
                 # Resolve cc_color from preserved profile
