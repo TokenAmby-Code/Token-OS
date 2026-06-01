@@ -45,7 +45,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import shared
 import talk as talk_service
@@ -54,6 +54,7 @@ from cron_engine import CronEngine
 from custodes_state_policy import (
     CustodesIntervention,
     StateEvent,
+    _snapshot_items,
     build_dedupe_key,
     classify_trigger,
     evaluate_state_event,
@@ -586,11 +587,21 @@ class TaskExecutionResponse(BaseModel):
 
 
 class CustodesStateEventRequest(BaseModel):
+    # Back-compat: all fields below `payload` are optional and default to the
+    # legacy policy-set behaviour, so existing emitters need no change.
+    model_config = ConfigDict(populate_by_name=True)
+
     event_type: str
     source: str
     instance_id: str | None = None
     severity: int | None = None
     payload: dict | None = None
+    # Format envelope (durable fix): the emitter MAY declare the class explicitly
+    # ('state' | 'enforcement'); when given it wins over the policy-set fallback.
+    # Accepts JSON key `class` (reserved word) or `event_class`.
+    event_class: str | None = Field(default=None, alias="class")
+    # Enforcement may declare itself exempt from the quiet-hours gate.
+    quiet_hours_exempt: bool = False
 
 
 # [MOVED to shared.py / routes/tts.py] — was: class NotifyRequest(BaseModel):
@@ -1471,6 +1482,9 @@ async def lifespan(app: FastAPI):
     # Start phone heartbeat monitor
     asyncio.create_task(phone_heartbeat_worker())
     print("Phone heartbeat monitor started")
+    # Start Custodes enforcement defer flusher (L2 hold-and-queue under typing guard)
+    asyncio.create_task(_custodes_enforcement_defer_worker())
+    print("Custodes enforcement defer flusher started")
     # Start Mac-side Deskflow backoff supervisor
     mac_kvm_supervisor_task = asyncio.create_task(mac_kvm_supervisor())
     print("Mac KVM supervisor started")
@@ -6344,6 +6358,59 @@ _CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
 _custodes_state_debounce: dict[str, dict] = {}
 _CUSTODES_CANCEL_REASON = "intervention_canceled_by_negative_edge"
 
+# ── L2: typing-guard hold-and-queue for Custodes-bound enforcement ────────────
+# A recognized enforcement event classifies + routes correctly, then the tmux
+# send is suppressed by the universal typing-guard gate. Per the Emperor
+# (2026-05-31): "typing IS the appeal — me submitting the very prompt the typing
+# guard knows I'm working on is my appeal." So Custodes-bound enforcement must
+# STALL, not drop — defer, flush on typing-stop (or a bounded timeout), and
+# re-evaluate staleness before firing. "We don't lose, we stall."
+#
+# Kept in-memory (not the durable `pane_write_queue`): these are time-sensitive
+# escalations that are staleness-checked on every flush — surviving a restart to
+# fire a stale nag hours later is exactly what we do NOT want.
+_custodes_enforcement_defer_queue: list[dict] = []
+# Bounded timeout: after this long held, flush regardless (a final delivery,
+# gate-overridden if still typing — the Custodes pane nag is benign even mid-flow;
+# the physical Pavlok is a separate, still-blocked path).
+_CUSTODES_DEFER_MAX_SECONDS = int(os.environ.get("TOKEN_API_CUSTODES_DEFER_MAX_SECONDS", "300"))
+# Mirrors `tmuxctl.send_gate._DEFAULT_TYPING_GUARD_WINDOW` — kept in sync via the
+# same env contract so the flusher's "typing stopped" matches what the gate sees.
+_TYPING_GUARD_WINDOW_SECONDS = int(os.environ.get("TMUX_TYPING_GUARD_WINDOW", "10"))
+
+
+def _typing_guard_active() -> bool:
+    """Canonical typing-guard predicate (sync): recent human keystroke on a client.
+
+    Mirrors ``tmuxctl.send_gate.typing_guard_active`` — reads tmux
+    ``#{client_activity}`` and reports active for ``_TYPING_GUARD_WINDOW_SECONDS``
+    after the last keystroke. This is the same signal the universal send gate
+    consults, so the flusher's notion of "typing stopped" matches the gate's.
+    Fail-open: if tmux is unreachable or reports nothing, returns False.
+    """
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "#{client_activity}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    value = proc.stdout.strip()
+    if not value:
+        return False
+    try:
+        activity = int(value)
+    except ValueError:
+        return False
+    age = int(time.time()) - activity
+    return 0 <= age <= max(1, _TYPING_GUARD_WINDOW_SECONDS)
+
 
 async def _custodes_state_snapshot() -> dict:
     """Small /api/state-style snapshot for Custodes policy prompts."""
@@ -6517,6 +6584,36 @@ async def _custodes_intervention_negative_edge_cancel_result(
     }
 
 
+# Signatures the Custodes injection subprocess (`claude-cmd` → `agent-cmd` →
+# `tmuxctl send-text`) surfaces in stderr. The universal send gate raises
+# `TmuxSendGated` ("send suppressed by gate: <reason>"); agent-cmd's own
+# typing-guard wait aborts with "user input not cleared". Both mean NO bytes
+# reached the pane and the write is safe to hold-and-queue (L2), not a loss.
+_GATE_SUPPRESSION_SIGNATURES = ("suppressed by gate", "user input not cleared")
+# Signatures meaning the targeted pane is stale/occupied — re-resolve the live
+# Custodes pane rather than fail (L4).
+_STALE_PANE_SIGNATURES = ("no live instance", "appears occupied", "rc=73", "no_registry_instance")
+
+
+def _classify_pane_inject_failure(stderr_text: str) -> tuple[str, str | None]:
+    """Categorize a Custodes inject failure: gated / stale_pane / generic.
+
+    Returns ``(category, gate_reason)``. At Custodes dispatch time quiet-hours is
+    already excluded upstream, so a gate hit here is the typing guard.
+    """
+    lowered = (stderr_text or "").lower()
+    if any(sig in lowered for sig in _GATE_SUPPRESSION_SIGNATURES):
+        reason = (
+            "quiet_hours"
+            if "quiet_hours" in lowered or "quiet hours" in lowered
+            else "typing_guard"
+        )
+        return "gated", reason
+    if any(sig in lowered for sig in _STALE_PANE_SIGNATURES):
+        return "stale_pane", None
+    return "generic", None
+
+
 async def _inject_custodes_prompt_to_pane(
     prompt: str,
     tmux_pane: str,
@@ -6553,14 +6650,24 @@ async def _inject_custodes_prompt_to_pane(
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
+            stderr_text = stderr.decode(errors="replace")
+            category, gate_reason = _classify_pane_inject_failure(stderr_text)
             reason = f"claude-cmd failed: rc={proc.returncode}"
-            logger.warning(f"Custodes state hook: {reason}: {stderr.decode()[:200]}")
-            return {
+            logger.warning(f"Custodes state hook: {reason} [{category}]: {stderr_text[:200]}")
+            result = {
                 "dispatched": False,
                 "reason": reason,
                 "instance_id": instance_id,
                 "tmux_pane": tmux_pane,
             }
+            if category == "gated":
+                # Held-and-queued by the router; surface as a gate hit, not a loss.
+                result["gated"] = True
+                result["gate_reason"] = gate_reason
+                result["reason"] = f"send_gated:{gate_reason}"
+            elif category == "stale_pane":
+                result["stale_pane"] = True
+            return result
     except Exception as exc:
         logger.warning(f"Custodes state hook: delivery failed: {exc}")
         return {
@@ -6797,8 +6904,22 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
     )
     stdout, stderr_b = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=45)
     if proc.returncode != 0:
-        reason = stderr_b.decode().strip()[:240] or stdout.decode().strip()[:240]
-        return {"dispatched": False, "reason": f"send_text_failed: {reason}", "assertion": result}
+        stderr_text = stderr_b.decode(errors="replace")
+        reason = stderr_text.strip()[:240] or stdout.decode().strip()[:240]
+        category, gate_reason = _classify_pane_inject_failure(stderr_text)
+        delivery = {
+            "dispatched": False,
+            "reason": f"send_text_failed: {reason}",
+            "assertion": result,
+        }
+        if category == "gated":
+            # No bytes reached the pane: hold-and-queue, do not lose (L2).
+            delivery["gated"] = True
+            delivery["gate_reason"] = gate_reason
+            delivery["reason"] = f"send_gated:{gate_reason}"
+        elif category == "stale_pane":
+            delivery["stale_pane"] = True
+        return delivery
     return {"dispatched": True, "reason": "sent", "pane": result.get("pane"), "assertion": result}
 
 
@@ -6962,12 +7083,33 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
             cancel_check=cancel_check,
         )
 
-    return await _inject_custodes_prompt_to_pane_maybe_cancel(
+    delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
         prompt,
         tmux_pane,
         instance_id=instance["id"],
         cancel_check=cancel_check,
     )
+    # L4: the DB pane was stale/occupied (rc=73 occupied, no live instance).
+    # Re-resolve the live Custodes pane from the tmux marker and retry once,
+    # rather than failing. A gated delivery is NOT stale — it bubbles up so the
+    # router can hold-and-queue it (L2).
+    if delivery.get("stale_pane") and not delivery.get("canceled"):
+        recovered_pane = await _find_custodes_tmux_pane()
+        if recovered_pane and recovered_pane != tmux_pane:
+            logger.warning(
+                f"Custodes state hook: DB pane {tmux_pane} stale/occupied; "
+                f"re-resolved live pane={recovered_pane}"
+            )
+            retry = await _inject_custodes_prompt_to_pane_maybe_cancel(
+                prompt,
+                recovered_pane,
+                instance_id=instance["id"],
+                cancel_check=cancel_check,
+            )
+            if retry.get("dispatched"):
+                retry["reason"] = "recovered_tmux_pane"
+            return retry
+    return delivery
 
 
 async def _dispatch_custodes_intervention_maybe_cancel(prompt: str, cancel_check) -> dict:
@@ -7147,11 +7289,38 @@ async def _dispatch_administratum_record(
     """
     instance = await _resolve_administratum_instance()
     if not instance:
+        # L5: no live recorder pane — the record is otherwise silently lost. Still
+        # write the deterministic Administratum log file (the recorder reads it on
+        # next wake) and emit an explicit dropped-record event so the loss is
+        # visible in the events table, never inferred.
+        await _append_administratum_log(
+            None,
+            classification=classification,
+            event=event,
+            intervention=intervention,
+        )
         logger.info(
             "Administratum record: no live recorder pane; "
-            f"{classification}:{intervention.event_type} not recorded to pane"
+            f"{classification}:{intervention.event_type} written to log file only"
         )
-        return {"dispatched": False, "reason": "no_administratum_pane"}
+        await log_event(
+            "administratum_record_dropped",
+            instance_id=event.instance_id,
+            device_id=event.source,
+            details={
+                "event_type": intervention.event_type,
+                "dedupe_key": intervention.dedupe_key,
+                "severity": intervention.severity,
+                "classification": classification,
+                "reason": "no_administratum_pane",
+                "log_file_written": True,
+            },
+        )
+        return {
+            "dispatched": False,
+            "reason": "no_administratum_pane",
+            "log_file_written": True,
+        }
 
     await _append_administratum_log(
         instance,
@@ -7180,6 +7349,239 @@ async def _dispatch_administratum_record(
     )
 
 
+# ── L2: enforcement defer queue (hold-and-queue under typing guard) ────────────
+
+
+async def _enforcement_still_warranted(
+    event: StateEvent, intervention: CustodesIntervention
+) -> tuple[bool, str]:
+    """Re-evaluate a deferred enforcement just before flushing it to Custodes.
+
+    Returns ``(warranted, reason)``. If the work signal made the enforcement moot
+    (typing was the appeal; the distraction/ack resolved while held), we drop it
+    DELIBERATELY (warranted=False) with a logged reason — never silently. Read-only:
+    this must not mutate state or log (the caller owns the drop record).
+    """
+    payload = event.payload or {}
+
+    # Ack ladder: if the expected ack is gone or no longer pending, the ladder
+    # resolved while we held — moot. (Read-only mirror of the negative-edge cancel.)
+    if event.event_type == "expected_ack_escalated" and payload.get("ack_id"):
+        ack = await _find_expected_ack(str(payload["ack_id"]), None, None)
+        if not ack:
+            return False, "ack_missing"
+        if ack.get("status") != EXPECTED_ACK_PENDING:
+            return False, "ack_not_pending"
+
+    # Phone distraction: if the phone is no longer the live distraction, the
+    # block/shock the nag refers to has already resolved — moot.
+    if event.source == "phone" and event.event_type in (
+        "phone_distraction_blocked",
+        "phone_distraction_enforce",
+    ):
+        if not PHONE_STATE.get("is_distracted", False):
+            return False, "phone_distraction_cleared"
+
+    return True, "warranted"
+
+
+async def _custodes_enforcement_defer_flush_once() -> list[dict]:
+    """Drain the Custodes-enforcement defer queue.
+
+    For each held item: if typing is still active AND we are within the bounded
+    window, leave it queued. Otherwise flush — re-checking staleness first
+    (drop deliberately as ``stale_after_typing`` if moot), else re-dispatching to
+    Custodes. Past the bounded timeout we deliver via a sanctioned, logged gate
+    override so a genuinely-still-warranted escalation is never lost.
+    """
+    results: list[dict] = []
+    typing_active = await asyncio.to_thread(_typing_guard_active)
+    now = time.time()
+
+    for item in list(_custodes_enforcement_defer_queue):
+        age = now - item["enqueued_at"]
+        timed_out = age >= _CUSTODES_DEFER_MAX_SECONDS
+        if typing_active and not timed_out:
+            # Still typing within the window: keep stalling (we don't lose).
+            continue
+
+        event: StateEvent = item["event"]
+        intervention: CustodesIntervention = item["intervention"]
+
+        warranted, stale_reason = await _enforcement_still_warranted(event, intervention)
+        if not warranted:
+            _custodes_enforcement_defer_queue.remove(item)
+            _custodes_state_debounce.pop(intervention.dedupe_key, None)
+            await _log_custodes_drop(
+                event,
+                intervention,
+                reason="stale_after_typing",
+                delivery={
+                    "dispatched": False,
+                    "reason": "stale_after_typing",
+                    "stale_reason": stale_reason,
+                    "held_seconds": round(age, 1),
+                },
+            )
+            results.append(
+                {
+                    "queue": "custodes_enforcement",
+                    "reason": "stale_after_typing",
+                    "stale_reason": stale_reason,
+                    "dispatched": False,
+                }
+            )
+            continue
+
+        async def cancel_check(stage: str, _e=event, _i=intervention) -> dict | None:
+            return await _custodes_intervention_negative_edge_cancel_result(_e, _i, stage=stage)
+
+        override_reason = None
+        if timed_out and typing_active:
+            # Bounded-timeout flush while still typing: deliver the (benign) Custodes
+            # pane nag via a sanctioned, audited gate override. The physical Pavlok
+            # path is separate and stays typing-guard-blocked.
+            override_reason = "custodes_enforcement_deferred_timeout"
+            os.environ["TMUX_SEND_GATE_ALLOW"] = override_reason
+        try:
+            delivery = await _dispatch_custodes_intervention_maybe_cancel(
+                intervention.behavioral_prompt, cancel_check
+            )
+        finally:
+            if override_reason is not None:
+                os.environ.pop("TMUX_SEND_GATE_ALLOW", None)
+
+        item["attempts"] = item.get("attempts", 0) + 1
+
+        if delivery.get("canceled"):
+            # Negative-edge resolved during flush — already logged by the canceller.
+            _custodes_enforcement_defer_queue.remove(item)
+            _custodes_state_debounce.pop(intervention.dedupe_key, None)
+            results.append(
+                {
+                    "queue": "custodes_enforcement",
+                    "reason": delivery.get("reason"),
+                    "dispatched": False,
+                }
+            )
+            continue
+
+        if delivery.get("gated") and not timed_out:
+            # Typing resumed between the predicate read and the send: keep stalling.
+            continue
+
+        # Delivered (or a terminal failure / forced timeout flush): leave the queue.
+        _custodes_enforcement_defer_queue.remove(item)
+        if delivery.get("dispatched"):
+            _custodes_state_debounce[intervention.dedupe_key] = {
+                "at": time.time(),
+                "severity": intervention.severity,
+            }
+        flush_reason = "flushed_timeout" if timed_out else "flushed_after_typing"
+        await _log_custodes_intervention_delivery(
+            event,
+            intervention,
+            delivery={
+                **delivery,
+                "flush_reason": flush_reason,
+                "held_seconds": round(age, 1),
+                "gate_override": override_reason,
+            },
+        )
+        results.append(
+            {
+                "queue": "custodes_enforcement",
+                "reason": flush_reason,
+                "dispatched": bool(delivery.get("dispatched")),
+            }
+        )
+
+    return results
+
+
+async def _custodes_enforcement_defer_worker() -> None:
+    """Periodic drain of the Custodes-enforcement defer queue."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            if _custodes_enforcement_defer_queue:
+                await _custodes_enforcement_defer_flush_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("custodes enforcement defer flush failed")
+
+
+async def _log_custodes_drop(
+    event: StateEvent,
+    intervention: CustodesIntervention,
+    *,
+    reason: str,
+    delivery: dict,
+) -> None:
+    """Log a Custodes-bound enforcement drop with an explicit, distinct reason.
+
+    Drops are first-class events (`custodes_intervention` with a non-dispatched
+    delivery) so leaks are visible in the log, never inferred from the absence
+    of a send. `feedback_no_error_suppressing_debounce`: surface, don't suppress.
+    """
+    await log_event(
+        "custodes_intervention",
+        instance_id=event.instance_id,
+        device_id=event.source,
+        details={
+            "event_type": intervention.event_type,
+            "dedupe_key": intervention.dedupe_key,
+            "severity": intervention.severity,
+            "audience_instance_id": "custodes",
+            "classification": "enforcement",
+            "prompt": intervention.behavioral_prompt,
+            "delivery": delivery,
+            "drop_reason": reason,
+        },
+    )
+
+
+async def _log_custodes_intervention_delivery(
+    event: StateEvent,
+    intervention: CustodesIntervention,
+    *,
+    delivery: dict,
+) -> None:
+    await log_event(
+        "custodes_intervention",
+        instance_id=delivery.get("instance_id") or event.instance_id,
+        device_id=event.source,
+        details={
+            "event_type": intervention.event_type,
+            "dedupe_key": intervention.dedupe_key,
+            "severity": intervention.severity,
+            "audience_instance_id": delivery.get("instance_id") or "custodes",
+            "classification": "enforcement",
+            "prompt": intervention.behavioral_prompt,
+            "delivery": delivery,
+        },
+    )
+
+
+def _enqueue_custodes_enforcement_defer(
+    event: StateEvent,
+    intervention: CustodesIntervention,
+    *,
+    gate_reason: str,
+) -> None:
+    _custodes_enforcement_defer_queue.append(
+        {
+            "event": event,
+            "intervention": intervention,
+            "dedupe_key": intervention.dedupe_key,
+            "gate_reason": gate_reason,
+            "enqueued_at": time.time(),
+            "attempts": 0,
+        }
+    )
+
+
 async def handle_custodes_state_event(
     event_type: str,
     source: str,
@@ -7187,8 +7589,18 @@ async def handle_custodes_state_event(
     instance_id: str | None = None,
     severity: int | None = None,
     payload: dict | None = None,
+    event_class: str | None = None,
+    quiet_hours_exempt: bool = False,
 ) -> dict:
-    """Internal router for state events that may wake Custodes."""
+    """Internal router for state events that may wake Custodes.
+
+    Format envelope (durable fix, Mars/Sessions/enforcement-hook-custodes-routing):
+    the emitter MAY declare ``event_class`` ('state'|'enforcement') and
+    ``quiet_hours_exempt`` in the request. When given, the declared class wins
+    over the policy-set fallback (`classify_trigger`). An unrecognized
+    ``event_type`` is no longer dropped to /dev/null — it defaults to an
+    Administratum record so the leak is captured, not lost.
+    """
     event = StateEvent(
         event_type=event_type,
         source=source,
@@ -7214,14 +7626,52 @@ async def handle_custodes_state_event(
 
     intervention = evaluate_state_event(event, await _custodes_state_snapshot())
     if intervention is None:
+        # Unknown event_type: do NOT drop to /dev/null. Default to an Administratum
+        # record so an unregistered hook is captured (a visible leak), never lost.
+        # If the emitter declared event_class='enforcement' we still only record —
+        # an unknown name has no behavioral prompt to escalate; registering it is
+        # the durable fix (see L1).
+        unknown_intervention = CustodesIntervention(
+            event_type=event_type,
+            dedupe_key=dedupe_key,
+            severity=normalized_severity,
+            prompt="",
+            reason="unknown_event_type",
+            payload=payload or {},
+            observed=", ".join(_snapshot_items({}, payload or {}, source)) or "no extra state",
+        )
+        administratum_delivery = await _dispatch_administratum_record(
+            event, unknown_intervention, "state"
+        )
+        await log_event(
+            "administratum_record",
+            instance_id=instance_id,
+            device_id=source,
+            details={
+                "event_type": event_type,
+                "dedupe_key": dedupe_key,
+                "severity": normalized_severity,
+                "classification": "unknown",
+                "audience_instance_id": "administratum",
+                "delivery": administratum_delivery,
+                "declared_class": event_class,
+            },
+        )
         return {
             "received": True,
             "intervention_dispatched": False,
+            "routed_to": "administratum",
+            "classification": "unknown",
             "dedupe_key": dedupe_key,
-            "reason": "no_policy_match",
+            "reason": "unknown_event_recorded_to_administratum",
+            "administratum_delivery": administratum_delivery,
         }
 
-    classification = classify_trigger(intervention.event_type)
+    # Declared class (envelope) wins over the policy-set fallback.
+    if event_class in ("state", "enforcement"):
+        classification = event_class
+    else:
+        classification = classify_trigger(intervention.event_type)
 
     # Administratum seizes the full state-hook stream: every recognized hook is
     # recorded + pushed to the recorder's pane immediately, ungated by quiet-hours
@@ -7255,9 +7705,28 @@ async def handle_custodes_state_event(
             "administratum_delivery": administratum_delivery,
         }
 
+    # L5: the enforcement branch also logs its Administratum record copy (the
+    # state branch already did; the enforcement copy previously went unlogged, so
+    # a lost record on the enforcement path was invisible). Now both branches emit
+    # an `administratum_record` event reflecting the delivery (incl. fallbacks).
+    await log_event(
+        "administratum_record",
+        instance_id=instance_id,
+        device_id=source,
+        details={
+            "event_type": intervention.event_type,
+            "dedupe_key": intervention.dedupe_key,
+            "severity": intervention.severity,
+            "classification": "enforcement",
+            "audience_instance_id": "administratum",
+            "delivery": administratum_delivery,
+            "note": "record_copy_alongside_custodes_escalation",
+        },
+    )
+
     # Enforcement hooks still escalate to Custodes — but stripped to behavioral
     # info only; the full metadata lives in the Administratum record above.
-    if is_quiet_hours():
+    if is_quiet_hours() and not quiet_hours_exempt:
         suppression = await log_quiet_hours_suppressed(
             source=source,
             event_type=f"custodes_state_event:{event_type}",
@@ -7298,6 +7767,20 @@ async def handle_custodes_state_event(
         intervention.severity,
     )
     if suppressed:
+        # Observability: a dedupe-suppressed enforcement is a DROP — log it with an
+        # explicit reason so the leak is visible, not inferred from a missing send.
+        await log_event(
+            "custodes_intervention_dropped",
+            instance_id=instance_id,
+            device_id=source,
+            details={
+                "event_type": intervention.event_type,
+                "dedupe_key": intervention.dedupe_key,
+                "severity": intervention.severity,
+                "classification": "enforcement",
+                "reason": dedupe_reason,
+            },
+        )
         return {
             "received": True,
             "intervention_dispatched": False,
@@ -7333,6 +7816,35 @@ async def handle_custodes_state_event(
             "dedupe_key": intervention.dedupe_key,
             "reason": delivery.get("reason", _CUSTODES_CANCEL_REASON),
             "cancel_details": delivery.get("cancel_details"),
+        }
+
+    # L2: the universal typing-guard send gate suppressed the pane write — NO bytes
+    # reached Custodes. This is NOT a loss: HOLD-AND-QUEUE the enforcement and flush
+    # when typing stops (or after a bounded timeout), re-checking staleness first.
+    # "We don't lose, we stall." (D2, Emperor 2026-05-31.)
+    if delivery.get("gated"):
+        gate_reason = delivery.get("gate_reason") or "typing_guard"
+        _enqueue_custodes_enforcement_defer(event, intervention, gate_reason=gate_reason)
+        await _log_custodes_drop(
+            event,
+            intervention,
+            reason="deferred",
+            delivery={
+                "dispatched": False,
+                "reason": "deferred",
+                "gate_reason": gate_reason,
+                "queue_depth": len(_custodes_enforcement_defer_queue),
+            },
+        )
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "routed_to": "custodes",
+            "classification": "enforcement",
+            "dedupe_key": intervention.dedupe_key,
+            "reason": "deferred",
+            "gate_reason": gate_reason,
+            "administratum_delivery": administratum_delivery,
         }
     if delivery.get("dispatched"):
         _custodes_state_debounce[intervention.dedupe_key] = {
@@ -7375,6 +7887,8 @@ async def custodes_state_event_endpoint(request: CustodesStateEventRequest):
         instance_id=request.instance_id,
         severity=request.severity,
         payload=request.payload,
+        event_class=request.event_class,
+        quiet_hours_exempt=request.quiet_hours_exempt,
     )
 
 
@@ -10547,7 +11061,7 @@ from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
 
-enforce_init_deps(is_quiet_hours=is_quiet_hours)
+enforce_init_deps(is_quiet_hours=is_quiet_hours, typing_guard_active=_typing_guard_active)
 
 # Wire voice route dependencies
 from routes.voice import init_deps as voice_init_deps

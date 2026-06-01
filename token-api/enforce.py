@@ -29,13 +29,16 @@ class EnforceRequest(BaseModel):
 
 
 _is_quiet_hours = None
+_typing_guard_active = None
 
 
-def init_deps(*, is_quiet_hours=None) -> None:
+def init_deps(*, is_quiet_hours=None, typing_guard_active=None) -> None:
     """Late-bind dependencies from main.py to avoid circular imports."""
-    global _is_quiet_hours
+    global _is_quiet_hours, _typing_guard_active
     if is_quiet_hours is not None:
         _is_quiet_hours = is_quiet_hours
+    if typing_guard_active is not None:
+        _typing_guard_active = typing_guard_active
 
 
 def _in_meeting() -> bool:
@@ -58,6 +61,20 @@ async def enforce(request: EnforceRequest) -> dict:
             },
         )
         return {"fired": False, "blocked_by": "quiet_hours"}
+
+    # The physical Pavlok stays typing-guard-blocked: typing IS the appeal — if the
+    # Emperor is actively at the keyboard the shock is held, not fired (D2, Emperor
+    # 2026-05-31). Mirrors the universal send gate's typing-guard predicate.
+    if _typing_guard_active and _typing_guard_active():
+        await log_event(
+            "enforce_blocked",
+            details={
+                "reason": "typing_guard",
+                "source": request.source,
+                "message": request.message[:200],
+            },
+        )
+        return {"fired": False, "blocked_by": "typing_guard"}
 
     if _in_meeting():
         await log_event(
