@@ -149,3 +149,110 @@ async def test_gated_then_cleared_gate_flushes_to_sent(app_env: Any, monkeypatch
     assert results[0]["status"] == main.PANE_WRITE_SENT
     assert results[0]["verification_status"] == "unverified"
     assert _fetch_status(app_env.db_path, queued["id"]) == "sent"
+
+
+# ---- brief clears/replaces a stale composer instead of deferring forever -----
+
+
+async def _has_pending_input(_pane: str) -> bool:
+    return True
+
+
+async def test_brief_clears_stale_composer_instead_of_deferring(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    """A brief to a composer that already holds text must NOT wedge as deferred.
+
+    Live symptom: a leftover draft in the target composer kept the additive
+    deferral returning pending forever, so the brief never delivered. brief now
+    clears/replaces (clear_prompt) and submits.
+    """
+    main = app_env.main
+    # Composer has text — the old behavior deferred here permanently.
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _has_pending_input)
+
+    seen: dict[str, Any] = {}
+
+    async def _ok(pane, payload, *, clear_prompt=False):
+        seen["clear_prompt"] = clear_prompt
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "submitted",
+            "verified_by": "composer_cleared",
+        }
+
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
+
+    queued = await main.enqueue_pane_write(
+        instance_id="fg-1",
+        tmux_pane="%9",
+        source="brief",
+        purpose="brief_send",
+        payload="brief for FG",
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert len(results) == 1
+    assert results[0]["status"] == main.PANE_WRITE_SENT
+    assert seen["clear_prompt"] is True, "brief must clear/replace the composer"
+    assert _fetch_status(app_env.db_path, queued["id"]) == "sent"
+
+
+async def test_nonbrief_still_defers_on_pending_input(app_env: Any, monkeypatch: Any) -> None:
+    """Regression guard: non-brief writes keep deferring on a busy composer."""
+    main = app_env.main
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _has_pending_input)
+
+    queued = await main.enqueue_pane_write(
+        instance_id="fg-1",
+        tmux_pane="%9",
+        source="enforcement",
+        purpose="nudge",
+        payload="nudge",
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert len(results) == 1
+    assert results[0]["status"] == main.PANE_WRITE_PENDING
+    assert results[0]["reason"] == "dispatch_deferred"
+    assert _fetch_status(app_env.db_path, queued["id"]) == "pending"
+
+
+# ---- submission confirmation: clear_prompt upgrades verification ------------
+
+
+async def test_clear_prompt_confirms_submission_when_composer_clears(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", lambda self, t, x, **k: None)
+    # After submit the composer is empty -> submission confirmed.
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+
+    result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
+
+    assert result["returncode"] == 0
+    assert result["verification_status"] == "submitted"
+    assert result["verified_by"] == "composer_cleared"
+
+
+async def test_clear_prompt_stays_unverified_when_composer_not_cleared(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", lambda self, t, x, **k: None)
+    # Composer still holds text -> submit not proven, stays unverified.
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _has_pending_input)
+
+    result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
+
+    assert result["returncode"] == 0
+    assert result["verification_status"] == "unverified"
+    assert result["verified_by"] is None
