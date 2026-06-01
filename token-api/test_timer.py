@@ -15,6 +15,7 @@ from timer import (
     TimerEvent,
     TimerMode,
     format_timer_time,
+    work_session_enforcement_action,
 )
 
 # ---- Helpers ----
@@ -1100,3 +1101,110 @@ class TestEdgeCases:
         engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
         engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=5000)
         assert engine.distraction_started_ms is None
+
+
+class TestWorkSession:
+    """Work-session local-0 reset: start/end/cancel accounting + serialization."""
+
+    def test_start_saves_original_and_zeroes_balance(self):
+        engine = make_engine(0)
+        engine._break_balance_ms = -7_200_000  # -2h debt
+        info = engine.start_work_session(started_at="2026-02-11T09:00:00")
+        assert engine.work_session_active is True
+        assert engine.work_session_original_break_ms == -7_200_000
+        assert engine.break_balance_ms == 0  # local 0 / break-even
+        assert info["original_break_ms"] == -7_200_000
+        assert engine.work_session_started_at == "2026-02-11T09:00:00"
+
+    def test_end_folds_earned_into_original(self):
+        """The headline case: -2h, earn +30m, end -> -1h30m."""
+        engine = make_engine(0)
+        engine._break_balance_ms = -7_200_000
+        engine.start_work_session()
+        engine._break_balance_ms = 1_800_000  # earned +30m during the session
+        info = engine.end_work_session()
+        assert engine.work_session_active is False
+        assert engine.break_balance_ms == -5_400_000  # -1h30m
+        assert info == {
+            "original_break_ms": -7_200_000,
+            "earned_ms": 1_800_000,
+            "break_balance_ms": -5_400_000,
+        }
+
+    def test_cancel_restores_original_and_forfeits_earned(self):
+        engine = make_engine(0)
+        engine._break_balance_ms = -3_600_000  # -1h
+        engine.start_work_session()
+        engine._break_balance_ms = 600_000  # earned +10m
+        info = engine.cancel_work_session()
+        assert engine.work_session_active is False
+        assert engine.break_balance_ms == -3_600_000  # back to original; earned forfeited
+        assert info["forfeited_ms"] == 600_000
+
+    def test_end_when_still_negative_goes_deeper(self):
+        """If the session itself ends negative, the diff folds in honestly."""
+        engine = make_engine(0)
+        engine._break_balance_ms = -3_600_000
+        engine.start_work_session()
+        engine._break_balance_ms = -600_000  # net -10m during the session
+        engine.end_work_session()
+        assert engine.break_balance_ms == -4_200_000  # deeper: -1h10m
+
+    def test_serialization_round_trip_mid_session(self):
+        """A restart mid-session must preserve active + saved original."""
+        engine = make_engine(0)
+        engine._break_balance_ms = -3_600_000
+        engine.start_work_session(started_at="2026-02-11T10:00:00")
+        engine._break_balance_ms = 600_000
+        restored = TimerEngine(now_mono_ms=0)
+        restored.from_dict(engine.to_dict(0), 0)
+        assert restored.work_session_active is True
+        assert restored.work_session_original_break_ms == -3_600_000
+        assert restored.break_balance_ms == 600_000
+        assert restored.work_session_started_at == "2026-02-11T10:00:00"
+        # ...and end still folds correctly after the restart.
+        restored.end_work_session()
+        assert restored.break_balance_ms == -3_000_000  # -50m
+
+    def test_pre_feature_state_loads_inactive(self):
+        """States persisted before this feature have no work-session keys."""
+        engine = make_engine(0)
+        engine.from_dict({"format_version": 2, "break_balance_ms": -1000}, 0)
+        assert engine.work_session_active is False
+        assert engine.work_session_original_break_ms == 0
+
+
+class TestWorkSessionEnforcementPolicy:
+    """Pure policy gate: when a dip below local 0 should zap vs cancel."""
+
+    THRESHOLD = -30_000  # -30s of debt
+
+    def _action(self, balance_ms, *, active=True, already_zapped=False):
+        return work_session_enforcement_action(
+            active=active,
+            balance_ms=balance_ms,
+            cancel_threshold_ms=self.THRESHOLD,
+            already_zapped=already_zapped,
+        )
+
+    def test_inactive_session_never_acts(self):
+        assert self._action(-999_999, active=False) == "none"
+
+    def test_break_even_or_positive_is_none(self):
+        assert self._action(0) == "none"
+        assert self._action(5_000) == "none"
+
+    def test_first_dip_below_zero_zaps(self):
+        assert self._action(-1_000) == "zap"
+        assert self._action(-29_000) == "zap"
+
+    def test_latched_dip_does_not_re_zap(self):
+        assert self._action(-10_000, already_zapped=True) == "none"
+
+    def test_threshold_triggers_cancel(self):
+        assert self._action(-30_000) == "cancel"
+        assert self._action(-120_000) == "cancel"
+
+    def test_cancel_wins_even_when_already_zapped(self):
+        """Past the threshold it cancels regardless of the dip latch."""
+        assert self._action(-45_000, already_zapped=True) == "cancel"

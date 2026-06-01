@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Work session: temporarily reset the break balance to a "local 0", then on end
+# fold the break accrued during the session back into the real balance.
+# TAGS: token-api
+# AUDIENCE: agent,human
+#
+# Why: when the break balance is deeply negative, "playing it out" to dig the
+# whole hole back can be demoralizing. A work session lets you declare a fresh
+# slate (treated as break-even from this moment), work, and on end the break you
+# earned during the session is added to your *original* balance. You still owe
+# the original debt — but you bank progress in human-sized chunks.
+#
+# Going negative during a session is a FAILURE: the server zaps at 100 and
+# redirects, and auto-cancels the session if you fall 30s of debt below local 0.
+#
+# Server owns the session state (timer engine + DB), so it survives restarts and
+# the tick loop can enforce in real time. This is a thin client over:
+#   GET/POST /api/timer/work-session[/start|/end|/cancel]
+#
+# Usage:
+#   work-session start     # save real break, reset to local 0, begin
+#   work-session status    # show session + what `end` would produce
+#   work-session end       # fold accrued break into the original, finish
+#   work-session cancel    # abort: restore original break, discard accrual
+
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/../lib/nas-path.sh" 2>/dev/null || true
+
+API="${TOKEN_API_URL:-http://localhost:7777}"
+
+die() { echo "error: $1" >&2; exit 1; }
+
+# POST/GET a work-session endpoint; on HTTP error surface the server's detail.
+call() {
+    local method="$1" path="$2"
+    local body http
+    body="$(curl -sS -X "$method" -w $'\n%{http_code}' "$API$path" 2>/dev/null)" \
+        || die "could not reach Token-API at $API"
+    http="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    if [[ "$http" -ge 400 ]]; then
+        local detail
+        detail="$(printf '%s' "$body" | python3 -c "import sys,json;print(json.load(sys.stdin).get('detail','HTTP '+'$http'))" 2>/dev/null || echo "HTTP $http")"
+        die "$detail"
+    fi
+    printf '%s' "$body"
+}
+
+# Pretty-print a signed second count as e.g. "-1h30m" / "+45m" / "0".
+fmt() {
+    python3 - "$1" <<'PY'
+import sys
+s = int(round(float(sys.argv[1])))
+sign = "-" if s < 0 else "+" if s > 0 else ""
+s = abs(s)
+h, rem = divmod(s, 3600)
+m, _ = divmod(rem, 60)
+if h and m: out = f"{h}h{m}m"
+elif h:     out = f"{h}h"
+elif m:     out = f"{m}m"
+else:       out = f"{s}s" if s else "0"
+print(f"{sign}{out}" if out != "0" else "0")
+PY
+}
+
+# Extract a field from a JSON blob on stdin.
+field() { python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))"; }
+
+case "${1:-}" in
+    -h|--help|"")
+        sed -n '2,25p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+
+    start)
+        resp="$(call POST /api/timer/work-session/start)"
+        original="$(printf '%s' "$resp" | field original_break_seconds)"
+        echo "Work session started."
+        echo "  Real balance saved: $(fmt "$original")"
+        echo "  You are now at local 0 (break-even). Go work."
+        if [[ "${original%.*}" -ge 0 ]]; then
+            echo "  note: balance was not negative — you had nothing to dig out of."
+        fi
+        echo "  WARNING: going negative now is a failure — zap at 100 + redirect,"
+        echo "           auto-cancel if you fall 30s below local 0."
+        ;;
+
+    status)
+        resp="$(call GET /api/timer/work-session)"
+        active="$(printf '%s' "$resp" | field active)"
+        if [[ "$active" != "True" ]]; then
+            echo "No active work session."
+            exit 0
+        fi
+        original="$(printf '%s' "$resp" | field original_break_seconds)"
+        earned="$(printf '%s' "$resp" | field earned_seconds)"
+        projected="$(printf '%s' "$resp" | field projected_break_seconds)"
+        started="$(printf '%s' "$resp" | field started_at)"
+        echo "Work session ACTIVE (since $started)"
+        echo "  Original balance:    $(fmt "$original")"
+        echo "  Earned this session: $(fmt "$earned")"
+        echo "  If you end now ->    $(fmt "$projected")"
+        ;;
+
+    end)
+        resp="$(call POST /api/timer/work-session/end)"
+        original="$(printf '%s' "$resp" | field original_break_ms)"
+        earned="$(printf '%s' "$resp" | field earned_ms)"
+        newbal="$(printf '%s' "$resp" | field break_balance_ms)"
+        echo "Work session ended."
+        echo "  Original:    $(fmt "$(( original / 1000 ))")"
+        echo "  Earned:      $(fmt "$(( earned / 1000 ))")"
+        echo "  New balance: $(fmt "$(( newbal / 1000 ))")"
+        ;;
+
+    cancel)
+        resp="$(call POST /api/timer/work-session/cancel)"
+        original="$(printf '%s' "$resp" | field original_break_ms)"
+        forfeited="$(printf '%s' "$resp" | field forfeited_ms)"
+        echo "Work session cancelled — restored original balance: $(fmt "$(( original / 1000 ))")"
+        echo "  (forfeited $(fmt "$(( forfeited / 1000 ))") earned during the session)"
+        ;;
+
+    *)
+        die "unknown command '$1' (use start|status|end|cancel)"
+        ;;
+esac
