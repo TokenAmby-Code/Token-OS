@@ -14,6 +14,12 @@ V1_TRIGGERS = {
     "distraction_timeout",
     "break_exhausted",
     "phone_distraction_blocked",
+    # `phone_distraction_enforce` is the shock-coupled phone path
+    # (`start_enforcement_cascade`, fired beside the physical Pavlok). It is a
+    # DISTINCT, ADDITIVE name from the lower-severity `phone_distraction_blocked`
+    # — registered (not renamed) so analytics + the quiet-hours suppression log
+    # keep keying on the existing string. See Mars/Sessions/enforcement-hook-custodes-routing.
+    "phone_distraction_enforce",
     "desktop_mode_blocked",
     "enforcement_cascade_started",
     "enforcement_cascade_escalate",
@@ -30,6 +36,7 @@ ENFORCEMENT_TRIGGERS = {
     "enforcement_cascade_escalate",
     "expected_ack_escalated",
     "phone_distraction_blocked",
+    "phone_distraction_enforce",
     "desktop_mode_blocked",
 }
 
@@ -229,6 +236,7 @@ def evaluate_state_event(
         "distraction_timeout": "Intervene immediately: close the distraction loop and redirect to one concrete work action.",
         "break_exhausted": "Intervene about exhausted break balance and restart work with the smallest next action.",
         "phone_distraction_blocked": "Intervene about the blocked phone distraction and redirect attention back to work.",
+        "phone_distraction_enforce": "Intervene about the shocked phone distraction (Pavlok already fired); redirect attention back to work immediately.",
         "desktop_mode_blocked": "Intervene about the blocked desktop mode and redirect to the active task.",
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
