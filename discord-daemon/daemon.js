@@ -23,9 +23,12 @@ mkdirSync(LOG_DIR, { recursive: true });
 
 // --- Logger ---
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
-const FIXER_INSTANCE_ENV = 'DISCORD_VOICE_FIXER_INSTANCE_ID';
-const FIXER_INSTANCE_TMUX_OPTION = '@DISCORD_VOICE_FIXER_INSTANCE_ID';
-const FIXER_PANE_TMUX_OPTION = '@DISCORD_VOICE_FIXER_PANE';
+// FG config knob: a named child label to redirect Discord error logs to, so FG
+// is not hounded by a child's own active work. Empty = route to FG (default).
+// The actual target is resolved against LIVE instances by token-api at fire
+// time — no stale @DISCORD_VOICE_FIXER_INSTANCE_ID / _PANE markers are trusted.
+const FIXER_REDIRECT_ENV = 'DISCORD_VOICE_FIXER_REDIRECT';
+const FIXER_REDIRECT_TMUX_OPTION = '@DISCORD_VOICE_FIXER_REDIRECT';
 
 function tmuxExecOptions(extra = {}) {
   const { TMUX, ...env } = process.env;
@@ -60,11 +63,20 @@ function createDiscordFixerHook() {
   const RECENT_MAX = 500;
   const agentCmd = join(BASE_DIR, 'cli-tools', 'bin', 'agent-cmd');
 
-  function resolveFixerInstanceId() {
-    const envValue = process.env[FIXER_INSTANCE_ENV];
+  let cachedPort = null;
+  function tokenApiPort() {
+    if (cachedPort) return cachedPort;
+    try { cachedPort = loadConfig().token_api_port; } catch {}
+    cachedPort = cachedPort || 7777;
+    return cachedPort;
+  }
+
+  function resolveFixerRedirect() {
+    // FG's config knob: the named child label to receive Discord error logs.
+    const envValue = process.env[FIXER_REDIRECT_ENV];
     if (envValue) return envValue.trim();
     try {
-      return execFileSync('tmux', ['show-options', '-gqv', FIXER_INSTANCE_TMUX_OPTION], tmuxExecOptions({
+      return execFileSync('tmux', ['show-options', '-gqv', FIXER_REDIRECT_TMUX_OPTION], tmuxExecOptions({
         encoding: 'utf8',
         timeout: 3000,
       })).trim();
@@ -73,33 +85,24 @@ function createDiscordFixerHook() {
     }
   }
 
-  function resolveFixerPane(fixerInstanceId) {
+  async function resolveLiveFixerTarget() {
+    // Resolve the routing target against LIVE instances at fire time: FG by
+    // default, or FG's named child when the redirect knob is set and live.
+    // Returns {instance_id, tmux_pane, label, source} or null — never a stale
+    // session-stub or a dead fallback pane.
+    const redirect = resolveFixerRedirect();
+    const qs = redirect ? `?redirect=${encodeURIComponent(redirect)}` : '';
     try {
-      const explicitPane = execFileSync('tmux', ['show-options', '-gqv', FIXER_PANE_TMUX_OPTION], tmuxExecOptions({
-        encoding: 'utf8',
-        timeout: 3000,
-      })).trim();
-      if (explicitPane?.startsWith?.('%')) return explicitPane;
-    } catch {}
-
-    if (!fixerInstanceId) return '';
-    try {
-      const out = execFileSync('tmux', [
-        'list-panes',
-        '-a',
-        '-F',
-        `#{pane_id}\t#{session_name}\t#{${FIXER_INSTANCE_TMUX_OPTION}}`,
-      ], tmuxExecOptions({ encoding: 'utf8', timeout: 3000 }));
-      for (const line of out.split(/\r?\n/)) {
-        if (!line) continue;
-        const [pane, sessionName, marker] = line.split('\t');
-        if (sessionName === 'discord-daemon') continue;
-        if (marker?.trim() === fixerInstanceId && pane?.startsWith?.('%')) return pane;
-      }
+      const resp = await fetch(`http://127.0.0.1:${tokenApiPort()}/api/discord/fixer-target${qs}`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      return data?.target || null;
     } catch {
-      return '';
+      return null;
     }
-    return '';
   }
 
   function pasteFixerPromptToPane(pane, prompt, logFile) {
@@ -140,10 +143,7 @@ function createDiscordFixerHook() {
     });
   }
 
-  return function hookDiscordError(line, msg, meta = {}, logFile) {
-    const fixerInstanceId = resolveFixerInstanceId();
-    if (!fixerInstanceId) return;
-
+  return async function hookDiscordError(line, msg, meta = {}, logFile) {
     const errorCode = classifyErrorCode(msg, meta);
     const key = `${errorCode}:${String(msg).slice(0, 180)}`;
     const now = Date.now();
@@ -158,12 +158,31 @@ function createDiscordFixerHook() {
     if (now - last < 30_000) return;
     recent.set(key, now);
 
+    // Resolve the routing target against LIVE instances at fire time: FG by
+    // default, or FG's named child via the redirect knob. If nothing live
+    // resolves, DROP — never dead-letter into a stale stub or someone else's
+    // pane (the bug that repeatedly spammed the Custodes pane).
+    let target = null;
+    try {
+      target = await resolveLiveFixerTarget();
+    } catch {
+      target = null;
+    }
+    if (!target || !target.instance_id) {
+      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook: no LIVE fixer target (FG offline / redirect dead); dropping ${errorCode}`;
+      console.log(failLine);
+      try { appendFileSync(logFile, failLine + '\n'); } catch {}
+      return;
+    }
+
     const recentLog = tailFile(logFile, 80);
     const prompt = [
       'Discord voice routing state hook to active fixer.',
       '',
       `error_code: ${errorCode}`,
-      `fixer_instance_id: ${fixerInstanceId}`,
+      `fixer_instance_id: ${target.instance_id}`,
+      `fixer_label: ${target.label || ''}`,
+      `fixer_source: ${target.source || ''}`,
       `timestamp: ${new Date(now).toISOString()}`,
       `trigger: ${msg}`,
       '',
@@ -173,15 +192,17 @@ function createDiscordFixerHook() {
       '```',
     ].join('\n');
 
-    sendFixerPrompt(['--instance', fixerInstanceId], prompt, logFile, (instanceError) => {
-      const fixerPane = resolveFixerPane(fixerInstanceId);
-      if (!fixerPane) {
-        const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook failed: ${instanceError}; no pane marked ${FIXER_INSTANCE_TMUX_OPTION}=${fixerInstanceId}`;
+    sendFixerPrompt(['--instance', target.instance_id], prompt, logFile, (instanceError) => {
+      // Live-pane fallback: only the pane the resolver verified for THIS target
+      // (never a hardcoded/stale pane). Skip the paste if it is not a real pane.
+      const fixerPane = target.tmux_pane;
+      if (!fixerPane || !fixerPane.startsWith('%')) {
+        const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook failed: ${instanceError}; target ${target.instance_id} has no live pane`;
         console.log(failLine);
         try { appendFileSync(logFile, failLine + '\n'); } catch {}
         return;
       }
-      const fallbackPrompt = `${prompt}\n\n(instance delivery failed, raw tmux pane fallback used: ${instanceError})`;
+      const fallbackPrompt = `${prompt}\n\n(instance delivery failed, live-pane fallback used: ${instanceError})`;
       pasteFixerPromptToPane(fixerPane, fallbackPrompt, logFile);
     });
   };
@@ -203,7 +224,7 @@ function createLogger(level = 'info') {
       // Don't crash on log write failure
     }
     if (lvl === 'error') {
-      try { discordFixerHook(line, msg, meta, logFile); } catch {}
+      try { Promise.resolve(discordFixerHook(line, msg, meta, logFile)).catch(() => {}); } catch {}
     }
   }
 

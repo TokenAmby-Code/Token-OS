@@ -18246,6 +18246,71 @@ async def _resolve_selected_tmux_pane() -> str | None:
         return None
 
 
+_DISCORD_FIXER_FG_LABEL = "mechanicus:fabricator-general"
+
+
+async def _resolve_discord_fixer_target(redirect: str | None = None) -> dict:
+    """Resolve the LIVE target for Discord error-log routing, at fire time.
+
+    Default target is the live Fabricator General. FG owns a config knob to
+    redirect error logs to one of its named LIVE children (so FG is not hounded
+    by a child's own active work). The target is resolved against the live
+    instance registry every call — it NEVER returns a stopped session-stub or a
+    dead fallback pane (the failure mode that dead-lettered into the Custodes
+    pane). When no live FG exists the caller is told so and must drop, not
+    paste blindly.
+    """
+    redirect = (redirect or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, tmux_pane, pane_label, tab_name, parent_instance_id, status
+               FROM claude_instances
+               WHERE status IN ('idle', 'processing') AND tmux_pane IS NOT NULL"""
+        )
+        live = [dict(row) for row in await cursor.fetchall()]
+
+    fg = next((r for r in live if (r.get("pane_label") or "") == _DISCORD_FIXER_FG_LABEL), None)
+    if not fg:
+        return {"success": True, "target": None, "reason": "no_live_fabricator_general"}
+
+    def _as_target(row: dict, source: str) -> dict:
+        return {
+            "instance_id": row["id"],
+            "tmux_pane": row["tmux_pane"],
+            "label": row.get("pane_label") or row.get("tab_name"),
+            "source": source,
+        }
+
+    if redirect:
+        child = next(
+            (
+                r
+                for r in live
+                if r.get("parent_instance_id") == fg["id"]
+                and redirect in {r.get("pane_label"), r.get("tab_name")}
+            ),
+            None,
+        )
+        if child:
+            return {"success": True, "target": _as_target(child, "redirect_child"), "reason": None}
+        # The redirect named a target that is not a live FG child — fall back to
+        # FG rather than dropping, and report why the redirect was not honored.
+        return {
+            "success": True,
+            "target": _as_target(fg, "fg"),
+            "reason": "redirect_not_live_child",
+        }
+
+    return {"success": True, "target": _as_target(fg, "fg"), "reason": None}
+
+
+@app.get("/api/discord/fixer-target")
+async def discord_fixer_target(redirect: str | None = None) -> dict:
+    """Live routing target for Discord error logs (FG default, child redirect)."""
+    return await _resolve_discord_fixer_target(redirect)
+
+
 async def _discord_voice_error_message(bot: str, error_msg: str):
     """Send immediate Discord VC TTS feedback for a voice routing failure."""
     try:
