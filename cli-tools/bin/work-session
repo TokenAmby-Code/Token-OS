@@ -35,7 +35,7 @@ die() { echo "error: $1" >&2; exit 1; }
 call() {
     local method="$1" path="$2"
     local body http
-    body="$(curl -sS -X "$method" -w $'\n%{http_code}' "$API$path" 2>/dev/null)" \
+    body="$(curl -sS --connect-timeout 5 --max-time 15 -X "$method" -w $'\n%{http_code}' "$API$path" 2>/dev/null)" \
         || die "could not reach Token-API at $API"
     http="${body##*$'\n'}"
     body="${body%$'\n'*}"

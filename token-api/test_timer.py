@@ -1173,6 +1173,19 @@ class TestWorkSession:
         assert engine.work_session_active is False
         assert engine.work_session_original_break_ms == 0
 
+    def test_daily_reset_clears_active_session(self):
+        """A daily reset mid-session must end the session and drop the saved
+        original debt — otherwise a later end() would re-impose the old debt."""
+        engine = make_engine(0, "2026-02-10")
+        engine._break_balance_ms = -7_200_000  # -2h debt
+        engine.start_work_session()
+        assert engine.work_session_active is True
+        assert engine.work_session_original_break_ms == -7_200_000
+        # Cross the reset hour into a new day.
+        engine.tick(1_000, "2026-02-11", current_hour=8)
+        assert engine.work_session_active is False
+        assert engine.work_session_original_break_ms == 0
+
 
 class TestWorkSessionEnforcementPolicy:
     """Pure policy gate: when a dip below local 0 should zap vs cancel."""

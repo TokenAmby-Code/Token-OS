@@ -8937,9 +8937,13 @@ NEGATIVE_BREAK_REFIRE_INTERVAL_MS = int(
 # Work session: dipping the break balance below local 0 is a failure. Any dip
 # below 0 zaps at full intensity + redirects; reaching this threshold (-30s of
 # debt) auto-cancels the session (restore original balance, forfeit earned break).
-WORK_SESSION_CANCEL_THRESHOLD_MS = int(
-    os.environ.get("WORK_SESSION_CANCEL_THRESHOLD_MS", str(-30 * 1000))
-)
+try:
+    WORK_SESSION_CANCEL_THRESHOLD_MS = int(
+        os.environ.get("WORK_SESSION_CANCEL_THRESHOLD_MS", str(-30 * 1000))
+    )
+except ValueError:
+    logger.warning("Invalid WORK_SESSION_CANCEL_THRESHOLD_MS; using default -30000")
+    WORK_SESSION_CANCEL_THRESHOLD_MS = -30 * 1000
 
 
 def _break_penalty_rational(multiplier: float) -> tuple[int, int]:

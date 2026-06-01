@@ -1011,6 +1011,7 @@ class TimerEngine:
         self._activity = Activity.WORKING
         self._productivity_active = True
         self._clear_manual_mode()
+        self._clear_work_session()
         self._activity_substate = {"distraction_started_ms": None, "is_scrolling_gaming": False}
         self._productivity_substate = {
             "idle_entered_ms": None,
