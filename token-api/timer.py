@@ -138,6 +138,17 @@ class TimerEngine:
         self._total_break_time_ms: int = 0
         self._break_balance_ms: int = 0  # positive = available, negative = backlog/debt
 
+        # ---- Per-class accrual shadow accounting (billable vs personal) ----
+        # ADDITIVE and DESCRIPTIVE: split work + earned break per work-class so we
+        # can show on-the-clock (billable Civic) vs personal-dev (Imperium)
+        # distinctly. These NEVER feed break_balance_ms or any enforcement
+        # decision — the single break pool above is the live engine, untouched.
+        # See billable.py / the break-accrual-true-work-split design doc.
+        # Keys are the plain CLASS_KEYS strings so this stays import-free/pure.
+        self._work_split: dict[str, int] = {"billable": 0, "personal": 0, "unknown": 0}
+        self._class_work_ms: dict[str, int] = {"billable": 0, "personal": 0, "unknown": 0}
+        self._class_break_ms: dict[str, int] = {"billable": 0, "personal": 0, "unknown": 0}
+
         # Timing
         self._daily_start_date: str | None = None
         self._last_tick_ms: int = now_mono_ms
@@ -222,6 +233,26 @@ class TimerEngine:
     @property
     def total_break_time_ms(self) -> int:
         return self._total_break_time_ms
+
+    @property
+    def work_split(self) -> dict[str, int]:
+        """Current per-class active-instance counts (billable/personal/unknown)."""
+        return dict(self._work_split)
+
+    @property
+    def class_work_ms(self) -> dict[str, int]:
+        """Cumulative work time attributed per class (shadow accounting)."""
+        return dict(self._class_work_ms)
+
+    @property
+    def class_break_ms(self) -> dict[str, int]:
+        """Cumulative break earned/spent attributed per class (shadow accounting)."""
+        return dict(self._class_break_ms)
+
+    @property
+    def work_instances(self) -> int:
+        """x numerator: total provably-working active instances across classes."""
+        return sum(self._work_split.values())
 
     @property
     def daily_start_date(self) -> str | None:
@@ -384,6 +415,29 @@ class TimerEngine:
             result.events.append(TimerEvent.MODE_CHANGED)
             result.old_mode = old_mode
         return result
+
+    def set_work_split(
+        self,
+        billable: int,
+        personal: int,
+        unknown: int,
+        now_mono_ms: int,
+    ) -> None:
+        """Set per-class active-instance counts for shadow accrual accounting.
+
+        Called by the timer worker alongside set_productivity with the count of
+        provably-working instances in each work-class. Pure descriptive input —
+        it does NOT change the productivity layer, the effective mode, or
+        break_balance_ms. Subsequent ticks attribute work/break to each class in
+        proportion to these counts. Advance first so elapsed time up to this
+        sample is attributed under the *previous* split.
+        """
+        self._advance(now_mono_ms)
+        self._work_split = {
+            "billable": max(0, int(billable)),
+            "personal": max(0, int(personal)),
+            "unknown": max(0, int(unknown)),
+        }
 
     def enter_break(self, now_mono_ms: int) -> tuple[bool, TickResult]:
         """Manual break entry. Returns (changed, result)."""
@@ -550,6 +604,10 @@ class TimerEngine:
             "total_work_time_ms": self._total_work_time_ms,
             "total_break_time_ms": self._total_break_time_ms,
             "break_balance_ms": self._break_balance_ms,
+            # Per-class shadow accrual (additive; billable vs personal)
+            "work_split": dict(self._work_split),
+            "class_work_ms": dict(self._class_work_ms),
+            "class_break_ms": dict(self._class_break_ms),
             # Timing
             "daily_start_date": self._daily_start_date,
             # Productivity substate
@@ -579,6 +637,13 @@ class TimerEngine:
             "focusTimeSeconds": round(self._total_focus_time_ms / 1000),
             "focusCutoffHour": self.focus_cutoff_hour,
             "focusCutoffTime": self.focus_cutoff_time,
+            # Per-class shadow accrual (billable vs personal) — descriptive only
+            "workSplit": dict(self._work_split),
+            "workInstances": self.work_instances,
+            "classWorkSeconds": {cls: round(ms / 1000) for cls, ms in self._class_work_ms.items()},
+            "classBreakSeconds": {
+                cls: round(ms / 1000) for cls, ms in self._class_break_ms.items()
+            },
         }
 
     def from_dict(self, data: dict, now_mono_ms: int) -> None:
@@ -610,6 +675,16 @@ class TimerEngine:
             acc = int(data.get("accumulated_break_ms", 0))
             bl = int(data.get("break_backlog_ms", 0))
             self._break_balance_ms = acc - bl
+
+        # Per-class shadow accrual (additive; absent in pre-split states → zero).
+        def _load_class_map(key: str) -> dict[str, int]:
+            raw = data.get(key) or {}
+            return {cls: int(raw.get(cls, 0)) for cls in ("billable", "personal", "unknown")}
+
+        self._work_split = _load_class_map("work_split")
+        self._class_work_ms = _load_class_map("class_work_ms")
+        self._class_break_ms = _load_class_map("class_break_ms")
+
         self._daily_start_date = data.get("daily_start_date")
 
         # Manual substate
@@ -835,8 +910,46 @@ class TimerEngine:
         if self._focus_active:
             self._total_focus_time_ms += elapsed_ms
 
+        # Per-class shadow accrual: split this tick's work + earned/spent break
+        # across billable/personal/unknown by active-instance share. Additive
+        # accounting only — break_balance_ms above is the live engine and is
+        # already final for this tick.
+        self._accrue_class_shadow(mode, elapsed_ms)
+
         self._last_tick_ms = now_mono_ms
         return result
+
+    def _accrue_class_shadow(self, mode: TimerMode, elapsed_ms: int) -> None:
+        """Attribute this tick's work/break to classes by active-instance share.
+
+        Mirrors the single-pool sign convention (WORKING earns, DISTRACTED/BREAK
+        spend, MULTITASKING/IDLE neutral) but tracked per work-class so the
+        cockpit can show on-the-clock vs personal-dev distinctly. Never touches
+        break_balance_ms or enforcement. Integer-proportional split; the floor
+        remainder is dropped (descriptive, not accounting-exact).
+        """
+        split = self._work_split
+        total = split["billable"] + split["personal"] + split["unknown"]
+        if total <= 0 or elapsed_ms <= 0:
+            return
+
+        # Work time accrues for any productive-ish mode (mirrors _total_work_time_ms,
+        # which counts WORKING / MULTITASKING / DISTRACTED).
+        if mode in (TimerMode.WORKING, TimerMode.MULTITASKING, TimerMode.DISTRACTED):
+            for cls in ("billable", "personal", "unknown"):
+                self._class_work_ms[cls] += elapsed_ms * split[cls] // total
+
+        # Break sign by mode: WORKING +1:1, DISTRACTED/BREAK -1:1, else neutral.
+        # (Phase-1 mirrors the integer rate table; the fractional x/y trickle is
+        # Phase-2, flagged off — see billable.trickle_numerator.)
+        break_sign = 0
+        if mode == TimerMode.WORKING:
+            break_sign = 1
+        elif mode in (TimerMode.DISTRACTED, TimerMode.BREAK):
+            break_sign = -1
+        if break_sign:
+            for cls in ("billable", "personal", "unknown"):
+                self._class_break_ms[cls] += break_sign * (elapsed_ms * split[cls] // total)
 
     def _check_daily_reset(
         self, now_mono_ms: int, today_date: str, current_hour: int | None = None
@@ -879,6 +992,11 @@ class TimerEngine:
         self._total_work_time_ms = 0
         self._total_break_time_ms = 0
         self._break_balance_ms = DEFAULT_BREAK_BUFFER_MS if with_buffer else 0
+        # Per-class shadow accrual resets with the day (counts re-derive on next
+        # worker sample; ledgers start fresh).
+        self._work_split = {"billable": 0, "personal": 0, "unknown": 0}
+        self._class_work_ms = {"billable": 0, "personal": 0, "unknown": 0}
+        self._class_break_ms = {"billable": 0, "personal": 0, "unknown": 0}
         self._daily_start_date = today_date
         self._last_tick_ms = now_mono_ms
 
