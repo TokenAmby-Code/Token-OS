@@ -1,0 +1,17 @@
+[Unit]
+Description=Token-API Server - Local FastAPI Service
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=token
+WorkingDirectory=/mnt/imperium/Token-OS/token-api
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 7777
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -34,9 +34,12 @@ if ! printf '%s\n' "$PROMPT_TEXT" | grep -vE '^[[:space:]]*$' >/dev/null; then
     exit 130
 fi
 
-# Run dispatch/fzf in this popup before allocating any legion pane. If the user
-# Ctrl-C's out of any selector, dispatch exits 130 and this popup closes without
-# opening a worker pane or continuing down a launch path.
+# Run dispatch/fzf in this popup before allocating any legion pane. Prefix+Space
+# is the direct worker launcher, not aspirant intake; otherwise selecting
+# "Sisters of Battle — Codex" only writes codex metadata into the aspirant note
+# and the hardcoded Claude aspirant trials session is what visibly launches.
+# If the user Ctrl-C's out of any selector, dispatch exits 130 and this popup
+# closes without opening a worker pane or continuing down a launch path.
 log_debug "starting dispatch selector chars=${#PROMPT_TEXT}"
-TOKEN_API_DISPATCH_ORIGIN=d "$DISPATCH_BIN" --target legion:new --prompt "$PROMPT_TEXT"
+TOKEN_API_DISPATCH_ORIGIN=d "$DISPATCH_BIN" --direct --target legion:new --prompt "$PROMPT_TEXT"
 log_debug "dispatch selector exited rc=0"

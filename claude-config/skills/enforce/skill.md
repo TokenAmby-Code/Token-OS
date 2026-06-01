@@ -184,4 +184,4 @@ When `/enforce --build` is invoked, read these files before starting implementat
 - Update MacroDroid macro specs (YAML → macrodroid-gen → push)
 - Adjust hook handlers (Stop, PreToolUse) to use new schema
 - Update the Phone Enforcement Architecture vault note
-- Test reachability: `curl http://100.102.92.24:7777/heartbeat`
+- Test reachability: `curl http://100.102.92.24:7777/server-heartbeat`

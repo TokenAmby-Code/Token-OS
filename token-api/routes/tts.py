@@ -710,6 +710,7 @@ class TTSQueueItem:
 hot_queue: deque[TTSQueueItem] = deque()
 pause_queue: deque[TTSQueueItem] = deque()
 tts_current: TTSQueueItem | None = None
+tts_current_started_at: datetime | None = None  # Wall-clock playback start, for elapsed
 tts_current_process: subprocess.Popen | None = None  # Current TTS/sound process for skip support
 tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. actual failure)
 tts_queue_lock = asyncio.Lock()
@@ -886,7 +887,7 @@ async def tts_queue_worker():
     queue via /api/tts/queue/promote or /api/tts/queue/play-pane before
     they will play.
     """
-    global tts_current
+    global tts_current, tts_current_started_at
 
     while True:
         try:
@@ -894,8 +895,10 @@ async def tts_queue_worker():
             async with tts_queue_lock:
                 if hot_queue:
                     tts_current = hot_queue.popleft()
+                    tts_current_started_at = datetime.now()
                 else:
                     tts_current = None
+                    tts_current_started_at = None
 
             if tts_current:
                 # Playback start (None -> item): snap operator focus + zoom to
@@ -1000,6 +1003,7 @@ async def tts_queue_worker():
                 # Clear @TTS_STATE on source pane
                 _set_tts_state(tts_current.tmux_pane, "")
                 tts_current = None
+                tts_current_started_at = None
                 await asyncio.sleep(0.5)  # Brief pause between items
             else:
                 # No items - wait a bit before checking again
@@ -1131,13 +1135,18 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
 
 
 def _queue_item_to_dict(item: TTSQueueItem) -> dict:
-    """Serialize a TTSQueueItem for API responses."""
+    """Serialize a TTSQueueItem for API responses.
+
+    Returns the *full* message — the cockpit clamps with CSS and shows the full
+    text on row expansion. (No consumer relies on a truncated `message`.)
+    """
     return {
         "instance_id": item.instance_id,
         "tab_name": item.tab_name,
-        "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
+        "message": item.message,
         "voice": item.voice,
         "queue": item.queue_target,
+        "status": item.status,
         "queued_at": item.queued_at.isoformat(),
     }
 
@@ -1152,14 +1161,36 @@ def get_tts_queue_status() -> dict:
         current = {
             "instance_id": tts_current.instance_id,
             "tab_name": tts_current.tab_name,
-            "message": tts_current.message[:50] + "..."
-            if len(tts_current.message) > 50
-            else tts_current.message,
+            # Full message — UI clamps and expands; no truncation here.
+            "message": tts_current.message,
             "voice": tts_current.voice,
+            "backend": TTS_BACKEND["current"],
+            "started_at": tts_current_started_at.isoformat()
+            if tts_current_started_at
+            else None,
         }
+
+    # Routing decision (device + why) — same brain behind GET /api/tts/routing,
+    # folded in so the cockpit can show "routing: PHONE — away from home".
+    routing = None
+    try:
+        decision = resolve_tts_device()
+        routing = {
+            "device": decision["device"],
+            "reason": decision["reason"],
+            "context": {
+                "location_zone": DESKTOP_STATE.get("location_zone"),
+                "in_meeting": DESKTOP_STATE.get("in_meeting", False),
+                "global_mode": TTS_GLOBAL_MODE["mode"],
+                "satellite_available": TTS_BACKEND["satellite_available"],
+            },
+        }
+    except Exception as e:
+        logger.warning(f"TTS routing summary failed (non-fatal): {e}")
 
     return {
         "current": current,
+        "routing": routing,
         "hot_queue": hot_list,
         "hot_queue_length": len(hot_list),
         "pause_queue": pause_list,
@@ -1416,6 +1447,61 @@ async def play_pane(request: PlayPaneRequest):
 
     logger.info(f"play-pane: Promoted {promoted} item(s) for {request.instance_id} to hot queue")
     return {"success": True, "promoted": promoted, "instance_id": request.instance_id}
+
+
+@router.post("/api/instances/{instance_id}/focus-pane")
+async def focus_instance_pane(instance_id: str):
+    """Human-initiated tmux focus: select + zoom the pane owning `instance_id`.
+
+    Unlike the playback-driven focus snap, this is explicit operator navigation
+    (a cockpit row click), so per the focus guard it CHANGES focus and does not
+    restore. Resolution is by instance_id -> tmux_pane (server-side); raw pane
+    ids never cross the API boundary. Skips with a reason (snapped:false) for
+    dead/remote/no-pane/voice-chat/discord instances, mirroring the snap guards.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT device_id, tmux_pane, tts_mode FROM claude_instances WHERE id = ?",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
+
+        if not row:
+            return {"snapped": False, "reason": "instance_gone"}
+
+        device_id = row["device_id"]
+        tmux_pane = row["tmux_pane"]
+        tts_mode = row["tts_mode"]
+
+        # Voice-chat: operator is conversing by voice, not reading the pane.
+        if tts_mode == "voice-chat":
+            return {"snapped": False, "reason": "voice_chat"}
+
+        # Local-only: only the machine owning the pane may move its focus.
+        local = _local_device_name()
+        if not local or device_id != local:
+            return {"snapped": False, "reason": "remote_pane", "device_id": device_id}
+
+        if not tmux_pane:
+            return {"snapped": False, "reason": "no_pane"}
+
+        pane_id = await resolve_tmux_pane_id(tmux_pane)
+        if not pane_id:
+            return {"snapped": False, "reason": "pane_dead"}
+
+        result = await _focus_and_zoom_pane(pane_id)
+        logger.info(f"Focus-pane (human) -> {pane_id} ({result.get('actions')})")
+        await log_event(
+            "focus_pane_requested",
+            instance_id=instance_id,
+            details={"pane_id": pane_id, "actions": result.get("actions")},
+        )
+        return {"snapped": True, "reason": None, **result}
+    except Exception as e:
+        logger.warning(f"focus-pane failed for {instance_id}: {e}")
+        return {"snapped": False, "reason": "error", "error": str(e)}
 
 
 @router.post("/api/tts/skip")

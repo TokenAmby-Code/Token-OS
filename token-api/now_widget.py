@@ -130,7 +130,7 @@ def compose_now_markdown(
         or timer.get("mode")
         or _derive_timer_mode(timer)
     )
-    balance = _format_minutes(timer.get("break_balance_ms") or timer.get("accumulated_break_ms"))
+    balance = _format_minutes(timer.get("break_balance_ms", timer.get("accumulated_break_ms", 0)))
     active = ", ".join(telemetry.active_instances) if telemetry.active_instances else "none"
     location = telemetry.location_zone or "unknown"
     desktop = telemetry.desktop_mode or "unknown"

@@ -104,9 +104,35 @@ def build_prompt(ctx: dict) -> str:
     """Build the Custodes prompt. Pointers only — the agent fetches live state."""
     today = ctx["today"]
     trigger = ctx.get("trigger", "alarm")
-    daily_thread_id = ctx.get("daily_thread_id", "")
 
-    prompt = f"""# Custodes
+    from datetime import timedelta
+    yesterday = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    preamble = ""
+    if trigger == "alarm":
+        preamble = f"""Before the morning session, orient yourself relative to the day boundary:
+
+Step 0 (surprise check) — open Terra/Journal/Daily/{yesterday}.md and check for a
+wind-down or EOD summary section (headings like '## Wind-Down', '## EOD', '## Evening',
+or a closing block written after 20:00). If there is NO such section the nightly debrief
+did not run. Write a brief late close-out to yesterday's note: open threads, deferred
+decisions, fleet state, carryover for today. Under 300 words. Mark it
+'Late close-out — morning session' so the record is honest about timing.
+If a wind-down section already exists, skip Step 0 entirely.
+
+Step 1 — write today's handoff blurb to Terra/Journal/Daily/{today}.md.
+Cover: yesterday's open carryover (cascades, pending decisions, anything mid-flight)
+and any persistent state that compaction would lose. Tight section, <500 words.
+
+Step 2 — /compact
+
+Then proceed with the morning session brief below.
+
+---
+
+"""
+
+    prompt = preamble + f"""# Custodes
 
 You are the Adeptus Custodes — the Emperor's personal guard. You are the
 accountability partner that runs continuously in the Emperor's day.
@@ -552,15 +578,9 @@ def run_morning_session() -> dict:
     # Phase 1: Create daily notes
     ensure_daily_notes()
 
-    # Phase 2: Create daily Discord thread
-    daily_thread_id = get_daily_thread_id(today)
-    if not daily_thread_id:
-        daily_thread_id = create_daily_thread(today)
-
-    # Phase 3: Gather context and build prompt
+    # Phase 2: Gather context and build prompt
     ctx = gather_context()
     ctx["trigger"] = "alarm"
-    ctx["daily_thread_id"] = daily_thread_id or ""
     prompt = build_prompt(ctx)
 
     # Phase 4: Create legion pane and launch
@@ -598,7 +618,6 @@ def run_morning_session() -> dict:
                 "started_at": datetime.now().isoformat(),
                 "status": "launched",
                 "pane_id": pane_id,
-                "daily_thread_id": daily_thread_id,
             }
         )
     )

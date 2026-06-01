@@ -89,10 +89,10 @@ printf -v workdir_q '%q' "$WORKDIR"
 printf -v thread_q '%q' "$THREAD_ID"
 printf -v prompt_q '%q' "$prompt"
 
-dispatch_bin="$(command -v codex-dispatch 2>/dev/null || echo "${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/codex-dispatch")"
+dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/dispatch")"
 printf -v dispatch_q '%q' "$dispatch_bin"
 printf -v pane_q '%q' "$pane_id"
-cmd="cd ${workdir_q} && ${dispatch_q} --resume-session ${thread_q} --resolved-tmux-pane ${pane_q} --launcher quiet-buster-resume --launch-mode quiet-buster ${workdir_q} ${prompt_q}"
+cmd="cd ${workdir_q} && ${dispatch_q} --direct --engine codex --resume ${thread_q} --pane ${pane_q} --dir ${workdir_q} --prompt ${prompt_q}"
 
 sleep 0.5
 tmux send-keys -t "$pane_id" "$cmd" Enter
