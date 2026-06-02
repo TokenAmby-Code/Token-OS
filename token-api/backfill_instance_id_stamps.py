@@ -29,9 +29,9 @@ def _local_device_name() -> str:
     """Best-effort local device name (matches token-api's cfg('device_name'))."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cli-tools" / "lib"))
-        from imperium_config import imperium_cfg  # type: ignore
+        from imperium_config import cfg  # type: ignore
 
-        return str(imperium_cfg("device_name") or "")
+        return str(cfg("device_name") or "")
     except Exception:
         return ""
 

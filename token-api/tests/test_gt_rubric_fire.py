@@ -56,6 +56,14 @@ def gt_env(monkeypatch, tmp_path):
     # Deterministic: never let real quiet-hours config defer a fire.
     monkeypatch.setattr(main.shared, "get_quiet_hours_status", lambda: {"active": False})
 
+    # tmuxctl owns instance_id -> pane resolution. Default to "pane gone" so GT
+    # tests are hermetic (no live tmux server in CI); local fires fail closed on
+    # this. Individual tests override to simulate a live, resolvable pane.
+    async def _pane_gone(_instance_id):
+        return (None, None)
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _pane_gone)
+
     yield SimpleNamespace(db_path=db_path, main=main, docs_dir=tmp_path)
 
     main._golden_throne_fire_times.clear()
@@ -70,8 +78,13 @@ def _write_doc(docs_dir: Path, frontmatter: str) -> Path:
     return doc
 
 
-def _insert(db_path: Path, *, device_id: str, doc_path: Path | None) -> str:
-    """Insert a golden_throne instance, optionally linked to a session doc."""
+def _insert(db_path: Path, *, device_id: str, doc_path: Path | None, tmux_pane: str = "%10") -> str:
+    """Insert a golden_throne instance, optionally linked to a session doc.
+
+    ``tmux_pane`` is the *stored* column value; for local instances the fire path
+    no longer trusts it (tmuxctl resolves the pane live by UUID), so tests can set
+    a deliberately stale value here to prove the stored column is not consulted.
+    """
     iid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
@@ -87,8 +100,8 @@ def _insert(db_path: Path, *, device_id: str, doc_path: Path | None) -> str:
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             tmux_pane, status, instance_type, zealotry, session_doc_id,
             registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', ?, '%10', 'idle', 'golden_throne', 4, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"gt-{iid[:8]}", "/tmp", device_id, doc_id, now, now),
+           VALUES (?, ?, ?, ?, 'local', ?, ?, 'idle', 'golden_throne', 4, ?, ?, ?)""",
+        (iid, str(uuid.uuid4()), f"gt-{iid[:8]}", "/tmp", device_id, tmux_pane, doc_id, now, now),
     )
     conn.commit()
     conn.close()
@@ -104,6 +117,7 @@ class _Recorder:
         self.enqueues = []
         self.enforcements = []
         self.state_events = []
+        self.resumes = []
 
         async def fake_log_event(*a, **k):
             return None
@@ -115,6 +129,7 @@ class _Recorder:
             return {"success": True}
 
         async def fake_record_resume(instance):
+            self.resumes.append(instance)
             return {"resume_count": 1, "window_started_at": "x", "enforced": False}
 
         async def fake_enqueue_pane_write(**kwargs):
@@ -295,3 +310,83 @@ async def test_acknowledged_rubric_is_skipped(gt_env, monkeypatch):
     assert rec.enqueues == []
     assert rec.enforcements == []
     assert rec.notifies == []
+
+
+# --- Phase 3 Tier 1: tmuxctl owns instance_id -> pane resolution -------------
+
+
+@pytest.mark.asyncio
+async def test_local_fire_fails_closed_when_pane_unresolved(gt_env, monkeypatch):
+    """A local instance whose pane no longer resolves must fail closed: no send,
+    no notify, no resume counted, and the instance is marked stopped. This is the
+    structural fix for the stale-position ("1:NE") ghost — there is no stored pane
+    perspective left to send to or speak."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+    # gt_env default: resolve_instance_pane -> (None, None) [pane gone]. Stored
+    # column carries a stale %N that must NOT be used as a fallback.
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None, tmux_pane="%999")
+
+    await main.golden_throne_followup(iid)
+
+    # Fail closed: no transport of any kind, no notification, no resume counted.
+    assert rec.enqueues == []
+    assert rec.posts == []
+    assert rec.notifies == []
+    assert rec.resumes == [], "a vanished pane must not be counted as a resume"
+
+    # Marked stopped so the GT timer stops re-firing at a vanished pane.
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute(
+        "SELECT status, gt_resume_count FROM claude_instances WHERE id = ?", (iid,)
+    ).fetchone()
+    conn.close()
+    assert row[0] == "stopped"
+    assert (row[1] or 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, monkeypatch):
+    """A local fire sends to the pane resolved live by UUID and speaks the live
+    role's position — never the stored tmux_pane/pane_label column."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+
+    seen = {}
+
+    async def _resolved(instance_id):
+        seen["instance_id"] = instance_id
+        return ("%77", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolved)
+
+    async def _alive(*a, **k):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_has_agent_process", _alive)
+
+    async def _sent(*a, **k):
+        return [{"status": main.PANE_WRITE_SENT, "returncode": 0, "stdout": "", "stderr": ""}]
+
+    monkeypatch.setattr(main, "process_pane_write_queue_once", _sent)
+
+    async def _pane_exists(_pane):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
+
+    # Stored column is deliberately stale; live resolution must win.
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None, tmux_pane="%999")
+
+    await main.golden_throne_followup(iid)
+
+    # Resolution was keyed by the instance UUID, not read from the column.
+    assert seen.get("instance_id") == iid
+    # The send targeted the live-resolved pane (%77), not the stored %999.
+    assert rec.enqueues, "live-resolved pane should receive a guarded send"
+    assert rec.enqueues[0]["tmux_pane"] == "%77"
+    # A real delivery counts a resume.
+    assert rec.resumes, "a delivered local fire must count a resume"
+    # The spoken surface uses the LIVE role's position (palace:N -> 1:N).
+    assert rec.notifies, "a delivered local fire notifies the Emperor"
+    assert "1:N" in rec.notifies[0]["message"]
