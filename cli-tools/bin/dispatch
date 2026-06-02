@@ -64,6 +64,7 @@ quote() { printf '%q' "$1"; }
 ENGINE="claude"
 ENGINE_EXPLICIT=false
 RESUME_ID=""
+RESUME_INSTANCE_ID=""
 RESUME_REQUESTED=false
 RESUME_ROW_FOUND=false
 ASPIRANT=false
@@ -546,6 +547,7 @@ resolve_resume_id() {
   sid_sql="$(sql_literal "$RESUME_ID")"
   row="$(sqlite_query_usv "
     SELECT
+      COALESCE(ci.id, ''),
       COALESCE(ci.engine, ''),
       COALESCE(ci.launcher, ''),
       COALESCE(ci.target_working_dir, ''),
@@ -582,11 +584,14 @@ resolve_resume_id() {
   fi
 
   RESUME_ROW_FOUND=true
-  local row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry
-  IFS=$'\x1f' read -r row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry \
+  local row_id row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry
+  IFS=$'\x1f' read -r row_id row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry \
     RESUME_DISPATCH_TARGET RESUME_DISPATCH_WINDOW RESUME_DISPATCH_MODE RESUME_DISPATCH_SLOT RESUME_LAUNCH_MODE \
     RESUME_TMUX_PANE RESUME_PRIMARCH RESUME_PARENT_INSTANCE_ID RESUME_DISCORD_HOSTED RESUME_DISCORD_CHANNEL RESUME_DISCORD_BOT <<< "$row"
 
+  # Canonical instance id (== @INSTANCE_ID stamped by SessionStart). RESUME_ID may
+  # have been a session_id; resolve-instance keys on ci.id, so stamp ci.id.
+  RESUME_INSTANCE_ID="$row_id"
   ENGINE="$(infer_engine "$row_engine" "$row_launcher")"
   RESUME_LAUNCHER="$row_launcher"
   [[ -n "$row_target_dir" ]] && WORK_DIR="$row_target_dir"
@@ -1306,9 +1311,12 @@ stamp_resume_instance_id() {
   # the pane-alloc -> SessionStart gap. No-op for fresh launches (the
   # registration hook stamps those). Cleared on agent death by the wrapper.
   local pane="$1"
-  [[ -n "$RESUME_ID" && -n "$pane" ]] || return 0
+  # Stamp the canonical ci.id resolved from the DB (RESUME_ID may be a session_id);
+  # fall back to the raw RESUME_ID when the row was not found (--engine/--dir resume).
+  local instance_id="${RESUME_INSTANCE_ID:-$RESUME_ID}"
+  [[ -n "$instance_id" && -n "$pane" ]] || return 0
   command -v tmux >/dev/null 2>&1 || return 0
-  tmux set-option -p -t "$pane" @INSTANCE_ID "$RESUME_ID" >/dev/null 2>&1 || true
+  tmux set-option -p -t "$pane" @INSTANCE_ID "$instance_id" >/dev/null 2>&1 || true
 }
 
 stage_agent_command() {

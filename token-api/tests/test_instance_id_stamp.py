@@ -4,9 +4,13 @@ import asyncio
 import subprocess
 import sys
 import uuid
+from collections.abc import Awaitable, Callable
 
 
-def _recorder():
+def _recorder() -> tuple[
+    list[tuple[str, ...]],
+    Callable[..., Awaitable[subprocess.CompletedProcess]],
+]:
     """Return (calls, fake_offloop) where fake_offloop records argv and succeeds."""
     calls: list[tuple[str, ...]] = []
 
@@ -17,7 +21,7 @@ def _recorder():
     return calls, fake_offloop
 
 
-def _stamp_calls(calls):
+def _stamp_calls(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
     return [
         c
         for c in calls
@@ -76,6 +80,8 @@ def test_reregistration_restamps_instance_id(app_env, monkeypatch):
 
     stamps = _stamp_calls(calls)
     assert stamps, "re-registration did not re-stamp @INSTANCE_ID"
+    # The re-stamp must land on the NEW pane (%88), not the original (%77).
+    assert stamps[-1][4] == "%88"
     assert stamps[-1][6] == session_id
 
 
@@ -126,3 +132,48 @@ def test_resolve_instance_pane_swallows_subprocess_error(app_env, monkeypatch):
 
     monkeypatch.setattr(shared, "_run_subprocess_offloop", boom)
     assert asyncio.run(shared.resolve_instance_pane("u")) == (None, None)
+
+
+def _unset_calls(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [
+        c
+        for c in calls
+        if c[0] == "tmux" and c[1] == "set-option" and "-u" in c and c[-1] == "@INSTANCE_ID"
+    ]
+
+
+def test_unstamp_clears_old_pane_when_stamp_still_matches(app_env, monkeypatch):
+    """An instance moving off a pane clears its own stamp on that pane."""
+    hooks = sys.modules["routes.hooks"]
+    calls: list[tuple[str, ...]] = []
+    session_id = str(uuid.uuid4())
+
+    async def fake_offloop(args, *, timeout=None, stdout=None, stderr=None, env=None):
+        calls.append(tuple(args))
+        # show-options reports the old pane still carries THIS instance's id.
+        out = session_id.encode() if "show-options" in args else b""
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout=out, stderr=b"")
+
+    monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
+    asyncio.run(hooks._unstamp_instance_id("%77", session_id))
+
+    unsets = _unset_calls(calls)
+    assert unsets, "old pane stamp was not cleared"
+    assert unsets[-1][5] == "%77"
+
+
+def test_unstamp_never_clobbers_pane_reused_by_another_instance(app_env, monkeypatch):
+    """If the old pane was re-stamped by a different instance, leave it alone."""
+    hooks = sys.modules["routes.hooks"]
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_offloop(args, *, timeout=None, stdout=None, stderr=None, env=None):
+        calls.append(tuple(args))
+        # show-options reports a DIFFERENT instance now owns the pane.
+        out = b"some-other-instance-id" if "show-options" in args else b""
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout=out, stderr=b"")
+
+    monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
+    asyncio.run(hooks._unstamp_instance_id("%77", str(uuid.uuid4())))
+
+    assert not _unset_calls(calls), "must not clear a pane owned by another instance"

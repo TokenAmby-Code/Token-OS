@@ -72,18 +72,34 @@ def main() -> int:
         return 1
 
     local = _local_device_name()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT id, tmux_pane, device_id, status
-        FROM claude_instances
-        WHERE COALESCE(tmux_pane, '') != ''
-          AND COALESCE(status, '') != 'stopped'
-        ORDER BY last_activity DESC
-        """
-    ).fetchall()
-    conn.close()
+    if not local:
+        # Fail closed: tmux pane ids are host-local, so without a known local
+        # device name we cannot distinguish a local row from a remote one that
+        # happens to carry a %N which is reused by an unrelated local pane —
+        # stamping then mis-maps a remote instance onto a local pane.
+        print(
+            "Cannot resolve local device name; refusing to stamp "
+            "(set device_name in imperium_config). No changes made.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, tmux_pane, device_id, status
+            FROM claude_instances
+            WHERE COALESCE(tmux_pane, '') != ''
+              AND COALESCE(status, '') != 'stopped'
+            ORDER BY last_activity DESC
+            """
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"DB read failed: {exc}", file=sys.stderr)
+        return 1
 
     stamped = skipped_remote = skipped_dead = 0
     for row in rows:
