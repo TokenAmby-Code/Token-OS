@@ -503,6 +503,18 @@ if [[ -f "$_HOOKS_DIR/post-push" ]]; then
     fi
 fi
 
+# Install native pre-commit hook (ruff belt-and-suspenders — keeps commits matching
+# CI's lockfile-pinned ruff even if the PostToolUse format-on-save hook goes stale).
+if [[ -f "$_HOOKS_DIR/pre-commit" ]]; then
+    HOOK_DIR=$(git -C "$WORKTREE_DIR" rev-parse --git-path hooks 2>/dev/null || echo "")
+    if [[ -n "$HOOK_DIR" ]]; then
+        mkdir -p "$HOOK_DIR"
+        cat "$_HOOKS_DIR/pre-commit" > "$HOOK_DIR/pre-commit"
+        chmod +x "$HOOK_DIR/pre-commit"
+        log_success "Installed pre-commit hook at $HOOK_DIR/pre-commit"
+    fi
+fi
+
 # Sync dependencies
 if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
     log_info "Syncing dependencies..."
@@ -541,6 +553,24 @@ if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
             fi
         done
     fi
+fi
+
+# Token-OS dual-project dev venv: the ruff hooks (post-tool-format.sh PostToolUse +
+# the native pre-commit) run `uv run --group dev ruff`, which needs a synced dev
+# venv. The generic sync above is a no-op when PKG_MANAGER is unset (Token-OS.conf
+# defines none), so ensure each project's dev group is synced before the first
+# edit/commit. Guarded to Token-OS's layout so other projects are unaffected.
+if [[ "$SKIP_SYNC" == "false" ]] && command -v uv &>/dev/null; then
+    for proj in token-api cli-tools; do
+        if [[ -f "$WORKTREE_DIR/$proj/pyproject.toml" ]]; then
+            log_info "Syncing $proj dev venv (uv sync --group dev)..."
+            if (cd "$WORKTREE_DIR/$proj" && uv sync --python 3.11 --group dev); then
+                log_success "$proj dev dependencies synced"
+            else
+                log_warn "$proj dev sync failed — ruff hooks may sync lazily on first run"
+            fi
+        fi
+    done
 fi
 
 echo ""
