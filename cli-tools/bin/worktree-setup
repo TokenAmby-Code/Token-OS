@@ -51,6 +51,7 @@ REQUIRE_FREE=false
 FORCE=false
 PROJECT="$(detect_default_project)"
 INIT_MODE=false
+SESSION_DOC_ID=""
 
 usage() {
     cat << 'EOF'
@@ -71,6 +72,10 @@ Options:
   --require-free        Claim the branch atomically; refuse if a live worktree
                         already holds it (1 branch = 1 worktree = 1 PR)
   -f, --force           Override an existing claim / reuse an existing branch
+  --session-doc <id>    Register this worktree (active) in the session doc's
+                        frontmatter worktrees: list. Supplied by the parent
+                        launcher (worktree-setup runs before the child instance
+                        exists). Best-effort; worktree still creates if absent.
   --init                Print template config for a new project
   -h, --help            Show this help message
 
@@ -248,6 +253,14 @@ while [[ $# -gt 0 ]]; do
         --require-free)
             REQUIRE_FREE=true
             shift
+            ;;
+        --session-doc)
+            if [[ $# -lt 2 ]]; then
+                log_error "--session-doc requires a doc id"
+                exit 1
+            fi
+            SESSION_DOC_ID="$2"
+            shift 2
             ;;
         -f|--force)
             FORCE=true
@@ -484,12 +497,34 @@ PORT=$ASSIGNED_PORT
 WORKTREE_BRANCH=$BRANCH_NAME
 WORKTREE_PROJECT=$PROJECT
 EOF
+        # Persist the session-doc id so worktree-delete can archive the entry.
+        if [[ -n "$SESSION_DOC_ID" ]]; then
+            echo "SESSION_DOC_ID=$SESSION_DOC_ID" >> "$WORKTREE_DIR/.worktree.env"
+        fi
         log_success "Assigned port $ASSIGNED_PORT (written to .worktree.env)"
     else
         log_warn "Port assignment failed — .worktree.env not written"
     fi
 else
     log_warn "worktree-ports lib not found — skipping port assignment"
+fi
+
+# Register this worktree as the session doc's active worktree (Phase 3 registry).
+# Server-side holds the one-active invariant (demotes any prior active → archived).
+# Best-effort: a missing/unreachable token-api never fails worktree creation.
+if [[ -n "$SESSION_DOC_ID" ]]; then
+    _claimed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    _wt_api="${TOKEN_API_URL:-http://localhost:7777}"
+    _wt_body=$(printf '{"action":"claim","path":"%s","branch":"%s","port":"%s","claimed_at":"%s"}' \
+        "$WORKTREE_DIR" "$BRANCH_NAME" "${ASSIGNED_PORT:-}" "$_claimed_at")
+    if curl -fsS -m 5 -X POST \
+        -H "Content-Type: application/json" \
+        -d "$_wt_body" \
+        "$_wt_api/api/session-docs/$SESSION_DOC_ID/worktrees" >/dev/null 2>&1; then
+        log_success "Registered worktree in session doc $SESSION_DOC_ID (active)"
+    else
+        log_warn "Could not register worktree in session doc $SESSION_DOC_ID (token-api unreachable?)"
+    fi
 fi
 
 # Install local post-push hook (per-worktree dev server hot-restart).
