@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resolve_parser.add_argument("target")
 
+    resolve_instance_parser = subparsers.add_parser(
+        "resolve-instance",
+        help="Resolve an instance UUID to its live tmux pane (pure tmux, fail-closed).",
+    )
+    resolve_instance_parser.add_argument(
+        "--format", choices=["json", "physical", "role", "full"], default="full"
+    )
+    resolve_instance_parser.add_argument("instance_id")
+
     session_doc_parser = subparsers.add_parser(
         "session-doc",
         help="Resolve a cardinal pane id to its linked session document.",
@@ -249,6 +258,27 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(resolved)
             return 0
+
+        if args.command == "resolve-instance":
+            import json
+
+            result = control.resolve_instance(args.instance_id)
+            if args.format == "json":
+                print(json.dumps(result))
+            elif not result["found"]:
+                # Exit 1 is the not-found sentinel for physical/role/full formats;
+                # nothing is printed so callers never mistake a stale value for live.
+                return 1
+            elif args.format == "physical":
+                print(result["pane_id"])
+            elif args.format == "role":
+                print(result["pane_role"])
+            else:  # full
+                print(f"instance_id: {result['instance_id']}")
+                print(f"pane_id: {result['pane_id'] or '(unset)'}")
+                print(f"pane_role: {result['pane_role'] or '(unset)'}")
+                print(f"found: {str(result['found']).lower()}")
+            return 0 if result["found"] else 1
 
         if args.command == "session-doc":
             import json

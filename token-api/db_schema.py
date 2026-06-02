@@ -883,48 +883,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
 
-        # ── Legion Pane Recolor System ──────────────────────────────
-        # Queue table: background processor reads this and applies tmux pane colors.
-        # SQLite trigger fires on ANY legion column update, catching all entry points.
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pane_recolor_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id TEXT NOT NULL,
-                legion TEXT NOT NULL,
-                tmux_pane TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Trigger: whenever legion changes on an instance, queue a recolor
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_legion_recolor
-            AFTER UPDATE OF legion ON claude_instances
-            WHEN OLD.legion IS NOT NEW.legion
-               OR (OLD.legion IS NULL AND NEW.legion IS NOT NULL)
-            BEGIN
-                INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane)
-                VALUES (NEW.id, NEW.legion, NEW.tmux_pane);
-            END
-        """)
-
-        # Trigger: whenever tmux_pane is (re)assigned on an instance that already
-        # has a legion, queue a recolor. Closes the order-of-operations gap where
-        # `legion` was set before `tmux_pane` — `trg_legion_recolor` fired with a
-        # NULL pane and the worker silently dropped it. With this trigger, the
-        # invariant "any (legion, tmux_pane) pair eventually paints" holds
-        # regardless of which column changes first.
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_tmux_pane_recolor
-            AFTER UPDATE OF tmux_pane ON claude_instances
-            WHEN NEW.tmux_pane IS NOT NULL
-               AND NEW.tmux_pane IS NOT OLD.tmux_pane
-               AND NEW.legion IS NOT NULL
-            BEGIN
-                INSERT INTO pane_recolor_queue (instance_id, legion, tmux_pane)
-                VALUES (NEW.id, NEW.legion, NEW.tmux_pane);
-            END
-        """)
+        # ── Legion Pane Recolor System (retired) ─────────────────────
+        # The queue table + DB triggers + 1s polling worker are gone. Pane tint is
+        # now applied event-driven at the lifecycle moments that actually change it
+        # (persona register/change, pane rebind, vacate, close) via
+        # shared.apply_pane_tint / clear_pane_tint. Drop the legacy objects so
+        # existing DBs converge too — no writer remains, so leaving them would only
+        # let the table grow unread.
+        await db.execute("DROP TRIGGER IF EXISTS trg_legion_recolor")
+        await db.execute("DROP TRIGGER IF EXISTS trg_tmux_pane_recolor")
+        await db.execute("DROP TABLE IF EXISTS pane_recolor_queue")
 
         # ── Pane State Queue (@CC_STATE) ──
         # Trigger-driven pane variable updates. Any status change on claude_instances

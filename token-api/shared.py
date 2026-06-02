@@ -539,6 +539,99 @@ async def tmux_pane_exists(tmux_pane: str | None) -> bool:
     return await resolve_tmux_pane_id(tmux_pane) is not None
 
 
+# ── Legion pane tint (event-driven) ─────────────────────────────────────────
+# Pane background colour by legion. MUST stay in sync with tmuxctl's
+# _assert_persona_color (cli-tools/lib/tmuxctl/assertions.py): custodes→gold,
+# mechanicus/fabricator→red, civic→green, else→default. The two painters share
+# this map and each fires ONLY on a lifecycle event (persona register/change,
+# pane vacate, close) — never on a timer — so they paint the same colour and
+# never fight. There is no polling worker; this and _assert_persona_color are
+# the only things that paint a pane.
+LEGION_PANE_COLORS = {
+    "custodes": "#302800",  # dark gold
+    "mechanicus": "#300808",  # dark red
+    "fabricator": "#300808",  # FG shares the mechanicus page tint
+    "civic": "#083010",  # dark green
+    "astartes": "default",  # no tint (default legion)
+}
+
+
+def apply_pane_tint(
+    tmux_pane: str | None, legion: str | None, *, source: str = "pane-tint"
+) -> None:
+    """Paint a pane's background for its legion. Event-driven — call this when an
+    instance registers or changes its persona (apply the colour) or vacates a
+    pane (pass legion=None/'astartes' to clear). Focus-preserving: it never moves
+    the operator's camera, and `select-pane -P` sets pane style only, so it can
+    neither change the active pane nor collapse a native zoom. Synchronous (runs
+    a tmux subprocess); async callers should wrap it in asyncio.to_thread.
+    """
+    if not tmux_pane:
+        return
+    bg = LEGION_PANE_COLORS.get(legion or "astartes", "default")
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        import sys
+
+        if str(cli_lib) not in sys.path:
+            sys.path.insert(0, str(cli_lib))
+        from tmuxctl.focus_guard import preserve_focus
+        from tmuxctl.tmux_adapter import TmuxAdapter
+    except Exception as exc:  # tmuxctl unavailable (e.g. non-tmux host)
+        logger.warning("pane tint: tmuxctl adapter unavailable (%s)", exc)
+        return
+    try:
+        adapter = TmuxAdapter()
+        with preserve_focus(adapter, source=source, attempted_target=tmux_pane):
+            adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
+    except Exception as exc:
+        logger.warning("pane tint failed for %s (legion=%s): %s", tmux_pane, legion, exc)
+
+
+def clear_pane_tint(tmux_pane: str | None, *, source: str = "pane-tint-clear") -> None:
+    """Clear a pane's legion tint back to default. Event-driven — call on close or
+    when a persona vacates a pane. Thin wrapper over apply_pane_tint(astartes)."""
+    apply_pane_tint(tmux_pane, "astartes", source=source)
+
+
+async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
+    """Resolve an instance UUID to its live ``(pane_id, role)`` via tmuxctl.
+
+    tmuxctl is the sole owner of ``instance_id -> pane`` resolution, computed
+    live from the pane's ``@INSTANCE_ID`` stamp. token-api stores no tmux pane
+    perspective; this is the only bridge. Fails closed: any miss, error, or
+    unstamped/dead pane returns ``(None, None)`` so callers never send to — or
+    speak the position of — a pane that no longer exists.
+    """
+    if not instance_id:
+        return (None, None)
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = await _run_subprocess_offloop(
+            ("python3", "-m", "tmuxctl.cli", "resolve-instance", instance_id, "--format", "json"),
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=3,
+        )
+    except Exception:
+        return (None, None)
+    # Exit 1 is the not-found sentinel; --format json still prints the payload on
+    # both exit codes, so parse stdout regardless and trust the `found` flag.
+    try:
+        payload = json.loads(proc.stdout.decode(errors="ignore").strip() or "{}")
+    except (ValueError, json.JSONDecodeError):
+        return (None, None)
+    if not payload.get("found"):
+        return (None, None)
+    pane_id = (payload.get("pane_id") or "").strip() or None
+    role = (payload.get("pane_role") or "").strip() or None
+    return (pane_id, role)
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",

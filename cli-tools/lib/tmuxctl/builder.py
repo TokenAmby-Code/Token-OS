@@ -12,6 +12,7 @@ PALACE_WINDOW = "palace"
 SOMNIUM_WINDOW = "somnium"
 LEGION_WINDOW = "legion"
 MECHANICUS_WINDOW = "mechanicus"
+RESERVISTS_WINDOW = "reservists"
 
 DETACHED_W = 240
 DETACHED_H = 60
@@ -220,6 +221,38 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
 
 
+def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
+    """Build the reservists stack window (index 5), split down the middle.
+
+    Left pane is the **civic reservist** — the standing civic day-job thread that
+    the civic-thread fallthrough activates when no civic instance is alive. It is
+    marked ``@CIVIC_RESERVIST 1`` so the orchestration harness can resolve it by
+    pane option (see civic-thread). The right pane is a second reservist slot.
+
+    Like mars/kreig, ``reservists`` is a recognized stack base with no
+    StackPageSpec, so stack reconcile leaves these two startup panes alone while
+    still allowing dispatch to add reservist workers later.
+    """
+    target = f"{session}:{RESERVISTS_WINDOW}"
+    adapter.run(
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        RESERVISTS_WINDOW,
+        "-d",
+        "-c",
+        _window_dir(RESERVISTS_WINDOW),
+    )
+    civic = f"{target}.1"
+    slot = _split_pane(adapter, civic, "-h", "-l", "50%", cwd=_window_dir(RESERVISTS_WINDOW))
+    _pane_tag(adapter, civic, "reservists:civic")
+    _set_pane_option(adapter, civic, "@PANE_TYPE", "reservists")
+    _set_pane_option(adapter, civic, "@CIVIC_RESERVIST", "1")
+    _pane_tag(adapter, slot, "reservists:slot")
+    _set_pane_option(adapter, slot, "@PANE_TYPE", "reservists")
+
+
 def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     """Build the full somnium workspace from an empty server.
 
@@ -250,6 +283,7 @@ def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     build_somnium_window(adapter, session, SOMNIUM_WINDOW)
     build_legion_window(adapter, session)
     build_mechanicus_window(adapter, session)
+    build_reservists_window(adapter, session)
     adapter.run("select-window", "-t", f"{session}:{PALACE_WINDOW}")
 
 

@@ -460,14 +460,10 @@ async def _get_pending_projection(db, instance_id: str) -> dict:
             if item["variable"] == "@CC_STATE":
                 pending["cc_state"] = True
 
-        cur = await db.execute(
-            "SELECT id, legion, tmux_pane FROM pane_recolor_queue WHERE instance_id = ? ORDER BY id DESC LIMIT 10",
-            (instance_id,),
-        )
-        for row in await cur.fetchall():
-            item = dict(row)
-            pending["queue_rows"].append({"type": "pane_recolor", **item})
-            pending["legion_tint"] = True
+        # Legion tint is applied synchronously at lifecycle events (no recolor
+        # queue), so there is never a pending tint row to project. legion_tint
+        # stays False; a pane_bg/legion mismatch is now a real finding, not a
+        # transient queued-but-not-yet-painted state.
     finally:
         db.row_factory = previous_factory
     return pending

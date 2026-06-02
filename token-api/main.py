@@ -407,19 +407,10 @@ sys.excepthook = _global_exception_handler
 # [MOVED to shared.py] — DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device
 
 
-# ── Legion Pane Recolor ──────────────────────────────────────
-# Dark-tinted tmux backgrounds per legion. Subtle but unmistakable.
-# "default" means no custom bg (reset to terminal default).
-LEGION_PANE_COLORS = {
-    "custodes": "#302800",  # dark gold
-    "mechanicus": "#300808",  # dark red
-    "fabricator": "#300808",  # FG shares the 4:mechanicus page tint. Without this
-    # entry the recolor worker resolves .get("fabricator",
-    # "default") and overwrites the bg=#300808 that
-    # _assert_persona_color sets — the two systems fight.
-    "civic": "#083010",  # dark green
-    "astartes": "default",  # no tint (default legion)
-}
+# Legion pane tint is event-driven: shared.apply_pane_tint / clear_pane_tint,
+# keyed to shared.LEGION_PANE_COLORS (the single colour map, kept in sync with
+# tmuxctl's _assert_persona_color). Fired on persona register/change, pane
+# vacate, and close — there is no polling recolor worker.
 
 
 # Scheduler instance. Jobs stay in memory; restart recovery is driven from the
@@ -1499,9 +1490,8 @@ async def lifespan(app: FastAPI):
     # Start Mac-side Deskflow backoff supervisor
     mac_kvm_supervisor_task = asyncio.create_task(mac_kvm_supervisor())
     print("Mac KVM supervisor started")
-    # Start legion pane recolor worker
-    asyncio.create_task(legion_pane_recolor_worker())
-    print("Legion pane recolor worker started")
+    # Legion pane tint is event-driven (shared.apply_pane_tint / clear_pane_tint),
+    # fired on persona register/change, pane vacate, and close — no polling worker.
     # Start pane state worker (@CC_STATE)
     asyncio.create_task(pane_state_worker())
     print("Pane state worker started")
@@ -1887,7 +1877,7 @@ async def stop_instance(instance_id: str):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0), tmux_pane FROM claude_instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1896,6 +1886,7 @@ async def stop_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         is_subagent = row[2]
+        stopped_tmux_pane = row[3]
 
         await sanctioned_update_instance(
             db,
@@ -1920,6 +1911,21 @@ async def stop_instance(instance_id: str):
         )
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
+
+        # Has another live instance already taken over this pane? If so, leave its
+        # tint alone — only clear when the vacated pane is genuinely unowned.
+        pane_still_owned = False
+        if stopped_tmux_pane:
+            cursor = await db.execute(
+                "SELECT 1 FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' AND id != ? LIMIT 1",
+                (stopped_tmux_pane, instance_id),
+            )
+            pane_still_owned = (await cursor.fetchone()) is not None
+
+    # Event-driven tint: the persona vacated this pane — clear its legion tint
+    # back to default. No queue, no poll.
+    if stopped_tmux_pane and not pane_still_owned:
+        await asyncio.to_thread(shared.clear_pane_tint, stopped_tmux_pane, source="stop-instance")
 
     # Log event
     await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
@@ -6918,7 +6924,7 @@ async def _find_custodes_tmux_pane() -> str | None:
 
     Uses the `@PANE_ID = legion:custodes` tmux pane option as the identity signal
     — set by `_create_custodes_legion_pane` at pane creation. Pane background
-    color is an OUTPUT of legion designation (driven by `pane_recolor_queue`),
+    color is an OUTPUT of legion designation (applied by shared.apply_pane_tint),
     never an input — keying recovery on color creates a circular SoT dependency
     where a missed recolor makes Custodes "disappear" to the dispatcher.
     """
@@ -8182,9 +8188,13 @@ async def set_instance_legion(instance_id: str, request: Request):
         )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
-        if not await cursor.fetchone():
+        cursor = await db.execute(
+            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+        tmux_pane = row[0]
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
@@ -8194,6 +8204,11 @@ async def set_instance_legion(instance_id: str, request: Request):
             actor="set-legion",
         )
         await db.commit()
+
+    # Event-driven tint: this instance just (re)registered its persona — paint
+    # its pane for the new legion. No queue, no poll.
+    if tmux_pane:
+        await asyncio.to_thread(shared.apply_pane_tint, tmux_pane, legion, source="set-legion")
 
     logger.info(f"Legion: {instance_id[:12]} → {legion}")
     return {"instance_id": instance_id, "legion": legion}
@@ -8218,9 +8233,13 @@ async def rebind_instance_tmux_pane(instance_id: str, request: Request):
         )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
-        if not await cursor.fetchone():
+        cursor = await db.execute(
+            "SELECT legion FROM claude_instances WHERE id = ?", (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+        legion = row[0]
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
@@ -8230,6 +8249,13 @@ async def rebind_instance_tmux_pane(instance_id: str, request: Request):
             actor="rebind-tmux-pane",
         )
         await db.commit()
+
+    # Event-driven tint: the instance's pane moved — repaint the new pane for its
+    # legion (closes the old trg_tmux_pane_recolor order-of-operations gap).
+    if legion:
+        await asyncio.to_thread(
+            shared.apply_pane_tint, tmux_pane, legion, source="rebind-tmux-pane"
+        )
 
     logger.info(f"Tmux pane: {instance_id[:12]} → {tmux_pane}")
     return {"instance_id": instance_id, "tmux_pane": tmux_pane}
@@ -16613,77 +16639,6 @@ async def enforce_break_exhausted_impl() -> dict:
         "desktop_enforcement": desktop_result,
         "phone_enforcement": phone_result,
     }
-
-
-async def legion_pane_recolor_worker():
-    """Background worker that processes the pane_recolor_queue table.
-
-    The SQLite trigger `trg_legion_recolor` fires on any UPDATE to the legion
-    column, inserting a row here. This worker polls every second, reads pending
-    recolors, and applies `tmux select-pane -P 'bg=...'` to each pane.
-    Catches ALL legion change entry points without caller cooperation.
-    """
-    while True:
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cursor = await db.execute(
-                    "SELECT id, instance_id, legion, tmux_pane FROM pane_recolor_queue ORDER BY id"
-                )
-                rows = await cursor.fetchall()
-                if not rows:
-                    await asyncio.sleep(1)
-                    continue
-
-                processed_ids = []
-                for row in rows:
-                    queue_id = row["id"]
-                    instance_id = row["instance_id"]
-                    legion = row["legion"] or "astartes"
-                    tmux_pane = row["tmux_pane"]
-
-                    # If trigger didn't capture tmux_pane, look it up
-                    if not tmux_pane:
-                        cur2 = await db.execute(
-                            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
-                        )
-                        pane_row = await cur2.fetchone()
-                        tmux_pane = pane_row["tmux_pane"] if pane_row else None
-
-                    if tmux_pane:
-                        bg = LEGION_PANE_COLORS.get(legion, "default")
-                        try:
-                            if bg == "default":
-                                cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", "bg=default"]
-                            else:
-                                cmd = ["tmux", "select-pane", "-t", tmux_pane, "-P", f"bg={bg}"]
-                            await asyncio.to_thread(
-                                _run_tmux_focus_preserved,
-                                tuple(cmd),
-                                source="token-api pane-recolor",
-                                attempted_target=tmux_pane,
-                            )
-                            logger.info(
-                                f"Legion recolor: {instance_id[:12]} → {legion} (bg={bg}, pane={tmux_pane})"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Legion recolor failed for {tmux_pane}: {e}")
-
-                    processed_ids.append(queue_id)
-
-                # Clear processed entries
-                if processed_ids:
-                    placeholders = ",".join("?" * len(processed_ids))
-                    await db.execute(
-                        f"DELETE FROM pane_recolor_queue WHERE id IN ({placeholders})",
-                        processed_ids,
-                    )
-                    await db.commit()
-
-        except Exception as e:
-            logger.error(f"Legion recolor worker error: {e}")
-
-        await asyncio.sleep(1)
 
 
 async def pane_state_worker():
