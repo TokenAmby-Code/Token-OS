@@ -9,6 +9,7 @@ Golden Throne — not here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from pydantic import BaseModel
 
@@ -33,7 +34,12 @@ _typing_guard_active = None
 _dictation_active = None
 
 
-def init_deps(*, is_quiet_hours=None, typing_guard_active=None, dictation_active=None) -> None:
+def init_deps(
+    *,
+    is_quiet_hours: Callable[[], bool] | None = None,
+    typing_guard_active: Callable[[], bool] | None = None,
+    dictation_active: Callable[[], bool] | None = None,
+) -> None:
     """Late-bind dependencies from main.py to avoid circular imports."""
     global _is_quiet_hours, _typing_guard_active, _dictation_active
     if is_quiet_hours is not None:

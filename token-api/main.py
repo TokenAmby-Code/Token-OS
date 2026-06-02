@@ -5205,6 +5205,15 @@ async def _find_expected_ack(
     return _expected_ack_row_to_dict(row) if row else None
 
 
+async def _has_pending_acks() -> bool:
+    """True if any enforcement sequence is currently pending."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM expected_acknowledgements WHERE status = 'pending' LIMIT 1"
+        )
+        return await cursor.fetchone() is not None
+
+
 async def _resolve_expected_ack(
     *,
     ack_id: str | None,
@@ -5368,7 +5377,7 @@ async def _resume_productivity_timer(trigger: str) -> dict:
             await timer_end_session(_current_session_id, duration_ms)
         _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
-        print(f"TIMER: {trigger} exited {old_mode} → {new_mode}")
+        logger.info("TIMER: %s exited %s → %s", trigger, old_mode, new_mode)
     return {
         "old_mode": old_mode,
         "exited_idle": exited_idle,
@@ -5456,12 +5465,15 @@ async def grant_break_credit(seconds: int, *, reason: str, source: str) -> dict:
     return {"seconds": seconds, "break_balance_ms": timer_engine.break_balance_ms}
 
 
-async def maybe_grant_first_ack_break_boost() -> dict:
+async def maybe_grant_first_ack_break_boost(eligible: bool = True) -> dict:
     """Grant the one-time ~30s break boost for the FIRST ack in a sequence only.
 
-    The sequence flag is reset when a fresh ack sequence opens (see
-    create_expected_ack). Subsequent acks in the same sequence grant nothing."""
-    if ACK_BREAK_BOOST_STATE["granted_in_sequence"]:
+    ``eligible`` gates the credit on a real enforcement sequence + a connected
+    Pavlok (the boost is a connectivity confirm, not free credit) — an ack with
+    no pending sequence or an unreachable device mints nothing. The sequence flag
+    is reset when a fresh ack sequence opens (see create_expected_ack), so
+    subsequent acks in the same sequence grant nothing either."""
+    if not eligible or ACK_BREAK_BOOST_STATE["granted_in_sequence"]:
         return {"granted": False, "seconds": 0}
     ACK_BREAK_BOOST_STATE["granted_in_sequence"] = True
     await grant_break_credit(
@@ -13659,7 +13671,7 @@ async def reset_timer():
 
 
 @app.post("/api/work-action")
-async def work_action(request: WorkActionRequest | None = None):
+async def work_action(request: WorkActionRequest | None = None) -> dict:
     """Manual work action signal — the canonical SATISFY work signal.
 
     Routes through the unified observe_work_signal sink: sets productivity active
@@ -17602,18 +17614,29 @@ async def enforce_endpoint(request: EnforceRequest):
 
 
 @app.post("/api/enforcement/ack")
-async def enforcement_ack(request: EnforcementAckRequest):
+async def enforcement_ack(request: EnforcementAckRequest) -> dict:
     """DEMOTED ack: a Pavlok-connectivity confirm, NOT an enforcement terminator.
 
     Acking no longer resolves enforcement — only a real work-signal ACTION does
     (see observe_work_signal / work-action / stand-down). What the ack still buys:
     it confirms the Pavlok is reachable, and the FIRST ack in a sequence grants a
-    one-time ~30s break credit (ACK_FIRST_BREAK_BOOST_SECONDS). Never repeated,
-    never resolves an ack on its own. The Emperor's words: "acking should never be
-    an end in itself."
+    one-time ~30s break credit (ACK_FIRST_BREAK_BOOST_SECONDS). The boost is gated
+    on a real pending sequence AND a reachable device, so a stale/bogus ack_id or
+    an unreachable Pavlok mints nothing. Never repeated, never resolves an ack on
+    its own. The Emperor's words: "acking should never be an end in itself."
     """
     connectivity = await asyncio.to_thread(check_phone_reachable)
-    boost = await maybe_grant_first_ack_break_boost()
+    reachable = bool(connectivity.get("reachable"))
+
+    # A boost only makes sense against a live enforcement sequence: a specific
+    # pending ack if one was named, otherwise any pending ack.
+    if request.ack_id or (request.source and request.instance_id):
+        ack = await _find_expected_ack(request.ack_id, request.source, request.instance_id)
+        pending_exists = bool(ack and ack["status"] == "pending")
+    else:
+        pending_exists = await _has_pending_acks()
+
+    boost = await maybe_grant_first_ack_break_boost(eligible=reachable and pending_exists)
 
     await log_event(
         "enforcement_ack_connectivity",
@@ -17623,7 +17646,8 @@ async def enforcement_ack(request: EnforcementAckRequest):
             "ack_id": request.ack_id,
             "source": request.source,
             "instance_id": request.instance_id,
-            "pavlok_reachable": bool(connectivity.get("reachable")),
+            "pavlok_reachable": reachable,
+            "pending_ack": pending_exists,
             "break_boost_granted": boost["granted"],
             "break_boost_seconds": boost["seconds"],
         },

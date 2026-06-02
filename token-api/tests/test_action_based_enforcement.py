@@ -17,43 +17,40 @@ import sqlite3
 from datetime import datetime, timedelta
 
 
-def _rows(db_path, query, params=()):
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return rows
+def _rows(db_path, query, params=()) -> list:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(query, params).fetchall()
 
 
-def _insert_pending_ack(db_path, main, *, ack_id, source, instance_id):
+def _insert_pending_ack(db_path, main, *, ack_id, source, instance_id) -> None:
     now = datetime.now()
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        INSERT INTO expected_acknowledgements (
-            id, source, instance_id, reason, status, created_at,
-            ack_due_at, level2_due_at, pavlok_due_at, details_json
-        ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
-        """,
-        (
-            ack_id,
-            source,
-            instance_id,
-            "pending enforcement test",
-            now.isoformat(),
-            (now + timedelta(seconds=1)).isoformat(),
-            (now + timedelta(seconds=15)).isoformat(),
-            (now + timedelta(seconds=15)).isoformat(),
-            "{}",
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO expected_acknowledgements (
+                id, source, instance_id, reason, status, created_at,
+                ack_due_at, level2_due_at, pavlok_due_at, details_json
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+            """,
+            (
+                ack_id,
+                source,
+                instance_id,
+                "pending enforcement test",
+                now.isoformat(),
+                (now + timedelta(seconds=1)).isoformat(),
+                (now + timedelta(seconds=15)).isoformat(),
+                (now + timedelta(seconds=15)).isoformat(),
+                "{}",
+            ),
+        )
+        conn.commit()
 
 
 # (a) work-action SATISFIES a pending enforcement via the unified work signal,
 #     logging an explicit resolved_by reason, and never fires Pavlok.
-def test_work_action_satisfies_enforcement_with_resolved_by_reason(app_env):
+def test_work_action_satisfies_enforcement_with_resolved_by_reason(app_env) -> None:
     from fastapi.testclient import TestClient
 
     main = app_env.main
@@ -97,7 +94,7 @@ def test_work_action_satisfies_enforcement_with_resolved_by_reason(app_env):
 
 # (b) dictation start DEFERS: enforcement is not resolved and not fired, Pavlok
 #     stays blocked while dictation is active, and a defer reason is logged.
-def test_dictation_start_defers_without_resolving(app_env, monkeypatch):
+def test_dictation_start_defers_without_resolving(app_env, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
     import enforce as enforce_mod
@@ -146,7 +143,7 @@ def test_dictation_start_defers_without_resolving(app_env, monkeypatch):
 
 
 # (c) a completed voice transcription emits a canonical work_signal event.
-def test_voice_transcription_complete_emits_work_signal(app_env, monkeypatch):
+def test_voice_transcription_complete_emits_work_signal(app_env, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
     main = app_env.main
@@ -179,7 +176,7 @@ def test_voice_transcription_complete_emits_work_signal(app_env, monkeypatch):
 
 # (d) the ack is DEMOTED: pressing it never resolves enforcement; the first ack
 #     in a sequence grants exactly one ~30s break credit, the second grants none.
-def test_ack_is_demoted_to_connectivity_confirm_with_one_time_boost(app_env, monkeypatch):
+def test_ack_is_demoted_to_connectivity_confirm_with_one_time_boost(app_env, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
     main = app_env.main
@@ -226,7 +223,7 @@ def test_ack_is_demoted_to_connectivity_confirm_with_one_time_boost(app_env, mon
 
 
 # (e) typing_guard active → Pavlok blocked AND a defer disposition logged.
-def test_typing_guard_blocks_pavlok_and_logs_defer(app_env, monkeypatch):
+def test_typing_guard_blocks_pavlok_and_logs_defer(app_env, monkeypatch) -> None:
     import asyncio
 
     import enforce as enforce_mod

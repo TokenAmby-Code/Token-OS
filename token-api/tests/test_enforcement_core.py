@@ -620,7 +620,7 @@ async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     assert json.loads(event["details"])["id"] == ack["id"]
 
 
-def test_enforcement_ack_endpoint_is_demoted_and_does_not_resolve(app_env, monkeypatch):
+def test_enforcement_ack_endpoint_is_demoted_and_does_not_resolve(app_env, monkeypatch) -> None:
     """The ack is demoted: pressing it confirms Pavlok connectivity but never
     resolves enforcement. Replaces the old ack-as-terminator contract."""
     from fastapi.testclient import TestClient

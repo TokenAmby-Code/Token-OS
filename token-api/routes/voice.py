@@ -47,7 +47,11 @@ _schedule_pedal_enter = None
 _observe_work_signal = None
 
 
-def init_deps(*, schedule_pedal_enter=None, observe_work_signal=None):
+def init_deps(
+    *,
+    schedule_pedal_enter: Callable[..., None] | None = None,
+    observe_work_signal: Callable[..., Awaitable[dict]] | None = None,
+):
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.
@@ -342,8 +346,14 @@ async def toggle_listening(instance_id: str, active: bool = True):
     )
     if active and _observe_work_signal:
         # Dictation start is live work — DEFER: it stalls enforcement and holds
-        # the Pavlok while active, without resolving any ack.
-        await _observe_work_signal(source="voice-chat", kind="dictation", instance_id=instance_id)
+        # the Pavlok while active, without resolving any ack. Guarded so a sink
+        # failure can't 500 the high-frequency toggle after the state is set.
+        try:
+            await _observe_work_signal(
+                source="voice-chat", kind="dictation", instance_id=instance_id
+            )
+        except Exception:
+            logger.exception("observe_work_signal failed for dictation (voice-chat)")
     return {"instance_id": instance_id, "listening": active}
 
 
@@ -359,8 +369,12 @@ async def set_dictation_state(active: bool):
 
     if active and _observe_work_signal:
         # Dictation start is live work — DEFER: it stalls enforcement and holds
-        # the Pavlok while active, without resolving any ack.
-        await _observe_work_signal(source="dictation", kind="dictation")
+        # the Pavlok while active, without resolving any ack. Guarded so a sink
+        # failure can't 500 the high-frequency AHK toggle after the state is set.
+        try:
+            await _observe_work_signal(source="dictation", kind="dictation")
+        except Exception:
+            logger.exception("observe_work_signal failed for dictation")
 
     # When dictation ends, flush any queued pedal enter after buffer delay
     if not active and PEDAL_STATE["enter_queued"] and _schedule_pedal_enter:
