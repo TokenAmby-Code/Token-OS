@@ -13494,7 +13494,12 @@ async def get_timer_shifts():
 async def enter_break_mode():
     """Enter break mode (for Stream Deck / TUI / manual control)."""
     global _current_session_id, _session_start_ms
-    if timer_engine.break_balance_ms <= 0:
+    # During a work session the engine balance is the local 0, so the normal
+    # "no balance, no break" guard would make declaring a break impossible —
+    # and dipping below local 0 is exactly the work-session failure path. Let
+    # the break through while a session is active; the session's own −30s
+    # cancel + dip-zap governs it.
+    if timer_engine.break_balance_ms <= 0 and not timer_engine.work_session_active:
         raise HTTPException(status_code=400, detail="No break time available")
 
     now_ms = int(time.monotonic() * 1000)
@@ -16544,11 +16549,22 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
         # so it waits a full re-fire interval before its own next zap.
         if action == "cancel":
             original_ms = timer_engine.work_session_original_break_ms
+            old_mode = timer_engine.current_mode.value
             cancel_info = timer_engine.cancel_work_session()
             sit["zapped"] = False
             await timer_save_to_db()
             await log_event(
                 "work_session_failed",
+                details={"break_balance_ms": bal, **cancel_info},
+            )
+            # Mirror the manual cancel endpoint so an auto-failed session also
+            # lands a work_session_cancel timer_shift — otherwise auto-failures
+            # are invisible on the ops timer graph (no WS✕ divider).
+            await timer_log_shift(
+                old_mode,
+                timer_engine.current_mode.value,
+                trigger="work_session_cancel",
+                source="work_session_failed",
                 details={"break_balance_ms": bal, **cancel_info},
             )
             _negative_break_situation["rep"] = 1

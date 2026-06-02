@@ -12,6 +12,17 @@ import { formatSignedDuration, formatClock } from '../format';
 const PAD = { top: 16, right: 16, bottom: 26, left: 52 };
 const HEIGHT = 240;
 
+// Curated allowlist: only work-session boundaries and daily/manual resets
+// render as full-height dividers. Deliberately no mode_change or enforcement
+// clutter — work sessions + resets are the only structural marks worth a line.
+const DIVIDER_TYPES: Record<string, { glyph: string; sev: 'good' | 'bad' | 'info' }> = {
+  work_session_start: { glyph: 'WS▶', sev: 'good' },
+  work_session_end: { glyph: 'WS■', sev: 'good' },
+  work_session_cancel: { glyph: 'WS✕', sev: 'bad' },
+  daily_reset: { glyph: 'RESET', sev: 'info' },
+  manual_reset: { glyph: 'RESET', sev: 'info' },
+};
+
 type Props = { history: TimerHistory };
 
 export function TimerGraph({ history }: Props) {
@@ -71,6 +82,31 @@ export function TimerGraph({ history }: Props) {
 
     return { t0, t1, span, lo, hi, stepMs, plotW, plotH, x, y };
   }, [history.generated_at, history.window_seconds, points, width]);
+
+  // Curated work-session/reset dividers, derived from the annotations the
+  // backend builds off timer_shifts. Keep only allowlisted types that land in
+  // the window with a finite timestamp; suppress a glyph label when it would
+  // crowd the previously-labeled divider (~34px).
+  const dividers = useMemo(() => {
+    if (!geom) return [];
+    const { x, t0, span } = geom;
+    const t1 = t0 + span;
+    const kept = (history.annotations ?? [])
+      .map((a) => {
+        const spec = DIVIDER_TYPES[a.type];
+        const t = Date.parse(a.t);
+        if (!spec || !Number.isFinite(t) || t < t0 || t > t1) return null;
+        return { a, px: x(t), glyph: spec.glyph, sev: spec.sev };
+      })
+      .filter((d): d is NonNullable<typeof d> => d !== null)
+      .sort((p, q) => p.px - q.px);
+    let lastLabeledPx = -Infinity;
+    return kept.map((d) => {
+      const showLabel = d.px - lastLabeledPx >= 34;
+      if (showLabel) lastLabeledPx = d.px;
+      return { ...d, showLabel };
+    });
+  }, [geom, history.annotations]);
 
   if (!geom) {
     return (
@@ -190,6 +226,19 @@ export function TimerGraph({ history }: Props) {
 
         {/* Zero line — prominent */}
         <line x1={PAD.left} x2={width - PAD.right} y1={zeroY} y2={zeroY} className="zero-line" />
+
+        {/* Work-session + reset dividers — over shading/grid, under the data line */}
+        <g className="dividers">
+          {dividers.map((d) => (
+            <g key={d.a.id} className={`divider divider--${d.sev}`}>
+              <line x1={d.px} x2={d.px} y1={PAD.top} y2={HEIGHT - PAD.bottom} className="divider__line" />
+              {d.showLabel ? (
+                <text x={d.px} y={PAD.top + 9} className="divider__label" textAnchor="middle">{d.glyph}</text>
+              ) : null}
+              <title>{`${formatClock(d.a.t)} · ${d.a.type} · ${d.a.label}`}</title>
+            </g>
+          ))}
+        </g>
 
         {/* Balance line, threshold colored */}
         {linePaths.map((run, i) => (
