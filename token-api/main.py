@@ -2886,10 +2886,16 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         )
         new_status = "processing"
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
-        acknowledged_acks = await acknowledge_pending_acks_for_instance(instance_id)
-        acknowledged_acks += await acknowledge_pending_work_action_acks()
-        _mark_mewgenics_work_action("prompt_submit", f"instance_id={instance_id}")
-        stop_enforcement_cascade(reason="prompt_submit")
+        # Prompt submit is a SATISFY work signal: it clears this instance's acks
+        # plus distraction/backlog acks. Productivity for instances is owned by
+        # the timer worker, so this signal does not flip productivity itself.
+        signal = await observe_work_signal(
+            source="api",
+            kind="prompt_submit",
+            instance_id=instance_id,
+            set_productivity=False,
+        )
+        acknowledged_acks = signal["resolved_acks"]
     elif request.action == "stop":
         new_status = "idle"
         acknowledged_acks = 0
@@ -4595,6 +4601,24 @@ def _activity_icons() -> list[ActivityIconState]:
 WORK_ACTION_BUFFER_SECONDS = 3 * 60
 TYPING_GUARD_ACTIVE_SECONDS = 15
 
+# ---- Action-based enforcement response (ack → action redesign) ----
+# Enforcement is satisfied/deferred by work-signal ACTIONS, not by acking.
+# SATISFY kinds clear the triggering condition → resolve the pending ack.
+# Everything else (ambient live work: dictation/voice) DEFERS — stall, don't lose.
+WORK_SIGNAL_SATISFY_KINDS = frozenset({"work_action", "prompt_submit"})
+# Ack sources a generic productivity signal is allowed to clear. Distraction +
+# backlog acks are cleared by "I'm working now"; agent-pane acks (golden_throne,
+# askq) are only cleared by activity on that specific instance.
+WORK_SIGNAL_SATISFY_SOURCES = frozenset({"phone_distraction", "backlog_violation", "phone_gaming"})
+# Live dictation holds the Pavlok like typing does, re-checked for staleness so a
+# stuck lock can't suppress enforcement forever.
+DICTATION_GUARD_WINDOW_SECONDS = 120
+# The demoted ack's one-time courtesy: the FIRST ack in an enforcement sequence
+# grants a small break credit (Pavlok-connectivity confirm), never repeated.
+ACK_FIRST_BREAK_BOOST_SECONDS = 30
+# Sequence state for the one-time boost; reset when a fresh ack sequence opens.
+ACK_BREAK_BOOST_STATE = {"granted_in_sequence": False}
+
 
 def _format_countdown_seconds(seconds: int | None) -> str | None:
     if seconds is None:
@@ -5055,6 +5079,15 @@ async def create_expected_ack(
                 _schedule_expected_ack_remaining(ack)
                 return ack
 
+        # A fresh ack SEQUENCE opens when this is the first pending ack — arm the
+        # one-time first-ack break boost (the demoted ack's courtesy credit).
+        pending_cursor = await db.execute(
+            "SELECT COUNT(*) FROM expected_acknowledgements WHERE status = 'pending'"
+        )
+        (pending_before,) = await pending_cursor.fetchone()
+        if pending_before == 0:
+            ACK_BREAK_BOOST_STATE["granted_in_sequence"] = False
+
         ack_id = str(uuid.uuid4())
         deadlines = _expected_ack_deadlines(
             ack_delay=ack_delay, level2_delay=level2_delay, pavlok_delay=pavlok_delay
@@ -5172,6 +5205,15 @@ async def _find_expected_ack(
     return _expected_ack_row_to_dict(row) if row else None
 
 
+async def _has_pending_acks() -> bool:
+    """True if any enforcement sequence is currently pending."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM expected_acknowledgements WHERE status = 'pending' LIMIT 1"
+        )
+        return await cursor.fetchone() is not None
+
+
 async def _resolve_expected_ack(
     *,
     ack_id: str | None,
@@ -5179,6 +5221,7 @@ async def _resolve_expected_ack(
     instance_id: str | None,
     status: str,
     bailout_reason: str | None = None,
+    resolved_by: str | None = None,
 ) -> dict:
     ack = await _find_expected_ack(ack_id, source, instance_id)
     if not ack:
@@ -5213,11 +5256,16 @@ async def _resolve_expected_ack(
     event_type = (
         "expected_ack_acknowledged" if status == "acknowledged" else "expected_ack_bailed_out"
     )
-    await log_event(event_type, instance_id=ack["instance_id"], details=ack)
-    return {"updated": True, "ack": ack}
+    # Every resolution carries an explicit reason — no silent paths. resolved_by
+    # records WHICH work signal cleared the condition (e.g. "work_signal:work_action").
+    details = {**ack, "resolved_by": resolved_by}
+    await log_event(event_type, instance_id=ack["instance_id"], details=details)
+    return {"updated": True, "ack": ack, "resolved_by": resolved_by}
 
 
-async def acknowledge_pending_acks_for_instance(instance_id: str, source: str | None = None) -> int:
+async def acknowledge_pending_acks_for_instance(
+    instance_id: str, source: str | None = None, resolved_by: str | None = None
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if source:
@@ -5241,36 +5289,46 @@ async def acknowledge_pending_acks_for_instance(instance_id: str, source: str | 
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+            ack_id=row["id"],
+            source=None,
+            instance_id=None,
+            status="acknowledged",
+            resolved_by=resolved_by,
         )
         if result["updated"]:
             count += 1
     return count
 
 
-async def acknowledge_pending_work_action_acks() -> int:
+async def acknowledge_pending_work_action_acks(resolved_by: str | None = None) -> int:
+    placeholders = ", ".join("?" for _ in WORK_SIGNAL_SATISFY_SOURCES)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """
+            f"""
             SELECT id FROM expected_acknowledgements
             WHERE status = 'pending'
-              AND source IN ('phone_distraction', 'backlog_violation')
-            """
+              AND source IN ({placeholders})
+            """,
+            tuple(WORK_SIGNAL_SATISFY_SOURCES),
         )
         rows = await cursor.fetchall()
 
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+            ack_id=row["id"],
+            source=None,
+            instance_id=None,
+            status="acknowledged",
+            resolved_by=resolved_by,
         )
         if result.get("updated"):
             count += 1
     return count
 
 
-async def acknowledge_backlog_surface_acks(surface: str) -> int:
+async def acknowledge_backlog_surface_acks(surface: str, resolved_by: str | None = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -5287,11 +5345,141 @@ async def acknowledge_backlog_surface_acks(surface: str) -> int:
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
+            ack_id=row["id"],
+            source=None,
+            instance_id=None,
+            status="acknowledged",
+            resolved_by=resolved_by,
         )
         if result.get("updated"):
             count += 1
     return count
+
+
+async def _resume_productivity_timer(trigger: str) -> dict:
+    """Flip the timer to productive-now and roll the session if we left idle.
+
+    Shared by every work signal that proves the Emperor is actively working.
+    Returns a small summary the caller can surface; phone/desktop distraction
+    state is intentionally left untouched (a work action proves work resumed,
+    not that the distraction ended)."""
+    global _current_session_id, _session_start_ms
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    result = timer_engine.set_productivity(True, now_ms)
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
+    if exited_idle:
+        new_mode = timer_engine.current_mode.value
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_shift(old_mode, new_mode, trigger=trigger, source="api")
+        if _current_session_id > 0:
+            duration_ms = now_ms - _session_start_ms
+            await timer_end_session(_current_session_id, duration_ms)
+        _current_session_id = await timer_start_session(new_mode, today)
+        _session_start_ms = now_ms
+        logger.info("TIMER: %s exited %s → %s", trigger, old_mode, new_mode)
+    return {
+        "old_mode": old_mode,
+        "exited_idle": exited_idle,
+        "current_mode": timer_engine.current_mode.value,
+    }
+
+
+async def observe_work_signal(
+    *,
+    source: str,
+    kind: str,
+    instance_id: str | None = None,
+    details: dict | None = None,
+    set_productivity: bool = True,
+) -> dict:
+    """The one work-signal sink. ALL work signals route through here.
+
+    Responsibilities (single router, no bolt-on side paths):
+      (a) optionally flip the timer to productive-now,
+      (b) decide DEFER vs SATISFY against currently-pending enforcement,
+      (c) for SATISFY, resolve the matching acks via ``_resolve_expected_ack``
+          with an explicit ``resolved_by="work_signal:<kind>"`` reason,
+      (d) log one canonical ``work_signal`` event — never a silent path.
+
+    SATISFY kinds clear the triggering condition (work-action bind, prompt
+    submit). Ambient live work (dictation, voice) DEFERS — it stalls enforcement
+    and holds the Pavlok (see enforce()'s dictation guard) but does not resolve
+    the ack; the escalation ladder re-checks staleness. "We don't lose, we stall."
+    """
+    disposition = "satisfy" if kind in WORK_SIGNAL_SATISFY_KINDS else "defer"
+
+    productivity: dict | None = None
+    if set_productivity:
+        productivity = await _resume_productivity_timer(kind)
+
+    # Work evidence + legacy cascade shim fire for any work signal.
+    _mark_mewgenics_work_action(source, (details or {}).get("note") if details else None)
+    stop_enforcement_cascade(reason=f"work_signal:{kind}")
+
+    resolved_acks = 0
+    if disposition == "satisfy":
+        resolved_by = f"work_signal:{kind}"
+        resolved_acks += await acknowledge_pending_work_action_acks(resolved_by=resolved_by)
+        if instance_id:
+            resolved_acks += await acknowledge_pending_acks_for_instance(
+                instance_id, resolved_by=resolved_by
+            )
+
+    payload = {
+        "source": source,
+        "kind": kind,
+        "instance_id": instance_id,
+        "disposition": disposition,
+        "resolved_acks": resolved_acks,
+    }
+    if details:
+        payload["details"] = details
+    if productivity:
+        payload["timer"] = productivity
+    await log_event("work_signal", instance_id=instance_id, details=payload)
+
+    return {
+        "disposition": disposition,
+        "kind": kind,
+        "resolved_acks": resolved_acks,
+        "timer": productivity,
+    }
+
+
+async def grant_break_credit(seconds: int, *, reason: str, source: str) -> dict:
+    """Structured one-off break credit (replaces the debug set-break poke for
+    real credits). Adds positive break balance, logs an explicit reason, persists."""
+    now_ms = int(time.monotonic() * 1000)
+    timer_engine.credit_break(max(0, seconds) * 1000, now_ms)
+    await log_event(
+        "break_credit",
+        details={
+            "reason": reason,
+            "source": source,
+            "seconds": seconds,
+            "break_balance_ms": timer_engine.break_balance_ms,
+        },
+    )
+    await timer_save_to_db()
+    return {"seconds": seconds, "break_balance_ms": timer_engine.break_balance_ms}
+
+
+async def maybe_grant_first_ack_break_boost(eligible: bool = True) -> dict:
+    """Grant the one-time ~30s break boost for the FIRST ack in a sequence only.
+
+    ``eligible`` gates the credit on a real enforcement sequence + a connected
+    Pavlok (the boost is a connectivity confirm, not free credit) — an ack with
+    no pending sequence or an unreachable device mints nothing. The sequence flag
+    is reset when a fresh ack sequence opens (see create_expected_ack), so
+    subsequent acks in the same sequence grant nothing either."""
+    if not eligible or ACK_BREAK_BOOST_STATE["granted_in_sequence"]:
+        return {"granted": False, "seconds": 0}
+    ACK_BREAK_BOOST_STATE["granted_in_sequence"] = True
+    await grant_break_credit(
+        ACK_FIRST_BREAK_BOOST_SECONDS, reason="ack_connectivity", source="enforcement_ack"
+    )
+    return {"granted": True, "seconds": ACK_FIRST_BREAK_BOOST_SECONDS}
 
 
 async def _terminal_backlog_ack_for_active_span(
@@ -6635,6 +6823,28 @@ def _typing_guard_active() -> bool:
         return False
     age = int(time.time()) - activity
     return 0 <= age <= max(1, _TYPING_GUARD_WINDOW_SECONDS)
+
+
+def _dictation_active() -> bool:
+    """Live dictation/voice predicate (sync): the Emperor is dictating right now.
+
+    Reads the shared DICTATION_STATE toggle (set by AHK / voice-chat listening)
+    with a staleness window so a lock that never toggled off can't suppress the
+    Pavlok indefinitely. Same DEFER role as ``_typing_guard_active``: while live,
+    enforcement stalls rather than fires.
+    """
+    if not DICTATION_STATE.get("active"):
+        return False
+    updated_at = DICTATION_STATE.get("updated_at")
+    if not updated_at:
+        # Active with no timestamp — honour the toggle but bounded by nothing we
+        # can stale-check; treat as live (fail toward stalling, never losing).
+        return True
+    try:
+        age = (datetime.now() - datetime.fromisoformat(updated_at)).total_seconds()
+    except (ValueError, TypeError):
+        return True
+    return 0 <= age <= DICTATION_GUARD_WINDOW_SECONDS
 
 
 async def _custodes_state_snapshot() -> dict:
@@ -11464,12 +11674,19 @@ from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
 
-enforce_init_deps(is_quiet_hours=is_quiet_hours, typing_guard_active=_typing_guard_active)
+enforce_init_deps(
+    is_quiet_hours=is_quiet_hours,
+    typing_guard_active=_typing_guard_active,
+    dictation_active=_dictation_active,
+)
 
 # Wire voice route dependencies
 from routes.voice import init_deps as voice_init_deps
 
-voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
+voice_init_deps(
+    schedule_pedal_enter=_schedule_pedal_enter,
+    observe_work_signal=observe_work_signal,
+)
 
 
 def _enforcement_state_payload(
@@ -11785,7 +12002,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             "scrolling",
             "gaming",
         ):
-            acknowledged_acks = await acknowledge_backlog_surface_acks("desktop")
+            acknowledged_acks = await acknowledge_backlog_surface_acks(
+                "desktop", resolved_by="negative_edge:desktop"
+            )
             await log_event(
                 "enforcement_negative_edge",
                 details={
@@ -13452,45 +13671,36 @@ async def reset_timer():
 
 
 @app.post("/api/work-action")
-async def work_action(request: WorkActionRequest | None = None):
-    """Manual work action signal — sets productivity active and resolves distraction acks."""
-    global _current_session_id, _session_start_ms
+async def work_action(request: WorkActionRequest | None = None) -> dict:
+    """Manual work action signal — the canonical SATISFY work signal.
+
+    Routes through the unified observe_work_signal sink: sets productivity active
+    and resolves distraction/backlog acks with a logged work_signal:work_action
+    reason. A work action proves productivity resumed; it does not prove phone/
+    desktop distraction ended, so attention-source state is left untouched
+    (productivity + YouTube → MULTITASKING, not a false clear to WORKING)."""
     request = request or WorkActionRequest()
     await bust_quiet_state(
         "api",
         "work_action",
         {"source": request.source, "note": request.note},
     )
-    now_ms = int(time.monotonic() * 1000)
-    old_mode = timer_engine.current_mode.value
-    result = timer_engine.set_productivity(True, now_ms)
-    exited_idle = TimerEvent.MODE_CHANGED in result.events
 
-    if exited_idle:
-        new_mode = timer_engine.current_mode.value
-        today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_shift(old_mode, new_mode, trigger="work_action", source="api")
-        if _current_session_id > 0:
-            duration_ms = now_ms - _session_start_ms
-            await timer_end_session(_current_session_id, duration_ms)
-        _current_session_id = await timer_start_session(new_mode, today)
-        _session_start_ms = now_ms
-        print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
-
-    acknowledged_acks = await acknowledge_pending_work_action_acks()
-    _mark_mewgenics_work_action(request.source, request.note)
-    stop_enforcement_cascade(reason=f"work_action:{request.source}")
-    # A work action proves productivity resumed; it does not prove phone/desktop
-    # distraction ended. Preserve attention-source state so productivity + YouTube
-    # becomes MULTITASKING instead of falsely clearing to WORKING. Phone app state
-    # must be ended by explicit close/new-app telemetry or a dedicated correction.
+    signal = await observe_work_signal(
+        source=request.source,
+        kind="work_action",
+        details={"note": request.note} if request.note else None,
+        set_productivity=True,
+    )
+    acknowledged_acks = signal["resolved_acks"]
+    timer = signal["timer"] or {}
 
     await log_event(
         "work_action",
         details={
             "source": request.source,
             "note": request.note,
-            "old_mode": old_mode,
+            "old_mode": timer.get("old_mode"),
             "current_mode": timer_engine.current_mode.value,
             "acknowledged_expected_acks": acknowledged_acks,
         },
@@ -13498,7 +13708,7 @@ async def work_action(request: WorkActionRequest | None = None):
 
     return {
         "idle_timer_reset": True,
-        "exited_idle": exited_idle,
+        "exited_idle": timer.get("exited_idle", False),
         "current_mode": timer_engine.current_mode.value,
         "acknowledged_expected_acks": acknowledged_acks,
     }
@@ -17404,16 +17614,52 @@ async def enforce_endpoint(request: EnforceRequest):
 
 
 @app.post("/api/enforcement/ack")
-async def enforcement_ack(request: EnforcementAckRequest):
-    """Acknowledge a pending expected acknowledgement."""
-    if not request.ack_id and not (request.source and request.instance_id):
-        raise HTTPException(status_code=400, detail="ack_id or source+instance_id is required")
-    return await _resolve_expected_ack(
-        ack_id=request.ack_id,
-        source=request.source,
+async def enforcement_ack(request: EnforcementAckRequest) -> dict:
+    """DEMOTED ack: a Pavlok-connectivity confirm, NOT an enforcement terminator.
+
+    Acking no longer resolves enforcement — only a real work-signal ACTION does
+    (see observe_work_signal / work-action / stand-down). What the ack still buys:
+    it confirms the Pavlok is reachable, and the FIRST ack in a sequence grants a
+    one-time ~30s break credit (ACK_FIRST_BREAK_BOOST_SECONDS). The boost is gated
+    on a real pending sequence AND a reachable device, so a stale/bogus ack_id or
+    an unreachable Pavlok mints nothing. Never repeated, never resolves an ack on
+    its own. The Emperor's words: "acking should never be an end in itself."
+    """
+    connectivity = await asyncio.to_thread(check_phone_reachable)
+    reachable = bool(connectivity.get("reachable"))
+
+    # A boost only makes sense against a live enforcement sequence: a specific
+    # pending ack if one was named, otherwise any pending ack.
+    if request.ack_id or (request.source and request.instance_id):
+        ack = await _find_expected_ack(request.ack_id, request.source, request.instance_id)
+        pending_exists = bool(ack and ack["status"] == "pending")
+    else:
+        pending_exists = await _has_pending_acks()
+
+    boost = await maybe_grant_first_ack_break_boost(eligible=reachable and pending_exists)
+
+    await log_event(
+        "enforcement_ack_connectivity",
         instance_id=request.instance_id,
-        status="acknowledged",
+        details={
+            "reason": "ack_connectivity",
+            "ack_id": request.ack_id,
+            "source": request.source,
+            "instance_id": request.instance_id,
+            "pavlok_reachable": reachable,
+            "pending_ack": pending_exists,
+            "break_boost_granted": boost["granted"],
+            "break_boost_seconds": boost["seconds"],
+        },
     )
+
+    return {
+        "resolved": False,
+        "pavlok_connectivity": connectivity,
+        "break_boost_granted": boost["granted"],
+        "break_boost_seconds": boost["seconds"],
+        "break_balance_seconds": round(timer_engine.break_balance_ms / 1000),
+    }
 
 
 @app.post("/api/enforcement/expect")
@@ -18948,6 +19194,21 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
+        # A completed voice transcription is verbal work — emit a work signal so
+        # speaking to the Custodes/FG defers/satisfies enforcement like typing
+        # does, instead of only registering as indirect instance activity.
+        try:
+            await observe_work_signal(
+                source="voice",
+                kind="voice_transcription",
+                details={
+                    "bot_name": request.bot_name,
+                    "content_len": len(request.content or ""),
+                },
+                set_productivity=True,
+            )
+        except Exception as e:
+            logger.warning(f"Voice work signal failed: {e}")
         voice_result = await _handle_discord_voice_draft(request)
         try:
             await log_event(

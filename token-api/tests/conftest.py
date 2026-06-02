@@ -8,6 +8,7 @@ _MODULES_TO_RELOAD = [
     "shared",
     "db_schema",
     "phone_service",
+    "enforce",
     "enforcement_service",
     "routes.voice",
     "routes.tts",

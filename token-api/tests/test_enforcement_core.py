@@ -620,8 +620,12 @@ async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     assert json.loads(event["details"])["id"] == ack["id"]
 
 
-def test_enforcement_ack_endpoint_resolves_pending_ack(app_env):
+def test_enforcement_ack_endpoint_is_demoted_and_does_not_resolve(app_env, monkeypatch) -> None:
+    """The ack is demoted: pressing it confirms Pavlok connectivity but never
+    resolves enforcement. Replaces the old ack-as-terminator contract."""
     from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app_env.main, "check_phone_reachable", lambda: {"reachable": True})
 
     client = TestClient(app_env.main.app)
     ack = app_env.main._expected_ack_deadlines()
@@ -650,11 +654,13 @@ def test_enforcement_ack_endpoint_resolves_pending_ack(app_env):
 
     resp = client.post("/api/enforcement/ack", json={"ack_id": "ack-1"})
     assert resp.status_code == 200
-    assert resp.json()["updated"] is True
+    assert resp.json()["resolved"] is False
+    assert resp.json()["pavlok_connectivity"] == {"reachable": True}
 
+    # The ack is untouched — only a real work signal resolves enforcement.
     row = _rows(app_env.db_path, "SELECT status, acknowledged_at FROM expected_acknowledgements")[0]
-    assert row["status"] == "acknowledged"
-    assert row["acknowledged_at"]
+    assert row["status"] == "pending"
+    assert row["acknowledged_at"] is None
 
 
 def test_enforcement_expect_endpoint_creates_manual_ack(app_env):
