@@ -5,7 +5,8 @@
   "main": "daemon.js",
   "type": "module",
   "scripts": {
-    "start": "node daemon.js"
+    "start": "node daemon.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",

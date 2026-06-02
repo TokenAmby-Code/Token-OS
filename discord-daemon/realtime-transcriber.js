@@ -2,6 +2,7 @@
 // Streams Discord PCM frames into a persistent Realtime transcription session.
 
 import WebSocket from 'ws';
+import { isBenignFixerError } from './fixer-classify.js';
 
 const DEFAULT_REALTIME_MODEL = 'gpt-realtime';
 const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
@@ -96,6 +97,16 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       if (event.type === 'error') {
         const message = event.error?.message || JSON.stringify(event.error || event);
         const errorCode = event.error?.code || event.error?.type || 'realtime_error';
+        if (isBenignFixerError(errorCode, message)) {
+          // The platform's 60-minute Realtime cap is a normal lifecycle event:
+          // cleanupSession deletes the session and the next audio frame recreates
+          // a fresh one. Logging this at info (not error) keeps it from paging the
+          // fixer for a self-healing event.
+          logger.info(
+            `Realtime [${botName}]: session expired (60-min max) for user ${userId}; reconnecting on next audio`
+          );
+          return;
+        }
         logger.error(`Realtime [${botName}]: ${message}`, {
           errorCode,
           provider: 'openai-realtime',
