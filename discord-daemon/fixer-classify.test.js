@@ -19,6 +19,13 @@ test('genuine websocket error still pages the fixer', () => {
   assert.equal(isBenignFixerError('realtime_websocket_error', 'websocket closed'), false);
 });
 
+test('"maximum duration" without the 60-min phrase is NOT suppressed (narrow match)', () => {
+  assert.equal(
+    isBenignFixerError('realtime_error', 'exceeded maximum duration for audio buffer'),
+    false
+  );
+});
+
 test('buffer-commit error still pages the fixer', () => {
   assert.equal(isBenignFixerError('realtime_input_audio_buffer_commit', 'buffer too small'), false);
 });
