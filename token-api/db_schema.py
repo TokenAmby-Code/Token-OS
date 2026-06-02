@@ -372,6 +372,30 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ON pane_write_queue(instance_id, source, status)
         """)
 
+        # Automated-activation markers. Every send through TmuxAdapter.run() is
+        # automated by construction (token-api interventions / tmuxctl CLI /
+        # enforcement / recovery — humans type directly into tmux, never through
+        # run()). The send gate records a per-pane marker so compute_work_state
+        # can discount the woken agent's reflex activity (instance last_activity
+        # bump + work_action) from productivity accounting; otherwise an automated
+        # state-hook/dispatch/enforcement wake re-anchors WORKING and the idle
+        # clock never matures. PRIMARY KEY on tmux_pane ⇒ last-writer-wins upsert
+        # slides the window forward across a multi-send reflex burst and bounds
+        # the table by live pane count.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS automated_pane_activity (
+                tmux_pane   TEXT PRIMARY KEY,
+                injected_at TIMESTAMP NOT NULL,
+                expires_at  TIMESTAMP NOT NULL,
+                source      TEXT,
+                verb        TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_automated_pane_activity_expires
+            ON automated_pane_activity(expires_at)
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pending_polls (
                 poll_id TEXT NOT NULL,

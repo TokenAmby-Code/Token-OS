@@ -34,6 +34,10 @@ export function TimerGraph({ history }: Props) {
   const { points, segments, gaps = [] } = history;
   const anomalyCount = history.anomaly_summary?.count ?? history.anomalies?.length ?? 0;
   const gapCount = history.anomaly_summary?.gap_count ?? gaps.length;
+  // A wall of anomalies is a reverse signal — the backend collapses it to a
+  // suspect-detection record. Render it as a calm diagnostic, not a red alarm.
+  const bulkSuspected = history.anomaly_summary?.bulk_suspected ?? false;
+  const suppressedCount = history.anomaly_summary?.suppressed_count ?? 0;
 
   const geom = useMemo(() => {
     if (points.length === 0) return null;
@@ -243,7 +247,13 @@ export function TimerGraph({ history }: Props) {
         />
       </svg>
 
-      {gapCount > 0 || anomalyCount > 0 ? (
+      {bulkSuspected ? (
+        <div className="chart-warning chart-warning--suspect">
+          telemetry suspect · {suppressedCount} anomalies in one batch reads as
+          false detection, not rendered
+          {gapCount > 0 ? ` · ${gapCount} telemetry gap${gapCount === 1 ? '' : 's'}` : ''}
+        </div>
+      ) : gapCount > 0 || anomalyCount > 0 ? (
         <div className={`chart-warning${anomalyCount > 0 ? ' chart-warning--bad' : ''}`}>
           {anomalyCount > 0
             ? `${anomalyCount} timer anomaly${anomalyCount === 1 ? '' : 'ies'}`

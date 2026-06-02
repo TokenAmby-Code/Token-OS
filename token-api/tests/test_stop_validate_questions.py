@@ -21,7 +21,14 @@ def _clear_pending(app_env):
     hooks._self_eval_pending.clear()
 
 
-def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=None):
+def _insert_instance(
+    db_path,
+    *,
+    session_doc_id=None,
+    is_subagent=0,
+    victory_at=None,
+    instance_type="golden_throne",
+):
     sid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
@@ -30,7 +37,7 @@ def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, registered_at, last_activity, instance_type, workflow_state,
             stop_allowed, session_doc_id, is_subagent, victory_at)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, 'golden_throne',
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, ?,
                    'worktree', 1, ?, ?, ?)""",
         (
             sid,
@@ -39,6 +46,7 @@ def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=
             "/tmp",
             now,
             now,
+            instance_type,
             session_doc_id,
             is_subagent,
             victory_at,
@@ -130,6 +138,21 @@ def test_no_questions_key_falls_through_to_existing_self_eval(app_env, client, t
     assert resp.status_code == 200
     assert resp.json()["decision"] == "block"
     assert _row(app_env.db_path, sid)["workflow_blocked_reason"] == "self_eval_required"
+
+
+def test_sync_instance_not_blocked(app_env, client, tmp_path):
+    """A sync (morning) instance falls through to a clean accept — no self-eval
+    block. The Stop handler re-injects a keepalive prompt instead; the StopValidate
+    gate must not interfere even when the session doc has unclosed questions."""
+    doc_id = _insert_doc(app_env.db_path, _blocked_doc(tmp_path))
+    sid = _insert_instance(app_env.db_path, session_doc_id=doc_id, instance_type="sync")
+
+    resp = client.post("/api/hooks/StopValidate", json={"session_id": sid})
+    assert resp.status_code == 200
+    assert resp.json() == {}
+
+    row = _row(app_env.db_path, sid)
+    assert row["stop_allowed"] == 1
 
 
 def test_no_block_when_subagent_or_victory(app_env, client, tmp_path):

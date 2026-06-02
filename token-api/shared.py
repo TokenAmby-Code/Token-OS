@@ -695,6 +695,21 @@ ASKQ_BUST_PROMPT = (
     "notification protocol to escalate."
 )
 
+# Re-injected on every clean Stop of a sync (morning) instance. The morning
+# session is temporally bound, not turn-based: it must not be possible to walk
+# away and have it sit idle. Each Stop yields a fresh timestamped keepalive that
+# pushes the instance to keep moving via tts / AskUserQuestion. The loop's only
+# exit is flipping the instance off `sync` (POST /api/morning/end, which sets
+# instance_type=one_off). Rip cord: PATCH /api/instances/{id}/type to one_off.
+MORNING_KEEPALIVE_PROMPT = (
+    "It is currently {ts} MST. The morning session is still active. Use `tts` or "
+    "AskUserQuestion to keep things moving — advance the regiment/plan, prompt the "
+    "Emperor, pace yourself by blocking on AskUserQuestion between phases. This "
+    "session stays alive until the Emperor officially ends it; when he does, call "
+    "`POST /api/morning/end` (or PATCH /api/instances/{{id}}/type to one_off as a "
+    "rip cord) to exit the loop."
+)
+
 # Global dictation state — tracks whether Wispr Flow is currently active
 # Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
 #             voice-select-other (explicit on/off during voice chat)

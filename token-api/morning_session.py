@@ -171,12 +171,6 @@ curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/synced" -H 'C
 If registration fails, report it immediately — the harness is broken. Do
 not silently proceed without custodes identity.
 
-Do not acknowledge any pending morning escalation yourself — the
-acknowledgement signal is user-originated (Emperor answers via Discord
-voice/text or explicitly calls `/api/morning/acknowledge`). Your job is to
-prompt for that response and continue once it arrives. On non-alarm
-triggers there is nothing to acknowledge — this is a no-op.
-
 ## Your First Turn
 
 1. Verify registration (above).
@@ -216,11 +210,29 @@ Secondary interface: SSH into the tmux pane from phone (Termux) and type
 directly. Both paths work — voice is lower friction while groggy.
 
 **Use AskUserQuestion between phases** to block and wait for the Emperor's
-response. This is a real conversation, not a monologue.
+response. This is a real conversation, not a monologue. Blocking on
+AskUserQuestion is also how you pace yourself — its timeout ladder is your
+pacing mechanism, not any external timer.
 
 **Be aggressively interactive.** Don't wait passively. If there's silence
 for more than a couple minutes, follow up with TTS. You are a presence,
 not a notification that can be swiped away.
+
+**This session is temporally bound, not turn-based.** When your turn ends,
+the Stop hook accepts it and immediately re-injects a fresh timestamped
+keepalive prompt — you cannot go quiet and let the morning drift. Keep
+moving: advance the regiment/plan, prompt the Emperor via `tts` /
+AskUserQuestion. The loop ends ONLY when the Emperor officially says he's
+done, at which point YOU call:
+```bash
+curl -s -X POST http://localhost:7777/api/morning/end
+```
+That flips this instance off `sync` (→ one_off); the next Stop is then a
+normal clean stop. **Rip cord:** if you ever need to force-exit the loop,
+PATCH this instance off `sync` directly:
+```bash
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Content-Type: application/json' -d '{{"instance_type":"one_off"}}'
+```
 
 ## Conversation Phases
 
@@ -229,7 +241,8 @@ Trigger-dependent:
   ONE AT A TIME, in order: alarm response, bed return, YouTube,
   treadmill, Pavlok equipped and connected, caffeine, teeth, breakfast,
   weigh-in) → daily planning → session spawning when settled → sign-off
-  with regiment score + TTS farewell.
+  with regiment score + TTS farewell, then `POST /api/morning/end` to
+  release the session.
 - **heartbeat** — registration + briefing → check substance timing (see
   below), work pace, anything flagged in the daily note → escalate or
   hand off as needed.
@@ -598,9 +611,6 @@ def run_morning_session() -> dict:
             }
         )
     )
-
-    # Register enforce escalation (idempotent — also done by /api/morning/start endpoint)
-    _post("/api/morning/enforce-register", {})
 
     print(f"Morning session launched in legion pane {pane_id}")
     return {"status": "launched", "pane_id": pane_id}

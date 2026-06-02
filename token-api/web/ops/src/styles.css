@@ -266,6 +266,8 @@ h1 {
   font-size: 11px;
 }
 .chart-warning--bad { color: var(--hazard); }
+/* Bulk anomaly = reverse signal, not a real alarm: brass, not hazard. */
+.chart-warning--suspect { color: var(--brass-bright); font-style: italic; }
 
 .chart-tip {
   position: absolute; top: 6px; pointer-events: none;

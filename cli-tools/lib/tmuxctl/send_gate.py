@@ -41,7 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,18 @@ _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
 # Recent-keystroke window (seconds) for the typing guard. Mirrors
 # bin/tmux-typing-guard-status' TMUX_TYPING_GUARD_WINDOW.
 _DEFAULT_TYPING_GUARD_WINDOW = 10
+
+# Automated-activation marker TTL (seconds). Every send through
+# TmuxAdapter.run() is automated by construction (see module docstring), so the
+# gate stamps the target pane with a marker that compute_work_state uses to
+# discount the woken agent's reflex activity from productivity. 90s covers the
+# PromptSubmit + PostToolUse reflex burst (debounced ~2s) yet stays under the
+# 3-min work_activity_cutoff, so a pane still producing activity past the window
+# re-anchors WORKING — the marker never *permanently* suppresses. The
+# permanent-vs-reflex distinction (carving legitimate automated work back in) is
+# deliberately deferred to a later pass.
+_DEFAULT_AUTOMATED_ACTIVITY_TTL = 90
+_AUTOMATED_ACTIVITY_TTL_ENV = "TMUXCTL_AUTOMATED_ACTIVITY_TTL"
 
 # Quiet-hours configuration. Same env contract as token-api/shared.py so there
 # is a single configuration source (the environment), not a duplicated literal.
@@ -369,6 +381,69 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
             conn.commit()
     except Exception as exc:
         logger.debug("send_gate event log dropped (%s): %s", event_type, exc)
+
+
+def automated_activity_ttl() -> int:
+    """TTL (seconds) for an automated-activation marker. Env-overridable; floored at 1."""
+    try:
+        ttl = int(
+            os.environ.get(_AUTOMATED_ACTIVITY_TTL_ENV, str(_DEFAULT_AUTOMATED_ACTIVITY_TTL))
+        )
+    except (TypeError, ValueError):
+        ttl = _DEFAULT_AUTOMATED_ACTIVITY_TTL
+    return max(1, ttl)
+
+
+def register_automated_send(
+    args: tuple[str, ...] | list[str],
+    *,
+    db_path: Path | None = None,
+    source: str | None = None,
+) -> None:
+    """Stamp the send's target pane with an automated-activation marker.
+
+    Every send through ``TmuxAdapter.run()`` is automated by construction (see the
+    module docstring): humans type directly into tmux, never through ``run()``. The
+    marker lets ``compute_work_state`` discount the woken agent's reflex activity
+    (instance ``last_activity`` bump + ``work_action``) from productivity accounting,
+    so an automated state-hook / dispatch / enforcement wake does not anchor WORKING
+    and the idle clock can mature.
+
+    Fires only for mutating send verbs with a resolved ``-t`` target (by the time
+    ``run()`` calls this the target is the canonical ``%pane_id``). Best-effort and
+    fail-open — never raises into the send path. Timestamps are naive-local to match
+    ``claude_instances.last_activity`` (the convention compute_work_state compares
+    against); the upsert slides the window forward across a multi-send reflex burst.
+    """
+    args = tuple(args)
+    if not is_send_verb(args):
+        return
+    target = _extract_target(args)
+    if not target:
+        return
+    now = datetime.now()
+    injected_at = now.isoformat()
+    expires_at = (now + timedelta(seconds=automated_activity_ttl())).isoformat()
+    path = db_path or _db_path()
+    try:
+        with sqlite3.connect(path, timeout=2.0) as conn:
+            conn.execute("PRAGMA busy_timeout=2000")
+            conn.execute(
+                """
+                INSERT INTO automated_pane_activity
+                    (tmux_pane, injected_at, expires_at, source, verb)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(tmux_pane) DO UPDATE SET
+                    injected_at = excluded.injected_at,
+                    expires_at  = excluded.expires_at,
+                    source      = excluded.source,
+                    verb        = excluded.verb
+                """,
+                (target, injected_at, expires_at, source or "tmuxctl", args[0]),
+            )
+            conn.commit()
+    except Exception as exc:  # fail-open: a marker write must never break the send.
+        logger.debug("send_gate automated-activity marker dropped for %s: %s", target, exc)
 
 
 def _cli(argv: list[str]) -> int:

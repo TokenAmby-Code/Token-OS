@@ -4613,6 +4613,12 @@ async def compute_work_state() -> WorkStateResponse:
     # productivity layer should drop to IDLE; TimerEngine then gives IDLE 7
     # more minutes before auto-break. Total grace from last work action: 10 min.
     work_activity_cutoff = now - timedelta(minutes=3)
+    # Human override for the automated-activation discount: a recent human
+    # keystroke (the same #{client_activity} predicate the send gate uses)
+    # disables the discount this tick, so genuine typing always anchors WORKING.
+    # Client-wide (not per-pane) by design — fail-toward-anchoring; carving it to
+    # per-pane is deferred. Sampled once: the discount is applied uniformly below.
+    human_typing = _typing_guard_active()
     active_instances: list[AgentRuntime] = []
     processing_recent_count = 0
     tracked_panes: set[str] = set()
@@ -4647,6 +4653,32 @@ async def compute_work_state() -> WorkStateResponse:
             for r in await pane_activity_cursor.fetchall()
             if r["last_activity"]
         }
+        # Automated-activation markers: panes woken by an automated tmuxctl
+        # injection (state-hook fanout / dispatch / enforcement) still inside the
+        # TTL window. Their reflex activity (instance last_activity bump +
+        # work_action) is discounted from productivity below so the mechanicus
+        # pane's reflex wake does not anchor WORKING. injected_at is naive-local
+        # (matches claude_instances.last_activity); a pane's activity is only
+        # discounted when it post-dates the injection (>= injected_at guard).
+        marker_cursor = await db.execute(
+            """
+            SELECT tmux_pane, injected_at
+            FROM automated_pane_activity
+            WHERE datetime(expires_at) >= datetime(?)
+            """,
+            (now.isoformat(),),
+        )
+        automated_panes: dict[str, datetime] = {}
+        for marker_row in await marker_cursor.fetchall():
+            try:
+                automated_panes[marker_row["tmux_pane"]] = datetime.fromisoformat(
+                    marker_row["injected_at"]
+                )
+            except Exception:
+                continue
+
+        # Widen to LIMIT 5 (was 1) so an interleaved human work_action still
+        # anchors even when the most-recent row is a discounted automated wake.
         recent_work_action_cursor = await db.execute(
             """
             SELECT
@@ -4657,16 +4689,61 @@ async def compute_work_state() -> WorkStateResponse:
             WHERE event_type = 'work_action'
               AND datetime(created_at) >= datetime('now', '-3 minutes')
             ORDER BY created_at DESC
-            LIMIT 1
+            LIMIT 5
             """
         )
-        recent_work_action = await recent_work_action_cursor.fetchone()
+        work_action_rows = await recent_work_action_cursor.fetchall()
+
+        # Keep the most-recent NON-discounted work_action. An automated injection
+        # wakes the agent → its PromptSubmit fires a prompt_submit work_action
+        # (note=session_id=…); if that pane has a live marker and no human is
+        # typing, the action is attributable to the injection and skipped. A
+        # tmux-typing-guard source is human input and is never discounted.
+        recent_work_action = None
+        for wa_row in work_action_rows:
+            try:
+                wa_details = json.loads(wa_row["details"] or "{}")
+            except Exception:
+                wa_details = {}
+            wa_source = wa_details.get("source")
+            wa_note = wa_details.get("note") or ""
+            discounted = False
+            if (
+                automated_panes
+                and not human_typing
+                and wa_source != "tmux-typing-guard"
+                and wa_note.startswith("session_id=")
+            ):
+                wa_sid = wa_note[len("session_id=") :].strip()
+                if wa_sid:
+                    wa_pane_cursor = await db.execute(
+                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                        (wa_sid,),
+                    )
+                    wa_pane_row = await wa_pane_cursor.fetchone()
+                    wa_pane = wa_pane_row["tmux_pane"] if wa_pane_row else None
+                    marker_injected = automated_panes.get(wa_pane) if wa_pane else None
+                    if marker_injected is not None:
+                        # Discount only activity at/after the injection. Compare
+                        # elapsed age (tz-independent): events.created_at is UTC
+                        # while injected_at is local, but both ages derive from
+                        # ~the same instant. age <= injected_age ⟺ created_at >=
+                        # injected_at.
+                        injected_age = (now - marker_injected).total_seconds()
+                        wa_age = wa_row["age_seconds"]
+                        if wa_age is not None and wa_age <= injected_age:
+                            discounted = True
+            if not discounted:
+                recent_work_action = wa_row
+                break
 
     for row in rows:
         last_activity = row["last_activity"]
         is_recent = False
+        last_activity_dt: datetime | None = None
         try:
-            is_recent = datetime.fromisoformat(last_activity) >= work_activity_cutoff
+            last_activity_dt = datetime.fromisoformat(last_activity)
+            is_recent = last_activity_dt >= work_activity_cutoff
         except Exception:
             pass
         live_pane = None
@@ -4700,6 +4777,19 @@ async def compute_work_state() -> WorkStateResponse:
         if row["device_id"] != LOCAL_DEVICE_NAME and not is_recent:
             continue
         if live_pane is False:
+            continue
+        # Discount an automated-injection reflex wake: this pane has a live
+        # marker, no human is typing, and its last_activity post-dates the
+        # injection — so the bump is attributable to the automated send, not
+        # work. The >= injected_at guard preserves a pane already working before
+        # the injection.
+        marker_injected = automated_panes.get(canonical_tmux_pane) if canonical_tmux_pane else None
+        if (
+            marker_injected is not None
+            and not human_typing
+            and last_activity_dt is not None
+            and last_activity_dt >= marker_injected
+        ):
             continue
         if canonical_tmux_pane:
             tracked_panes.add(canonical_tmux_pane)
@@ -4735,9 +4825,20 @@ async def compute_work_state() -> WorkStateResponse:
         if not pane_last_activity_str:
             continue
         try:
-            if datetime.fromisoformat(pane_last_activity_str) < work_activity_cutoff:
-                continue
+            pane_last_activity_dt = datetime.fromisoformat(pane_last_activity_str)
         except Exception:
+            continue
+        if pane_last_activity_dt < work_activity_cutoff:
+            continue
+        # Same automated-injection discount as the instance loop — the observed
+        # and instance paths read the same underlying last_activity, so guarding
+        # only one would leak the reflex wake through the other.
+        marker_injected = automated_panes.get(pane)
+        if (
+            marker_injected is not None
+            and not human_typing
+            and pane_last_activity_dt >= marker_injected
+        ):
             continue
         observed_agents.append(
             AgentRuntime(
@@ -15079,6 +15180,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         reason = str(gap.get("reason") or "unknown")
         gap_count_by_reason[reason] = gap_count_by_reason.get(reason, 0) + 1
 
+    # A bulk collapse means the detector flagged a wall of anomalies at once —
+    # treated as a systemic false-detection (reverse signal), not real timer
+    # violations. Surface it as "suspect" so the UI doesn't cry "247 anomalies".
+    bulk_record = (
+        anomalies[0]
+        if anomalies and anomalies[0].get("reason") == "bulk_anomaly_suspected"
+        else None
+    )
+
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
@@ -15090,10 +15200,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "gaps": gaps,
         "anomalies": anomalies,
         "anomaly_summary": {
-            "count": len(anomalies),
+            # When bulk-suspected, do not count the suppressed wall as real
+            # anomalies — the count is the reverse signal, exposed separately.
+            "count": 0 if bulk_record else len(anomalies),
             "gap_count": len(gaps),
             "gap_count_by_reason": gap_count_by_reason,
-            "latest": anomalies[-1] if anomalies else None,
+            "latest": None if bulk_record else (anomalies[-1] if anomalies else None),
+            "bulk_suspected": bool(bulk_record),
+            "suppressed_count": bulk_record.get("suppressed_count") if bulk_record else 0,
+            "dominant_reason": bulk_record.get("dominant_reason") if bulk_record else None,
         },
         "source": "timer_samples+timer_shifts+live_timer_engine",
     }
@@ -17327,275 +17442,6 @@ async def phone_heartbeat_worker():
 
 # [MOVED to shared.py / routes/tts.py] — was: def _is_quiet_hours() -> bool:
 
-# ── Morning Enforce ─────────────────────────────────────────
-# In-memory state for the current day's morning session enforce loop.
-# Resets each time a new morning session fires.
-MORNING_ENFORCE_STATE: dict = {
-    "status": "idle",  # idle | pending | acknowledged | overridden | blocked
-    "session_type": None,
-    "fired_at": None,
-    "acknowledged_at": None,
-    "override_reason": None,
-    "escalation_level": 0,  # 0 = none, 1 = TTS repeat, 2 = Discord DM, 3 = blocked
-}
-
-
-def _register_morning_expected_response(session_type: str = "morning_session") -> None:
-    """Register an expected response and schedule escalation checks at +5/+10/+15 min."""
-    MORNING_ENFORCE_STATE.update(
-        {
-            "status": "pending",
-            "session_type": session_type,
-            "fired_at": datetime.utcnow().isoformat(),
-            "acknowledged_at": None,
-            "override_reason": None,
-            "escalation_level": 0,
-        }
-    )
-
-    base = datetime.now()
-    for level, offset_min in [(1, 5), (2, 10), (3, 15)]:
-        fire_at = base + timedelta(minutes=offset_min)
-        job_id = f"morning-enforce-l{level}"
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-        scheduler.add_job(
-            _morning_escalate,
-            DateTrigger(run_date=fire_at),
-            args=[level],
-            id=job_id,
-            replace_existing=True,
-            name=f"Morning Enforce L{level}",
-            misfire_grace_time=120,
-        )
-
-    # Schedule instance health check at +90s — detects 401, crash, dead pane
-    health_fire_at = base + timedelta(seconds=90)
-    health_job_id = "morning-health-check"
-    try:
-        scheduler.remove_job(health_job_id)
-    except Exception:
-        pass
-    scheduler.add_job(
-        _morning_health_check,
-        DateTrigger(run_date=health_fire_at),
-        id=health_job_id,
-        replace_existing=True,
-        name="Morning Health Check",
-        misfire_grace_time=120,
-    )
-    logger.info(
-        f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s"
-    )
-
-
-@app.post("/api/morning/enforce-register")
-async def register_morning_enforce():
-    """Register the morning escalation chain independently of /api/morning/start.
-
-    Used by morning_launcher.py which handles session spawning itself but still
-    needs the enforce escalation pathway (Discord DMs at +5/+10/+15 min).
-    """
-    _register_morning_expected_response("morning_session")
-    await log_event("morning_enforce_registered", device_id="cron")
-    return {
-        "status": "registered",
-        "escalations": [
-            "+90s health-check",
-            "+5min phone+TTS",
-            "+10min phone+beep+Discord",
-            "+15min zap+blocked+Discord",
-        ],
-    }
-
-
-def _cancel_morning_escalations() -> None:
-    """Cancel all pending escalation jobs and health check (called on acknowledge/override)."""
-    for job_id in [
-        "morning-enforce-l1",
-        "morning-enforce-l2",
-        "morning-enforce-l3",
-        "morning-health-check",
-    ]:
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-
-
-def _morning_health_check() -> None:
-    """APScheduler callback at +90s: verify the morning Claude instance is alive.
-
-    Checks if the instance acknowledged (meaning it booted, authenticated, and
-    ran its first tool). If not, captures the tmux pane to detect 401/crash,
-    sends TTS alert, and dispatches a self-heal investigation agent.
-    """
-    state = MORNING_ENFORCE_STATE
-    if state["status"] not in ("pending",):
-        logger.info(f"Morning health check: status={state['status']}, no action needed")
-        return
-
-    # Check if acknowledged_at was set by Emperor-origin Discord/API acknowledgement.
-    if state.get("acknowledged_at"):
-        logger.info("Morning health check: already acknowledged, healthy")
-        return
-
-    # Not acknowledged after 90s — check the pane for signs of life
-    logger.warning("Morning health check: no acknowledgement after 90s, inspecting pane")
-
-    pane_id = None
-    error_signature = None
-    pane_output = ""
-
-    # Read pane_id from state file
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        state_file = Path("/tmp/custodes_morning_sessions") / f"morning_{today}.json"
-        if state_file.exists():
-            state_data = json.loads(state_file.read_text())
-            pane_id = state_data.get("pane_id")
-    except Exception as e:
-        logger.warning(f"Morning health check: could not read state file: {e}")
-
-    # Capture pane output to detect failure signatures
-    if pane_id:
-        try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", pane_id, "-p"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            pane_output = result.stdout
-        except Exception as e:
-            logger.warning(f"Morning health check: pane capture failed: {e}")
-            pane_output = f"[pane capture error: {e}]"
-
-    # Detect known failure signatures
-    failure_signatures = [
-        "401",
-        "/login",
-        "authentication_error",
-        "Invalid authentication",
-        "ECONNREFUSED",
-    ]
-    for sig in failure_signatures:
-        if sig.lower() in pane_output.lower():
-            error_signature = sig
-            break
-
-    if not error_signature and pane_output.strip():
-        # Pane has output but no error signature — might just be slow, give benefit of doubt
-        # Check if there's any sign of Claude running (prompt indicators)
-        if any(
-            indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]
-        ):
-            logger.info(
-                "Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain"
-            )
-            return
-
-    # ── Failure confirmed — alert and self-heal ──
-    failure_reason = error_signature or "no response and no Claude activity detected"
-    logger.error(f"Morning health check FAILED: {failure_reason}")
-
-    # 1. TTS alert
-    speak_checkin_tts("Morning session launch failed. Dispatching investigation.")
-
-    # 2. Log event
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                log_event(
-                    "morning_health_check_failed",
-                    details={
-                        "reason": failure_reason,
-                        "pane_id": pane_id,
-                        "pane_snippet": pane_output[-500:] if pane_output else None,
-                    },
-                ),
-                loop,
-            ).result(timeout=5)
-    except Exception as e:
-        logger.warning(f"Morning health check: event log failed: {e}")
-
-    # 3. Dispatch self-heal investigation agent
-    try:
-        diag_prompt = (
-            f"Morning session health check failed at +90s. Failure reason: {failure_reason}. "
-            f"Pane {pane_id or 'unknown'} output snippet: {pane_output[-300:] if pane_output else 'empty'}. "
-            "Investigate the root cause (auth expiry, CLI crash, network issue, etc.), "
-            "attempt to fix it if possible (e.g. kill dead pane, re-auth), "
-            "and report findings to Discord #briefing channel. "
-            "If the fix requires user interaction (like /login), send TTS instructions."
-        )
-        subprocess.Popen(
-            [
-                "claude",
-                "--print",
-                "--output-format",
-                "text",
-                "--model",
-                "sonnet",
-                "--allowedTools",
-                "Bash,Read,Grep,Glob,Write",
-                "-p",
-                diag_prompt,
-            ],
-            cwd="/Volumes/Imperium/Imperium-ENV",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        logger.info("Morning health check: self-heal agent dispatched")
-    except Exception as e:
-        logger.error(f"Morning health check: self-heal dispatch failed: {e}")
-        # Last resort: just TTS what went wrong
-        speak_checkin_tts(
-            f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent."
-        )
-
-
-def _morning_escalate(level: int) -> None:
-    """APScheduler callback: fire morning enforce escalation at the given level.
-
-    Runs in APScheduler thread — bridges to async enforce via event loop.
-    L1 is a pure notification; L2/L3 fire atomic shock+TTS at rising intensity.
-    """
-    state = MORNING_ENFORCE_STATE
-    if state["status"] != "pending":
-        logger.info(f"Morning escalation L{level} skipped: status={state['status']}")
-        return
-
-    state["escalation_level"] = level
-    logger.warning(f"Morning enforce escalation L{level} fired")
-
-    if level == 1:
-        _notify_sync(NotifyRequest(message="Morning session pending.", type="tts"))
-    elif level == 2:
-        _enforce_sync(
-            EnforceRequest(
-                message="Morning Session unacknowledged",
-                intensity=25,
-                source="morning",
-            )
-        )
-    elif level == 3:
-        state["status"] = "blocked"
-        logger.warning("Morning enforce L3: morning_blocked — Custodes will not proceed")
-        _enforce_sync(
-            EnforceRequest(
-                message=(
-                    "Morning Session BLOCKED (15 min elapsed). "
-                    "Custodes will not proceed until you respond."
-                ),
-                intensity=50,
-                source="morning",
-            )
-        )
-
 
 # ── Atomic Enforce (stateless emitter) ────────────────────
 # Every /api/enforce call fires Pavlok (>=25 intensity) AND a notification.
@@ -17909,7 +17755,6 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
     # Fallback: no live Custodes — spawn fresh via existing synchronous path
     # without blocking the event loop.
     asyncio.create_task(asyncio.to_thread(run_morning_session))
-    _register_morning_expected_response("morning_session")
     await log_event(
         "custodes_morning_brief_dispatched",
         details={"mode": "spawn", "target_pane": None, "instance_id": None, "date": today},
@@ -17941,16 +17786,13 @@ async def start_morning_session():
     # Fire and forget — the synchronous launcher runs in a worker thread.
     asyncio.create_task(asyncio.to_thread(run_morning_session))
 
-    # Register enforce expected response — escalation chain fires if unanswered
-    _register_morning_expected_response("morning_session")
-
     await log_event("morning_session_start", device_id="phone", details={"date": today})
     return {"status": "started", "date": today}
 
 
 @app.get("/api/morning/status")
 async def get_morning_session_status():
-    """Check current morning session state, including enforce escalation status."""
+    """Check current morning session state."""
     today = datetime.now().strftime("%Y-%m-%d")
     state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
     session_state: dict = {}
@@ -17961,77 +17803,64 @@ async def get_morning_session_status():
     else:
         session_state = {"status": "not_started", "date": today}
 
-    # Merge enforce state
-    session_state["enforce"] = {
-        "status": MORNING_ENFORCE_STATE["status"],
-        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
-        "fired_at": MORNING_ENFORCE_STATE["fired_at"],
-        "acknowledged_at": MORNING_ENFORCE_STATE["acknowledged_at"],
-        "override_reason": MORNING_ENFORCE_STATE["override_reason"],
-        "morning_blocked": MORNING_ENFORCE_STATE["status"] == "blocked",
-    }
     return session_state
 
 
-@app.post("/api/morning/acknowledge")
-async def acknowledge_morning_session():
-    """Acknowledge the morning session — clears pending enforce state and cancels escalations."""
-    state = MORNING_ENFORCE_STATE
-    if state["status"] not in ("pending", "blocked"):
-        return {
-            "status": "noop",
-            "reason": f"enforce state is '{state['status']}', nothing to acknowledge",
-        }
+@app.post("/api/morning/end")
+async def end_morning_session():
+    """Officially end the morning session.
 
-    _cancel_morning_escalations()
-    state["acknowledged_at"] = datetime.utcnow().isoformat()
-    state["status"] = "acknowledged"
-    logger.info("Morning session acknowledged — enforce escalations cancelled")
+    Flips the live Custodes instance off `sync` (→ one_off) via the sanctioned
+    write path so the self-continuing Stop loop in routes/hooks.py terminates: the
+    next Stop is then a normal clean stop instead of re-injecting a keepalive.
+    No live Custodes → nothing to end.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, instance_type
+               FROM claude_instances
+               WHERE legion = 'custodes'
+                 AND status IN ('idle', 'processing')
+                 AND stopped_at IS NULL
+               ORDER BY last_activity DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"status": "no_active_custodes"}
 
+        instance_id = row["id"]
+        old_type = row["instance_type"] or "one_off"
+
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"instance_type": "one_off"},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="morning-end",
+        )
+        await db.commit()
+
+    # Cancel timers when leaving golden_throne or sync (matches set_instance_type).
+    if old_type in ("golden_throne", "sync"):
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        try:
+            scheduler.remove_job(f"sync-retrigger-{instance_id}")
+        except Exception:
+            pass
+
+    logger.info(f"Morning session ended — {instance_id[:12]} flipped {old_type} → one_off")
     await log_event(
-        "morning_acknowledged",
-        details={
-            "escalation_level": state["escalation_level"],
-            "fired_at": state["fired_at"],
-        },
+        "morning_session_end",
+        instance_id=instance_id,
+        details={"old_type": old_type, "new_type": "one_off"},
     )
-    return {
-        "status": "acknowledged",
-        "escalation_level": state["escalation_level"],
-        "fired_at": state["fired_at"],
-        "acknowledged_at": state["acknowledged_at"],
-    }
-
-
-class MorningOverrideRequest(BaseModel):
-    reason: str
-
-
-@app.post("/api/morning/override")
-async def override_morning_session(request: MorningOverrideRequest):
-    """Override the morning session enforce — requires a reason. Unblocks Custodes."""
-    if not request.reason or not request.reason.strip():
-        raise HTTPException(status_code=400, detail="reason is required for override")
-
-    _cancel_morning_escalations()
-    MORNING_ENFORCE_STATE["status"] = "overridden"
-    MORNING_ENFORCE_STATE["override_reason"] = request.reason.strip()
-    MORNING_ENFORCE_STATE["acknowledged_at"] = datetime.utcnow().isoformat()
-    logger.info(f"Morning session overridden: {request.reason.strip()}")
-
-    await log_event(
-        "morning_overridden",
-        details={
-            "reason": request.reason.strip(),
-            "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
-            "fired_at": MORNING_ENFORCE_STATE["fired_at"],
-        },
-    )
-    return {
-        "status": "overridden",
-        "reason": request.reason.strip(),
-        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
-    }
+    return {"instance_id": instance_id, "instance_type": "one_off"}
 
 
 _ALARM_DISMISS_JOB_ID = "morning_alarm_dismiss"
@@ -19238,14 +19067,6 @@ async def receive_discord_message(request: DiscordMessageRequest):
     if request.channel_name == "forge" and stripped.startswith("http") and " " not in stripped:
         asyncio.create_task(_discord_clip(stripped, request))
         return {"received": True, "message_id": request.message_id}
-
-    # Morning ack shortcut — fastest possible escalation cancel via Discord
-    if MORNING_ENFORCE_STATE.get("status") == "pending":
-        lower = content.lower().strip()
-        if any(kw in lower for kw in ("ack", "acknowledged", "acknowledge", "here", "awake")):
-            await acknowledge_morning_session()
-            logger.info(f"Morning ack via Discord from {author_name}")
-            # Still fall through to inject into synced session if applicable
 
     # Trigger 1: @Mechanicus mention → try synced injection, fallback to one-off responder
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:

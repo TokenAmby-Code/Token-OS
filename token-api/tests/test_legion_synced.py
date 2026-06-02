@@ -6,7 +6,6 @@ Covers:
 - Helpers: _format_discord_injection
 - Cleanup: synced=0 on stop
 - Auto-detect: civic legion from working_dir
-- Morning ack: Discord keyword triggers acknowledge
 - Cron: legion column on cron_jobs
 
 Uses a temporary SQLite database via TOKEN_API_DB env var.
@@ -22,7 +21,6 @@ from pathlib import Path
 import pytest
 
 ALLOWED_LEGIONS = set()
-MORNING_ENFORCE_STATE = {}
 _format_discord_injection = None
 _TEST_DB_PATH = None
 
@@ -37,9 +35,8 @@ def client(app_env):
 
 @pytest.fixture(autouse=True)
 def _bind_main_globals(app_env):
-    global ALLOWED_LEGIONS, MORNING_ENFORCE_STATE, _format_discord_injection, _TEST_DB_PATH
+    global ALLOWED_LEGIONS, _format_discord_injection, _TEST_DB_PATH
     ALLOWED_LEGIONS = app_env.main.ALLOWED_LEGIONS
-    MORNING_ENFORCE_STATE = app_env.main.MORNING_ENFORCE_STATE
     _format_discord_injection = app_env.main._format_discord_injection
     _TEST_DB_PATH = str(app_env.db_path)
 
@@ -366,76 +363,7 @@ class TestCivicAutoDetect:
         assert row["legion"] == "mechanicus"
 
 
-# ── 8. Morning ack via Discord ────────────────────────────────
-
-
-class TestMorningAckViaDiscord:
-    def _post_discord_message(self, client, content, channel="chat"):
-        return client.post(
-            "/api/discord/message",
-            json={
-                "channel_id": "test-channel-id",
-                "channel_name": channel,
-                "content": content,
-                "author": {"username": "Emperor", "id": "12345"},
-            },
-        )
-
-    def test_discord_ack_clears_enforce(self, client):
-        """'ack' keyword in Discord should clear pending enforce state."""
-        # Set enforce to pending
-        MORNING_ENFORCE_STATE.update(
-            {
-                "status": "pending",
-                "session_type": "morning_session",
-                "fired_at": datetime.utcnow().isoformat(),
-                "acknowledged_at": None,
-                "override_reason": None,
-                "escalation_level": 0,
-            }
-        )
-
-        resp = self._post_discord_message(client, "ack")
-        assert resp.status_code == 200
-        assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
-
-    def test_discord_ack_keywords(self, client):
-        """All ack keywords should work."""
-        for keyword in ("ack", "acknowledged", "acknowledge", "here", "awake"):
-            MORNING_ENFORCE_STATE.update(
-                {
-                    "status": "pending",
-                    "session_type": "morning_session",
-                    "fired_at": datetime.utcnow().isoformat(),
-                    "acknowledged_at": None,
-                    "escalation_level": 0,
-                }
-            )
-            self._post_discord_message(client, keyword)
-            assert MORNING_ENFORCE_STATE["status"] == "acknowledged", f"Keyword '{keyword}' failed"
-
-    def test_discord_no_ack_when_idle(self, client):
-        """'ack' when enforce is idle should not change state."""
-        MORNING_ENFORCE_STATE["status"] = "idle"
-        self._post_discord_message(client, "ack")
-        assert MORNING_ENFORCE_STATE["status"] == "idle"
-
-    def test_discord_ack_case_insensitive(self, client):
-        """Ack keywords should be case-insensitive."""
-        MORNING_ENFORCE_STATE.update(
-            {
-                "status": "pending",
-                "session_type": "morning_session",
-                "fired_at": datetime.utcnow().isoformat(),
-                "acknowledged_at": None,
-                "escalation_level": 0,
-            }
-        )
-        self._post_discord_message(client, "ACK")
-        assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
-
-
-# ── 9. Workflow / continuity state ───────────────────────────
+# ── 8. Workflow / continuity state ───────────────────────────
 
 
 class TestWorkflowState:

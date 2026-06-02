@@ -22,6 +22,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from fastapi import APIRouter, Request
@@ -53,6 +54,7 @@ from shared import (
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
     FALLBACK_VOICES,
+    MORNING_KEEPALIVE_PROMPT,
     PROFILES,
     ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
@@ -3009,8 +3011,57 @@ async def handle_stop(payload: dict) -> dict:
         return result
 
     if instance_type == "sync":
+        # Self-continuing sync (morning) session: accept the Stop, then re-inject a
+        # fresh timestamped keepalive prompt so the session is temporally bound, not
+        # turn-based. The only exit is flipping the instance off `sync` (via
+        # POST /api/morning/end → instance_type=one_off); after that flip this branch
+        # is no longer taken and the next Stop is a normal clean stop.
         result["action"] = "stop_processed_sync"
         await log_event("hook_stop", instance_id=session_id, details={"sync": True})
+
+        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
+        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(
+            ts=now_mst.strftime("%H:%M")
+        )
+
+        tmux_pane = instance.get("tmux_pane")
+        if not tmux_pane:
+            # Re-fetch from DB in case the cached instance row didn't capture it.
+            try:
+                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+                    cursor = await db.execute(
+                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                        (session_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if row:
+                        tmux_pane = row[0]
+            except Exception:
+                pass
+
+        if not tmux_pane:
+            logger.warning(
+                f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane"
+            )
+            return result
+
+        try:
+            proc = await _run_subprocess_offloop(
+                ("claude-cmd", "--pane", tmux_pane, keepalive_prompt),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                timeout=10,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    f"Hook: Stop {session_id[:12]}... sync keepalive claude-cmd failed: "
+                    f"{proc.stderr.decode()[:200]}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Hook: Stop {session_id[:12]}... sync keepalive delivery failed: {e}"
+            )
+
         return result
 
     # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
@@ -3817,7 +3868,7 @@ async def handle_stop_validate(payload: dict) -> dict:
         return {}
 
     # ── Questions gate: session docs with non-closed questions block once ──
-    if instance_type in ("golden_throne", "sync") and instance.get("session_doc_id"):
+    if instance_type in ("golden_throne",) and instance.get("session_doc_id"):
         session_doc_path = None
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
             cursor = await db.execute(
@@ -3920,8 +3971,10 @@ async def handle_stop_validate(payload: dict) -> dict:
         )
         return {}
 
-    # ── Block: golden_throne and sync instances get self-eval prompt ──
-    if instance_type in ("golden_throne", "sync"):
+    # ── Block: golden_throne instances get self-eval prompt ──
+    # (sync instances fall through to a clean accept — the Stop handler re-injects
+    # a keepalive prompt instead of blocking on self-eval.)
+    if instance_type in ("golden_throne",):
         _self_eval_pending[session_id] = now
         blocked_at = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:

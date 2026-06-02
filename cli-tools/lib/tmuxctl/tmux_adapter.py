@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -243,6 +244,13 @@ class TmuxAdapter:
         log_blocked(self, target=target, command=command, surface="tmux-adapter", argv=args)
         return True
 
+    def _send_gate_source(self) -> str:
+        """Diagnostic provenance tag for the automated-activity marker (argv0 basename)."""
+        try:
+            return os.path.basename(sys.argv[0]) or "tmuxctl"
+        except Exception:
+            return "tmuxctl"
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
@@ -263,6 +271,13 @@ class TmuxAdapter:
         resolved_args = self._resolve_tmux_args(args_tuple)
         if self._mechanicus_focus_guard_blocks(resolved_args):
             return ""
+        # Every send through run() is automated by construction (see this method's
+        # docstring): stamp the target pane so compute_work_state discounts the
+        # woken agent's reflex activity from productivity. Resolved args carry the
+        # canonical %pane_id; recorded only after suppression/focus-guard returns
+        # (a blocked send writes nothing to the pane) and before the keys land, so
+        # the marker is committed before the agent's hooks can fire. Never raises.
+        send_gate.register_automated_send(resolved_args, source=self._send_gate_source())
         proc = subprocess.run(
             [self.tmux_binary, *resolved_args],
             text=True,
