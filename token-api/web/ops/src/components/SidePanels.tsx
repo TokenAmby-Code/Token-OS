@@ -141,7 +141,7 @@ export function StatusCards({ state }: { state: OpsState }) {
         rows={[
           ['available', enf.available ? 'yes' : 'no'],
           ['pavlok', String((enf.pavlok as Record<string, unknown>)?.enabled ?? '—')],
-          ['cooldown', String((enf.pavlok as Record<string, unknown>)?.cooldown_remaining ?? '—')],
+          ['zaps today', String((enf.pavlok as Record<string, unknown>)?.zap_count ?? '—')],
         ]}
       />
     </div>

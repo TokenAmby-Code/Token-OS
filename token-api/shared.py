@@ -689,10 +689,6 @@ PHONE_STATE = {
     "is_distracted": False,
     "reachable": None,  # Last known reachability status
     "last_reachable_check": None,
-    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
-    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
-    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
-    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
     "distraction_ack_app": None,  # app currently covered by a phone_distraction expected ack
     "distraction_ack_id": None,
 }
@@ -707,11 +703,10 @@ PAVLOK_CONFIG = {
     "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
     "token": os.getenv("PAVLOK_API_TOKEN"),
     "enabled": True,
-    "cooldown_seconds": 30,
-    "zap_cooldown_seconds": 20 * 60,
-    "soft_cooldown_seconds": 3 * 60,
+    # min_gap_seconds is single-lane actuator serialization (delays, never drops)
+    # — NOT a cooldown/cap. Daily caps, zap/soft cooldowns, and dedup windows were
+    # removed per the Enforcement Dedup Removal decree; they masked false-fires.
     "min_gap_seconds": 2.0,
-    "daily_zap_cap": 6,
     "default_zap_value": 50,
     "friday_zap_value": 30,
     "warning_value": 50,

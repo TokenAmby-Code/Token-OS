@@ -3243,8 +3243,7 @@ async def handle_stop(payload: dict) -> dict:
     # an enforcement event. Pavlok stim delivery is the explicit product of
     # enforce/cascade pathways only (see enforce.py / main.py distraction paths).
     # Mirroring every "claude_finished" Stop to a Pavlok soft buzz turned the
-    # watch into a per-Stop buzzer and bypassed the soft cooldown
-    # (respect_cooldown=False). Ref: regression-pavlok-soft-on-tts-chime-2026-05-24.
+    # watch into a per-Stop buzzer. Ref: regression-pavlok-soft-on-tts-chime-2026-05-24.
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event(

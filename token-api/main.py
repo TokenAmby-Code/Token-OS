@@ -91,8 +91,6 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from phone_service import (
-    _persist_twitter_zap_cooldown,
-    _restore_twitter_zap_cooldown,
     _send_to_phone,
     push_phone_widget_async,
     send_pavlok_stimulus,
@@ -793,7 +791,7 @@ class StateValidateRequest(BaseModel):
 class PhoneActivityRequest(BaseModel):
     """Request from MacroDroid for phone app activity."""
 
-    app: str  # App name: "twitter", "youtube", "game", or app package name
+    app: str  # App name: "youtube", "game", or app package name
     action: str = "open"  # "open" | "close"
     package: str | None = None  # Optional package name for games
 
@@ -1382,9 +1380,6 @@ async def lifespan(app: FastAPI):
             f.write(f"\n--- SERVER STARTED at {timestamp} ---\n")
     except Exception:
         pass
-
-    # Restore twitter zap cooldown across restarts
-    _restore_twitter_zap_cooldown()
 
     # Startup
     await init_database_async(DB_PATH)
@@ -3737,8 +3732,6 @@ async def enter_quiet_mode_internal(
     PHONE_STATE["current_app"] = None
     PHONE_STATE["app_opened_at"] = None
     PHONE_STATE["is_distracted"] = False
-    PHONE_STATE["twitter_open_since"] = None
-    PHONE_STATE["twitter_zapped"] = False
     PHONE_STATE["distraction_ack_app"] = None
     PHONE_STATE["distraction_ack_id"] = None
     PHONE_STATE["last_activity"] = datetime.now().isoformat()
@@ -10206,8 +10199,6 @@ async def put_daily_note_callout(request: DailyNoteCalloutRequest):
     }
 
 
-# [MOVED to phone_service.py] — _persist_twitter_zap_cooldown, _restore_twitter_zap_cooldown
-
 # Shizuku restart state
 SHIZUKU_STATE = {
     "dead": False,
@@ -10288,10 +10279,6 @@ async def attempt_shizuku_restart() -> dict:
 
 # App categories for phone distraction detection
 PHONE_DISTRACTION_APPS = {
-    # Twitter/X
-    "twitter": "scrolling",
-    "x": "scrolling",
-    "com.twitter.android": "scrolling",
     # YouTube
     "youtube": "video",
     "com.google.android.youtube": "video",
@@ -10314,9 +10301,6 @@ PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS = int(
 
 # Human-readable display names for phone apps (key = lowercased app name or package)
 PHONE_APP_DISPLAY_NAMES = {
-    "twitter": "Twitter/X",
-    "x": "Twitter/X",
-    "com.twitter.android": "Twitter/X",
     "youtube": "YouTube",
     "com.google.android.youtube": "YouTube",
     "game": "Game",
@@ -10715,7 +10699,6 @@ async def recover_recent_phone_distraction_state() -> bool:
 # The name in parens is the app's display name as configured in the trigger.
 # This map resolves that display name to the key used in PHONE_DISTRACTION_APPS.
 MACRODROID_TRIGGER_APP_MAP = {
-    "x": "twitter",
     "youtube": "youtube",
     "yt": "youtube",
     "yt_bg": "youtube",
@@ -10778,7 +10761,7 @@ def parse_macrodroid_trigger(raw: str) -> dict:
       + type-specific fields
 
     App triggers:
-      "Application Launched (X)" → {type: "app", app: "twitter", action: "open"}
+      "Application Launched (YouTube)" → {type: "app", app: "youtube", action: "open"}
       "Application Closed (YouTube)" → {type: "app", app: "youtube", action: "close"}
 
     Geofence triggers:
@@ -10786,7 +10769,7 @@ def parse_macrodroid_trigger(raw: str) -> dict:
       "Geofence Exit (Gym)" → {type: "geofence", location: "gym", action: "exit"}
 
     Passthrough:
-      "twitter" → {type: "unknown", raw: "twitter"}
+      "minecraft" → {type: "unknown", raw: "minecraft"}
     """
     if not raw:
         return {"type": "unknown", "raw": ""}
@@ -10852,7 +10835,6 @@ def _sync_generate_daily_analytics(date_str: str):
     shift_count_by_trigger = defaultdict(int)
     shift_count_by_source = defaultdict(int)
     enforcement_count = 0
-    twitter_shifts = 0
     modes_seen = set()
     peak_balance = 0
     min_balance = float("inf")
@@ -10865,8 +10847,6 @@ def _sync_generate_daily_analytics(date_str: str):
         shift_count_by_source[r["source"] or "unknown"] += 1
         if r["trigger"] == "enforcement":
             enforcement_count += 1
-        if r["phone_app"] and "twitter" in (r["phone_app"] or "").lower():
-            twitter_shifts += 1
         modes_seen.add(r["new_mode"])
         if r["old_mode"]:
             modes_seen.add(r["old_mode"])
@@ -10883,7 +10863,6 @@ def _sync_generate_daily_analytics(date_str: str):
         "shifts_by_trigger": dict(shift_count_by_trigger),
         "shifts_by_source": dict(shift_count_by_source),
         "enforcement_events": enforcement_count,
-        "twitter_shifts": twitter_shifts,
         "modes_seen": sorted(modes_seen),
         "peak_break_balance_ms": peak_balance,
         "min_break_balance_ms": min_balance if min_balance != float("inf") else 0,
@@ -10909,7 +10888,6 @@ def _sync_generate_daily_analytics(date_str: str):
             {
                 "timer_total_shifts": summary["total_shifts"],
                 "timer_enforcements": enforcement_count,
-                "timer_twitter_shifts": twitter_shifts,
                 "timer_peak_break": format_timer_time(peak_balance),
                 "timer_min_break": format_timer_time(
                     min_balance if min_balance != float("inf") else 0
@@ -11378,7 +11356,7 @@ def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool 
     Send enforcement command to phone via MacroDroid HTTP server.
 
     Args:
-        app_name: App to enable/disable (twitter, youtube, etc.)
+        app_name: App to enable/disable (youtube, game, etc.)
         action: "disable" or "enable"
 
     Returns:
@@ -11398,7 +11376,6 @@ def enforce_phone_app(app_name: str, action: str = "disable", _auto_retry: bool 
             "zap",
             30,
             reason=f"manual_phone_enforce_{action}_{app_name}",
-            respect_cooldown=False,
         )
         if PHONE_STATE.get("reachable") is False:
             return {
@@ -12087,7 +12064,6 @@ async def handle_mewgenics_space_telemetry(request: MewgenicsSpaceTelemetryReque
                     "zap",
                     PAVLOK_CONFIG.get("friday_zap_value", 30),
                     "mewgenics_space",
-                    True,
                 )
                 zap_fired = bool(pavlok_result.get("success")) and not pavlok_result.get(
                     "blocked_by_guardrail"
@@ -12288,7 +12264,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     """
     Handle phone app activity from MacroDroid.
 
-    Called when distraction apps (Twitter, YouTube, games) are opened/closed.
+    Called when distraction apps (YouTube, games) are opened/closed.
     Returns whether the app is allowed based on break time or productivity.
 
     Unlike desktop, we don't force-close apps - just return allowed/blocked
@@ -12323,14 +12299,6 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             PHONE_STATE["app_opened_at"] = None
             PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-
-        # Clear Twitter tracking on close
-        if app_name in ("twitter", "x", "com.twitter.android"):
-            PHONE_STATE["twitter_open_since"] = None
-            PHONE_STATE["twitter_zapped"] = False  # reset zap latch on confirmed close
-            # Clear manual mode so close event restores work mode
-            timer_engine._clear_manual_mode()
-            print("    Twitter closed, manual mode cleared")
 
         # Phone close only clears the phone substate, then recomputes composite
         # timer activity from any remaining independent attention sources.
@@ -12404,26 +12372,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         },
     )
 
-    is_twitter = app_name in ("twitter", "x", "com.twitter.android")
-
-    # Phantom open guard: if Twitter was already zapped and we haven't received
-    # a confirmed close event, ignore all subsequent "open" events entirely.
-    # MacroDroid's app_launched trigger re-fires on notification banners, app
-    # switcher, etc. — these phantom opens were resetting current_app and
-    # restarting the 7-minute timer, causing repeat zaps.
-    if is_twitter and PHONE_STATE.get("twitter_zapped"):
-        print("    Phantom Twitter open ignored (already zapped, awaiting confirmed close)")
-        return PhoneActivityResponse(
-            allowed=False,
-            reason="phantom_blocked",
-            message="Twitter already enforced, waiting for confirmed close",
-        )
-
     # Duplicate open debounce: if we're already tracking this app, don't
     # re-process. MacroDroid sends repeated app_launched events for the same
     # app (notification banners, app switcher swipe-throughs, etc.).
     current = (PHONE_STATE.get("current_app") or "").lower()
-    if current == app_name or (is_twitter and current in ("twitter", "x", "com.twitter.android")):
+    if current == app_name:
         print(f"    Duplicate {app_name} open ignored (already current_app)")
         ack = None
         if is_quiet_hours():
@@ -12449,13 +12402,6 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     async def _observe_phone_distraction(productivity_active: bool | None = None) -> bool:
         """Feed phone foreground into the composite timer state without direct mode assertions."""
-        # If twitter was already zapped, don't let phantom opens change timer mode
-        # (this prevents phantom opens from burning break time → break_exhausted zaps)
-        if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get(
-            "twitter_zapped"
-        ):
-            print("    Skipping phone observation — twitter already zapped")
-            return False
         PHONE_STATE["distraction_observed_count"] = (
             int(PHONE_STATE.get("distraction_observed_count") or 0) + 1
         )
@@ -12501,19 +12447,6 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             },
         )
         print(f"    Phone open observed -> {distraction_mode} | timer={timer_updated}")
-        # Track Twitter open time for 7-minute enforcement
-        if app_name in ("twitter", "x", "com.twitter.android"):
-            if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
-                PHONE_STATE["twitter_open_since"] = time.monotonic()
-                print("    Twitter timer started")
-            elif PHONE_STATE.get("twitter_zapped"):
-                print("    Twitter open (ignoring — already zapped, waiting for confirmed close)")
-        else:
-            # Different app opened — if twitter timer is running, close event was dropped
-            if PHONE_STATE["twitter_open_since"] is not None or PHONE_STATE.get("twitter_zapped"):
-                print(f"    Clearing stale Twitter timer (new app: {app_name})")
-                PHONE_STATE["twitter_open_since"] = None
-                PHONE_STATE["twitter_zapped"] = False
         if shift_to_log:
             asyncio.create_task(
                 timer_log_shift(
@@ -13288,7 +13221,6 @@ async def get_timer_shifts():
             "mode_distribution": {},
             "shifts_by_trigger": {},
             "enforcement_count": 0,
-            "twitter_time_mins": 0,
         }
 
     balance_series = []
@@ -13296,7 +13228,6 @@ async def get_timer_shifts():
     mode_time = defaultdict(int)
     shifts_by_trigger = defaultdict(int)
     enforcement_count = 0
-    twitter_shifts = 0
     prev_time = None
 
     for r in rows:
@@ -13316,8 +13247,6 @@ async def get_timer_shifts():
         shifts_by_trigger[r["trigger"] or "unknown"] += 1
         if r["trigger"] == "enforcement":
             enforcement_count += 1
-        if r["phone_app"] and "twitter" in (r["phone_app"] or "").lower():
-            twitter_shifts += 1
         # Rough mode time (time between shifts spent in old_mode)
         if prev_time and r["old_mode"]:
             try:
@@ -13339,7 +13268,6 @@ async def get_timer_shifts():
         "mode_distribution": dict(mode_time),
         "shifts_by_trigger": dict(shifts_by_trigger),
         "enforcement_count": enforcement_count,
-        "twitter_shifts": twitter_shifts,
     }
 
 
@@ -15454,7 +15382,6 @@ async def _ops_read_enforcement_summary() -> dict:
             "pavlok": {
                 "enabled": PAVLOK_CONFIG.get("enabled"),
                 "zap_count": PAVLOK_STATE.get("zap_count", 0),
-                "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
                 "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
                 "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
             },
@@ -15468,7 +15395,6 @@ async def _ops_read_enforcement_summary() -> dict:
             "pavlok": {
                 "enabled": PAVLOK_CONFIG.get("enabled"),
                 "zap_count": PAVLOK_STATE.get("zap_count", 0),
-                "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
                 "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
                 "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
             },
@@ -16508,42 +16434,6 @@ async def timer_worker():
             # as lower assertion confidence; the source is cleared only by explicit
             # close/new-app telemetry or an intentional correction endpoint.
 
-            # Twitter 7-minute enforcement
-            twitter_since = PHONE_STATE.get("twitter_open_since")
-            if twitter_since is not None:
-                # Staleness guard: if current_app is no longer twitter, the close
-                # telemetry was likely dropped by MacroDroid — clear the timer
-                current_app = (PHONE_STATE.get("current_app") or "").lower()
-                if current_app not in ("twitter", "x", "com.twitter.android"):
-                    stale_elapsed = time.monotonic() - twitter_since
-                    print(
-                        f"TIMER: Twitter timer stale ({stale_elapsed:.0f}s) — current_app={current_app!r}, clearing (dropped close event)"
-                    )
-                    PHONE_STATE["twitter_open_since"] = None
-                    PHONE_STATE["twitter_zapped"] = False
-                else:
-                    twitter_elapsed = time.monotonic() - twitter_since
-                    if twitter_elapsed > 420:  # 7 minutes
-                        now_mono = time.monotonic()
-                        since_last_zap = now_mono - PHONE_STATE.get("twitter_last_zap_at", 0)
-                        if since_last_zap < 1800:  # 30-minute cooldown
-                            print(
-                                f"TIMER: Twitter 7-min hit but cooldown active ({since_last_zap:.0f}s < 1800s). Skipping zap."
-                            )
-                            PHONE_STATE["twitter_open_since"] = None
-                        else:
-                            print(
-                                f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break."
-                            )
-                            PHONE_STATE["twitter_open_since"] = None  # one-shot per session
-                            PHONE_STATE["twitter_zapped"] = (
-                                True  # block re-zap until confirmed close
-                            )
-                            PHONE_STATE["twitter_last_zap_at"] = now_mono
-                            PHONE_STATE["twitter_last_zap_wall"] = time.time()
-                            _persist_twitter_zap_cooldown()
-                            asyncio.create_task(_async_enforce_twitter_timeout())
-
             now = time.time()
 
             # Update idle_timeout_exempt based on location only
@@ -16644,55 +16534,6 @@ async def _async_enforce_break_exhausted():
     await log_event("break_exhausted_enforcement", details=result)
 
 
-async def _async_enforce_twitter_timeout():
-    """Enforce Twitter 7-minute timeout: notify, zap, force break."""
-    global _current_session_id, _session_start_ms
-    now_ms = int(time.monotonic() * 1000)
-
-    # Pavlok zap is device-control (the watch is geofence-agnostic).
-    pavlok_result = await asyncio.to_thread(
-        send_pavlok_stimulus,
-        "zap",
-        30,
-        "twitter_timeout",
-        True,
-    )
-    # Spoken alert + banner go through the comms middleware (geofence-routed).
-    # NOTE: the legacy phone `/enforce` call also triggered a phone-side Spotify
-    # redirect/pause; that side effect is deferred to the granular `/play`
-    # endpoint (see the comms-router follow-up ticket) rather than re-bypassing
-    # the router with a phone-direct enforce payload.
-    result = await dispatch_notify(
-        "twitter timeout",
-        banner="Twitter timeout",
-    )
-
-    # Force timer into BREAK mode (clear any existing manual mode first)
-    old_mode = timer_engine.current_mode.value
-    timer_engine._clear_manual_mode()
-    changed, _ = timer_engine.enter_break(now_ms)
-    if changed:
-        today = datetime.now().strftime("%Y-%m-%d")
-        new_mode = timer_engine.current_mode.value
-        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
-        await timer_log_shift(
-            old_mode, new_mode, trigger="enforcement", source="timer_worker", phone_app="twitter"
-        )
-        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
-        _current_session_id = await timer_start_session(new_mode, today)
-        _session_start_ms = now_ms
-
-    await log_event(
-        "twitter_timeout_enforcement",
-        details={
-            "old_mode": old_mode,
-            "forced_break": changed,
-            "pavlok": pavlok_result,
-            "phone": result,
-        },
-    )
-
-
 async def enforce_break_exhausted_impl() -> dict:
     """Shared enforcement logic for break exhaustion (used by timer worker and API endpoint)."""
     enforced_any = False
@@ -16728,9 +16569,7 @@ async def enforce_break_exhausted_impl() -> dict:
             trigger="break_exhausted",
         )
         enforce_app = current_app
-        if current_app in ("x", "twitter", "com.twitter.android"):
-            enforce_app = "twitter"
-        elif current_app in (
+        if current_app in (
             "youtube",
             "com.google.android.youtube",
             "app.revanced.android.youtube",
@@ -17714,30 +17553,15 @@ async def enforcement_status():
                 )
         pending.append(ack)
 
-    def _cooldown_remaining(last_at: str | None, cooldown_seconds: int | None) -> int:
-        if not last_at or not cooldown_seconds:
-            return 0
-        elapsed = (datetime.now() - datetime.fromisoformat(last_at)).total_seconds()
-        return round(max(0, cooldown_seconds - elapsed))
-
     return {
         "pending": pending,
         "pending_count": len(pending),
         "pavlok": {
             "enabled": PAVLOK_CONFIG["enabled"],
-            "daily_zap_cap": PAVLOK_CONFIG.get("daily_zap_cap", 6),
             "zap_count_date": PAVLOK_STATE.get("zap_count_date"),
             "zap_count": PAVLOK_STATE.get("zap_count", 0),
-            "zap_cooldown_seconds": PAVLOK_CONFIG.get("zap_cooldown_seconds"),
-            "soft_cooldown_seconds": PAVLOK_CONFIG.get("soft_cooldown_seconds"),
             "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
             "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
-            "zap_cooldown_remaining_seconds": _cooldown_remaining(
-                PAVLOK_STATE.get("last_zap_at"), PAVLOK_CONFIG.get("zap_cooldown_seconds")
-            ),
-            "soft_cooldown_remaining_seconds": _cooldown_remaining(
-                PAVLOK_STATE.get("last_soft_at"), PAVLOK_CONFIG.get("soft_cooldown_seconds")
-            ),
         },
     }
 

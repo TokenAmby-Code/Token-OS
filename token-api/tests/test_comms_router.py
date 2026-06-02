@@ -7,8 +7,8 @@ selection, quiet-hours gating, and fanout. Circumventing the router by sending
 spoken text phone-direct via `_send_to_phone(tts_text=...)` is a violation.
 
 These are unit/structural guards, not a substitute for the live-path validation
-(GT ready-for-ack, twitter-timeout, break-exhausted, AskUserQuestion) the
-migration was exercised against.
+(GT ready-for-ack, break-exhausted, AskUserQuestion) the migration was
+exercised against.
 """
 
 from __future__ import annotations

@@ -937,24 +937,24 @@ def test_pavlok_guardrails_drop_cap_cooldown_keep_quiet_and_contexts(app_env):
             "last_soft_at": None,
         }
     )
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed) is None
 
     # Old cooldown is gone — a zap one minute after the last is still allowed.
     phone_service.PAVLOK_STATE.update({"zap_count": 0, "last_zap_at": fixed.isoformat()})
-    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1), True) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1)) is None
 
     # Context suppress-windows remain.
     phone_service.PAVLOK_STATE["last_zap_at"] = None
     phone_service.TTS_GLOBAL_MODE["mode"] = "silent"
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "quiet_mode"
+    assert phone_service._pavlok_guardrail_block("zap", fixed)["reason"] == "quiet_mode"
     phone_service.TTS_GLOBAL_MODE["mode"] = "verbose"
 
     phone_service.DESKTOP_STATE["in_meeting"] = True
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "meeting"
+    assert phone_service._pavlok_guardrail_block("zap", fixed)["reason"] == "meeting"
     phone_service.DESKTOP_STATE["in_meeting"] = False
 
     phone_service.DESKTOP_STATE["club_context"] = True
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True)["reason"] == "club_context"
+    assert phone_service._pavlok_guardrail_block("zap", fixed)["reason"] == "club_context"
     phone_service.DESKTOP_STATE["club_context"] = False
 
 
@@ -1956,8 +1956,8 @@ def test_mewgenics_space_second_working_press_zaps_directly(app_env, monkeypatch
 
     calls = []
 
-    def fake_send(stimulus_type, value, reason, respect_cooldown=True):
-        calls.append((stimulus_type, value, reason, respect_cooldown))
+    def fake_send(stimulus_type, value, reason):
+        calls.append((stimulus_type, value, reason))
         return {"success": True}
 
     monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_send)
@@ -1974,7 +1974,7 @@ def test_mewgenics_space_second_working_press_zaps_directly(app_env, monkeypatch
     assert second.json()["reason"] == "direct_zap"
     assert second.json()["zap_fired"] is True
     assert calls == [
-        ("zap", app_env.main.PAVLOK_CONFIG.get("friday_zap_value", 30), "mewgenics_space", True)
+        ("zap", app_env.main.PAVLOK_CONFIG.get("friday_zap_value", 30), "mewgenics_space")
     ]
     rows = _rows(app_env.db_path, "SELECT source FROM expected_acknowledgements")
     assert rows == []
@@ -2256,8 +2256,7 @@ def test_enforce_fires_past_old_daily_zap_cap(app_env):
         }
     )
 
-    assert phone_service._pavlok_guardrail_block("zap", fixed, False) is None
-    assert phone_service._pavlok_guardrail_block("zap", fixed, True) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed) is None
 
 
 def test_enforce_ignores_old_cooldown_window(app_env):
@@ -2270,5 +2269,5 @@ def test_enforce_ignores_old_cooldown_window(app_env):
         {"zap_count": 0, "zap_count_date": "2026-05-01", "last_zap_at": fixed.isoformat()}
     )
 
-    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1), True) is None
-    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=2), True) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=1)) is None
+    assert phone_service._pavlok_guardrail_block("zap", fixed + timedelta(minutes=2)) is None

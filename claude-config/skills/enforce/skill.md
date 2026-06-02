@@ -86,7 +86,6 @@ All callers migrated to v3 (2026-03-30). Fallback chain: phone v3 → server-sid
 | `/api/notify` (webhook path) | `/notify` | — | `tts_text`, `banner_text`, `vibe=30` | Deployed |
 | Enforcement cascade (levels 1-3) | `/notify` | `prescriptive` | vibe/beep/tts_text/banner_text per level | Deployed |
 | Enforcement cascade (levels 4-5) | `/enforce` | `prescriptive` | zap/tts_text/banner_text + Spotify | Deployed |
-| Twitter timeout | `/enforce` | `prescriptive` | `zap=30`, `tts_text`, `banner_text` | Deployed |
 | Break exhaustion | `/enforce` | `prescriptive` | `zap=30`, `tts_text=Break time exhausted`, `banner_text` | Deployed |
 | Instance count drop | `/notify` | `prescriptive` | `vibe=50-80`, `beep=50`, `tts_text`, `banner_text` | Deployed |
 | PreToolUse AskUserQuestion | `/notify` | `prescriptive` | `tts_text=<question>`, `banner_text=Question`, `vibe=50`, `beep=30` | **Pending** |
