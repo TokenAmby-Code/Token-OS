@@ -16260,11 +16260,160 @@ async def get_ops_display_state():
             "backend": tts_summary.get("backend"),
             "satellite_available": tts_summary.get("satellite_available"),
             "global_mode": tts_summary.get("global_mode"),
+            "routing": tts_summary.get("routing"),
         },
         "voice_drafts": [
             _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
         ],
         "enforcement": enforcement_summary,
+    }
+
+
+def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
+    """First meaningful prose line of a session-doc body — a *head*, never the
+    whole document. The cockpit is a glance surface; Obsidian renders the doc.
+
+    Skips blank lines, markdown heading/quote/list markers, and HTML comments,
+    then returns one trimmed line capped at `limit` chars.
+    """
+    if not body:
+        return None
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("<!--", "%%", "---", "![", "|")):
+            continue
+        # strip leading markdown markers (#, >, -, *, +, digits.) so the head
+        # reads as prose rather than syntax
+        line = re.sub(r"^([#>\-*+]+\s*|\d+\.\s+)", "", line).strip()
+        if not line:
+            continue
+        return (line[: limit - 1] + "…") if len(line) > limit else line
+    return None
+
+
+@app.get("/api/ui/ops/session-docs")
+async def get_ops_session_docs(
+    include_archived: bool = False,
+    limit_per_lane: int = 12,
+):
+    """Read-only pipeline-board feed for the ops cockpit.
+
+    Groups DB-registered session docs into status lanes, each doc carrying a
+    one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
+    renders more than the head — the document is authored and read in Obsidian
+    (the single writer of `status:`). This endpoint performs no mutations.
+
+    `archived` docs are excluded by default (there are hundreds). Each lane is
+    capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
+    carries the true per-status counts so the board reports what it dropped
+    rather than silently truncating. Ordering is by `created_at` because
+    `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
+    surfaces docs that have been open a long time.
+    """
+    from urllib.parse import quote
+
+    vault_root = Path(
+        os.environ.get("IMPERIUM_ENV")
+        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
+    )
+    vault_name = vault_root.name
+    now = datetime.now()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = (
+            "SELECT id, file_path, title, project, primarch_name, cron_job_id, "
+            "status, created_at, updated_at FROM session_documents"
+        )
+        if not include_archived:
+            query += " WHERE status != 'archived'"
+        query += " ORDER BY created_at DESC"
+        cursor = await db.execute(query)
+        rows = await cursor.fetchall()
+        linked: dict[int, int] = {}
+        cnt = await db.execute(
+            "SELECT session_doc_id, COUNT(*) FROM claude_instances "
+            "WHERE session_doc_id IS NOT NULL GROUP BY session_doc_id"
+        )
+        for r in await cnt.fetchall():
+            linked[r[0]] = r[1]
+
+    # True per-lane totals (pre-cap) so the board never lies about coverage.
+    lane_totals: dict[str, int] = {}
+    for row in rows:
+        status = (row["status"] or "unknown").lower()
+        lane_totals[status] = lane_totals.get(status, 0) + 1
+
+    # Cap each lane to the most-recent N. Reading frontmatter is the only
+    # filesystem cost, so it happens *after* the cap — never on hundreds of docs.
+    per_lane_count: dict[str, int] = {}
+    docs = []
+    for row in rows:
+        d = dict(row)
+        status = (d.get("status") or "unknown").lower()
+        if per_lane_count.get(status, 0) >= max(1, limit_per_lane):
+            continue
+        per_lane_count[status] = per_lane_count.get(status, 0) + 1
+
+        fp_str = d.get("file_path")
+        head: str | None = None
+        fm: dict = {}
+        note_rel: str | None = None
+        if fp_str:
+            fp = Path(fp_str)
+            if not fp.is_absolute():
+                fp = vault_root / fp_str  # file_path is stored vault-relative
+            try:
+                if fp.is_file():
+                    fm, body = await asyncio.to_thread(read_frontmatter, fp)
+                    head = _ops_session_doc_head(body)
+            except Exception:
+                fm, head = {}, None
+            try:
+                note_rel = str(fp.relative_to(vault_root))
+            except ValueError:
+                note_rel = str(fp_str)
+
+        obsidian_uri = None
+        if note_rel:
+            note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
+            obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
+
+        created = d.get("created_at")
+        age_seconds = None
+        if created:
+            try:
+                parsed = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.replace(tzinfo=None)
+                age_seconds = max(0, int((now - parsed).total_seconds()))
+            except Exception:
+                age_seconds = None
+
+        docs.append(
+            {
+                "id": d.get("id"),
+                "title": d.get("title") or (Path(str(fp_str)).stem if fp_str else None),
+                "path": fp_str,
+                "vault_rel": note_rel,
+                "obsidian_uri": obsidian_uri,
+                "status": status,
+                "project": d.get("project") or fm.get("project"),
+                "primarch": d.get("primarch_name") or fm.get("primarch"),
+                "legion": fm.get("legion"),
+                "instance_type": fm.get("instance_type"),
+                "head": head,
+                "created_at": created,
+                "age_seconds": age_seconds,
+                "linked_instances": linked.get(d.get("id"), 0),
+            }
+        )
+
+    return {
+        "generated_at": now.isoformat(),
+        "lane_totals": lane_totals,
+        "limit_per_lane": max(1, limit_per_lane),
+        "docs": docs,
     }
 
 

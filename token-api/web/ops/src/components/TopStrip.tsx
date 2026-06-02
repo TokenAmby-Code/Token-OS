@@ -1,76 +1,102 @@
-// Persistent glanceable strip: the <2s "am I working / in debt / distracted /
-// blocked?" readout. Single row on desktop, wraps to a grid on narrow frames.
+// The persistent glanceable HUD: the <2s "am I working / in debt / distracted /
+// blocked?" readout, rendered as a cluster of floating circular gauges that
+// live in the fixed top bar (bound to the viewport, never to scroll position).
+// Magnitudes become arcs; enum/bool states become center glyphs (per the rule
+// that app *names* — free text — get a short label, everything else a gauge).
 
 import type { OpsState } from '../types';
-import { modeVisual } from '../modes';
-import { formatSignedDuration } from '../format';
+import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
+import { formatSignedClock, formatClock } from '../format';
+import { Ring } from './Ring';
 
-function Stat({
-  label,
-  value,
-  detail,
-  tone,
-  accent,
-}: {
-  label: string;
-  value: string;
-  detail?: string;
-  tone?: 'good' | 'bad' | 'warn' | 'neutral';
-  accent?: string;
-}) {
-  return (
-    <div className={`stat ${tone ? `stat--${tone}` : ''}`}>
-      <span className="stat__label">{label}</span>
-      <strong className="stat__value" style={accent ? { color: accent } : undefined}>{value}</strong>
-      {detail ? <span className="stat__detail">{detail}</span> : null}
-    </div>
-  );
+// One banked hour of break fills the ring; debt fills it in hazard.
+const BREAK_SCALE_MS = 60 * 60 * 1000;
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
-export function TopStrip({ state }: { state: OpsState }) {
+export function HudRings({ state }: { state: OpsState }) {
   const mv = modeVisual(state.timer.mode);
+  const bal = state.timer.break_balance_ms;
   const debt = state.timer.is_in_backlog;
-  const phoneDistracted = state.attention.phone.is_distracted;
+  const breakRatio = Math.min(1, Math.abs(bal) / BREAK_SCALE_MS);
+
+  const desk = state.attention.desktop;
+  const phone = state.attention.phone;
   const pending = state.enforcement.pending_count;
+  const active = state.instances.counts.active;
+  const stale = state.instances.counts.stale;
+
+  const alarmAcked = state.alarm?.acked ?? false;
+  const alarmTime = state.alarm?.day_started_at ? formatClock(state.alarm.day_started_at) : null;
+
+  const deskLabel = desk.steam_app_name
+    ? truncate(desk.steam_app_name, 11)
+    : desk.work_mode || desk.mode || '—';
+  const phoneLabel = phone.app ? truncate(phone.app, 11) : 'clear';
 
   return (
-    <div className="strip">
-      <div className="strip__mode" style={{ '--mode-c': mv.color } as React.CSSProperties}>
-        <span className="strip__glyph">{mv.glyph}</span>
-        <div>
-          <span className="stat__label">Timer</span>
-          <strong className="strip__modename">{mv.label}</strong>
-        </div>
-      </div>
-
-      <Stat
-        label="Break balance"
-        value={formatSignedDuration(state.timer.break_balance_ms)}
-        detail={debt ? 'in debt' : 'available'}
+    <div className="rings">
+      <Ring
+        label="Timer"
+        glyph={mv.glyph}
+        detail={mv.label.toLowerCase()}
+        color={mv.color}
+        title={`Timer mode · ${mv.label}`}
+      />
+      <Ring
+        label="Break"
+        value={formatSignedClock(bal)}
+        detail={debt ? 'in debt' : 'banked'}
+        color={debt ? 'var(--hazard)' : 'var(--phosphor)'}
+        ratio={breakRatio}
         tone={debt ? 'bad' : 'good'}
+        title="Break balance"
       />
-      <Stat
+      <Ring
         label="Desktop"
-        value={state.attention.desktop.mode || '—'}
-        detail={state.attention.desktop.steam_app_name ?? state.attention.desktop.work_mode}
+        glyph={desktopGlyph(desk)}
+        detail={deskLabel}
+        color="var(--cyan)"
+        tone={desk.steam_app_name ? 'warn' : 'neutral'}
+        title={`Desktop · ${deskLabel}`}
       />
-      <Stat
+      <Ring
         label="Phone"
-        value={state.attention.phone.app ?? 'clear'}
-        detail={phoneDistracted ? 'distracted' : 'no distraction'}
-        tone={phoneDistracted ? 'bad' : 'neutral'}
+        glyph={phoneGlyph(phone)}
+        detail={phoneLabel}
+        color={phone.is_distracted ? 'var(--hazard)' : 'var(--muted)'}
+        tone={phone.is_distracted ? 'bad' : 'neutral'}
+        title={`Phone · ${phoneLabel}`}
       />
-      <Stat
+      <Ring
         label="Fleet"
-        value={`${state.instances.counts.active}`}
-        detail={`${state.instances.counts.stale} stale`}
-        tone={state.instances.counts.stale > 0 ? 'warn' : 'good'}
+        value={`${active}`}
+        detail={stale > 0 ? `${stale} stale` : 'all fresh'}
+        color="var(--brass)"
+        ratio={active > 0 ? 1 - Math.min(1, stale / active) : undefined}
+        tone={stale > 0 ? 'warn' : 'good'}
+        title="Active fleet"
       />
-      <Stat
-        label="Enforcement"
+      <Ring
+        label="Enforce"
         value={`${pending}`}
         detail={`tts q ${state.tts.queue_length}`}
+        color={pending > 0 ? 'var(--hazard)' : 'var(--muted)'}
+        ratio={pending > 0 ? 1 : undefined}
         tone={pending > 0 ? 'bad' : 'neutral'}
+        pulse={pending > 0}
+        title="Enforcement pending"
+      />
+      <Ring
+        label="Alarm"
+        glyph={alarmAcked ? '✓' : '○'}
+        detail={alarmAcked ? (alarmTime ?? 'acked') : 'pending'}
+        color={alarmAcked ? 'var(--phosphor)' : 'var(--muted)'}
+        tone={alarmAcked ? 'good' : 'neutral'}
+        title="Alarm ack — tap to simulate"
+        onClick={alarmAcked ? undefined : () => { fetch('/api/alarm/ack', { method: 'POST' }); }}
       />
     </div>
   );
