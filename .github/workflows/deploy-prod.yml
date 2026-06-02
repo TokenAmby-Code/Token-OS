@@ -1,7 +1,21 @@
 name: Deploy (prod)
 
-# Triggers ONLY on merge to main. Per-worktree local dev URLs are
-# untouched — there is no "merge to deploy dev" path. Merge means ship.
+# Triggers ONLY on merge to main. Per-worktree local dev URLs are untouched —
+# there is no "merge to deploy dev" path. Merge means ship.
+#
+# Token-OS is personal software on a local Mac — "deploy to prod" == restart the
+# right local services. A GH-hosted runner cannot reach the Mac directly, so this
+# joins the Emperor's tailnet (ephemeral node) and POSTs the changed-service list
+# to token-api's /api/cd/restart webhook. The endpoint is ACK-FIRST: it returns
+# 200 immediately and restarts detached, so this job does not hang on the restart.
+#
+# Required GitHub secrets (provisioned OUTSIDE this repo):
+#   TS_AUTHKEY        — ephemeral, pre-authorized Tailscale auth key
+#   CD_RESTART_SECRET — shared bearer secret; must match token-api's env of the
+#                       same name (launchd-injected / Keychain). Fail-closed there.
+#   CD_TAILNET_HOST   — the Mac's tailnet address (MagicDNS name or 100.x IP)
+# Tailnet ACL must also allow this ephemeral node to reach CD_TAILNET_HOST:7777
+# (configured in the tailnet admin console — easy to forget; shows up as a curl timeout).
 
 on:
   push:
@@ -9,42 +23,111 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # for OIDC-based cloud auth, if used
+  pull-requests: read  # resolve the merged PR url for the pr_state→merged badge flip
 
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # ── What changed? Map globs → service keys the webhook understands. ──
+  detect-changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: production
+    outputs:
+      services: ${{ steps.assemble.outputs.services }}
+      any: ${{ steps.assemble.outputs.any }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
         with:
-          python-version: "3.11"
+          filters: |
+            token_api:
+              - 'token-api/**/*.py'
+              - 'token-api/uv.lock'
+              - 'token-api/pyproject.toml'
+            ops_ui:
+              - 'token-api/ui/ops/**'
+              - 'token-api/web/ops/**'
+            discord:
+              - 'discord-daemon/**'
+            satellite:
+              - 'token-api/token-satellite.py'
+            mobile:
+              - 'mobile/**'
 
-      - name: Install uv
+      - name: Assemble changed-service list
+        id: assemble
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          svcs=()
+          [ "${{ steps.changes.outputs.token_api }}" = "true" ] && svcs+=("token-api")
+          [ "${{ steps.changes.outputs.ops_ui }}" = "true" ]    && svcs+=("ops-ui")
+          [ "${{ steps.changes.outputs.discord }}" = "true" ]   && svcs+=("discord-daemon")
+          [ "${{ steps.changes.outputs.satellite }}" = "true" ] && svcs+=("satellite")
+          [ "${{ steps.changes.outputs.mobile }}" = "true" ]    && svcs+=("mobile")
+          if [ ${#svcs[@]} -eq 0 ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "services=[]" >> "$GITHUB_OUTPUT"
+          else
+            json=$(printf '%s\n' "${svcs[@]}" | jq -R . | jq -cs .)
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "services=$json" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Changed services: ${svcs[*]:-(none)}"
 
-      # ─── Replace this block with the actual prod deploy command ───
-      # Examples:
-      #   - gcloud run deploy ... (Cloud Run)
-      #   - fly deploy
-      #   - rsync over SSH to a VPS
-      #   - kubectl rollout
-      #
-      # Until wired up, this is a no-op so merges to main don't fail.
-      - name: Deploy
+  # ── Restart the affected local services via the tailnet webhook. ──
+  restart:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve merged PR url (best-effort, for badge flip)
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "TODO: wire prod deploy command here."
-          echo "Commit: $GITHUB_SHA"
-          echo "Ref:    $GITHUB_REF"
+          url=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+                  --jq '.[0].html_url' 2>/dev/null || true)
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Tailscale (ephemeral)
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          # Mark the node ephemeral so it's auto-removed from the tailnet on exit.
+          args: --accept-routes
+
+      - name: POST restart webhook (ack-first)
+        env:
+          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+          CD_HOST: ${{ secrets.CD_TAILNET_HOST }}
+          SERVICES: ${{ needs.detect-changes.outputs.services }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
+            echo "::error::CD_RESTART_SECRET / CD_TAILNET_HOST secrets not configured"
+            exit 1
+          fi
+          body=$(jq -nc \
+            --argjson services "$SERVICES" \
+            --arg sha "$SHA" \
+            --arg pr_url "$PR_URL" \
+            '{services: $services, sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
+          echo "Posting restart for services: $SERVICES"
+          # The endpoint acks immediately then restarts detached; a short timeout is
+          # fine. A timeout here almost always means the tailnet ACL blocks :7777.
+          code=$(curl -sS -o /tmp/cd_resp.json -w '%{http_code}' \
+            -m 20 -X POST \
+            -H "Authorization: Bearer ${CD_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "$body" \
+            "http://${CD_HOST}:7777/api/cd/restart")
+          echo "HTTP $code"
+          cat /tmp/cd_resp.json 2>/dev/null || true
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::CD restart webhook returned HTTP $code"
+            exit 1
+          fi

@@ -10,6 +10,7 @@ This server provides:
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -14507,6 +14508,191 @@ async def cancel_shutdown():
             }
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+
+# ============ CD: restart-on-merge webhook (Phase 2) ============
+#
+# Token-OS is personal software on a local Mac — "deploy to prod" means restart
+# the right local services. deploy-prod.yml (push→main) joins the tailnet via an
+# ephemeral GHA node and POSTs here with the changed-service list. Design choice:
+# ACK-FIRST, RESTART-DETACHED — validate the secret, spawn a fully detached restart,
+# and return 200 *before* token-api restarts itself, so the response flushes while
+# the runner is still waiting. The self-restart child survives our death
+# (start_new_session) and kicks launchd externally; restore_restart_state()
+# rehydrates ephemeral state on boot.
+
+# The shared secret lives OUTSIDE the repo — injected into token-api's launchd
+# environment (or read from Keychain) as CD_RESTART_SECRET. Fail-closed: if it is
+# unset/blank the endpoint refuses every request. Tailscale is defense-in-depth,
+# not a substitute for the secret.
+_CD_SECRET_ENV = "CD_RESTART_SECRET"
+
+# In-flight guard: coalesce concurrent restarts. A self-restart kills the process
+# (clearing this anyway), but two webhooks racing must not spawn two kickstarts.
+_cd_self_restart_scheduled = False
+
+# Canonical service keys → how each is restarted. deploy-prod.yml's path-filter
+# emits these keys. "log-only" globs (tmux/ahk/hammerspoon) are intentionally
+# dropped — no headless restart path — and only logged.
+_CD_LOG_ONLY = {"tmux", "ahk", "hammerspoon"}
+
+
+def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
+    """Fire-and-forget a detached child that survives our own restart."""
+    log_path = Path(f"/tmp/cd-{log_name}.log")
+    handle = log_path.open("a")
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        handle.close()
+
+
+async def _cd_flip_pr_merged(pr_url: str) -> int:
+    """Flip pr_state→merged for instances whose pr_url matches the merged PR."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE pr_url = ? AND pr_state = 'open'",
+            (pr_url,),
+        )
+        ids = [r[0] for r in await cursor.fetchall()]
+        for iid in ids:
+            await sanctioned_update_instance(
+                db,
+                instance_id=iid,
+                updates={"pr_state": "merged"},
+                mutation_type="instance_updated",
+                write_source="cd",
+                actor="cd-restart",
+            )
+        await db.commit()
+    return len(ids)
+
+
+@app.post("/api/cd/restart")
+async def cd_restart(request: Request):
+    """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
+
+    Body: {"services": [...], "sha": "...", "pr_url": "..."} — services is the
+    changed-service key list from deploy-prod.yml's path filter. Returns a
+    per-service result map immediately; the token-api self-restart (if any) is
+    deferred to a detached child so this 200 flushes first.
+    """
+    global _cd_self_restart_scheduled
+
+    configured = os.environ.get(_CD_SECRET_ENV, "").strip()
+    if not configured:
+        # Fail-closed: never accept when no secret is provisioned.
+        logger.error("CD: /api/cd/restart called but %s is unset — refusing", _CD_SECRET_ENV)
+        raise HTTPException(status_code=503, detail="CD restart not configured")
+
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, configured):
+        logger.warning("CD: rejected /api/cd/restart — bad/missing bearer secret")
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    services = body.get("services") or []
+    if not isinstance(services, list):
+        raise HTTPException(status_code=400, detail="services must be a list")
+    sha = body.get("sha")
+    pr_url = body.get("pr_url")
+
+    results: dict[str, str] = {}
+    needs_self_restart = False
+
+    for svc in services:
+        key = str(svc).strip().lower()
+        if key in ("token-api", "token_api", "tokenapi", "ops-ui", "ops", "web"):
+            # ops-ui is served by token-api; token-restart AppleScript-reloads tabs.
+            needs_self_restart = True
+            results[key] = "self-restart scheduled"
+        elif key in ("discord-daemon", "discord", "discord-context"):
+            try:
+                _cd_spawn_detached(
+                    ["launchctl", "kickstart", "-k", "gui/501/ai.openclaw.discord-context"],
+                    log_name="discord-restart",
+                )
+                results[key] = "kicked"
+            except Exception as e:  # per-service failure must not fail the webhook
+                results[key] = f"error: {e}"
+        elif key in ("satellite", "token-satellite", "wsl"):
+            try:
+                wsl_host = cfg("tailscale_ip", "wsl")
+                _cd_spawn_detached(
+                    [
+                        "curl",
+                        "-fsS",
+                        "-m",
+                        "5",
+                        "-X",
+                        "POST",
+                        f"http://{wsl_host}:7777/restart",
+                    ],
+                    log_name="satellite-restart",
+                )
+                results[key] = "restart posted"
+            except Exception as e:
+                results[key] = f"error: {e}"
+        elif key in ("mobile", "push-mobile"):
+            try:
+                push_mobile = str(SCRIPTS_DIR / "cli-tools" / "bin" / "push-mobile")
+                _cd_spawn_detached([push_mobile, "-a"], log_name="push-mobile")
+                results[key] = "push-mobile -a spawned"
+            except Exception as e:
+                results[key] = f"error: {e}"
+        elif key in _CD_LOG_ONLY:
+            logger.info("CD: %s changed — log-only (no headless restart path)", key)
+            results[key] = "log-only (dropped)"
+        else:
+            results[key] = "unknown service (ignored)"
+
+    # Flip the merged PR's originating instance badge (Phase 1 → merged).
+    merged_flips = 0
+    if pr_url:
+        try:
+            merged_flips = await _cd_flip_pr_merged(pr_url)
+        except Exception as e:
+            logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
+
+    # Schedule the (deferred, detached) self-restart AFTER acking. The child sleeps
+    # so this 200 fully flushes before launchd kicks us. save_restart_state() here
+    # guards against kickstart -k not allowing a graceful lifespan shutdown.
+    self_restart = "not requested"
+    if needs_self_restart:
+        if _cd_self_restart_scheduled:
+            self_restart = "already scheduled (coalesced)"
+        else:
+            _cd_self_restart_scheduled = True
+            try:
+                save_restart_state()
+            except Exception as e:
+                logger.warning("CD: save_restart_state failed (continuing): %s", e)
+            token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
+            _cd_spawn_detached(
+                ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)}"],
+                log_name="self-restart",
+            )
+            self_restart = "scheduled (detached, ~2s)"
+            logger.info("CD: self-restart scheduled (sha=%s)", sha)
+
+    return {
+        "ok": True,
+        "sha": sha,
+        "services": results,
+        "self_restart": self_restart,
+        "pr_merged_flips": merged_flips,
+    }
 
 
 # ============ KVM (Deskflow) ============
