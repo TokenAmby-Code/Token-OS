@@ -92,7 +92,6 @@ async def enforce(request: EnforceRequest) -> dict:
         stimulus_type="zap",
         value=intensity,
         reason=f"enforce_{request.source}",
-        respect_cooldown=False,
     )
     await log_event("pavlok_stimulus", details=pavlok_result)
 

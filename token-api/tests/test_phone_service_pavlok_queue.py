@@ -15,9 +15,6 @@ def phone_service_env(monkeypatch, tmp_path):
             "enabled": True,
             "token": "test-token",
             "min_gap_seconds": 2.0,
-            "zap_cooldown_seconds": 20 * 60,
-            "soft_cooldown_seconds": 3 * 60,
-            "daily_zap_cap": 6,
         }
     )
     phone_service.PAVLOK_STATE.update(
@@ -56,7 +53,7 @@ def test_pavlok_phone_success_suppresses_api_fallback(phone_service_env, monkeyp
         lambda *args, **kwargs: pytest.fail("Pavlok API fallback should not run"),
     )
 
-    result = phone_service.send_pavlok_stimulus("beep", 25, "pytest", respect_cooldown=False)
+    result = phone_service.send_pavlok_stimulus("beep", 25, "pytest")
 
     assert result["success"] is True
     assert result["accepted"] is True
@@ -84,7 +81,7 @@ def test_pavlok_phone_failure_falls_back_to_api(phone_service_env, monkeypatch):
 
     monkeypatch.setattr(phone_service.requests, "post", fake_post)
 
-    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
+    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest")
 
     assert result["success"] is True
     assert result["accepted"] is True
@@ -107,7 +104,7 @@ def test_pavlok_min_gap_is_applied_between_stimuli(phone_service_env, monkeypatc
         lambda endpoint, params: {"success": True, "status_code": 200},
     )
 
-    result = phone_service.send_pavlok_stimulus("vibe", 20, "pytest", respect_cooldown=False)
+    result = phone_service.send_pavlok_stimulus("vibe", 20, "pytest")
 
     assert result["success"] is True
     assert sleeps == [1.0]
@@ -127,8 +124,8 @@ def test_concurrent_style_zap_and_beep_serialize_through_one_lane(phone_service_
         phone_service.time, "sleep", lambda delay: call_order.append(("sleep", delay))
     )
 
-    zap = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
-    beep = phone_service.send_pavlok_stimulus("beep", 30, "pytest", respect_cooldown=False)
+    zap = phone_service.send_pavlok_stimulus("zap", 30, "pytest")
+    beep = phone_service.send_pavlok_stimulus("beep", 30, "pytest")
 
     assert zap["success"] is True
     assert beep["success"] is True
@@ -142,8 +139,8 @@ def test_send_to_phone_strips_notify_pavlok_params_and_queues(phone_service_env,
     pavlok_calls = []
     raw_calls = []
 
-    def fake_pavlok(stimulus_type, value, reason, respect_cooldown=True):
-        pavlok_calls.append((stimulus_type, value, reason, respect_cooldown))
+    def fake_pavlok(stimulus_type, value, reason):
+        pavlok_calls.append((stimulus_type, value, reason))
         return {"success": True, "type": stimulus_type, "value": value}
 
     def fake_raw(endpoint, params):
@@ -159,7 +156,7 @@ def test_send_to_phone_strips_notify_pavlok_params_and_queues(phone_service_env,
     )
 
     assert result["success"] is True
-    assert pavlok_calls == [("vibe", 30, "phone_params_notify", True)]
+    assert pavlok_calls == [("vibe", 30, "phone_params_notify")]
     assert raw_calls == [("/notify", {"tts_text": "hello", "banner_text": "hi"})]
 
 
@@ -173,9 +170,8 @@ def test_send_to_phone_strips_enforce_zap_and_keeps_notification_params(
     monkeypatch.setattr(
         phone_service,
         "send_pavlok_stimulus",
-        lambda stimulus_type, value, reason, respect_cooldown=True: (
-            pavlok_calls.append((stimulus_type, value, reason, respect_cooldown))
-            or {"success": True}
+        lambda stimulus_type, value, reason: (
+            pavlok_calls.append((stimulus_type, value, reason)) or {"success": True}
         ),
     )
     monkeypatch.setattr(
@@ -192,7 +188,7 @@ def test_send_to_phone_strips_enforce_zap_and_keeps_notification_params(
     )
 
     assert result["success"] is True
-    assert pavlok_calls == [("zap", 50, "phone_params_enforce", True)]
+    assert pavlok_calls == [("zap", 50, "phone_params_enforce")]
     assert raw_calls == [
         ("/enforce", {"tts_text": "close it", "banner_text": "enforcement active"})
     ]
@@ -212,7 +208,7 @@ def test_guardrails_block_before_queue_dispatch(phone_service_env, monkeypatch):
         lambda *args, **kwargs: pytest.fail("guardrail block must not dispatch to API"),
     )
 
-    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
+    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest")
 
     assert result["success"] is False
     assert result["blocked_by_guardrail"] is True
@@ -239,7 +235,7 @@ def test_daily_zap_cap_removed_zap_dispatches_past_old_cap(phone_service_env, mo
 
     monkeypatch.setattr(phone_service, "_send_to_phone_raw", fake_phone)
 
-    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest", respect_cooldown=False)
+    result = phone_service.send_pavlok_stimulus("zap", 30, "pytest")
 
     assert result["success"] is True
     assert dispatched == [("/zap", {"action": "zap", "intensity": 30})]

@@ -13,7 +13,6 @@ from datetime import datetime
 import requests
 
 from shared import (
-    DB_PATH,
     DESKTOP_STATE,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
@@ -25,41 +24,10 @@ from shared import (
 
 logger = logging.getLogger("token_api")
 
-TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
-TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
-
 _last_widget_push = {"mode": None, "active": None}
 _PAVLOK_STIMULUS_TYPES = ("zap", "beep", "vibe")
 _pavlok_dispatch_lock = threading.Lock()
 _last_pavlok_dispatch_monotonic: float | None = None
-
-
-def _persist_twitter_zap_cooldown():
-    """Write twitter zap wall-clock time to file so it survives restarts."""
-    try:
-        TWITTER_ZAP_COOLDOWN_FILE.write_text(str(time.time()))
-    except Exception as e:
-        print(f"WARN: Failed to persist twitter zap cooldown: {e}")
-
-
-def _restore_twitter_zap_cooldown():
-    """On startup, restore twitter zap cooldown from file.
-    If a zap happened less than 30 min ago, set twitter_zapped=True to block phantom opens."""
-    try:
-        if TWITTER_ZAP_COOLDOWN_FILE.exists():
-            last_zap_wall = float(TWITTER_ZAP_COOLDOWN_FILE.read_text().strip())
-            elapsed = time.time() - last_zap_wall
-            if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
-                PHONE_STATE["twitter_zapped"] = True
-                PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
-                print(
-                    f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked."
-                )
-            else:
-                print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
-                TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
-    except Exception as e:
-        print(f"WARN: Failed to restore twitter zap cooldown: {e}")
 
 
 def push_phone_widget(mode: str, active_count: int):
@@ -186,7 +154,6 @@ def send_pavlok_stimulus(
     stimulus_type: str = "zap",
     value: int | None = None,
     reason: str = "manual",
-    respect_cooldown: bool = True,
 ) -> dict:
     """Queue and send one stimulus (zap/beep/vibe) to the Pavlok watch.
 
@@ -219,7 +186,7 @@ def send_pavlok_stimulus(
         return result
 
     now = datetime.now()
-    guardrail = _pavlok_guardrail_block(stimulus_type, now, respect_cooldown)
+    guardrail = _pavlok_guardrail_block(stimulus_type, now)
     if guardrail:
         result = {
             "skipped": True,
@@ -245,10 +212,10 @@ def send_pavlok_stimulus(
     value = _normalize_stimulus_value(value)
 
     with _pavlok_dispatch_lock:
-        # Re-check cooldown/cap after waiting for the lane, so concurrent
-        # callers cannot all pass the pre-flight guardrail against stale state.
+        # Re-check context guardrails after waiting for the lane, so a context
+        # that closed (meeting ended, quiet lifted) while queued is honored.
         now = datetime.now()
-        guardrail = _pavlok_guardrail_block(stimulus_type, now, respect_cooldown)
+        guardrail = _pavlok_guardrail_block(stimulus_type, now)
         if guardrail:
             result = {
                 "skipped": True,
@@ -398,7 +365,6 @@ def _normalize_stimulus_value(raw_value) -> int:
 def _pavlok_guardrail_block(
     stimulus_type: str,
     now: datetime,
-    respect_cooldown: bool,
 ) -> dict | None:
     """Return a guardrail block reason, or None when stimulus is allowed."""
     global_mode = (TTS_GLOBAL_MODE.get("mode") or "").lower()
@@ -423,9 +389,7 @@ def _pavlok_guardrail_block(
     # Enforcement Dedup Removal decree — they masked false-fires and silently
     # killed escalating enforce loops (e.g. negative-break would die at zap #6).
     # Only the context suppress-windows above (quiet/meeting/sleep/club/driving/
-    # medical) and the typing-guard mutex remain. `respect_cooldown` is now
-    # vestigial; kept in the signature to avoid touching every caller.
-    _ = respect_cooldown
+    # medical) and the typing-guard mutex remain.
     return None
 
 

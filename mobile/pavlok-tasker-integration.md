@@ -12,7 +12,7 @@ Bypass the cloud API. Have Token-API send a request to the phone (via Tasker HTT
 
 - **Token-API** runs on desktop at `localhost:7777`
 - **Phone** (Samsung S24) reachable via Tailscale at `100.102.92.24`
-- **MacroDroid** already runs an HTTP server on port 7777 for app enforcement (`/enforce?action=disable&app=twitter`)
+- **MacroDroid** already runs an HTTP server on port 7777 for app enforcement (`/enforce?action=disable&app=youtube`)
 - **Tasker** newly installed on phone
 - **Pavlok app** installed on phone, handles BLE connection to watch
 
