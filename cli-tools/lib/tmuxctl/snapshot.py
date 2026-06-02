@@ -56,7 +56,7 @@ def _infer_archetype(window_name: str) -> WindowArchetype:
         return WindowArchetype.SOMNIUM
     if base == "legion":
         return WindowArchetype.LEGION_STACK
-    if base in {"mechanicus", "mars", "kreig"}:
+    if base in {"mechanicus", "mars", "kreig", "reservists"}:
         return WindowArchetype.MECHANICUS_STACK
     return WindowArchetype.UNKNOWN
 

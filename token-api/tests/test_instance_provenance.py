@@ -3,6 +3,7 @@
 import sqlite3
 import sys
 import uuid
+from typing import Any
 
 import pytest
 
@@ -242,7 +243,25 @@ class TestReconciliation:
         assert latest["mutation_type"] == "instance_stopped"
         assert latest["actor"] == "stop-hook"
 
-    def test_primarch_supplant_clears_old_legion_pane_tint(self, client, app_env):
+    def test_primarch_supplant_repaints_panes_event_driven(
+        self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Supplant paints panes via the event-driven tint path (no recolor queue):
+        the new pane is painted for the preserved legion and the vacated pane cleared."""
+        import shared
+
+        tint_calls = []
+        monkeypatch.setattr(
+            shared,
+            "apply_pane_tint",
+            lambda pane, legion, **kw: tint_calls.append(("apply", pane, legion)),
+        )
+        monkeypatch.setattr(
+            shared,
+            "clear_pane_tint",
+            lambda pane, **kw: tint_calls.append(("clear", pane)),
+        )
+
         old_id = str(uuid.uuid4())
         new_id = str(uuid.uuid4())
         conn = _db(app_env)
@@ -271,16 +290,9 @@ class TestReconciliation:
         assert resp.status_code == 200, resp.text
         assert resp.json()["action"] == "supplanted"
 
-        conn = _db(app_env)
-        rows = conn.execute(
-            "SELECT legion, tmux_pane FROM pane_recolor_queue ORDER BY id ASC"
-        ).fetchall()
-        conn.close()
-
-        assert [tuple(row) for row in rows] == [
-            ("custodes", "%new"),
-            ("astartes", "%old"),
-        ]
+        # New pane painted for the preserved legion; vacated pane cleared.
+        assert ("apply", "%new", "custodes") in tint_calls
+        assert ("clear", "%old") in tint_calls
 
     def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env):
         """Plan-mode context-clear: Claude Code emits fresh session_id but same pid+pane.

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# civic-thread — the ORCHESTRATION-level "one civic instance alive" invariant.
+#
+# "Alive" here means an agent-thread that is ACTIVELY INFERRING (stop-hook governed),
+# NOT a process that happens to be running. The invariant is satisfied when at least
+# one Claude instance with status=processing has a working_dir in the Civic volume.
+# (Per Emperor 2026-06-01: "anything that's in the civic volume and processing" —
+#  reservist/infra threads are NOT excluded; they count.)
+#
+# When the invariant is NOT satisfied, the FALLTHROUGH fires: it injects an activation
+# prompt into the **civic reservist** pane (left pane of the `5:reservists` window) via
+# `tmux-resume` (which routes through tmuxctl's send_gate). That reservist then becomes
+# the live civic thread.
+#
+# This is distinct from, and sits ABOVE, `civic-invariant` (which keeps the askCivic
+# backend *process* — the billable-pool *substrate* — healthy). civic-thread is the
+# orchestration characteristic; civic-invariant is the process characteristic.
+#
+# Subcommands:
+#   status        human-readable: live civic threads + reservist pane + verdict
+#   check         quiet; exit 0 iff >=1 civic thread is actively inferring
+#   count         print the number of live civic threads
+#   list          list the live civic threads
+#   reservist     print the resolved civic reservist pane id (empty if not built yet)
+#   fallthrough   if no civic thread: inject activation prompt into the reservist pane
+#                 (alias: ensure). --dry-run to preview the injection.
+#
+set -uo pipefail
+
+STATE_DIR="${CIVIC_INVARIANT_STATE:-$HOME/.civic-invariant}"
+CIVIC_PATH_PREFIX="${CIVIC_THREAD_PATH:-/Volumes/Civic}"
+# tmux pane OPTION that marks the civic reservist pane. The pane gets this set to "1"
+# when the 5:reservists window is built (see civic-thread README / window plan).
+RESERVIST_OPT="${CIVIC_RESERVIST_OPT:-@CIVIC_RESERVIST}"
+PROMPT_FILE="${CIVIC_THREAD_PROMPT:-$STATE_DIR/reservist-activation-prompt.md}"
+EVENT_LOG="$STATE_DIR/civic-thread.log"
+
+mkdir -p "$STATE_DIR"
+ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+event() { printf '[%s] %s\n' "$(ts)" "$*" >>"$EVENT_LOG"; }
+say()   { printf '%s\n' "$*"; }
+
+# --- Detection ---------------------------------------------------------------
+# Faithful to the Emperor's spec: status=processing AND working_dir under Civic.
+_civic_rows() {
+  agents-db query "SELECT id, tab_name, working_dir, last_activity \
+    FROM claude_instances \
+    WHERE status='processing' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%' \
+    ORDER BY last_activity DESC" 2>/dev/null
+}
+
+cmd_count() {
+  agents-db query "SELECT COUNT(*) FROM claude_instances \
+    WHERE status='processing' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%'" 2>/dev/null \
+    | grep -oE '[0-9]+' | tail -1
+}
+
+cmd_list() { _civic_rows; }
+
+cmd_check() { [ "$(cmd_count)" -ge 1 ] 2>/dev/null; }
+
+# --- Reservist pane resolution (through tmux pane options) -------------------
+# Returns the pane id whose ${RESERVIST_OPT} option == "1". Empty if the
+# 5:reservists window / civic reservist pane has not been built+tagged yet.
+cmd_reservist() {
+  tmux list-panes -a -F "#{pane_id} #{${RESERVIST_OPT}}" 2>/dev/null \
+    | awk '$2=="1"{print $1; exit}'
+}
+
+# --- Fallthrough -------------------------------------------------------------
+cmd_fallthrough() {
+  local dry=""; [ "${1:-}" = "--dry-run" ] && dry="--dry-run"
+
+  if cmd_check; then
+    event "fallthrough: satisfied ($(cmd_count) civic thread(s) inferring); no action"
+    say "✅ civic thread alive ($(cmd_count) processing in $CIVIC_PATH_PREFIX) — no fallthrough"
+    return 0
+  fi
+
+  local pane; pane=$(cmd_reservist)
+  if [ -z "$pane" ]; then
+    event "fallthrough BLOCKED: no civic reservist pane (5:reservists not built/tagged)"
+    say  "✗ invariant UNMET but no civic reservist pane found (option ${RESERVIST_OPT}=1)."
+    say  "  Build the 5:reservists window + tag its left pane first (see window plan)."
+    return 3
+  fi
+  if [ ! -f "$PROMPT_FILE" ]; then
+    event "fallthrough BLOCKED: activation prompt missing ($PROMPT_FILE)"
+    say  "✗ activation prompt missing: $PROMPT_FILE"
+    return 4
+  fi
+
+  event "fallthrough FIRING: 0 civic threads -> inject activation prompt into $pane ${dry}"
+  say  "… invariant UNMET — injecting civic activation prompt into reservist pane $pane"
+  tmux-resume -t "$pane" -f "$PROMPT_FILE" $dry
+}
+
+# --- Status ------------------------------------------------------------------
+cmd_status() {
+  local n pane
+  n=$(cmd_count); pane=$(cmd_reservist)
+  say "civic-thread (orchestration invariant)"
+  say "  civic volume      : $CIVIC_PATH_PREFIX"
+  say "  live civic threads: ${n:-0} (status=processing, actively inferring)"
+  [ "${n:-0}" -ge 1 ] 2>/dev/null && _civic_rows | sed 's/^/    /'
+  say "  reservist pane    : ${pane:-<not built — 5:reservists missing>}"
+  say "  activation prompt : $( [ -f "$PROMPT_FILE" ] && echo "$PROMPT_FILE" || echo "<missing>" )"
+  if [ "${n:-0}" -ge 1 ] 2>/dev/null; then
+    say "  INVARIANT: ✅ satisfied (a civic thread is alive)"
+    return 0
+  else
+    say "  INVARIANT: ❌ no civic thread alive — fallthrough would fire"
+    return 1
+  fi
+}
+
+case "${1:-status}" in
+  status)              shift; cmd_status "$@" ;;
+  check)               shift; cmd_check  "$@" ;;
+  count)               shift; cmd_count  "$@" ;;
+  list)                shift; cmd_list   "$@" ;;
+  reservist)           shift; cmd_reservist "$@" ;;
+  fallthrough|ensure)  shift; cmd_fallthrough "$@" ;;
+  *) say "usage: civic-thread {status|check|count|list|reservist|fallthrough [--dry-run]}"; exit 2 ;;
+esac

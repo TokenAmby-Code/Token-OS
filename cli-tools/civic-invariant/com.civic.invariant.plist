@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  civic-invariant keeper (macOS LaunchAgent).
+
+  Runs `civic-invariant ensure` at load and every 60s. Because `ensure` is
+  idempotent, this no-ops when the instance is healthy and respawns it (and the
+  Cloud SQL proxy) when it is down. This is the "always exactly one alive" loop.
+
+  STAGED, NOT LOADED. Enabling a persistent background keeper is an Emperor
+  decision (he may prefer the Mechanicus fleet cron instead). To enable:
+
+    cp ~/.civic-invariant/com.civic.invariant.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.civic.invariant.plist
+
+  To disable:
+
+    launchctl unload -w ~/Library/LaunchAgents/com.civic.invariant.plist
+
+  Note: when the Civic AES-256 mount is LOCKED a from-scratch rebuild can't run,
+  but keep-alive of the already-built worktree still works (everything it needs is
+  on local disk). If the worktree/.venv/SA-key are missing, `ensure` logs an error
+  and exits non-zero rather than thrashing.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.civic.invariant</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tokenclaw/.civic-invariant/civic-invariant</string>
+        <string>ensure</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tokenclaw/.civic-invariant/keeper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tokenclaw/.civic-invariant/keeper.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
