@@ -38,6 +38,153 @@ def test_dispatch_claude_system_prompt_file_dry_run(tmp_path):
     assert "initial\\ prompt" in result.stdout
 
 
+def test_dispatch_unicode_prompt_no_illegal_byte_sequence_under_c_locale(tmp_path):
+    """Regression: a unicode prompt must dry-run cleanly under a C/POSIX locale.
+
+    dispatch pipes prompt/title text through sed/tr/cut (title + slugify) and the
+    %pane redactor runs over bash `printf %q` output. Under LC_ALL=C — the default
+    in cron/launchd and many shells — BSD tooling used to abort with
+    `sed: RE error: illegal byte sequence`, forcing the user to export
+    LC_ALL=en_US.UTF-8 by hand. The script now hardens its own locale; no env var
+    should ever be required.
+    """
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("# Sand the flow → mirror coat\n\nMake it ✓ now\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    # Simulate the hostile default the user hits; the script must self-correct.
+    env["LC_ALL"] = "C"
+    env.pop("LC_CTYPE", None)
+    env.pop("LANG", None)
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--prompt-file",
+            str(prompt_file),
+        ],
+        capture_output=True,
+        text=True,
+        # Prompt bytes may surface in the printed command; never let decoding the
+        # harness output mask the real assertion below.
+        errors="replace",
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "illegal byte sequence" not in result.stderr
+    assert "illegal byte sequence" not in result.stdout
+    assert "RE error" not in result.stderr
+
+
+def test_dispatch_legion_shorthand_maps_to_target(tmp_path):
+    for keyword in ("legion", "mechanicus", "civic"):
+        result = subprocess.run(
+            [str(DISPATCH), keyword, "--dry-run", "--direct", "--dir", str(ROOT), "work"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stderr
+        assert f"target:          {keyword}:new" in result.stdout
+
+
+def test_dispatch_legion_shorthand_only_consumes_leading_token():
+    # A prompt that merely mentions "legion" must not be hijacked as a target.
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "deploy the legion now"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "target:          current" in result.stdout
+    assert "legion:new" not in result.stdout
+
+
+def test_dispatch_explicit_target_overrides_shorthand():
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "legion",
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--target",
+            "mechanicus:new",
+            "work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "target:          mechanicus:new" in result.stdout
+
+
+def test_dispatch_worktree_derives_title_and_short_objective(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text(
+        "# Sand the dispatch flow → mirror coat\n\nbody line ✓\n", encoding="utf-8"
+    )
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--aspirant",
+            "--worktree",
+            "test-mirror-coat",
+            "--prompt-file",
+            str(prompt_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr
+    # Title from the branch name, objective from the first line (heading stripped).
+    assert "title:          test mirror coat" in result.stdout
+    assert "objective:      Sand the dispatch flow → mirror coat" in result.stdout
+
+
+def test_dispatch_worktree_metadata_does_not_override_explicit(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("# heading\n\nbody\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--aspirant",
+            "--worktree",
+            "test-mirror-coat",
+            "--title",
+            "My Title",
+            "--objective",
+            "My Objective",
+            "--prompt-file",
+            str(prompt_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "title:          My Title" in result.stdout
+    assert "objective:      My Objective" in result.stdout
+
+
 def test_dispatch_codex_rejects_system_prompt(tmp_path):
     system_file = tmp_path / "system.txt"
     system_file.write_text("unsupported", encoding="utf-8")

@@ -13,15 +13,58 @@ source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 
+# Harden the ctype locale internally. dispatch pipes arbitrary prompt/title text
+# (which routinely contains non-ASCII: →, ✓, emoji) through sed/tr/cut. Under a
+# C/POSIX LC_CTYPE — the default in cron/launchd and many shells — BSD regex
+# tooling aborts with `sed: RE error: illegal byte sequence` on multibyte input.
+# A user must NEVER have to export LC_ALL=en_US.UTF-8 themselves to launch a
+# worker. We pin a concrete UTF-8 LC_CTYPE (not just trust an inherited LANG,
+# which BSD libc does not always honour for ctype). LC_ALL overrides every LC_*
+# category, so a hostile LC_ALL=C must be cleared for the override to take effect.
+# (One sed — the %pane redactor — runs over bash `printf %q` output, which on
+# macOS can contain invalid UTF-8; it pins LC_ALL=C locally for byte-safe
+# matching. See redact_tmux_panes_for_display.)
+dispatch_force_utf8_ctype() {
+  case "${LC_ALL:-}" in
+    ""|*.UTF-8|*.utf-8|*.UTF8|*.utf8) ;;    # unset or already UTF-8: leave it
+    *) unset LC_ALL ;;                      # e.g. LC_ALL=C — clear so LC_CTYPE wins
+  esac
+  case "${LC_ALL:-}" in
+    *.UTF-8|*.utf-8|*.UTF8|*.utf8) return 0 ;;  # a UTF-8 LC_ALL already governs all
+  esac
+  case "${LC_CTYPE:-}" in
+    *.UTF-8|*.utf-8|*.UTF8|*.utf8) return 0 ;;  # an explicit UTF-8 ctype is in force
+  esac
+  local loc
+  for loc in "${LANG:-}" en_US.UTF-8 C.UTF-8 UTF-8; do
+    case "$loc" in *.UTF-8|*.utf-8|*.UTF8|*.utf8) ;; *) continue ;; esac
+    if locale -a 2>/dev/null | grep -qix "$loc"; then
+      export LC_CTYPE="$loc"
+      return 0
+    fi
+  done
+  # en_US.UTF-8 ships on essentially every macOS install; use it as a last resort.
+  export LC_CTYPE="en_US.UTF-8"
+}
+dispatch_force_utf8_ctype
+
 usage() {
   cat <<'USAGE'
 dispatch — canonical launcher for new or resumed agent sessions
 
 Usage:
-  dispatch [options]
+  dispatch [legion|mechanicus|civic] [options]
+
+  The optional leading word is target shorthand:
+    dispatch legion ...       ≡  dispatch --target legion:new ...
+    dispatch mechanicus ...   ≡  dispatch --target mechanicus:new ...
+    dispatch civic ...        ≡  dispatch --target civic:new ...
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
+  --repo <name>                Branch from a known project's checkout by name,
+                               resolving ~/.config/worktrees/<name>.conf
+                               (case-insensitive); avoids passing a full --dir
   --id, --resume, -r <id>      Resume an existing agent session by instance id or session_id
   --aspirant                  Create an aspirant instead of launching directly
   --aspirant-kind <kind>      dispatch, deploy_p, or deploy_d (with --aspirant)
@@ -91,6 +134,7 @@ GT_MODE=true
 ZEALOTRY=""
 SYNC=false
 INSTANCE_TYPE_OVERRIDE=""
+REPO=""
 WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
@@ -102,9 +146,20 @@ INTERACTIVE=false
 DISPATCH_AUTO_EXPANDED_PANE=""
 DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 
+# Positional target shorthand: `dispatch legion ...` ≡ `dispatch --target legion:new ...`
+# (same for mechanicus, civic). Only the leading token is consumed so a prompt word
+# like "legion" is never swallowed. An explicit --target later still wins.
+case "${1:-}" in
+  legion|mechanicus|civic)
+    TARGET="$1:new"
+    shift
+    ;;
+esac
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
     --id|--resume|-r)
       if [[ $# -lt 2 || "${2:-}" == --* ]]; then
         err "--id/--resume/-r requires an instance id or session_id"
@@ -630,6 +685,18 @@ fi
 if $INTERACTIVE && $ASPIRANT && [[ -z "$PROMPT" && -z "$OBJECTIVE" ]]; then
   PROMPT="$(read_interactive_objective)"
 fi
+# Worktree dispatches derive metadata from the branch + prompt heading when the
+# caller omitted it (Fix #5): a short objective from the prompt's first non-blank
+# line (heading marker stripped) rather than the whole prompt, and a title from
+# the branch name. Explicit --title/--objective always win.
+if [[ -n "$WORKTREE_BRANCH" ]]; then
+  if [[ -z "$OBJECTIVE" && -n "$PROMPT" ]]; then
+    OBJECTIVE="$(printf '%s\n' "$PROMPT" | sed -E '/^[[:space:]]*$/d' | head -n1 | sed -E 's/^[[:space:]]*#+[[:space:]]*//')"
+  fi
+  if [[ -z "$TITLE" ]]; then
+    TITLE="$(printf '%s' "$WORKTREE_BRANCH" | tr '_-' '  ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  fi
+fi
 if [[ -z "$OBJECTIVE" && -n "$PROMPT" ]]; then
   OBJECTIVE="$PROMPT"
 fi
@@ -649,6 +716,36 @@ fi
 if [[ -n "$SYSTEM_PROMPT" && -n "$PERSONA" && "$ASPIRANT" != true ]]; then
   err "--system-prompt/--system-prompt-file are only supported for direct Claude wrapper launches, not --persona"
   exit 64
+fi
+
+# --repo <name> resolves the worktree config in ~/.config/worktrees/<name>.conf
+# (case-insensitively — confs are e.g. Token-OS.conf but `--repo token-os` is
+# natural) and branches the dispatch from that project's prod checkout, so the
+# common path need not pass a full --dir. maybe_enter_worktree then auto-detects
+# the project from that dir. An explicit --dir always wins.
+if [[ -n "$REPO" ]]; then
+  REPO_CONF=""
+  if [[ -f "$HOME/.config/worktrees/${REPO}.conf" ]]; then
+    REPO_CONF="$HOME/.config/worktrees/${REPO}.conf"
+  else
+    repo_lc="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+    for _conf in "$HOME"/.config/worktrees/*.conf; do
+      [[ -f "$_conf" ]] || continue
+      if [[ "$(basename "$_conf" .conf | tr '[:upper:]' '[:lower:]')" == "$repo_lc" ]]; then
+        REPO_CONF="$_conf"; break
+      fi
+    done
+  fi
+  [[ -n "$REPO_CONF" ]] || { err "--repo '$REPO': no config at ~/.config/worktrees/${REPO}.conf"; exit 66; }
+  REPO_SECRETS="$( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""
+    # shellcheck disable=SC1090
+    source "$REPO_CONF" 2>/dev/null || true
+    eval "printf '%s' \"\${SECRETS_DIR:-}\"" )"
+  [[ -n "$REPO_SECRETS" ]] || { err "--repo '$REPO': config has no SECRETS_DIR ($REPO_CONF)"; exit 66; }
+  if ! $WORK_DIR_EXPLICIT; then
+    WORK_DIR="$REPO_SECRETS"
+    WORK_DIR_EXPLICIT=true
+  fi
 fi
 
 WORK_DIR="$(eval echo "$WORK_DIR")"
@@ -1299,10 +1396,13 @@ build_agent_command() {
   for a in "${cmd[@]}"; do printf ' %q' "$a"; done
 }
 
-FINAL_COMMAND="$(build_agent_command)"
+FINAL_COMMAND="$(LC_ALL=C; build_agent_command)"
 
 redact_tmux_panes_for_display() {
-  sed -E 's/%[0-9]+/<tmux-pane>/g'
+  # Operates on `printf %q` output (FINAL_COMMAND / dispatch_command) which on
+  # macOS can carry invalid UTF-8 bytes; pin LC_ALL=C so this ASCII-only %pane
+  # match is byte-safe and never trips "sed: RE error: illegal byte sequence".
+  LC_ALL=C sed -E 's/%[0-9]+/<tmux-pane>/g'
 }
 
 stamp_resume_instance_id() {
@@ -1360,7 +1460,7 @@ build_dispatch_command() {
   for a in "${args[@]}"; do printf '%q ' "$a"; done
 }
 
-RESOLVED_DISPATCH_COMMAND="$(build_dispatch_command)"
+RESOLVED_DISPATCH_COMMAND="$(LC_ALL=C; build_dispatch_command)"
 PERSONA_DISPLAY="$PERSONA"
 if [[ -z "$PERSONA_DISPLAY" ]]; then
   if [[ "$ENGINE" == "codex" ]]; then
@@ -1430,7 +1530,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   fi
   RESOLVED_PHYSICAL_TARGET="$pane_id"
   stamp_resume_instance_id "$pane_id"
-  FINAL_COMMAND="$(build_agent_command)"
+  FINAL_COMMAND="$(LC_ALL=C; build_agent_command)"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   tmux send-keys -t "$pane_id" "$STAGED_COMMAND" Enter

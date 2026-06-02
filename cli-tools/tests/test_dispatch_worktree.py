@@ -91,3 +91,46 @@ def test_already_isolated_worktree_skips(env: Env) -> None:
     assert res.returncode == 0, res.stderr
     line = _worktree_line(res.stdout).lower()
     assert "isolated" in line or "n/a" in line
+
+
+def _instance_type_line(stdout: str) -> str:
+    return next(ln for ln in stdout.splitlines() if "instance_type:" in ln)
+
+
+def test_worktree_defaults_to_golden_throne(env: Env) -> None:
+    # Custodes directive: a --worktree worker keeps the Golden Throne lane by
+    # default (alive until session-doc victory criteria are expended). one_off is
+    # an explicit opt-in only — never the default.
+    res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "golden_throne" in _instance_type_line(res.stdout)
+
+
+def test_worktree_one_off_is_explicit_opt_in(env: Env) -> None:
+    res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "--no-gt", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "one_off" in _instance_type_line(res.stdout)
+
+
+def test_repo_resolves_secrets_dir_case_insensitively(env: Env) -> None:
+    # The conf in the fixture is clmtest.conf; --repo CLMTEST must still resolve it
+    # (real confs are e.g. Token-OS.conf but `--repo token-os` is natural).
+    res = _run(env, "--repo", "CLMTEST", "--worktree", "rb", "do it")
+    assert res.returncode == 0, res.stderr
+    assert f"dir:             {env.prod}" in res.stdout
+    # And it branches a worktree from that repo's checkout.
+    assert "wt-rb" in _worktree_line(res.stdout)
+
+
+def test_repo_unknown_errors(env: Env) -> None:
+    res = _run(env, "--repo", "nonesuch", "--worktree", "rb", "do it")
+    assert res.returncode == 66
+    assert "no config" in res.stderr.lower()
+
+
+def test_explicit_dir_wins_over_repo(env: Env) -> None:
+    other = env.prod.parent / "elsewhere"
+    other.mkdir()
+    res = _run(env, "--repo", "clmtest", "--dir", str(other), "do it")
+    assert res.returncode == 0, res.stderr
+    assert f"dir:             {other}" in res.stdout
