@@ -12,6 +12,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SlashCommandBuilder, Events } from 'discord.js';
 import { execFile, execFileSync } from 'child_process';
+import { isBenignFixerError } from './fixer-classify.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -145,6 +146,14 @@ function createDiscordFixerHook() {
 
   return async function hookDiscordError(line, msg, meta = {}, logFile) {
     const errorCode = classifyErrorCode(msg, meta);
+    if (isBenignFixerError(errorCode, msg)) {
+      // Defense-in-depth: a benign Realtime lifecycle event (e.g. the 60-min
+      // session cap) must never page the fixer even if logged at error from
+      // another path. Drop it before any dedup bookkeeping or target resolution.
+      const debugLine = `${new Date().toISOString()} [DEBUG] Discord fixer hook suppressed benign event (${errorCode}): ${msg}`;
+      try { appendFileSync(logFile, debugLine + '\n'); } catch {}
+      return;
+    }
     const key = `${errorCode}:${String(msg).slice(0, 180)}`;
     const now = Date.now();
     for (const [k, ts] of recent) {
