@@ -144,9 +144,7 @@ async def _consumer_custodes_morning_session() -> dict:
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "http://localhost:7777/api/morning/start", timeout=10
-            )
+            resp = await client.post("http://localhost:7777/api/morning/start", timeout=10)
             data = resp.json()
             return {
                 "status": "ok",

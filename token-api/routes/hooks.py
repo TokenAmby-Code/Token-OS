@@ -3121,9 +3121,7 @@ async def handle_stop(payload: dict) -> dict:
         await log_event("hook_stop", instance_id=session_id, details={"sync": True})
 
         now_mst = datetime.now(ZoneInfo("America/Phoenix"))
-        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(
-            ts=now_mst.strftime("%H:%M")
-        )
+        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(ts=now_mst.strftime("%H:%M"))
 
         tmux_pane = instance.get("tmux_pane")
         if not tmux_pane:
@@ -3141,9 +3139,7 @@ async def handle_stop(payload: dict) -> dict:
                 pass
 
         if not tmux_pane:
-            logger.warning(
-                f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane"
-            )
+            logger.warning(f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane")
             return result
 
         try:
@@ -3159,9 +3155,7 @@ async def handle_stop(payload: dict) -> dict:
                     f"{proc.stderr.decode()[:200]}"
                 )
         except Exception as e:
-            logger.warning(
-                f"Hook: Stop {session_id[:12]}... sync keepalive delivery failed: {e}"
-            )
+            logger.warning(f"Hook: Stop {session_id[:12]}... sync keepalive delivery failed: {e}")
 
         return result
 

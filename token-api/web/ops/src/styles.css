@@ -383,6 +383,13 @@ h1 {
 .divider--info .divider__line { stroke: var(--brass); opacity: 0.4; }
 .divider--info .divider__label { fill: var(--brass); }
 
+/* Work-action ticks: explicit-press point events. Cyan dash + a top cap, set
+   apart from the brass/hazard session dividers and the mode-shading bands. */
+.wa-tick-g { cursor: help; }
+.wa-tick { stroke: var(--cyan); stroke-width: 1.3; stroke-dasharray: 3 4; opacity: 0.8; }
+.wa-tick__cap { fill: var(--cyan); opacity: 0.92; }
+.wa-tick-g:hover .wa-tick { opacity: 1; stroke-width: 1.8; }
+
 .bal-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .bal-line--pos { stroke: var(--m-working); filter: drop-shadow(0 0 4px rgba(147, 217, 79, 0.4)); }
 .bal-line--neg { stroke: var(--hazard); filter: drop-shadow(0 0 4px rgba(255, 91, 61, 0.4)); }

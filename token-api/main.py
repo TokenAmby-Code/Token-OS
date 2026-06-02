@@ -22,7 +22,7 @@ import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -131,6 +131,7 @@ from session_doc_helpers import (
     mark_rubric_notified,
     read_frontmatter,
     read_rubric,
+    serialize_frontmatter,
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
@@ -4606,6 +4607,11 @@ TYPING_GUARD_ACTIVE_SECONDS = 15
 # SATISFY kinds clear the triggering condition → resolve the pending ack.
 # Everything else (ambient live work: dictation/voice) DEFERS — stall, don't lose.
 WORK_SIGNAL_SATISFY_KINDS = frozenset({"work_action", "prompt_submit"})
+# Work-action staleness window for the cockpit HUD dial: the green→red fade runs
+# over this many minutes since the last explicit work-action. Named (not magic)
+# and surfaced in the cockpit read model so the frontend fade and any future
+# backend nudge agree on "you haven't logged a work action in a while."
+WORK_ACTION_STALE_FADE_MINUTES = 30
 # Ack sources a generic productivity signal is allowed to clear. Distraction +
 # backlog acks are cleared by "I'm working now"; agent-pane acks (golden_throne,
 # askq) are only cleared by activity on that specific instance.
@@ -10319,6 +10325,35 @@ def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
         return False
 
 
+def _append_work_action_to_daily_note(at: str, source: str) -> None:
+    """Append one {at, source} to today's daily-note `work_actions` frontmatter.
+
+    The canonical, durable store for explicit work-actions (count = len). Resolves
+    the vault from IMPERIUM_ENV at call time — unlike the module-level
+    DAILY_NOTE_DIR — so a temp test vault and a relocated NAS mount both land in
+    the right note. Create-if-missing keeps a pre-day-start press from being
+    dropped; day_start still owns the rich daily note.
+    """
+    vault = os.environ.get("IMPERIUM_ENV")
+    root = (
+        Path(vault)
+        if vault
+        else Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV"
+    )
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    note_path = root / "Terra" / "Journal" / "Daily" / f"{date_str}.md"
+    if not note_path.exists():
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(
+            serialize_frontmatter({"date": date_str, "type": "daily-note"}, f"# {date_str}\n"),
+            encoding="utf-8",
+        )
+    fm, _body = read_frontmatter(note_path)
+    actions = list(fm.get("work_actions") or [])
+    actions.append({"at": at, "source": source})
+    update_frontmatter(note_path, {"work_actions": actions})
+
+
 @app.get("/api/daily-note")
 async def get_daily_note():
     """Return today's daily note content as plain text."""
@@ -13700,16 +13735,29 @@ async def work_action(request: WorkActionRequest | None = None) -> dict:
     acknowledged_acks = signal["resolved_acks"]
     timer = signal["timer"] or {}
 
+    # Local-ISO press time, stamped into the event so the cockpit timeline ticks
+    # land in the same time domain as timer samples (events.created_at is UTC).
+    action_at = datetime.now().isoformat()
     await log_event(
         "work_action",
         details={
             "source": request.source,
             "note": request.note,
+            "at": action_at,
             "old_mode": timer.get("old_mode"),
             "current_mode": timer_engine.current_mode.value,
             "acknowledged_expected_acks": acknowledged_acks,
         },
     )
+
+    # Canonical, durable record: append to today's daily-note frontmatter. This
+    # lives in the endpoint, NOT observe_work_signal, so prompt_submit/dictation/
+    # voice never write the note. Best-effort — a vault-write failure must never
+    # break the work-action API (mirrors the dictation observe_work_signal guard).
+    try:
+        await asyncio.to_thread(_append_work_action_to_daily_note, action_at, request.source)
+    except Exception as exc:
+        logger.warning("work_action: daily-note persist failed: %s", exc)
 
     return {
         "idle_timer_reset": True,
@@ -15321,6 +15369,92 @@ def _ops_shift_to_annotation(row: dict) -> dict:
     }
 
 
+def _ops_parse_local_dt(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp to a naive *local* datetime, or None.
+
+    Work-action `at` is stamped as naive local ISO; the DB created_at fallback is
+    naive UTC. Tz-aware strings are converted to local. Used to position ticks
+    against the timer graph's local-time window."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+async def _ops_read_work_actions(
+    *, window_start: datetime | None = None, now: datetime | None = None
+) -> dict:
+    """Work-action visualization read model, served from the `events` table.
+
+    Load-bearing: `count`/`ticks`/`last_at` cover explicit work-actions
+    (event_type='work_action') since local midnight. `ticks` carries the press
+    `at` + `source`; when `window_start` is given (timer graph) ticks are clipped
+    to that window, otherwise they span today. `last_at` drives the HUD dial's
+    staleness fade. The optional, non-load-bearing `score` aggregates ALL work
+    signals (event_type='work_signal') for the day — kept in a separate field,
+    never joined to the timer-graph series.
+    """
+    now = now or datetime.now()
+    # "Today" = since local midnight. events.created_at is stored UTC, so compare
+    # against the UTC instant of local midnight — the day boundary tracks the
+    # operator, not the server clock.
+    local_midnight = datetime(now.year, now.month, now.day)
+    utc_floor = local_midnight.astimezone(UTC).replace(tzinfo=None)
+    floor_iso = utc_floor.isoformat(sep=" ")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT created_at, details
+            FROM events
+            WHERE event_type = 'work_action' AND datetime(created_at) >= datetime(?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (floor_iso,),
+        )
+        action_rows = [dict(row) for row in await cursor.fetchall()]
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM events
+            WHERE event_type = 'work_signal' AND datetime(created_at) >= datetime(?)
+            """,
+            (floor_iso,),
+        )
+        score_row = await cursor.fetchone()
+
+    ticks: list[dict] = []
+    count = 0
+    last_at: str | None = None
+    for row in action_rows:
+        details = _ops_parse_event_details(row.get("details"))
+        details = details if isinstance(details, dict) else {}
+        at = details.get("at") or row.get("created_at")
+        if not at:
+            continue
+        count += 1
+        last_at = at
+        if window_start is not None:
+            parsed = _ops_parse_local_dt(at)
+            if parsed is None or parsed < window_start:
+                continue
+        ticks.append({"at": at, "source": details.get("source")})
+
+    return {
+        "count": count,
+        "ticks": ticks,
+        "last_at": last_at,
+        "score": int(score_row["n"]) if score_row else 0,
+        "stale_fade_minutes": WORK_ACTION_STALE_FADE_MINUTES,
+    }
+
+
 async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = "60s") -> dict:
     """Return live timer history for the ops graph.
 
@@ -15483,6 +15617,8 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         else None
     )
 
+    work_actions = await _ops_read_work_actions(window_start=start, now=now)
+
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
@@ -15490,6 +15626,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "gap_threshold_seconds": gap_threshold_seconds,
         "points": points,
         "segments": segments,
+        "work_action_ticks": work_actions["ticks"],
         "annotations": [_ops_shift_to_annotation(row) for row in shift_rows],
         "gaps": gaps,
         "anomalies": anomalies,
@@ -16198,6 +16335,7 @@ async def get_ops_display_state():
     cron_summary = await _ops_read_cron_summary()
     enforcement_summary = await _ops_read_enforcement_summary()
     tts_summary = get_tts_queue_status()
+    work_actions = await _ops_read_work_actions(now=now)
     assertions = _ops_build_state_assertions(
         generated_at=now,
         work_state=work_state,
@@ -16271,6 +16409,7 @@ async def get_ops_display_state():
             _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
         ],
         "enforcement": enforcement_summary,
+        "work_actions": work_actions,
     }
 
 
