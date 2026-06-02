@@ -524,6 +524,11 @@ table.fleet { width: 100%; border-collapse: collapse; }
 
 .tag { margin-left: 7px; font-size: 9.5px; padding: 1px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
 .tag--stale { color: var(--hazard); border: 1px solid var(--hazard-deep); background: rgba(255, 91, 61, 0.08); }
+/* "Agent has PR open" badge (Phase 1) */
+a.tag--pr { text-decoration: none; cursor: pointer; }
+.tag--pr-open { color: #58c463; border: 1px solid rgba(88, 196, 99, 0.5); background: rgba(88, 196, 99, 0.1); }
+.tag--pr-open:hover { background: rgba(88, 196, 99, 0.2); }
+.tag--pr-merged { color: #a779e0; border: 1px solid rgba(167, 121, 224, 0.45); background: rgba(167, 121, 224, 0.08); }
 
 /* zealotry pips */
 .zeal { display: inline-flex; gap: 3px; align-items: center; }

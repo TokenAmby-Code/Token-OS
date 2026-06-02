@@ -8516,6 +8516,47 @@ async def set_instance_synced(instance_id: str, request: Request):
     return {"instance_id": instance_id, "synced": bool(synced_int), "legion": legion}
 
 
+@app.patch("/api/instances/{instance_id}/pr")
+async def set_instance_pr(instance_id: str, request: Request):
+    """Set the "agent has a PR open" flag (pr_url + pr_state) for an instance.
+
+    Phase 1: pr-create calls this best-effort after `gh pr create`, keyed off
+    $TOKEN_API_INSTANCE_ID, so /ui/ops badges the originating instance. pr_state is
+    flipped to 'merged' by the CD restart-on-merge webhook (Phase 2). Writes go
+    through sanctioned_update_instance (pr_url/pr_state are registered mutable fields).
+    """
+    body = await request.json()
+    pr_state = body.get("pr_state")
+    if pr_state is not None and pr_state not in ("open", "merged", "closed"):
+        raise HTTPException(status_code=400, detail="pr_state must be open|merged|closed")
+
+    updates: dict = {}
+    if "pr_url" in body:
+        updates["pr_url"] = body.get("pr_url")
+    if "pr_state" in body:
+        updates["pr_state"] = pr_state
+    if not updates:
+        raise HTTPException(status_code=400, detail="no pr fields provided (pr_url, pr_state)")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="set-pr",
+        )
+        await db.commit()
+
+    logger.info(f"PR flag: {instance_id[:12]} → {updates}")
+    return {"instance_id": instance_id, **updates}
+
+
 @app.patch("/api/instances/{instance_id}/discord")
 async def set_instance_discord(instance_id: str, request: Request):
     """Set discord_hosted flag and discord_channel for an instance."""
@@ -15843,6 +15884,10 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "legion": inst.get("legion"),
                 "work_class": work_class,
                 "instance_type": inst.get("instance_type"),
+                # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
+                # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
+                "pr_url": inst.get("pr_url"),
+                "pr_state": inst.get("pr_state"),
                 "workflow_state": inst.get("workflow_state"),
                 "next_required_action": inst.get("next_required_action"),
                 "stop_allowed": bool(inst.get("stop_allowed"))
