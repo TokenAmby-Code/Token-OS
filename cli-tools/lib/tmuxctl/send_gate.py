@@ -386,9 +386,7 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
 def automated_activity_ttl() -> int:
     """TTL (seconds) for an automated-activation marker. Env-overridable; floored at 1."""
     try:
-        ttl = int(
-            os.environ.get(_AUTOMATED_ACTIVITY_TTL_ENV, str(_DEFAULT_AUTOMATED_ACTIVITY_TTL))
-        )
+        ttl = int(os.environ.get(_AUTOMATED_ACTIVITY_TTL_ENV, str(_DEFAULT_AUTOMATED_ACTIVITY_TTL)))
     except (TypeError, ValueError):
         ttl = _DEFAULT_AUTOMATED_ACTIVITY_TTL
     return max(1, ttl)

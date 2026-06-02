@@ -89,7 +89,9 @@ def test_marker_upsert_slides_window_last_writer_wins(db_path):
 def test_marker_window_matches_ttl(db_path):
     send_gate.register_automated_send(("send-keys", "-t", "%42", "hi"))
     _, _, _, injected_at, expires_at = _markers(db_path)[0]
-    span = (datetime.fromisoformat(expires_at) - datetime.fromisoformat(injected_at)).total_seconds()
+    span = (
+        datetime.fromisoformat(expires_at) - datetime.fromisoformat(injected_at)
+    ).total_seconds()
     assert span == pytest.approx(send_gate.automated_activity_ttl(), abs=1)
 
 
@@ -114,8 +116,9 @@ def test_run_records_marker_before_send_and_skips_suppressed(monkeypatch, db_pat
     monkeypatch.setattr(
         tmux_adapter.subprocess,
         "run",
-        lambda cmd, *a, **k: calls.append(cmd)
-        or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+        lambda cmd, *a, **k: (
+            calls.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
     )
 
     adapter = TmuxAdapter(tmux_binary="tmux")

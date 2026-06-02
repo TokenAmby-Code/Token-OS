@@ -17,6 +17,7 @@ DB connectivity (see ~/.civic-invariant/README or the session doc):
     allowlisted on the dev SQL public IP, so .env sets DB_HOST=127.0.0.1 and we
     run a local cloud-sql-proxy on 127.0.0.1:5432 (managed by the harness).
 """
+
 import os
 import sys
 
