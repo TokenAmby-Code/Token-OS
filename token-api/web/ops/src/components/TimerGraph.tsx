@@ -136,6 +136,12 @@ export function TimerGraph({ history }: Props) {
   const yTicks = quarterHourTicks(lo, hi, stepMs);
   const tape = hourTapeTicks(t0, t0 + span);
 
+  // Explicit work-action presses → point ticks (one thin vertical per press, no
+  // width/interval calc), distinct from the mode bands and the session dividers.
+  const workActions = (history.work_action_ticks ?? [])
+    .map((w) => ({ ...w, px: x(Date.parse(w.at)) }))
+    .filter((w) => Number.isFinite(w.px) && w.px >= PAD.left - 0.5 && w.px <= width - PAD.right + 0.5);
+
   const hoverPoint = hover != null ? points[hover] : null;
   const hoverX = hoverPoint ? x(Date.parse(hoverPoint.t)) : 0;
 
@@ -239,6 +245,19 @@ export function TimerGraph({ history }: Props) {
             </g>
           ))}
         </g>
+
+        {/* Explicit work-action ticks — point events, distinct cyan dash + cap,
+            native hover tooltip (source + time). Not interval bars, not dividers. */}
+        {workActions.map((w, i) => (
+          <g key={`wa-${i}`} className="wa-tick-g">
+            <line x1={w.px} x2={w.px} y1={PAD.top} y2={HEIGHT - PAD.bottom} className="wa-tick" />
+            <path
+              d={`M ${(w.px - 3.4).toFixed(1)} ${PAD.top} L ${(w.px + 3.4).toFixed(1)} ${PAD.top} L ${w.px.toFixed(1)} ${PAD.top + 5.5} Z`}
+              className="wa-tick__cap"
+            />
+            <title>{`work action${w.source ? ` · ${w.source}` : ''} · ${formatClock(w.at)}`}</title>
+          </g>
+        ))}
 
         {/* Balance line, threshold colored */}
         {linePaths.map((run, i) => (

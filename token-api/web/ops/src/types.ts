@@ -223,6 +223,22 @@ export type OpsState = {
     day_started_at: string | null;
     source: string | null;
   };
+  work_actions?: WorkActionSummary;
+};
+
+// One explicit work-action press: timeline tick + dial input.
+export type WorkActionTick = {
+  at: string; // local ISO timestamp of the press
+  source: string | null;
+};
+
+// Work-action visualization read model (GET /api/ui/ops/state → work_actions).
+export type WorkActionSummary = {
+  count: number; // load-bearing: explicit work-actions today
+  ticks: WorkActionTick[];
+  last_at: string | null; // drives the staleness green→red fade
+  score: number; // non-load-bearing: all work_signal events today
+  stale_fade_minutes: number; // fade window; backend + frontend agree
 };
 
 // ── Timer history read-model (GET /api/ui/ops/timer/history) ──────────────
@@ -273,6 +289,9 @@ export type TimerHistory = {
   gap_threshold_seconds?: number;
   points: TimerHistoryPoint[];
   segments: TimerHistorySegment[];
+  // Explicit work-action presses within the graph window — drawn as vertical
+  // ticks, distinct from the timer_shifts mode bands and session dividers.
+  work_action_ticks?: WorkActionTick[];
   annotations?: TimerHistoryAnnotation[];
   gaps?: Array<{ start: string; end: string; reason: string; anomaly_reason?: string }>;
   anomalies?: Array<Record<string, unknown>>;

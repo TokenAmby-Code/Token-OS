@@ -16,6 +16,22 @@ function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
+// Work-action staleness fade endpoints (RGB), interpolated each poll.
+const WA_FRESH: [number, number, number] = [147, 217, 79]; // --m-working
+const WA_STALE: [number, number, number] = [255, 91, 61]; // --hazard
+
+function waFadeColor(ratio: number): string {
+  const mix = (a: number, b: number) => Math.round(a + (b - a) * ratio);
+  return `rgb(${mix(WA_FRESH[0], WA_STALE[0])}, ${mix(WA_FRESH[1], WA_STALE[1])}, ${mix(WA_FRESH[2], WA_STALE[2])})`;
+}
+
+function waAgo(minutes: number): string {
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${Math.round(minutes)}m ago`;
+  const h = Math.floor(minutes / 60);
+  return `${h}h ${Math.round(minutes % 60).toString().padStart(2, '0')}m`;
+}
+
 export function HudRings({ state }: { state: OpsState }) {
   const mv = modeVisual(state.timer.mode);
   const bal = state.timer.break_balance_ms;
@@ -30,6 +46,24 @@ export function HudRings({ state }: { state: OpsState }) {
 
   const alarmAcked = state.alarm?.acked ?? false;
   const alarmTime = state.alarm?.day_started_at ? formatClock(state.alarm.day_started_at) : null;
+
+  // Work-action dial #1 (load-bearing): today's count, with a green→red fade as
+  // the last explicit action goes stale — the "log a work action" nudge.
+  const wa = state.work_actions;
+  const waFadeMin = wa?.stale_fade_minutes || 30;
+  const waLastMs = wa?.last_at ? Date.parse(wa.last_at) : NaN;
+  const waHasLast = Number.isFinite(waLastMs);
+  const waMinsSince = waHasLast ? Math.max(0, (Date.now() - waLastMs) / 60000) : null;
+  const waStale = waMinsSince == null ? 0 : Math.max(0, Math.min(1, waMinsSince / waFadeMin));
+  const waColor = waHasLast ? waFadeColor(waStale) : 'var(--muted)';
+  const waDetail = !waHasLast ? 'none today' : waStale >= 1 ? 'log one' : waAgo(waMinsSince ?? 0);
+  const waTone: 'good' | 'warn' | 'bad' | 'neutral' = !waHasLast
+    ? 'neutral'
+    : waStale >= 1
+      ? 'bad'
+      : waStale >= 0.5
+        ? 'warn'
+        : 'good';
 
   const deskLabel = desk.steam_app_name
     ? truncate(desk.steam_app_name, 11)
@@ -98,6 +132,31 @@ export function HudRings({ state }: { state: OpsState }) {
         title="Alarm ack — tap to simulate"
         onClick={alarmAcked ? undefined : () => { fetch('/api/alarm/ack', { method: 'POST' }); }}
       />
+      {wa ? (
+        <Ring
+          label="Work"
+          value={`${wa.count}`}
+          detail={waDetail}
+          color={waColor}
+          ratio={waHasLast ? waStale : undefined}
+          tone={waTone}
+          pulse={waStale >= 1}
+          title={
+            waHasLast
+              ? `${wa.count} work action${wa.count === 1 ? '' : 's'} today · last ${formatClock(wa.last_at)}`
+              : 'No work actions logged today'
+          }
+        />
+      ) : null}
+      {typeof wa?.score === 'number' ? (
+        <Ring
+          label="Activity"
+          value={`${wa.score}`}
+          detail="all signals"
+          color="var(--brass)"
+          title="Aggregate work signals today (non-load-bearing)"
+        />
+      ) : null}
     </div>
   );
 }
