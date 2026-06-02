@@ -256,3 +256,66 @@ async def test_clear_prompt_stays_unverified_when_composer_not_cleared(
     assert result["returncode"] == 0
     assert result["verification_status"] == "unverified"
     assert result["verified_by"] is None
+
+
+# ---- end-to-end incident guard: real gate -> never "sent" -------------------
+
+
+async def test_real_gate_suppression_never_reports_sent_end_to_end(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    """The 2026-05-30 incident, pinned end-to-end through production code.
+
+    Unlike the translation tests above (which stub the adapter), this drives the
+    REAL ``TmuxAdapter`` gate: ``send_gate.evaluate`` suppresses the byte-bearing
+    literal send, ``run()`` writes nothing, ``send_text_then_submit`` raises
+    ``TmuxSendGated``, and the translation layer must surface ``gated`` — never
+    the false ``sent`` that reported a brief delivered three times when it never
+    reached the pane. No real ``tmux`` byte is ever issued.
+    """
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    real_sends: list[list[str]] = []
+
+    def _suppress(args_tuple):
+        # The live gate suppresses every pane send (the C-u clear AND the
+        # byte-bearing literal) while quiet hours / the typing guard is active.
+        if "send-keys" in args_tuple:
+            return {"reason": "typing_guard", "suppressed": True}
+        return None
+
+    def _fake_subprocess_run(cmd, *a, **k):  # pragma: no cover - must never fire for a send
+        real_sends.append(cmd)
+        raise AssertionError(f"a gated send must issue zero tmux bytes, got: {cmd}")
+
+    monkeypatch.setattr(ta.send_gate, "evaluate", _suppress)
+    monkeypatch.setattr(ta.send_gate, "record_suppression", lambda *a, **k: None)
+    monkeypatch.setattr(ta.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
+
+    result = await main._tmux_send_payload_then_submit("%9", "brief for FG")
+
+    assert result["gated"] is True
+    assert result["gate_reason"] == "typing_guard"
+    assert result["verification_status"] == "gated"
+    assert result["verification_status"] != "sent"
+    assert result["verified_by"] is None
+    assert result["returncode"] != 0
+    assert real_sends == [], "the suppressed send must reach no tmux subprocess"
+
+    # And the queue must keep it pending (re-queueable), never mark it sent.
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+    queued = await main.enqueue_pane_write(
+        instance_id="fg-1",
+        tmux_pane="%9",
+        source="brief",
+        purpose="dispatch",
+        payload="brief for FG",
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert results[0]["status"] == main.PANE_WRITE_PENDING
+    assert results[0]["status"] != main.PANE_WRITE_SENT
+    assert results[0]["reason"].startswith("send_gated")
+    assert _fetch_status(app_env.db_path, queued["id"]) == "pending"
