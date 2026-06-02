@@ -175,6 +175,68 @@ def update_frontmatter(
     return fm
 
 
+def update_session_doc_worktrees(
+    file_path: Path,
+    *,
+    action: str,
+    path: str,
+    branch: str | None = None,
+    port: Any = None,
+    claimed_at: str | None = None,
+) -> list[dict]:
+    """Mutate a session doc's `worktrees` registry, holding the one-active invariant.
+
+    Entry shape: {path, branch, port, status: active|archived, claimed_at}.
+
+    - action="claim": demote any prior active entry to archived, then add (or
+      refresh) an active entry for `path`. Exactly one entry stays active.
+    - action="archive": flip the entry matching `path` from active → archived.
+      Archived entries are RETAINED, never deleted.
+
+    The caller MUST serialize concurrent calls (the token-api endpoint holds an
+    asyncio.Lock) — read-modify-write on the file is not atomic on its own, and
+    the one-active invariant only holds if claims don't interleave.
+    """
+    if action not in ("claim", "archive"):
+        raise ValueError(f"unknown action: {action!r}")
+    if not path:
+        raise ValueError(f"{action} requires path")
+
+    fm, _body = read_frontmatter(file_path)
+    wts = fm.get("worktrees")
+    if not isinstance(wts, list):
+        wts = []
+    # Keep only well-formed dict entries; drop anything malformed.
+    wts = [w for w in wts if isinstance(w, dict)]
+
+    if action == "claim":
+        for w in wts:
+            if w.get("status") == "active":
+                w["status"] = "archived"
+        existing = next((w for w in wts if w.get("path") == path), None)
+        if existing is not None:
+            existing.update(
+                {"branch": branch, "port": port, "status": "active", "claimed_at": claimed_at}
+            )
+        else:
+            wts.append(
+                {
+                    "path": path,
+                    "branch": branch,
+                    "port": port,
+                    "status": "active",
+                    "claimed_at": claimed_at,
+                }
+            )
+    else:  # archive
+        for w in wts:
+            if w.get("path") == path and w.get("status") == "active":
+                w["status"] = "archived"
+
+    update_frontmatter(file_path, {"worktrees": wts})
+    return wts
+
+
 def update_victory_frontmatter(
     file_path: Path,
     victory_reason: str,
@@ -714,6 +776,11 @@ def create_session_doc_file(
     fm["instance_type"] = "one_off"
     fm["zealotry"] = 4
     fm["pr_url"] = None
+    # Worktree registry (Phase 3). List of {path, branch, port, status, claimed_at};
+    # exactly one entry is status:active at a time, archived entries are retained.
+    # NOT the dormant `worktrees` DB table. Mutated server-side via
+    # update_session_doc_worktrees() to hold the one-active invariant.
+    fm["worktrees"] = []
 
     body = (
         f"# Session: {title}\n\n"

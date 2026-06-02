@@ -136,6 +136,7 @@ from session_doc_helpers import (
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
+    update_session_doc_worktrees,
 )
 from shared import (
     CRASH_LOG_PATH,
@@ -8862,6 +8863,58 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
     )
     logger.info(f"rubric-flip: doc {doc_id} {rubric_key or 'victory'}.{key} = {value}")
     return {"doc_id": doc_id, "key": key, "value": value, "extra": list(extra.keys())}
+
+
+# Serializes worktree-registry mutations so the demote-prior-active-then-append
+# stays atomic under concurrent claims (Phase 3, one-active invariant).
+_worktree_registry_lock = asyncio.Lock()
+
+
+@app.post("/api/session-docs/{doc_id}/worktrees")
+async def session_doc_worktrees(doc_id: int, request: Request):
+    """Mutate a session doc's worktree registry (Phase 3).
+
+    Body: {"action": "claim"|"archive", "path": str, "branch"?, "port"?,
+    "claimed_at"?}. The demote-active-then-append happens server-side under a
+    lock to hold the one-active invariant. Registry lives in session-doc
+    frontmatter — NOT the dormant `worktrees` DB table.
+    """
+    body = await request.json()
+    action = body.get("action")
+    if action not in ("claim", "archive"):
+        raise HTTPException(status_code=400, detail="action must be claim|archive")
+    path = body.get("path")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+    fp = Path(row[0])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail=f"Session doc file missing: {fp}")
+
+    async with _worktree_registry_lock:
+        try:
+            wts = await asyncio.to_thread(
+                update_session_doc_worktrees,
+                fp,
+                action=action,
+                path=path,
+                branch=body.get("branch"),
+                port=body.get("port"),
+                claimed_at=body.get("claimed_at"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.warning(f"worktrees: write failed for doc {doc_id}: {exc}")
+            raise HTTPException(status_code=500, detail=f"worktree registry write failed: {exc}")
+
+    logger.info(f"worktrees: doc {doc_id} {action} {path}")
+    return {"doc_id": doc_id, "action": action, "worktrees": wts}
 
 
 @app.post("/api/session-docs/{doc_id}/victory-ack")
