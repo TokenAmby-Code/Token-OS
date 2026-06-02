@@ -92,7 +92,11 @@ def test_a_handful_of_anomalies_is_not_bulk():
     now = datetime.now()
     points = [
         {"t": (now - timedelta(seconds=90)).isoformat(), "mode": "working", "break_balance_ms": 0},
-        {"t": (now - timedelta(seconds=60)).isoformat(), "mode": "working", "break_balance_ms": -600_000},
+        {
+            "t": (now - timedelta(seconds=60)).isoformat(),
+            "mode": "working",
+            "break_balance_ms": -600_000,
+        },
         {"t": (now - timedelta(seconds=30)).isoformat(), "mode": "working", "break_balance_ms": 0},
     ]
 
