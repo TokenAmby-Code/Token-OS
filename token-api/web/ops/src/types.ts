@@ -257,6 +257,13 @@ export type TimerHistory = {
     gap_count: number;
     gap_count_by_reason?: Record<string, number>;
     latest?: Record<string, unknown> | null;
+    // A wall of anomalies is a reverse signal: when the detector flags a large
+    // share of the window at once the batch is treated as a systemic false
+    // detection, not real timer violations. `count` is then 0 and the
+    // suppressed wall size is reported here for a calmer "suspect" banner.
+    bulk_suspected?: boolean;
+    suppressed_count?: number;
+    dominant_reason?: string | null;
   };
   source?: string;
 };

@@ -18,6 +18,17 @@ GAP_THRESHOLD_SECONDS = 90
 RATE_TOLERANCE_MS = 30_000
 MATERIAL_DELTA_MS = 5 * 60_000
 
+# A wall of anomalies is a reverse signal. When a large share of the sample
+# transitions in a window flag at once, the cause is almost always systemic —
+# clock skew, a telemetry backfill, or a restart flooding the window with
+# out-of-order samples — not dozens of genuine timer violations. Past these
+# bounds we collapse the wall into a single "suspect detection" diagnostic
+# rather than crying "247 anomalies" and shattering the graph into point soup.
+# Both bounds must trip: the ratio catches systemic floods, the min-count
+# stops a tiny window (2-of-3 transitions) from reading as a "wall".
+BULK_ANOMALY_MIN_COUNT = 12
+BULK_ANOMALY_RATIO = 0.34
+
 RESET_DISCONTINUITY_TRIGGERS = {
     "daily_reset",
     "manual_reset",
@@ -72,6 +83,8 @@ def annotate_timer_telemetry(
     material_delta_ms: int = MATERIAL_DELTA_MS,
     no_sample_reason: str = "no_timer_samples",
     break_penalty_multiplier: float = 1.0,
+    bulk_anomaly_min_count: int = BULK_ANOMALY_MIN_COUNT,
+    bulk_anomaly_ratio: float = BULK_ANOMALY_RATIO,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Mark point gaps/anomalies and return ``(gaps, anomalies)``.
 
@@ -213,4 +226,58 @@ def annotate_timer_telemetry(
     if (window_end - last_time).total_seconds() > gap_threshold_seconds:
         add_gap(last_time, window_end, "sample_gap", None)
 
+    # Reverse-signal collapse: if anomalies dominate the window, the detector is
+    # almost certainly wrong about all of them at once. Demote the wall to a
+    # single suspect-detection record rather than rendering point soup.
+    comparisons = max(1, len(parsed) - 1)
+    if (
+        len(anomalies) >= bulk_anomaly_min_count
+        and len(anomalies) >= comparisons * bulk_anomaly_ratio
+    ):
+        anomalies = _collapse_bulk_anomalies(parsed, gaps, anomalies, comparisons)
+        gaps = [gap for gap in gaps if not gap.get("anomaly_reason")]
+
     return gaps, anomalies
+
+
+def _collapse_bulk_anomalies(
+    parsed: list[tuple[datetime, dict[str, Any]]],
+    gaps: list[dict[str, Any]],
+    anomalies: list[dict[str, Any]],
+    comparisons: int,
+) -> list[dict[str, Any]]:
+    """Undo the per-point anomaly marks and return one bulk-suspect record.
+
+    The individual ``anomaly`` flags drove both the red marker dots and the
+    line-splitting (``gap_before``); clearing them lets the balance line
+    reconnect so the graph reads as "telemetry suspect", not a shattered mess.
+    Genuine telemetry gaps (resets, silence) are untouched — only the
+    anomaly-derived marks are reverted.
+    """
+
+    reason_counts: dict[str, int] = {}
+    for anomaly in anomalies:
+        reason = str(anomaly.get("reason") or "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    dominant_reason = max(reason_counts, key=reason_counts.get)
+
+    for _ts, point in parsed:
+        if not point.get("anomaly"):
+            continue
+        point.pop("anomaly", None)
+        point.pop("anomaly_reason", None)
+        point.pop("gap_before", None)
+        point.pop("gap_reason", None)
+        point.pop("expected_abs_rate", None)
+
+    return [
+        {
+            "t": parsed[-1][1].get("t"),
+            "reason": "bulk_anomaly_suspected",
+            "gap_reason": "bulk_anomaly_suspected",
+            "suppressed_count": len(anomalies),
+            "dominant_reason": dominant_reason,
+            "reason_counts": reason_counts,
+            "comparisons": comparisons,
+        }
+    ]

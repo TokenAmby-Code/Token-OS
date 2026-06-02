@@ -15079,6 +15079,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         reason = str(gap.get("reason") or "unknown")
         gap_count_by_reason[reason] = gap_count_by_reason.get(reason, 0) + 1
 
+    # A bulk collapse means the detector flagged a wall of anomalies at once —
+    # treated as a systemic false-detection (reverse signal), not real timer
+    # violations. Surface it as "suspect" so the UI doesn't cry "247 anomalies".
+    bulk_record = (
+        anomalies[0]
+        if anomalies and anomalies[0].get("reason") == "bulk_anomaly_suspected"
+        else None
+    )
+
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
@@ -15090,10 +15099,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "gaps": gaps,
         "anomalies": anomalies,
         "anomaly_summary": {
-            "count": len(anomalies),
+            # When bulk-suspected, do not count the suppressed wall as real
+            # anomalies — the count is the reverse signal, exposed separately.
+            "count": 0 if bulk_record else len(anomalies),
             "gap_count": len(gaps),
             "gap_count_by_reason": gap_count_by_reason,
-            "latest": anomalies[-1] if anomalies else None,
+            "latest": None if bulk_record else (anomalies[-1] if anomalies else None),
+            "bulk_suspected": bool(bulk_record),
+            "suppressed_count": bulk_record.get("suppressed_count") if bulk_record else 0,
+            "dominant_reason": bulk_record.get("dominant_reason") if bulk_record else None,
         },
         "source": "timer_samples+timer_shifts+live_timer_engine",
     }
