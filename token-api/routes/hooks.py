@@ -326,6 +326,69 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     return None
 
 
+async def _stamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
+    """Stamp ``@INSTANCE_ID=<session_id>`` on the agent's tmux pane.
+
+    tmux becomes the source of truth for ``instance_id -> pane`` resolution; the
+    stamp lives and dies with the pane. Done in the same critical section as the
+    row upsert so no reader ever sees a registered row whose pane is unstamped.
+    Best-effort: a failed stamp is logged, not raised — the row write must not be
+    blocked by tmux being unavailable (e.g. remote/satellite-hosted panes whose
+    ``%N`` is not addressable from this host).
+    """
+    if not tmux_pane or not session_id:
+        return
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", session_id),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=2,
+        )
+        if proc.returncode != 0:
+            logger.debug(
+                f"Hook: @INSTANCE_ID stamp failed for {tmux_pane} "
+                f"({session_id}): {proc.stderr.decode(errors='ignore').strip()}"
+            )
+    except Exception as exc:
+        logger.debug(f"Hook: @INSTANCE_ID stamp errored for {tmux_pane}: {exc}")
+
+
+async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
+    """Clear ``@INSTANCE_ID`` on a pane an instance is moving *off* of.
+
+    When an instance moves panes (transplant / re-register onto a new ``%N``) the
+    new pane is stamped, but the old pane would otherwise keep this instance's
+    stamp — leaving two live panes resolving to the same UUID until teardown. We
+    clear it here so ``resolve-instance`` never sees a duplicate.
+
+    Guarded: only unset when the pane *still* carries this instance's id, so a
+    pane already reused by a different agent (which re-stamped with its own id) is
+    never clobbered. Best-effort; never raises.
+    """
+    if not tmux_pane or not session_id:
+        return
+    try:
+        current = await _run_subprocess_offloop(
+            ("tmux", "show-options", "-pqv", "-t", tmux_pane, "@INSTANCE_ID"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=2,
+        )
+        if current.returncode != 0:
+            return
+        if current.stdout.decode(errors="ignore").strip() != session_id:
+            return  # pane gone or already owned by a different instance
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-p", "-u", "-t", tmux_pane, "@INSTANCE_ID"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"Hook: @INSTANCE_ID unstamp errored for {tmux_pane}: {exc}")
+
+
 async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) -> bool:
     tmux_pane = existing.get("tmux_pane")
     if not tmux_pane:
@@ -1723,6 +1786,9 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
+                await _stamp_instance_id(tmux_pane, session_id)
+                if old_tmux_pane and old_tmux_pane != tmux_pane:
+                    await _unstamp_instance_id(old_tmux_pane, session_id)
                 await _apply_instance_workflow_state(
                     db,
                     instance_id=session_id,
@@ -1859,6 +1925,13 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
+                await _stamp_instance_id(tmux_pane or existing_row["tmux_pane"], session_id)
+                if (
+                    tmux_pane
+                    and existing_row["tmux_pane"]
+                    and tmux_pane != existing_row["tmux_pane"]
+                ):
+                    await _unstamp_instance_id(existing_row["tmux_pane"], session_id)
                 await _apply_session_doc_instance_name(
                     db,
                     instance_id=session_id,
@@ -1991,6 +2064,7 @@ async def handle_session_start(payload: dict) -> dict:
                     where_clause="id = ?",
                     where_params=(supplant_id,),
                 )
+                await _stamp_instance_id(tmux_pane, session_id)
 
                 # Auto-link primarch session doc if applicable
                 session_doc_id = resolved_session_doc_id or old_inst["session_doc_id"]
@@ -2257,6 +2331,7 @@ async def handle_session_start(payload: dict) -> dict:
             actor="SessionStart",
             wrapper_launch_id=wrapper_launch_id,
         )
+        await _stamp_instance_id(tmux_pane, session_id)
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
             db,

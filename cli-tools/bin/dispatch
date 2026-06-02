@@ -64,6 +64,7 @@ quote() { printf '%q' "$1"; }
 ENGINE="claude"
 ENGINE_EXPLICIT=false
 RESUME_ID=""
+RESUME_INSTANCE_ID=""
 RESUME_REQUESTED=false
 RESUME_ROW_FOUND=false
 ASPIRANT=false
@@ -546,6 +547,7 @@ resolve_resume_id() {
   sid_sql="$(sql_literal "$RESUME_ID")"
   row="$(sqlite_query_usv "
     SELECT
+      COALESCE(ci.id, ''),
       COALESCE(ci.engine, ''),
       COALESCE(ci.launcher, ''),
       COALESCE(ci.target_working_dir, ''),
@@ -582,11 +584,14 @@ resolve_resume_id() {
   fi
 
   RESUME_ROW_FOUND=true
-  local row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry
-  IFS=$'\x1f' read -r row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry \
+  local row_id row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry
+  IFS=$'\x1f' read -r row_id row_engine row_launcher row_target_dir row_work_dir row_dispatch_doc row_doc_path row_type row_zealotry \
     RESUME_DISPATCH_TARGET RESUME_DISPATCH_WINDOW RESUME_DISPATCH_MODE RESUME_DISPATCH_SLOT RESUME_LAUNCH_MODE \
     RESUME_TMUX_PANE RESUME_PRIMARCH RESUME_PARENT_INSTANCE_ID RESUME_DISCORD_HOSTED RESUME_DISCORD_CHANNEL RESUME_DISCORD_BOT <<< "$row"
 
+  # Canonical instance id (== @INSTANCE_ID stamped by SessionStart). RESUME_ID may
+  # have been a session_id; resolve-instance keys on ci.id, so stamp ci.id.
+  RESUME_INSTANCE_ID="$row_id"
   ENGINE="$(infer_engine "$row_engine" "$row_launcher")"
   RESUME_LAUNCHER="$row_launcher"
   [[ -n "$row_target_dir" ]] && WORK_DIR="$row_target_dir"
@@ -1300,6 +1305,20 @@ redact_tmux_panes_for_display() {
   sed -E 's/%[0-9]+/<tmux-pane>/g'
 }
 
+stamp_resume_instance_id() {
+  # On resume, stamp the allocated pane with the instance UUID immediately so
+  # tmuxctl resolve-instance finds it before the agent re-registers — closing
+  # the pane-alloc -> SessionStart gap. No-op for fresh launches (the
+  # registration hook stamps those). Cleared on agent death by the wrapper.
+  local pane="$1"
+  # Stamp the canonical ci.id resolved from the DB (RESUME_ID may be a session_id);
+  # fall back to the raw RESUME_ID when the row was not found (--engine/--dir resume).
+  local instance_id="${RESUME_INSTANCE_ID:-$RESUME_ID}"
+  [[ -n "$instance_id" && -n "$pane" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux set-option -p -t "$pane" @INSTANCE_ID "$instance_id" >/dev/null 2>&1 || true
+}
+
 stage_agent_command() {
   local cmd="$1" stage
   stage="$(mktemp -t dispatch-agent.XXXXXX)"
@@ -1410,6 +1429,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
     exit 1
   fi
   RESOLVED_PHYSICAL_TARGET="$pane_id"
+  stamp_resume_instance_id "$pane_id"
   FINAL_COMMAND="$(build_agent_command)"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
@@ -1427,6 +1447,7 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   fi
   PHYSICAL_TARGET="${RESOLVED_PHYSICAL_TARGET:-$(resolve_dispatch_physical_target "$TARGET")}"
   assert_dispatch_target_unoccupied "$PHYSICAL_TARGET"
+  stamp_resume_instance_id "$PHYSICAL_TARGET"
   tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
@@ -1443,4 +1464,5 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   exit 0
 fi
 
+stamp_resume_instance_id "${RESOLVED_PHYSICAL_TARGET:-${TMUX_PANE:-}}"
 exec bash -lc "$FINAL_COMMAND"

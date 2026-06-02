@@ -94,6 +94,12 @@ build_payload() {
 
 cleanup() {
   local exit_code=$?
+  # Clear the instance->pane stamp the instant the agent dies. Unset by name
+  # (no value needed); tmuxctl resolve-instance returns not-found immediately,
+  # so no consumer sends to — or speaks the position of — a vanished agent.
+  if [[ -n "$TMUX_PANE_VALUE" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux set-option -p -u -t "$TMUX_PANE_VALUE" @INSTANCE_ID >/dev/null 2>&1 || true
+  fi
   local end_payload
   end_payload="$(build_payload "WrapperEnd" "$exit_code")"
   post_hook "WrapperEnd" "$end_payload"
