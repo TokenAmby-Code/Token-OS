@@ -313,7 +313,10 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "legion": "custodes",
         "primarch": "custodes",
         "instance_type": "sync",
-        "synced": True,
+        # synced is NOT derived at registration: custodes now resolves via the
+        # legion:custodes pane marker, not synced (#67), so the correct startup
+        # default is synced=0. The morning session flips it to 1 while live.
+        "synced": False,
     },
     MECHANICUS_FG_LABEL: {
         # FG owns a dedicated singleton legion ("fabricator", see ALLOWED_LEGIONS /

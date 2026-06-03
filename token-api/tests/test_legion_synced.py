@@ -394,7 +394,9 @@ class TestPersonaPaneAutoSetup:
         assert row["legion"] == "custodes"
         assert row["primarch"] == "custodes"
         assert row["instance_type"] == "sync"
-        assert row["synced"] == 1
+        # synced is NOT set at registration (#67): custodes resolves via the
+        # pane marker; the morning session flips synced to 1 while live.
+        assert row["synced"] == 0
 
     def test_fabricator_general_pane(self, client):
         # FG owns the dedicated singleton legion "fabricator" (not "mechanicus" —
