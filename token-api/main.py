@@ -93,6 +93,7 @@ from pane_surface import (
 )
 from phone_service import (
     _send_to_phone,
+    load_zap_count_from_daily_note,
     push_phone_widget_async,
     send_pavlok_stimulus,
 )
@@ -1397,6 +1398,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Day-start schedule fallback sync failed: {exc}")
     await load_tasks_from_db()
     timer_load_from_db()
+    load_zap_count_from_daily_note()
     restore_restart_state()
     recovered_phone_distraction = await recover_recent_phone_distraction_state()
     # Sync timer activity layer with restored desktop mode

@@ -6,12 +6,15 @@ without reaching back through the _main() lazy import.
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
+from session_doc_helpers import read_frontmatter, serialize_frontmatter, update_frontmatter
 from shared import (
     DESKTOP_STATE,
     PAVLOK_CONFIG,
@@ -404,9 +407,69 @@ def _roll_daily_zap_count(now: datetime) -> None:
         PAVLOK_STATE["zap_count"] = 0
 
 
+def _daily_note_path(date_str: str) -> Path:
+    """Resolve the Imperium daily-note path for ``date_str``.
+
+    Mirrors ``_append_work_action_to_daily_note`` (main.py): resolve the vault
+    from ``IMPERIUM_ENV`` at call time, else ``$IMPERIUM/Imperium-ENV`` — so a
+    temp test vault and a relocated NAS mount both land in the right note.
+    """
+    vault = os.environ.get("IMPERIUM_ENV")
+    root = (
+        Path(vault)
+        if vault
+        else Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV"
+    )
+    return root / "Terra" / "Journal" / "Daily" / f"{date_str}.md"
+
+
+def _persist_zap_count_to_daily_note(count: int, date_str: str) -> None:
+    """Write-through today's ``zap_count`` into the daily-note frontmatter.
+
+    Called from ``_increment_daily_zap_count`` under ``_pavlok_dispatch_lock``,
+    atomically with the in-memory bump, so the durable count never drifts from
+    the dispatched count. Best-effort: a NAS hiccup must never block or fail an
+    accepted zap. Create-if-missing keeps a pre-day-start zap from being dropped;
+    ``day_start`` still owns the rich daily note.
+    """
+    try:
+        note_path = _daily_note_path(date_str)
+        if not note_path.exists():
+            note_path.parent.mkdir(parents=True, exist_ok=True)
+            note_path.write_text(
+                serialize_frontmatter({"date": date_str, "type": "daily-note"}, f"# {date_str}\n"),
+                encoding="utf-8",
+            )
+        update_frontmatter(note_path, {"zap_count": count})
+    except Exception as exc:
+        logger.warning(f"PAVLOK: zap_count persist failed: {exc}")
+
+
+def load_zap_count_from_daily_note() -> None:
+    """Hydrate ``PAVLOK_STATE`` zap_count from today's daily note on startup.
+
+    A restart resets the in-memory count to 0; this forces it back to the durable
+    value so the day's count survives restarts. Best-effort — a missing note or
+    NAS outage simply leaves the in-memory default.
+    """
+    try:
+        today = datetime.now().date().isoformat()
+        note_path = _daily_note_path(today)
+        if not note_path.exists():
+            return
+        fm, _body = read_frontmatter(note_path)
+        count = fm.get("zap_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            PAVLOK_STATE["zap_count_date"] = today
+            PAVLOK_STATE["zap_count"] = count
+    except Exception as exc:
+        logger.warning(f"PAVLOK: zap_count load failed: {exc}")
+
+
 def _increment_daily_zap_count(now: datetime) -> None:
     _roll_daily_zap_count(now)
     PAVLOK_STATE["zap_count"] = int(PAVLOK_STATE.get("zap_count") or 0) + 1
+    _persist_zap_count_to_daily_note(PAVLOK_STATE["zap_count"], now.date().isoformat())
 
 
 def _log_pavlok_guardrail_block(result: dict) -> None:
