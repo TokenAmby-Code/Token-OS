@@ -783,12 +783,13 @@ ASKQ_BUST_PROMPT = (
     "notification protocol to escalate."
 )
 
-# Re-injected on every clean Stop of a sync (morning) instance. The morning
-# session is temporally bound, not turn-based: it must not be possible to walk
-# away and have it sit idle. Each Stop yields a fresh timestamped keepalive that
-# pushes the instance to keep moving via tts / AskUserQuestion. The loop's only
-# exit is flipping the instance off `sync` (POST /api/morning/end, which sets
-# instance_type=one_off). Rip cord: PATCH /api/instances/{id}/type to one_off.
+# Re-injected on the clean Stop of a sync (morning) instance — but ONLY while an
+# active, in-bound morning session exists (see morning_session.morning_session_active).
+# The morning session is temporally bound, not turn-based: it must not be possible
+# to walk away and have it sit idle. Each Stop yields a fresh timestamped keepalive
+# that pushes the instance to keep moving via tts / AskUserQuestion. The loop exits
+# when the morning session ends (POST /api/morning/end) or trips the 2-hour bound;
+# after either, `sync` no longer re-injects.
 MORNING_KEEPALIVE_PROMPT = (
     "It is currently {ts} MST. The morning session is still active. Use `tts` or "
     "AskUserQuestion to keep things moving — advance the regiment/plan, prompt the "
@@ -796,6 +797,15 @@ MORNING_KEEPALIVE_PROMPT = (
     "session stays alive until the Emperor officially ends it; when he does, call "
     "`POST /api/morning/end` (or PATCH /api/instances/{{id}}/type to one_off as a "
     "rip cord) to exit the loop."
+)
+
+# Sent ONCE to the morning pane when the {hours}-hour bound trips. It is a notice,
+# not a keepalive — the session is already auto-ended, so this does not re-prompt.
+MORNING_EXPIRY_NOTICE = (
+    "The morning session has reached its {hours}-hour limit and has been "
+    "automatically ended. No further keepalive prompts will be sent. Wrap up "
+    "cleanly — a brief closing `tts` if appropriate, then stop. You remain the "
+    "Custodes singleton for state-hook interventions; only the morning loop is over."
 )
 
 # Global dictation state — tracks whether Wispr Flow is currently active

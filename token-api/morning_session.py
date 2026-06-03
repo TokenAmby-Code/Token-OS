@@ -15,7 +15,7 @@ The launcher exits after launch — the Claude session is autonomous from there.
 import json
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BASE = "http://localhost:7777"
@@ -25,6 +25,96 @@ VAULT_DIR = "/Volumes/Imperium/Imperium-ENV"
 TMUX_SESSION = "main"
 PROMPT_FILE = "/tmp/custodes-morning-prompt.md"
 SESSION_DIR = Path("/tmp/custodes_morning_sessions")
+
+# The Emperor's 2-hour auto-disable: a morning session is "active" only within
+# this many hours of started_at. Past the bound it is auto-ended and the Stop-hook
+# keepalive stops re-injecting (see routes/hooks.py and morning_session_active).
+MORNING_MAX_DURATION_HOURS = 2
+
+
+def morning_state_dir() -> Path:
+    """Directory holding per-day morning state files.
+
+    Resolved at call time from CUSTODES_MORNING_DIR (defaults to SESSION_DIR) so
+    tests can isolate state from the real /tmp without reloading this module.
+    """
+    return Path(os.environ.get("CUSTODES_MORNING_DIR", str(SESSION_DIR)))
+
+
+def morning_state_file(today: str | None = None) -> Path:
+    """Path to today's morning state file."""
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    return morning_state_dir() / f"morning_{day}.json"
+
+
+def read_morning_state(today: str | None = None) -> dict | None:
+    """Return today's morning state dict, or None if absent/unreadable."""
+    state_file = morning_state_file(today)
+    if not state_file.exists():
+        return None
+    try:
+        return json.loads(state_file.read_text())
+    except Exception:
+        return None
+
+
+def write_morning_status(
+    status: str, *, ended_by: str | None = None, today: str | None = None
+) -> dict | None:
+    """Durably flip the morning state-file status (e.g. to "ended").
+
+    Returns the updated state dict, or None if there is no state file to update.
+    `ended_by` records who/what ended the session and stamps ended_at.
+    """
+    state_file = morning_state_file(today)
+    if not state_file.exists():
+        return None
+    try:
+        data = json.loads(state_file.read_text())
+    except Exception:
+        return None
+    data["status"] = status
+    if ended_by:
+        data["ended_by"] = ended_by
+        data["ended_at"] = datetime.now().isoformat()
+    state_file.write_text(json.dumps(data))
+    return data
+
+
+def morning_session_active(today: str | None = None) -> tuple[bool, str]:
+    """Decide whether today's morning session is active and in-bound.
+
+    Returns (active, reason). Active requires ALL of:
+      - a morning record exists for today,
+      - its status == "launched" (not "ended"),
+      - it is within MORNING_MAX_DURATION_HOURS of started_at.
+
+    Past the bound the session is auto-ended (status="ended",
+    ended_by="auto-2h-bound") and (False, "expired") is returned — the caller
+    emits one final notice and does NOT re-prompt. Reasons for an inactive
+    session: "no_session", "ended", "expired".
+    """
+    state = read_morning_state(today)
+    if state is None:
+        return False, "no_session"
+    if state.get("status") != "launched":
+        return False, "ended"
+
+    started_raw = state.get("started_at")
+    if not started_raw:
+        # Launched but undated — preserve the morning behavior rather than expire.
+        return True, "active"
+    try:
+        started = datetime.fromisoformat(started_raw)
+    except Exception:
+        return True, "active"
+    if started.tzinfo is not None:
+        started = started.replace(tzinfo=None)
+
+    if datetime.now() - started > timedelta(hours=MORNING_MAX_DURATION_HOURS):
+        write_morning_status("ended", ended_by="auto-2h-bound", today=today)
+        return False, "expired"
+    return True, "active"
 
 
 def _get(path: str) -> dict | list | str:
@@ -524,9 +614,9 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
 
 def run_morning_session() -> dict:
     """Main morning session launcher."""
-    SESSION_DIR.mkdir(exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    state_file = SESSION_DIR / f"morning_{today}.json"
+    state_file = morning_state_file(today)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Prevent double-trigger
     if state_file.exists():

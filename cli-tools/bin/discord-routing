@@ -4,8 +4,10 @@
 # AUDIENCE: agent, user
 """Diagnose the Discord voice/mention injection routing chain.
 
-Checks each legion's routing path: DB instance lookup → tmux_pane → pane alive →
-voice-chat status. Prints a status table and fix suggestions.
+Checks each legion's routing path and prints a status table and fix suggestions.
+- Custodes is a singleton: its verdict is modelled on the `legion:custodes` tmux
+  pane marker (pane exists + alive ⇒ OK), independent of synced / live-row state.
+- Mechanicus routes through a live `synced=1` DB row (intentional, separate pattern).
 
 Usage:
     discord-routing              # Full diagnostic
@@ -66,6 +68,36 @@ def get_live_panes():
     return set()
 
 
+def get_custodes_marked_pane():
+    """Resolve the singleton Custodes pane from its tmux marker.
+
+    Mirrors main._find_custodes_tmux_pane: the authoritative Custodes identity is the
+    `@PANE_ID = legion:custodes` tmux pane option with claude running — NOT a live or
+    `synced` DB row. Returns the pane_id, or None if no marked claude pane is alive.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            pane_id, marker, cmd = parts[0], parts[1], parts[2]
+            if marker != "legion:custodes":
+                continue
+            cmd_is_claude = "claude" in cmd.lower() or (cmd[:1].isdigit() and "." in cmd)
+            if cmd_is_claude:
+                return pane_id
+    except Exception:
+        pass
+    return None
+
+
 def check_api_reachable():
     """Check if Token-API is reachable."""
     data = api_get("/api/status")
@@ -83,8 +115,82 @@ def check_voice_chat_sessions():
     return {}
 
 
+def check_custodes(db, live_panes: set):
+    """Check the Custodes routing chain — modelled on the `legion:custodes` singleton
+    pane marker, NOT on a live/`synced` DB row.
+
+    Verdict OK ⇔ a marked claude pane exists and is alive. This matches the injection
+    logic (main._inject_custodes_via_singleton_pane): the marker decides the target;
+    the DB row is supplementary (supplies instance_id / voice-chat) and a
+    stale/`one_off`/`synced=0` row does NOT fail the verdict.
+    """
+    result = {
+        "legion": "custodes",
+        "instance_id": None,
+        "instance_status": None,
+        "synced": None,
+        "tmux_pane": None,
+        "pane_alive": False,
+        "voice_chat": False,
+        "last_activity": None,
+        "input_lock": None,
+        "issues": [],
+        "fixes": [],
+        "verdict": "BROKEN",
+    }
+
+    pane = get_custodes_marked_pane()
+    if not pane:
+        result["issues"].append("No live legion:custodes pane (marker @PANE_ID=legion:custodes)")
+        result["fixes"].append(
+            "Launch/restore the singleton: primarch custodes "
+            "(or tmuxctl assert-instance --pane legion:custodes)"
+        )
+        return result
+
+    result["tmux_pane"] = pane
+    # The marker came from the live pane list, so the pane is alive by construction.
+    result["pane_alive"] = pane in live_panes if live_panes else True
+
+    # DB row is supplementary: it supplies instance_id / voice-chat for the marked
+    # pane, never decides the target. A missing/stale row is an unbound singleton, OK.
+    if db is not None:
+        cursor = db.cursor()
+        cursor.execute(
+            """SELECT id, status, synced, last_activity, input_lock
+               FROM claude_instances
+               WHERE tmux_pane = ? AND status != 'stopped'
+               ORDER BY last_activity DESC LIMIT 1""",
+            (pane,),
+        )
+        row = cursor.fetchone()
+        if row:
+            result["instance_id"] = row["id"]
+            result["instance_status"] = row["status"]
+            result["synced"] = bool(row["synced"])
+            result["last_activity"] = row["last_activity"]
+            result["input_lock"] = row["input_lock"]
+            if row["input_lock"]:
+                result["issues"].append(f"Input lock held: {row['input_lock']}")
+                result["fixes"].append(
+                    f"Clear if stale: curl -X DELETE {API_URL}/api/instances/{row['id']}/input-lock"
+                )
+            vc_data = api_get(f"/api/instances/{row['id']}/voice-chat")
+            if vc_data and vc_data.get("active"):
+                result["voice_chat"] = True
+        else:
+            result["instance_status"] = "pane-only"
+
+    # Pane alive + marker present ⇒ OK; a held input lock is a non-fatal WARN.
+    result["verdict"] = "WARN" if result["issues"] else "OK"
+    return result
+
+
 def check_legion(legion: str, db, live_panes: set):
     """Check the full routing chain for a legion. Returns a diagnostic dict."""
+    if legion == "custodes":
+        return check_custodes(db, live_panes)
+
     result = {
         "legion": legion,
         "instance_id": None,
@@ -105,8 +211,9 @@ def check_legion(legion: str, db, live_panes: set):
         result["fixes"].append(f"Ensure {DB_PATH} exists (Token-API creates it)")
         return result
 
-    # Query matching what _try_discord_injection does
-    # Custodes: any live instance. Mechanicus: synced instances only.
+    # Query matching what _try_discord_injection does for non-singleton legions.
+    # Mechanicus: synced instances only (intentional, separate from the Custodes
+    # singleton path — Custodes is handled above via its pane marker).
     if legion == "mechanicus":
         query = """
             SELECT id, tmux_pane, status, synced, last_activity, input_lock, device_id, pid
@@ -144,21 +251,6 @@ def check_legion(legion: str, db, live_panes: set):
                 )
             else:
                 result["fixes"].append(f"Launch a {legion} instance with synced mode")
-        elif legion == "custodes":
-            result["fixes"].append(
-                "Launch a custodes instance: primarch custodes"
-            )
-            # Check if there's a stopped one
-            cursor.execute(
-                "SELECT id, status FROM claude_instances WHERE legion = ? ORDER BY last_activity DESC LIMIT 1",
-                (legion,)
-            )
-            stopped = cursor.fetchone()
-            if stopped:
-                result["fixes"].append(
-                    f"Found stopped instance {stopped['id']} (status={stopped['status']}). "
-                    f"May need a fresh launch."
-                )
         return result
 
     # Instance found

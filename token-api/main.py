@@ -18289,11 +18289,18 @@ async def get_morning_session_status():
 async def end_morning_session():
     """Officially end the morning session.
 
-    Flips the live Custodes instance off `sync` (→ one_off) via the sanctioned
-    write path so the self-continuing Stop loop in routes/hooks.py terminates: the
-    next Stop is then a normal clean stop instead of re-injecting a keepalive.
-    No live Custodes → nothing to end.
+    Durably flips the state file to status="ended" so the Stop-hook keepalive gate
+    (routes/hooks.py → morning_session_active) stops re-injecting, regardless of the
+    live instance's type. Also flips the live Custodes instance off `sync` (→ one_off)
+    via the sanctioned write path. The state-file write is the authoritative loop
+    terminator; the type flip preserves the historical clean-exit contract.
     """
+    from morning_session import write_morning_status
+
+    # Authoritative: end the session in the state file even if no live row is found.
+    ended_state = write_morning_status("ended", ended_by="morning-end")
+    morning_status = "ended" if ended_state is not None else "no_session"
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -18307,7 +18314,7 @@ async def end_morning_session():
         )
         row = await cursor.fetchone()
         if not row:
-            return {"status": "no_active_custodes"}
+            return {"status": "no_active_custodes", "morning_status": morning_status}
 
         instance_id = row["id"]
         old_type = row["instance_type"] or "one_off"
@@ -18337,9 +18344,13 @@ async def end_morning_session():
     await log_event(
         "morning_session_end",
         instance_id=instance_id,
-        details={"old_type": old_type, "new_type": "one_off"},
+        details={"old_type": old_type, "new_type": "one_off", "morning_status": morning_status},
     )
-    return {"instance_id": instance_id, "instance_type": "one_off"}
+    return {
+        "instance_id": instance_id,
+        "instance_type": "one_off",
+        "morning_status": morning_status,
+    }
 
 
 _ALARM_DISMISS_JOB_ID = "morning_alarm_dismiss"
@@ -18814,72 +18825,20 @@ async def _discord_voice_error(legion: str, transcript: str):
     await _discord_voice_error_message(legion, error_msg)
 
 
-async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
-    """Try to inject a Discord message into a live instance for a legion.
+async def _agent_cmd_inject(
+    legion: str,
+    instance_id: str | None,
+    tmux_pane: str | None,
+    formatted: str,
+    channel_name: str | None,
+) -> bool:
+    """Deliver `formatted` to an already-resolved target via agent-cmd.
 
-    Args:
-        require_synced: If True, only target instances with synced=1 (Mechanicus pattern).
-                        If False, target any live instance (Custodes singleton pattern).
-    Returns True if injection succeeded, False if no matching instance or injection failed.
+    Prefers --instance (best routing); falls back to --pane. Returns False if
+    neither a target instance nor a pane was supplied.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        if require_synced:
-            cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
-                   LIMIT 1""",
-                (legion,),
-            )
-        else:
-            cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND status IN ('idle', 'processing')
-                   LIMIT 1""",
-                (legion,),
-            )
-        row = await cursor.fetchone()
-
-    instance_id = row[0] if row else None
-    tmux_pane = row[1] if row else None
-
-    # Custodes is a singleton pane.  The DB row is often stale after compaction,
-    # restarts, or manual pane recovery, while tmux still has the authoritative
-    # legion:custodes marker.  Recover from tmux instead of returning a false
-    # target failure.
-    if (not tmux_pane) and legion == "custodes" and not require_synced:
-        recovered = await _find_custodes_tmux_pane()
-        if recovered:
-            tmux_pane = recovered
-            logger.info(f"Discord injection: recovered Custodes pane {tmux_pane}")
-
-    formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
-
-    if not tmux_pane and legion == "custodes" and not require_synced:
-        # Voice Custodes should not degrade to a target-failure readback just
-        # because the singleton row is stale or currently stopped.  Delegate
-        # upsert-vs-launch to the same tmuxctl owner used by state hooks.
-        try:
-            result = await _assert_and_send_custodes(formatted, source="Discord injection")
-            if result.get("dispatched"):
-                logger.info(
-                    f"Discord injection: custodes → {result.get('pane')} via assert-instance legion:custodes"
-                )
-                return True
-            logger.warning(
-                f"Discord injection: assert-instance legion:custodes failed: {result.get('reason')}"
-            )
-            return False
-        except Exception as e:
-            logger.warning(f"Discord injection: assert-instance legion:custodes error: {e}")
-            return False
-
-    if not tmux_pane:
-        if instance_id:
-            logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
-        else:
-            logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
+    if not instance_id and not tmux_pane:
         return False
-
     try:
         agent_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "agent-cmd"
         cmd = [str(agent_cmd)]
@@ -18909,7 +18868,7 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
             target = instance_id[:12] if instance_id else tmux_pane
-            logger.info(f"Discord injection: {legion} → {target} (#{message.channel_name})")
+            logger.info(f"Discord injection: {legion} → {target} (#{channel_name})")
             return True
         logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
         return False
@@ -18920,6 +18879,97 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
     except Exception as e:
         logger.warning(f"Discord injection error: {e}")
         return False
+
+
+async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str | None) -> bool:
+    """Resolve the Custodes Discord target deterministically from the singleton lock.
+
+    The authoritative Custodes identity is the `legion:custodes` tmux pane marker —
+    NOT a live/`synced` DB row. The pane is resolved from the marker; the DB is
+    consulted only to supply an instance_id for that already-identified pane (better
+    agent-cmd routing), never to decide the target. When no marked pane is alive,
+    delegate upsert-vs-launch to the same tmuxctl assert-instance owner the state
+    hooks use. This holds even when the DB row is stale/`one_off`/`synced=0`.
+    """
+    tmux_pane = await _find_custodes_tmux_pane()
+    if tmux_pane:
+        instance_id = None
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    """SELECT id FROM claude_instances
+                       WHERE tmux_pane = ? AND stopped_at IS NULL
+                       ORDER BY last_activity DESC LIMIT 1""",
+                    (tmux_pane,),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    instance_id = row[0]
+        except Exception:
+            pass
+        return await _agent_cmd_inject("custodes", instance_id, tmux_pane, formatted, channel_name)
+
+    # No live legion:custodes pane → assert (upsert-or-launch) then send. Voice/mention
+    # Custodes must not degrade to a target-failure readback just because no pane is up.
+    try:
+        result = await _assert_and_send_custodes(formatted, source="Discord injection")
+        if result.get("dispatched"):
+            logger.info(
+                f"Discord injection: custodes → {result.get('pane')} via assert-instance legion:custodes"
+            )
+            return True
+        logger.warning(
+            f"Discord injection: assert-instance legion:custodes failed: {result.get('reason')}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"Discord injection: assert-instance legion:custodes error: {e}")
+        return False
+
+
+async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
+    """Try to inject a Discord message into a live instance for a legion.
+
+    Custodes resolves deterministically via the `legion:custodes` singleton pane
+    marker — Discord holds no perspective on sync sessions, so `require_synced` does
+    NOT apply to Custodes. Other legions (e.g. Mechanicus) route through a live DB
+    row, optionally gated on synced=1 (the intentional Mechanicus pattern).
+
+    Returns True if injection succeeded, False if no matching instance or injection failed.
+    """
+    formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
+
+    if legion == "custodes":
+        return await _inject_custodes_via_singleton_pane(formatted, message.channel_name)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if require_synced:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,),
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,),
+            )
+        row = await cursor.fetchone()
+
+    instance_id = row[0] if row else None
+    tmux_pane = row[1] if row else None
+
+    if not tmux_pane:
+        if instance_id:
+            logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
+        else:
+            logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
+        return False
+
+    return await _agent_cmd_inject(legion, instance_id, tmux_pane, formatted, message.channel_name)
 
 
 # Dedup cache for Discord messages (daemon sometimes delivers twice)
@@ -19129,6 +19179,16 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
         logger.warning(f"Voice draft [imperial_guard]: supplied target pane invalid/dead: {pane!r}")
         return None
 
+    if bot == "custodes":
+        # Custodes singleton: resolve the voice target from the `legion:custodes`
+        # pane marker, not a live/`synced` DB row. Discord holds no perspective on
+        # sync sessions — the marker is the authoritative identity.
+        pane = await _find_custodes_tmux_pane()
+        if pane and await _tmux_pane_exists(pane):
+            return pane
+        logger.warning("Voice draft [custodes]: no live legion:custodes pane")
+        return None
+
     require_synced = bot == "mechanicus"
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
@@ -19147,8 +19207,6 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
             )
         row = await cursor.fetchone()
     pane = row[0] if row else None
-    if (not pane) and bot == "custodes":
-        pane = await _find_custodes_tmux_pane()
     if pane and await _tmux_pane_exists(pane):
         return pane
     logger.warning(f"Voice draft [{bot}]: no live target pane")
