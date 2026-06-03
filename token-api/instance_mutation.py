@@ -71,6 +71,7 @@ INSTANCE_MUTATION_FIELDS = {
     "planning_source",
     "pr_url",
     "pr_state",
+    "hook_driven",
 }
 
 LEGION_PANE_COLORS = {

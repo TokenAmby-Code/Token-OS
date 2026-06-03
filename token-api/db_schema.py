@@ -173,6 +173,15 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "pr_state",
                 "ALTER TABLE claude_instances ADD COLUMN pr_state TEXT",
             ),
+            # Per-instance "this instance is being driven autonomously, not by the
+            # Emperor" flag. Set =1 before an automated / agent-to-agent wake is sent
+            # to the target; cleared =0 on Stop/SessionEnd. compute_work_state discounts
+            # hook_driven instances at read-time (belt-and-suspenders with the low-level
+            # automated_pane_activity marker). See hook_driven redesign.
+            (
+                "hook_driven",
+                "ALTER TABLE claude_instances ADD COLUMN hook_driven INTEGER DEFAULT 0",
+            ),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:

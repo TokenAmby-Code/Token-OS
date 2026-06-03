@@ -74,6 +74,14 @@ def _set_marker(db_path, injected_offset_s: float, ttl_s: float) -> None:
         conn.commit()
 
 
+def _set_hook_driven(db_path, value: int) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE claude_instances SET hook_driven = ? WHERE id = ?", (value, SESSION_ID)
+        )
+        conn.commit()
+
+
 def _add_work_action(db_path, note: str, source: str = "prompt_submit") -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -158,6 +166,40 @@ async def test_activity_predating_injection_is_not_discounted(work_state_env):
     # its real activity; only activity attributable to the injection is dropped.
     _set_last_activity(work_state_env.db_path, seconds_ago=30)
     _set_marker(work_state_env.db_path, injected_offset_s=-1, ttl_s=90)
+    ws = await work_state_env.main.compute_work_state()
+    assert ws.productivity_active is True
+    assert ws.active_instance_count == 1
+
+
+# ── hook_driven read-time discount (no marker needed) ──────────────────────────
+
+
+async def test_hook_driven_discounts_without_marker(work_state_env):
+    # Proof 3: the durable per-instance flag alone (NO automated_pane_activity
+    # marker present) drives the discount across both the instance loop and the
+    # work_action read — proving hook_driven, not the marker, is sufficient.
+    _set_hook_driven(work_state_env.db_path, 1)
+    _add_work_action(work_state_env.db_path, f"session_id={SESSION_ID}")
+    ws = await work_state_env.main.compute_work_state()
+    assert ws.productivity_active is False, "hook_driven instance must not anchor work"
+    assert ws.active_instance_count == 0
+    assert ws.observed_agent_count == 0
+    assert ws.work_action_source is None
+
+
+async def test_hook_driven_human_typing_overrides_discount(work_state_env, monkeypatch):
+    # Proof 4: the typing-guard override disables the discount even with hook_driven=1
+    # so a genuine human keystroke always anchors WORKING.
+    monkeypatch.setattr(work_state_env.main, "_typing_guard_active", lambda: True)
+    _set_hook_driven(work_state_env.db_path, 1)
+    ws = await work_state_env.main.compute_work_state()
+    assert ws.productivity_active is True
+    assert ws.active_instance_count == 1
+
+
+async def test_hook_driven_cleared_anchors(work_state_env):
+    # hook_driven=0 (the post-Stop state) with no marker → ordinary anchoring.
+    _set_hook_driven(work_state_env.db_path, 0)
     ws = await work_state_env.main.compute_work_state()
     assert ws.productivity_active is True
     assert ws.active_instance_count == 1

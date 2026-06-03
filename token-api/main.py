@@ -1714,6 +1714,9 @@ async def orchestrator_naming_nudge(request: NamingNudgeRequest):
         source=NAMING_NUDGE_QUEUE_SOURCE,
         purpose=NAMING_NUDGE_QUEUE_PURPOSE,
         payload=message,
+        # System-originated nudge to the agent — autonomous wake (classification:
+        # golden-throne followup / naming nudge → hook_driven by principle).
+        hook_driven=True,
     )
     queue_results = await process_pane_write_queue_once(queued["id"])
     queue_result = queue_results[0] if queue_results else queued
@@ -4034,6 +4037,60 @@ async def _tmux_pane_has_pending_input(tmux_pane: str) -> bool:
     return _pane_input_line_has_text(lines[-1])
 
 
+async def _flag_hook_driven(
+    instance_id: str | None = None, *, tmux_pane: str | None = None, actor: str
+) -> None:
+    """Mark a target instance hook_driven=1 — "being driven autonomously, not by
+    the Emperor" (agent-to-agent / system fanout / automated wake). MUST commit
+    before the wake byte reaches the pane so the agent's PromptSubmit can't observe
+    a stale 0. Cleared on Stop/SessionEnd. Best-effort: a flag-write failure must
+    never block the actual send.
+
+    Resolves the concrete instance row by ``id`` first, then by live ``tmux_pane``
+    (the talk/brief queue path passes a pane id in the instance_id slot)."""
+    if not (instance_id or "").strip() and not (tmux_pane or "").strip():
+        return
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            db.row_factory = aiosqlite.Row
+            target_id: str | None = None
+            if (instance_id or "").strip():
+                cur = await db.execute(
+                    "SELECT id FROM claude_instances WHERE id = ?", (instance_id,)
+                )
+                row = await cur.fetchone()
+                if row:
+                    target_id = row["id"]
+            if target_id is None and (tmux_pane or "").strip():
+                cur = await db.execute(
+                    "SELECT id FROM claude_instances WHERE tmux_pane = ? "
+                    "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
+                    (tmux_pane,),
+                )
+                row = await cur.fetchone()
+                if row:
+                    target_id = row["id"]
+            if target_id is None:
+                # Target row not registered yet — nothing to flag (rare race).
+                return
+            await sanctioned_update_instance(
+                db,
+                instance_id=target_id,
+                updates={"hook_driven": 1},
+                mutation_type="status_changed",
+                write_source="dispatch",
+                actor=actor,
+            )
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "hook_driven flag failed for %s (%s): %s",
+            (instance_id or tmux_pane or "?")[:24],
+            actor,
+            exc,
+        )
+
+
 async def enqueue_pane_write(
     *,
     instance_id: str,
@@ -4041,9 +4098,15 @@ async def enqueue_pane_write(
     source: str,
     purpose: str,
     payload: str,
+    hook_driven: bool = False,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
+    # Caller-classified autonomous wake: flag the target BEFORE the write lands so
+    # its PromptSubmit observes hook_driven=1 (read-time discount). See classification
+    # table — Emperor-proxied (Custodes-out) / direct-Emperor sends pass hook_driven=False.
+    if hook_driven:
+        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
     queue_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4662,7 +4725,7 @@ async def compute_work_state() -> WorkStateResponse:
         cursor = await db.execute(
             """
             SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id,
-                   last_activity, legion
+                   last_activity, legion, COALESCE(hook_driven, 0) AS hook_driven
             FROM claude_instances
             WHERE status IN ('processing', 'idle')
               AND COALESCE(is_subagent, 0) = 0
@@ -4671,7 +4734,9 @@ async def compute_work_state() -> WorkStateResponse:
         rows = await cursor.fetchall()
         pane_activity_cursor = await db.execute(
             """
-            SELECT tmux_pane, MAX(last_activity) AS last_activity
+            SELECT tmux_pane,
+                   MAX(last_activity) AS last_activity,
+                   MAX(COALESCE(hook_driven, 0)) AS hook_driven
             FROM claude_instances
             WHERE tmux_pane IS NOT NULL
               AND device_id = ?
@@ -4679,10 +4744,15 @@ async def compute_work_state() -> WorkStateResponse:
             """,
             (LOCAL_DEVICE_NAME,),
         )
+        pane_activity_rows = await pane_activity_cursor.fetchall()
         pane_last_activity: dict[str, str] = {
-            r["tmux_pane"]: r["last_activity"]
-            for r in await pane_activity_cursor.fetchall()
-            if r["last_activity"]
+            r["tmux_pane"]: r["last_activity"] for r in pane_activity_rows if r["last_activity"]
+        }
+        # Panes whose (non-stopped — Stop clears the flag) instance is hook_driven=1,
+        # i.e. being driven autonomously / agent-to-agent. Discounted at read-time
+        # alongside the low-level automated_pane_activity marker (belt-and-suspenders).
+        pane_hook_driven: set[str] = {
+            r["tmux_pane"] for r in pane_activity_rows if r["hook_driven"]
         }
         # Automated-activation markers: panes woken by an automated tmuxctl
         # injection (state-hook fanout / dispatch / enforcement) still inside the
@@ -4740,21 +4810,28 @@ async def compute_work_state() -> WorkStateResponse:
             wa_note = wa_details.get("note") or ""
             discounted = False
             if (
-                automated_panes
-                and not human_typing
+                not human_typing
                 and wa_source != "tmux-typing-guard"
                 and wa_note.startswith("session_id=")
             ):
                 wa_sid = wa_note[len("session_id=") :].strip()
                 if wa_sid:
                     wa_pane_cursor = await db.execute(
-                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                        "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
+                        "FROM claude_instances WHERE id = ?",
                         (wa_sid,),
                     )
                     wa_pane_row = await wa_pane_cursor.fetchone()
                     wa_pane = wa_pane_row["tmux_pane"] if wa_pane_row else None
+                    wa_hook_driven = bool(wa_pane_row["hook_driven"]) if wa_pane_row else False
                     marker_injected = automated_panes.get(wa_pane) if wa_pane else None
-                    if marker_injected is not None:
+                    if wa_hook_driven:
+                        # hook_driven: the instance is being driven autonomously, so
+                        # its prompt_submit work_action is not the Emperor's work.
+                        # Discount unconditionally (no injected_at timestamp to gate
+                        # against — the flag is durable, not a TTL marker).
+                        discounted = True
+                    elif marker_injected is not None:
                         # Discount only activity at/after the injection. Compare
                         # elapsed age (tz-independent): events.created_at is UTC
                         # while injected_at is local, but both ages derive from
@@ -4809,18 +4886,23 @@ async def compute_work_state() -> WorkStateResponse:
             continue
         if live_pane is False:
             continue
-        # Discount an automated-injection reflex wake: this pane has a live
-        # marker, no human is typing, and its last_activity post-dates the
-        # injection — so the bump is attributable to the automated send, not
-        # work. The >= injected_at guard preserves a pane already working before
-        # the injection.
+        # Discount an automated/autonomous wake (no human typing this tick). Two
+        # independent signals, either suffices (belt-and-suspenders):
+        #   • marker: this pane has a live automated_pane_activity marker and its
+        #     last_activity post-dates the injection — the bump is attributable to
+        #     the automated send. The >= injected_at guard preserves a pane already
+        #     working before the injection.
+        #   • hook_driven: this instance is flagged as driven autonomously /
+        #     agent-to-agent (set before the wake, cleared on Stop). Durable flag,
+        #     no timestamp gate.
         marker_injected = automated_panes.get(canonical_tmux_pane) if canonical_tmux_pane else None
-        if (
+        marker_discount = (
             marker_injected is not None
-            and not human_typing
             and last_activity_dt is not None
             and last_activity_dt >= marker_injected
-        ):
+        )
+        hook_driven_discount = bool(row["hook_driven"])
+        if (marker_discount or hook_driven_discount) and not human_typing:
             continue
         if canonical_tmux_pane:
             tracked_panes.add(canonical_tmux_pane)
@@ -4861,15 +4943,14 @@ async def compute_work_state() -> WorkStateResponse:
             continue
         if pane_last_activity_dt < work_activity_cutoff:
             continue
-        # Same automated-injection discount as the instance loop — the observed
+        # Same automated/autonomous discount as the instance loop — the observed
         # and instance paths read the same underlying last_activity, so guarding
-        # only one would leak the reflex wake through the other.
+        # only one would leak the reflex wake through the other. marker (TTL) OR
+        # hook_driven (durable, per-pane), gated by no human typing.
         marker_injected = automated_panes.get(pane)
-        if (
-            marker_injected is not None
-            and not human_typing
-            and pane_last_activity_dt >= marker_injected
-        ):
+        marker_discount = marker_injected is not None and pane_last_activity_dt >= marker_injected
+        hook_driven_discount = pane in pane_hook_driven
+        if (marker_discount or hook_driven_discount) and not human_typing:
             continue
         observed_agents.append(
             AgentRuntime(
@@ -6494,6 +6575,8 @@ async def golden_throne_followup(session_id: str):
                     source="golden_throne",
                     purpose="followup",
                     payload=inject_prompt,
+                    # Golden-throne followup is a system-originated autonomous wake.
+                    hook_driven=True,
                 )
                 queue_results = await process_pane_write_queue_once(queued["id"])
                 queue_result = queue_results[0] if queue_results else queued
@@ -7149,6 +7232,12 @@ async def _inject_custodes_prompt_to_pane(
         canceled = await cancel_check("pre_pane_inject")
         if canceled:
             return canceled
+    # State-hook fanout wake (custodes-in / Administratum record — both route
+    # through this helper). The target is being driven autonomously, NOT acting
+    # outbound, so flag hook_driven=1 before the byte lands; its reflex PromptSubmit
+    # is then discounted at read-time. Custodes-OUT (talk/brief/dispatch) never
+    # reaches this helper.
+    await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor="state-hook-fanout")
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
@@ -9936,7 +10025,28 @@ async def disarm_pane_tap(instance_id: str):
 # --- Trinity Chunk 1: talk / brief inter-persona comm primitives ------------
 
 
-async def _talk_send_payload(target_pane: str, payload: str) -> dict:
+async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
+    """Classify a talk/brief sender as Custodes. The Emperor acts THROUGH Custodes,
+    so Custodes' OUTBOUND sends count as the Emperor's work and must NOT flag the
+    target hook_driven (Emperor-proxied, custodes-out). Every other sender is
+    agent-to-agent → flag the target. Sender legion is the attribution key."""
+    if not (caller_pane or "").strip():
+        return False
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT legion FROM claude_instances WHERE tmux_pane = ? "
+                "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
+                (caller_pane,),
+            )
+            row = await cur.fetchone()
+    except Exception:
+        return False
+    return bool(row) and (row["legion"] or "").lower() == "custodes"
+
+
+async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
     Drained synchronously so a CLI long-poll sees an actual delivery state.
@@ -9947,6 +10057,7 @@ async def _talk_send_payload(target_pane: str, payload: str) -> dict:
         source="talk",
         purpose="talk_send",
         payload=payload,
+        hook_driven=hook_driven,
     )
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
@@ -9972,6 +10083,10 @@ async def talk_send(request: TalkSendRequest):
     if caller_pane == target_pane:
         raise HTTPException(status_code=400, detail="caller_pane and target_pane are the same")
 
+    # hook_driven classification: flag the target unless the SENDER is Custodes
+    # (Emperor-proxied, custodes-out → no flag). Sender = resolved caller_pane.
+    talk_hook_driven = not await _pane_sender_is_custodes(caller_pane)
+
     # Explicit-return shortcut: if the SWAPPED pair (caller=target, target=caller)
     # is already open, this call IS the return.
     returned = await talk_service.return_talk(
@@ -9983,7 +10098,9 @@ async def talk_send(request: TalkSendRequest):
         # Still deliver the message into the original caller's pane so the
         # listener actually sees the response in its input stream.
         try:
-            send_result = await _talk_send_payload(target_pane, request.payload)
+            send_result = await _talk_send_payload(
+                target_pane, request.payload, hook_driven=talk_hook_driven
+            )
         except Exception as exc:  # noqa: BLE001
             send_result = {"status": "failed", "error": str(exc)}
         return {
@@ -10004,7 +10121,9 @@ async def talk_send(request: TalkSendRequest):
         engine=target_engine,
     )
     try:
-        send_result = await _talk_send_payload(target_pane, request.payload)
+        send_result = await _talk_send_payload(
+            target_pane, request.payload, hook_driven=talk_hook_driven
+        )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
         raise HTTPException(status_code=502, detail=f"talk delivery failed: {exc}") from exc
@@ -10043,6 +10162,14 @@ async def brief_send(request: BriefSendRequest):
     if not request.panes and not request.pages:
         raise HTTPException(status_code=400, detail="at least one --pane or --page required")
 
+    # hook_driven classification: flag each target unless the SENDER is Custodes
+    # (Emperor-proxied → no flag). An absent/unknown caller is not Custodes →
+    # flag (agent-to-agent / system default; typing-guard still overrides).
+    caller_resolved = (
+        await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
+    )
+    brief_hook_driven = not await _pane_sender_is_custodes(caller_resolved)
+
     resolved, unresolved = await talk_service.resolve_brief_targets(
         panes=request.panes,
         pages=request.pages,
@@ -10061,7 +10188,11 @@ async def brief_send(request: BriefSendRequest):
         pane_id = target["pane_id"]
         try:
             if request.ephemeral:
-                # Reuse the temp_message side-channel infra (/btw or /side).
+                # Reuse the temp_message side-channel infra (/btw or /side). The
+                # temp_message queue_sender path doesn't carry hook_driven, so flag
+                # the target directly before the send (still before the byte lands).
+                if brief_hook_driven:
+                    await _flag_hook_driven(pane_id, tmux_pane=pane_id, actor="brief:ephemeral")
                 instance = await talk_service.lookup_instance_for_pane(pane_id)
                 engine = (instance or {}).get("engine")
                 receipt = await temp_message_service.send_temp_message(
@@ -10080,6 +10211,7 @@ async def brief_send(request: BriefSendRequest):
                     source="brief",
                     purpose="brief_send",
                     payload=request.payload,
+                    hook_driven=brief_hook_driven,
                 )
                 drained = await process_pane_write_queue_once(queued["id"])
                 receipt = drained[0] if drained else queued
@@ -13917,11 +14049,16 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
         {"source": request.source, "note": request.note},
     )
 
+    # Only an EXPLICIT user press (Stream Deck / work-action bind) flips global
+    # productivity. Hook-driven satisfy signals (prompt_submit / ask_user_question,
+    # explicit=False) still resolve expected-acks and bust quiet-state, but no
+    # longer anchor global productivity — that is now the read-time calculus's job
+    # (compute_work_state). This removes the idle-clock-reset vector at its root.
     signal = await observe_work_signal(
         source=request.source,
         kind="work_action",
         details={"note": request.note} if request.note else None,
-        set_productivity=True,
+        set_productivity=explicit,
     )
     acknowledged_acks = signal["resolved_acks"]
     timer = signal["timer"] or {}
