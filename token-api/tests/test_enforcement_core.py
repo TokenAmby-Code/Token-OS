@@ -7,6 +7,36 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_instance_pane_resolution(app_env, monkeypatch):
+    """tmuxctl owns instance_id -> pane resolution.
+
+    These Golden-Throne tests insert a local instance with a stored ``tmux_pane``
+    and assert the fire dispatches to it. After the Phase-3 reader cutover the
+    fire path resolves the pane live by UUID, so mimic a correctly-stamped live
+    pane here: resolve to the instance's stored ``tmux_pane`` and derive its role
+    via ``_tmux_pane_label`` (which individual tests monkeypatch) — the dual-write
+    reality where the stored pane still matches the live one. Scoped to this file
+    so tests of the real ``resolve_instance_pane`` elsewhere are untouched.
+    """
+    main = app_env.main
+
+    async def _resolve_instance_pane(instance_id):
+        conn = sqlite3.connect(app_env.db_path)
+        try:
+            row = conn.execute(
+                "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        pane = row[0] if row else None
+        if not pane:
+            return (None, None)
+        return (pane, await main._tmux_pane_label(pane))
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
+
+
 def _rows(db_path, query, params=()):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
