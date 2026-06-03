@@ -18964,10 +18964,14 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
 
     if not tmux_pane:
         if instance_id:
-            logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
+            # Pane is null/stale but the row is live — agent-cmd still routes by
+            # --instance (its preferred path). Don't hard-fail a recoverable target.
+            logger.info(
+                f"Discord injection: {legion} {instance_id[:12]} has no tmux_pane — routing via --instance"
+            )
         else:
             logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
-        return False
+            return False
 
     return await _agent_cmd_inject(legion, instance_id, tmux_pane, formatted, message.channel_name)
 

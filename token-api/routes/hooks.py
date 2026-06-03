@@ -3154,12 +3154,17 @@ async def handle_stop(payload: dict) -> dict:
                 if tmux_pane:
                     notice = MORNING_EXPIRY_NOTICE.format(hours=MORNING_MAX_DURATION_HOURS)
                     try:
-                        await _run_subprocess_offloop(
+                        proc = await _run_subprocess_offloop(
                             ("claude-cmd", "--pane", tmux_pane, notice),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                             timeout=10,
                         )
+                        if proc.returncode != 0:
+                            logger.warning(
+                                f"Hook: Stop {session_id[:12]}... morning expiry notice claude-cmd failed: "
+                                f"{proc.stderr.decode()[:200]}"
+                            )
                     except Exception as e:
                         logger.warning(
                             f"Hook: Stop {session_id[:12]}... morning expiry notice failed: {e}"

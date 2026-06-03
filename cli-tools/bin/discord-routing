@@ -43,9 +43,9 @@ def api_get(path: str):
     """GET from Token-API, return parsed JSON or None."""
     try:
         result = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "2", "--max-time", "5",
-             f"{API_URL}{path}"],
-            capture_output=True, text=True
+            ["curl", "-s", "--connect-timeout", "2", "--max-time", "5", f"{API_URL}{path}"],
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout)
@@ -58,8 +58,7 @@ def get_live_panes():
     """Return set of alive tmux pane IDs."""
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
-            capture_output=True, text=True
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"], capture_output=True, text=True
         )
         if result.returncode == 0:
             return set(result.stdout.strip().split("\n"))
@@ -68,7 +67,7 @@ def get_live_panes():
     return set()
 
 
-def get_custodes_marked_pane():
+def get_custodes_marked_pane() -> str | None:
     """Resolve the singleton Custodes pane from its tmux marker.
 
     Mirrors main._find_custodes_tmux_pane: the authoritative Custodes identity is the
@@ -77,9 +76,9 @@ def get_custodes_marked_pane():
     """
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F",
-             "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}"],
-            capture_output=True, text=True
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}"],
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
             return None
@@ -115,7 +114,7 @@ def check_voice_chat_sessions():
     return {}
 
 
-def check_custodes(db, live_panes: set):
+def check_custodes(db: sqlite3.Connection | None, live_panes: set[str]) -> dict[str, object]:
     """Check the Custodes routing chain — modelled on the `legion:custodes` singleton
     pane marker, NOT on a live/`synced` DB row.
 
@@ -240,7 +239,7 @@ def check_legion(legion: str, db, live_panes: set):
             # Check if there's an unsynced instance
             cursor.execute(
                 "SELECT id, synced, status FROM claude_instances WHERE legion = ? AND status IN ('idle', 'processing') LIMIT 1",
-                (legion,)
+                (legion,),
             )
             unsynced = cursor.fetchone()
             if unsynced:
@@ -319,8 +318,10 @@ def print_table(results, dictation_data, api_ok):
     if dictation_data:
         vc_inst = dictation_data.get("voice_chat_instance")
         dictation_on = dictation_data.get("active", False)
-        print(f"  Dictation: {'ON' if dictation_on else 'OFF'}"
-              f"  |  Voice-chat instance: {vc_inst or 'none'}")
+        print(
+            f"  Dictation: {'ON' if dictation_on else 'OFF'}"
+            f"  |  Voice-chat instance: {vc_inst or 'none'}"
+        )
     print()
 
     # Table
