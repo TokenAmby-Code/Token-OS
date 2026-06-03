@@ -17329,12 +17329,21 @@ def _derive_session_doc_slug(file_path: str | None) -> str | None:
     return match.group(1) if match else (name or None)
 
 
+_DAILY_NOTE_DATE_SLUG_RX = re.compile(r"\d{4}-\d{2}-\d{2}$")
+
+
 def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) -> bool:
     cleaned = _clean_tab_name(tab_name)
     if not cleaned or _is_placeholder_tab_name(tab_name):
         return False
     slug = _derive_session_doc_slug(file_path)
     if not slug:
+        return False
+    # A date-named daily note (YYYY-MM-DD) is never a real mismatch against a
+    # persona tab: the custodes/persona binds to the day's note, whose slug is
+    # the date, not the persona name. (Satisfies the rescued WIP test-first
+    # spec, tests/test_legion_synced.py::TestTabNameMismatchDailyNote.)
+    if _DAILY_NOTE_DATE_SLUG_RX.match(slug):
         return False
     a = cleaned.lower()
     b = slug.lower()
