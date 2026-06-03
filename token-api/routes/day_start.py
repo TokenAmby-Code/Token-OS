@@ -155,6 +155,80 @@ async def _consumer_custodes_morning_session() -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+_DAILY_NOTE_BASENAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
+
+
+async def _consumer_custodes_doc_rebind() -> dict:
+    """Rebind a live custodes bound to a prior-day daily note onto today's note.
+
+    A custodes alive across midnight stays bound to yesterday's daily note. Only
+    date-named daily-note bindings are rebound; bespoke dockets are left untouched.
+    """
+    from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
+    from instance_mutation import sanctioned_update_instance
+
+    rebound: list[dict] = []
+    skipped: list[dict] = []
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        today_id = await resolve_or_create_today_daily_note_session_doc(db)
+
+        # Canonical "today" date string from the resolved note's own path so the
+        # comparison matches whatever date the helper minted.
+        cursor = await db.execute(
+            "SELECT file_path FROM session_documents WHERE id = ?", (today_id,)
+        )
+        today_row = await cursor.fetchone()
+        today_match = (
+            _DAILY_NOTE_BASENAME_RE.search(today_row["file_path"])
+            if today_row and today_row["file_path"]
+            else None
+        )
+        today_date = today_match.group(1) if today_match else None
+
+        cursor = await db.execute(
+            """
+            SELECT ci.id AS id, ci.session_doc_id AS session_doc_id, sd.file_path AS file_path
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            WHERE ci.legion = 'custodes'
+              AND ci.status IN ('idle', 'processing')
+              AND ci.stopped_at IS NULL
+            """
+        )
+        live = await cursor.fetchall()
+
+        for row in live:
+            file_path = row["file_path"]
+            match = _DAILY_NOTE_BASENAME_RE.search(file_path) if file_path else None
+            if not match:
+                # No doc, or a bespoke docket — leave the binding untouched.
+                skipped.append({"instance_id": row["id"], "reason": "not_daily_note"})
+                continue
+            if today_date and match.group(1) == today_date:
+                skipped.append({"instance_id": row["id"], "reason": "already_today"})
+                continue
+
+            await sanctioned_update_instance(
+                db,
+                instance_id=row["id"],
+                updates={"session_doc_id": today_id},
+                mutation_type="instance_updated",
+                write_source="day_start",
+                actor="day_start:custodes_doc_rebind",
+            )
+            rebound.append({"instance_id": row["id"], "from_date": match.group(1)})
+
+        if rebound:
+            await db.commit()
+            await log_event(
+                "custodes_doc_rebound",
+                details={"today_doc_id": today_id, "rebound": rebound},
+            )
+
+    return {"status": "ok", "rebound": rebound, "skipped": skipped}
+
+
 async def _consumer_stub(name: str, follow_up: str) -> dict:
     return {"status": "stubbed", "consumer": name, "follow_up": follow_up}
 
@@ -181,6 +255,7 @@ async def _day_start_fanout(day_state: dict) -> list[dict]:
     consumers = [
         ("quiet_hours", _consumer_quiet_hours(day_state)),
         ("tts_suppression", _consumer_tts_suppression(day_state)),
+        ("custodes_doc_rebind", _consumer_custodes_doc_rebind()),
         ("custodes_morning_session", _consumer_custodes_morning_session()),
         (
             "pavlok_daily_warmup",

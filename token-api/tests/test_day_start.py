@@ -117,3 +117,59 @@ def test_wake_anchor_schedule_sync_reads_daily_note_frontmatter(app_env):
         "SELECT schedule FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'",
     )
     assert row["schedule"] == "15 9 * * *"
+
+
+def test_alarm_silenced_fires_day_start_and_launches_morning(app_env, monkeypatch):
+    """Silencing the Hatch alarm fires day-start and launches the morning session.
+
+    Pins Problem B's wiring: the alarm-silenced ingress calls
+    fire_day_start_internal(source="alarm_silenced"), which latches day_state
+    (non-null) and runs the fan-out whose custodes_morning_session consumer
+    launches morning. A re-silence is idempotent — no second launch.
+    """
+    from fastapi.testclient import TestClient
+
+    import routes.day_start as day_start
+
+    launches: list[bool] = []
+
+    async def fake_morning():
+        launches.append(True)
+        return {"status": "ok", "result": "launched", "pane_id": "%99"}
+
+    async def fake_phone(_state):
+        return {"status": "ok", "reachable": True}
+
+    async def fake_rebind():
+        return {"status": "ok", "rebound": [], "skipped": []}
+
+    # Stub the network/DB-touching consumers so the test exercises the wiring,
+    # not localhost:7777 or the daily-note rebind path.
+    monkeypatch.setattr(day_start, "_consumer_custodes_morning_session", fake_morning)
+    monkeypatch.setattr(day_start, "_consumer_phone_reachability", fake_phone)
+    monkeypatch.setattr(day_start, "_consumer_custodes_doc_rebind", fake_rebind)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/morning/alarm-silenced")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["already_started"] is False
+    # day_state goes non-null — the core "no morning session at all" fix.
+    assert data["day_state"]["day_started_at"]
+    assert data["day_state"]["source"] == "alarm_silenced"
+    # The morning session was launched via the day-start fan-out.
+    assert launches == [True]
+
+    row = _row(
+        app_env.db_path,
+        "SELECT * FROM day_state WHERE date = ?",
+        (data["day_state"]["date"],),
+    )
+    assert row["day_started_at"] == data["day_state"]["day_started_at"]
+    assert row["source"] == "alarm_silenced"
+
+    # Idempotent: a re-silence does not re-fire the fan-out or re-launch morning.
+    second = client.post("/api/morning/alarm-silenced").json()
+    assert second["already_started"] is True
+    assert launches == [True]

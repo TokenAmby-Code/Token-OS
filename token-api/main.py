@@ -17613,12 +17613,21 @@ def _derive_session_doc_slug(file_path: str | None) -> str | None:
     return match.group(1) if match else (name or None)
 
 
+_DAILY_NOTE_DATE_SLUG_RX = re.compile(r"\d{4}-\d{2}-\d{2}$")
+
+
 def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) -> bool:
     cleaned = _clean_tab_name(tab_name)
     if not cleaned or _is_placeholder_tab_name(tab_name):
         return False
     slug = _derive_session_doc_slug(file_path)
     if not slug:
+        return False
+    # A date-named daily note (YYYY-MM-DD) is never a real mismatch against a
+    # persona tab: the custodes/persona binds to the day's note, whose slug is
+    # the date, not the persona name. (Satisfies the rescued WIP test-first
+    # spec, tests/test_legion_synced.py::TestTabNameMismatchDailyNote.)
+    if _DAILY_NOTE_DATE_SLUG_RX.match(slug):
         return False
     a = cleaned.lower()
     b = slug.lower()
@@ -18685,6 +18694,89 @@ async def alarm_dismiss(delay_minutes: int = 0):
     )
     await log_event(
         "morning_alarm_dismiss",
+        device_id="phone",
+        details={
+            "delay_minutes": delay_minutes,
+            "fires_at": fires_at.isoformat(),
+        },
+    )
+
+    return {
+        "scheduled_at": now.isoformat(),
+        "fires_at": fires_at.isoformat(),
+    }
+
+
+_ALARM_SILENCED_JOB_ID = "morning_alarm_silenced"
+
+
+@app.post("/api/morning/alarm-silenced")
+async def alarm_silenced(delay_minutes: int = 0):
+    """Fire the unified day-start hook when the Hatch alarm is silenced.
+
+    The Hatch alarm-silence keystroke is the Emperor's canonical wake/ack
+    signal (distinct from snooze/dismiss), so silencing it starts the day:
+    fire_day_start_internal(source="alarm_silenced") latches day_state and runs
+    the day-start fan-out, whose custodes_morning_session consumer launches the
+    morning session. Idempotent by construction — set_day_started_at reports
+    already_started on a repeat, so a re-silence never double-launches morning.
+
+    delay_minutes (0–120, default 0) mirrors alarm_dismiss for phone-macro
+    parity: 0 fires now; >0 schedules an idempotent (replace_existing) job so a
+    re-silence within the window reschedules rather than stacking.
+
+    Args:
+        delay_minutes: Minutes to wait before firing (default 0, max 120).
+    """
+    delay_minutes = max(0, min(delay_minutes, 120))
+    now = datetime.now()
+
+    if delay_minutes == 0:
+        result = await fire_day_start_internal(source="alarm_silenced")
+        await log_event(
+            "morning_alarm_silenced",
+            device_id="phone",
+            details={
+                "delay_minutes": 0,
+                "fired_at": now.isoformat(),
+                "already_started": result.get("already_started", False),
+            },
+        )
+        return {
+            "fired_at": now.isoformat(),
+            "already_started": result.get("already_started", False),
+            "day_state": result.get("day_state"),
+        }
+
+    fires_at = now + timedelta(minutes=delay_minutes)
+
+    async def _fire_day_start():
+        try:
+            await fire_day_start_internal(source="alarm_silenced")
+        except Exception as exc:
+            logger.error(f"alarm-silenced day-start fire failed: {exc}")
+
+    # Cancel any existing pending job (idempotent)
+    try:
+        scheduler.remove_job(_ALARM_SILENCED_JOB_ID)
+        logger.info("alarm-silenced: cancelled previous pending job")
+    except Exception:
+        pass  # No existing job — fine
+
+    scheduler.add_job(
+        _fire_day_start,
+        DateTrigger(run_date=fires_at),
+        id=_ALARM_SILENCED_JOB_ID,
+        replace_existing=True,
+        name="Morning Alarm Silenced",
+        misfire_grace_time=300,
+    )
+
+    logger.info(
+        f"alarm-silenced: day-start scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)"
+    )
+    await log_event(
+        "morning_alarm_silenced",
         device_id="phone",
         details={
             "delay_minutes": delay_minutes,
@@ -23800,6 +23892,7 @@ hooks_init_deps(
     schedule_golden_throne_callback=schedule_golden_throne_followup,
     golden_throne_activity_callback=golden_throne_user_activity,
     askq_level1_callback=_askq_level1_callback,
+    tmux_send_payload_then_submit=_tmux_send_payload_then_submit,
 )
 
 

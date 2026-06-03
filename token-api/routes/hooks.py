@@ -165,6 +165,11 @@ _golden_throne_activity_callback: Callable[..., Any] | None = None
 _askq_level1_callback: Callable[..., Any] | None = None
 _askq_touch2_callback: Callable[..., Any] | None = None
 _askq_level3_callback: Callable[..., Any] | None = None
+# main.py's gate-aware, verification-tracked pane-write primitive. Hooks route
+# live prompt delivery through this instead of a bespoke send so the universal
+# send gate is honored and delivery truth (gated/unverified/submitted) is not
+# faked. Tests wire a fake directly onto this module global.
+_tmux_send_payload_then_submit: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -178,12 +183,13 @@ def init_deps(
     schedule_golden_throne_callback=None,
     golden_throne_activity_callback=None,
     askq_level1_callback=None,
+    tmux_send_payload_then_submit=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
     global _run_stop_evaluators, _auto_name_instance, _work_action_callback
     global _schedule_golden_throne_callback, _golden_throne_activity_callback
-    global _askq_level1_callback
+    global _askq_level1_callback, _tmux_send_payload_then_submit
 
     _scheduler = scheduler
     _timer_engine = timer_engine
@@ -194,6 +200,7 @@ def init_deps(
     _schedule_golden_throne_callback = schedule_golden_throne_callback
     _golden_throne_activity_callback = golden_throne_activity_callback
     _askq_level1_callback = askq_level1_callback
+    _tmux_send_payload_then_submit = tmux_send_payload_then_submit
 
 
 def _require_dep(name: str, value):
@@ -287,6 +294,46 @@ SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
+CUSTODES_PANE_LABEL = "legion:custodes"
+
+# Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
+# stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
+# persona, so we derive its row identity (legion + primarch + instance_type, and
+# synced for the custodes singleton) from the pane. This makes "SessionStart from
+# a persona pane registers correctly" an infrastructure invariant — no persona
+# ever has to self-PATCH legion/type/synced. The fields chosen match each
+# persona's own resolution key: custodes resolves on legion+synced+instance_type,
+# FG on its pane label, Administratum on primarch='administratum'.
+#
+# Worker panes (mechanicus:N, mechanicus:worker-N) are intentionally absent — they
+# are not personas and resolve their legion from dispatch env / working-dir
+# auto-detect, not from a fixed identity.
+PERSONA_PANE_IDENTITY: dict[str, dict] = {
+    CUSTODES_PANE_LABEL: {
+        "legion": "custodes",
+        "primarch": "custodes",
+        "instance_type": "sync",
+        "synced": True,
+    },
+    MECHANICUS_FG_LABEL: {
+        # FG owns a dedicated singleton legion ("fabricator", see ALLOWED_LEGIONS /
+        # SINGLETON_LEGIONS and assertions._row_matches_persona). The "mechanicus:"
+        # prefix is the tmux page/region, NOT the legion.
+        "legion": "fabricator",
+        "primarch": "fabricator-general",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+    MECHANICUS_ADMIN_LABEL: {
+        # Administratum has no dedicated legion; it registers under the shared
+        # mechanicus legion. Its load-bearing resolution key is primarch (token-api
+        # _resolve_administratum_instance keys on primarch='administratum').
+        "legion": "mechanicus",
+        "primarch": "administratum",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+}
 
 
 async def _run_subprocess_offloop(
@@ -1176,29 +1223,56 @@ def _stop_event_key(session_id: str, payload: dict) -> str:
 
 
 async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
-    """Best-effort live prompt delivery used from hooks without importing main.py."""
-    try:
-        from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+    """Live prompt delivery through the verified pane-write primitive.
 
-        adapter = TmuxAdapter()
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(adapter.send_text_then_submit, tmux_pane, payload),
-                timeout=10,
-            )
-            return {"status": "sent", "operation": "tmuxctl.send_text_then_submit"}
-        except TmuxError as exc:
-            return {"status": "failed", "error": str(exc)}
-    except Exception:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "send-keys", "-t", tmux_pane, payload, "Enter"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            return {"status": "sent", "operation": "tmux.send-keys"}
-        return {"status": "failed", "error": proc.stderr.decode(errors="replace")}
+    Routes through main.py's gate-aware ``_tmux_send_payload_then_submit``
+    (injected via init_deps) instead of the old bespoke send that discarded the
+    adapter's result and hardcoded ``{"status": "sent"}`` — and then fell back to
+    a raw ``tmux send-keys`` that reported ``sent`` on rc==0 alone, with no
+    delivery proof and no respect for the universal send gate. Both were lies:
+    "fired but nothing arrived" while the system believed it delivered.
+
+    Reports the truth instead:
+
+      * ``sent``       — submission verified (the composer cleared after submit)
+      * ``unverified`` — bytes were issued but delivery is not yet proven; the
+                          proof belt (UserPromptSubmit correlation) confirms it
+                          asynchronously
+      * ``gated``      — the universal send gate suppressed the write (NO bytes
+                          reached the pane); never reported as delivered
+      * ``failed``     — the send errored
+
+    The full primitive result is returned under ``send`` so callers can persist
+    the verification record.
+    """
+    send = _tmux_send_payload_then_submit
+    if send is None:
+        return {"status": "failed", "error": "pane-write primitive not initialized"}
+    result = await send(tmux_pane, payload)
+    if result.get("gated"):
+        # Gate suppressed the send — no bytes issued. NOT a delivery.
+        return {
+            "status": "gated",
+            "verification_status": result.get("verification_status", "gated"),
+            "gate_reason": result.get("gate_reason"),
+            "send": result,
+        }
+    if result.get("returncode") == 0:
+        # Bytes issued. Only a confirmed submission (composer cleared) is
+        # "sent"; otherwise it is honestly "unverified" until the proof belt
+        # correlates a UserPromptSubmit. Never default bytes-issued to "sent".
+        verified = result.get("verification_status") == "submitted"
+        return {
+            "status": "sent" if verified else "unverified",
+            "verification_status": result.get("verification_status"),
+            "operation": result.get("operation"),
+            "send": result,
+        }
+    return {
+        "status": "failed",
+        "error": result.get("stderr") or result.get("error"),
+        "send": result,
+    }
 
 
 async def _enqueue_and_send_stop_delivery(
@@ -1251,19 +1325,41 @@ async def _enqueue_and_send_stop_delivery(
     await db.commit()
 
     send_result = await _direct_pane_write(subscription["subscriber_pane"], payload)
-    sent = send_result.get("status") == "sent"
-    final_status = "sent" if sent else "failed"
+    delivery_status = send_result.get("status")
+    # Map delivery truth onto the durable queue row + the delivery record:
+    #   sent/unverified -> bytes were issued, so the queue row is terminal
+    #       'sent' (re-queuing would double the send); the proof belt upgrades
+    #       an 'unverified' delivery asynchronously.
+    #   gated           -> the universal gate suppressed the write (NO bytes).
+    #       Keep the pane_write_queue row 'pending' so the periodic worker
+    #       re-drains it when the gate clears — never reported as delivered.
+    #   failed          -> the send errored.
+    bytes_issued = delivery_status in ("sent", "unverified")
+    if delivery_status == "gated":
+        queue_status = "pending"
+    elif bytes_issued:
+        queue_status = "sent"
+    else:
+        queue_status = "failed"
+    # The delivery record carries the precise truth, including 'unverified'.
+    delivery_record_status = (
+        delivery_status
+        if delivery_status in ("sent", "unverified", "gated", "failed")
+        else "failed"
+    )
+    delivered_at = datetime.now().isoformat() if bytes_issued else None
+    error = send_result.get("error") or send_result.get("gate_reason")
     await db.execute(
         """UPDATE pane_write_queue
            SET status = ?, attempted_at = ?, sent_at = ?, updated_at = ?,
                last_error = ?, last_result_json = ?
            WHERE id = ?""",
         (
-            final_status,
+            queue_status,
             now,
-            now if sent else None,
+            now if bytes_issued else None,
             datetime.now().isoformat(),
-            send_result.get("error"),
+            error,
             json.dumps(send_result, sort_keys=True),
             queue_id,
         ),
@@ -1273,15 +1369,15 @@ async def _enqueue_and_send_stop_delivery(
            SET status = ?, delivered_at = ?, error = ?
            WHERE id = ?""",
         (
-            final_status,
-            datetime.now().isoformat() if sent else None,
-            send_result.get("error"),
+            delivery_record_status,
+            delivered_at,
+            error,
             delivery_id,
         ),
     )
     await db.commit()
     return {
-        "status": final_status,
+        "status": delivery_status,
         "delivery_id": delivery_id,
         "queue_id": queue_id,
         "subscriber_pane": subscription["subscriber_pane"],
@@ -1621,6 +1717,23 @@ async def handle_session_start(payload: dict) -> dict:
     )
     if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
         launch_instance_type = None
+    # Persona/orchestrator pane (tmuxctl stamps a stable @PANE_ID like
+    # "legion:custodes" / "mechanicus:fabricator-general" / "mechanicus:admin").
+    # A fresh spawn in one of these panes IS that persona — derive its row identity
+    # from the pane so the agent never self-PATCHes legion/primarch/type/synced.
+    # The pane is authoritative for the persona's legion (written below in the
+    # auto_legion block regardless of env); here we only fill the blanks the launch
+    # left in the env-derived fields (dispatch_legion for doc resolution, primarch,
+    # instance_type) so an explicit dispatch can still tune those.
+    persona_identity = PERSONA_PANE_IDENTITY.get(pane_label or "")
+    if persona_identity:
+        if not dispatch_legion:
+            dispatch_legion = persona_identity["legion"]
+        if not primarch_name:
+            primarch_name = persona_identity.get("primarch") or ""
+        if launch_instance_type is None:
+            launch_instance_type = persona_identity.get("instance_type")
+    persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
     )
@@ -2303,7 +2416,7 @@ async def handle_session_start(payload: dict) -> dict:
                 "pid": payload.get("pid"),
                 "status": "idle",
                 "legion": _prior_legion or "astartes",
-                "synced": 0,
+                "synced": 1 if persona_synced else 0,
                 "input_lock": None,
                 "is_subagent": is_subagent,
                 "tmux_pane": tmux_pane,
@@ -2406,6 +2519,10 @@ async def handle_session_start(payload: dict) -> dict:
                 auto_legion = "mechanicus"
         elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
             auto_legion = "civic"
+        elif persona_identity:
+            # Fresh persona singleton: the INSERT wrote _prior_legion or "astartes",
+            # never dispatch_legion — so write the pane's canonical legion here.
+            auto_legion = persona_identity["legion"]
 
         # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:
