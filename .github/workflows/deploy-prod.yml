@@ -10,12 +10,16 @@ name: Deploy (prod)
 # 200 immediately and restarts detached, so this job does not hang on the restart.
 #
 # Required GitHub secrets (provisioned OUTSIDE this repo):
-#   TS_AUTHKEY        — ephemeral, pre-authorized Tailscale auth key
+#   TS_AUTHKEY        — ephemeral, pre-authorized Tailscale auth key (tagged tag:ci)
 #   CD_RESTART_SECRET — shared bearer secret; must match token-api's env of the
-#                       same name (launchd-injected / Keychain). Fail-closed there.
-#   CD_TAILNET_HOST   — the Mac's tailnet address (MagicDNS name or 100.x IP)
-# Tailnet ACL must also allow this ephemeral node to reach CD_TAILNET_HOST:7777
+#                       same name (launchd-injected). Fail-closed there.
+#   TAILSCALE_IP_MAC  — the Mac's tailnet IP (reused existing infra secret).
+# Tailnet ACL must also allow the tag:ci ephemeral node to reach <Mac>:7777
 # (configured in the tailnet admin console — easy to forget; shows up as a curl timeout).
+#
+# GUARD: if any of the three secrets is unset, the restart job SKIPS the tailnet
+# join + webhook (logs a notice, stays GREEN) instead of failing. So this workflow
+# is safe to merge before provisioning is complete — it just no-ops until ready.
 
 on:
   push:
@@ -81,9 +85,24 @@ jobs:
     if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+      CD_HOST: ${{ secrets.TAILSCALE_IP_MAC }}
     steps:
+      - name: Provisioning gate (skip cleanly if secrets unset)
+        id: gate
+        run: |
+          if [ -z "$TS_AUTHKEY" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
+            echo "::notice::CD secrets not fully provisioned (TS_AUTHKEY/CD_RESTART_SECRET/TAILSCALE_IP_MAC) — skipping restart. This is NOT a failure."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve merged PR url (best-effort, for badge flip)
         id: pr
+        if: steps.gate.outputs.go == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -92,6 +111,7 @@ jobs:
           echo "url=${url}" >> "$GITHUB_OUTPUT"
 
       - name: Tailscale (ephemeral)
+        if: steps.gate.outputs.go == 'true'
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
@@ -99,17 +119,12 @@ jobs:
           args: --accept-routes
 
       - name: POST restart webhook (ack-first)
+        if: steps.gate.outputs.go == 'true'
         env:
-          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
-          CD_HOST: ${{ secrets.CD_TAILNET_HOST }}
           SERVICES: ${{ needs.detect-changes.outputs.services }}
           PR_URL: ${{ steps.pr.outputs.url }}
           SHA: ${{ github.sha }}
         run: |
-          if [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
-            echo "::error::CD_RESTART_SECRET / CD_TAILNET_HOST secrets not configured"
-            exit 1
-          fi
           body=$(jq -nc \
             --argjson services "$SERVICES" \
             --arg sha "$SHA" \
