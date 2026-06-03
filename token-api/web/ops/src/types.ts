@@ -45,6 +45,8 @@ export type OpsInstance = {
   is_subagent: boolean;
   legion: string | null;
   instance_type: string | null;
+  pr_url: string | null;
+  pr_state: string | null; // "open" | "merged" | null
   workflow_state: string | null;
   next_required_action: string | null;
   stop_allowed: boolean | null;

@@ -150,11 +150,16 @@ for file in "${FILES[@]}"; do
 
     rel="${file#$project_root/}"
     log "format ${file}"
-    if ! (cd "$project_root" && uvx --python 3.11 ruff format "$rel" >> "$LOG_FILE" 2>&1); then
+    # Single source of truth = uv.lock via `uv run --group dev ruff` — byte-identical
+    # to CI (push.yml/pr.yml, which run `uv run --python 3.11 --group dev ruff`). Do NOT
+    # use `uvx ruff` (floating latest): that version skew vs the lockfile-pinned CI ruff
+    # is exactly what kept turning CI red on format drift. --force-exclude makes ruff
+    # honor [tool.ruff] exclude for the explicitly-passed path (matches CI directory mode).
+    if ! (cd "$project_root" && uv run --python 3.11 --group dev ruff format --force-exclude "$rel" >> "$LOG_FILE" 2>&1); then
         log "ruff format failed for ${file}"
         continue
     fi
-    if ! (cd "$project_root" && uvx --python 3.11 ruff check --fix "$rel" >> "$LOG_FILE" 2>&1); then
+    if ! (cd "$project_root" && uv run --python 3.11 --group dev ruff check --fix --force-exclude "$rel" >> "$LOG_FILE" 2>&1); then
         log "ruff check --fix failed for ${file}"
         continue
     fi

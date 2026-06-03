@@ -301,6 +301,18 @@ if [[ -x "$SCRIPT_DIR/rubric-flip" ]]; then
     "$SCRIPT_DIR/rubric-flip" --quiet --extra "pr_url=$PR_URL" pr_opened true || true
 fi
 
+# Instance DB flag: mark the originating instance as "has PR open" so /ui/ops can
+# badge it (Phase 1). Same instance→token-api path rubric-flip uses ($TOKEN_API_INSTANCE_ID
+# → :7777). Additive to the session-doc rubric write above, not a replacement.
+# Best-effort: never fail `pr create` if token-api is down or the instance is unknown.
+if [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
+    _pr_api="${TOKEN_API_URL:-http://localhost:7777}"
+    curl -fsS -m 5 -X PATCH \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"pr_url":"%s","pr_state":"open"}' "$PR_URL")" \
+        "${_pr_api}/api/instances/${TOKEN_API_INSTANCE_ID}/pr" >/dev/null 2>&1 || true
+fi
+
 if [[ "$NO_WAIT" == "true" ]]; then
     printf '%s\n' "$PR_URL"
     log "Review wait skipped. Run: pr-review-loop $PR_NUMBER --read"

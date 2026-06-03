@@ -10,6 +10,7 @@ This server provides:
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -135,6 +136,7 @@ from session_doc_helpers import (
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
+    update_session_doc_worktrees,
 )
 from shared import (
     CRASH_LOG_PATH,
@@ -8516,6 +8518,47 @@ async def set_instance_synced(instance_id: str, request: Request):
     return {"instance_id": instance_id, "synced": bool(synced_int), "legion": legion}
 
 
+@app.patch("/api/instances/{instance_id}/pr")
+async def set_instance_pr(instance_id: str, request: Request):
+    """Set the "agent has a PR open" flag (pr_url + pr_state) for an instance.
+
+    Phase 1: pr-create calls this best-effort after `gh pr create`, keyed off
+    $TOKEN_API_INSTANCE_ID, so /ui/ops badges the originating instance. pr_state is
+    flipped to 'merged' by the CD restart-on-merge webhook (Phase 2). Writes go
+    through sanctioned_update_instance (pr_url/pr_state are registered mutable fields).
+    """
+    body = await request.json()
+    pr_state = body.get("pr_state")
+    if pr_state is not None and pr_state not in ("open", "merged", "closed"):
+        raise HTTPException(status_code=400, detail="pr_state must be open|merged|closed")
+
+    updates: dict = {}
+    if "pr_url" in body:
+        updates["pr_url"] = body.get("pr_url")
+    if "pr_state" in body:
+        updates["pr_state"] = pr_state
+    if not updates:
+        raise HTTPException(status_code=400, detail="no pr fields provided (pr_url, pr_state)")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="set-pr",
+        )
+        await db.commit()
+
+    logger.info(f"PR flag: {instance_id[:12]} → {updates}")
+    return {"instance_id": instance_id, **updates}
+
+
 @app.patch("/api/instances/{instance_id}/discord")
 async def set_instance_discord(instance_id: str, request: Request):
     """Set discord_hosted flag and discord_channel for an instance."""
@@ -8820,6 +8863,58 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
     )
     logger.info(f"rubric-flip: doc {doc_id} {rubric_key or 'victory'}.{key} = {value}")
     return {"doc_id": doc_id, "key": key, "value": value, "extra": list(extra.keys())}
+
+
+# Serializes worktree-registry mutations so the demote-prior-active-then-append
+# stays atomic under concurrent claims (Phase 3, one-active invariant).
+_worktree_registry_lock = asyncio.Lock()
+
+
+@app.post("/api/session-docs/{doc_id}/worktrees")
+async def session_doc_worktrees(doc_id: int, request: Request):
+    """Mutate a session doc's worktree registry (Phase 3).
+
+    Body: {"action": "claim"|"archive", "path": str, "branch"?, "port"?,
+    "claimed_at"?}. The demote-active-then-append happens server-side under a
+    lock to hold the one-active invariant. Registry lives in session-doc
+    frontmatter — NOT the dormant `worktrees` DB table.
+    """
+    body = await request.json()
+    action = body.get("action")
+    if action not in ("claim", "archive"):
+        raise HTTPException(status_code=400, detail="action must be claim|archive")
+    path = body.get("path")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+    fp = Path(row[0])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail=f"Session doc file missing: {fp}")
+
+    async with _worktree_registry_lock:
+        try:
+            wts = await asyncio.to_thread(
+                update_session_doc_worktrees,
+                fp,
+                action=action,
+                path=path,
+                branch=body.get("branch"),
+                port=body.get("port"),
+                claimed_at=body.get("claimed_at"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.warning(f"worktrees: write failed for doc {doc_id}: {exc}")
+            raise HTTPException(status_code=500, detail=f"worktree registry write failed: {exc}")
+
+    logger.info(f"worktrees: doc {doc_id} {action} {path}")
+    return {"doc_id": doc_id, "action": action, "worktrees": wts}
 
 
 @app.post("/api/session-docs/{doc_id}/victory-ack")
@@ -14468,6 +14563,191 @@ async def cancel_shutdown():
         return {"success": False, "message": str(e)}
 
 
+# ============ CD: restart-on-merge webhook (Phase 2) ============
+#
+# Token-OS is personal software on a local Mac — "deploy to prod" means restart
+# the right local services. deploy-prod.yml (push→main) joins the tailnet via an
+# ephemeral GHA node and POSTs here with the changed-service list. Design choice:
+# ACK-FIRST, RESTART-DETACHED — validate the secret, spawn a fully detached restart,
+# and return 200 *before* token-api restarts itself, so the response flushes while
+# the runner is still waiting. The self-restart child survives our death
+# (start_new_session) and kicks launchd externally; restore_restart_state()
+# rehydrates ephemeral state on boot.
+
+# The shared secret lives OUTSIDE the repo — injected into token-api's launchd
+# environment (or read from Keychain) as CD_RESTART_SECRET. Fail-closed: if it is
+# unset/blank the endpoint refuses every request. Tailscale is defense-in-depth,
+# not a substitute for the secret.
+_CD_SECRET_ENV = "CD_RESTART_SECRET"
+
+# In-flight guard: coalesce concurrent restarts. A self-restart kills the process
+# (clearing this anyway), but two webhooks racing must not spawn two kickstarts.
+_cd_self_restart_scheduled = False
+
+# Canonical service keys → how each is restarted. deploy-prod.yml's path-filter
+# emits these keys. "log-only" globs (tmux/ahk/hammerspoon) are intentionally
+# dropped — no headless restart path — and only logged.
+_CD_LOG_ONLY = {"tmux", "ahk", "hammerspoon"}
+
+
+def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
+    """Fire-and-forget a detached child that survives our own restart."""
+    log_path = Path(f"/tmp/cd-{log_name}.log")
+    handle = log_path.open("a")
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        handle.close()
+
+
+async def _cd_flip_pr_merged(pr_url: str) -> int:
+    """Flip pr_state→merged for instances whose pr_url matches the merged PR."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE pr_url = ? AND pr_state = 'open'",
+            (pr_url,),
+        )
+        ids = [r[0] for r in await cursor.fetchall()]
+        for iid in ids:
+            await sanctioned_update_instance(
+                db,
+                instance_id=iid,
+                updates={"pr_state": "merged"},
+                mutation_type="instance_updated",
+                write_source="cd",
+                actor="cd-restart",
+            )
+        await db.commit()
+    return len(ids)
+
+
+@app.post("/api/cd/restart")
+async def cd_restart(request: Request):
+    """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
+
+    Body: {"services": [...], "sha": "...", "pr_url": "..."} — services is the
+    changed-service key list from deploy-prod.yml's path filter. Returns a
+    per-service result map immediately; the token-api self-restart (if any) is
+    deferred to a detached child so this 200 flushes first.
+    """
+    global _cd_self_restart_scheduled
+
+    configured = os.environ.get(_CD_SECRET_ENV, "").strip()
+    if not configured:
+        # Fail-closed: never accept when no secret is provisioned.
+        logger.error("CD: /api/cd/restart called but %s is unset — refusing", _CD_SECRET_ENV)
+        raise HTTPException(status_code=503, detail="CD restart not configured")
+
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, configured):
+        logger.warning("CD: rejected /api/cd/restart — bad/missing bearer secret")
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    services = body.get("services") or []
+    if not isinstance(services, list):
+        raise HTTPException(status_code=400, detail="services must be a list")
+    sha = body.get("sha")
+    pr_url = body.get("pr_url")
+
+    results: dict[str, str] = {}
+    needs_self_restart = False
+
+    for svc in services:
+        key = str(svc).strip().lower()
+        if key in ("token-api", "token_api", "tokenapi", "ops-ui", "ops", "web"):
+            # ops-ui is served by token-api; token-restart AppleScript-reloads tabs.
+            needs_self_restart = True
+            results[key] = "self-restart scheduled"
+        elif key in ("discord-daemon", "discord", "discord-context"):
+            try:
+                _cd_spawn_detached(
+                    ["launchctl", "kickstart", "-k", "gui/501/ai.openclaw.discord-context"],
+                    log_name="discord-restart",
+                )
+                results[key] = "kicked"
+            except Exception as e:  # per-service failure must not fail the webhook
+                results[key] = f"error: {e}"
+        elif key in ("satellite", "token-satellite", "wsl"):
+            try:
+                wsl_host = cfg("tailscale_ip", "wsl")
+                _cd_spawn_detached(
+                    [
+                        "curl",
+                        "-fsS",
+                        "-m",
+                        "5",
+                        "-X",
+                        "POST",
+                        f"http://{wsl_host}:7777/restart",
+                    ],
+                    log_name="satellite-restart",
+                )
+                results[key] = "restart posted"
+            except Exception as e:
+                results[key] = f"error: {e}"
+        elif key in ("mobile", "push-mobile"):
+            try:
+                push_mobile = str(SCRIPTS_DIR / "cli-tools" / "bin" / "push-mobile")
+                _cd_spawn_detached([push_mobile, "-a"], log_name="push-mobile")
+                results[key] = "push-mobile -a spawned"
+            except Exception as e:
+                results[key] = f"error: {e}"
+        elif key in _CD_LOG_ONLY:
+            logger.info("CD: %s changed — log-only (no headless restart path)", key)
+            results[key] = "log-only (dropped)"
+        else:
+            results[key] = "unknown service (ignored)"
+
+    # Flip the merged PR's originating instance badge (Phase 1 → merged).
+    merged_flips = 0
+    if pr_url:
+        try:
+            merged_flips = await _cd_flip_pr_merged(pr_url)
+        except Exception as e:
+            logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
+
+    # Schedule the (deferred, detached) self-restart AFTER acking. The child sleeps
+    # so this 200 fully flushes before launchd kicks us. save_restart_state() here
+    # guards against kickstart -k not allowing a graceful lifespan shutdown.
+    self_restart = "not requested"
+    if needs_self_restart:
+        if _cd_self_restart_scheduled:
+            self_restart = "already scheduled (coalesced)"
+        else:
+            _cd_self_restart_scheduled = True
+            try:
+                save_restart_state()
+            except Exception as e:
+                logger.warning("CD: save_restart_state failed (continuing): %s", e)
+            token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
+            _cd_spawn_detached(
+                ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)}"],
+                log_name="self-restart",
+            )
+            self_restart = "scheduled (detached, ~2s)"
+            logger.info("CD: self-restart scheduled (sha=%s)", sha)
+
+    return {
+        "ok": True,
+        "sha": sha,
+        "services": results,
+        "self_restart": self_restart,
+        "pr_merged_flips": merged_flips,
+    }
+
+
 # ============ KVM (Deskflow) ============
 
 
@@ -15843,6 +16123,10 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "legion": inst.get("legion"),
                 "work_class": work_class,
                 "instance_type": inst.get("instance_type"),
+                # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
+                # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
+                "pr_url": inst.get("pr_url"),
+                "pr_state": inst.get("pr_state"),
                 "workflow_state": inst.get("workflow_state"),
                 "next_required_action": inst.get("next_required_action"),
                 "stop_allowed": bool(inst.get("stop_allowed"))

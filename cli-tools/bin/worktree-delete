@@ -224,6 +224,25 @@ if command -v free_port &>/dev/null; then
     fi
 fi
 
+# Archive this worktree's entry in its session doc (Phase 3 registry), BEFORE the
+# directory (and its .worktree.env) is removed. Entries are flipped active→archived,
+# never deleted. Best-effort: unreachable token-api never blocks teardown.
+if [[ -f "$WORKTREE_DIR/.worktree.env" ]]; then
+    _SESSION_DOC_ID="$(grep -E '^SESSION_DOC_ID=' "$WORKTREE_DIR/.worktree.env" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    if [[ -n "$_SESSION_DOC_ID" ]]; then
+        _wt_api="${TOKEN_API_URL:-http://localhost:7777}"
+        _wt_body=$(printf '{"action":"archive","path":"%s"}' "$WORKTREE_DIR")
+        if curl -fsS -m 5 -X POST \
+            -H "Content-Type: application/json" \
+            -d "$_wt_body" \
+            "$_wt_api/api/session-docs/$_SESSION_DOC_ID/worktrees" >/dev/null 2>&1; then
+            log_success "Archived worktree entry in session doc $_SESSION_DOC_ID"
+        else
+            log_warn "Could not archive worktree entry in session doc $_SESSION_DOC_ID (token-api unreachable?)"
+        fi
+    fi
+fi
+
 # Remove worktree
 if [[ -d "$WORKTREE_DIR" ]]; then
     log_info "Removing worktree..."

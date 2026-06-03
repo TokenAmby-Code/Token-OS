@@ -162,6 +162,17 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "planning_source",
                 "ALTER TABLE claude_instances ADD COLUMN planning_source TEXT",
             ),
+            # "Agent has a PR open" flag (Phase 1). Additive + nullable, no backfill
+            # lock. pr_state ∈ {open, merged}; surfaced as a /ui/ops badge. pr_state is
+            # flipped to 'merged' by the CD restart-on-merge webhook (Phase 2).
+            (
+                "pr_url",
+                "ALTER TABLE claude_instances ADD COLUMN pr_url TEXT",
+            ),
+            (
+                "pr_state",
+                "ALTER TABLE claude_instances ADD COLUMN pr_state TEXT",
+            ),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
