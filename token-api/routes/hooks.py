@@ -65,7 +65,6 @@ from shared import (
     log_event,
     resolve_device_from_ip,
 )
-from timer import TimerEvent
 
 logger = logging.getLogger("token_api")
 
@@ -1275,6 +1274,43 @@ async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
     }
 
 
+async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
+    """Flag a stop-subscription subscriber hook_driven=1 before delivery — the
+    subscriber (e.g. FG watching its stack workers) is being woken autonomously by
+    the watched instance's Stop, NOT by the Emperor. Resolve by subscriber_instance_id
+    first, else by live subscriber_pane. Committed by the caller before the byte
+    lands (see the commit preceding _direct_pane_write). Best-effort."""
+    target_id = _normalize_text(subscription.get("subscriber_instance_id"))
+    pane = _normalize_text(subscription.get("subscriber_pane"))
+    try:
+        if not target_id and pane:
+            prev_factory = getattr(db, "row_factory", None)
+            db.row_factory = aiosqlite.Row
+            try:
+                cur = await db.execute(
+                    "SELECT id FROM claude_instances WHERE tmux_pane = ? "
+                    "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
+                    (pane,),
+                )
+                row = await cur.fetchone()
+            finally:
+                db.row_factory = prev_factory
+            if row:
+                target_id = row["id"]
+        if not target_id:
+            return
+        await sanctioned_update_instance(
+            db,
+            instance_id=target_id,
+            updates={"hook_driven": 1},
+            mutation_type="status_changed",
+            write_source="hooks",
+            actor="stop-subscription-delivery",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("hook_driven flag (stop-subscription) failed: %s", exc)
+
+
 async def _enqueue_and_send_stop_delivery(
     db,
     *,
@@ -1282,6 +1318,10 @@ async def _enqueue_and_send_stop_delivery(
     stop_event_key: str,
     payload: str,
 ) -> dict:
+    # Subscriber is woken autonomously by this Stop — flag it before the send. The
+    # flag is committed together with the delivery rows below (db.commit precedes
+    # _direct_pane_write), so the subscriber's PromptSubmit can't observe a stale 0.
+    await _flag_subscriber_hook_driven(db, subscription)
     delivery_id: int | None = None
     queue_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -2397,6 +2437,22 @@ async def handle_session_start(payload: dict) -> dict:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
 
+        # Dispatch → worker classification (hook_driven column, distinct from the
+        # instance_type='hook_driven' enum). A worker dispatched by a non-Custodes
+        # agent (e.g. Fabricator General) is driven autonomously → hook_driven=1; a
+        # Custodes-dispatched worker is Emperor-proxied → 0; a direct-Emperor launch
+        # has no agent parent → 0. parent_instance_id is the resolved dispatcher.
+        # Cleared on the worker's first Stop. (Default tuple row factory here.)
+        launch_hook_driven = 0
+        if parent_instance_id and not is_subagent:
+            cursor = await db.execute(
+                "SELECT legion FROM claude_instances WHERE id = ? LIMIT 1",
+                (parent_instance_id,),
+            )
+            _parent_row = await cursor.fetchone()
+            if _parent_row and (_parent_row[0] or "").lower() != "custodes":
+                launch_hook_driven = 1
+
         # Insert instance
         now = datetime.now().isoformat()
         internal_session_id = str(uuid.uuid4())
@@ -2434,6 +2490,7 @@ async def handle_session_start(payload: dict) -> dict:
                 "launch_mode": launch_mode,
                 "parent_instance_id": parent_instance_id,
                 "transplant_expected": 1 if transplant_expected else 0,
+                "hook_driven": launch_hook_driven,
                 "instance_type": launch_instance_type or "one_off",
                 "zealotry": launch_zealotry if launch_zealotry is not None else 4,
                 "session_doc_policy": session_doc_policy,
@@ -2721,6 +2778,7 @@ async def handle_session_end(payload: dict) -> dict:
                 "status": "stopped",
                 "synced": 0,
                 "stopped_at": now,
+                "hook_driven": 0,
                 "workflow_state": "closed",
                 "workflow_updated_at": now,
                 "workflow_blocked_reason": None,
@@ -2851,15 +2909,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
         await db.commit()
 
-    # Signal productivity — sets prod active, exits IDLE if needed
-    now_ms = int(time.monotonic() * 1000)
-    old_mode = shared.timer_engine.current_mode.value
-    result = shared.timer_engine.set_productivity(True, now_ms)
-    exited_idle = TimerEvent.MODE_CHANGED in result.events
-    if exited_idle:
-        new_mode = shared.timer_engine.current_mode.value
-        await shared.timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
-        logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
+    # NOTE: this hook no longer flips global productivity. Productivity is now a
+    # read-time calculus in compute_work_state (the 10s poll), which discounts
+    # hook_driven / automated-marker panes. An automated wake that triggers a fresh
+    # PromptSubmit therefore can no longer reset the idle clock. The work_action
+    # callback still fires (resolves expected-acks, busts quiet-state) but, for this
+    # non-explicit source, no longer sets global productivity (see _work_action).
+    exited_idle = False
     if _work_action_callback:
         await _work_action_callback(source="prompt_submit", note=f"session_id={session_id}")
 
@@ -2959,9 +3015,11 @@ async def handle_post_tool_use(payload: dict) -> dict:
         )
         await db.commit()
 
-    # Signal productivity — active tool use = real work
-    now_ms = int(time.monotonic() * 1000)
-    shared.timer_engine.set_productivity(True, now_ms)
+    # NOTE: no longer flips global productivity (read-time calculus owns it now —
+    # see handle_prompt_submit / compute_work_state). The status/last_activity
+    # heartbeat above is unchanged so stopped instances still resurrect and a
+    # missed PromptSubmit is still caught. Liveness is preserved; only the
+    # productivity flip is removed.
     if tool_name == "AskUserQuestion" and _work_action_callback:
         await _work_action_callback(
             source="ask_user_question_answered", note=f"session_id={session_id}"
@@ -3050,11 +3108,14 @@ async def handle_stop(payload: dict) -> dict:
     )
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        # Stop clears hook_driven=0 — the autonomous wake that flagged this instance
+        # has run its course. Idempotent (clearing an already-0 row is a no-op), so
+        # this is a safe generic clear on every Stop regardless of how it was woken.
         if will_evaluate or is_sync_instance:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"last_activity": now},
+                updates={"last_activity": now, "hook_driven": 0},
                 mutation_type="instance_updated",
                 write_source="hooks",
                 actor="Stop",
@@ -3063,7 +3124,7 @@ async def handle_stop(payload: dict) -> dict:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"status": "idle", "last_activity": now},
+                updates={"status": "idle", "last_activity": now, "hook_driven": 0},
                 mutation_type="status_changed",
                 write_source="hooks",
                 actor="Stop",
@@ -3127,7 +3188,7 @@ async def handle_stop(payload: dict) -> dict:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"status": "idle", "last_activity": now},
+                updates={"status": "idle", "last_activity": now, "hook_driven": 0},
                 mutation_type="status_changed",
                 write_source="hooks",
                 actor="Stop-golden-throne-idle",
