@@ -51,7 +51,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
-AHK_SCRIPTS_DIR = Path.home() / "Scripts" / "ahk"
+# AHK scripts ship in the repo's ahk/ dir (the satellite runs from the NAS
+# checkout). Was ~/Scripts/ahk — the dead pre-rename namespace, absent on this
+# host, which silently broke /ahk/execute.
+AHK_SCRIPTS_DIR = REPO_ROOT / "ahk"
 
 # PowerShell script for persistent TTS engine.
 # Uses SpeakAsync so the main loop stays responsive to skip/poll/pause/resume commands.
@@ -590,7 +593,6 @@ DESKFLOW_GUI_CONFIG_WSL = Path("/mnt/c/Users/colby/AppData/Roaming/Deskflow/Desk
 DESKFLOW_CORE_LOG = Path("/tmp/deskflow-core.log")
 DESKFLOW_SERVER_CONFIG_BACKUPS = [
     REPO_ROOT / "config" / "deskflow" / "wsl-server.conf",
-    Path("/mnt/imperium/Scripts/config/deskflow/wsl-server.conf"),
 ]
 DESKFLOW_POLL_INTERVAL = 30  # seconds between checks
 DESKFLOW_CONFIRM_CHECKS = 2  # consecutive checks before state transition
@@ -2102,8 +2104,18 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
 
 
 @app.post("/restart")
-async def restart_satellite(pull: bool = True):
-    """Git pull, then exit for systemd restart.
+async def restart_satellite(pull: bool = False):
+    """Exit for systemd restart, reloading code from the shared NAS checkout.
+
+    The satellite runs from the NAS checkout (``WorkingDirectory`` ==
+    ``Path(__file__).resolve().parents[1]``), the single source of truth that the
+    Mac (token-restart / CI restart-on-merge) fast-forwards. A plain restart
+    therefore reloads new code with no pull, so ``pull`` defaults to **False**.
+
+    Historically this pulled ``~/Scripts`` — the dead pre-rename Token-OS
+    namespace, a path that no longer exists on this host, so the pull silently
+    failed on every self-restart. When a pull IS requested we now ff the repo the
+    satellite actually runs from, never that dusty namespace.
 
     Legacy TUI restart signal files are intentionally gone. The live cockpit is
     `/ui/ops`; browser refresh is handled by token-restart on Mac and by the
@@ -2112,11 +2124,12 @@ async def restart_satellite(pull: bool = True):
     result = {"pull": None, "browser_gui": "frontend_auto_reload", "restarting": True}
     _send_lifecycle_event("restart_requested", {"pull": pull})
 
-    # 1. Git pull
+    # 1. Git pull (opt-in). Target the repo this process runs from — the shared
+    # NAS checkout — not the retired ~/Scripts namespace.
     if pull:
         try:
             proc = subprocess.run(
-                ["git", "-C", str(Path.home() / "Scripts"), "pull", "--ff-only"],
+                ["git", "-C", str(REPO_ROOT), "pull", "--ff-only"],
                 capture_output=True,
                 text=True,
                 timeout=15,
