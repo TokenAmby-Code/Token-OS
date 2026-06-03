@@ -127,3 +127,33 @@ def test_score_aggregates_work_signals_separately(client) -> None:
 
     assert wa["count"] == 1  # load-bearing: explicit work-actions only
     assert wa["score"] == 2  # non-load-bearing: all work_signal events
+
+
+# (6) Regression: prompt_submit / ask_user_question / typing-guard reach the same
+#     work_action() logic via hook_work_action_callback. They satisfy enforcement
+#     but are NOT explicit presses — they must not write the daily note or count
+#     toward the work-action dial/ticks. (Bug from PR #64: the count/persist keyed
+#     off event_type='work_action', which the hook path also produces.)
+def test_hook_driven_work_action_is_not_explicit(client, app_env) -> None:
+    import asyncio
+
+    main = app_env.main
+    note_path = _daily_note_path()
+
+    # Hook-driven satisfy signal (e.g. a prompt submit) — explicit=False.
+    asyncio.run(main.hook_work_action_callback("prompt_submit", "session_id=abc"))
+
+    # The hook path neither writes the daily note...
+    if note_path.exists():
+        assert _read_work_actions(note_path) == []
+    # ...nor counts as an explicit work-action.
+    resp = client.get("/api/ui/ops/state")
+    assert resp.json()["work_actions"]["count"] == 0
+
+    # An explicit HTTP press IS counted and persisted, even with the hook event
+    # already in the same events table.
+    client.post("/api/work-action", json={"source": "streamdeck"})
+    assert [a["source"] for a in _read_work_actions(note_path)] == ["streamdeck"]
+    wa = client.get("/api/ui/ops/state").json()["work_actions"]
+    assert wa["count"] == 1
+    assert wa["ticks"][0]["source"] == "streamdeck"

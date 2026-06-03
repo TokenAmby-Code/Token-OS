@@ -13718,8 +13718,24 @@ async def work_action(request: WorkActionRequest | None = None) -> dict:
     and resolves distraction/backlog acks with a logged work_signal:work_action
     reason. A work action proves productivity resumed; it does not prove phone/
     desktop distraction ended, so attention-source state is left untouched
-    (productivity + YouTube → MULTITASKING, not a false clear to WORKING)."""
-    request = request or WorkActionRequest()
+    (productivity + YouTube → MULTITASKING, not a false clear to WORKING).
+
+    This HTTP entry point is an EXPLICIT user press (Stream Deck, work-action
+    bind, Custodes-logged). Hook-driven satisfy signals (prompt_submit, etc.)
+    reach the same logic via hook_work_action_callback with explicit=False."""
+    return await _work_action(request or WorkActionRequest(), explicit=True)
+
+
+async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
+    """Core work-action handler, shared by the explicit HTTP endpoint and the
+    hook callback.
+
+    `explicit` marks a genuine user press. Only explicit presses are stamped
+    ``explicit: true`` in the event, persisted to the daily-note ``work_actions``
+    array, and counted by the cockpit work-action dial/ticks. Hook-driven satisfy
+    signals (prompt_submit / ask_user_question / typing-guard) still route here
+    for enforcement, but must NOT pollute the explicit-press visualization or the
+    durable daily-note log."""
     await bust_quiet_state(
         "api",
         "work_action",
@@ -13744,20 +13760,22 @@ async def work_action(request: WorkActionRequest | None = None) -> dict:
             "source": request.source,
             "note": request.note,
             "at": action_at,
+            "explicit": explicit,
             "old_mode": timer.get("old_mode"),
             "current_mode": timer_engine.current_mode.value,
             "acknowledged_expected_acks": acknowledged_acks,
         },
     )
 
-    # Canonical, durable record: append to today's daily-note frontmatter. This
-    # lives in the endpoint, NOT observe_work_signal, so prompt_submit/dictation/
-    # voice never write the note. Best-effort — a vault-write failure must never
-    # break the work-action API (mirrors the dictation observe_work_signal guard).
-    try:
-        await asyncio.to_thread(_append_work_action_to_daily_note, action_at, request.source)
-    except Exception as exc:
-        logger.warning("work_action: daily-note persist failed: %s", exc)
+    # Canonical, durable record: append to today's daily-note frontmatter — only
+    # for explicit presses, never hook-driven satisfy signals (prompt_submit etc.
+    # come through with explicit=False). Best-effort — a vault-write failure must
+    # never break the work-action path (mirrors the dictation guard).
+    if explicit:
+        try:
+            await asyncio.to_thread(_append_work_action_to_daily_note, action_at, request.source)
+        except Exception as exc:
+            logger.warning("work_action: daily-note persist failed: %s", exc)
 
     return {
         "idle_timer_reset": True,
@@ -13768,7 +13786,9 @@ async def work_action(request: WorkActionRequest | None = None) -> dict:
 
 
 async def hook_work_action_callback(source: str, note: str | None = None):
-    return await work_action(WorkActionRequest(source=source, note=note))
+    # Hook-driven satisfy signal (prompt_submit / ask_user_question / typing-
+    # guard): not an explicit press — keep it out of the daily note + cockpit.
+    return await _work_action(WorkActionRequest(source=source, note=note), explicit=False)
 
 
 # ============ Work Mode / Geofence Endpoints ============
@@ -15391,13 +15411,16 @@ async def _ops_read_work_actions(
 ) -> dict:
     """Work-action visualization read model, served from the `events` table.
 
-    Load-bearing: `count`/`ticks`/`last_at` cover explicit work-actions
-    (event_type='work_action') since local midnight. `ticks` carries the press
-    `at` + `source`; when `window_start` is given (timer graph) ticks are clipped
-    to that window, otherwise they span today. `last_at` drives the HUD dial's
-    staleness fade. The optional, non-load-bearing `score` aggregates ALL work
-    signals (event_type='work_signal') for the day — kept in a separate field,
-    never joined to the timer-graph series.
+    Load-bearing: `count`/`ticks`/`last_at` cover EXPLICIT work-actions only —
+    `event_type='work_action'` with `details.explicit = true` — since local
+    midnight. The explicit flag is essential: work_action() is also the hook
+    callback for prompt_submit / ask_user_question / typing-guard (which satisfy
+    enforcement), and those must not inflate the press count or daily note.
+    `ticks` carries the press `at` + `source`; when `window_start` is given
+    (timer graph) ticks are clipped to that window, otherwise they span today.
+    `last_at` drives the HUD dial's staleness fade. The optional, non-load-bearing
+    `score` aggregates ALL work signals (event_type='work_signal') for the day —
+    kept in a separate field, never joined to the timer-graph series.
     """
     now = now or datetime.now()
     # "Today" = since local midnight. events.created_at is stored UTC, so compare
@@ -15413,7 +15436,9 @@ async def _ops_read_work_actions(
             """
             SELECT created_at, details
             FROM events
-            WHERE event_type = 'work_action' AND datetime(created_at) >= datetime(?)
+            WHERE event_type = 'work_action'
+              AND json_extract(details, '$.explicit') = 1
+              AND datetime(created_at) >= datetime(?)
             ORDER BY created_at ASC, id ASC
             """,
             (floor_iso,),
