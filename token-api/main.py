@@ -16767,6 +16767,73 @@ async def get_ops_display_state():
     }
 
 
+@app.post("/api/ui/ops/phone/clear")
+async def ops_clear_phone_attention(request: Request) -> dict:
+    """Manual presence override — the "I'm not on my phone" button.
+
+    Force-clears the phone attention substate when telemetry is wrong (e.g. a
+    YouTube playback-edge flap leaves `current_app` asserting open while the
+    phone is actually idle). This is a *correction*, not enforcement: it never
+    zaps and never touches the desktop substate. Composite timer activity is
+    recomputed from whatever real attention sources remain, and any pending
+    phone-distraction / gaming / backlog ack from the false signal is resolved.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    source = body.get("source") or "ops_ui"
+
+    before = {
+        "current_app": PHONE_STATE.get("current_app"),
+        "is_distracted": PHONE_STATE.get("is_distracted", False),
+    }
+    # App to resolve acks for: whatever telemetry last asserted, falling back to
+    # the app that opened the still-pending ack.
+    ack_app = (before["current_app"] or PHONE_STATE.get("distraction_ack_app") or "").lower()
+
+    old_timer_mode = timer_engine.current_mode.value
+    PHONE_STATE["current_app"] = None
+    PHONE_STATE["app_opened_at"] = None
+    PHONE_STATE["is_distracted"] = False
+    PHONE_STATE["last_activity"] = datetime.now().isoformat()
+
+    now_ms = int(time.monotonic() * 1000)
+    timer_updated = _sync_activity_from_remaining_distraction_signals(now_ms)
+    if timer_updated:
+        await timer_log_shift(
+            old_timer_mode,
+            timer_engine.current_mode.value,
+            trigger="phone_presence_override",
+            source=source,
+            phone_app=before["current_app"],
+        )
+
+    acknowledged_acks = await acknowledge_phone_acks(ack_app) if ack_app else 0
+    stop_enforcement_cascade(reason="phone_presence_override")
+
+    logger.info(f"Phone presence override (source={source}) -> cleared {before['current_app']!r}")
+    await log_event(
+        "phone_presence_override",
+        device_id="phone",
+        details={
+            "source": source,
+            "before": before,
+            "acknowledged_acks": acknowledged_acks,
+            "timer_updated": timer_updated,
+        },
+    )
+    return {
+        "ok": True,
+        "before": before,
+        "after": {"current_app": None, "is_distracted": False},
+        "acknowledged_acks": acknowledged_acks,
+        "timer_updated": timer_updated,
+    }
+
+
 def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
     """First meaningful prose line of a session-doc body — a *head*, never the
     whole document. The cockpit is a glance surface; Obsidian renders the doc.
