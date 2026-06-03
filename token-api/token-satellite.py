@@ -1915,6 +1915,63 @@ def _get_or_create_kreig_pane() -> str:
     return pane_id
 
 
+def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
+    """Resolve an instance UUID to its live ``(pane_id, role)`` on THIS host.
+
+    The satellite is the sole owner of ``instance_id -> pane`` resolution for the
+    panes on its own tmux server (panes are host-local). It shells the same
+    ``tmuxctl resolve-instance`` primitive token-api uses locally, reading the
+    pane's ``@INSTANCE_ID`` stamp. Fails closed: any miss, error, or unstamped/
+    dead pane returns ``(None, None)`` so callers treat it as "instance gone"
+    rather than sending to — or speaking the position of — a vanished pane.
+    """
+    if not session_id:
+        return (None, None)
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = subprocess.run(
+            ["python3", "-m", "tmuxctl.cli", "resolve-instance", session_id, "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+        )
+    except Exception:
+        return (None, None)
+    # Exit 1 is the not-found sentinel; --format json prints the payload on both
+    # exit codes, so parse stdout regardless and trust the `found` flag.
+    try:
+        payload = json.loads((proc.stdout or "").strip() or "{}")
+    except (ValueError, json.JSONDecodeError):
+        return (None, None)
+    if not payload.get("found"):
+        return (None, None)
+    pane_id = (payload.get("pane_id") or "").strip() or None
+    role = (payload.get("pane_role") or "").strip() or None
+    return (pane_id, role)
+
+
+@app.get("/tmux/resolve-instance")
+async def tmux_resolve_instance(session_id: str):
+    """Resolve a Claude instance UUID to its live pane on this satellite's host.
+
+    Called by the Mac token-api when it needs the pane/role of a remote-hosted
+    instance — panes are host-local, so the Mac never resolves them against its
+    own tmux server. Returns ``found: false`` (not an error) when the pane is
+    gone, so the caller can fail closed and mark the instance stopped.
+    """
+    pane_id, role = _resolve_instance_pane(session_id)
+    return {
+        "session_id": session_id,
+        "found": pane_id is not None,
+        "pane_id": pane_id,
+        "pane_role": role,
+    }
+
+
 @app.post("/golden-throne/followup")
 async def golden_throne_followup(req: GoldenThroneFollowupRequest):
     """Resume an idle Claude instance via tmux send-keys or claude --resume.
@@ -2027,7 +2084,19 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 logger.error(f"Golden Throne: resume failed for {req.session_id[:12]}: {e}")
                 raise HTTPException(status_code=500, detail=f"resume failed: {e}")
     else:
-        raise HTTPException(status_code=400, detail="No tmux_pane provided")
+        # No live pane resolved for this instance on this host — fail closed.
+        # The Mac resolves via /tmux/resolve-instance before dispatching, so an
+        # empty pane here means the instance is gone (or the pane vanished in the
+        # resolve->dispatch race). Never fabricate a target or resume blindly.
+        logger.info(
+            f"Golden Throne: no live pane for {req.session_id[:12]} on this host; "
+            f"reporting instance_gone"
+        )
+        return {
+            "success": False,
+            "status": "instance_gone",
+            "session_id": req.session_id,
+        }
 
     return {"success": True, "transport": transport, "session_id": req.session_id}
 

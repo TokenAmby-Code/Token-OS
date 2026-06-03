@@ -6235,6 +6235,38 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
     )
 
 
+async def _resolve_remote_instance_pane(
+    session_id: str, device_id: str
+) -> tuple[str | None, str | None]:
+    """Resolve a remote instance's live ``(pane_id, role)`` on its own host.
+
+    tmux panes are host-local, so token-api never resolves a remote pane against
+    its own tmux server (a stale remote %N would mis-map onto an unrelated local
+    pane) and keeps no stored remote-pane perspective. It asks the pane's host —
+    the satellite — which shells its local ``tmuxctl resolve-instance``. Fails
+    closed: any miss, unreachable satellite, or error returns ``(None, None)`` so
+    the caller marks the instance stopped instead of speaking a stale position.
+    """
+    if not session_id:
+        return (None, None)
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/resolve-instance",
+                params={"session_id": session_id},
+            )
+        if resp.status_code >= 400:
+            return (None, None)
+        payload = resp.json()
+    except Exception:
+        return (None, None)
+    if not isinstance(payload, dict) or not payload.get("found"):
+        return (None, None)
+    pane_id = (payload.get("pane_id") or "").strip() or None
+    role = (payload.get("pane_role") or "").strip() or None
+    return (pane_id, role)
+
+
 async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -6345,17 +6377,15 @@ async def golden_throne_followup(session_id: str):
     tab_name = instance.get("tab_name", "session")
     engine = _agent_engine(instance)
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-    # tmuxctl owns instance_id -> pane resolution. For local instances resolve
-    # the pane live by UUID; token-api keeps no stored pane perspective, so a
-    # stale stored %N can no longer drive a send or speak a stale position
-    # (this is what produced the "1:NE" ghost). Remote panes live on another
-    # tmux server — the satellite resolves them on their own host; that cutover
-    # is the next Phase-3 slice, so remote still uses the stored %N for now.
+    # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
+    # perspective, so a stale stored %N can no longer drive a send or speak a
+    # stale position (this is what produced the "1:NE" ghost). Local instances
+    # resolve via the local tmuxctl; remote panes live on another tmux server, so
+    # the satellite resolves them on their own host by UUID. Both fail closed.
     if device_id == LOCAL_DEVICE_NAME:
         tmux_pane, pane_label = await shared.resolve_instance_pane(session_id)
     else:
-        tmux_pane = instance.get("tmux_pane")
-        pane_label = await _tmux_pane_label(tmux_pane)
+        tmux_pane, pane_label = await _resolve_remote_instance_pane(session_id, device_id)
     pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
     human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
     instance["tmux_pane"] = tmux_pane
@@ -6397,10 +6427,10 @@ async def golden_throne_followup(session_id: str):
         return
 
     # Dispatch: local for instances on this machine, satellite for remote.
-    # Fail closed: a local instance whose pane no longer resolves must not be
-    # sent to, counted as a resume, or spoken with a fabricated position. (Also
-    # stops a stale local %N from mis-routing into the satellite branch below.)
-    if device_id == LOCAL_DEVICE_NAME and not tmux_pane:
+    # Fail closed for ANY device: an instance whose pane no longer resolves — a
+    # local tmuxctl miss or a remote satellite miss/unreachable — must not be sent
+    # to, counted as a resume, or spoken with a fabricated position.
+    if not tmux_pane:
         await _golden_throne_handle_instance_gone(session_id, engine)
         return
     followup_id = str(uuid.uuid4())
@@ -6612,6 +6642,11 @@ async def golden_throne_followup(session_id: str):
                     f"Golden Throne: follow-up dispatched for {session_id[:12]} "
                     f"via {result.get('transport', '?')}"
                 )
+                # The pane vanished on its host between resolve and dispatch —
+                # fail closed: mark stopped, no resume counted, no stale position.
+                if result.get("status") == "instance_gone":
+                    await _golden_throne_handle_instance_gone(session_id, engine)
+                    return
         except Exception as e:
             dispatch_details.update(
                 {

@@ -64,6 +64,15 @@ def gt_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _pane_gone)
 
+    # Remote instances resolve on their OWN host via the satellite (panes are
+    # host-local). Default to a live, resolvable remote pane so the rubric-routing
+    # tests — which use a remote device to exercise the satellite dispatch path —
+    # keep delivering. The remote-fail-closed test overrides this to (None, None).
+    async def _remote_resolved(_session_id, _device_id):
+        return ("%10", "kreig:N")
+
+    monkeypatch.setattr(main, "_resolve_remote_instance_pane", _remote_resolved)
+
     yield SimpleNamespace(db_path=db_path, main=main, docs_dir=tmp_path)
 
     main._golden_throne_fire_times.clear()
@@ -390,3 +399,80 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
     # The spoken surface uses the LIVE role's position (palace:N -> 1:N).
     assert rec.notifies, "a delivered local fire notifies the Emperor"
     assert "1:N" in rec.notifies[0]["message"]
+
+
+# --- Phase 3 Tier 1b: satellite owns remote instance_id -> pane resolution ---
+
+
+@pytest.mark.asyncio
+async def test_remote_fire_fails_closed_when_satellite_cannot_resolve(gt_env, monkeypatch):
+    """A remote instance whose pane the satellite cannot resolve must fail closed:
+    no satellite dispatch, no notify, no resume counted, instance marked stopped.
+
+    tmux panes are host-local — token-api keeps no stored remote-pane perspective
+    and never resolves a remote pane against its own tmux server. Resolution is
+    owned by the pane's own host (the satellite); a miss there is "instance gone"."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+
+    async def _gone(_session_id, _device_id):
+        return (None, None)
+
+    monkeypatch.setattr(main, "_resolve_remote_instance_pane", _gone)
+
+    # Stored column carries a stale %N that must NOT be used as a fallback.
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME + "-remote",
+        doc_path=None,
+        tmux_pane="%999",
+    )
+
+    await main.golden_throne_followup(iid)
+
+    assert rec.posts == [], "must not dispatch to a satellite for an unresolved remote pane"
+    assert rec.notifies == []
+    assert rec.resumes == [], "a vanished remote pane must not be counted as a resume"
+
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute(
+        "SELECT status, gt_resume_count FROM claude_instances WHERE id = ?", (iid,)
+    ).fetchone()
+    conn.close()
+    assert row[0] == "stopped"
+    assert (row[1] or 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_remote_fire_resolves_via_satellite_not_stored_column(gt_env, monkeypatch):
+    """A remote fire resolves the pane on the satellite host by UUID and dispatches
+    to the live-resolved pane — never the stored tmux_pane column."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+
+    seen = {}
+
+    async def _resolved(session_id, device_id):
+        seen["session_id"] = session_id
+        seen["device_id"] = device_id
+        return ("%88", "kreig:N")
+
+    monkeypatch.setattr(main, "_resolve_remote_instance_pane", _resolved)
+
+    # Stored column is deliberately stale; live remote resolution must win.
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME + "-remote",
+        doc_path=None,
+        tmux_pane="%999",
+    )
+
+    await main.golden_throne_followup(iid)
+
+    # Resolution was keyed by the instance UUID on its own host, not read from the column.
+    assert seen.get("session_id") == iid
+    # Dispatched to the satellite carrying the live-resolved pane (%88), not stored %999.
+    assert len(rec.posts) == 1
+    assert rec.posts[0]["json"].get("tmux_pane") == "%88"
+    # A real remote delivery counts a resume.
+    assert rec.resumes, "a delivered remote fire must count a resume"
