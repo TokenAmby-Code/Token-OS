@@ -54,6 +54,7 @@ from shared import (
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
     FALLBACK_VOICES,
+    MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
     PROFILES,
     ULTIMATE_FALLBACK,
@@ -3112,17 +3113,22 @@ async def handle_stop(payload: dict) -> dict:
         return result
 
     if instance_type == "sync":
-        # Self-continuing sync (morning) session: accept the Stop, then re-inject a
-        # fresh timestamped keepalive prompt so the session is temporally bound, not
-        # turn-based. The only exit is flipping the instance off `sync` (via
-        # POST /api/morning/end → instance_type=one_off); after that flip this branch
-        # is no longer taken and the next Stop is a normal clean stop.
-        result["action"] = "stop_processed_sync"
-        await log_event("hook_stop", instance_id=session_id, details={"sync": True})
+        # Self-continuing morning session. The keepalive is gated on an ACTIVE
+        # morning session — NOT on instance_type alone. `sync` is NECESSARY (a
+        # non-sync instance never reaches here) but NOT SUFFICIENT: a correctly
+        # registered Custodes singleton stays `sync` for state-hook interventions,
+        # yet must stop looping once the morning session is ended (POST
+        # /api/morning/end) or past the Emperor's MORNING_MAX_DURATION_HOURS bound.
+        from morning_session import MORNING_MAX_DURATION_HOURS, morning_session_active
 
-        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
-        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(ts=now_mst.strftime("%H:%M"))
+        active, morning_reason = morning_session_active()
+        await log_event(
+            "hook_stop",
+            instance_id=session_id,
+            details={"sync": True, "keepalive": active, "morning": morning_reason},
+        )
 
+        # Resolve the pane once — needed for the keepalive OR the expiry notice.
         tmux_pane = instance.get("tmux_pane")
         if not tmux_pane:
             # Re-fetch from DB in case the cached instance row didn't capture it.
@@ -3137,6 +3143,41 @@ async def handle_stop(payload: dict) -> dict:
                         tmux_pane = row[0]
             except Exception:
                 pass
+
+        if not active:
+            # No active morning session → clean Stop, no keepalive re-injection.
+            # When the 2h bound just tripped, morning_session_active() already
+            # auto-ended the state file; emit ONE final in-band notice and then go
+            # quiet — do NOT keep re-prompting.
+            if morning_reason == "expired":
+                result["action"] = "stop_processed_sync_expired"
+                if tmux_pane:
+                    notice = MORNING_EXPIRY_NOTICE.format(hours=MORNING_MAX_DURATION_HOURS)
+                    try:
+                        proc = await _run_subprocess_offloop(
+                            ("claude-cmd", "--pane", tmux_pane, notice),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            timeout=10,
+                        )
+                        if proc.returncode != 0:
+                            logger.warning(
+                                f"Hook: Stop {session_id[:12]}... morning expiry notice claude-cmd failed: "
+                                f"{proc.stderr.decode()[:200]}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Hook: Stop {session_id[:12]}... morning expiry notice failed: {e}"
+                        )
+            else:
+                result["action"] = f"stop_processed_sync_idle:{morning_reason}"
+            return result
+
+        # Active, in-bound morning session → re-inject a fresh timestamped keepalive
+        # so the session stays temporally bound, not turn-based.
+        result["action"] = "stop_processed_sync"
+        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
+        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(ts=now_mst.strftime("%H:%M"))
 
         if not tmux_pane:
             logger.warning(f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane")
