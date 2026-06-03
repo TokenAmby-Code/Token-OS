@@ -165,6 +165,11 @@ _golden_throne_activity_callback: Callable[..., Any] | None = None
 _askq_level1_callback: Callable[..., Any] | None = None
 _askq_touch2_callback: Callable[..., Any] | None = None
 _askq_level3_callback: Callable[..., Any] | None = None
+# main.py's gate-aware, verification-tracked pane-write primitive. Hooks route
+# live prompt delivery through this instead of a bespoke send so the universal
+# send gate is honored and delivery truth (gated/unverified/submitted) is not
+# faked. Tests wire a fake directly onto this module global.
+_tmux_send_payload_then_submit: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -178,12 +183,13 @@ def init_deps(
     schedule_golden_throne_callback=None,
     golden_throne_activity_callback=None,
     askq_level1_callback=None,
+    tmux_send_payload_then_submit=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
     global _run_stop_evaluators, _auto_name_instance, _work_action_callback
     global _schedule_golden_throne_callback, _golden_throne_activity_callback
-    global _askq_level1_callback
+    global _askq_level1_callback, _tmux_send_payload_then_submit
 
     _scheduler = scheduler
     _timer_engine = timer_engine
@@ -194,6 +200,7 @@ def init_deps(
     _schedule_golden_throne_callback = schedule_golden_throne_callback
     _golden_throne_activity_callback = golden_throne_activity_callback
     _askq_level1_callback = askq_level1_callback
+    _tmux_send_payload_then_submit = tmux_send_payload_then_submit
 
 
 def _require_dep(name: str, value):
@@ -1216,29 +1223,56 @@ def _stop_event_key(session_id: str, payload: dict) -> str:
 
 
 async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
-    """Best-effort live prompt delivery used from hooks without importing main.py."""
-    try:
-        from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+    """Live prompt delivery through the verified pane-write primitive.
 
-        adapter = TmuxAdapter()
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(adapter.send_text_then_submit, tmux_pane, payload),
-                timeout=10,
-            )
-            return {"status": "sent", "operation": "tmuxctl.send_text_then_submit"}
-        except TmuxError as exc:
-            return {"status": "failed", "error": str(exc)}
-    except Exception:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "send-keys", "-t", tmux_pane, payload, "Enter"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            return {"status": "sent", "operation": "tmux.send-keys"}
-        return {"status": "failed", "error": proc.stderr.decode(errors="replace")}
+    Routes through main.py's gate-aware ``_tmux_send_payload_then_submit``
+    (injected via init_deps) instead of the old bespoke send that discarded the
+    adapter's result and hardcoded ``{"status": "sent"}`` — and then fell back to
+    a raw ``tmux send-keys`` that reported ``sent`` on rc==0 alone, with no
+    delivery proof and no respect for the universal send gate. Both were lies:
+    "fired but nothing arrived" while the system believed it delivered.
+
+    Reports the truth instead:
+
+      * ``sent``       — submission verified (the composer cleared after submit)
+      * ``unverified`` — bytes were issued but delivery is not yet proven; the
+                          proof belt (UserPromptSubmit correlation) confirms it
+                          asynchronously
+      * ``gated``      — the universal send gate suppressed the write (NO bytes
+                          reached the pane); never reported as delivered
+      * ``failed``     — the send errored
+
+    The full primitive result is returned under ``send`` so callers can persist
+    the verification record.
+    """
+    send = _tmux_send_payload_then_submit
+    if send is None:
+        return {"status": "failed", "error": "pane-write primitive not initialized"}
+    result = await send(tmux_pane, payload)
+    if result.get("gated"):
+        # Gate suppressed the send — no bytes issued. NOT a delivery.
+        return {
+            "status": "gated",
+            "verification_status": result.get("verification_status", "gated"),
+            "gate_reason": result.get("gate_reason"),
+            "send": result,
+        }
+    if result.get("returncode") == 0:
+        # Bytes issued. Only a confirmed submission (composer cleared) is
+        # "sent"; otherwise it is honestly "unverified" until the proof belt
+        # correlates a UserPromptSubmit. Never default bytes-issued to "sent".
+        verified = result.get("verification_status") == "submitted"
+        return {
+            "status": "sent" if verified else "unverified",
+            "verification_status": result.get("verification_status"),
+            "operation": result.get("operation"),
+            "send": result,
+        }
+    return {
+        "status": "failed",
+        "error": result.get("stderr") or result.get("error"),
+        "send": result,
+    }
 
 
 async def _enqueue_and_send_stop_delivery(
@@ -1291,19 +1325,41 @@ async def _enqueue_and_send_stop_delivery(
     await db.commit()
 
     send_result = await _direct_pane_write(subscription["subscriber_pane"], payload)
-    sent = send_result.get("status") == "sent"
-    final_status = "sent" if sent else "failed"
+    delivery_status = send_result.get("status")
+    # Map delivery truth onto the durable queue row + the delivery record:
+    #   sent/unverified -> bytes were issued, so the queue row is terminal
+    #       'sent' (re-queuing would double the send); the proof belt upgrades
+    #       an 'unverified' delivery asynchronously.
+    #   gated           -> the universal gate suppressed the write (NO bytes).
+    #       Keep the pane_write_queue row 'pending' so the periodic worker
+    #       re-drains it when the gate clears — never reported as delivered.
+    #   failed          -> the send errored.
+    bytes_issued = delivery_status in ("sent", "unverified")
+    if delivery_status == "gated":
+        queue_status = "pending"
+    elif bytes_issued:
+        queue_status = "sent"
+    else:
+        queue_status = "failed"
+    # The delivery record carries the precise truth, including 'unverified'.
+    delivery_record_status = (
+        delivery_status
+        if delivery_status in ("sent", "unverified", "gated", "failed")
+        else "failed"
+    )
+    delivered_at = datetime.now().isoformat() if bytes_issued else None
+    error = send_result.get("error") or send_result.get("gate_reason")
     await db.execute(
         """UPDATE pane_write_queue
            SET status = ?, attempted_at = ?, sent_at = ?, updated_at = ?,
                last_error = ?, last_result_json = ?
            WHERE id = ?""",
         (
-            final_status,
+            queue_status,
             now,
-            now if sent else None,
+            now if bytes_issued else None,
             datetime.now().isoformat(),
-            send_result.get("error"),
+            error,
             json.dumps(send_result, sort_keys=True),
             queue_id,
         ),
@@ -1313,15 +1369,15 @@ async def _enqueue_and_send_stop_delivery(
            SET status = ?, delivered_at = ?, error = ?
            WHERE id = ?""",
         (
-            final_status,
-            datetime.now().isoformat() if sent else None,
-            send_result.get("error"),
+            delivery_record_status,
+            delivered_at,
+            error,
             delivery_id,
         ),
     )
     await db.commit()
     return {
-        "status": final_status,
+        "status": delivery_status,
         "delivery_id": delivery_id,
         "queue_id": queue_id,
         "subscriber_pane": subscription["subscriber_pane"],

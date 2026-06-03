@@ -23599,6 +23599,7 @@ hooks_init_deps(
     schedule_golden_throne_callback=schedule_golden_throne_followup,
     golden_throne_activity_callback=golden_throne_user_activity,
     askq_level1_callback=_askq_level1_callback,
+    tmux_send_payload_then_submit=_tmux_send_payload_then_submit,
 )
 
 
