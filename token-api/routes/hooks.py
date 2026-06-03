@@ -287,6 +287,46 @@ SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
+CUSTODES_PANE_LABEL = "legion:custodes"
+
+# Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
+# stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
+# persona, so we derive its row identity (legion + primarch + instance_type, and
+# synced for the custodes singleton) from the pane. This makes "SessionStart from
+# a persona pane registers correctly" an infrastructure invariant — no persona
+# ever has to self-PATCH legion/type/synced. The fields chosen match each
+# persona's own resolution key: custodes resolves on legion+synced+instance_type,
+# FG on its pane label, Administratum on primarch='administratum'.
+#
+# Worker panes (mechanicus:N, mechanicus:worker-N) are intentionally absent — they
+# are not personas and resolve their legion from dispatch env / working-dir
+# auto-detect, not from a fixed identity.
+PERSONA_PANE_IDENTITY: dict[str, dict] = {
+    CUSTODES_PANE_LABEL: {
+        "legion": "custodes",
+        "primarch": "custodes",
+        "instance_type": "sync",
+        "synced": True,
+    },
+    MECHANICUS_FG_LABEL: {
+        # FG owns a dedicated singleton legion ("fabricator", see ALLOWED_LEGIONS /
+        # SINGLETON_LEGIONS and assertions._row_matches_persona). The "mechanicus:"
+        # prefix is the tmux page/region, NOT the legion.
+        "legion": "fabricator",
+        "primarch": "fabricator-general",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+    MECHANICUS_ADMIN_LABEL: {
+        # Administratum has no dedicated legion; it registers under the shared
+        # mechanicus legion. Its load-bearing resolution key is primarch (token-api
+        # _resolve_administratum_instance keys on primarch='administratum').
+        "legion": "mechanicus",
+        "primarch": "administratum",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+}
 
 
 async def _run_subprocess_offloop(
@@ -1621,6 +1661,23 @@ async def handle_session_start(payload: dict) -> dict:
     )
     if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
         launch_instance_type = None
+    # Persona/orchestrator pane (tmuxctl stamps a stable @PANE_ID like
+    # "legion:custodes" / "mechanicus:fabricator-general" / "mechanicus:admin").
+    # A fresh spawn in one of these panes IS that persona — derive its row identity
+    # from the pane so the agent never self-PATCHes legion/primarch/type/synced.
+    # The pane is authoritative for the persona's legion (written below in the
+    # auto_legion block regardless of env); here we only fill the blanks the launch
+    # left in the env-derived fields (dispatch_legion for doc resolution, primarch,
+    # instance_type) so an explicit dispatch can still tune those.
+    persona_identity = PERSONA_PANE_IDENTITY.get(pane_label or "")
+    if persona_identity:
+        if not dispatch_legion:
+            dispatch_legion = persona_identity["legion"]
+        if not primarch_name:
+            primarch_name = persona_identity.get("primarch") or ""
+        if launch_instance_type is None:
+            launch_instance_type = persona_identity.get("instance_type")
+    persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
     )
@@ -2303,7 +2360,7 @@ async def handle_session_start(payload: dict) -> dict:
                 "pid": payload.get("pid"),
                 "status": "idle",
                 "legion": _prior_legion or "astartes",
-                "synced": 0,
+                "synced": 1 if persona_synced else 0,
                 "input_lock": None,
                 "is_subagent": is_subagent,
                 "tmux_pane": tmux_pane,
@@ -2406,6 +2463,10 @@ async def handle_session_start(payload: dict) -> dict:
                 auto_legion = "mechanicus"
         elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
             auto_legion = "civic"
+        elif persona_identity:
+            # Fresh persona singleton: the INSERT wrote _prior_legion or "astartes",
+            # never dispatch_legion — so write the pane's canonical legion here.
+            auto_legion = persona_identity["legion"]
 
         # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:

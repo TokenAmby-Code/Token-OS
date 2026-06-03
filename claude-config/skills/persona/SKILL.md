@@ -8,7 +8,9 @@ user_invocable: true
 
 ## Purpose
 
-When an instance loads a persona via `@Personas/<name>.md`, the DB doesn't know about it — the instance shows as `legion: astartes, instance_type: one_off`. This skill bridges the gap: read the persona file, extract identity fields, and PATCH the instance's DB row via Token-API.
+When an instance loads a persona via `@Personas/<name>.md` **in an arbitrary pane**, the DB doesn't know about it — the instance shows as `legion: astartes, instance_type: one_off`. This skill bridges the gap: read the persona file, extract identity fields, and PATCH the instance's DB row via Token-API.
+
+**Singleton persona panes auto-register — do not PATCH them.** The custodes, Fabricator-General, and Administratum panes carry a stable `@PANE_ID` (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`) stamped by tmuxctl. `SessionStart` derives the row identity (legion + primarch + instance_type) from that pane label — it is an infrastructure invariant, not the agent's job. **Note for custodes:** `synced` is **NOT** derived at startup — its correct default is `synced=0`. The morning session flips it to `synced=1`; do not treat `synced=0` at registration time as a defect. If you are one of these personas, your row is **already correct on startup**. Run the verify step below and **report** if it is wrong (that means the harness is broken) — never self-PATCH. Patching is only for ad-hoc personas loaded into a non-persona pane.
 
 ## Usage
 
@@ -75,7 +77,19 @@ If neither env var is set, try:
 curl -s "$TOKEN_API_URL/api/instances/resolve?source_ip=127.0.0.1&status=processing" | jq -r '.id'
 ```
 
-### Step 4: PATCH the instance
+### Step 3.5: Verify before patching (persona panes are already registered)
+
+Read the current row and its pane label first:
+```bash
+curl -s "$TOKEN_API_URL/api/instances" \
+  | jq --arg id "$INSTANCE_ID" '.[] | select(.id==$id) | {legion, instance_type, synced, primarch, pane_label}'
+```
+
+- If `pane_label` is one of `legion:custodes` / `mechanicus:fabricator-general` / `mechanicus:admin`, this is a **singleton persona pane**. `SessionStart` already set its identity (legion + primarch + instance_type). **Verify those match the expected identity and stop — do not PATCH.** If they do not match, report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH.
+  - **`synced` is exempt from this check for custodes.** Its correct startup default is `synced=0`; the morning session flips it to `1`. Do **not** report `synced=0` as a mismatch and do **not** self-PATCH it at registration time.
+- Otherwise (ad-hoc persona in a non-persona pane), continue to Step 4 and PATCH.
+
+### Step 4: PATCH the instance (ad-hoc panes only)
 
 ```bash
 # Set legion

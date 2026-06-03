@@ -363,6 +363,174 @@ class TestCivicAutoDetect:
         assert row["legion"] == "mechanicus"
 
 
+# ── 7b. Persona pane auto-setup (no self-PATCH) ──────────────
+
+
+class TestPersonaPaneAutoSetup:
+    """A fresh spawn in a persona/orchestrator pane is registered with the
+    persona's canonical identity from the @PANE_ID label alone — no env legion/
+    primarch/type and no manual PATCH. (Generalized from the custodes-only case.)"""
+
+    def _register(self, client, pane_label, tmux_pane):
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "pid": 99999,
+                "pane_label": pane_label,
+                "tmux_pane": tmux_pane,
+                "env": {},
+            },
+        )
+        assert resp.status_code == 200, f"Hook failed: {resp.text}"
+        row = _get_instance(sid)
+        assert row is not None
+        return row
+
+    def test_custodes_pane(self, client):
+        row = self._register(client, "legion:custodes", "%32")
+        assert row["legion"] == "custodes"
+        assert row["primarch"] == "custodes"
+        assert row["instance_type"] == "sync"
+        assert row["synced"] == 1
+
+    def test_fabricator_general_pane(self, client):
+        # FG owns the dedicated singleton legion "fabricator" (not "mechanicus" —
+        # that prefix is the tmux region). Matches assertions._row_matches_persona.
+        row = self._register(client, "mechanicus:fabricator-general", "%40")
+        assert row["legion"] == "fabricator"
+        assert row["primarch"] == "fabricator-general"
+        assert row["instance_type"] == "hook_driven"
+        assert row["synced"] == 0
+
+    def test_administratum_pane(self, client):
+        # Administratum resolves on primarch='administratum' — the field that
+        # MUST be backfilled or the recorder becomes unfindable.
+        row = self._register(client, "mechanicus:admin", "%41")
+        assert row["legion"] == "mechanicus"
+        assert row["primarch"] == "administratum"
+        assert row["instance_type"] == "hook_driven"
+        assert row["synced"] == 0
+
+    def test_worker_pane_defaults(self, client):
+        """A non-persona pane (mechanicus worker) still defaults
+        astartes/one_off/synced=0 with no primarch — pane identity is reserved
+        for the singleton orchestrators."""
+        row = self._register(client, "mechanicus:worker-1", "%77")
+        assert row["legion"] == "astartes"
+        assert row["instance_type"] == "one_off"
+        assert row["synced"] == 0
+        assert not row["primarch"]
+
+    def test_pane_legion_is_authoritative(self, client):
+        """The pane is authoritative for the persona's legion: even a conflicting
+        env legion yields the pane's legion on the row (you can't mis-register a
+        persona pane by passing the wrong legion)."""
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "pid": 99999,
+                "pane_label": "mechanicus:fabricator-general",
+                "tmux_pane": "%42",
+                "env": {"TOKEN_API_LEGION": "civic"},
+            },
+        )
+        assert resp.status_code == 200, f"Hook failed: {resp.text}"
+        row = _get_instance(sid)
+        assert row["legion"] == "fabricator"
+
+
+# ── 7d. Day-start custodes daily-note rebind ─────────────────
+
+
+class TestCustodesDocRebind:
+    def _insert_doc(self, db_path, file_path, title="doc"):
+        conn = sqlite3.connect(db_path)
+        now = datetime.now().isoformat()
+        cur = conn.execute(
+            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?)""",
+            (title, file_path, None, now, now),
+        )
+        conn.commit()
+        doc_id = cur.lastrowid
+        conn.close()
+        return doc_id
+
+    def _insert_custodes(self, db_path, *, session_doc_id, status="idle"):
+        iid = str(uuid.uuid4())
+        conn = sqlite3.connect(db_path)
+        now = datetime.now().isoformat()
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, legion, synced, session_doc_id, registered_at, last_activity)
+               VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'custodes', 1, ?, ?, ?)""",
+            (iid, str(uuid.uuid4()), f"Custodes-{iid[:6]}", status, session_doc_id, now, now),
+        )
+        conn.commit()
+        conn.close()
+        return iid
+
+    def test_rebind_prior_day_leaves_bespoke(self, app_env, monkeypatch):
+        import sys
+
+        db_path = str(app_env.db_path)
+        day_start = sys.modules["routes.day_start"]
+        helpers = sys.modules.get("session_doc_helpers")
+        if helpers is None:
+            import session_doc_helpers as helpers
+
+        base = "/x/Terra/Journal/Daily"
+        today_id = self._insert_doc(db_path, f"{base}/2026-06-02.md", "2026-06-02")
+        yday_id = self._insert_doc(db_path, f"{base}/2026-06-01.md", "2026-06-01")
+        docket_id = self._insert_doc(db_path, "/x/Mars/Sessions/some-fix.md", "some-fix")
+
+        stale = self._insert_custodes(db_path, session_doc_id=yday_id)
+        bespoke = self._insert_custodes(db_path, session_doc_id=docket_id)
+        current = self._insert_custodes(db_path, session_doc_id=today_id)
+        stopped = self._insert_custodes(db_path, session_doc_id=yday_id, status="stopped")
+
+        async def _fake_today(db, date_str=None):
+            return today_id
+
+        monkeypatch.setattr(
+            helpers, "resolve_or_create_today_daily_note_session_doc", _fake_today
+        )
+
+        result = asyncio.run(day_start._consumer_custodes_doc_rebind())
+
+        rebound_ids = {r["instance_id"] for r in result["rebound"]}
+        assert stale in rebound_ids
+        assert bespoke not in rebound_ids
+        assert current not in rebound_ids
+        assert stopped not in rebound_ids
+
+        assert _get_instance(stale)["session_doc_id"] == today_id
+        assert _get_instance(bespoke)["session_doc_id"] == docket_id
+        assert _get_instance(current)["session_doc_id"] == today_id
+
+
+# ── 7c. Daily-note tab/session-doc mismatch exemption ────────
+
+
+class TestTabNameMismatchDailyNote:
+    def test_date_slug_never_mismatches(self, app_env):
+        """A persona tab vs a date-named daily note is not a real mismatch."""
+        fn = app_env.main._tab_name_session_doc_mismatch
+        assert fn("Custodes", "/x/Terra/Journal/Daily/2026-06-02.md") is False
+
+    def test_real_drift_still_flagged(self, app_env):
+        """A descriptive tab vs an unrelated descriptive slug is still a mismatch."""
+        fn = app_env.main._tab_name_session_doc_mismatch
+        assert fn("foo-fix", "/x/Mars/Sessions/bar-baz.md") is True
+
+
 # ── 8. Workflow / continuity state ───────────────────────────
 
 
