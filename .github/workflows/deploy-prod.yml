@@ -29,6 +29,11 @@ permissions:
   contents: read
   pull-requests: read  # resolve the merged PR url for the pr_state→merged badge flip
 
+# Run JS actions (checkout/paths-filter/tailscale) on Node 24 — Node 20 is being
+# removed from runners (Sep 2026). See .github/workflows/README.md.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
