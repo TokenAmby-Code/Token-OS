@@ -50,9 +50,7 @@ def _insert_instance(instance_id=None, *, status="idle", working_dir="/tmp"):
 def _get_instance(instance_id):
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM claude_instances WHERE id = ?", (instance_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
