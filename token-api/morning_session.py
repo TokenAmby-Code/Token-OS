@@ -102,12 +102,16 @@ def morning_session_active(today: str | None = None) -> tuple[bool, str]:
 
     started_raw = state.get("started_at")
     if not started_raw:
-        # Launched but undated — preserve the morning behavior rather than expire.
-        return True, "active"
+        # Launched but undated — a corrupt/incomplete record must NOT stay active
+        # forever; that reintroduces the indefinite keepalive loop this gate exists
+        # to kill. Auto-end it and report inactive.
+        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
+        return False, "ended"
     try:
         started = datetime.fromisoformat(started_raw)
     except Exception:
-        return True, "active"
+        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
+        return False, "ended"
     if started.tzinfo is not None:
         started = started.replace(tzinfo=None)
 
@@ -618,12 +622,22 @@ def run_morning_session() -> dict:
     state_file = morning_state_file(today)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Prevent double-trigger
+    # Prevent double-trigger AND resurrection of an already-completed day. A bare
+    # /api/morning/start (phone macro re-fire) must not relaunch a morning that is
+    # already launched OR already ended — the latter produced the evening misfires:
+    # the phone re-POSTed hours after the real morning ended, and an "ended" record
+    # (the only guarded status before) sailed past this gate and relaunched Custodes
+    # into the legion pane in the evening. Failure statuses (nas_unavailable, no_pane,
+    # launch_failed) are intentionally NOT guarded so a genuine retry can proceed.
     if state_file.exists():
         data = json.loads(state_file.read_text())
-        if data.get("status") == "launched":
+        status = data.get("status")
+        if status == "launched":
             print("Morning session already launched, skipping")
             return {"status": "already_launched"}
+        if status == "ended":
+            print("Morning session already ended for today, skipping relaunch")
+            return {"status": "already_ended"}
 
     print(f"Morning session launcher starting: {today}")
 

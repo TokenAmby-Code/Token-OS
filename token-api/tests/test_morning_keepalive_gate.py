@@ -299,3 +299,28 @@ def test_custodes_voice_target_resolves_via_marker(app_env, monkeypatch):
 
     pane = asyncio.run(main._resolve_discord_voice_target("custodes", _msg()))
     assert pane == "%42"
+
+
+# ── Part C: launch-side re-fire guard ────────────────────────
+
+
+def test_run_morning_session_skips_when_already_launched(app_env):
+    """A bare re-trigger while status=='launched' must not relaunch (double-trigger)."""
+    import morning_session
+
+    _write_morning_state("launched")
+    assert morning_session.run_morning_session() == {"status": "already_launched"}
+
+
+def test_run_morning_session_skips_relaunch_when_already_ended(app_env):
+    """An already-ENDED day must NOT be resurrected by a stray /api/morning/start.
+
+    This is the evening-misfire guard: the phone macro re-POSTed hours after the real
+    morning ended; before the fix an "ended" record sailed past the guard and
+    relaunched Custodes into the legion pane in the evening. Failure statuses are
+    intentionally not guarded so a genuine retry still proceeds.
+    """
+    import morning_session
+
+    _write_morning_state("ended", extra={"ended_by": "test"})
+    assert morning_session.run_morning_session() == {"status": "already_ended"}
