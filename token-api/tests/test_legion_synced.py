@@ -499,9 +499,7 @@ class TestCustodesDocRebind:
         async def _fake_today(db, date_str=None):
             return today_id
 
-        monkeypatch.setattr(
-            helpers, "resolve_or_create_today_daily_note_session_doc", _fake_today
-        )
+        monkeypatch.setattr(helpers, "resolve_or_create_today_daily_note_session_doc", _fake_today)
 
         result = asyncio.run(day_start._consumer_custodes_doc_rebind())
 

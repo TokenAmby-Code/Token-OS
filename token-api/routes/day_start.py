@@ -164,8 +164,8 @@ async def _consumer_custodes_doc_rebind() -> dict:
     A custodes alive across midnight stays bound to yesterday's daily note. Only
     date-named daily-note bindings are rebound; bespoke dockets are left untouched.
     """
-    from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
     from instance_mutation import sanctioned_update_instance
+    from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
 
     rebound: list[dict] = []
     skipped: list[dict] = []
