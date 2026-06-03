@@ -4,13 +4,20 @@
 // Magnitudes become arcs; enum/bool states become center glyphs (per the rule
 // that app *names* — free text — get a short label, everything else a gauge).
 
+import { useEffect, useRef, useState } from 'react';
 import type { OpsState } from '../types';
 import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
 import { formatSignedClock, formatClock } from '../format';
+import { clearPhoneAttention } from '../api';
 import { Ring } from './Ring';
 
 // One banked hour of break fills the ring; debt fills it in hazard.
 const BREAK_SCALE_MS = 60 * 60 * 1000;
+
+// Two-tap arm window for the "I'm not on my phone" clear: first tap arms the
+// Phone dial (glyph → "clear?"), a second tap within this window commits, and
+// otherwise it silently disarms — no accidental one-tap clears.
+const PHONE_CLEAR_ARM_MS = 3000;
 
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
@@ -70,6 +77,22 @@ export function HudRings({ state }: { state: OpsState }) {
     : desk.work_mode || desk.mode || '—';
   const phoneLabel = phone.app ? truncate(phone.app, 11) : 'clear';
 
+  // Phone dial doubles as the "I'm not on my phone" clear: arm on first tap,
+  // commit on a second tap within PHONE_CLEAR_ARM_MS, else auto-disarm.
+  const [phoneArmed, setPhoneArmed] = useState(false);
+  const phoneArmTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(phoneArmTimer.current), []);
+  function tapPhoneDial() {
+    if (phoneArmed) {
+      window.clearTimeout(phoneArmTimer.current);
+      setPhoneArmed(false);
+      clearPhoneAttention().catch((err) => console.error('phone clear failed', err));
+      return;
+    }
+    setPhoneArmed(true);
+    phoneArmTimer.current = window.setTimeout(() => setPhoneArmed(false), PHONE_CLEAR_ARM_MS);
+  }
+
   return (
     <div className="rings">
       <Ring
@@ -98,11 +121,13 @@ export function HudRings({ state }: { state: OpsState }) {
       />
       <Ring
         label="Phone"
-        glyph={phoneGlyph(phone)}
-        detail={phoneLabel}
-        color={phone.is_distracted ? 'var(--hazard)' : 'var(--muted)'}
-        tone={phone.is_distracted ? 'bad' : 'neutral'}
-        title={`Phone · ${phoneLabel}`}
+        glyph={phoneArmed ? undefined : phoneGlyph(phone)}
+        value={phoneArmed ? 'clear?' : undefined}
+        detail={phoneArmed ? 'tap to confirm' : phoneLabel}
+        color={phoneArmed ? 'var(--brass)' : phone.is_distracted ? 'var(--hazard)' : 'var(--muted)'}
+        tone={phoneArmed ? 'warn' : phone.is_distracted ? 'bad' : 'neutral'}
+        title={`Phone · ${phoneLabel} · tap: I'm not on my phone (2-tap clear, no zap)`}
+        onClick={tapPhoneDial}
       />
       <Ring
         label="Fleet"

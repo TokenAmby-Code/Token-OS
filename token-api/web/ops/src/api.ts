@@ -120,6 +120,19 @@ export function focusPane(instanceId: string): Promise<FocusResult> {
   return postJson<FocusResult>(`/api/instances/${encodeURIComponent(instanceId)}/focus-pane`);
 }
 
+export type PhoneClearResult = {
+  ok: boolean;
+  before: { current_app: string | null; is_distracted: boolean };
+  after: { current_app: string | null; is_distracted: boolean };
+  acknowledged_acks: number;
+  timer_updated: boolean;
+};
+
+/** "I'm not on my phone" — force-clear phone attention when telemetry is stuck. No zap. */
+export function clearPhoneAttention(): Promise<PhoneClearResult> {
+  return postJson<PhoneClearResult>('/api/ui/ops/phone/clear', { source: 'ops_ui' });
+}
+
 /** Time the operator's day graph begins; the timer graph anchors here. */
 const DAY_START_HOUR = 7;
 const DAY_START_MINUTE = 20;
