@@ -17738,13 +17738,20 @@ async def process_pane_state_queue_once() -> list[dict]:
 
         processed: list[int] = []
         results: list[dict] = []
-        stopped_assertions: list[tuple[str, str]] = []
+        # Track the FINAL queued @CC_STATE per instance in this drain. A status that
+        # bounces (stopped -> idle) inserts two rows in one batch; asserting off the
+        # early "stopped" row would fire a false close-down against a pane whose
+        # final drained state is no longer stopped. Keep only the last @CC_STATE per
+        # instance and assert after the loop. (instance_id -> (value, role, pane).)
+        latest_cc_state: dict[str, tuple[str, str | None, str | None]] = {}
         for row in rows:
             # Resolve the live pane and fail closed. A pane that no longer resolves
             # (agent died, geometry changed, tmux server cycled) must never receive
             # a set-option nor spawn a stale close-down assertion. The row drains
             # either way.
             pane, role = await shared.resolve_instance_pane(row["instance_id"])
+            if row["variable"] == "@CC_STATE":
+                latest_cc_state[row["instance_id"]] = (row["value"], role, pane)
             if not pane:
                 processed.append(row["id"])
                 results.append(
@@ -17781,12 +17788,6 @@ async def process_pane_state_queue_once() -> list[dict]:
             except Exception as e:
                 status = "error"
                 logger.warning(f"Pane state set failed for {pane}: {e}")
-            if (
-                row["variable"] == "@CC_STATE"
-                and row["value"] == "stopped"
-                and not _is_assert_persona_label(role)
-            ):
-                stopped_assertions.append((role or pane, row["instance_id"]))
             processed.append(row["id"])
             results.append(
                 {
@@ -17804,8 +17805,12 @@ async def process_pane_state_queue_once() -> list[dict]:
             ph = ",".join("?" * len(processed))
             await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
             await db.commit()
-    for pane_target, instance_id in stopped_assertions:
-        spawn_tmux_assert_instance(pane_target, instance_id, "pane-state-stopped")
+    # Spawn a close-down assertion only for instances whose FINAL @CC_STATE this
+    # drain is "stopped", whose pane still resolves live, and whose live role is not
+    # an asserted persona. Keyed on the live role, never a stored pane_label.
+    for instance_id, (value, role, pane) in latest_cc_state.items():
+        if value == "stopped" and pane and not _is_assert_persona_label(role):
+            spawn_tmux_assert_instance(role or pane, instance_id, "pane-state-stopped")
     return results
 
 

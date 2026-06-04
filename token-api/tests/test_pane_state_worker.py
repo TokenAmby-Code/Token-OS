@@ -20,6 +20,7 @@ resolver elsewhere is untouched; each test sets the live-resolution it asserts.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,7 +28,7 @@ import pytest
 
 
 def _enqueue_pane_state(
-    db_path: Any, instance_id: str, variable: str, value: str, tmux_pane: str | None
+    db_path: Path, instance_id: str, variable: str, value: str, tmux_pane: str | None
 ) -> int:
     """Insert one row into pane_state_queue (the SQLite trigger's product) and
     return its id. Mirrors what ``trg_status_pane_state`` writes on a status flip,
@@ -42,13 +43,13 @@ def _enqueue_pane_state(
         return int(cur.lastrowid)
 
 
-def _queue_count(db_path: Any) -> int:
+def _queue_count(db_path: Path) -> int:
     with sqlite3.connect(db_path) as conn:
         return int(conn.execute("SELECT COUNT(*) FROM pane_state_queue").fetchone()[0])
 
 
 @pytest.fixture
-def _capture_set_option(app_env, monkeypatch):
+def _capture_set_option(app_env, monkeypatch) -> list[tuple[str, ...]]:
     """Capture every ``tmux set-option`` the worker issues (no tmux server in
     tests). Returns the list of captured argv tuples."""
     main = app_env.main
@@ -179,3 +180,55 @@ async def test_stopped_on_persona_role_skips_assertion(
     await main.process_pane_state_queue_once()
 
     assert spawned == [], "persona role must not spawn a close-down assertion"
+
+
+async def test_bounced_state_in_one_drain_does_not_assert_stale_stopped(
+    app_env: Any, monkeypatch: Any, _capture_set_option: list
+) -> None:
+    """A status that bounces stopped -> idle within one drain queues two @CC_STATE
+    rows. The early ``stopped`` must NOT fire a close-down assertion when the FINAL
+    drained state for that instance is no longer stopped."""
+    main = app_env.main
+
+    async def _resolve_live(_instance_id):
+        return ("%77", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
+
+    spawned: list[Any] = []
+    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
+
+    # Same instance: stopped then idle, both drained in one batch (ORDER BY id).
+    _enqueue_pane_state(app_env.db_path, "inst-bounce", "@CC_STATE", "stopped", "%77")
+    _enqueue_pane_state(app_env.db_path, "inst-bounce", "@CC_STATE", "idle", "%77")
+    await main.process_pane_state_queue_once()
+
+    assert spawned == [], "final state is idle — no stale stopped assertion"
+
+
+async def test_repeated_stopped_in_one_drain_asserts_once(
+    app_env: Any, monkeypatch: Any, _capture_set_option: list
+) -> None:
+    """Two ``stopped`` rows for the same instance in one drain collapse to a single
+    close-down assertion (deduped on the final per-instance state)."""
+    main = app_env.main
+
+    async def _resolve_live(_instance_id):
+        return ("%77", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
+
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        main,
+        "spawn_tmux_assert_instance",
+        lambda pane_target, instance_id="", source="system": spawned.append(
+            (pane_target, instance_id)
+        ),
+    )
+
+    _enqueue_pane_state(app_env.db_path, "inst-stop2", "@CC_STATE", "stopped", "%77")
+    _enqueue_pane_state(app_env.db_path, "inst-stop2", "@CC_STATE", "stopped", "%77")
+    await main.process_pane_state_queue_once()
+
+    assert spawned == [("palace:N", "inst-stop2")], "stopped must assert exactly once"
