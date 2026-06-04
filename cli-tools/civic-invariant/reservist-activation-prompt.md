@@ -72,7 +72,7 @@ in **both** locations (they must stay byte-identical):
 
 After both are updated, verify they match:
 
-```
+```bash
 diff ~/.civic-invariant/reservist-activation-prompt.md \
      /Volumes/Imperium/Token-OS/cli-tools/civic-invariant/reservist-activation-prompt.md
 ```
