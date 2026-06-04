@@ -60,11 +60,19 @@ def _insert_instance(
     conn.close()
 
 
+_FETCH_QUERIES = {
+    "tab_name": "SELECT tab_name FROM claude_instances WHERE id = ?",
+    "hook_driven": "SELECT hook_driven FROM claude_instances WHERE id = ?",
+    "status": "SELECT status FROM claude_instances WHERE id = ?",
+}
+
+
 def _fetch(db_path: Any, instance_id: str, column: str) -> Any:
+    # Allowlist the column to a fixed query (no identifier interpolation) so the
+    # helper can never build dynamic SQL even if call sites grow.
+    query = _FETCH_QUERIES[column]
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            f"SELECT {column} FROM claude_instances WHERE id = ?", (instance_id,)
-        ).fetchone()
+        row = conn.execute(query, (instance_id,)).fetchone()
     return row[0] if row else None
 
 
