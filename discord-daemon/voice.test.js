@@ -10,6 +10,13 @@ test('tmux field parsing does not depend on literal tab output', () => {
   assert.deepEqual(parseTmuxFields(line), ['1780603214', '/dev/ttys024', 'main']);
 });
 
+test('tmux field parsing preserves literal tabs inside field values', () => {
+  const sessionName = 'main\twith-tab';
+  const line = ['1780603214', '/dev/ttys024', sessionName].join(TMUX_FIELD_SEP);
+
+  assert.deepEqual(parseTmuxFields(line), ['1780603214', '/dev/ttys024', sessionName]);
+});
+
 test('tmux field separator is explicit for launchd C-locale tmux calls', () => {
   assert.equal(TMUX_FIELD_SEP.includes('\t'), false);
   assert.equal(TMUX_FIELD_SEP.includes('_/'), false);

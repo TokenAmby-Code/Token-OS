@@ -26,6 +26,12 @@ const AUDIO_DIR = join(process.env.HOME || '/tmp', '.discord-cli', 'audio');
 mkdirSync(AUDIO_DIR, { recursive: true });
 export const TMUX_FIELD_SEP = '__TOKEN_DISCORD_FIELD__';
 
+/**
+ * Split tmux output fields using the daemon-owned separator.
+ *
+ * @param {string} line
+ * @returns {string[]}
+ */
 export function parseTmuxFields(line) {
   return String(line || '').split(TMUX_FIELD_SEP);
 }
