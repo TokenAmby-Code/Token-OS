@@ -11,6 +11,23 @@ def client(app_env, monkeypatch):
         return None
 
     monkeypatch.setattr(app_env.main, "_refresh_tmux_pane_label", _noop_refresh)
+
+    # The rename route now resolves pane -> instance via the pane's live
+    # @INSTANCE_ID stamp (tmuxctl owns resolution). There is no tmux server in
+    # tests, so the real resolver fails closed and every rename would 404. Stub it
+    # to echo the active row whose stored tmux_pane matches — the dual-write reality
+    # where the live pane still equals the stored one — so these endpoint tests
+    # exercise their real contract.
+    async def _stamp(pane):
+        with sqlite3.connect(app_env.db_path) as conn:
+            r = conn.execute(
+                "SELECT id FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' "
+                "ORDER BY last_activity DESC LIMIT 1",
+                (pane,),
+            ).fetchone()
+        return r[0] if r else None
+
+    monkeypatch.setattr(app_env.main.shared, "instance_id_for_pane", _stamp)
     return TestClient(app_env.main.app)
 
 
