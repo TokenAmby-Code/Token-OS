@@ -4307,14 +4307,34 @@ async def process_pane_write_queue_once(
     results: list[dict] = []
     for row in rows:
         item = dict(row)
-        pane = item["tmux_pane"]
+        instance_id = item["instance_id"]
+        stored_pane = item["tmux_pane"]
+        # tmuxctl owns instance_id -> pane. Resolve the LIVE pane at dequeue rather
+        # than trusting the stored column: the periodic worker may drain this item
+        # long after enqueue, by which time the stored %N can be stale (pane moved,
+        # tmux server cycled, agent died). Fail closed when the pane no longer
+        # resolves — never deliver an automated write to a stale or reused pane.
+        live_pane, _live_role = await shared.resolve_instance_pane(instance_id)
+        pane = live_pane
         base = {
             "queue_id": item["id"],
-            "instance_id": item["instance_id"],
+            "instance_id": instance_id,
             "tmux_pane": pane,
+            "stored_pane": stored_pane,
             "source": item["source"],
             "purpose": item["purpose"],
         }
+        if not pane:
+            # Pane gone: terminal for this item (cancel, do not retry or send).
+            result = {**base, "status": PANE_WRITE_CANCELLED, "reason": "pane_unresolved"}
+            await _mark_pane_write(
+                item["id"],
+                status=PANE_WRITE_CANCELLED,
+                result=result,
+                error="pane_unresolved",
+            )
+            results.append(result)
+            continue
         is_brief = item["source"] == "brief"
         try:
             # brief clears/replaces a stale composer rather than deferring on it
