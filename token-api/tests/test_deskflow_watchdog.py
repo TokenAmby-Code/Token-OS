@@ -136,9 +136,43 @@ def test_classify_maps_real_log_lines_to_edges():
 
 def test_server_up_invites_mac_exactly_once():
     module = load_satellite_module()
-    wd = make_watchdog(module)
+    wd = make_watchdog(module)  # follower not connected
     module.DeskFlowWatchdog._on_server_up(wd)
     assert wd.actions.count("invite_mac") == 1
+
+
+def test_boot_server_up_is_suppressed_once():
+    # The eager boot invite arms a one-shot suppression of the paired SERVER_UP.
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd._suppress_boot_server_up = True
+    module.DeskFlowWatchdog._on_server_up(wd)
+    assert wd.actions == []
+    assert wd._suppress_boot_server_up is False
+    # A later SERVER_UP (real restart, disconnected) invites normally.
+    module.DeskFlowWatchdog._on_server_up(wd)
+    assert wd.actions == ["invite_mac"]
+
+
+def test_server_up_while_connected_does_not_invite():
+    # SERVER_UP must not bounce an already-connected client (invite is stop+start).
+    module = load_satellite_module()
+    wd = make_watchdog(module, follower_connected=True)
+    module.DeskFlowWatchdog._on_server_up(wd)
+    assert wd.actions == []
+
+
+def test_follower_connected_latches_fallback_probe():
+    # When only the one-shot Established probe is positive, the follower's derived
+    # state must latch so _observe()/status stop reporting the link down.
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd._follower.connected = False
+    wd._check_deskflow_connected = lambda: True
+    # Use the REAL _follower_connected (make_watchdog stubs it out by default).
+    wd._follower_connected = module.DeskFlowWatchdog._follower_connected.__get__(wd)
+    assert wd._follower_connected() is True
+    assert wd._follower.connected is True
 
 
 def test_drop_while_running_schedules_recovery():
@@ -245,7 +279,10 @@ def _wait_until(predicate, timeout=3.0):
 def test_follower_tails_edges_and_reopens_on_truncation(tmp_path):
     module = load_satellite_module()
     log = tmp_path / "deskflow-core.log"
-    log.write_text("this preexisting line must be skipped (seek to end)\n")
+    # Seed with a REAL edge line: if the first open replayed history instead of
+    # seeking to end, this DROP would be classified and queued — so the assertions
+    # below actually exercise the "skip existing history on first open" contract.
+    log.write_text(LINE_DROP + "\n")
 
     original = module.DESKFLOW_CORE_LOG
     module.DESKFLOW_CORE_LOG = log
@@ -255,6 +292,14 @@ def test_follower_tails_edges_and_reopens_on_truncation(tmp_path):
     try:
         follower.start()
         assert _wait_until(lambda: follower._fh is not None)
+
+        # The seeded DROP must NOT be replayed: nothing queued, connected untouched.
+        try:
+            stray = edge_queue.get(timeout=0.5)
+            raise AssertionError(f"first open replayed history: {stray}")
+        except queue.Empty:
+            pass
+        assert follower.connected is False
 
         with log.open("a") as fh:
             fh.write(LINE_UP_IPC + "\n")

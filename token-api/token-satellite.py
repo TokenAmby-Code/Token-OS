@@ -631,7 +631,7 @@ class DeskflowLogFollower(threading.Thread):
 
     READ_INTERVAL = 0.25  # seconds between tail reads when at EOF
 
-    def __init__(self, edge_queue: "queue.Queue", stop_event: threading.Event):
+    def __init__(self, edge_queue: "queue.Queue", stop_event: threading.Event) -> None:
         super().__init__(daemon=True, name="deskflow-log-follower")
         self._edge_queue = edge_queue
         self._stop_event = stop_event
@@ -652,7 +652,7 @@ class DeskflowLogFollower(threading.Thread):
             return cls.SERVER_UP
         return None
 
-    def _emit(self, edge: str):
+    def _emit(self, edge: str) -> None:
         """Update derived connected state from the edge and enqueue it."""
         if edge == self.UP:
             self.connected = True
@@ -682,7 +682,7 @@ class DeskflowLogFollower(threading.Thread):
             self._inode = None
         return True
 
-    def _close(self):
+    def _close(self) -> None:
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -703,7 +703,7 @@ class DeskflowLogFollower(threading.Thread):
             return True
         return (self._inode is not None and st.st_ino != self._inode) or st.st_size < pos
 
-    def run(self):
+    def run(self) -> None:
         while not self._stop_event.is_set():
             if self._fh is None:
                 if not self._open(seek_end=self._first_open):
@@ -769,14 +769,17 @@ class DeskFlowWatchdog:
         self._recovery_lock = threading.Lock()
         self._edge_queue: queue.Queue = queue.Queue()
         self._follower = DeskflowLogFollower(self._edge_queue, self._stop_event)
+        # When boot launches the server, its paired SERVER_UP edge is redundant
+        # with the eager boot invite — consume it once to avoid a double-invite.
+        self._suppress_boot_server_up = False
 
-    def start(self):
+    def start(self) -> None:
         self._follower.start()
         self._thread = threading.Thread(target=self._run, daemon=True, name="deskflow-watchdog")
         self._thread.start()
         logger.info("KVM watchdog: Started")
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
@@ -814,30 +817,29 @@ class DeskFlowWatchdog:
 
     # ── Main loop ──
 
-    def _run(self):
+    def _run(self) -> None:
         self._wait_for_tailscale()
         if self._stop_event.is_set():
             return
 
         # Start DeskFlow server immediately — it stays up permanently.
-        self._start_deskflow_server()
+        started = self._start_deskflow_server()
 
-        # Boot invitation: "server up" ⇒ "Mac invited" as one explicit step, so the
-        # Mac never busy-waits for the client and we never race the follower's
-        # SERVER_UP seeding (the follower then handles SERVER_UP only on later
-        # server restarts).
-        self._invite_mac()
-
-        # Seed connection state once (follower edge, else a single Established probe).
+        # Boot invitation. The Mac never busy-waits; we invite eagerly so a missed
+        # boot SERVER_UP line (the follower can open the freshly-created log just
+        # after that line is written) can never leave the Mac un-invited. If we
+        # launched the server, arm _suppress_boot_server_up so the paired SERVER_UP
+        # edge is consumed once instead of issuing a duplicate (bouncing) invite.
         if self._follower_connected():
             self._mark_connected()
             logger.info("KVM watchdog: Mac connected on boot → RUNNING")
         else:
             if self.state == "starting":
                 self.state = "waiting"
-            logger.info(
-                f"KVM watchdog: Mac not connected on boot yet, server running, state={self.state}"
-            )
+            if started:
+                self._suppress_boot_server_up = True
+            logger.info("KVM watchdog: Inviting Mac on boot (server started=%s)", started)
+            self._invite_mac()
 
         # Edge loop: block on the follower's edge queue. On timeout, run only the
         # low-frequency process-liveness check — the one surviving timer.
@@ -857,7 +859,7 @@ class DeskFlowWatchdog:
             except Exception as e:
                 logger.error(f"KVM watchdog: edge dispatch error ({edge}): {e}")
 
-    def _dispatch_edge(self, edge: str):
+    def _dispatch_edge(self, edge: str) -> None:
         # Stopped: manual force_stop, ignore edges until force_start.
         if self.state == "stopped":
             return
@@ -877,18 +879,31 @@ class DeskFlowWatchdog:
         elif edge == DeskflowLogFollower.DROP:
             self._on_link_down()
 
-    def _on_server_up(self):
-        """Server (re)started — atomically (re)invite the Mac client."""
+    def _on_server_up(self) -> None:
+        """Server (re)started — invite the Mac client.
+
+        Skip in two cases, because the invite path stop+starts the client and a
+        redundant invite would bounce a live/converging session:
+          - the boot SERVER_UP that pairs with the eager boot invite (one-shot), or
+          - the client is already connected (an established client needs no invite).
+        """
+        if self._suppress_boot_server_up:
+            self._suppress_boot_server_up = False
+            logger.info("KVM watchdog: boot SERVER_UP edge (already invited) → no invite")
+            return
+        if self._follower.connected:
+            logger.info("KVM watchdog: SERVER_UP edge while connected → no invite")
+            return
         logger.info("KVM watchdog: SERVER_UP edge → inviting Mac")
         self._invite_mac()
 
-    def _on_link_up(self):
+    def _on_link_up(self) -> None:
         """Client-connected edge — mark RUNNING (resurrects from waiting/backoff/ceased)."""
         if self.state != "running":
             logger.info(f"KVM watchdog: UP edge → RUNNING (was {self.state})")
             self._mark_connected()
 
-    def _on_link_down(self):
+    def _on_link_down(self) -> None:
         """Client-disconnected edge — drop to WAITING and run the heal ladder."""
         if self.state == "running":
             logger.info("KVM watchdog: DROP edge → WAITING, healing")
@@ -897,16 +912,24 @@ class DeskFlowWatchdog:
             self.next_recovery_at = time.time()
             self._recover_connection(reason="drop_edge")
 
-    def _invite_mac(self):
+    def _invite_mac(self) -> None:
         """The invitation IS the Mac client start (POST MAC_API_BASE/api/kvm/start)."""
         self._start_mac_client()
 
     def _follower_connected(self) -> bool:
         """Authoritative connection read: the follower's derived state, with a
-        one-shot (never periodic) Established probe as the boot/edge fallback."""
+        one-shot (never periodic) Established probe as the boot/edge fallback.
+
+        A positive fallback probe latches ``self._follower.connected`` so
+        ``_observe()`` / ``/kvm/status`` stop reporting the link down until the
+        next contradicting log edge arrives.
+        """
         if self._follower.connected:
             return True
-        return self._check_deskflow_connected()
+        if self._check_deskflow_connected():
+            self._follower.connected = True
+            return True
+        return False
 
     def _opportunistic_defer(self, seconds: float = DESKFLOW_OPP_GRACE) -> bool:
         """Watch the follower for an UP within a short grace window before escalating.
@@ -1105,10 +1128,12 @@ class DeskFlowWatchdog:
         except Exception:
             return False
 
-    def _start_deskflow_server(self):
+    def _start_deskflow_server(self) -> bool:
+        """Start deskflow-core if not running. Returns True iff a fresh process was
+        launched (→ a SERVER_UP log edge will follow); False if already running."""
         if self._check_deskflow_running():
             logger.info("KVM watchdog: DeskFlow already running, skipping start")
-            return
+            return False
         logger.info("KVM watchdog: Starting DeskFlow server")
         try:
             self._ensure_deskflow_config()
@@ -1119,8 +1144,10 @@ class DeskFlowWatchdog:
                 stderr=subprocess.STDOUT,
                 close_fds=True,
             )
+            return True
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
+            return False
 
     def _reload_deskflow_server(self):
         """Light local reload: restart only the core process and relaunch the GUI wrapper."""
@@ -1397,7 +1424,7 @@ class DeskFlowWatchdog:
 
     # ── API helpers ──
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, object]:
         observation = self._observe()
         self.last_observation = observation
         running = observation["deskflow_running"]

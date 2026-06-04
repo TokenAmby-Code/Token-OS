@@ -21,6 +21,7 @@ import shlex
 import signal
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1352,7 +1353,7 @@ async def run_overdue_tasks():
 
 # Lifespan context manager
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global stale_flag_cleaner_task, timer_worker_task, APP_LOOP
     import routes.tts as _tts_mod  # For mutable tts_worker_task assignment
 
@@ -15040,7 +15041,7 @@ def _stop_mac_deskflow_client(reason: str):
 
 
 @app.post("/api/kvm/start")
-async def kvm_start():
+async def kvm_start() -> dict[str, object]:
     """Start (or re-converge) the Deskflow client on this Mac.
 
     This is the satellite's invitation receiver. With Deskflow's native auto-retry
@@ -15092,7 +15093,7 @@ async def kvm_stop():
 
 
 @app.get("/api/kvm/status")
-async def kvm_status():
+async def kvm_status() -> dict[str, object]:
     """Check if Deskflow is running on this Mac.
 
     Lifecycle now lives on the WSL satellite's event-driven watchdog; the Mac
