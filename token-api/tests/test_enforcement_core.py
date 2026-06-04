@@ -372,7 +372,13 @@ async def test_pane_write_queue_submits_with_separate_literal_text_and_enter(app
             "operation": "tmuxctl.send_text_then_submit",
         }
 
+    async def _resolve_live(_instance_id):
+        # Tier 2(b): the drain resolves the pane live by instance_id; this
+        # instance has no DB row, so resolve directly to its live pane.
+        return ("%10", "palace:N")
+
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_pending_input", pane_has_input)
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve_live)
     monkeypatch.setattr(
         app_env.main,
         "_tmux_send_payload_then_submit",
