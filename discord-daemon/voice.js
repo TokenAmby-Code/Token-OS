@@ -24,6 +24,11 @@ const execFileAsync = promisify(execFile);
 
 const AUDIO_DIR = join(process.env.HOME || '/tmp', '.discord-cli', 'audio');
 mkdirSync(AUDIO_DIR, { recursive: true });
+export const TMUX_FIELD_SEP = '__TOKEN_DISCORD_FIELD__';
+
+export function parseTmuxFields(line) {
+  return String(line || '').split(TMUX_FIELD_SEP);
+}
 
 export function createVoiceManager(botClients, config, logger) {
   const guildId = config.guild_id;
@@ -56,9 +61,9 @@ export function createVoiceManager(botClients, config, logger) {
         '-t',
         pane,
         '-p',
-        '#{pane_id}\t#{session_name}\t#{pane_current_command}\t#{pane_current_path}',
+        `#{pane_id}${TMUX_FIELD_SEP}#{session_name}${TMUX_FIELD_SEP}#{pane_current_command}${TMUX_FIELD_SEP}#{pane_current_path}`,
       ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 })).trim();
-      const [paneId, sessionName, command, currentPath] = raw.split('\t');
+      const [paneId, sessionName, command, currentPath] = parseTmuxFields(raw);
       if (paneId !== pane) return null;
       return { paneId, sessionName, command, currentPath };
     } catch {
@@ -81,13 +86,13 @@ export function createVoiceManager(botClients, config, logger) {
         'list-windows',
         '-a',
         '-F',
-        '#{session_name}\t#{window_active}\t#{window_index}\t#{pane_id}',
+        `#{session_name}${TMUX_FIELD_SEP}#{window_active}${TMUX_FIELD_SEP}#{window_index}${TMUX_FIELD_SEP}#{pane_id}`,
       ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
 
       const candidates = [];
       for (const line of windowsOut.split(/\r?\n/)) {
         if (!line) continue;
-        const [sessionName, rawActive, rawIndex, pane] = line.split('\t');
+        const [sessionName, rawActive, rawIndex, pane] = parseTmuxFields(line);
         if (!pane?.startsWith?.('%')) continue;
         if (sessionName === 'discord-daemon' || sessionName?.startsWith?.('tx_test_')) continue;
         if (!isRoutablePane(pane)) continue;
@@ -119,13 +124,13 @@ export function createVoiceManager(botClients, config, logger) {
       const clientsOut = execFileSync('tmux', [
         'list-clients',
         '-F',
-        '#{client_activity}\t#{client_name}\t#{session_name}',
+        `#{client_activity}${TMUX_FIELD_SEP}#{client_name}${TMUX_FIELD_SEP}#{session_name}`,
       ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
 
       const clients = [];
       for (const line of clientsOut.split(/\r?\n/)) {
         if (!line) continue;
-        const [rawActivity, clientName, sessionName] = line.split('\t');
+        const [rawActivity, clientName, sessionName] = parseTmuxFields(line);
         const activity = Number.parseInt(rawActivity || '0', 10);
         if (clientName && Number.isFinite(activity) && sessionName !== 'discord-daemon') {
           clients.push({ clientName, sessionName, activity });
