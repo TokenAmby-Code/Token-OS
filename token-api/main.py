@@ -17714,80 +17714,111 @@ async def enforce_break_exhausted_impl() -> dict:
     }
 
 
+async def process_pane_state_queue_once() -> list[dict]:
+    """Drain pane_state_queue once — push tmux pane variables (@CC_STATE etc).
+
+    tmuxctl is the sole owner of ``instance_id -> pane`` resolution. This drainer
+    resolves the LIVE pane per row via ``shared.resolve_instance_pane`` rather than
+    trusting the stored ``pane_state_queue.tmux_pane`` (which the trigger stamped
+    from ``claude_instances.tmux_pane`` and which goes stale the moment geometry
+    changes, a pane is reused, or the agent dies). It fails closed when the pane no
+    longer resolves: no ``set-option``, no close-down assertion — but the queue row
+    is still drained so a dead instance cannot wedge the queue. The
+    ``@CC_STATE=stopped`` assert-persona decision keys on the *live role*, not a
+    stored ``pane_label``. Returns one result dict per drained row.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, instance_id, variable, value FROM pane_state_queue ORDER BY id"
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return []
+
+        processed: list[int] = []
+        results: list[dict] = []
+        stopped_assertions: list[tuple[str, str]] = []
+        for row in rows:
+            # Resolve the live pane and fail closed. A pane that no longer resolves
+            # (agent died, geometry changed, tmux server cycled) must never receive
+            # a set-option nor spawn a stale close-down assertion. The row drains
+            # either way.
+            pane, role = await shared.resolve_instance_pane(row["instance_id"])
+            if not pane:
+                processed.append(row["id"])
+                results.append(
+                    {
+                        "queue_id": row["id"],
+                        "instance_id": row["instance_id"],
+                        "variable": row["variable"],
+                        "value": row["value"],
+                        "tmux_pane": None,
+                        "status": "skipped",
+                        "reason": "pane_unresolved",
+                    }
+                )
+                continue
+            status = "applied"
+            try:
+                await _run_subprocess_offloop(
+                    (
+                        "tmux",
+                        "set-option",
+                        "-p",
+                        "-t",
+                        pane,
+                        row["variable"],
+                        row["value"],
+                    ),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    timeout=5,
+                )
+                logger.info(
+                    f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
+                )
+            except Exception as e:
+                status = "error"
+                logger.warning(f"Pane state set failed for {pane}: {e}")
+            if (
+                row["variable"] == "@CC_STATE"
+                and row["value"] == "stopped"
+                and not _is_assert_persona_label(role)
+            ):
+                stopped_assertions.append((role or pane, row["instance_id"]))
+            processed.append(row["id"])
+            results.append(
+                {
+                    "queue_id": row["id"],
+                    "instance_id": row["instance_id"],
+                    "variable": row["variable"],
+                    "value": row["value"],
+                    "tmux_pane": pane,
+                    "status": status,
+                    "reason": None,
+                }
+            )
+
+        if processed:
+            ph = ",".join("?" * len(processed))
+            await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
+            await db.commit()
+    for pane_target, instance_id in stopped_assertions:
+        spawn_tmux_assert_instance(pane_target, instance_id, "pane-state-stopped")
+    return results
+
+
 async def pane_state_worker():
     """Process pane_state_queue — push tmux pane variables (@CC_STATE etc).
 
     The SQLite trigger `trg_status_pane_state` fires on any UPDATE to the status
-    column, inserting a row here. This worker polls every second, reads pending
-    state changes, and applies `tmux set-option -p` to each pane.
+    column, inserting a row here. This worker polls every second and drains the
+    queue via `process_pane_state_queue_once`.
     """
     while True:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cursor = await db.execute(
-                    "SELECT id, instance_id, variable, value, tmux_pane FROM pane_state_queue ORDER BY id"
-                )
-                rows = await cursor.fetchall()
-                if not rows:
-                    await asyncio.sleep(1)
-                    continue
-
-                processed = []
-                stopped_assertions: list[tuple[str, str]] = []
-                for row in rows:
-                    pane = row["tmux_pane"]
-                    pane_label = None
-                    if not pane:
-                        cur2 = await db.execute(
-                            "SELECT tmux_pane, pane_label FROM claude_instances WHERE id = ?",
-                            (row["instance_id"],),
-                        )
-                        r = await cur2.fetchone()
-                        pane = r["tmux_pane"] if r else None
-                        pane_label = r["pane_label"] if r else None
-                    else:
-                        cur2 = await db.execute(
-                            "SELECT pane_label FROM claude_instances WHERE id = ?",
-                            (row["instance_id"],),
-                        )
-                        r = await cur2.fetchone()
-                        pane_label = r["pane_label"] if r else None
-                    if pane:
-                        try:
-                            await _run_subprocess_offloop(
-                                (
-                                    "tmux",
-                                    "set-option",
-                                    "-p",
-                                    "-t",
-                                    pane,
-                                    row["variable"],
-                                    row["value"],
-                                ),
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL,
-                                timeout=5,
-                            )
-                            logger.info(
-                                f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Pane state set failed for {pane}: {e}")
-                    if (
-                        row["variable"] == "@CC_STATE"
-                        and row["value"] == "stopped"
-                        and not _is_assert_persona_label(pane_label)
-                    ):
-                        stopped_assertions.append((pane_label or pane, row["instance_id"]))
-                    processed.append(row["id"])
-
-                if processed:
-                    ph = ",".join("?" * len(processed))
-                    await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
-                    await db.commit()
-                for pane_target, instance_id in stopped_assertions:
-                    spawn_tmux_assert_instance(pane_target, instance_id, "pane-state-stopped")
+            await process_pane_state_queue_once()
         except Exception as e:
             logger.error(f"Pane state worker error: {e}")
         await asyncio.sleep(1)
