@@ -28,8 +28,9 @@ export const TMUX_FIELD_SEP = '__TOKEN_DISCORD_FIELD__';
 
 /**
  * Split tmux output fields using the daemon-owned separator.
+ * Null or undefined input is treated as an empty string and returns [''].
  *
- * @param {string} line
+ * @param {string | null | undefined} line
  * @returns {string[]}
  */
 export function parseTmuxFields(line) {
