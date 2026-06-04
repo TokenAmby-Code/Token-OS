@@ -264,6 +264,112 @@ def test_recovery_lock_skips_overlapping_recovery():
     assert wd.actions == []
 
 
+# ── Idle-tick recovery driver (the recovery-wedge fix) ──
+
+
+def test_edge_loop_timeout_slow_while_running():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd.state = "running"
+    assert wd._edge_loop_timeout() == float(module.DESKFLOW_PROCESS_CHECK_INTERVAL)
+
+
+def test_edge_loop_timeout_short_while_waiting_respects_next_recovery_at():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd.state = "waiting"
+    # A retry scheduled ~5s out yields a short, bounded timeout.
+    wd.next_recovery_at = time.time() + 5
+    t = wd._edge_loop_timeout()
+    assert 1.0 <= t <= float(module.DESKFLOW_PROCESS_CHECK_INTERVAL)
+    assert t <= 6.0
+    # Overdue retry clamps to the 1.0s floor, never negative.
+    wd.next_recovery_at = time.time() - 100
+    assert wd._edge_loop_timeout() == 1.0
+    # A far-future retry is capped at the slow liveness cadence.
+    wd.next_recovery_at = time.time() + 10_000
+    assert wd._edge_loop_timeout() == float(module.DESKFLOW_PROCESS_CHECK_INTERVAL)
+
+
+def test_idle_tick_drives_recovery_when_waiting_and_due():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "waiting"
+    wd._follower.connected = False
+    wd.next_recovery_at = time.time() - 1  # due
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert ("recover", "waiting") in wd.actions
+
+
+def test_idle_tick_drives_recovery_when_backoff_and_due():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "backoff"
+    wd._follower.connected = False
+    wd.next_recovery_at = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert ("recover", "backoff") in wd.actions
+
+
+def test_idle_tick_no_recovery_when_not_due():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "waiting"
+    wd._follower.connected = False
+    wd.next_recovery_at = time.time() + 1000  # not due yet
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert not any(a == ("recover", "waiting") for a in wd.actions)
+
+
+def test_idle_tick_no_recovery_when_running():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "running"
+    wd.next_recovery_at = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
+
+
+def test_idle_tick_no_recovery_when_ceased():
+    # ceased waits for an UP edge to resurrect — the idle tick must not retry.
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "ceased"
+    wd._follower.connected = False
+    wd.next_recovery_at = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
+
+
+def test_idle_tick_no_recovery_when_connected():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "waiting"
+    wd._follower.connected = True  # already healed
+    wd.next_recovery_at = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
+
+
+def test_idle_tick_runs_liveness_except_when_stopped():
+    module = load_satellite_module()
+    calls = []
+    # waiting → liveness runs.
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "waiting"
+    wd._follower.connected = True  # isolate the liveness call from the retry path
+    wd._ensure_server_alive = lambda: calls.append("alive")
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert calls == ["alive"]
+
+    # stopped → return immediately, no liveness, no auto-restart.
+    wd_stopped = make_watchdog(module, record_recover=True)
+    wd_stopped.state = "stopped"
+    wd_stopped._ensure_server_alive = lambda: calls.append("alive-stopped")
+    module.DeskFlowWatchdog._on_idle_tick(wd_stopped)
+    assert "alive-stopped" not in calls
+
+
 # ── Follower tail mechanics ──
 
 

@@ -840,24 +840,65 @@ class DeskFlowWatchdog:
                 self._suppress_boot_server_up = True
             logger.info("KVM watchdog: Inviting Mac on boot (server started=%s)", started)
             self._invite_mac()
+            # Arm a fallback retry: if the boot invite + its paired SERVER_UP never
+            # connect the Mac, no further edge arrives — the idle tick re-drives the
+            # ladder at next_recovery_at. _mark_connected() resets this to 0.0.
+            self.next_recovery_at = time.time() + DESKFLOW_BACKOFF_SECONDS[0]
 
-        # Edge loop: block on the follower's edge queue. On timeout, run only the
-        # low-frequency process-liveness check — the one surviving timer.
+        # Edge loop: block on the follower's edge queue. On timeout, run the idle
+        # tick (process liveness + a bounded recovery retry while un-connected).
         while not self._stop_event.is_set():
             try:
-                edge = self._edge_queue.get(timeout=DESKFLOW_PROCESS_CHECK_INTERVAL)
+                edge = self._edge_queue.get(timeout=self._edge_loop_timeout())
             except queue.Empty:
-                # force_stop means leave the server down — don't auto-restart it.
-                if self.state != "stopped":
-                    try:
-                        self._ensure_server_alive()
-                    except Exception as e:
-                        logger.error(f"KVM watchdog: liveness check error: {e}")
+                self._on_idle_tick()
                 continue
             try:
                 self._dispatch_edge(edge)
             except Exception as e:
                 logger.error(f"KVM watchdog: edge dispatch error ({edge}): {e}")
+
+    def _edge_loop_timeout(self) -> float:
+        """Edge-queue blocking timeout.
+
+        While actively un-connected (``waiting``/``backoff``) the loop must wake
+        promptly to drive the next recovery retry — return a ``next_recovery_at``-
+        aware timeout clamped into ``[1.0, DESKFLOW_PROCESS_CHECK_INTERVAL]``. In
+        every other state (``running``/``held``/``ceased``/``stopped``) only the
+        slow process-liveness cadence matters.
+        """
+        if self.state in ("waiting", "backoff"):
+            remaining = self.next_recovery_at - time.time()
+            return max(1.0, min(remaining, float(DESKFLOW_PROCESS_CHECK_INTERVAL)))
+        return float(DESKFLOW_PROCESS_CHECK_INTERVAL)
+
+    def _on_idle_tick(self) -> None:
+        """Idle-tick body: process liveness + a bounded recovery retry.
+
+        Runs when the edge queue times out with no edge. Keeps the server process
+        alive, and — while actively un-connected — re-drives the recovery ladder at
+        the scheduled retry time so a wedged ``waiting``/``backoff`` (boot invite or
+        a prior rung that never connected the Mac, with no further edge arriving)
+        heals without an external trigger.
+        """
+        # force_stop means leave the server down — don't auto-restart it.
+        if self.state == "stopped":
+            return
+        try:
+            self._ensure_server_alive()
+        except Exception as e:
+            logger.error(f"KVM watchdog: liveness check error: {e}")
+
+        # Bounded recovery retry: only while actively un-connected. ``ceased`` is
+        # excluded by design (it waits for an UP edge to resurrect); ``running``/
+        # ``held`` never retry. ``_recovery_lock`` guards re-entrancy; backoff
+        # escalation to ``ceased`` after DESKFLOW_MAX_RECOVERY_ATTEMPTS still bounds it.
+        if (
+            self.state in ("waiting", "backoff")
+            and not self._follower.connected
+            and time.time() >= self.next_recovery_at
+        ):
+            self._recover_connection(reason=self.state)
 
     def _dispatch_edge(self, edge: str) -> None:
         # Stopped: manual force_stop, ignore edges until force_start.
