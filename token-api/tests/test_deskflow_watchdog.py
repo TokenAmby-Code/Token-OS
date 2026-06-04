@@ -1,4 +1,7 @@
 import importlib.util
+import queue
+import threading
+import time
 from pathlib import Path
 
 
@@ -10,93 +13,263 @@ def load_satellite_module():
     return module
 
 
-class FakeDeskFlowWatchdog:
-    def __init__(self, module, wait_results):
-        self.module = module
-        self.real = module.DeskFlowWatchdog()
-        self.actions = []
-        self.wait_results = list(wait_results)
-        self.observation = {
+class FakeLogFollower:
+    """Stand-in for DeskflowLogFollower in watchdog tests.
+
+    Settable ``connected`` plus a ``feed(line)`` that runs the REAL classifier on a
+    real deskflow-core log string and mirrors ``_emit`` onto the watchdog's edge
+    queue — so tests drive state with the exact strings deskflow emits, never a
+    paraphrase.
+    """
+
+    def __init__(self, module, edge_queue):
+        self._module = module
+        self._edge_queue = edge_queue
+        self.connected = False
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+    def feed(self, line):
+        follower = self._module.DeskflowLogFollower
+        edge = follower._classify(line)
+        if edge is None:
+            return None
+        if edge == follower.UP:
+            self.connected = True
+        elif edge == follower.DROP:
+            self.connected = False
+        self._edge_queue.put(edge)
+        return edge
+
+
+def make_watchdog(
+    module,
+    *,
+    follower_connected=False,
+    wait_results=None,
+    observation=None,
+    record_recover=False,
+):
+    """Real ``DeskFlowWatchdog`` with leaf primitives replaced by recorders.
+
+    Overrides are set as INSTANCE attributes, so every internal ``self._leaf()``
+    call resolves to the recorder at any nesting depth (the wrapper/unbound-method
+    pattern only doubles one level deep).
+    """
+    wd = module.DeskFlowWatchdog()
+    actions = []
+    wd.actions = actions
+
+    wd._follower = FakeLogFollower(module, wd._edge_queue)
+    wd._follower.connected = follower_connected
+
+    if observation is None:
+        observation = {
             "deskflow_running": True,
             "deskflow_listening": True,
-            "deskflow_connected": False,
+            "deskflow_connected": follower_connected,
             "mac_reachable": True,
             "mac_client_running": False,
         }
+    wd._observe = lambda: dict(observation)
+    wd._check_deskflow_connected = lambda: wd._follower.connected
+    wd._follower_connected = lambda: wd._follower.connected
+    wd._opportunistic_defer = lambda seconds=None: wd._follower.connected
 
-    def __getattr__(self, name):
-        return getattr(self.real, name)
+    pending = list(wait_results or [])
 
-    def _check_deskflow_connected(self):
+    def _wait_for_connection(seconds=None):
+        actions.append("wait")
+        if pending:
+            ok = pending.pop(0)
+            if ok:
+                wd._mark_connected()
+            return ok
         return False
 
-    def _observe(self):
-        return dict(self.observation)
+    wd._wait_for_connection = _wait_for_connection
 
-    def _wait_for_connection(self, seconds=None):
-        self.actions.append("wait")
-        if self.wait_results:
-            connected = self.wait_results.pop(0)
-            if connected:
-                self.real._mark_connected()
-            return connected
-        return False
+    wd._start_mac_client = lambda: actions.append("mac_quick_reconnect")
+    wd._reload_deskflow_server = lambda: actions.append("local_reload")
+    wd._stop_deskflow_server = lambda: actions.append("local_stop")
+    wd._start_deskflow_server = lambda: actions.append("local_start")
+    wd._reload_mac_client = lambda: actions.append("mac_reload")
+    wd._restart_mac_client = lambda: actions.append("mac_full_restart")
+    wd._schedule_backoff = lambda: actions.append("backoff")
+    wd._invite_mac = lambda: actions.append("invite_mac")
 
-    def _start_mac_client(self):
-        self.actions.append("mac_quick_reconnect")
+    if record_recover:
+        wd._recover_connection = lambda reason: actions.append(("recover", reason))
 
-    def _reload_deskflow_server(self):
-        self.actions.append("local_reload")
+    return wd
 
-    def _stop_deskflow_server(self):
-        self.actions.append("local_stop")
 
-    def _start_deskflow_server(self):
-        self.actions.append("local_start")
+# Real deskflow-core log lines (captured live 2026-06-03), with the
+# "[timestamp] LEVEL:" prefix the classifier must see through.
+LINE_DROP = '[2026-06-03T16:49:45.999] IPC: client "Tokens-Mac-Mini" has disconnected'
+LINE_UP_IPC = '[2026-06-03T16:49:48.508] IPC: client "Tokens-Mac-Mini" has connected'
+LINE_UP_NOTE = "[2026-06-03T16:49:48.487] NOTE: accepted client connection"
+LINE_SERVER_UP = "[2026-06-03T16:49:10.768] IPC: started server, waiting for clients"
+LINE_NOISE = "[2026-06-03T16:50:28.945] ERROR: failed to accept secure socket"
 
-    def _reload_mac_client(self):
-        self.actions.append("mac_reload")
 
-    def _restart_mac_client(self):
-        self.actions.append("mac_full_restart")
+# ── Classifier ──
 
-    def _schedule_backoff(self):
-        self.actions.append("backoff")
 
-    def recover(self):
-        return self.module.DeskFlowWatchdog._recover_connection(self, "test")
+def test_classify_maps_real_log_lines_to_edges():
+    module = load_satellite_module()
+    f = module.DeskflowLogFollower
+    assert f._classify(LINE_DROP) == f.DROP
+    assert f._classify(LINE_UP_IPC) == f.UP
+    assert f._classify(LINE_UP_NOTE) == f.UP
+    assert f._classify(LINE_SERVER_UP) == f.SERVER_UP
+    assert f._classify(LINE_NOISE) is None
+    assert f._classify("") is None
+
+
+# ── Edge dispatch ──
+
+
+def test_server_up_invites_mac_exactly_once():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    module.DeskFlowWatchdog._on_server_up(wd)
+    assert wd.actions.count("invite_mac") == 1
+
+
+def test_drop_while_running_schedules_recovery():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "running"
+    module.DeskFlowWatchdog._on_link_down(wd)
+    assert wd.state == "waiting"
+    assert ("recover", "drop_edge") in wd.actions
+
+
+def test_drop_while_not_running_does_not_recover():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "waiting"
+    module.DeskFlowWatchdog._on_link_down(wd)
+    assert wd.actions == []
+
+
+def test_up_while_ceased_resurrects_to_running():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd.state = "ceased"
+    wd._follower.connected = True
+    module.DeskFlowWatchdog._on_link_up(wd)
+    assert wd.state == "running"
+
+
+def test_stopped_swallows_edges():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd.state = "stopped"
+    module.DeskFlowWatchdog._dispatch_edge(wd, module.DeskflowLogFollower.SERVER_UP)
+    assert wd.state == "stopped"
+    assert wd.actions == []
+
+
+def test_held_swallows_edges_until_expiry():
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "held"
+    wd.hold_until = time.time() + 3600
+    module.DeskFlowWatchdog._dispatch_edge(wd, module.DeskflowLogFollower.DROP)
+    assert wd.state == "held"
+    assert wd.actions == []
+
+
+# ── Recovery ladder ──
 
 
 def test_recovery_stops_after_mac_quick_reconnect():
     module = load_satellite_module()
-    watchdog = FakeDeskFlowWatchdog(module, wait_results=[True])
-
-    watchdog.recover()
-
-    assert watchdog.actions == ["mac_quick_reconnect", "wait"]
-    assert watchdog.real.state == "running"
+    wd = make_watchdog(module, wait_results=[True])
+    module.DeskFlowWatchdog._recover_connection(wd, "test")
+    assert wd.actions == ["mac_quick_reconnect", "wait"]
+    assert wd.state == "running"
 
 
 def test_recovery_stops_after_local_reload_before_full_restart():
     module = load_satellite_module()
-    watchdog = FakeDeskFlowWatchdog(module, wait_results=[False, True])
+    wd = make_watchdog(module, wait_results=[False, True])
+    module.DeskFlowWatchdog._recover_connection(wd, "test")
+    assert wd.actions == ["mac_quick_reconnect", "wait", "local_reload", "wait"]
+    assert "local_stop" not in wd.actions
+    assert "mac_full_restart" not in wd.actions
+    assert wd.state == "running"
 
-    watchdog.recover()
 
-    assert watchdog.actions == ["mac_quick_reconnect", "wait", "local_reload", "wait"]
-    assert "local_stop" not in watchdog.actions
-    assert "mac_full_restart" not in watchdog.actions
-    assert watchdog.real.state == "running"
+def test_opportunistic_defer_aborts_ladder_before_touching_mac():
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    # The link drops, then self-heals within the grace window (real strings).
+    wd._follower.feed(LINE_DROP)
+    wd._follower.feed(LINE_UP_IPC)  # connected → True
+    module.DeskFlowWatchdog._recover_connection(wd, "drop_edge")
+    assert "mac_quick_reconnect" not in wd.actions
+    assert wd.actions == []
+    assert wd.state == "running"
 
 
 def test_recovery_lock_skips_overlapping_recovery():
     module = load_satellite_module()
-    watchdog = FakeDeskFlowWatchdog(module, wait_results=[])
-    assert watchdog.real._recovery_lock.acquire(blocking=False)
-
+    wd = make_watchdog(module, wait_results=[])
+    assert wd._recovery_lock.acquire(blocking=False)
     try:
-        watchdog.recover()
+        module.DeskFlowWatchdog._recover_connection(wd, "test")
     finally:
-        watchdog.real._recovery_lock.release()
+        wd._recovery_lock.release()
+    assert wd.actions == []
 
-    assert watchdog.actions == []
+
+# ── Follower tail mechanics ──
+
+
+def _wait_until(predicate, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_follower_tails_edges_and_reopens_on_truncation(tmp_path):
+    module = load_satellite_module()
+    log = tmp_path / "deskflow-core.log"
+    log.write_text("this preexisting line must be skipped (seek to end)\n")
+
+    original = module.DESKFLOW_CORE_LOG
+    module.DESKFLOW_CORE_LOG = log
+    edge_queue: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    follower = module.DeskflowLogFollower(edge_queue, stop)
+    try:
+        follower.start()
+        assert _wait_until(lambda: follower._fh is not None)
+
+        with log.open("a") as fh:
+            fh.write(LINE_UP_IPC + "\n")
+            fh.flush()
+        assert edge_queue.get(timeout=3) == module.DeskflowLogFollower.UP
+        assert _wait_until(lambda: follower.connected is True)
+
+        # Truncate + rewrite (logrotate / manual delete-recreate). The reopen must
+        # read from the START of the new file, so this DROP is not lost.
+        with log.open("w") as fh:
+            fh.write(LINE_DROP + "\n")
+            fh.flush()
+        assert edge_queue.get(timeout=3) == module.DeskflowLogFollower.DROP
+        assert _wait_until(lambda: follower.connected is False)
+    finally:
+        stop.set()
+        follower.join(timeout=3)
+        module.DESKFLOW_CORE_LOG = original
