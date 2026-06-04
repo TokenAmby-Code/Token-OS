@@ -2,10 +2,12 @@ import importlib.util
 import queue
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 
-def load_satellite_module():
+def load_satellite_module() -> Any:
     module_path = Path(__file__).resolve().parents[1] / "token-satellite.py"
     spec = importlib.util.spec_from_file_location("token_satellite_for_tests", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -22,18 +24,18 @@ class FakeLogFollower:
     paraphrase.
     """
 
-    def __init__(self, module, edge_queue):
+    def __init__(self, module: Any, edge_queue: queue.Queue) -> None:
         self._module = module
         self._edge_queue = edge_queue
-        self.connected = False
+        self.connected: bool = False
 
-    def start(self):
+    def start(self) -> None:
         pass
 
-    def join(self, timeout=None):
+    def join(self, timeout: float | None = None) -> None:
         pass
 
-    def feed(self, line):
+    def feed(self, line: str) -> str | None:
         follower = self._module.DeskflowLogFollower
         edge = follower._classify(line)
         if edge is None:
@@ -47,13 +49,13 @@ class FakeLogFollower:
 
 
 def make_watchdog(
-    module,
+    module: Any,
     *,
-    follower_connected=False,
-    wait_results=None,
-    observation=None,
-    record_recover=False,
-):
+    follower_connected: bool = False,
+    wait_results: list[bool] | None = None,
+    observation: dict[str, Any] | None = None,
+    record_recover: bool = False,
+) -> Any:
     """Real ``DeskFlowWatchdog`` with leaf primitives replaced by recorders.
 
     Overrides are set as INSTANCE attributes, so every internal ``self._leaf()``
@@ -82,7 +84,7 @@ def make_watchdog(
 
     pending = list(wait_results or [])
 
-    def _wait_for_connection(seconds=None):
+    def _wait_for_connection(seconds: float | None = None) -> bool:
         actions.append("wait")
         if pending:
             ok = pending.pop(0)
@@ -96,7 +98,13 @@ def make_watchdog(
     wd._start_mac_client = lambda: actions.append("mac_quick_reconnect")
     wd._reload_deskflow_server = lambda: actions.append("local_reload")
     wd._stop_deskflow_server = lambda: actions.append("local_stop")
-    wd._start_deskflow_server = lambda: actions.append("local_start")
+
+    def _start_deskflow_server() -> bool:
+        # Mirror the real method's bool contract (used by the boot path).
+        actions.append("local_start")
+        return True
+
+    wd._start_deskflow_server = _start_deskflow_server
     wd._reload_mac_client = lambda: actions.append("mac_reload")
     wd._restart_mac_client = lambda: actions.append("mac_full_restart")
     wd._schedule_backoff = lambda: actions.append("backoff")
@@ -120,7 +128,7 @@ LINE_NOISE = "[2026-06-03T16:50:28.945] ERROR: failed to accept secure socket"
 # ── Classifier ──
 
 
-def test_classify_maps_real_log_lines_to_edges():
+def test_classify_maps_real_log_lines_to_edges() -> None:
     module = load_satellite_module()
     f = module.DeskflowLogFollower
     assert f._classify(LINE_DROP) == f.DROP
@@ -134,14 +142,14 @@ def test_classify_maps_real_log_lines_to_edges():
 # ── Edge dispatch ──
 
 
-def test_server_up_invites_mac_exactly_once():
+def test_server_up_invites_mac_exactly_once() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)  # follower not connected
     module.DeskFlowWatchdog._on_server_up(wd)
     assert wd.actions.count("invite_mac") == 1
 
 
-def test_boot_server_up_is_suppressed_once():
+def test_boot_server_up_is_suppressed_once() -> None:
     # The eager boot invite arms a one-shot suppression of the paired SERVER_UP.
     module = load_satellite_module()
     wd = make_watchdog(module)
@@ -154,7 +162,7 @@ def test_boot_server_up_is_suppressed_once():
     assert wd.actions == ["invite_mac"]
 
 
-def test_server_up_while_connected_does_not_invite():
+def test_server_up_while_connected_does_not_invite() -> None:
     # SERVER_UP must not bounce an already-connected client (invite is stop+start).
     module = load_satellite_module()
     wd = make_watchdog(module, follower_connected=True)
@@ -162,7 +170,7 @@ def test_server_up_while_connected_does_not_invite():
     assert wd.actions == []
 
 
-def test_follower_connected_latches_fallback_probe():
+def test_follower_connected_latches_fallback_probe() -> None:
     # When only the one-shot Established probe is positive, the follower's derived
     # state must latch so _observe()/status stop reporting the link down.
     module = load_satellite_module()
@@ -175,7 +183,7 @@ def test_follower_connected_latches_fallback_probe():
     assert wd._follower.connected is True
 
 
-def test_drop_while_running_schedules_recovery():
+def test_drop_while_running_schedules_recovery() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "running"
@@ -184,7 +192,7 @@ def test_drop_while_running_schedules_recovery():
     assert ("recover", "drop_edge") in wd.actions
 
 
-def test_drop_while_not_running_does_not_recover():
+def test_drop_while_not_running_does_not_recover() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "waiting"
@@ -192,7 +200,7 @@ def test_drop_while_not_running_does_not_recover():
     assert wd.actions == []
 
 
-def test_up_while_ceased_resurrects_to_running():
+def test_up_while_ceased_resurrects_to_running() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)
     wd.state = "ceased"
@@ -201,7 +209,7 @@ def test_up_while_ceased_resurrects_to_running():
     assert wd.state == "running"
 
 
-def test_stopped_swallows_edges():
+def test_stopped_swallows_edges() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)
     wd.state = "stopped"
@@ -210,7 +218,7 @@ def test_stopped_swallows_edges():
     assert wd.actions == []
 
 
-def test_held_swallows_edges_until_expiry():
+def test_held_swallows_edges_until_expiry() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "held"
@@ -223,7 +231,7 @@ def test_held_swallows_edges_until_expiry():
 # ── Recovery ladder ──
 
 
-def test_recovery_stops_after_mac_quick_reconnect():
+def test_recovery_stops_after_mac_quick_reconnect() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, wait_results=[True])
     module.DeskFlowWatchdog._recover_connection(wd, "test")
@@ -231,7 +239,7 @@ def test_recovery_stops_after_mac_quick_reconnect():
     assert wd.state == "running"
 
 
-def test_recovery_stops_after_local_reload_before_full_restart():
+def test_recovery_stops_after_local_reload_before_full_restart() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, wait_results=[False, True])
     module.DeskFlowWatchdog._recover_connection(wd, "test")
@@ -241,7 +249,7 @@ def test_recovery_stops_after_local_reload_before_full_restart():
     assert wd.state == "running"
 
 
-def test_opportunistic_defer_aborts_ladder_before_touching_mac():
+def test_opportunistic_defer_aborts_ladder_before_touching_mac() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)
     # The link drops, then self-heals within the grace window (real strings).
@@ -253,7 +261,7 @@ def test_opportunistic_defer_aborts_ladder_before_touching_mac():
     assert wd.state == "running"
 
 
-def test_recovery_lock_skips_overlapping_recovery():
+def test_recovery_lock_skips_overlapping_recovery() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, wait_results=[])
     assert wd._recovery_lock.acquire(blocking=False)
@@ -267,14 +275,14 @@ def test_recovery_lock_skips_overlapping_recovery():
 # ── Idle-tick recovery driver (the recovery-wedge fix) ──
 
 
-def test_edge_loop_timeout_slow_while_running():
+def test_edge_loop_timeout_slow_while_running() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)
     wd.state = "running"
     assert wd._edge_loop_timeout() == float(module.DESKFLOW_PROCESS_CHECK_INTERVAL)
 
 
-def test_edge_loop_timeout_short_while_waiting_respects_next_recovery_at():
+def test_edge_loop_timeout_short_while_waiting_respects_next_recovery_at() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module)
     wd.state = "waiting"
@@ -291,7 +299,7 @@ def test_edge_loop_timeout_short_while_waiting_respects_next_recovery_at():
     assert wd._edge_loop_timeout() == float(module.DESKFLOW_PROCESS_CHECK_INTERVAL)
 
 
-def test_idle_tick_drives_recovery_when_waiting_and_due():
+def test_idle_tick_drives_recovery_when_waiting_and_due() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "waiting"
@@ -301,7 +309,7 @@ def test_idle_tick_drives_recovery_when_waiting_and_due():
     assert ("recover", "waiting") in wd.actions
 
 
-def test_idle_tick_drives_recovery_when_backoff_and_due():
+def test_idle_tick_drives_recovery_when_backoff_and_due() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "backoff"
@@ -311,7 +319,7 @@ def test_idle_tick_drives_recovery_when_backoff_and_due():
     assert ("recover", "backoff") in wd.actions
 
 
-def test_idle_tick_no_recovery_when_not_due():
+def test_idle_tick_no_recovery_when_not_due() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "waiting"
@@ -321,7 +329,7 @@ def test_idle_tick_no_recovery_when_not_due():
     assert not any(a == ("recover", "waiting") for a in wd.actions)
 
 
-def test_idle_tick_no_recovery_when_running():
+def test_idle_tick_no_recovery_when_running() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "running"
@@ -330,7 +338,7 @@ def test_idle_tick_no_recovery_when_running():
     assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
 
 
-def test_idle_tick_no_recovery_when_ceased():
+def test_idle_tick_no_recovery_when_ceased() -> None:
     # ceased waits for an UP edge to resurrect — the idle tick must not retry.
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
@@ -341,7 +349,7 @@ def test_idle_tick_no_recovery_when_ceased():
     assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
 
 
-def test_idle_tick_no_recovery_when_connected():
+def test_idle_tick_no_recovery_when_connected() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
     wd.state = "waiting"
@@ -351,7 +359,7 @@ def test_idle_tick_no_recovery_when_connected():
     assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
 
 
-def test_idle_tick_runs_liveness_except_when_stopped():
+def test_idle_tick_runs_liveness_except_when_stopped() -> None:
     module = load_satellite_module()
     calls = []
     # waiting → liveness runs.
@@ -373,7 +381,7 @@ def test_idle_tick_runs_liveness_except_when_stopped():
 # ── Follower tail mechanics ──
 
 
-def _wait_until(predicate, timeout=3.0):
+def _wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -382,7 +390,7 @@ def _wait_until(predicate, timeout=3.0):
     return False
 
 
-def test_follower_tails_edges_and_reopens_on_truncation(tmp_path):
+def test_follower_tails_edges_and_reopens_on_truncation(tmp_path: Any) -> None:
     module = load_satellite_module()
     log = tmp_path / "deskflow-core.log"
     # Seed with a REAL edge line: if the first open replayed history instead of
