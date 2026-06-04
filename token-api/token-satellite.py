@@ -2104,7 +2104,7 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
 
 
 @app.post("/restart")
-async def restart_satellite(pull: bool = False):
+async def restart_satellite(pull: bool = False) -> dict[str, object]:
     """Exit for systemd restart, reloading code from the shared NAS checkout.
 
     The satellite runs from the NAS checkout (``WorkingDirectory`` ==
