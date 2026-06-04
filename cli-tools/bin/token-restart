@@ -4,7 +4,8 @@
 # AUDIENCE: human, agent
 #
 # Usage:
-#   token-restart              # Full restart: Mac + WSL satellite
+#   token-restart              # Full restart: Mac token-api + Discord + WSL satellite
+#   token-restart --discord    # Restart the Discord daemon only (launchd)
 #   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --kill       # Just kill Mac server, don't restart
@@ -38,6 +39,13 @@ WSL_PORT=7777
 LABEL="ai.openclaw.tokenapi"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
+# Discord daemon — launchd-supervised, Mac-only. token-restart is the
+# AUTHORITATIVE restart path: launchctl kickstart against KeepAlive. Never use
+# `discord-daemon start/restart` (pidfile+nohup) — it split-brains against launchd.
+DISCORD_LABEL="ai.tokenclaw.discord"
+DISCORD_PLIST="$HOME/Library/LaunchAgents/${DISCORD_LABEL}.plist"
+DISCORD_URL="http://127.0.0.1:7779"
+
 is_mac() {
     [[ "$IMPERIUM_MACHINE" == "mac" ]]
 }
@@ -47,7 +55,8 @@ show_help() {
 token-restart - Multi-device restart orchestrator
 
 Usage:
-    token-restart              Full restart (Mac → WSL)
+    token-restart              Full restart (Mac token-api → Discord → WSL)
+    token-restart --discord    Restart the Discord daemon only (launchd)
     token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
     token-restart --kill       Kill Mac process (launchd auto-restarts)
@@ -59,14 +68,17 @@ Usage:
 
 Flow:
     1. Restart Mac token-api (launchctl)
-    2. Restart WSL satellite (HTTP → restart, SSH fallback)
-    3. Health-check all, print summary
+    2. Restart Discord daemon (launchd, Mac-only)
+    3. Restart WSL satellite (HTTP → restart, SSH fallback)
+    4. Health-check all, print summary
 
 Notes:
     - All devices read from NAS (/Volumes/Imperium/Token-OS) — no sync needed
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
+    - Discord daemon managed by launchd (ai.tokenclaw.discord) — this is the
+      AUTHORITATIVE restart path; do NOT use `discord-daemon restart`
     - Open /ui/ops browser tabs are reloaded after a healthy restart
 EOF
 }
@@ -83,6 +95,7 @@ remote_restart() {
     # Pass through relevant flags
     local flags=""
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
+    [[ "${ACTION}" == "discord" ]] && flags="$flags --discord"
 
     if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
@@ -216,6 +229,65 @@ restart_mac() {
     echo -e "  ${RED}✗${NC} Mac server failed to start within ${max_attempts}s"
     echo "  Check logs: tail ~/.claude/token-api-stderr.log"
     return 1
+}
+
+# ============ Discord ============
+
+check_discord_health() {
+    # Healthy = daemon up AND actually connected to Discord. A 200 from /status
+    # alone isn't enough (the HTTP API binds before the gateway connects), so
+    # require "connected": true in the body.
+    curl -sf "${DISCORD_URL}/status" 2>/dev/null \
+        | grep -q '"connected"[[:space:]]*:[[:space:]]*true'
+}
+
+get_discord_status() {
+    echo -e "${BOLD}Discord daemon${NC} (${DISCORD_URL})"
+
+    if launchctl print "gui/$(id -u)/${DISCORD_LABEL}" > /dev/null 2>&1; then
+        echo -e "  Launchd: ${GREEN}loaded${NC}"
+    else
+        echo -e "  Launchd: ${RED}not loaded${NC}"
+    fi
+
+    if check_discord_health; then
+        echo -e "  Health:  ${GREEN}●${NC} connected"
+    else
+        echo -e "  Health:  ${RED}●${NC} not responding"
+    fi
+}
+
+restart_discord() {
+    echo -e "${BLUE}→${NC} Restarting Discord daemon (launchd)..."
+
+    launchctl kickstart -k "gui/$(id -u)/${DISCORD_LABEL}" 2>/dev/null || {
+        echo "  Service not loaded, bootstrapping..."
+        launchctl bootstrap "gui/$(id -u)" "$DISCORD_PLIST" 2>/dev/null || true
+    }
+
+    # The kickstart above already succeeded — launchd (KeepAlive) now owns
+    # liveness. This loop only waits to CONFIRM the daemon is back. Cold-start
+    # from the NAS is slow (node loads node_modules over SMB in an uninterruptible
+    # read, ~1-3 min on a cold mount cache), so confirmation is best-effort.
+    local attempts=0
+    local max_attempts=45
+
+    printf '  waiting for Discord daemon'
+    while [[ $attempts -lt $max_attempts ]]; do
+        sleep 1
+        if check_discord_health; then
+            printf '\n'
+            echo -e "  ${GREEN}✓${NC} Discord daemon is up and connected"
+            return 0
+        fi
+        printf '.'
+        attempts=$((attempts + 1))
+    done
+    printf '\n'
+
+    echo -e "  ${YELLOW}○${NC} Kickstart issued; daemon still cold-loading from NAS."
+    echo -e "    launchd will bring it up — confirm with: discord-daemon status"
+    return 0
 }
 
 # ============ WSL ============
@@ -387,6 +459,8 @@ get_status_all() {
     echo ""
     get_mac_status
     echo ""
+    get_discord_status
+    echo ""
     get_wsl_status
     echo ""
     get_phone_status
@@ -435,6 +509,10 @@ full_restart() {
     restart_mac || true
     echo ""
 
+    # 1b. Discord daemon (Mac-only, launchd-supervised)
+    restart_discord || true
+    echo ""
+
     # 2. WSL restart
     restart_wsl &
     local wsl_pid=$!
@@ -450,14 +528,19 @@ full_restart() {
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
     if check_mac_health; then
-        echo -e "  Mac:   ${GREEN}●${NC} healthy"
+        echo -e "  Mac:     ${GREEN}●${NC} healthy"
     else
-        echo -e "  Mac:   ${RED}●${NC} not responding"
+        echo -e "  Mac:     ${RED}●${NC} not responding"
+    fi
+    if check_discord_health; then
+        echo -e "  Discord: ${GREEN}●${NC} connected"
+    else
+        echo -e "  Discord: ${RED}●${NC} not responding"
     fi
     if check_wsl_health; then
-        echo -e "  WSL:   ${GREEN}●${NC} healthy"
+        echo -e "  WSL:     ${GREEN}●${NC} healthy"
     else
-        echo -e "  WSL:   ${YELLOW}○${NC} unknown"
+        echo -e "  WSL:     ${YELLOW}○${NC} unknown"
     fi
 }
 
@@ -486,6 +569,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --wsl-only)
             ACTION="wsl-only"
+            shift
+            ;;
+        --discord)
+            ACTION="discord"
             shift
             ;;
         --no-push)
@@ -535,6 +622,9 @@ case "$ACTION" in
         ;;
     wsl-only)
         restart_wsl
+        ;;
+    discord)
+        restart_discord
         ;;
     restart)
         if [[ -n "$DEPLOY_FROM" ]]; then
