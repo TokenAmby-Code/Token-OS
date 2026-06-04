@@ -12018,10 +12018,29 @@ from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
 
+# Work-session enforcement sidecar. While a declared work session owns
+# enforcement it fires its own authoritative zap@100 + redirect; the generic
+# enforcement system is the blocked party. These are the only sources allowed
+# through the sidecar gate — everything else (cascade@50, negative-break) is
+# suppressed at the single enforce() chokepoint so the work session is the sole
+# enforcer for the duration. See _work_session_enforcement_gate.
+WORK_SESSION_ENFORCE_SOURCES = {"work_session_negative", "work_session_failed"}
+
+
+def _work_session_enforcement_gate(source: str) -> str | None:
+    """Sidecar mutual-exclusion: while a work session owns enforcement, the
+    generic enforcement system is the blocked party. Only the work session's
+    own zaps pass; everything else is suppressed at this single chokepoint."""
+    if timer_engine.work_session_active and source not in WORK_SESSION_ENFORCE_SOURCES:
+        return "work_session_sidecar"
+    return None
+
+
 enforce_init_deps(
     is_quiet_hours=is_quiet_hours,
     typing_guard_active=_typing_guard_active,
     dictation_active=_dictation_active,
+    enforcement_gate=_work_session_enforcement_gate,
 )
 
 # Wire voice route dependencies
@@ -17187,13 +17206,12 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
     try:
         sit = _negative_break_situation
 
-        # During an active work session the work-session gate owns negative-balance
-        # enforcement (stricter: straight to 100 + redirect + auto-cancel). Defer
-        # and keep this loop reset so it carries no stale escalation afterward.
-        if timer_engine.work_session_active:
-            sit["rep"] = 0
-            sit["last_fire_mono_ms"] = None
-            return None
+        # During an active work session the work-session gate owns enforcement
+        # (stricter: straight to 100 + redirect + auto-cancel). This loop still
+        # runs, but its zap is suppressed at the enforce() sidecar chokepoint
+        # (source="negative_break_loop" is not allowlisted): a suppressed enforce
+        # returns fired:False, so rep/last_fire below are never committed and no
+        # escalation accumulates. No scattered work_session_active check needed.
 
         # Double-fire avoidance: on the tick where balance crosses 0 → negative,
         # the BREAK_EXHAUSTED handler fires the rep0 entry vibe. Seed the record
@@ -17257,8 +17275,9 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
     balance falls to WORK_SESSION_CANCEL_THRESHOLD_MS (-30s) the session is
     auto-cancelled — the saved original balance is restored and the earned break
     is forfeited — with a final 100 zap + redirect. Never raises into the tick
-    loop. Runs AFTER the negative-break gate (which defers while a session is
-    active), so the two never enforce on the same tick.
+    loop. Runs AFTER the negative-break gate; while a session is active that
+    gate's zap is suppressed at the enforce() sidecar chokepoint, so only this
+    gate's work_session_* zaps fire — the two never zap on the same tick.
     """
     try:
         sit = _work_session_situation
@@ -17529,8 +17548,9 @@ async def timer_worker():
             # the gate must live outside it). Fires a zap + TTS while the break
             # balance is negative and the timer is on break, escalating every
             # 10 min. See: Negative-Balance Break Enforcement Loop spec.
-            # Negative-break runs first; it defers while a work session is active,
-            # so it and the work-session gate never enforce on the same tick.
+            # Negative-break runs first; while a work session is active its zap is
+            # suppressed at the enforce() sidecar chokepoint, so it and the
+            # work-session gate never zap on the same tick.
             await _negative_break_enforce_tick(now_ms, result)
 
             # Work-session gate: a declared work session fails if the balance dips

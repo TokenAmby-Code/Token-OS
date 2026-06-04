@@ -32,6 +32,7 @@ class EnforceRequest(BaseModel):
 _is_quiet_hours = None
 _typing_guard_active = None
 _dictation_active = None
+_enforcement_gate = None
 
 
 def init_deps(
@@ -39,15 +40,19 @@ def init_deps(
     is_quiet_hours: Callable[[], bool] | None = None,
     typing_guard_active: Callable[[], bool] | None = None,
     dictation_active: Callable[[], bool] | None = None,
+    enforcement_gate: Callable[[str], str | None] | None = None,
 ) -> None:
     """Late-bind dependencies from main.py to avoid circular imports."""
     global _is_quiet_hours, _typing_guard_active, _dictation_active
+    global _enforcement_gate
     if is_quiet_hours is not None:
         _is_quiet_hours = is_quiet_hours
     if typing_guard_active is not None:
         _typing_guard_active = typing_guard_active
     if dictation_active is not None:
         _dictation_active = dictation_active
+    if enforcement_gate is not None:
+        _enforcement_gate = enforcement_gate
 
 
 def _in_meeting() -> bool:
@@ -115,6 +120,25 @@ async def enforce(request: EnforceRequest) -> dict:
             },
         )
         return {"fired": False, "blocked_by": "meeting"}
+
+    # Sidecar mutual-exclusion gate: when another subsystem owns enforcement
+    # (e.g. an active work session), it blocks the generic emitter from outside
+    # so that subsystem can assume it is the only enforcer. The predicate is
+    # late-bound from main.py and decides per-source whether to suppress; the
+    # owning subsystem's own sources are allowlisted there.
+    if _enforcement_gate:
+        gate_block = _enforcement_gate(request.source)
+        if gate_block:
+            await log_event(
+                "enforce_blocked",
+                details={
+                    "reason": gate_block,
+                    "disposition": "suppress",
+                    "source": request.source,
+                    "message": request.message[:200],
+                },
+            )
+            return {"fired": False, "blocked_by": gate_block}
 
     intensity = max(int(request.intensity), ENFORCE_MIN_INTENSITY)
     pavlok_result = send_pavlok_stimulus(
