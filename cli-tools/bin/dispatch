@@ -299,18 +299,42 @@ sql_literal() {
 }
 
 resolve_caller_instance_id() {
-  [[ -n "${TMUX_PANE:-}" ]] || return 0
-  local pane_sql row
-  pane_sql="$(sql_literal "$TMUX_PANE")"
-  row="$(sqlite_query "
-    SELECT id
-    FROM claude_instances
-    WHERE tmux_pane = '${pane_sql}'
-      AND COALESCE(status, '') != 'stopped'
-    ORDER BY last_activity DESC
-    LIMIT 1;
-  ")"
-  [[ -n "$row" ]] && printf '%s' "$row"
+  local pane_sql row label_sql
+  # 1. By the caller's own tmux pane (interactive / pane-bound dispatch).
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    pane_sql="$(sql_literal "$TMUX_PANE")"
+    row="$(sqlite_query "
+      SELECT id
+      FROM claude_instances
+      WHERE tmux_pane = '${pane_sql}'
+        AND COALESCE(status, '') != 'stopped'
+      ORDER BY last_activity DESC
+      LIMIT 1;
+    ")"
+    [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
+  fi
+  # 2. Explicit instance id from the harness env. An agent's Bash-tool subshell
+  #    often lacks $TMUX_PANE but still carries the dispatching instance's id.
+  if [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
+    printf '%s' "${TOKEN_API_INSTANCE_ID}"
+    return 0
+  fi
+  # 3. Persona singleton by bound pane label. Headless personas (e.g. the
+  #    Fabricator-General) dispatch from an agent context with neither
+  #    $TMUX_PANE nor an instance-id env; resolve the live row by its pane label
+  #    (e.g. pane_label='mechanicus:fabricator-general' for TOKEN_API_PRIMARCH).
+  if [[ -n "${TOKEN_API_PRIMARCH:-}" ]]; then
+    label_sql="$(sql_literal "$TOKEN_API_PRIMARCH")"
+    row="$(sqlite_query "
+      SELECT id
+      FROM claude_instances
+      WHERE pane_label LIKE '%:' || '${label_sql}'
+        AND COALESCE(status, '') != 'stopped'
+      ORDER BY last_activity DESC
+      LIMIT 1;
+    ")"
+    [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
+  fi
   return 0
 }
 
@@ -1013,14 +1037,24 @@ if [[ -n "$TARGET" ]]; then
   fi
 fi
 if [[ -n "$RESUME_ID" ]]; then
+  # An explicit --target wins over restored resume metadata. Without the
+  # `-z "$TARGET"` guards, resuming with `--target mechanicus:new` would relocate
+  # the worker back to its origin window (e.g. legion) because the resume row's
+  # DISPATCH_WINDOW/MODE/SLOT silently clobber the values just parsed from --target.
   [[ -n "$RESUME_DISPATCH_TARGET" && -z "$TARGET" ]] && RESOLVED_TARGET="$RESUME_DISPATCH_TARGET"
-  [[ -n "$RESUME_DISPATCH_WINDOW" ]] && DISPATCH_WINDOW="$RESUME_DISPATCH_WINDOW"
-  [[ -n "$RESUME_DISPATCH_MODE" ]] && DISPATCH_MODE="$RESUME_DISPATCH_MODE"
-  [[ -n "$RESUME_DISPATCH_SLOT" ]] && DISPATCH_SLOT="$RESUME_DISPATCH_SLOT"
+  [[ -n "$RESUME_DISPATCH_WINDOW" && -z "$TARGET" ]] && DISPATCH_WINDOW="$RESUME_DISPATCH_WINDOW"
+  [[ -n "$RESUME_DISPATCH_MODE" && -z "$TARGET" ]] && DISPATCH_MODE="$RESUME_DISPATCH_MODE"
+  [[ -n "$RESUME_DISPATCH_SLOT" && -z "$TARGET" ]] && DISPATCH_SLOT="$RESUME_DISPATCH_SLOT"
   [[ -n "$RESUME_LAUNCH_MODE" ]] && LAUNCH_MODE="$RESUME_LAUNCH_MODE"
   if [[ -n "$TARGET" ]]; then
     if [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
       LAUNCH_MODE="direct"
+    elif [[ "$TARGET" == *:new ]]; then
+      # Resume into a freshly allocated stack pane: keep the tmux_stack_new path
+      # (it pins --session main and supports resume via stamp_resume_instance_id).
+      # tmux_target would send-keys to the literal ":new" allocation token, and
+      # tmux would read the window name (e.g. mechanicus) as a missing session.
+      LAUNCH_MODE="tmux_stack_new"
     else
       LAUNCH_MODE="tmux_target"
     fi
@@ -1124,7 +1158,13 @@ if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
 fi
 
 AUTO_PARENT_INSTANCE_ID="${TOKEN_API_PARENT_INSTANCE_ID:-}"
-if [[ -z "$AUTO_PARENT_INSTANCE_ID" && -z "$RESUME_ID" ]]; then
+# Resolve the dispatching caller as the child's parent when no explicit parent
+# was passed. This must run on the resume path too: resurrecting a worker into a
+# fresh pane (e.g. FG re-parenting a wiped agent via `--resume … --target …:new`)
+# should make the resurrector the parent so the FG↔child stop-hook auto-subscribe
+# fires. Skip only for an in-place resume (LAUNCH_MODE=direct), where the caller
+# *is* the resumed instance and self-parenting is meaningless.
+if [[ -z "$AUTO_PARENT_INSTANCE_ID" && "$LAUNCH_MODE" != "direct" ]]; then
   AUTO_PARENT_INSTANCE_ID="$(resolve_caller_instance_id)"
 fi
 
