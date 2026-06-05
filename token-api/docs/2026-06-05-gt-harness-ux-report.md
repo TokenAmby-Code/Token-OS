@@ -234,3 +234,28 @@ into the commit via `--amend` *before* the push, so the pushed branch already co
 "I pushed" entry). Flipped `pushed: true`. From here, further UX entries become *new*
 follow-up commits (the branch is now published; no more amends). Stopping to await the
 `pr_opened` poke.
+
+### GT poke #5 — accountability check, `pr_opened` (2026-06-05T~23:26Z)
+
+**1. Exact poke text (verbatim).** Thread message identical; SOP unmet line now:
+> Unmet conditions: `pr_opened`, `coderabbit_passed`, `sanguinius_satisfied`.
+
+**2. Specific vs generic.** Specific — `pushed` dropped after the flip; first unmet =
+`pr_opened`. The tail is now the two-step review gate (`pr_opened` → `coderabbit_passed`)
+plus the skip-bound `sanguinius_satisfied`.
+
+**3. Actionability.** **High.** One action: open the PR. I deliberately used plain
+`gh pr create` (a clean, non-blocking open) rather than the review-loop wrapper, because
+the poke names only `pr_opened` — opening, not merging. Charter-faithful scoping; no
+questions.
+
+**4. Cadence/timing at z10.** Poke #4 ≈ `23:23Z`, poke #5 ≈ `23:26Z` → ~3 min,
+work-dominated as always.
+
+**Action taken (this poke):** Opened **PR #88**
+(https://github.com/TokenAmby-Code/Token-OS/pull/88) base `main` ← `gt-harness-proof`.
+This UX entry is a *new follow-up commit* (branch already published — no more amends),
+which updates the PR before CodeRabbit reviews it. Recorded `pr_url` in the session-doc
+frontmatter and flipped `pr_opened: true`. Stopping to await the `coderabbit_passed` poke —
+the one genuinely externally-gated step (CodeRabbit must actually run and be addressed),
+so it may legitimately need more than one ~60s cycle.
