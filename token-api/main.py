@@ -19,9 +19,9 @@ import os
 import re
 import shlex
 import signal
-import socket
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -192,10 +192,8 @@ from timer_telemetry import (
     parse_timer_timestamp,
 )
 
-DESKFLOW_SERVER_PORT = 24800
 DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
 DESKFLOW_KEYMAP_GUARD = SCRIPTS_DIR / "Shell" / "deskflow-keymap-guard.sh"
-MAC_KVM_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -426,18 +424,6 @@ APP_LOOP: asyncio.AbstractEventLoop | None = None
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
-mac_kvm_supervisor_task = None
-
-MAC_KVM_STATE = {
-    "state": "starting",
-    "server_host": None,
-    "server_reachable": None,
-    "client_running": None,
-    "retry_attempts": 0,
-    "next_probe_at": 0.0,
-    "last_action": None,
-    "last_changed": None,
-}
 
 
 # Pydantic Models
@@ -1368,8 +1354,8 @@ async def run_overdue_tasks():
 
 # Lifespan context manager
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global stale_flag_cleaner_task, timer_worker_task, mac_kvm_supervisor_task, APP_LOOP
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    global stale_flag_cleaner_task, timer_worker_task, APP_LOOP
     import routes.tts as _tts_mod  # For mutable tts_worker_task assignment
 
     # Install asyncio exception handler for this loop
@@ -1488,9 +1474,9 @@ async def lifespan(app: FastAPI):
     # Start Custodes enforcement defer flusher (L2 hold-and-queue under typing guard)
     asyncio.create_task(_custodes_enforcement_defer_worker())
     print("Custodes enforcement defer flusher started")
-    # Start Mac-side Deskflow backoff supervisor
-    mac_kvm_supervisor_task = asyncio.create_task(mac_kvm_supervisor())
-    print("Mac KVM supervisor started")
+    # Mac-side Deskflow lifecycle is event-driven: the WSL satellite invites this
+    # Mac via POST /api/kvm/start when its log follower sees the server come up.
+    # No Mac-side probe/supervisor (it spammed the server with secure-socket errors).
     # Legion pane tint is event-driven (shared.apply_pane_tint / clear_pane_tint),
     # fired on persona register/change, pane vacate, and close — no polling worker.
     # Start pane state worker (@CC_STATE)
@@ -1533,12 +1519,6 @@ async def lifespan(app: FastAPI):
         timer_worker_task.cancel()
         try:
             await timer_worker_task
-        except asyncio.CancelledError:
-            pass
-    if mac_kvm_supervisor_task:
-        mac_kvm_supervisor_task.cancel()
-        try:
-            await mac_kvm_supervisor_task
         except asyncio.CancelledError:
             pass
     scheduler.shutdown(wait=True)
@@ -14990,11 +14970,6 @@ async def cd_restart(request: Request):
 # ============ KVM (Deskflow) ============
 
 
-def _mac_kvm_set_state(**updates):
-    MAC_KVM_STATE.update(updates)
-    MAC_KVM_STATE["last_changed"] = datetime.now().isoformat()
-
-
 def _deskflow_client_remote_host() -> str:
     try:
         config_text = DESKFLOW_CLIENT_CONFIG_PATH.read_text()
@@ -15021,15 +14996,6 @@ def _deskflow_client_remote_host() -> str:
         f"KVM: Deskflow client config has no [client] remoteHost; falling back to {DESKTOP_CONFIG['host']}"
     )
     return DESKTOP_CONFIG["host"]
-
-
-def _wsl_deskflow_server_reachable() -> tuple[bool, str]:
-    host = _deskflow_client_remote_host()
-    try:
-        with socket.create_connection((host, DESKFLOW_SERVER_PORT), timeout=2):
-            return True, host
-    except OSError:
-        return False, host
 
 
 def _mac_deskflow_pids() -> list[str]:
@@ -15096,75 +15062,27 @@ def _stop_mac_deskflow_client(reason: str):
     logger.info(f"KVM: Stopped Deskflow client ({reason}, exit={result.returncode})")
 
 
-async def mac_kvm_supervisor():
-    """Mac-side guard that prevents Deskflow's native client from retry-spamming.
-
-    If the WSL Deskflow server port is absent, the Mac client is stopped so
-    deskflow-core cannot loop internally. Token-API then probes with exponential
-    backoff and starts the client only after the server port is reachable.
-    """
-    await asyncio.sleep(5)
-    while True:
-        try:
-            server_reachable, server_host = await asyncio.to_thread(_wsl_deskflow_server_reachable)
-            client_running = await asyncio.to_thread(_mac_deskflow_running)
-
-            if server_reachable:
-                if not client_running:
-                    await asyncio.to_thread(_start_mac_deskflow_client, "server_reachable")
-                    client_running = True
-                    action = "client_started"
-                else:
-                    action = "server_reachable"
-                _mac_kvm_set_state(
-                    state="running",
-                    server_host=server_host,
-                    server_reachable=True,
-                    client_running=client_running,
-                    retry_attempts=0,
-                    next_probe_at=0.0,
-                    last_action=action,
-                )
-                await asyncio.sleep(30)
-                continue
-
-            stopped_client = False
-            if client_running:
-                await asyncio.to_thread(_stop_mac_deskflow_client, "server_unreachable")
-                client_running = False
-                stopped_client = True
-
-            attempts = int(MAC_KVM_STATE.get("retry_attempts") or 0) + 1
-            delay = MAC_KVM_BACKOFF_SECONDS[min(attempts - 1, len(MAC_KVM_BACKOFF_SECONDS) - 1)]
-            next_probe_at = time.time() + delay
-            _mac_kvm_set_state(
-                state="backoff",
-                server_host=server_host,
-                server_reachable=False,
-                client_running=False,
-                retry_attempts=attempts,
-                next_probe_at=next_probe_at,
-                last_action="client_stopped_backoff" if stopped_client else "server_absent_backoff",
-            )
-            logger.info(f"KVM: WSL Deskflow server absent; next Mac probe in {delay}s")
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"KVM supervisor error: {e}")
-            _mac_kvm_set_state(state="error", last_action=str(e)[:200])
-            await asyncio.sleep(60)
-
-
 @app.post("/api/kvm/start")
-async def kvm_start():
-    """Start Deskflow client (software KVM) on this Mac."""
-    try:
-        if _mac_deskflow_running():
-            return {"success": True, "message": "Deskflow already running", "already_running": True}
+async def kvm_start() -> dict[str, object]:
+    """Start (or re-converge) the Deskflow client on this Mac.
 
+    This is the satellite's invitation receiver. With Deskflow's native auto-retry
+    disabled, a client that is *running but disconnected* (stale socket) will not
+    re-dial on its own, so "already running" must NOT no-op — that would leave a
+    dead client wedged. We stop+start to converge a known-good client. The keymap
+    guard runs pre/post inside _start_mac_deskflow_client.
+    """
+    try:
+        was_running = _mac_deskflow_running()
+        if was_running:
+            _stop_mac_deskflow_client("api_start_restart")
+            await asyncio.sleep(1)  # let killall -9 tear down before reopening
         _start_mac_deskflow_client("api_start")
-        return {"success": True, "message": "Deskflow started", "already_running": False}
+        return {
+            "success": True,
+            "message": "Deskflow restarted" if was_running else "Deskflow started",
+            "already_running": was_running,
+        }
     except Exception as e:
         logger.error(f"KVM: Failed to start Deskflow: {e}")
         return {"success": False, "message": str(e)}
@@ -15197,21 +15115,18 @@ async def kvm_stop():
 
 
 @app.get("/api/kvm/status")
-async def kvm_status():
-    """Check if Deskflow is running on this Mac."""
+async def kvm_status() -> dict[str, object]:
+    """Check if Deskflow is running on this Mac.
+
+    Lifecycle now lives on the WSL satellite's event-driven watchdog; the Mac
+    only reports process liveness. The satellite's _get_mac_kvm_status reads
+    only ``running``, so dropping the old ``supervisor`` block is safe.
+    """
     pids = _mac_deskflow_pids()
     running = bool(pids)
     return {
         "running": running,
         "pids": pids,
-        "supervisor": {
-            **MAC_KVM_STATE,
-            "next_probe_at": (
-                datetime.fromtimestamp(MAC_KVM_STATE["next_probe_at"]).isoformat()
-                if MAC_KVM_STATE.get("next_probe_at")
-                else None
-            ),
-        },
     }
 
 
