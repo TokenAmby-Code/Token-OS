@@ -27,7 +27,7 @@ WORK_SESSION_ENFORCE_SOURCES = {"work_session_negative", "work_session_failed"}
 
 
 @pytest.fixture
-def gate_env(monkeypatch):
+def gate_env(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, list], dict[str, bool]]:
     """Neutralize the other guardrails + real Pavlok/notify side effects so a
     test observes only the sidecar gate's decision.
 
@@ -38,14 +38,14 @@ def gate_env(monkeypatch):
     """
     calls = {"zaps": []}
 
-    def fake_zap(*, stimulus_type, value, reason):
+    def fake_zap(*, stimulus_type: str, value: int, reason: str) -> dict[str, object]:
         calls["zaps"].append({"type": stimulus_type, "value": value, "reason": reason})
         return {"ok": True, "type": stimulus_type, "value": value}
 
-    async def fake_notify(req):
+    async def fake_notify(req: object) -> dict[str, bool]:
         return {"ok": True}
 
-    async def fake_log(event, details=None):
+    async def fake_log(event: str, details: dict | None = None) -> None:
         return None
 
     monkeypatch.setattr(enforce, "send_pavlok_stimulus", fake_zap)
