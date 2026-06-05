@@ -1855,12 +1855,20 @@ async def handle_session_start(payload: dict) -> dict:
         # already occupying this pane, keyed off ITS persisted primarch rather than the
         # (possibly-unresolved) new registration's label.
         if not supplant_id and tmux_pane:
+            # Gate strictly to the KNOWN persona primarchs (from PERSONA_PANE_IDENTITY).
+            # `primarch` can be set on non-persona rows too, so matching any non-empty
+            # primarch would let a recycled non-persona pane inherit a stale row's
+            # identity/session metadata instead of registering clean. (CodeRabbit #83.)
+            persona_primarchs = sorted(
+                {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
+            )
+            placeholders = ",".join("?" for _ in persona_primarchs)
             cursor = await db.execute(
-                """SELECT id FROM claude_instances
-                   WHERE tmux_pane = ? AND id != ?
-                     AND primarch IS NOT NULL AND TRIM(primarch) != ''
-                   ORDER BY registered_at DESC LIMIT 1""",
-                (tmux_pane, session_id),
+                f"""SELECT id FROM claude_instances
+                    WHERE tmux_pane = ? AND id != ?
+                      AND TRIM(primarch) IN ({placeholders})
+                    ORDER BY registered_at DESC LIMIT 1""",
+                (tmux_pane, session_id, *persona_primarchs),
             )
             row = await cursor.fetchone()
             if row:

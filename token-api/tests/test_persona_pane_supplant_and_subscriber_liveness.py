@@ -122,6 +122,44 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
     assert surviving_primarch == "fabricator-general", "persona identity preserved"
 
 
+def test_non_persona_pane_is_not_supplanted(app_env, monkeypatch):
+    # A recycled NON-persona pane (its prior occupant carried a non-persona primarch)
+    # must NOT inherit the stale row's identity — the pane-label supplant is gated to
+    # the known persona primarchs only. Registers clean as its own row. (CodeRabbit #83.)
+    hooks = sys.modules["routes.hooks"]
+
+    _insert(
+        app_env.db_path,
+        "stale-worker",
+        pane="%wk",
+        primarch="vulkan",  # non-persona primarch
+        legion="astartes",
+        status="stopped",
+    )
+
+    async def no_label(_pane):
+        return None
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+
+    async def run():
+        return await hooks.handle_session_start(
+            {
+                "session_id": "new-worker",
+                "cwd": "/tmp",
+                "env": {"TMUX_PANE": "%wk", "TOKEN_API_ENGINE": "claude"},
+            }
+        )
+
+    asyncio.run(run())
+
+    ids = {r[0] for r in _rows_at_pane(app_env.db_path, "%wk")}
+    # No supplant: the stale non-persona row survives untouched and the new session
+    # registers as its own distinct row.
+    assert "stale-worker" in ids, "non-persona row must not be supplanted/migrated"
+    assert "new-worker" in ids, "new session must register as its own row"
+
+
 # ── R-H2: subscriber flag resolves the live pane over a dead id ─────────────────
 
 
