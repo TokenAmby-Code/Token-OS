@@ -1277,13 +1277,18 @@ async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
 async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
     """Flag a stop-subscription subscriber hook_driven=1 before delivery — the
     subscriber (e.g. FG watching its stack workers) is being woken autonomously by
-    the watched instance's Stop, NOT by the Emperor. Resolve by subscriber_instance_id
-    first, else by live subscriber_pane. Committed by the caller before the byte
-    lands (see the commit preceding _direct_pane_write). Best-effort."""
-    target_id = _normalize_text(subscription.get("subscriber_instance_id"))
+    the watched instance's Stop, NOT by the Emperor. Resolve by the LIVE occupant of
+    subscriber_pane first, falling back to subscriber_instance_id only when the pane
+    yields no live row. A subscriber's instance id rotates on resume while it keeps
+    its pane (the live `1402f092`→`f55ac307`-at-`%96` FG split); trusting the recorded
+    id first would flag a now-dead row (a silent no-op) and the autonomous-wakeup
+    marker would never reach the live subscriber. Committed by the caller before the
+    byte lands (see the commit preceding _direct_pane_write). Best-effort."""
+    declared_id = _normalize_text(subscription.get("subscriber_instance_id"))
     pane = _normalize_text(subscription.get("subscriber_pane"))
+    target_id = None
     try:
-        if not target_id and pane:
+        if pane:
             prev_factory = getattr(db, "row_factory", None)
             db.row_factory = aiosqlite.Row
             try:
@@ -1297,6 +1302,9 @@ async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
                 db.row_factory = prev_factory
             if row:
                 target_id = row["id"]
+        # Fall back to the recorded subscriber id only when the pane has no live row.
+        if not target_id:
+            target_id = declared_id
         if not target_id:
             return
         await sanctioned_update_instance(
@@ -1831,6 +1839,36 @@ async def handle_session_start(payload: dict) -> dict:
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE primarch = ? ORDER BY registered_at DESC LIMIT 1",
                 (primarch_name,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                supplant_id = row["id"]
+
+        # 3b. Persona pane-label singleton (FG / Administratum / Custodes). A persona
+        # pane is bound by its tmux pane label, and the `primarch` derived above comes
+        # from that label via PERSONA_PANE_IDENTITY — but ONLY when the label resolves
+        # at SessionStart. On a fresh persona resume the @PANE_ID may not be stamped
+        # yet, so `_tmux_pane_label` returns nothing, no primarch is derived, and the
+        # primarch-singleton case (3) cannot fire. The result is a *duplicate* persona
+        # row while the prior row lingers un-demoted (its stop subscriptions orphaned —
+        # the live `1402f092`/`f55ac307`-at-`%96` split). Supplant the persona row
+        # already occupying this pane, keyed off ITS persisted primarch rather than the
+        # (possibly-unresolved) new registration's label.
+        if not supplant_id and tmux_pane:
+            # Gate strictly to the KNOWN persona primarchs (from PERSONA_PANE_IDENTITY).
+            # `primarch` can be set on non-persona rows too, so matching any non-empty
+            # primarch would let a recycled non-persona pane inherit a stale row's
+            # identity/session metadata instead of registering clean. (CodeRabbit #83.)
+            persona_primarchs = sorted(
+                {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
+            )
+            placeholders = ",".join("?" for _ in persona_primarchs)
+            cursor = await db.execute(
+                f"""SELECT id FROM claude_instances
+                    WHERE tmux_pane = ? AND id != ?
+                      AND TRIM(primarch) IN ({placeholders})
+                    ORDER BY registered_at DESC LIMIT 1""",
+                (tmux_pane, session_id, *persona_primarchs),
             )
             row = await cursor.fetchone()
             if row:
