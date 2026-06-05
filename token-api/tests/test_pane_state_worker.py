@@ -49,7 +49,7 @@ def _queue_count(db_path: Path) -> int:
 
 
 @pytest.fixture
-def _capture_set_option(app_env, monkeypatch) -> list[tuple[str, ...]]:
+def _capture_set_option(app_env: Any, monkeypatch: Any) -> list[tuple[str, ...]]:
     """Capture every ``tmux set-option`` the worker issues (no tmux server in
     tests). Returns the list of captured argv tuples."""
     main = app_env.main
@@ -71,7 +71,7 @@ def _set_options(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
 
 
 async def test_pushes_to_live_resolved_pane_not_stored_column(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """A row stamped with a now-stale ``%999`` must push ``@CC_STATE`` to the
     live-resolved ``%77`` (pane moved/reused since the trigger fired)."""
@@ -101,7 +101,7 @@ async def test_pushes_to_live_resolved_pane_not_stored_column(
 
 
 async def test_pane_gone_drains_row_without_touching_tmux(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """If the instance no longer resolves to a pane, the worker issues no
     ``set-option`` yet still drains the queue row (no wedge)."""
@@ -131,7 +131,7 @@ async def test_pane_gone_drains_row_without_touching_tmux(
 
 
 async def test_stopped_spawns_assertion_with_live_role(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """A live-resolved stopped instance with a non-persona role spawns the
     close-down assertion targeting the live role (resolved, not stored)."""
@@ -161,7 +161,7 @@ async def test_stopped_spawns_assertion_with_live_role(
 
 
 async def test_stopped_on_persona_role_skips_assertion(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """The assert-persona guard keys on the LIVE role: a stopped instance whose
     live role is a persona label (e.g. ``legion:custodes``) must NOT spawn an
@@ -183,7 +183,7 @@ async def test_stopped_on_persona_role_skips_assertion(
 
 
 async def test_bounced_state_in_one_drain_does_not_assert_stale_stopped(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """A status that bounces stopped -> idle within one drain queues two @CC_STATE
     rows. The early ``stopped`` must NOT fire a close-down assertion when the FINAL
@@ -207,7 +207,7 @@ async def test_bounced_state_in_one_drain_does_not_assert_stale_stopped(
 
 
 async def test_repeated_stopped_in_one_drain_asserts_once(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """Two ``stopped`` rows for the same instance in one drain collapse to a single
     close-down assertion (deduped on the final per-instance state)."""
