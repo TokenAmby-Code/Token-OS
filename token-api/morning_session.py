@@ -13,10 +13,13 @@ The launcher exits after launch — the Claude session is autonomous from there.
 """
 
 import json
+import logging
 import os
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger("token_api")
 
 BASE = "http://localhost:7777"
 DISCORD_DAEMON = "http://localhost:7779"
@@ -565,26 +568,53 @@ def create_legion_pane() -> str | None:
     Morning launch is not a worker dispatch and must not create duplicate
     Custodes panes. The legion page invariant is owned by tmuxctl; this launcher
     only resolves the fixed orchestrator target.
+
+    The `stack enforce` call is a BEST-EFFORT pre-assertion of the legion-stack
+    invariant. The legion stack/pane is persistent across the day, so a slow or
+    hung enforce must NOT abort the morning launch — `resolve-pane` is the
+    operation that actually gates the launch. We therefore swallow the enforce's
+    5s timeout (and any other subprocess error) and proceed to resolve the pane.
+
+    Regression (P0, 2026-06-05): an uncaught `subprocess.TimeoutExpired` from
+    this enforce propagated out of `run_morning_session()`, so the Emperor was
+    never placed into morning-session mode and the break was never paused. See
+    test_morning_session.py and the morning-session-failure-cascade memory.
     """
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
-    subprocess.run(
-        [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    result = subprocess.run(
-        [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        subprocess.run(
+            [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "tmuxctl stack enforce legion timed out (5s) — continuing; "
+            "the legion stack is persistent and resolve-pane gates the launch"
+        )
+    except Exception as e:
+        logger.warning("tmuxctl stack enforce legion failed (%s) — continuing", e)
+
+    try:
+        result = subprocess.run(
+            [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("tmuxctl resolve-pane legion:custodes timed out (5s)")
+        return None
+    except Exception as e:
+        logger.error("tmuxctl resolve-pane legion:custodes failed: %s", e)
+        return None
     if result.returncode != 0:
-        print(f"Error: could not resolve legion:custodes: {result.stderr}")
+        logger.error("could not resolve legion:custodes: %s", result.stderr)
         return None
     pane_id = result.stdout.strip()
     if not pane_id:
-        print("Error: tmuxctl resolve-pane did not return a pane_id for legion:custodes")
+        logger.error("tmuxctl resolve-pane did not return a pane_id for legion:custodes")
         return None
     return pane_id
 
