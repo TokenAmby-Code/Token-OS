@@ -13,10 +13,13 @@ The launcher exits after launch — the Claude session is autonomous from there.
 """
 
 import json
+import logging
 import os
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger("token_api")
 
 BASE = "http://localhost:7777"
 DISCORD_DAEMON = "http://localhost:7779"
@@ -586,12 +589,12 @@ def create_legion_pane() -> str | None:
             timeout=5,
         )
     except subprocess.TimeoutExpired:
-        print(
-            "Warning: tmuxctl stack enforce legion timed out (5s) — continuing; "
+        logger.warning(
+            "tmuxctl stack enforce legion timed out (5s) — continuing; "
             "the legion stack is persistent and resolve-pane gates the launch"
         )
     except Exception as e:
-        print(f"Warning: tmuxctl stack enforce legion failed ({e}) — continuing")
+        logger.warning("tmuxctl stack enforce legion failed (%s) — continuing", e)
 
     try:
         result = subprocess.run(
@@ -601,17 +604,17 @@ def create_legion_pane() -> str | None:
             timeout=5,
         )
     except subprocess.TimeoutExpired:
-        print("Error: tmuxctl resolve-pane legion:custodes timed out (5s)")
+        logger.error("tmuxctl resolve-pane legion:custodes timed out (5s)")
         return None
     except Exception as e:
-        print(f"Error: tmuxctl resolve-pane legion:custodes failed: {e}")
+        logger.error("tmuxctl resolve-pane legion:custodes failed: %s", e)
         return None
     if result.returncode != 0:
-        print(f"Error: could not resolve legion:custodes: {result.stderr}")
+        logger.error("could not resolve legion:custodes: %s", result.stderr)
         return None
     pane_id = result.stdout.strip()
     if not pane_id:
-        print("Error: tmuxctl resolve-pane did not return a pane_id for legion:custodes")
+        logger.error("tmuxctl resolve-pane did not return a pane_id for legion:custodes")
         return None
     return pane_id
 
