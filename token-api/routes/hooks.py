@@ -378,8 +378,12 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     return None
 
 
-async def _stamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
-    """Stamp ``@INSTANCE_ID=<session_id>`` on the agent's tmux pane.
+async def _stamp_instance_id(
+    tmux_pane: str | None,
+    session_id: str | None,
+    display_name: str | None = None,
+) -> None:
+    """Stamp ``@INSTANCE_ID=<session_id>`` (and optionally ``@PANE_LABEL``) on the pane.
 
     tmux becomes the source of truth for ``instance_id -> pane`` resolution; the
     stamp lives and dies with the pane. Done in the same critical section as the
@@ -387,6 +391,11 @@ async def _stamp_instance_id(tmux_pane: str | None, session_id: str | None) -> N
     Best-effort: a failed stamp is logged, not raised — the row write must not be
     blocked by tmux being unavailable (e.g. remote/satellite-hosted panes whose
     ``%N`` is not addressable from this host).
+
+    ``display_name`` is the instance's ``tab_name`` (NOT the persona ``pane_label``
+    column). When provided, it hydrates ``@PANE_LABEL`` so the border shows the name
+    *before* the first rename — a fresh register INSERTs, so ``trg_tab_name_pane_state``
+    (AFTER UPDATE) never fires for it. Renames thereafter flow through the trigger.
     """
     if not tmux_pane or not session_id:
         return
@@ -404,6 +413,19 @@ async def _stamp_instance_id(tmux_pane: str | None, session_id: str | None) -> N
             )
     except Exception as exc:
         logger.debug(f"Hook: @INSTANCE_ID stamp errored for {tmux_pane}: {exc}")
+
+    label = (display_name or "").strip()
+    if not label:
+        return
+    try:
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-p", "-t", tmux_pane, "@PANE_LABEL", label),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"Hook: @PANE_LABEL stamp errored for {tmux_pane}: {exc}")
 
 
 async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
@@ -1983,7 +2005,9 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
-                await _stamp_instance_id(tmux_pane, session_id)
+                await _stamp_instance_id(
+                    tmux_pane, session_id, display_name=existing_row["tab_name"]
+                )
                 if old_tmux_pane and old_tmux_pane != tmux_pane:
                     await _unstamp_instance_id(old_tmux_pane, session_id)
                 await _apply_instance_workflow_state(
@@ -2122,7 +2146,11 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
-                await _stamp_instance_id(tmux_pane or existing_row["tmux_pane"], session_id)
+                await _stamp_instance_id(
+                    tmux_pane or existing_row["tmux_pane"],
+                    session_id,
+                    display_name=existing_row["tab_name"],
+                )
                 if (
                     tmux_pane
                     and existing_row["tmux_pane"]
@@ -2261,7 +2289,7 @@ async def handle_session_start(payload: dict) -> dict:
                     where_clause="id = ?",
                     where_params=(supplant_id,),
                 )
-                await _stamp_instance_id(tmux_pane, session_id)
+                await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["tab_name"])
 
                 # Auto-link primarch session doc if applicable
                 session_doc_id = resolved_session_doc_id or old_inst["session_doc_id"]
@@ -2545,7 +2573,7 @@ async def handle_session_start(payload: dict) -> dict:
             actor="SessionStart",
             wrapper_launch_id=wrapper_launch_id,
         )
-        await _stamp_instance_id(tmux_pane, session_id)
+        await _stamp_instance_id(tmux_pane, session_id, display_name=tab_name)
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
             db,

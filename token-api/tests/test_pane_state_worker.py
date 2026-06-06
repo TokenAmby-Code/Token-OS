@@ -48,6 +48,30 @@ def _queue_count(db_path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM pane_state_queue").fetchone()[0])
 
 
+def _insert_instance(db_path: Path, instance_id: str, tab_name: str, tmux_pane: str = "%1") -> None:
+    """Insert a minimal live claude_instances row so the rename trigger has a target."""
+    now = "2026-06-06T00:00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, legion, synced, tmux_pane, registered_at, last_activity)
+               VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'idle', 'astartes', 1, ?, ?, ?)""",
+            (instance_id, f"{instance_id}-sess", tab_name, tmux_pane, now, now),
+        )
+        conn.commit()
+
+
+def _queue_rows(db_path: Path, variable: str) -> list[tuple[str, str, str, str | None]]:
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.execute(
+            "SELECT instance_id, variable, value, tmux_pane FROM pane_state_queue "
+            "WHERE variable = ? ORDER BY id",
+            (variable,),
+        )
+        return [tuple(r) for r in cur.fetchall()]
+
+
 @pytest.fixture
 def _capture_set_option(app_env: Any, monkeypatch: Any) -> list[tuple[str, ...]]:
     """Capture every ``tmux set-option`` the worker issues (no tmux server in
@@ -232,3 +256,105 @@ async def test_repeated_stopped_in_one_drain_asserts_once(
     await main.process_pane_state_queue_once()
 
     assert spawned == [("palace:N", "inst-stop2")], "stopped must assert exactly once"
+
+
+# ---- @PANE_LABEL pushes generically (Phase 1 Part A) ------------------------
+
+
+async def test_pushes_pane_label_generically(
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+) -> None:
+    """The worker pushes @PANE_LABEL like any other variable — the raw name lives in
+    the var; styling stays in the format string. Delivered to the LIVE-resolved pane."""
+    main = app_env.main
+
+    async def _resolve_live(_instance_id):
+        return ("%12", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
+
+    _enqueue_pane_state(app_env.db_path, "inst-named", "@PANE_LABEL", "auth-refactor", "%999")
+    results = await main.process_pane_state_queue_once()
+
+    sets = _set_options(_capture_set_option)
+    assert len(sets) == 1
+    argv = sets[0]
+    assert argv[-2:] == ("@PANE_LABEL", "auth-refactor")
+    assert "%12" in argv, "must push to the live-resolved pane"
+    assert "%999" not in argv
+    assert results[0]["status"] == "applied"
+    assert _queue_count(app_env.db_path) == 0
+
+
+async def test_pane_label_value_stopped_does_not_assert(
+    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+) -> None:
+    """@PANE_LABEL is name data, not state: even a literal value of 'stopped' (an
+    instance named that) must never drive the @CC_STATE close-down assertion, which
+    keys on the variable, not the value."""
+    main = app_env.main
+
+    async def _resolve_live(_instance_id):
+        return ("%3", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
+    spawned: list[Any] = []
+    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
+
+    _enqueue_pane_state(app_env.db_path, "inst-x", "@PANE_LABEL", "stopped", "%3")
+    await main.process_pane_state_queue_once()
+
+    assert spawned == [], "a @PANE_LABEL value must never drive the close-down assertion"
+
+
+# ---- trg_tab_name_pane_state: rename enqueues @PANE_LABEL -------------------
+
+
+def test_rename_trigger_enqueues_pane_label(app_env: Any) -> None:
+    """An UPDATE to tab_name fires trg_tab_name_pane_state → one @PANE_LABEL row with
+    the raw new name and the stamped pane. The trigger is AFTER UPDATE, so the initial
+    INSERT must NOT enqueue (fresh registers hydrate via the hooks path instead)."""
+    _insert_instance(app_env.db_path, "inst-rename", "old-name", tmux_pane="%7")
+    assert _queue_rows(app_env.db_path, "@PANE_LABEL") == [], "INSERT must not enqueue"
+
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
+            ("new-name", "inst-rename"),
+        )
+        conn.commit()
+
+    assert _queue_rows(app_env.db_path, "@PANE_LABEL") == [
+        ("inst-rename", "@PANE_LABEL", "new-name", "%7")
+    ]
+
+
+def test_rename_trigger_skips_noop(app_env: Any) -> None:
+    """A rename to the SAME value (OLD IS NOT NEW is false) enqueues nothing."""
+    _insert_instance(app_env.db_path, "inst-noop", "same-name", tmux_pane="%8")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
+            ("same-name", "inst-noop"),
+        )
+        conn.commit()
+    assert _queue_rows(app_env.db_path, "@PANE_LABEL") == []
+
+
+def test_rename_trigger_null_does_not_enqueue_or_abort(app_env: Any) -> None:
+    """Setting tab_name to NULL must NOT enqueue (the NULL would violate the queue's
+    NOT NULL value column) and must NOT abort the parent UPDATE. The WHEN guard
+    (NEW.tab_name IS NOT NULL) is what keeps the row write alive."""
+    _insert_instance(app_env.db_path, "inst-null", "had-name", tmux_pane="%9")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "UPDATE claude_instances SET tab_name = NULL WHERE id = ?",
+            ("inst-null",),
+        )
+        conn.commit()
+        tab = conn.execute(
+            "SELECT tab_name FROM claude_instances WHERE id = ?", ("inst-null",)
+        ).fetchone()[0]
+
+    assert tab is None, "parent UPDATE must survive (no trigger-side constraint abort)"
+    assert _queue_rows(app_env.db_path, "@PANE_LABEL") == []

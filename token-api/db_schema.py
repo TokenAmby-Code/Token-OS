@@ -948,6 +948,23 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
+        # A rename queues the raw display name to @PANE_LABEL (Phase 1 Part A).
+        # The pane border reads @PANE_LABEL in-format (zero fork per redraw) instead
+        # of shelling out to tmux-pane-label every status-interval. Mirrors
+        # trg_status_pane_state; pane_state_worker pushes it generically. Styling
+        # stays in the format string — the var carries data, not presentation.
+        # NEW.tab_name IS NOT NULL guards the queue's NOT NULL value column: a rename
+        # to NULL would otherwise abort the parent UPDATE on the constraint.
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tab_name_pane_state
+            AFTER UPDATE OF tab_name ON claude_instances
+            WHEN OLD.tab_name IS NOT NEW.tab_name AND NEW.tab_name IS NOT NULL
+            BEGIN
+                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                VALUES (NEW.id, '@PANE_LABEL', NEW.tab_name, NEW.tmux_pane);
+            END
+        """)
+
         # ── Session Doc Sync Queue ──
         # Trigger-driven session doc frontmatter updates. Fires on status change,
         # tab rename, doc link, and doc unlink — keeps agents: list coherent.
