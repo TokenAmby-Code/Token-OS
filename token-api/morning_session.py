@@ -179,7 +179,7 @@ def reconcile_custodes_active(inst: dict) -> dict:
         results["type"] = _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"})
     if not is_synced:
         results["synced"] = _patch(f"/api/instances/{instance_id}/synced", {"synced": True})
-    print(f"Morning session: reconciled desynced custodes {instance_id[:12]} -> sync/synced")
+    logger.info("Morning session: reconciled desynced custodes %s -> sync/synced", instance_id[:12])
     return {"reconciled": True, "instance_id": instance_id, "results": results}
 
 
