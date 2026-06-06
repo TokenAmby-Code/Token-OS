@@ -14792,6 +14792,11 @@ async def cancel_shutdown():
 # the runner is still waiting. The self-restart child survives our death
 # (start_new_session) and kicks launchd externally; restore_restart_state()
 # rehydrates ephemeral state on boot.
+#
+# CD auto-deploy proof (2026-06-06): this comment reached the live serving
+# checkout via the fixed pipeline alone — deploy-prod.yml → webhook →
+# `token-restart --sync` ff-forwarded the checkout to this commit and restarted,
+# with NO manual git step. See #92 for the fix that made merges self-deploying.
 
 # The shared secret lives OUTSIDE the repo — injected into token-api's launchd
 # environment (or read from Keychain) as CD_RESTART_SECRET. Fail-closed: if it is
