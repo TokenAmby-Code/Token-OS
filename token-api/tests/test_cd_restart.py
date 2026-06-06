@@ -1,9 +1,13 @@
-"""Tests for the CD restart-on-merge webhook (Phase 2).
+"""Tests for the CD restart-on-merge webhook.
 
 POST /api/cd/restart — secret-validated (fail-closed), ack-first, restart-detached.
-All actual restarts (detached spawns + save_restart_state) are monkeypatched, so
-these tests exercise auth, the service→action map, ack-first behavior, the
-pr_state→merged flip, and the in-flight coalescing guard without restarting anything.
+The webhook is now DUMB: every authorized merge spawns ONE detached, git-aware
+`token-restart --sync` (which ff-pulls the live checkout and restarts only the
+services the merge changed). There is no per-service routing in the handler
+anymore — any legacy `services` field is accepted but informational. All actual
+restarts (the detached spawn + save_restart_state) are monkeypatched, so these
+tests exercise auth, the single-spawn contract, the pr_state→merged flip, and the
+time-window coalescing guard without restarting anything.
 """
 
 import sqlite3
@@ -34,7 +38,9 @@ def client(app_env, monkeypatch, spawned):
 
     monkeypatch.setattr(app_env.main, "_cd_spawn_detached", _fake_spawn)
     monkeypatch.setattr(app_env.main, "save_restart_state", lambda: None)
-    monkeypatch.setattr(app_env.main, "_cd_self_restart_scheduled", False, raising=False)
+    # Reset the time-window coalesce clock so each test starts uncoalesced
+    # (module-level state otherwise leaks across tests in the same process).
+    monkeypatch.setattr(app_env.main, "_cd_last_restart_spawn", 0.0, raising=False)
     monkeypatch.setenv("CD_RESTART_SECRET", SECRET)
     return TestClient(app_env.main.app)
 
@@ -66,6 +72,10 @@ def _pr_state(iid):
     return row[0] if row else None
 
 
+def _self_restarts(spawned):
+    return [cmd for name, cmd in spawned if name == "self-restart"]
+
+
 # ── Auth / fail-closed ───────────────────────────────────────
 
 
@@ -74,64 +84,60 @@ def test_missing_server_secret_fails_closed(app_env, monkeypatch):
 
     monkeypatch.delenv("CD_RESTART_SECRET", raising=False)
     c = TestClient(app_env.main.app)
-    resp = c.post("/api/cd/restart", json={"services": ["token-api"]}, headers=_auth())
+    resp = c.post("/api/cd/restart", json={"sha": "abc"}, headers=_auth())
     assert resp.status_code == 503
 
 
 def test_bad_secret_rejected(client):
-    resp = client.post("/api/cd/restart", json={"services": ["token-api"]}, headers=_auth("wrong"))
+    resp = client.post("/api/cd/restart", json={"sha": "abc"}, headers=_auth("wrong"))
     assert resp.status_code == 401
 
 
 def test_missing_bearer_rejected(client):
-    resp = client.post("/api/cd/restart", json={"services": ["token-api"]})
+    resp = client.post("/api/cd/restart", json={"sha": "abc"})
     assert resp.status_code == 401
 
 
-# ── Service → action map ─────────────────────────────────────
+# ── Single git-aware token-restart spawn ─────────────────────
 
 
-def test_token_api_schedules_self_restart(client, spawned):
-    resp = client.post("/api/cd/restart", json={"services": ["token-api"]}, headers=_auth())
+def test_merge_spawns_one_git_aware_token_restart(client, spawned):
+    resp = client.post("/api/cd/restart", json={"sha": "deadbeef"}, headers=_auth())
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is True
-    assert "scheduled" in body["self_restart"]
-    # token-restart spawned detached, WITH --sync so the merge is ff-only pulled
-    # into the live checkout before the restart (otherwise the merge ships nothing).
-    self_restarts = [cmd for name, cmd in spawned if name == "self-restart"]
-    assert len(self_restarts) == 1
-    assert any("--sync" in part for part in self_restarts[0]), self_restarts[0]
-    # ...specifically appended to the token-restart invocation, not loose.
-    assert self_restarts[0][-1].rstrip().endswith("--sync")
+    assert "scheduled" in body["restart"]
+    # Exactly ONE detached spawn: token-restart, WITH --sync (so the merge is
+    # ff-pulled into the live checkout before the git-aware selective restart).
+    restarts = _self_restarts(spawned)
+    assert len(restarts) == 1
+    assert any("token-restart" in part for part in restarts[0]), restarts[0]
+    assert restarts[0][-1].rstrip().endswith("--sync")
+    # No per-service side-spawns anymore (no discord kickstart / push-mobile / curl).
+    assert len(spawned) == 1
 
 
-def test_discord_only_does_not_self_restart(client, spawned):
-    resp = client.post("/api/cd/restart", json={"services": ["discord-daemon"]}, headers=_auth())
+def test_no_services_field_still_spawns(client, spawned):
+    # The git-aware webhook does not need a services list — token-restart derives
+    # the changed set from git. An empty body (just a sha) still deploys.
+    resp = client.post("/api/cd/restart", json={"sha": "cafef00d"}, headers=_auth())
     assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["self_restart"] == "not requested"
-    assert body["services"]["discord-daemon"] == "kicked"
-    # a launchctl kickstart was spawned, no self-restart
-    assert any(name == "discord-restart" for name, _ in spawned)
-    assert not any(name == "self-restart" for name, _ in spawned)
+    assert len(_self_restarts(spawned)) == 1
 
 
-def test_mobile_maps_to_push_mobile(client, spawned):
-    resp = client.post("/api/cd/restart", json={"services": ["mobile"]}, headers=_auth())
-    assert resp.status_code == 200
-    assert any(name == "push-mobile" for name, _ in spawned)
-
-
-def test_log_only_services_take_no_action(client, spawned):
+def test_legacy_services_field_accepted_but_not_routed(client, spawned):
+    # A pre-git-aware workflow body (with a services list) is accepted, but the
+    # handler does NOT do per-service routing — it just spawns token-restart.
     resp = client.post(
-        "/api/cd/restart", json={"services": ["tmux", "ahk", "hammerspoon"]}, headers=_auth()
+        "/api/cd/restart",
+        json={"services": ["discord-daemon", "mobile"], "sha": "1234"},
+        headers=_auth(),
     )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["self_restart"] == "not requested"
-    assert all(v == "log-only (dropped)" for v in body["services"].values())
-    assert spawned == []
+    assert resp.status_code == 200, resp.text
+    # One token-restart, and crucially NO discord kickstart / push-mobile spawns.
+    assert len(spawned) == 1
+    assert spawned[0][0] == "self-restart"
+    assert not any(name in ("discord-restart", "push-mobile") for name, _ in spawned)
 
 
 # ── pr_state → merged flip ───────────────────────────────────
@@ -142,7 +148,7 @@ def test_merged_pr_flips_instance_badge(client):
     iid = _insert_instance_with_pr(url, "open")
     resp = client.post(
         "/api/cd/restart",
-        json={"services": ["token-api"], "pr_url": url},
+        json={"sha": "abc", "pr_url": url},
         headers=_auth(),
     )
     assert resp.status_code == 200, resp.text
@@ -150,14 +156,14 @@ def test_merged_pr_flips_instance_badge(client):
     assert _pr_state(iid) == "merged"
 
 
-# ── In-flight coalescing ─────────────────────────────────────
+# ── Time-window coalescing ───────────────────────────────────
 
 
-def test_concurrent_self_restart_coalesces(client, spawned):
-    first = client.post("/api/cd/restart", json={"services": ["token-api"]}, headers=_auth())
-    second = client.post("/api/cd/restart", json={"services": ["token-api"]}, headers=_auth())
+def test_concurrent_restart_coalesces(client, spawned):
+    first = client.post("/api/cd/restart", json={"sha": "a"}, headers=_auth())
+    second = client.post("/api/cd/restart", json={"sha": "b"}, headers=_auth())
     assert first.status_code == 200 and second.status_code == 200
-    assert "scheduled" in first.json()["self_restart"]
-    assert "coalesced" in second.json()["self_restart"]
-    # only ONE self-restart spawned despite two webhooks
-    assert sum(1 for name, _ in spawned if name == "self-restart") == 1
+    assert "scheduled" in first.json()["restart"]
+    assert "coalesced" in second.json()["restart"]
+    # only ONE token-restart spawned despite two webhooks in the same window
+    assert len(_self_restarts(spawned)) == 1

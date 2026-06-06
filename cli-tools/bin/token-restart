@@ -4,26 +4,36 @@
 # AUDIENCE: human, agent
 #
 # Usage:
-#   token-restart              # Full restart: Mac token-api + Discord + WSL satellite
+#   token-restart              # Git-aware smart deploy: sync the live checkout,
+#                              #   then restart ONLY the services whose files changed
+#   token-restart --no-sync    # Skip the git sync; full restart on current code
 #   token-restart --discord    # Restart the Discord daemon only (launchd)
 #   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
-#   token-restart --sync       # CD only: ff-only pull the live checkout, then restart
+#   token-restart --sync       # Accepted no-op alias (sync is now the default)
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
 # After healthy restart, reloads any open /ui/ops browser tabs on Mac.
-# Git sync: a bare `token-restart` does NOT pull (the live NAS checkout
-# /Volumes/Imperium/Token-OS is restarted as-is — no surprise pulls for humans).
-# The CD webhook passes --sync, which fast-forwards that checkout to origin/main
-# BEFORE restarting so a merge-to-main actually ships new code. See
-# sync_live_checkout() for the ff-only, stash-guarded, abort-on-conflict path.
+#
+# GIT-AWARE SMART DEPLOY (the mantra: a merge to main → one restart endpoint hit →
+# this script syncs + intelligently restarts):
+#   By DEFAULT token-restart ff-only pulls the live serving checkout
+#   (/Volumes/Imperium/Token-OS) to origin/main BEFORE restarting, so a
+#   merge-to-main actually ships new code. It then DIFFS what the pull changed and
+#   restarts ONLY the affected services (token-api / ops-ui / discord / WSL
+#   satellite / mobile) — see map_changed_to_services(). If the sync pulled nothing
+#   new (already current, or --no-sync), it falls back to a full restart of the
+#   standard set, preserving the human "restart my stuff now" workflow.
+#   The sync is ff-only + stash-guarded + abort-on-conflict (degrades to a plain
+#   restart on any trouble) — see sync_live_checkout().
 
 set -euo pipefail
 
-_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+_BIN_DIR="$(dirname "$(readlink -f "$0")")"
+_LIB_DIR="${_BIN_DIR}/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 # Colors
@@ -57,30 +67,39 @@ is_mac() {
 
 show_help() {
     cat << 'EOF'
-token-restart - Multi-device restart orchestrator
+token-restart - Git-aware smart deploy + multi-device restart orchestrator
 
 Usage:
-    token-restart              Full restart (Mac token-api → Discord → WSL)
+    token-restart              Sync live checkout, restart ONLY changed services
+    token-restart --no-sync    Skip git sync; full restart on current code
     token-restart --discord    Restart the Discord daemon only (launchd)
     token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
-    token-restart --sync       CD only: ff-only pull live checkout, then restart
+    token-restart --sync       Accepted no-op alias (sync is the default)
     token-restart -h, --help   Show this help
 
     When run from a non-Mac device, proxies to Mac via SSH.
 
-Flow:
-    1. Restart Mac token-api (launchctl)
-    2. Restart Discord daemon (launchd, Mac-only)
-    3. Restart WSL satellite (HTTP → restart, SSH fallback)
-    4. Health-check all, print summary
+Smart-deploy flow (default):
+    0. ff-only pull the live checkout to origin/main (stash-guarded)
+    1. If the pull advanced HEAD: diff old→new and restart ONLY the services
+       whose files changed:
+         token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
+         token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
+         discord-daemon/**                          → Discord daemon (launchd)
+         token-api/token-satellite.py               → WSL satellite
+         mobile/**                                  → push-mobile -a (phone)
+    2. If the pull was a no-op (already current) or --no-sync: full restart of
+       the standard set (Mac token-api → Discord → WSL), preserving the human
+       "restart my stuff now" workflow.
+    3. Health-check what was restarted, print summary.
 
 Notes:
-    - Default: the live NAS checkout (/Volumes/Imperium/Token-OS) is restarted
-      as-is — no git pull. --sync (CD only) ff-only pulls it to origin/main first.
+    - Sync is ff-only + stash-guarded + abort-on-conflict; degrades to a plain
+      restart on any trouble (WIP never lost, tree never broken).
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
@@ -99,11 +118,12 @@ remote_restart() {
 
     echo -e "${BLUE}→${NC} Proxying restart to Mac ($MAC_HOST)..."
 
-    # Pass through relevant flags
+    # Pass through relevant flags. Sync is the default on the Mac side, so only
+    # the opt-out needs forwarding.
     local flags=""
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
     [[ "${ACTION}" == "discord" ]] && flags="$flags --discord"
-    [[ "${SYNC_BEFORE_RESTART}" == true ]] && flags="$flags --sync"
+    [[ "${SYNC_BEFORE_RESTART}" == false ]] && flags="$flags --no-sync"
 
     if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
@@ -211,12 +231,13 @@ sync_venv_if_needed() {
     fi
 }
 
-# ============ CD code-sync (opt-in via --sync) ============
+# ============ Code-sync (default; opt out with --no-sync) ============
 #
-# CD path ONLY: before restarting, fast-forward the LIVE serving checkout to
-# origin/main so a merge-to-main actually ships new code (the restart alone runs
-# whatever is already checked out). A bare `token-restart` never calls this — no
-# surprise pulls for humans.
+# Before restarting, fast-forward the LIVE serving checkout to origin/main so a
+# merge-to-main actually ships new code (the restart alone runs whatever is
+# already checked out). This is the DEFAULT now; --no-sync skips it. On a
+# successful advance it records SYNC_DID_ADVANCE + SYNC_CHANGED_PATHS so
+# full_restart() can restart only the services the pull changed.
 #
 # SAFETY (load-bearing — losing WIP or breaking the live tree is worse than not
 # shipping):
@@ -316,6 +337,11 @@ sync_live_checkout() {
     local new_head
     new_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
     echo -e "  ${GREEN}✓${NC} CD-sync: fast-forwarded ${old_head:0:9} → ${new_head:0:9}"
+
+    # Record that the checkout advanced + exactly which files the pull changed, so
+    # full_restart() can restart ONLY the affected services (git-aware deploy).
+    SYNC_DID_ADVANCE=true
+    SYNC_CHANGED_PATHS="$(git -C "$dir" diff --name-only "$old_head" "$new_head" 2>/dev/null || true)"
 
     # Reapply WIP on top of the new HEAD.
     if [[ -n "$my_stash" ]]; then
@@ -636,55 +662,171 @@ PYEOF
     echo -e "  ${GREEN}✓${NC} Plist updated"
 }
 
+# ============ Mobile ============
+
+restart_mobile() {
+    echo -e "${BLUE}→${NC} Deploying mobile (push-mobile -a)..."
+    # Resolve PATH-first (the standard cli-tools push-mobile), falling back to our
+    # sibling in _BIN_DIR if PATH doesn't carry it (e.g. a bare CD environment).
+    local push_mobile
+    push_mobile="$(command -v push-mobile 2>/dev/null || true)"
+    [[ -n "$push_mobile" ]] || push_mobile="${_BIN_DIR}/push-mobile"
+    if [[ ! -x "$push_mobile" ]]; then
+        echo -e "  ${YELLOW}⚠${NC} push-mobile not found — skipping mobile deploy"
+        return 0
+    fi
+    # push-mobile validates + pushes the mobile/ tree to the phone. Fire it but
+    # never let a phone-unreachable push fail the whole deploy.
+    if "$push_mobile" -a; then
+        echo -e "  ${GREEN}✓${NC} push-mobile completed"
+    else
+        echo -e "  ${YELLOW}⚠${NC} push-mobile failed (continuing)"
+    fi
+}
+
+# ============ Git-aware service mapping ============
+#
+# Map the files a sync just pulled (SYNC_CHANGED_PATHS, one path per line) to the
+# services that must restart, setting the RESTART_* globals. This is the SINGLE
+# SOURCE OF TRUTH for path→service routing: deploy-prod.yml no longer filters
+# paths — it just hits the restart endpoint and lets this script decide from git.
+#
+# NOTE: in bash `case` patterns, `*` matches `/` (unlike filename globbing), so
+# `token-api/*.py` covers nested files too. Order matters — the first matching
+# arm wins, so specific paths (satellite, ops) precede the general .py arm.
+
+map_changed_to_services() {
+    local path
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        case "$path" in
+            token-api/token-satellite.py)
+                # Satellite code lives under token-api/ but runs on WSL. (Also a
+                # *.py, so token-api restarts too — matches old paths-filter.)
+                RESTART_WSL=true
+                RESTART_TOKENAPI=true
+                ;;
+            token-api/ui/ops/* | token-api/web/ops/*)
+                # Ops cockpit is served by token-api; a restart bumps the build-id
+                # so connected browsers reload, and we also refresh open tabs.
+                RESTART_OPS=true
+                RESTART_TOKENAPI=true
+                ;;
+            token-api/*.py | token-api/uv.lock | token-api/pyproject.toml)
+                RESTART_TOKENAPI=true
+                ;;
+            discord-daemon/*)
+                RESTART_DISCORD=true
+                ;;
+            mobile/*)
+                RESTART_MOBILE=true
+                ;;
+            *)
+                : # unmapped (docs, cli-tools, workflows, tmux/ahk/hammerspoon):
+                  # no long-lived service to bounce — nothing to do.
+                ;;
+        esac
+    done <<< "$SYNC_CHANGED_PATHS"
+    return 0
+}
+
 # ============ Full Restart ============
 
 full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 0. CD code-sync (opt-in via --sync): ff-only pull the live checkout so a
-    #    merge actually ships before we restart. Always degrades gracefully.
+    # 0. Git sync (default): ff-only pull the live checkout so a merge ships
+    #    before we restart. Sets SYNC_DID_ADVANCE + SYNC_CHANGED_PATHS. Always
+    #    degrades gracefully — a failed/uneventful sync just leaves the flags off.
     if [[ "$SYNC_BEFORE_RESTART" == true ]]; then
         sync_live_checkout || true
         echo ""
     fi
 
-    # 1. Mac restart
-    restart_mac || true
-    echo ""
+    # 1. Decide what to restart.
+    if [[ "$SYNC_DID_ADVANCE" == true ]]; then
+        # Smart deploy: restart ONLY the services whose files the pull changed.
+        map_changed_to_services
+        if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
+            && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true ]]; then
+            echo -e "${GREEN}✓${NC} No deployable services changed — nothing to restart."
+            return 0
+        fi
+        local changed_list=""
+        [[ "$RESTART_TOKENAPI" == true ]] && changed_list+=" token-api"
+        [[ "$RESTART_OPS" == true ]] && changed_list+=" ops-ui"
+        [[ "$RESTART_DISCORD" == true ]] && changed_list+=" discord"
+        [[ "$RESTART_WSL" == true ]] && changed_list+=" wsl"
+        [[ "$RESTART_MOBILE" == true ]] && changed_list+=" mobile"
+        echo -e "${BLUE}→${NC} Changed services:${changed_list}"
+        echo ""
+    else
+        # No new commits (already current / --no-sync / sync degraded): full
+        # restart of the standard set — the human "restart my stuff now" path.
+        RESTART_TOKENAPI=true
+        RESTART_DISCORD=true
+        RESTART_WSL=true
+    fi
 
-    # 1b. Discord daemon (Mac-only, launchd-supervised)
-    restart_discord || true
-    echo ""
+    # 2. Mac token-api
+    if [[ "$RESTART_TOKENAPI" == true ]]; then
+        restart_mac || true
+        echo ""
+    fi
 
-    # 2. WSL restart
-    restart_wsl &
-    local wsl_pid=$!
+    # 3. Discord daemon (Mac-only, launchd-supervised)
+    if [[ "$RESTART_DISCORD" == true ]]; then
+        restart_discord || true
+        echo ""
+    fi
 
-    wait $wsl_pid 2>/dev/null || true
+    # 4. WSL satellite (background; never blocks the deploy)
+    local wsl_pid=""
+    if [[ "$RESTART_WSL" == true ]]; then
+        restart_wsl &
+        wsl_pid=$!
+    fi
 
-    # 3. Browser cockpit refresh (replaces legacy TUI restart signaling)
-    if check_mac_health; then
+    # 5. Mobile (phone push)
+    if [[ "$RESTART_MOBILE" == true ]]; then
+        restart_mobile || true
+        echo ""
+    fi
+
+    [[ -n "$wsl_pid" ]] && { wait "$wsl_pid" 2>/dev/null || true; }
+
+    # 6. Browser cockpit refresh — only if token-api was (re)started and healthy.
+    if [[ "$RESTART_TOKENAPI" == true ]] && check_mac_health; then
         refresh_ops_browser_gui || true
     fi
 
-    # 4. Summary
+    # 7. Summary — report only what we touched.
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
-    if check_mac_health; then
-        echo -e "  Mac:     ${GREEN}●${NC} healthy"
-    else
-        echo -e "  Mac:     ${RED}●${NC} not responding"
+    if [[ "$RESTART_TOKENAPI" == true ]]; then
+        if check_mac_health; then
+            echo -e "  Mac:     ${GREEN}●${NC} healthy"
+        else
+            echo -e "  Mac:     ${RED}●${NC} not responding"
+        fi
     fi
-    if check_discord_health; then
-        echo -e "  Discord: ${GREEN}●${NC} connected"
-    else
-        echo -e "  Discord: ${RED}●${NC} not responding"
+    if [[ "$RESTART_DISCORD" == true ]]; then
+        if check_discord_health; then
+            echo -e "  Discord: ${GREEN}●${NC} connected"
+        else
+            echo -e "  Discord: ${RED}●${NC} not responding"
+        fi
     fi
-    if check_wsl_health; then
-        echo -e "  WSL:     ${GREEN}●${NC} healthy"
-    else
-        echo -e "  WSL:     ${YELLOW}○${NC} unknown"
+    if [[ "$RESTART_WSL" == true ]]; then
+        if check_wsl_health; then
+            echo -e "  WSL:     ${GREEN}●${NC} healthy"
+        else
+            echo -e "  WSL:     ${YELLOW}○${NC} unknown"
+        fi
+    fi
+    if [[ "$RESTART_MOBILE" == true ]]; then
+        echo -e "  Mobile:  ${GREEN}●${NC} push-mobile dispatched"
     fi
 }
 
@@ -692,7 +834,19 @@ full_restart() {
 
 ACTION="restart"
 DEPLOY_FROM=""
-SYNC_BEFORE_RESTART=false
+# Sync is the DEFAULT now (the git-aware deploy mantra: always ship fresh code).
+# --no-sync opts out; --sync is an accepted no-op alias.
+SYNC_BEFORE_RESTART=true
+# Set by sync_live_checkout() when the pull advances HEAD, plus the changed paths.
+SYNC_DID_ADVANCE=false
+SYNC_CHANGED_PATHS=""
+# Which services to restart — set by map_changed_to_services() (smart mode) or
+# forced on in the full-restart fallback. Must be initialised for `set -u`.
+RESTART_TOKENAPI=false
+RESTART_OPS=false
+RESTART_DISCORD=false
+RESTART_WSL=false
+RESTART_MOBILE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -701,9 +855,14 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --sync)
-            # CD only: ff-only pull the live checkout before restarting. A
-            # modifier, not an action — composes with the default full restart.
+            # No-op alias: sync is the default now. Kept so existing callers
+            # (e.g. the CD webhook, which passes --sync explicitly) don't break.
             SYNC_BEFORE_RESTART=true
+            shift
+            ;;
+        --no-sync)
+            # Opt out of the git sync: full restart on whatever is checked out.
+            SYNC_BEFORE_RESTART=false
             shift
             ;;
         --kill)

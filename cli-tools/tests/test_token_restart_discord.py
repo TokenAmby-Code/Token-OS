@@ -84,7 +84,10 @@ def test_discord_flag_does_not_touch_token_api(tmp_path: Path) -> None:
 
 def test_full_restart_includes_discord(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, ["launchctl", "sleep", "ssh", "osascript", "uv", "pgrep"])
-    proc = _run([], env)  # bare token-restart == full restart
+    # --no-sync == the old bare `token-restart`: skip the git sync and full-restart
+    # the standard set on current code. (A bare `token-restart` now syncs by
+    # default; the git-aware selective path is covered in test_token_restart_smart_deploy.)
+    proc = _run(["--no-sync"], env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert f"kickstart -k gui/501/{TOKENAPI_LABEL}" in calls

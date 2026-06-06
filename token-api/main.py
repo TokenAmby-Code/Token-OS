@@ -14823,14 +14823,14 @@ async def cancel_shutdown():
 # not a substitute for the secret.
 _CD_SECRET_ENV = "CD_RESTART_SECRET"
 
-# In-flight guard: coalesce concurrent restarts. A self-restart kills the process
-# (clearing this anyway), but two webhooks racing must not spawn two kickstarts.
-_cd_self_restart_scheduled = False
-
-# Canonical service keys → how each is restarted. deploy-prod.yml's path-filter
-# emits these keys. "log-only" globs (tmux/ahk/hammerspoon) are intentionally
-# dropped — no headless restart path — and only logged.
-_CD_LOG_ONLY = {"tmux", "ahk", "hammerspoon"}
+# In-flight guard: coalesce duplicate restart webhooks by a short time window.
+# A latched boolean can't work anymore — a git-aware token-restart may NOT restart
+# token-api (e.g. a discord-only or mobile-only deploy), so this process survives
+# and a stuck boolean would block every future deploy. Distinct merges are
+# serialized minutes apart by the workflow's concurrency group, so a window this
+# short only ever swallows a genuine same-event duplicate, never a real 2nd deploy.
+_cd_last_restart_spawn = 0.0  # time.monotonic() of the last token-restart spawn
+_CD_COALESCE_WINDOW_S = 15.0
 
 
 def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
@@ -14875,12 +14875,16 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
 async def cd_restart(request: Request):
     """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
 
-    Body: {"services": [...], "sha": "...", "pr_url": "..."} — services is the
-    changed-service key list from deploy-prod.yml's path filter. Returns a
-    per-service result map immediately; the token-api self-restart (if any) is
-    deferred to a detached child so this 200 flushes first.
+    Body: {"sha": "...", "pr_url": "..."}. The merge to main is shipped by a single
+    detached, git-aware `token-restart --sync`: it ff-only pulls the live checkout
+    to origin/main and then restarts ONLY the services whose files the merge
+    changed (see map_changed_to_services in cli-tools/bin/token-restart). The CD
+    pipeline no longer routes services — it just hits this endpoint. Any legacy
+    `services` field is accepted but informational (logged, not acted on).
+    Returns immediately; the restart is deferred to a detached child so this 200
+    flushes first.
     """
-    global _cd_self_restart_scheduled
+    global _cd_last_restart_spawn
 
     configured = os.environ.get(_CD_SECRET_ENV, "").strip()
     if not configured:
@@ -14898,60 +14902,12 @@ async def cd_restart(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    services = body.get("services") or []
-    if not isinstance(services, list):
-        raise HTTPException(status_code=400, detail="services must be a list")
     sha = body.get("sha")
     pr_url = body.get("pr_url")
-
-    results: dict[str, str] = {}
-    needs_self_restart = False
-
-    for svc in services:
-        key = str(svc).strip().lower()
-        if key in ("token-api", "token_api", "tokenapi", "ops-ui", "ops", "web"):
-            # ops-ui is served by token-api; token-restart AppleScript-reloads tabs.
-            needs_self_restart = True
-            results[key] = "self-restart scheduled"
-        elif key in ("discord-daemon", "discord", "discord-context"):
-            try:
-                _cd_spawn_detached(
-                    ["launchctl", "kickstart", "-k", "gui/501/ai.openclaw.discord-context"],
-                    log_name="discord-restart",
-                )
-                results[key] = "kicked"
-            except Exception as e:  # per-service failure must not fail the webhook
-                results[key] = f"error: {e}"
-        elif key in ("satellite", "token-satellite", "wsl"):
-            try:
-                wsl_host = cfg("tailscale_ip", "wsl")
-                _cd_spawn_detached(
-                    [
-                        "curl",
-                        "-fsS",
-                        "-m",
-                        "5",
-                        "-X",
-                        "POST",
-                        f"http://{wsl_host}:7777/restart",
-                    ],
-                    log_name="satellite-restart",
-                )
-                results[key] = "restart posted"
-            except Exception as e:
-                results[key] = f"error: {e}"
-        elif key in ("mobile", "push-mobile"):
-            try:
-                push_mobile = str(SCRIPTS_DIR / "cli-tools" / "bin" / "push-mobile")
-                _cd_spawn_detached([push_mobile, "-a"], log_name="push-mobile")
-                results[key] = "push-mobile -a spawned"
-            except Exception as e:
-                results[key] = f"error: {e}"
-        elif key in _CD_LOG_ONLY:
-            logger.info("CD: %s changed — log-only (no headless restart path)", key)
-            results[key] = "log-only (dropped)"
-        else:
-            results[key] = "unknown service (ignored)"
+    # Informational only: token-restart derives the real changed-service set from
+    # the git diff of the sync it performs. Kept for logging + backward-compat with
+    # the pre-git-aware workflow body.
+    services = body.get("services")
 
     # Flip the merged PR's originating instance badge (Phase 1 → merged).
     merged_flips = 0
@@ -14961,37 +14917,36 @@ async def cd_restart(request: Request):
         except Exception as e:
             logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
 
-    # Schedule the (deferred, detached) self-restart AFTER acking. The child sleeps
-    # so this 200 fully flushes before launchd kicks us. save_restart_state() here
-    # guards against kickstart -k not allowing a graceful lifespan shutdown.
-    # --sync makes token-restart ff-only pull the live checkout to origin/main
-    # BEFORE restarting, so the merge that triggered this webhook actually ships
-    # new code (the restart alone would re-launch whatever was already checked
-    # out). The sync is ff-only + stash-guarded and degrades to a plain restart
-    # on any trouble — see sync_live_checkout() in cli-tools/bin/token-restart.
-    self_restart = "not requested"
-    if needs_self_restart:
-        if _cd_self_restart_scheduled:
-            self_restart = "already scheduled (coalesced)"
-        else:
-            _cd_self_restart_scheduled = True
-            try:
-                save_restart_state()
-            except Exception as e:
-                logger.warning("CD: save_restart_state failed (continuing): %s", e)
-            token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
-            _cd_spawn_detached(
-                ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
-                log_name="self-restart",
-            )
-            self_restart = "scheduled (detached, ~2s)"
-            logger.info("CD: self-restart scheduled (sha=%s)", sha)
+    # Spawn ONE detached, git-aware token-restart AFTER acking (the child sleeps so
+    # this 200 fully flushes before launchd may kick us). `token-restart --sync`
+    # ff-only pulls the live checkout to origin/main so the merge actually ships,
+    # then restarts ONLY the services it changed. (--sync is token-restart's
+    # default now; we still pass it explicitly so the CD path always syncs
+    # regardless of any future default change.) Coalesce duplicate webhooks by a
+    # short time window — see _CD_COALESCE_WINDOW_S. save_restart_state() guards
+    # against kickstart -k skipping a graceful lifespan shutdown.
+    now = time.monotonic()
+    if now - _cd_last_restart_spawn < _CD_COALESCE_WINDOW_S:
+        restart = "coalesced (recent restart in flight)"
+        logger.info("CD: restart coalesced (sha=%s, services=%s)", sha, services)
+    else:
+        _cd_last_restart_spawn = now
+        try:
+            save_restart_state()
+        except Exception as e:
+            logger.warning("CD: save_restart_state failed (continuing): %s", e)
+        token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
+        _cd_spawn_detached(
+            ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
+            log_name="self-restart",
+        )
+        restart = "scheduled (detached, ~2s)"
+        logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
 
     return {
         "ok": True,
         "sha": sha,
-        "services": results,
-        "self_restart": self_restart,
+        "restart": restart,
         "pr_merged_flips": merged_flips,
     }
 
