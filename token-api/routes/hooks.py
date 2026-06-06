@@ -297,11 +297,11 @@ CUSTODES_PANE_LABEL = "legion:custodes"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
-# persona, so we derive its row identity (legion + primarch + instance_type, and
-# synced for the custodes singleton) from the pane. This makes "SessionStart from
+# persona, so we derive its row identity (legion + primarch + instance_type) from
+# the pane. This makes "SessionStart from
 # a persona pane registers correctly" an infrastructure invariant — no persona
 # ever has to self-PATCH legion/type/synced. The fields chosen match each
-# persona's own resolution key: custodes resolves on legion+synced+instance_type,
+# persona's own resolution key: custodes resolves on the legion:custodes pane marker,
 # FG on its pane label, Administratum on primarch='administratum'.
 #
 # Worker panes (mechanicus:N, mechanicus:worker-N) are intentionally absent — they
@@ -312,7 +312,10 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "legion": "custodes",
         "primarch": "custodes",
         "instance_type": "sync",
-        "synced": True,
+        # synced is NOT derived at registration: custodes now resolves via the
+        # legion:custodes pane marker, not synced (#67), so the correct startup
+        # default is synced=0. The morning session flips it to 1 while live.
+        "synced": False,
     },
     MECHANICUS_FG_LABEL: {
         # FG owns a dedicated singleton legion ("fabricator", see ALLOWED_LEGIONS /
