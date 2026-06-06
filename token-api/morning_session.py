@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -33,6 +34,21 @@ SESSION_DIR = Path("/tmp/custodes_morning_sessions")
 # this many hours of started_at. Past the bound it is auto-ended and the Stop-hook
 # keepalive stops re-injecting (see routes/hooks.py and morning_session_active).
 MORNING_MAX_DURATION_HOURS = 2
+
+# Statuses that mean "a morning session is up and the keepalive should run":
+#   launched — transitional, the prompt was injected, validation pending.
+#   active   — self-validation confirmed a live legion=custodes,sync instance.
+# Anything else (ended/failed/expired/no_pane/launch_failed/nas_unavailable) is
+# inactive and the Stop-hook keepalive must NOT re-inject.
+MORNING_ACTIVE_STATUSES = ("launched", "active")
+
+# In-pathway self-validation budget: after the prompt is injected, poll the
+# instances table this long for the launched Custodes to self-register as
+# legion=custodes, instance_type=sync. Generous by default so a normal cold
+# boot is never mistaken for a failure; the supervisor layer is the redundant
+# net for anything that slips past this window.
+CUSTODES_CONFIRM_TIMEOUT_S = int(os.environ.get("CUSTODES_CONFIRM_TIMEOUT_S", "90"))
+CUSTODES_CONFIRM_INTERVAL_S = float(os.environ.get("CUSTODES_CONFIRM_INTERVAL_S", "3"))
 
 
 def morning_state_dir() -> Path:
@@ -84,12 +100,97 @@ def write_morning_status(
     return data
 
 
+def update_morning_state(updates: dict, *, today: str | None = None) -> dict | None:
+    """Merge ``updates`` into today's morning state file.
+
+    Returns the updated state dict, or None if there is no state file. Used to
+    record self-validation results (confirmed instance id, timing) on top of the
+    status the launcher already wrote.
+    """
+    state_file = morning_state_file(today)
+    if not state_file.exists():
+        return None
+    try:
+        data = json.loads(state_file.read_text())
+    except Exception:
+        return None
+    data.update(updates)
+    state_file.write_text(json.dumps(data))
+    return data
+
+
+def find_live_custodes() -> dict | None:
+    """Return a live morning-Custodes instance row, or None.
+
+    The authoritative signal that a morning session is genuinely up: a row with
+    legion=custodes, instance_type=sync, and no stopped_at. Custodes is a
+    singleton (launch demotes any prior custodes) and stale rows are swept, so
+    at most one such row exists. Reads the same /api/instances surface the
+    Custodes prompt and supervisor use, so all three agree.
+    """
+    instances = _get("/api/instances?sort=recent_activity")
+    if not isinstance(instances, list):
+        return None
+    for inst in instances:
+        if (
+            isinstance(inst, dict)
+            and inst.get("legion") == "custodes"
+            and inst.get("instance_type") == "sync"
+            and inst.get("stopped_at") in (None, "")
+        ):
+            return inst
+    return None
+
+
+def confirm_custodes_registered(
+    *,
+    pane_id: str | None = None,
+    timeout_s: int | None = None,
+    interval_s: float | None = None,
+) -> dict:
+    """Poll for the launched morning Custodes to self-register.
+
+    After the prompt is injected the launcher does not know whether a live
+    legion=custodes,sync session actually came up — /api/morning/start is
+    fire-and-forget and the day-start consumer reports "started" unconditionally.
+    This closes that gap in-pathway: poll the instances table until a live sync
+    Custodes appears (success) or the budget is exhausted (failure).
+
+    Returns {"live": bool, "instance_id": str|None, "tmux_pane": str|None,
+    "pane_matched": bool, "waited_s": float}.
+    """
+    budget = CUSTODES_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
+    interval = CUSTODES_CONFIRM_INTERVAL_S if interval_s is None else interval_s
+    start = time.monotonic()
+    while True:
+        inst = find_live_custodes()
+        if inst is not None:
+            inst_pane = inst.get("tmux_pane")
+            return {
+                "live": True,
+                "instance_id": inst.get("id"),
+                "tmux_pane": inst_pane,
+                "pane_matched": bool(pane_id) and inst_pane == pane_id,
+                "waited_s": round(time.monotonic() - start, 1),
+            }
+        if time.monotonic() - start >= budget:
+            return {
+                "live": False,
+                "instance_id": None,
+                "tmux_pane": None,
+                "pane_matched": False,
+                "waited_s": round(time.monotonic() - start, 1),
+            }
+        time.sleep(interval)
+
+
 def morning_session_active(today: str | None = None) -> tuple[bool, str]:
     """Decide whether today's morning session is active and in-bound.
 
     Returns (active, reason). Active requires ALL of:
       - a morning record exists for today,
-      - its status == "launched" (not "ended"),
+      - its status is in MORNING_ACTIVE_STATUSES ("launched"/"active", not
+        "ended"/"failed"),
       - it is within MORNING_MAX_DURATION_HOURS of started_at.
 
     Past the bound the session is auto-ended (status="ended",
@@ -100,7 +201,7 @@ def morning_session_active(today: str | None = None) -> tuple[bool, str]:
     state = read_morning_state(today)
     if state is None:
         return False, "no_session"
-    if state.get("status") != "launched":
+    if state.get("status") not in MORNING_ACTIVE_STATUSES:
         return False, "ended"
 
     started_raw = state.get("started_at")
@@ -622,7 +723,6 @@ def create_legion_pane() -> str | None:
 def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
     """Assert `legion:custodes`, then send the morning prompt after assertion is true."""
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
-    import time
 
     def _assert_once() -> dict:
         result = subprocess.run(
@@ -764,7 +864,8 @@ def run_morning_session() -> dict:
         )
         return {"status": "launch_failed"}
 
-    # Save state — the session is now autonomous
+    # Transitional state — the prompt is injected; the keepalive may start while
+    # we confirm. The session is autonomous from here.
     state_file.write_text(
         json.dumps(
             {
@@ -775,9 +876,49 @@ def run_morning_session() -> dict:
             }
         )
     )
+    print(f"Morning session launched in legion pane {pane_id}; confirming registration")
 
-    print(f"Morning session launched in legion pane {pane_id}")
-    return {"status": "launched", "pane_id": pane_id}
+    # In-pathway self-validation. The launch is otherwise fire-and-forget: a
+    # "launched" flag with no live Custodes behind it would get keepalive-injected
+    # into a dead pane. Poll the instances table for a live legion=custodes,sync
+    # row and flip the state file to a real active/failed (not just launched).
+    confirmation = confirm_custodes_registered(pane_id=pane_id)
+    if confirmation["live"]:
+        update_morning_state(
+            {
+                "status": "active",
+                "confirmed_at": datetime.now().isoformat(),
+                "confirmed_instance_id": confirmation["instance_id"],
+                "confirmed_pane": confirmation["tmux_pane"],
+                "confirm_waited_s": confirmation["waited_s"],
+            }
+        )
+        print(
+            f"Morning session active: confirmed custodes {confirmation['instance_id']} "
+            f"in pane {confirmation['tmux_pane']} after {confirmation['waited_s']}s"
+        )
+        return {
+            "status": "active",
+            "pane_id": pane_id,
+            "instance_id": confirmation["instance_id"],
+        }
+
+    # The prompt was injected but no live sync Custodes registered within the
+    # budget. Mark failed so the keepalive does NOT re-inject into a phantom, and
+    # warn. The supervisor layer is the redundant net that also alerts the Emperor.
+    update_morning_state(
+        {
+            "status": "failed",
+            "failed_reason": "custodes_not_registered",
+            "confirm_waited_s": confirmation["waited_s"],
+        }
+    )
+    send_tts(
+        "Morning session launch could not be confirmed — no live Custodes "
+        "registered. Standing by for the supervisor check."
+    )
+    print(f"Morning session launch unconfirmed: no live custodes after {confirmation['waited_s']}s")
+    return {"status": "failed", "pane_id": pane_id, "reason": "custodes_not_registered"}
 
 
 def start_morning_session_background():

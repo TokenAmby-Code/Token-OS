@@ -28,8 +28,10 @@ def test_quiet_hours_morning_latch_released_by_day_start(app_env):
 
     assert app_env.main._is_quiet_hours(morning) is True
 
-    # A non-official source (the automated schedule_fallback wake-anchor) must
-    # NOT release the morning latch — that was the overnight-bypass regression.
+    # A non-official source must NOT release the morning latch — that was the
+    # overnight-bypass regression. (schedule_fallback is used here only as a
+    # representative non-official source; the magic-number fallback cron that
+    # produced it has been removed — wake is event-driven via alarm_silenced.)
     app_env.shared.set_day_started_at_sync(
         source="schedule_fallback",
         at=morning,
@@ -86,37 +88,6 @@ def test_day_start_endpoint_sets_state_and_fanout(app_env, monkeypatch):
     second = client.post("/api/day-start/fire", json={"source": "test"}).json()
     assert second["already_started"] is True
     assert second["fanout"] == []
-
-
-def test_wake_anchor_schedule_sync_reads_daily_note_frontmatter(app_env):
-    import asyncio
-
-    import routes.day_start as day_start
-
-    daily_dir = app_env.db_path.parent / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
-    daily_dir.mkdir(parents=True)
-    (daily_dir / "2026-05-10.md").write_text(
-        "---\ntitle: 2026-05-10\nwake_anchor: 09:15\n---\n\n# Daily\n",
-        encoding="utf-8",
-    )
-
-    result = asyncio.run(
-        day_start.sync_day_start_schedule_from_daily_note(
-            date_str="2026-05-10",
-            db_path=app_env.db_path,
-        )
-    )
-
-    assert result == {
-        "wake_anchor": "09:15",
-        "cron": "15 9 * * *",
-        "task_id": "day_start_schedule_fallback",
-    }
-    row = _row(
-        app_env.db_path,
-        "SELECT schedule FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'",
-    )
-    assert row["schedule"] == "15 9 * * *"
 
 
 def test_alarm_silenced_fires_day_start_and_launches_morning(app_env, monkeypatch):
