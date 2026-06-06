@@ -208,11 +208,16 @@ def _poll(
     *,
     now,
     ack,
-    custodes,
+    morning_active=False,
+    custodes=None,
     anchor="2026-06-05T08:00:00-07:00",
     deadline="2026-06-05T08:15:00-07:00",
 ):
-    """Drive one poll tick with stubbed signals; return recorded failures + disarm."""
+    """Drive one poll tick with stubbed signals; return recorded failures + disarm.
+
+    The health gate is ``morning_is_active`` (the deterministic state-file signal),
+    not bare custodes-process liveness; ``custodes`` only feeds the ok-log detail.
+    """
     fake = FakeScheduler()
     fake.jobs[ms.SUPERVISOR_POLL_JOB_ID] = {"placeholder": True}
     monkeypatch.setattr(ms.shared, "scheduler", fake)
@@ -221,6 +226,9 @@ def _poll(
 
     async def fake_ack(*, now_local=None, db_path=None):
         return ack
+
+    async def fake_active(date_str=None):
+        return morning_active
 
     async def fake_cust():
         return custodes
@@ -231,6 +239,7 @@ def _poll(
         failures.append(failure_type)
 
     monkeypatch.setattr(ms, "ack_seen_today", fake_ack)
+    monkeypatch.setattr(ms, "morning_is_active", fake_active)
     monkeypatch.setattr(ms, "custodes_running", fake_cust)
     monkeypatch.setattr(ms, "_handle_failure", fake_failure)
 
@@ -238,32 +247,45 @@ def _poll(
     return failures, fake.removed
 
 
-def test_poll_ack_and_custodes_disarms(monkeypatch):
+def test_poll_ack_and_active_morning_disarms(monkeypatch):
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
     failures, removed = _poll(
-        monkeypatch, now=now, ack={"day_started_at": "x"}, custodes={"id": "abc"}
+        monkeypatch,
+        now=now,
+        ack={"day_started_at": "x"},
+        morning_active=True,
+        custodes={"id": "abc"},
     )
     assert failures == []
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
 
 
-def test_poll_ack_no_custodes_alerts_and_disarms(monkeypatch):
+def test_poll_ack_but_morning_not_active_alerts_and_disarms(monkeypatch):
+    # A custodes process is alive (the singleton always is), but the morning
+    # session never confirmed active — the reactive launch failed. The supervisor
+    # must catch this rather than be fooled by the resting singleton.
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
-    failures, removed = _poll(monkeypatch, now=now, ack={"day_started_at": "x"}, custodes=None)
+    failures, removed = _poll(
+        monkeypatch,
+        now=now,
+        ack={"day_started_at": "x"},
+        morning_active=False,
+        custodes={"id": "resting-singleton"},
+    )
     assert failures == ["ack_no_custodes"]
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
 
 
 def test_poll_no_ack_before_deadline_keeps_waiting(monkeypatch):
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)  # before 08:15 deadline
-    failures, removed = _poll(monkeypatch, now=now, ack=None, custodes=None)
+    failures, removed = _poll(monkeypatch, now=now, ack=None)
     assert failures == []
     assert removed == []  # still armed
 
 
 def test_poll_no_ack_past_deadline_alerts(monkeypatch):
     now = datetime(2026, 6, 5, 8, 20, tzinfo=_TZ)  # past 08:15 deadline
-    failures, removed = _poll(monkeypatch, now=now, ack=None, custodes=None)
+    failures, removed = _poll(monkeypatch, now=now, ack=None)
     assert failures == ["no_ack"]
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
 

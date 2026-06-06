@@ -160,6 +160,7 @@ def test_run_morning_session_survives_stack_enforce_timeout(isolated_morning_dir
         "instance_id": "cafe1234",
         "tmux_pane": "%42",
         "pane_matched": True,
+        "reconciled": True,
         "waited_s": 0.0,
     }
 
@@ -215,6 +216,7 @@ def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated
         "instance_id": None,
         "tmux_pane": None,
         "pane_matched": False,
+        "reconciled": False,
         "waited_s": 90.0,
     }
     tts_messages: list[str] = []
@@ -266,3 +268,105 @@ def test_run_morning_session_no_pane_fails_gracefully(isolated_morning_dir):
         result = morning_session.run_morning_session()
 
     assert result["status"] == "no_pane"
+
+
+# ── find_live_custodes + reconcile: desynced-row upsert ───────
+
+
+def test_find_live_custodes_matches_desynced_hook_driven():
+    """A resting/desynced custodes (hook_driven, synced=0) is still THE custodes.
+
+    Injecting the morning prompt into an already-running custodes pane is the
+    expected path, so the locator must FIND that row in order to reconcile it —
+    not miss it (the old sync-only match) and declare the morning a failure.
+    """
+    instances = [
+        {
+            "id": "dead1",
+            "legion": "custodes",
+            "instance_type": "hook_driven",
+            "stopped_at": "2026-06-06T01:00:00",
+        },
+        {
+            "id": "live1",
+            "legion": "custodes",
+            "instance_type": "hook_driven",
+            "synced": 0,
+            "tmux_pane": "%9",
+            "stopped_at": None,
+        },
+    ]
+    with patch("morning_session._get", lambda path: instances):
+        inst = morning_session.find_live_custodes()
+    assert inst is not None
+    assert inst["id"] == "live1"
+
+
+def test_find_live_custodes_none_when_no_custodes_alive():
+    """No live custodes of any type → None (the one genuine launch failure)."""
+    instances = [
+        {"id": "x", "legion": "mechanicus", "instance_type": "sync", "stopped_at": None},
+        {
+            "id": "y",
+            "legion": "custodes",
+            "instance_type": "sync",
+            "stopped_at": "2026-06-06T01:00:00",
+        },
+    ]
+    with patch("morning_session._get", lambda path: instances):
+        assert morning_session.find_live_custodes() is None
+
+
+def test_reconcile_custodes_active_upserts_desynced_row():
+    """A desynced custodes (hook_driven/synced=0) is PATCHed to sync + synced=1."""
+    sent: dict = {}
+
+    def fake_patch(path, data=None):
+        sent[path] = data
+        return {"ok": True}
+
+    inst = {
+        "id": "abc123def456",
+        "legion": "custodes",
+        "instance_type": "hook_driven",
+        "synced": 0,
+    }
+    with patch("morning_session._patch", side_effect=fake_patch):
+        result = morning_session.reconcile_custodes_active(inst)
+    assert result["reconciled"] is True
+    assert sent["/api/instances/abc123def456/type"] == {"instance_type": "sync"}
+    assert sent["/api/instances/abc123def456/synced"] == {"synced": True}
+
+
+def test_reconcile_custodes_active_noop_when_already_active():
+    """Already sync+synced → idempotent no-op, zero PATCH calls."""
+    calls: list = []
+    inst = {"id": "abc", "legion": "custodes", "instance_type": "sync", "synced": 1}
+    with patch("morning_session._patch", side_effect=lambda *a, **k: calls.append(a)):
+        result = morning_session.reconcile_custodes_active(inst)
+    assert result["reconciled"] is False
+    assert result["reason"] == "already_active"
+    assert calls == []
+
+
+def test_confirm_custodes_registered_reconciles_desynced():
+    """confirm finds a desynced custodes, reconciles it, returns live + reconciled."""
+    inst = {
+        "id": "live9",
+        "legion": "custodes",
+        "instance_type": "hook_driven",
+        "synced": 0,
+        "tmux_pane": "%9",
+        "stopped_at": None,
+    }
+    with (
+        patch("morning_session._get", lambda path: [inst]),
+        patch("morning_session._patch", lambda path, data=None: {"ok": True}),
+    ):
+        result = morning_session.confirm_custodes_registered(
+            pane_id="%9", timeout_s=1, interval_s=0
+        )
+    assert result["live"] is True
+    assert result["instance_id"] == "live9"
+    assert result["pane_matched"] is True
+    assert result["reconciled"] is True

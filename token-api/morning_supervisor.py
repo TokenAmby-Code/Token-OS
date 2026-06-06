@@ -141,8 +141,22 @@ async def ack_seen_today(*, now_local: datetime | None = None, db_path=None) -> 
 
 
 async def custodes_running() -> dict | None:
-    """Return the live morning-Custodes row, or None — same signal as in-pathway."""
+    """Return the live Custodes singleton row, or None (process-liveness only)."""
     return await asyncio.to_thread(morning_session.find_live_custodes)
+
+
+async def morning_is_active(date_str: str | None = None) -> bool:
+    """Whether today's morning session is confirmed active (state-file signal).
+
+    This is the deterministic "the morning came up" signal that
+    run_morning_session writes after it confirms + reconciles a live custodes.
+    The supervisor checks THIS rather than mere custodes-process liveness:
+    custodes is a singleton and is usually alive even when no morning launched,
+    so "a custodes exists" would mask a real launch failure. "active" here means
+    a session was actually confirmed for today.
+    """
+    active, _ = await asyncio.to_thread(morning_session.morning_session_active, date_str)
+    return active
 
 
 # ── Arming ─────────────────────────────────────────────────────
@@ -249,21 +263,21 @@ async def _supervisor_poll_job(date_str: str, anchor_iso: str, deadline_iso: str
 
     ack = await ack_seen_today(now_local=now_local)
     if ack is not None:
-        cust = await custodes_running()
-        if cust is not None:
-            # Healthy: real ack + live Custodes. Self-disarm.
+        if await morning_is_active(date_str):
+            # Healthy: real ack + confirmed-active morning session. Self-disarm.
+            cust = await custodes_running()
             await log_event(
                 "morning_supervisor_ok",
                 details={
                     "date": date_str,
                     "day_started_at": ack.get("day_started_at"),
-                    "custodes_instance_id": cust.get("id"),
+                    "custodes_instance_id": cust.get("id") if cust else None,
                 },
             )
-            logger.info("Morning supervisor: ack + live custodes confirmed — disarming")
+            logger.info("Morning supervisor: ack + active morning session confirmed — disarming")
             _disarm()
             return
-        # Ack landed but no live Custodes — the reactive launch failed.
+        # Ack landed but the morning session is not active — reactive launch failed.
         await _handle_failure(
             failure_type="ack_no_custodes",
             now_local=now_local,
