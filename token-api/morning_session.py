@@ -50,6 +50,13 @@ MORNING_ACTIVE_STATUSES = ("launched", "active")
 CUSTODES_CONFIRM_TIMEOUT_S = int(os.environ.get("CUSTODES_CONFIRM_TIMEOUT_S", "90"))
 CUSTODES_CONFIRM_INTERVAL_S = float(os.environ.get("CUSTODES_CONFIRM_INTERVAL_S", "3"))
 
+# Canonical "this row is a Custodes" signal — mirrors tmuxctl's own check
+# (assertions.py: legion=custodes and instance_type in {sync, hook_driven}).
+# We accept either type on purpose: a resting/desynced custodes (hook_driven)
+# is still THE custodes the morning prompt was injected into, and the launcher
+# reconciles its row to the active-morning identity rather than failing.
+CUSTODES_INSTANCE_TYPES = ("sync", "hook_driven")
+
 
 def morning_state_dir() -> Path:
     """Directory holding per-day morning state files.
@@ -120,13 +127,19 @@ def update_morning_state(updates: dict, *, today: str | None = None) -> dict | N
 
 
 def find_live_custodes() -> dict | None:
-    """Return a live morning-Custodes instance row, or None.
+    """Return the live Custodes singleton row, or None if no custodes is alive.
 
-    The authoritative signal that a morning session is genuinely up: a row with
-    legion=custodes, instance_type=sync, and no stopped_at. Custodes is a
-    singleton (launch demotes any prior custodes) and stale rows are swept, so
-    at most one such row exists. Reads the same /api/instances surface the
-    Custodes prompt and supervisor use, so all three agree.
+    Matches the canonical custodes signal (CUSTODES_INSTANCE_TYPES): a live row
+    with legion=custodes and instance_type in {sync, hook_driven}. Custodes is a
+    singleton (launch demotes any prior custodes) and stale rows are swept, so at
+    most one such row exists. Reads the same /api/instances surface the Custodes
+    prompt and supervisor use, so all three agree.
+
+    This intentionally accepts a *desynced* custodes (hook_driven / synced=0):
+    injecting the morning prompt into an already-running custodes pane is the
+    expected path, so the launcher needs to FIND that row in order to reconcile
+    it to the active-morning identity. Returns None only when no custodes process
+    is alive at all — the one genuine launch failure.
     """
     instances = _get("/api/instances?sort=recent_activity")
     if not isinstance(instances, list):
@@ -135,11 +148,39 @@ def find_live_custodes() -> dict | None:
         if (
             isinstance(inst, dict)
             and inst.get("legion") == "custodes"
-            and inst.get("instance_type") == "sync"
+            and inst.get("instance_type") in CUSTODES_INSTANCE_TYPES
             and inst.get("stopped_at") in (None, "")
         ):
             return inst
     return None
+
+
+def reconcile_custodes_active(inst: dict) -> dict:
+    """Upsert a desynced Custodes row to the active-morning identity.
+
+    The morning prompt is often injected into an already-running custodes that
+    is still in its resting row state (instance_type=hook_driven and/or
+    synced=0). Rather than treat that as a missing session, promote the row to
+    the canonical active-morning identity (instance_type=sync, synced=1) — the
+    same identity the SessionStart hook derives for a custodes — so every
+    downstream signal (keepalive, supervisor, Discord routing) agrees a morning
+    session is live. Best-effort and idempotent: a no-op when already sync+synced,
+    and individual PATCH failures are returned, not raised.
+    """
+    instance_id = inst.get("id")
+    if not instance_id:
+        return {"reconciled": False, "reason": "no_instance_id"}
+    is_sync = inst.get("instance_type") == "sync"
+    is_synced = bool(inst.get("synced"))
+    if is_sync and is_synced:
+        return {"reconciled": False, "reason": "already_active", "instance_id": instance_id}
+    results: dict = {}
+    if not is_sync:
+        results["type"] = _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"})
+    if not is_synced:
+        results["synced"] = _patch(f"/api/instances/{instance_id}/synced", {"synced": True})
+    logger.info("Morning session: reconciled desynced custodes %s -> sync/synced", instance_id[:12])
+    return {"reconciled": True, "instance_id": instance_id, "results": results}
 
 
 def confirm_custodes_registered(
@@ -151,13 +192,15 @@ def confirm_custodes_registered(
     """Poll for the launched morning Custodes to self-register.
 
     After the prompt is injected the launcher does not know whether a live
-    legion=custodes,sync session actually came up — /api/morning/start is
-    fire-and-forget and the day-start consumer reports "started" unconditionally.
-    This closes that gap in-pathway: poll the instances table until a live sync
-    Custodes appears (success) or the budget is exhausted (failure).
+    Custodes session actually came up — /api/morning/start is fire-and-forget and
+    the day-start consumer reports "started" unconditionally. This closes that gap
+    in-pathway: poll the instances table until a live Custodes appears, then
+    reconcile its row to the active-morning identity (upsert a desynced row rather
+    than fail). Failure is reserved for the budget expiring with no custodes at
+    all.
 
     Returns {"live": bool, "instance_id": str|None, "tmux_pane": str|None,
-    "pane_matched": bool, "waited_s": float}.
+    "pane_matched": bool, "reconciled": bool, "waited_s": float}.
     """
     budget = CUSTODES_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
     interval = CUSTODES_CONFIRM_INTERVAL_S if interval_s is None else interval_s
@@ -165,12 +208,14 @@ def confirm_custodes_registered(
     while True:
         inst = find_live_custodes()
         if inst is not None:
+            recon = reconcile_custodes_active(inst)
             inst_pane = inst.get("tmux_pane")
             return {
                 "live": True,
                 "instance_id": inst.get("id"),
                 "tmux_pane": inst_pane,
                 "pane_matched": bool(pane_id) and inst_pane == pane_id,
+                "reconciled": bool(recon.get("reconciled")),
                 "waited_s": round(time.monotonic() - start, 1),
             }
         if time.monotonic() - start >= budget:
@@ -179,6 +224,7 @@ def confirm_custodes_registered(
                 "instance_id": None,
                 "tmux_pane": None,
                 "pane_matched": False,
+                "reconciled": False,
                 "waited_s": round(time.monotonic() - start, 1),
             }
         time.sleep(interval)
@@ -245,6 +291,24 @@ def _post(path: str, data: dict = None) -> dict:
         f"{BASE}{path}",
         data=body,
         headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _patch(path: str, data: dict = None) -> dict:
+    """PATCH to Token-API."""
+    import urllib.request
+
+    body = json.dumps(data or {}).encode()
+    req = urllib.request.Request(
+        f"{BASE}{path}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="PATCH",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -891,16 +955,19 @@ def run_morning_session() -> dict:
                 "confirmed_instance_id": confirmation["instance_id"],
                 "confirmed_pane": confirmation["tmux_pane"],
                 "confirm_waited_s": confirmation["waited_s"],
+                "confirm_reconciled": confirmation["reconciled"],
             }
         )
         print(
             f"Morning session active: confirmed custodes {confirmation['instance_id']} "
-            f"in pane {confirmation['tmux_pane']} after {confirmation['waited_s']}s"
+            f"in pane {confirmation['tmux_pane']} after {confirmation['waited_s']}s "
+            f"(reconciled={confirmation['reconciled']})"
         )
         return {
             "status": "active",
             "pane_id": pane_id,
             "instance_id": confirmation["instance_id"],
+            "reconciled": confirmation["reconciled"],
         }
 
     # The prompt was injected but no live sync Custodes registered within the
