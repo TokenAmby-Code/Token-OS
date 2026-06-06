@@ -78,13 +78,13 @@ Thread message:
 
 SOP payload (`/tmp/golden-throne-sop-604c7b90.md`), verbatim:
 > Golden Throne accountability check for this session doc.
->   /Volumes/Imperium/Imperium-ENV/Terra/Sessions/needs-session-name-1137.md
+> /Volumes/Imperium/Imperium-ENV/Terra/Sessions/needs-session-name-1137.md
 >
 > Unmet conditions: `extensively_validated`, `vault_searched`, `committed`, `pushed`, `pr_opened`, `coderabbit_passed`, `sanguinius_satisfied`.
 > This session is not done. Either:
->   1. Address the unmet condition and flip its frontmatter flag, or
->   2. Escalate to Emperor via /api/notify if you are blocked, or
->   3. Mark inapplicable conditions in `victory_skip` (with justification in the doc body).
+> 1. Address the unmet condition and flip its frontmatter flag, or
+> 2. Escalate to Emperor via /api/notify if you are blocked, or
+> 3. Mark inapplicable conditions in `victory_skip` (with justification in the doc body).
 >
 > Declaring victory is not an in-thread action: do not merely write 'victory' or a completion claim. Victory must be recorded through the API/session-doc state transition: POST .../api/session-docs/<doc_id>/victory-ack, or the legacy .../api/instances/<instance_id>/victory ...
 > To disable Golden Throne pings for this thread, set the instance to one_off ...
@@ -154,11 +154,11 @@ post-stop wait (e.g. waiting on an external CI/queue), which a docs run never do
 
 **Action taken (this poke) — `vault_searched` satisfied; two real staleness hits:**
 
-Reviewed the GT/harness vault corpus surfaced by `obsidian search`: `Terra/Ultramar/
-Golden Throne Protocol.md` (canonical), `Mars/Logs/2026-06-05-gt-harness-proof-spec.md`
-(this run's spec), and the titles `Golden Throne Completeness Checklist`, `Golden Throne
-- Three-Stage Evolution`, `Golden Throne Enforcement Coordinator`, `Golden Throne
-Implementation`, `Token API Golden Throne Recovery`.
+Reviewed the GT/harness vault corpus surfaced by `obsidian search`:
+
+- `Terra/Ultramar/Golden Throne Protocol.md` (canonical)
+- `Mars/Logs/2026-06-05-gt-harness-proof-spec.md` (this run's spec)
+- Surfaced titles: `Golden Throne Completeness Checklist`, `Golden Throne - Three-Stage Evolution`, `Golden Throne Enforcement Coordinator`, `Golden Throne Implementation`, `Token API Golden Throne Recovery`.
 
 - **STALENESS A — canonical doc under-reports z10 by 2×.** `Golden Throne Protocol.md`'s
   interval table lists **z10 = "2 min"**, but the live code is
@@ -259,3 +259,53 @@ which updates the PR before CodeRabbit reviews it. Recorded `pr_url` in the sess
 frontmatter and flipped `pr_opened: true`. Stopping to await the `coderabbit_passed` poke —
 the one genuinely externally-gated step (CodeRabbit must actually run and be addressed),
 so it may legitimately need more than one ~60s cycle.
+
+### GT poke #6 — accountability check, `coderabbit_passed` (round 1) (2026-06-06T~02:04Z)
+
+**1. Exact poke text (verbatim).** Thread message identical. **The SOP's unmet-list
+format changed** this round — earlier pokes rendered it inline
+(`Unmet conditions: \`a\`, \`b\`, ...`); this one renders a bulleted list:
+> Unmet conditions:
+>   - `coderabbit_passed`
+>   - `sanguinius_satisfied`
+
+(A minor instability in the accountability-prompt template — same data, different shape.
+Worth flagging: a maximally-literal subject keys off this text, so format drift is a small
+robustness risk, though here it was trivially parseable.)
+
+**2. Specific vs generic.** Specific (names both remaining flags). **This is the first
+poke whose named condition I could NOT satisfy in-cycle.** The poke says
+`coderabbit_passed` is unmet, but it carries **no information about CodeRabbit's actual
+verdict** — I had to independently query the PR (`gh pr view 88 --json reviews,...`) to
+learn *why*. GT's frontmatter-only model can flag the gap but cannot surface the external
+reviewer's content; closing the loop requires the agent to go fetch it. That's an inherent
+limit of driving an externally-gated condition off frontmatter alone.
+
+**3. Actionability — and the externally-gated reality.** CodeRabbit had reviewed and
+returned **`CHANGES_REQUESTED`** with **2 actionable nits** (all CI checks — quality,
+push-advisory, secrets-scan, CodeRabbit status — passed; only the review verdict gated):
+- **MD027** — multiple spaces after `>` in the verbatim SOP blockquote (the indented path
+  + numbered lines). Fixed: collapsed to a single space (verbatim wording preserved; only
+  the cosmetic 2-space indent dropped).
+- **MD038** — inline code spans split across source line-breaks (e.g.
+  `` `Golden Throne⏎- Three-Stage Evolution` ``) render as spans with stray spaces. Fixed:
+  reflowed the vault-corpus paragraph into a list so every code span stays intact on one
+  line.
+
+Both nits were **real and correct**; addressed them rather than dismissing. Pushed the fix
+to re-trigger CodeRabbit. **Did NOT flip `coderabbit_passed`** — honesty rule: CodeRabbit
+must re-review and clear `CHANGES_REQUESTED` first. This poke's "measurable progress" is
+*address-and-push*, not *flip*. The next `coderabbit_passed` poke is the re-check.
+
+**4. Cadence/timing at z10 — a real anomaly.** Poke #5 ≈ `23:26Z`, poke #6 ≈ `02:04Z`
+(next day) → **~2h38m**, vastly exceeding the z10 ~60s nominal. From inside the thread I
+**cannot determine the cause** — candidates: token-api (which hosts the GT timers) was
+restarted/paused during the window, or pokes were intentionally spaced to let CodeRabbit
+run, or a timer simply stalled. **UX finding:** at "z10 = tightest leash," cadence
+fidelity is only as good as the GT timer's liveness, and **the driven agent has no
+in-thread signal distinguishing "leash deliberately loosened" from "timer stalled" from
+"waiting on CI."** A long unexplained gap reads identically to all three. For a proof
+whose headline is "60s tight leash," this is the single most important cadence caveat:
+the *nominal* interval and the *observed* interval can diverge by orders of magnitude with
+no visible explanation. (The earlier pokes #1–#5 held a tight, predictable rhythm; this
+gap is the exception, and it coincides with the one externally-gated step.)
