@@ -3323,6 +3323,7 @@ async def golden_throne_user_activity(instance_id: str, source: str = "prompt_su
         scheduler.remove_job(f"golden-throne-{instance_id}")
     except Exception:
         pass
+    await _gt_clear_fire(instance_id)
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await sanctioned_update_instance(
@@ -3423,6 +3424,49 @@ def _golden_throne_rubric_state(status: RubricStatus | None) -> str:
     return "ready_for_ack"
 
 
+async def _gt_push_fire(instance_id: str, fire_at_epoch: int) -> None:
+    """Push @GT_FIRE (absolute fire epoch) to a GT instance's live pane.
+
+    The pane border renders the countdown from @GT_FIRE in-format via strftime %s
+    (current epoch) + #{e|} integer math — ceil(minutes) = (fire − now + 59) / 60 —
+    so it ticks each redraw with zero fork. Resolves the LIVE pane (same owner as
+    pane_state_worker) and fails closed; best-effort, never raises.
+    """
+    pane, _role = await shared.resolve_instance_pane(instance_id)
+    if not pane:
+        return
+    try:
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-p", "-t", pane, "@GT_FIRE", str(fire_at_epoch)),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"GT: @GT_FIRE push failed for {instance_id[:12]} ({pane}): {exc}")
+
+
+async def _gt_clear_fire(instance_id: str) -> None:
+    """Unset @GT_FIRE on a GT instance's live pane (timer disarmed / fired / reset).
+
+    Idempotent: unsetting an absent option is a no-op, and a pane that no longer
+    resolves (closed / moved) is skipped — its pane-scoped option died with it.
+    Best-effort, never raises.
+    """
+    pane, _role = await shared.resolve_instance_pane(instance_id)
+    if not pane:
+        return
+    try:
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-p", "-u", "-t", pane, "@GT_FIRE"),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"GT: @GT_FIRE clear failed for {instance_id[:12]} ({pane}): {exc}")
+
+
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
     """Arm the one-shot Golden Throne follow-up timer for an idle instance.
 
@@ -3444,6 +3488,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
+        await _gt_clear_fire(instance_id)
         return {
             "scheduled": False,
             "reason": "session_doc_acknowledged",
@@ -3455,6 +3500,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
+        await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
 
     delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, ZEALOTRY_DELAY_MAP[4])
@@ -3473,6 +3519,9 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         replace_existing=True,
         misfire_grace_time=ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS,
     )
+    # Project the fire epoch onto the pane so the border renders a zero-fork
+    # countdown (see _gt_push_fire / pane-border-format @GT_FIRE).
+    await _gt_push_fire(instance_id, int(fire_at.timestamp()))
     details = {
         "zealotry": zealotry,
         "delay_seconds": delay_seconds,
@@ -6363,6 +6412,12 @@ async def golden_throne_followup(session_id: str):
 
     instance = dict(instance)
 
+    # The one-shot timer has fired and is consumed, so the pane is no longer
+    # "armed": clear @GT_FIRE now. A reschedule below (quiet-hours / rate-limit)
+    # re-pushes a fresh epoch; a dispatch leaves it cleared until the next stop
+    # hook re-arms, and a skip leaves it cleared (correct — no countdown).
+    await _gt_clear_fire(session_id)
+
     # Skip if already processing (user beat us to it)
     # Sync instances are permanently processing — never skip them
     if instance["status"] == "processing" and instance.get("instance_type") != "sync":
@@ -6873,6 +6928,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
         logger.info(f"Nudge: cancelled golden throne timer for {instance_id[:12]}")
     except Exception:
         pass
+    await _gt_clear_fire(instance_id)
 
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
@@ -8549,6 +8605,7 @@ async def set_zealotry(instance_id: str, request: Request):
             timer_cancelled = True
         except Exception:
             pass
+        await _gt_clear_fire(instance_id)
 
     logger.info(f"Golden Throne: zealotry={zealotry} for {instance_id[:12]}")
     return {"instance_id": instance_id, "zealotry": zealotry, "timer_cancelled": timer_cancelled}
@@ -8940,6 +8997,8 @@ async def _victory_ack_core(
             timers_cancelled.append(iid)
         except Exception:
             pass
+    for iid in timers_cancelled:
+        await _gt_clear_fire(iid)
 
     victory_surface = ", ".join(instance_surfaces) or doc_title
     try:
@@ -9172,6 +9231,7 @@ async def declare_victory(instance_id: str, request: Request):
         timer_cancelled = True
     except Exception:
         pass
+    await _gt_clear_fire(instance_id)
 
     victory_surface = tab_name if _is_meaningful_tab_name(tab_name) else instance_id[:12]
     try:
@@ -9282,6 +9342,7 @@ async def set_instance_type(instance_id: str, request: Request):
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
+        await _gt_clear_fire(instance_id)
         try:
             scheduler.remove_job(f"sync-retrigger-{instance_id}")
         except Exception:
@@ -18915,6 +18976,7 @@ async def end_morning_session():
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
+        await _gt_clear_fire(instance_id)
         try:
             scheduler.remove_job(f"sync-retrigger-{instance_id}")
         except Exception:
