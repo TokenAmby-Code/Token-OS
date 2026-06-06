@@ -97,8 +97,13 @@ def test_token_api_schedules_self_restart(client, spawned):
     body = resp.json()
     assert body["ok"] is True
     assert "scheduled" in body["self_restart"]
-    # token-restart spawned detached
-    assert any(name == "self-restart" for name, _ in spawned)
+    # token-restart spawned detached, WITH --sync so the merge is ff-only pulled
+    # into the live checkout before the restart (otherwise the merge ships nothing).
+    self_restarts = [cmd for name, cmd in spawned if name == "self-restart"]
+    assert len(self_restarts) == 1
+    assert any("--sync" in part for part in self_restarts[0]), self_restarts[0]
+    # ...specifically appended to the token-restart invocation, not loose.
+    assert self_restarts[0][-1].rstrip().endswith("--sync")
 
 
 def test_discord_only_does_not_self_restart(client, spawned):
