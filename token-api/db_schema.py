@@ -1061,11 +1061,14 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 1,
             ),
             (
-                "day_start_schedule_fallback",
-                "Day Start Schedule Fallback",
-                "Fire the unified day-start hook at the default wake anchor if not already fired",
+                "morning_supervisor_arm",
+                "Morning Supervisor Arm",
+                "Bookkeeping check (the only fixed day-start cron): derive expected wake "
+                "empirically from the last same-type real ack and arm the relative "
+                "morning-session watchdog poller. The reactive day-start stays "
+                "event-driven (alarm_silenced); there is no magic-number wake cron.",
                 "cron",
-                "30 8 * * *",
+                "0 4 * * *",
                 0,
             ),
         ]
@@ -1077,6 +1080,14 @@ async def init_database_async(db_path: Path | None = None) -> None:
             """,
                 (task_id, name, description, task_type, schedule, max_retries),
             )
+
+        # Retire the legacy magic-number day-start fallback. There is no fixed
+        # wake-anchor cron anymore: the reactive day-start is event-driven
+        # (alarm_silenced), and "expected wake" lives only in the morning
+        # supervisor. Drop any pre-existing row so an older DB stops firing the
+        # phantom 08:30 morning session. History in task_executions is retained.
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'")
+        await db.execute("DELETE FROM task_locks WHERE task_id = 'day_start_schedule_fallback'")
 
         checkin_tasks = [
             (

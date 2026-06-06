@@ -78,6 +78,7 @@ from instance_mutation import (
     reconcile_instance,
     sanctioned_update_instance,
 )
+from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     DEFAULT_TAB_NAME_RX,
     PLACEHOLDER_TAB_NAME_RX,
@@ -98,7 +99,7 @@ from phone_service import (
     send_pavlok_stimulus,
 )
 from questions_gate import trials_clear
-from routes.day_start import fire_day_start_internal, sync_day_start_schedule_from_daily_note
+from routes.day_start import fire_day_start_internal
 from routes.day_start import router as day_start_router
 from routes.hooks import (
     NUDGE_COOLDOWN_SECONDS,
@@ -1120,10 +1121,10 @@ async def purge_old_events() -> dict:
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
     "purge_old_events": purge_old_events,
-    "day_start_schedule_fallback": lambda: fire_day_start_internal(
-        source="schedule_fallback",
-        details={"schedule": "wake_anchor"},
-    ),
+    # The only fixed day-start cron: 04:00 bookkeeping that derives expected wake
+    # from history and arms the relative morning watchdog. It never launches a
+    # session — that stays event-driven via /api/morning/alarm-silenced.
+    "morning_supervisor_arm": arm_morning_supervisor,
     "checkin_morning_start": lambda: trigger_checkin("morning_start"),
     "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
     "checkin_decision_point": lambda: trigger_checkin("decision_point"),
@@ -1373,15 +1374,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Startup
     await init_database_async(DB_PATH)
-    try:
-        day_start_schedule = await sync_day_start_schedule_from_daily_note()
-        print(
-            "Day-start schedule fallback synced "
-            f"to wake_anchor={day_start_schedule['wake_anchor']} "
-            f"({day_start_schedule['cron']})"
-        )
-    except Exception as exc:
-        logger.warning(f"Day-start schedule fallback sync failed: {exc}")
     await load_tasks_from_db()
     timer_load_from_db()
     load_zap_count_from_daily_note()
@@ -1447,6 +1439,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     recovered_gt = await recover_recent_stopped_golden_throne_timers()
     if recovered_gt:
         print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
+    # Re-arm the morning supervisor poller if we restarted inside today's
+    # supervision window (the relative poller lives in the in-memory jobstore
+    # and is otherwise lost across a restart; the 04:00 cron only re-arms daily).
+    try:
+        supervisor_state = await arm_morning_supervisor(recover=True)
+        print(f"Morning supervisor recovery: {supervisor_state}")
+    except Exception as exc:
+        logger.warning(f"Morning supervisor startup recovery failed: {exc}")
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
