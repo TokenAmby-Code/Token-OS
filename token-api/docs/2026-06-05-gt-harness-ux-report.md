@@ -266,8 +266,8 @@ so it may legitimately need more than one ~60s cycle.
 format changed** this round — earlier pokes rendered it inline
 (`Unmet conditions: \`a\`, \`b\`, ...`); this one renders a bulleted list:
 > Unmet conditions:
->   - `coderabbit_passed`
->   - `sanguinius_satisfied`
+> - `coderabbit_passed`
+> - `sanguinius_satisfied`
 
 (A minor instability in the accountability-prompt template — same data, different shape.
 Worth flagging: a maximally-literal subject keys off this text, so format drift is a small
@@ -309,3 +309,37 @@ whose headline is "60s tight leash," this is the single most important cadence c
 the *nominal* interval and the *observed* interval can diverge by orders of magnitude with
 no visible explanation. (The earlier pokes #1–#5 held a tight, predictable rhythm; this
 gap is the exception, and it coincides with the one externally-gated step.)
+
+### GT poke #7 — `coderabbit_passed` re-check (round 2) (2026-06-06T~03:23Z)
+
+**1. Exact poke text (verbatim).** Thread message identical; SOP unmet line **reverted to
+the inline format**: `Unmet conditions: coderabbit_passed, sanguinius_satisfied.` So the
+template oscillates (poke #5 inline → #6 bulleted → #7 inline) — confirming the format
+drift noted at poke #6 is non-deterministic, not a one-time change.
+
+**2. Specific vs generic.** Specific. This is the re-check of `coderabbit_passed`.
+
+**3. Actionability — and a sharp meta-finding (the self-describing-doc loop).**
+CodeRabbit re-reviewed my fix commit `74cacc1` and **still returned `CHANGES_REQUESTED`** —
+but for a *brand-new* nit, not the old ones. The old MD027/MD038 were resolved; the new
+MD027 was on the **poke #6 entry I had just written** — where, documenting the format
+drift, I quoted the bulleted unmet-list verbatim with multi-space `>` markers. **My
+documentation of a harness quirk introduced the very lint class I was documenting.**
+This is the key structural UX finding of the externally-gated phase: a deliverable that
+*narrates its own driving process* keeps growing with verbatim poke-quotes, and **every
+new quote is fresh review surface** — under an ASSERTIVE reviewer this risks a mild
+Sisyphus loop (each round's log entry can spawn next round's nit). Mitigations applied:
+(i) **self-lint before every push now** — grep for `^>[ ]{2,}` blockquotes and for
+odd-backtick lines (split code spans) — both clean this round; (ii) the doc nearly stops
+growing after `coderabbit_passed`, since the only remaining condition is the
+`sanguinius_satisfied` skip. Fixed the new MD027 (collapsed `>   - ` → `> - `).
+
+**4. Cadence/timing at z10.** Poke #6 ≈ `02:04Z`, poke #7 ≈ `03:23Z` → ~1h19m. Still far
+above the 60s nominal but shorter than poke #6's ~2.6h. The externally-gated phase runs at
+a slow, irregular cadence (hours, not seconds) — reinforcing the poke-#6 caveat that
+observed cadence decouples from nominal once the timer's liveness or external spacing
+dominates.
+
+**Action taken (this poke):** Fixed the new MD027; self-linted clean; committing + pushing
+to trigger CodeRabbit round 3. **Still did NOT flip `coderabbit_passed`** — not yet cleared.
+Stopping to await the next re-check poke.
