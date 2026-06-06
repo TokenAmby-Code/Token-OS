@@ -476,3 +476,91 @@ async def test_remote_fire_resolves_via_satellite_not_stored_column(gt_env, monk
     assert rec.posts[0]["json"].get("tmux_pane") == "%88"
     # A real remote delivery counts a resume.
     assert rec.resumes, "a delivered remote fire must count a resume"
+
+
+# --- CodeRabbit-aware poke rendering ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coderabbit_finding_poke_names_body_and_location_not_bare_key(gt_env, monkeypatch):
+    """An unmet coderabbit_<id> condition renders the comment's file location and
+    body excerpt — not just the bare numeric rubric key."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+    fm = (
+        "victory:\n"
+        "  a: true\n"
+        "  coderabbit_555: false\n"
+        "coderabbit_review_state: complete\n"
+        "coderabbit_comments:\n"
+        "  - id: 555\n"
+        "    key: coderabbit_555\n"
+        "    category: actionable\n"
+        "    path: token-api/main.py\n"
+        "    line: 42\n"
+        '    body: "Potential issue: this dereferences foo before the null guard"\n'
+        "    addressed: false\n"
+    )
+    doc = _write_doc(gt_env.docs_dir, fm)
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+
+    await main.golden_throne_followup(iid)
+
+    prompt = rec.posts[0]["json"]["prompt"]
+    assert "token-api/main.py:42" in prompt
+    assert "dereferences foo before the null guard" in prompt
+    assert "CodeRabbit" in prompt
+
+
+@pytest.mark.asyncio
+async def test_coderabbit_pending_review_is_benign_hold_not_sisyphus(gt_env, monkeypatch):
+    """When the sole unmet condition is coderabbit_passed and the bot is still
+    reviewing, the poke is a benign HOLD — never a Sisyphus accusation."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+    fm = "victory:\n  a: true\n  coderabbit_passed: false\ncoderabbit_review_state: pending\n"
+    doc = _write_doc(gt_env.docs_dir, fm)
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+
+    await main.golden_throne_followup(iid)
+
+    prompt = rec.posts[0]["json"]["prompt"]
+    assert "HOLD" in prompt
+    assert "Sit tight" in prompt
+    # No accountability / Sisyphus accusation language.
+    assert "This session is not done" not in prompt
+    assert "Silently rolling over is not an option" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_coderabbit_tts_and_banner_do_not_speak_numeric_ids(gt_env, monkeypatch):
+    """TTS/banner humanize a coderabbit_<id> key into a phrase; the numeric id is
+    never spoken."""
+    main = gt_env.main
+    # Direct unit assertions on the humanizer.
+    assert main._humanize_condition_key("coderabbit_777") == "a CodeRabbit finding"
+    assert main._humanize_condition_key(main.CODERABBIT_NITPICK_KEY) == "CodeRabbit nitpicks"
+    assert main._humanize_condition_key(main.CODERABBIT_PASSED_KEY) == "CodeRabbit review"
+
+    rec = _Recorder(main, monkeypatch)
+    fm = (
+        "victory:\n"
+        "  coderabbit_777: false\n"
+        "coderabbit_review_state: complete\n"
+        "coderabbit_comments:\n"
+        "  - id: 777\n"
+        "    key: coderabbit_777\n"
+        "    category: actionable\n"
+        "    path: a.py\n"
+        "    line: 9\n"
+        '    body: "Potential issue"\n'
+        "    addressed: false\n"
+    )
+    doc = _write_doc(gt_env.docs_dir, fm)
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+
+    await main.golden_throne_followup(iid)
+
+    msg = rec.notifies[0]["message"]
+    assert "a CodeRabbit finding" in msg
+    assert "coderabbit_777" not in msg  # raw key never spoken
