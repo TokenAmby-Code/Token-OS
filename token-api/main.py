@@ -14940,6 +14940,11 @@ async def cd_restart(request: Request):
     # Schedule the (deferred, detached) self-restart AFTER acking. The child sleeps
     # so this 200 fully flushes before launchd kicks us. save_restart_state() here
     # guards against kickstart -k not allowing a graceful lifespan shutdown.
+    # --sync makes token-restart ff-only pull the live checkout to origin/main
+    # BEFORE restarting, so the merge that triggered this webhook actually ships
+    # new code (the restart alone would re-launch whatever was already checked
+    # out). The sync is ff-only + stash-guarded and degrades to a plain restart
+    # on any trouble — see sync_live_checkout() in cli-tools/bin/token-restart.
     self_restart = "not requested"
     if needs_self_restart:
         if _cd_self_restart_scheduled:
@@ -14952,7 +14957,7 @@ async def cd_restart(request: Request):
                 logger.warning("CD: save_restart_state failed (continuing): %s", e)
             token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
             _cd_spawn_detached(
-                ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)}"],
+                ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
                 log_name="self-restart",
             )
             self_restart = "scheduled (detached, ~2s)"

@@ -11,10 +11,15 @@
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
+#   token-restart --sync       # CD only: ff-only pull the live checkout, then restart
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
 # After healthy restart, reloads any open /ui/ops browser tabs on Mac.
-# NAS era: no git sync needed — all devices read from /Volumes/Imperium/Token-OS.
+# Git sync: a bare `token-restart` does NOT pull (the live NAS checkout
+# /Volumes/Imperium/Token-OS is restarted as-is — no surprise pulls for humans).
+# The CD webhook passes --sync, which fast-forwards that checkout to origin/main
+# BEFORE restarting so a merge-to-main actually ships new code. See
+# sync_live_checkout() for the ff-only, stash-guarded, abort-on-conflict path.
 
 set -euo pipefail
 
@@ -62,6 +67,7 @@ Usage:
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
+    token-restart --sync       CD only: ff-only pull live checkout, then restart
     token-restart -h, --help   Show this help
 
     When run from a non-Mac device, proxies to Mac via SSH.
@@ -73,7 +79,8 @@ Flow:
     4. Health-check all, print summary
 
 Notes:
-    - All devices read from NAS (/Volumes/Imperium/Token-OS) — no sync needed
+    - Default: the live NAS checkout (/Volumes/Imperium/Token-OS) is restarted
+      as-is — no git pull. --sync (CD only) ff-only pulls it to origin/main first.
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
@@ -96,6 +103,7 @@ remote_restart() {
     local flags=""
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
     [[ "${ACTION}" == "discord" ]] && flags="$flags --discord"
+    [[ "${SYNC_BEFORE_RESTART}" == true ]] && flags="$flags --sync"
 
     if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
@@ -201,6 +209,135 @@ sync_venv_if_needed() {
             echo -e "  ${YELLOW}⚠${NC} Venv sync failed (continuing with existing venv)"
         fi
     fi
+}
+
+# ============ CD code-sync (opt-in via --sync) ============
+#
+# CD path ONLY: before restarting, fast-forward the LIVE serving checkout to
+# origin/main so a merge-to-main actually ships new code (the restart alone runs
+# whatever is already checked out). A bare `token-restart` never calls this — no
+# surprise pulls for humans.
+#
+# SAFETY (load-bearing — losing WIP or breaking the live tree is worse than not
+# shipping):
+#   - Fast-forward ONLY. We never `reset --hard` to force the sync forward and we
+#     never force. If origin/main is not a fast-forward of HEAD, we abort.
+#   - Stash-guard tracked WIP first; reapply it after the ff. We only ever touch
+#     the stash THIS run pushed, matched back by its commit SHA — a pre-existing
+#     unrelated stash (e.g. an old hydra-merge-wave stash) is never popped.
+#   - On ANY trouble (resolve/fetch failure, not-a-ff, stash push/pop conflict)
+#     we abort the sync cleanly, restore WIP, leave the tree clean, and restart
+#     on the current code (degrade to the no-sync behavior).
+
+resolve_live_checkout() {
+    # The git toplevel of the launchd-served WorkingDirectory (don't hardcode).
+    local workdir="" toplevel=""
+    if [[ -f "$PLIST" ]]; then
+        workdir="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$PLIST" 2>/dev/null || true)"
+    fi
+    [[ -z "$workdir" || ! -d "$workdir" ]] && workdir="${TOKEN_OS:-}"
+    [[ -z "$workdir" || ! -d "$workdir" ]] && return 1
+    toplevel="$(git -C "$workdir" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -z "$toplevel" ]] && return 1
+    printf '%s\n' "$toplevel"
+}
+
+_cd_sync_stash_ref_for() {
+    # Echo the stash@{N} selector whose commit SHA == $2 (in repo $1), else fail.
+    # Lets us pop ONLY the stash we pushed, never an unrelated pre-existing one.
+    local dir="$1" want="$2" sel sha
+    [[ -z "$want" ]] && return 1
+    while read -r sel sha; do
+        [[ "$sha" == "$want" ]] && { printf '%s\n' "$sel"; return 0; }
+    done < <(git -C "$dir" stash list --format='%gd %H' 2>/dev/null)
+    return 1
+}
+
+_cd_sync_pop_mine() {
+    # Pop the stash we pushed (repo $1, stash commit-sha $2), matched by SHA.
+    # Returns 0 on a clean pop; non-zero on conflict/failure (stash left intact).
+    local dir="$1" mysha="$2" ref
+    ref="$(_cd_sync_stash_ref_for "$dir" "$mysha")" || return 1
+    git -C "$dir" stash pop "$ref" >/dev/null 2>&1
+}
+
+sync_live_checkout() {
+    local dir
+    dir="$(resolve_live_checkout)" || {
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: could not resolve live checkout — restarting on current code"
+        return 0
+    }
+    echo -e "${BLUE}→${NC} CD-sync: fast-forwarding ${dir} → origin/main..."
+
+    if ! git -C "$dir" fetch origin main >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: 'git fetch origin main' failed — restarting on current code"
+        return 0
+    fi
+
+    # Use FETCH_HEAD (exactly what we just fetched) — robust even if the
+    # remote-tracking origin/main ref lags behind the fetch.
+    local old_head target
+    old_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+    target="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || true)"
+    if [[ -z "$old_head" || -z "$target" ]]; then
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: could not resolve HEAD/FETCH_HEAD — restarting on current code"
+        return 0
+    fi
+    if [[ "$old_head" == "$target" ]]; then
+        echo -e "  ${GREEN}✓${NC} CD-sync: already at origin/main (${old_head:0:9}) — no sync needed"
+        return 0
+    fi
+
+    # Stash-guard tracked WIP (only if dirty). Untracked files are left in place;
+    # if one would collide, the ff-merge aborts cleanly and we degrade below.
+    local my_stash=""
+    if ! git -C "$dir" diff --quiet 2>/dev/null || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+        if git -C "$dir" stash push -m "cd-sync auto-stash ${old_head}" >/dev/null 2>&1; then
+            my_stash="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+            echo -e "  ${BLUE}→${NC} CD-sync: stashed local WIP (${my_stash:0:9})"
+        else
+            echo -e "  ${YELLOW}⚠${NC} CD-sync: 'git stash push' failed — restarting on current code"
+            return 0
+        fi
+    fi
+
+    # Fast-forward ONLY. Never reset --hard, never force.
+    if ! git -C "$dir" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: NOT a fast-forward (or merge refused) — ABORTING sync"
+        # HEAD is untouched; just restore our WIP, then restart on current code.
+        if [[ -n "$my_stash" ]]; then
+            _cd_sync_pop_mine "$dir" "$my_stash" \
+                || echo -e "  ${RED}✗${NC} CD-sync: WIP preserved in stash (${my_stash:0:9}); manual 'git stash pop' needed"
+        fi
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: restarting on current code (${old_head:0:9})"
+        return 0
+    fi
+
+    local new_head
+    new_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+    echo -e "  ${GREEN}✓${NC} CD-sync: fast-forwarded ${old_head:0:9} → ${new_head:0:9}"
+
+    # Reapply WIP on top of the new HEAD.
+    if [[ -n "$my_stash" ]]; then
+        if _cd_sync_pop_mine "$dir" "$my_stash"; then
+            echo -e "  ${GREEN}✓${NC} CD-sync: restored local WIP"
+        else
+            # Pop conflicted against the new code. Roll the working tree back to
+            # the captured pre-sync commit (where the WIP cleanly belongs) and
+            # reapply it, so we never ship a half-merged tree or strand WIP. This
+            # reset is to a known-good pre-sync SHA (NOT a forced sync to
+            # origin/main) and is immediately followed by restoring the WIP.
+            echo -e "  ${RED}✗${NC} CD-sync: WIP did not reapply on new HEAD — rolling the sync back"
+            git -C "$dir" reset --hard "$old_head" >/dev/null 2>&1 || true
+            if _cd_sync_pop_mine "$dir" "$my_stash"; then
+                echo -e "  ${YELLOW}⚠${NC} CD-sync: rolled back to ${old_head:0:9}, WIP restored — restarting on current code"
+            else
+                git -C "$dir" reset --hard "$old_head" >/dev/null 2>&1 || true
+                echo -e "  ${RED}✗${NC} CD-sync: rolled back to ${old_head:0:9}; WIP preserved in stash (${my_stash:0:9}) — manual 'git stash pop' needed"
+            fi
+        fi
+    fi
+    return 0
 }
 
 restart_mac() {
@@ -505,6 +642,13 @@ full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
+    # 0. CD code-sync (opt-in via --sync): ff-only pull the live checkout so a
+    #    merge actually ships before we restart. Always degrades gracefully.
+    if [[ "$SYNC_BEFORE_RESTART" == true ]]; then
+        sync_live_checkout || true
+        echo ""
+    fi
+
     # 1. Mac restart
     restart_mac || true
     echo ""
@@ -548,12 +692,19 @@ full_restart() {
 
 ACTION="restart"
 DEPLOY_FROM=""
+SYNC_BEFORE_RESTART=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             show_help
             exit 0
+            ;;
+        --sync)
+            # CD only: ff-only pull the live checkout before restarting. A
+            # modifier, not an action — composes with the default full restart.
+            SYNC_BEFORE_RESTART=true
+            shift
             ;;
         --kill)
             ACTION="kill"
