@@ -501,3 +501,28 @@ flowchart LR
 ```
 
 <!-- SANG-DIAGRAMS:END -->
+
+## Run summary
+
+The Golden Throne drove this instance through the super-workflow one rubric condition per
+poke, exactly as designed, with specific and actionable accusations every time. The
+mechanical steps (skip, vault review, commit, push, PR) each resolved in a single poke.
+Two things needed more than the harness alone:
+
+- **The externally-gated step.** CodeRabbit took five rounds to approve — but each review
+  was fast (~4–5 min); the long waits were GT-poke latency, and after round 3 the GT
+  cadence stalled entirely (>12h), so a human had to step in for the run to finish. The
+  headline caveat stands: at "z10 = tightest leash," the observed cadence was orders of
+  magnitude looser than nominal, and a stalled leash is indistinguishable from a loose one
+  from inside the thread.
+- **A mis-specified condition.** `sanguinius_satisfied` was charter-modeled as a skippable
+  prose gate; the operator corrected it to "produce a diagram set." The intended
+  secondary-instance path didn't execute (infra not built), so the parent produced the
+  diagrams directly.
+
+Final rubric state: `session_doc_up_to_date`, `vault_searched`, `committed`, `pushed`,
+`pr_opened`, `sanguinius_satisfied`, `commentary_resolved`, and `coderabbit_passed` all
+satisfied; `extensively_validated` skipped with justification. Verdict: **GT can drive a
+maximally-obedient instance off frontmatter-specific pokes for self-contained steps; the
+weak points are timer/poke-latency liveness and any step the rubric mis-specifies or that
+depends on an external reviewer.**
