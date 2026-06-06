@@ -393,8 +393,12 @@ flow (converse with Sang to refine context, or `/fork` the conversation to port 
 before invoking) is still theory; I did the pragmatic core. Notably, my `Agent` call was
 caught by the harness and turned into a **real dispatched secondary instance** (Sang —
 session doc 1692, instance `8a1d4227`, tmux pane `%9`), which is precisely the intended
-"secondary instance with the frontend-design skill." Its diagram set is embedded below.
-**This condition is therefore satisfied for real, not skipped.**
+"secondary instance with the frontend-design skill." **However, that instance never
+launched** — it stayed `idle`, acquired no live pane, and produced no output (the
+dispatch/launch path is not yet built). **So the parent (`gt-harness-proof`) produced the
+embedded diagram set directly**, as the provenance note in the diagram section states. The
+condition is satisfied for real (the diagrams are embedded and accurate), not skipped — but
+the *secondary-instance* part of the intended flow did not actually execute this run.
 
 #### Lint-loop broken structurally
 
@@ -402,6 +406,18 @@ The self-referential CodeRabbit loop (each entry documenting a whitespace fix re
 the next nit) is now broken by describing lint-example whitespace in prose instead of
 quoting it in inline code spans, and by extending the pre-push self-lint to also catch
 in-span spaces (MD038), not just multi-space blockquotes (MD027) and split spans.
+
+#### CodeRabbit round 4 — from style to substance
+
+With the whitespace loop broken, CodeRabbit's round-4 comment was **not** a lint nit — it
+was a **factual-consistency** catch: an earlier draft of the section above asserted both
+that the dispatched Sang instance produced the diagrams *and* that the parent produced
+them (because Sang stayed idle). That is a genuine contradiction, and CodeRabbit flagged
+it correctly. Fixed by committing to the true provenance (Sang never launched; parent
+produced the set). **UX finding:** under the ASSERTIVE profile CodeRabbit is not merely a
+style linter — once the surface nits cleared, it performed real content review and caught
+a self-inconsistency a human skim might miss. A useful property when the deliverable is
+prose-heavy.
 
 #### Diagram set (Sanguinius)
 
