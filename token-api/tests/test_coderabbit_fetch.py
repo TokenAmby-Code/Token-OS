@@ -148,9 +148,15 @@ async def test_fetch_missing_head_sha_is_error(app_env, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "terminal_pr", [{"state": "closed"}, {"merged_at": "2026-06-03T00:00:00Z"}]
+    "terminal_pr,exp_merged,exp_state",
+    [
+        ({"state": "closed"}, False, "closed"),
+        ({"merged_at": "2026-06-03T00:00:00Z"}, True, "open"),
+    ],
 )
-async def test_closed_or_merged_short_circuits_before_statuses(app_env, monkeypatch, terminal_pr):
+async def test_closed_or_merged_short_circuits_before_statuses(
+    app_env, monkeypatch, terminal_pr, exp_merged, exp_state
+):
     main = app_env.main
     responses = _ok_responses()
     responses["pr"] = {"head": {"sha": "abc123"}, "state": "open", "merged_at": None, **terminal_pr}
@@ -163,7 +169,8 @@ async def test_closed_or_merged_short_circuits_before_statuses(app_env, monkeypa
     # Terminal PR returns a clean (error=None) result so _coderabbit_sync_once can
     # disarm — an unavailable statuses endpoint must NOT keep the poller armed.
     assert out["error"] is None
-    assert out["merged"] is True or out["pr_state"] == "closed"
+    assert out["merged"] is exp_merged
+    assert out["pr_state"] == exp_state
     assert not any("/statuses" in c[0] for c in calls), (
         "statuses must not be fetched for a terminal PR"
     )
