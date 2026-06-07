@@ -147,6 +147,28 @@ async def test_fetch_missing_head_sha_is_error(app_env, monkeypatch):
 # --- review_terminal only from a fully-fetched status list -------------------
 
 
+@pytest.mark.parametrize(
+    "terminal_pr", [{"state": "closed"}, {"merged_at": "2026-06-03T00:00:00Z"}]
+)
+async def test_closed_or_merged_short_circuits_before_statuses(app_env, monkeypatch, terminal_pr):
+    main = app_env.main
+    responses = _ok_responses()
+    responses["pr"] = {"head": {"sha": "abc123"}, "state": "open", "merged_at": None, **terminal_pr}
+    responses["statuses"] = None  # would error — but must never be reached for a terminal PR
+    calls: list = []
+    monkeypatch.setattr(main, "_gh_api_json", _gh_router(responses, calls))
+
+    out = await main._fetch_coderabbit_comments("o/r", "5")
+
+    # Terminal PR returns a clean (error=None) result so _coderabbit_sync_once can
+    # disarm — an unavailable statuses endpoint must NOT keep the poller armed.
+    assert out["error"] is None
+    assert out["merged"] is True or out["pr_state"] == "closed"
+    assert not any("/statuses" in c[0] for c in calls), (
+        "statuses must not be fetched for a terminal PR"
+    )
+
+
 async def test_review_terminal_false_when_status_pending(app_env, monkeypatch):
     main = app_env.main
     responses = _ok_responses()

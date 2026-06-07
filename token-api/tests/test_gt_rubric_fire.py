@@ -506,10 +506,13 @@ async def test_coderabbit_finding_poke_names_body_and_location_not_bare_key(gt_e
 
     await main.golden_throne_followup(iid)
 
+    assert len(rec.posts) == 1
     prompt = rec.posts[0]["json"]["prompt"]
     assert "token-api/main.py:42" in prompt
     assert "dereferences foo before the null guard" in prompt
     assert "CodeRabbit" in prompt
+    # The bare numeric rubric key is never surfaced in the accountability prompt.
+    assert "coderabbit_555" not in prompt
 
 
 @pytest.mark.asyncio
@@ -524,6 +527,7 @@ async def test_coderabbit_pending_review_is_benign_hold_not_sisyphus(gt_env, mon
 
     await main.golden_throne_followup(iid)
 
+    assert len(rec.posts) == 1
     prompt = rec.posts[0]["json"]["prompt"]
     assert "HOLD" in prompt
     assert "Sit tight" in prompt
@@ -561,6 +565,7 @@ async def test_coderabbit_tts_and_banner_do_not_speak_numeric_ids(gt_env, monkey
 
     await main.golden_throne_followup(iid)
 
+    assert len(rec.notifies) >= 1
     msg = rec.notifies[0]["message"]
     assert "a CodeRabbit finding" in msg
     assert "coderabbit_777" not in msg  # raw key never spoken

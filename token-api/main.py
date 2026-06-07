@@ -3586,6 +3586,17 @@ async def _fetch_coderabbit_comments(repo: str, pr_number: str) -> dict:
     pr_state = pr_obj.get("state")
     pr_created_at = pr_obj.get("created_at")
     merged = bool(pr_obj.get("merged_at"))
+    if merged or pr_state == "closed":
+        # Terminal PR: the poller is about to disarm on merged/closed. Return now
+        # (error=None) so an unavailable statuses endpoint can't keep it armed.
+        return {
+            "comments": [],
+            "review_terminal": False,
+            "pr_state": pr_state,
+            "merged": merged,
+            "pr_created_at": pr_created_at,
+            "error": None,
+        }
 
     # Commit statuses (fully paginated) drive review terminality. A failed/partial
     # statuses fetch must NOT silently read as "not terminal" — skip the round.
@@ -6489,8 +6500,8 @@ def _render_missing_condition(key: str, fm: dict) -> str:
         if entry:
             loc = _coderabbit_loc(entry)
             loc_str = f" at {loc}" if loc else ""
-            return f"`{key}` — CodeRabbit{loc_str}: {_coderabbit_excerpt(entry.get('body', ''))}"
-        return f"`{key}` — CodeRabbit finding (detail unavailable; see the PR)"
+            return f"CodeRabbit finding{loc_str}: {_coderabbit_excerpt(entry.get('body', ''))}"
+        return "CodeRabbit finding (detail unavailable; see the PR)"
     return f"`{key}`"
 
 
