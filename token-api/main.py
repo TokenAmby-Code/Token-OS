@@ -1861,7 +1861,7 @@ async def stop_instance(instance_id: str):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0), tmux_pane FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1870,7 +1870,13 @@ async def stop_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         is_subagent = row[2]
-        stopped_tmux_pane = row[3]
+
+        # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
+        # the tint-clear below — never the stored tmux_pane column. resolve-instance
+        # only returns a pane that still carries THIS instance's @INSTANCE_ID stamp,
+        # so a truthy result is unambiguously ours to vacate; a dead, reused, or
+        # taken-over pane resolves to None and we leave the tint to its current owner.
+        stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
 
         await sanctioned_update_instance(
             db,
@@ -1896,20 +1902,10 @@ async def stop_instance(instance_id: str):
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
 
-        # Has another live instance already taken over this pane? If so, leave its
-        # tint alone — only clear when the vacated pane is genuinely unowned.
-        pane_still_owned = False
-        if stopped_tmux_pane:
-            cursor = await db.execute(
-                "SELECT 1 FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' AND id != ? LIMIT 1",
-                (stopped_tmux_pane, instance_id),
-            )
-            pane_still_owned = (await cursor.fetchone()) is not None
-
     # Event-driven tint: the persona vacated this pane — clear its legion tint
     # back to default. No queue, no poll.
-    if stopped_tmux_pane and not pane_still_owned:
-        await asyncio.to_thread(shared.clear_pane_tint, stopped_tmux_pane, source="stop-instance")
+    if stopped_pane:
+        await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
 
     # Log event
     await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
@@ -2727,17 +2723,22 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         raise HTTPException(status_code=400, detail="tmux_pane is required")
     tab_name = _validate_instance_name_slug(request.tab_name)
 
+    # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp rather
+    # than querying the stored tmux_pane column. The CLI passes the agent's own live
+    # $TMUX_PANE, so the stamp is authoritative and current.
+    pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+    if not pane_instance_id:
+        raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tab_name, tmux_pane
+            """SELECT id, tab_name
                FROM claude_instances
-               WHERE tmux_pane = ?
+               WHERE id = ?
                  AND COALESCE(status, '') != 'stopped'
-               ORDER BY datetime(COALESCE(last_activity, registered_at, '1970-01-01')) DESC,
-                        registered_at DESC
                LIMIT 1""",
-            (tmux_pane,),
+            (pane_instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -4093,14 +4094,17 @@ async def _flag_hook_driven(
                 if row:
                     target_id = row["id"]
             if target_id is None and (tmux_pane or "").strip():
-                cur = await db.execute(
-                    "SELECT id FROM claude_instances WHERE tmux_pane = ? "
-                    "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
-                    (tmux_pane,),
-                )
-                row = await cur.fetchone()
-                if row:
-                    target_id = row["id"]
+                # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID
+                # stamp, then confirm the row by id (never query the stored column).
+                pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+                if pane_instance_id:
+                    cur = await db.execute(
+                        "SELECT id FROM claude_instances WHERE id = ? AND status != 'stopped'",
+                        (pane_instance_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        target_id = row["id"]
             if target_id is None:
                 # Target row not registered yet — nothing to flag (rare race).
                 return
@@ -9800,6 +9804,11 @@ async def pane_session_doc(tmux_pane: str):
     Returns {vault, file_path (vault-relative), absolute_path, title, doc_id,
     instance_id}. 404 if no instance for the pane, or no linked session doc.
     """
+    # tmuxctl owns pane -> instance: resolve the pane's live @INSTANCE_ID stamp,
+    # then look up the row by id (no stored tmux_pane query).
+    instance_id = await shared.instance_id_for_pane(tmux_pane)
+    if not instance_id:
+        raise HTTPException(404, f"No instance for pane {tmux_pane}")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -9807,10 +9816,10 @@ async def pane_session_doc(tmux_pane: str):
                       sd.title, sd.project
                FROM claude_instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.tmux_pane = ?
-               ORDER BY ci.last_activity DESC
+               WHERE ci.id = ?
+                 AND COALESCE(ci.status, '') != 'stopped'
                LIMIT 1""",
-            (tmux_pane,),
+            (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -9832,16 +9841,20 @@ async def pane_session_doc(tmux_pane: str):
 
 @app.get("/api/panes/{tmux_pane}/instance")
 async def pane_instance(tmux_pane: str):
-    """Resolve the most recent active instance bound to a tmux pane."""
+    """Resolve the active instance bound to a tmux pane."""
+    # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp, then
+    # look up the row by id (no stored tmux_pane query).
+    instance_id = await shared.instance_id_for_pane(tmux_pane)
+    if not instance_id:
+        raise HTTPException(404, f"No active instance for pane {tmux_pane}")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT *
                FROM claude_instances
-               WHERE tmux_pane = ? AND status != 'stopped'
-               ORDER BY last_activity DESC
+               WHERE id = ? AND status != 'stopped'
                LIMIT 1""",
-            (tmux_pane,),
+            (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -10096,12 +10109,16 @@ async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
     if not (caller_pane or "").strip():
         return False
     try:
+        # tmuxctl owns pane -> instance: identify the sender via the pane's live
+        # @INSTANCE_ID stamp, then read its legion by id (no stored tmux_pane query).
+        caller_instance_id = await shared.instance_id_for_pane(caller_pane)
+        if not caller_instance_id:
+            return False
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT legion FROM claude_instances WHERE tmux_pane = ? "
-                "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
-                (caller_pane,),
+                "SELECT legion FROM claude_instances WHERE id = ? AND status != 'stopped'",
+                (caller_instance_id,),
             )
             row = await cur.fetchone()
     except Exception:
@@ -19581,20 +19598,11 @@ async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str 
     """
     tmux_pane = await _find_custodes_tmux_pane()
     if tmux_pane:
-        instance_id = None
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    """SELECT id FROM claude_instances
-                       WHERE tmux_pane = ? AND stopped_at IS NULL
-                       ORDER BY last_activity DESC LIMIT 1""",
-                    (tmux_pane,),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    instance_id = row[0]
-        except Exception:
-            pass
+        # The pane is already identified from the marker; the DB is consulted only
+        # to supply an instance_id for better agent-cmd routing. tmuxctl owns
+        # pane -> instance, so read the pane's live @INSTANCE_ID stamp directly
+        # rather than querying the stored tmux_pane column.
+        instance_id = await shared.instance_id_for_pane(tmux_pane)
         return await _agent_cmd_inject("custodes", instance_id, tmux_pane, formatted, channel_name)
 
     # No live legion:custodes pane → assert (upsert-or-launch) then send. Voice/mention

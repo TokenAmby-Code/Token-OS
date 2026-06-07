@@ -243,6 +243,11 @@ def test_custodes_injection_resolves_via_pane_marker_not_synced(app_env, monkeyp
     async def fake_assert(*a, **k):
         raise AssertionError("assert-instance must not be used when a marked pane is alive")
 
+    # tmuxctl owns pane -> instance: the instance_id for the already-identified pane
+    # now comes from the pane's live @INSTANCE_ID stamp, not a stored tmux_pane query.
+    async def fake_stamp(pane):
+        return "cust-stale" if pane == "%42" else None
+
     captured = {}
 
     async def fake_agent_cmd(legion, instance_id, tmux_pane, formatted, channel_name):
@@ -253,12 +258,13 @@ def test_custodes_injection_resolves_via_pane_marker_not_synced(app_env, monkeyp
 
     monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find)
     monkeypatch.setattr(main, "_assert_and_send_custodes", fake_assert)
+    monkeypatch.setattr(main.shared, "instance_id_for_pane", fake_stamp)
     monkeypatch.setattr(main, "_agent_cmd_inject", fake_agent_cmd)
 
     ok = asyncio.run(main._try_discord_injection("custodes", _msg()))
     assert ok is True
     assert captured["tmux_pane"] == "%42"
-    # DB row supplied the instance_id for the already-identified pane.
+    # The pane's @INSTANCE_ID stamp supplied the instance_id for the marked pane.
     assert captured["instance_id"] == "cust-stale"
     assert captured["legion"] == "custodes"
 

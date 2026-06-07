@@ -632,6 +632,34 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
     return (pane_id, role)
 
 
+async def instance_id_for_pane(pane: str | None) -> str | None:
+    """Reverse of :func:`resolve_instance_pane`: read a pane's live ``@INSTANCE_ID``
+    stamp (``pane -> instance_id``).
+
+    tmuxctl and the agent wrapper own the stamp — set at register, cleared on agent
+    death — so the pane itself is the authoritative reverse bridge. token-api keeps
+    no tmux-pane perspective; this is the only reverse lookup, replacing every
+    ``WHERE tmux_pane = ?`` query against ``claude_instances``. Fails closed: any
+    miss, error, or unstamped/dead pane returns ``None`` so callers never act on a
+    stale or reused pane.
+    """
+    if not (pane or "").strip():
+        return None
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "show-options", "-pv", "-t", pane, "@INSTANCE_ID"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.decode(errors="ignore").strip() if proc.stdout else ""
+    return value or None
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
