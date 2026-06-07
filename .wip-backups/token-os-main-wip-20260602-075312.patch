@@ -1,0 +1,1552 @@
+diff --git a/cli-tools/bin/tmux-context b/cli-tools/bin/tmux-context
+index e6e7605..2321112 100644
+--- a/cli-tools/bin/tmux-context
++++ b/cli-tools/bin/tmux-context
+@@ -6,7 +6,7 @@
+ 1. Displays context % in Claude Code's status line
+ 2. Sets @CONTEXT_INFO pane option for tmux pane border display
+ 3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
+-4. Nudges agent to plan mode at 180k token threshold (non-blocking)
++4. Nudges agent to plan mode at 250k token threshold (non-blocking)
+ 5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
+ 
+ Enriches display with Token-API instance data (voice, session doc).
+@@ -31,7 +31,7 @@ import urllib.request
+ 
+ # --- Config ---
+ STATE_DIR = "/tmp/claude-panes"
+-FLUSH_TOKEN_THRESHOLD = 180_000  # used context tokens — nudge agent to plan mode for refocus
++FLUSH_TOKEN_THRESHOLD = 250_000  # used context tokens — nudge agent to plan mode for refocus
+ FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
+ MODE_ENFORCE_COOLDOWN = 8  # seconds — don't re-check mode within 8s of last correction
+ API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+@@ -287,7 +287,7 @@ def check_pre_compact(pane_id, pct, total_tokens):
+ 
+     # Non-blocking nudge: tell agent to wrap up then enter plan mode.
+     # Plan-gatekeeper hook will catch ExitPlanMode and force session doc update.
+-    msg = "Context threshold reached (180k). Pause your current task and update your session document comprehensively — include completed work, assumptions made, unvalidated code, design decisions, and remaining tasks. Then end your inference with an explicit recommendation: switch to plan mode OR run /compact to refocus."
++    msg = "Context threshold reached (250k). Pause your current task and update your session document comprehensively — include completed work, assumptions made, unvalidated code, design decisions, and remaining tasks. Then end your inference with an explicit recommendation: switch to plan mode OR run /compact to refocus."
+     agent_cmd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-cmd")
+     subprocess.Popen([agent_cmd, "--pane", pane_id, msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+diff --git a/cli-tools/lib/tmuxctl/send_gate.py b/cli-tools/lib/tmuxctl/send_gate.py
+index 2eb8b43..1c298ed 100644
+--- a/cli-tools/lib/tmuxctl/send_gate.py
++++ b/cli-tools/lib/tmuxctl/send_gate.py
+@@ -41,7 +41,7 @@ import sqlite3
+ import subprocess
+ import sys
+ import time
+-from datetime import UTC, datetime, tzinfo
++from datetime import UTC, datetime, timedelta, tzinfo
+ from pathlib import Path
+ from zoneinfo import ZoneInfo
+ 
+@@ -60,6 +60,18 @@ _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
+ # bin/tmux-typing-guard-status' TMUX_TYPING_GUARD_WINDOW.
+ _DEFAULT_TYPING_GUARD_WINDOW = 10
+ 
++# Automated-activation marker TTL (seconds). Every send through
++# TmuxAdapter.run() is automated by construction (see module docstring), so the
++# gate stamps the target pane with a marker that compute_work_state uses to
++# discount the woken agent's reflex activity from productivity. 90s covers the
++# PromptSubmit + PostToolUse reflex burst (debounced ~2s) yet stays under the
++# 3-min work_activity_cutoff, so a pane still producing activity past the window
++# re-anchors WORKING — the marker never *permanently* suppresses. The
++# permanent-vs-reflex distinction (carving legitimate automated work back in) is
++# deliberately deferred to a later pass.
++_DEFAULT_AUTOMATED_ACTIVITY_TTL = 90
++_AUTOMATED_ACTIVITY_TTL_ENV = "TMUXCTL_AUTOMATED_ACTIVITY_TTL"
++
+ # Quiet-hours configuration. Same env contract as token-api/shared.py so there
+ # is a single configuration source (the environment), not a duplicated literal.
+ _QUIET_START_ENV = "TOKEN_API_QUIET_START_HOUR"
+@@ -371,6 +383,69 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
+         logger.debug("send_gate event log dropped (%s): %s", event_type, exc)
+ 
+ 
++def automated_activity_ttl() -> int:
++    """TTL (seconds) for an automated-activation marker. Env-overridable; floored at 1."""
++    try:
++        ttl = int(
++            os.environ.get(_AUTOMATED_ACTIVITY_TTL_ENV, str(_DEFAULT_AUTOMATED_ACTIVITY_TTL))
++        )
++    except (TypeError, ValueError):
++        ttl = _DEFAULT_AUTOMATED_ACTIVITY_TTL
++    return max(1, ttl)
++
++
++def register_automated_send(
++    args: tuple[str, ...] | list[str],
++    *,
++    db_path: Path | None = None,
++    source: str | None = None,
++) -> None:
++    """Stamp the send's target pane with an automated-activation marker.
++
++    Every send through ``TmuxAdapter.run()`` is automated by construction (see the
++    module docstring): humans type directly into tmux, never through ``run()``. The
++    marker lets ``compute_work_state`` discount the woken agent's reflex activity
++    (instance ``last_activity`` bump + ``work_action``) from productivity accounting,
++    so an automated state-hook / dispatch / enforcement wake does not anchor WORKING
++    and the idle clock can mature.
++
++    Fires only for mutating send verbs with a resolved ``-t`` target (by the time
++    ``run()`` calls this the target is the canonical ``%pane_id``). Best-effort and
++    fail-open — never raises into the send path. Timestamps are naive-local to match
++    ``claude_instances.last_activity`` (the convention compute_work_state compares
++    against); the upsert slides the window forward across a multi-send reflex burst.
++    """
++    args = tuple(args)
++    if not is_send_verb(args):
++        return
++    target = _extract_target(args)
++    if not target:
++        return
++    now = datetime.now()
++    injected_at = now.isoformat()
++    expires_at = (now + timedelta(seconds=automated_activity_ttl())).isoformat()
++    path = db_path or _db_path()
++    try:
++        with sqlite3.connect(path, timeout=2.0) as conn:
++            conn.execute("PRAGMA busy_timeout=2000")
++            conn.execute(
++                """
++                INSERT INTO automated_pane_activity
++                    (tmux_pane, injected_at, expires_at, source, verb)
++                VALUES (?, ?, ?, ?, ?)
++                ON CONFLICT(tmux_pane) DO UPDATE SET
++                    injected_at = excluded.injected_at,
++                    expires_at  = excluded.expires_at,
++                    source      = excluded.source,
++                    verb        = excluded.verb
++                """,
++                (target, injected_at, expires_at, source or "tmuxctl", args[0]),
++            )
++            conn.commit()
++    except Exception as exc:  # fail-open: a marker write must never break the send.
++        logger.debug("send_gate automated-activity marker dropped for %s: %s", target, exc)
++
++
+ def _cli(argv: list[str]) -> int:
+     """CLI for the shell readers (bin/tmux shim, tmux-guard.sh, status segment).
+ 
+diff --git a/cli-tools/lib/tmuxctl/tmux_adapter.py b/cli-tools/lib/tmuxctl/tmux_adapter.py
+index 190920c..85b516d 100644
+--- a/cli-tools/lib/tmuxctl/tmux_adapter.py
++++ b/cli-tools/lib/tmuxctl/tmux_adapter.py
+@@ -5,6 +5,7 @@ import os
+ import re
+ import shutil
+ import subprocess
++import sys
+ import time
+ from pathlib import Path
+ 
+@@ -243,6 +244,13 @@ class TmuxAdapter:
+         log_blocked(self, target=target, command=command, surface="tmux-adapter", argv=args)
+         return True
+ 
++    def _send_gate_source(self) -> str:
++        """Diagnostic provenance tag for the automated-activity marker (argv0 basename)."""
++        try:
++            return os.path.basename(sys.argv[0]) or "tmuxctl"
++        except Exception:
++            return "tmuxctl"
++
+     def run(self, *args: str, allow_failure: bool = False) -> str:
+         # Universal send gate — the inescapable pane-write sentinel. Every send
+         # to a pane that originates in Python (token-api interventions, the
+@@ -263,6 +271,13 @@ class TmuxAdapter:
+         resolved_args = self._resolve_tmux_args(args_tuple)
+         if self._mechanicus_focus_guard_blocks(resolved_args):
+             return ""
++        # Every send through run() is automated by construction (see this method's
++        # docstring): stamp the target pane so compute_work_state discounts the
++        # woken agent's reflex activity from productivity. Resolved args carry the
++        # canonical %pane_id; recorded only after suppression/focus-guard returns
++        # (a blocked send writes nothing to the pane) and before the keys land, so
++        # the marker is committed before the agent's hooks can fire. Never raises.
++        send_gate.register_automated_send(resolved_args, source=self._send_gate_source())
+         proc = subprocess.run(
+             [self.tmux_binary, *resolved_args],
+             text=True,
+diff --git a/discord-daemon/daemon.js b/discord-daemon/daemon.js
+index fdf8a9b..96c91ca 100644
+--- a/discord-daemon/daemon.js
++++ b/discord-daemon/daemon.js
+@@ -12,6 +12,7 @@ import { join, dirname } from 'path';
+ import { fileURLToPath } from 'url';
+ import { SlashCommandBuilder, Events } from 'discord.js';
+ import { execFile, execFileSync } from 'child_process';
++import { isBenignFixerError } from './fixer-classify.js';
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url));
+ const BASE_DIR = join(__dirname, '..');
+@@ -145,6 +146,14 @@ function createDiscordFixerHook() {
+ 
+   return async function hookDiscordError(line, msg, meta = {}, logFile) {
+     const errorCode = classifyErrorCode(msg, meta);
++    if (isBenignFixerError(errorCode, msg)) {
++      // Defense-in-depth: a benign Realtime lifecycle event (e.g. the 60-min
++      // session cap) must never page the fixer even if logged at error from
++      // another path. Drop it before any dedup bookkeeping or target resolution.
++      const debugLine = `${new Date().toISOString()} [DEBUG] Discord fixer hook suppressed benign event (${errorCode}): ${msg}`;
++      try { appendFileSync(logFile, debugLine + '\n'); } catch {}
++      return;
++    }
+     const key = `${errorCode}:${String(msg).slice(0, 180)}`;
+     const now = Date.now();
+     for (const [k, ts] of recent) {
+diff --git a/discord-daemon/fixer-classify.js b/discord-daemon/fixer-classify.js
+new file mode 100644
+index 0000000..c9fd041
+--- /dev/null
++++ b/discord-daemon/fixer-classify.js
+@@ -0,0 +1,16 @@
++// fixer-classify.js — shared, pure predicate for the Discord voice fixer router.
++// Distinguishes benign Realtime lifecycle events from genuine errors so a normal
++// 60-minute session expiry never escalates to ERROR-level logging or pages the fixer.
++
++// Returns true for benign Realtime lifecycle events that must NOT page the fixer.
++// The match is deliberately narrow — only the known 60-minute session cap signal.
++/**
++ * @param {string} errorCode
++ * @param {string} msg
++ * @returns {boolean}
++ */
++export function isBenignFixerError(errorCode, msg) {
++  if (errorCode === 'session_expired') return true;
++  const text = String(msg || '').toLowerCase();
++  return text.includes('maximum duration of 60 minutes');
++}
+diff --git a/discord-daemon/fixer-classify.test.js b/discord-daemon/fixer-classify.test.js
+new file mode 100644
+index 0000000..51aa9df
+--- /dev/null
++++ b/discord-daemon/fixer-classify.test.js
+@@ -0,0 +1,35 @@
++// fixer-classify.test.js — pins the benign-Realtime-lifecycle predicate contract.
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++
++import { isBenignFixerError } from './fixer-classify.js';
++
++test('session_expired error code is benign regardless of message', () => {
++  assert.equal(isBenignFixerError('session_expired', 'anything'), true);
++});
++
++test('60-min max-duration message is benign even without the dedicated code', () => {
++  assert.equal(
++    isBenignFixerError('realtime_error', 'Your session hit the maximum duration of 60 minutes'),
++    true
++  );
++});
++
++test('genuine websocket error still pages the fixer', () => {
++  assert.equal(isBenignFixerError('realtime_websocket_error', 'websocket closed'), false);
++});
++
++test('"maximum duration" without the 60-min phrase is NOT suppressed (narrow match)', () => {
++  assert.equal(
++    isBenignFixerError('realtime_error', 'exceeded maximum duration for audio buffer'),
++    false
++  );
++});
++
++test('buffer-commit error still pages the fixer', () => {
++  assert.equal(isBenignFixerError('realtime_input_audio_buffer_commit', 'buffer too small'), false);
++});
++
++test('empty/undefined inputs are not benign', () => {
++  assert.equal(isBenignFixerError(undefined, ''), false);
++});
+diff --git a/discord-daemon/package.json b/discord-daemon/package.json
+index 4c6331b..3135664 100644
+--- a/discord-daemon/package.json
++++ b/discord-daemon/package.json
+@@ -5,7 +5,8 @@
+   "main": "daemon.js",
+   "type": "module",
+   "scripts": {
+-    "start": "node daemon.js"
++    "start": "node daemon.js",
++    "test": "node --test"
+   },
+   "dependencies": {
+     "@discordjs/opus": "^0.10.0",
+diff --git a/discord-daemon/realtime-transcriber.js b/discord-daemon/realtime-transcriber.js
+index 26277a7..db0defd 100644
+--- a/discord-daemon/realtime-transcriber.js
++++ b/discord-daemon/realtime-transcriber.js
+@@ -2,6 +2,7 @@
+ // Streams Discord PCM frames into a persistent Realtime transcription session.
+ 
+ import WebSocket from 'ws';
++import { isBenignFixerError } from './fixer-classify.js';
+ 
+ const DEFAULT_REALTIME_MODEL = 'gpt-realtime';
+ const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+@@ -96,6 +97,16 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
+       if (event.type === 'error') {
+         const message = event.error?.message || JSON.stringify(event.error || event);
+         const errorCode = event.error?.code || event.error?.type || 'realtime_error';
++        if (isBenignFixerError(errorCode, message)) {
++          // The platform's 60-minute Realtime cap is a normal lifecycle event:
++          // cleanupSession deletes the session and the next audio frame recreates
++          // a fresh one. Logging this at info (not error) keeps it from paging the
++          // fixer for a self-healing event.
++          logger.info(
++            `Realtime [${botName}]: session expired (60-min max) for user ${userId}; reconnecting on next audio`
++          );
++          return;
++        }
+         logger.error(`Realtime [${botName}]: ${message}`, {
+           errorCode,
+           provider: 'openai-realtime',
+diff --git a/token-api/db_schema.py b/token-api/db_schema.py
+index 2ddebd0..1ec1e7c 100644
+--- a/token-api/db_schema.py
++++ b/token-api/db_schema.py
+@@ -372,6 +372,30 @@ async def init_database_async(db_path: Path | None = None) -> None:
+             ON pane_write_queue(instance_id, source, status)
+         """)
+ 
++        # Automated-activation markers. Every send through TmuxAdapter.run() is
++        # automated by construction (token-api interventions / tmuxctl CLI /
++        # enforcement / recovery — humans type directly into tmux, never through
++        # run()). The send gate records a per-pane marker so compute_work_state
++        # can discount the woken agent's reflex activity (instance last_activity
++        # bump + work_action) from productivity accounting; otherwise an automated
++        # state-hook/dispatch/enforcement wake re-anchors WORKING and the idle
++        # clock never matures. PRIMARY KEY on tmux_pane ⇒ last-writer-wins upsert
++        # slides the window forward across a multi-send reflex burst and bounds
++        # the table by live pane count.
++        await db.execute("""
++            CREATE TABLE IF NOT EXISTS automated_pane_activity (
++                tmux_pane   TEXT PRIMARY KEY,
++                injected_at TIMESTAMP NOT NULL,
++                expires_at  TIMESTAMP NOT NULL,
++                source      TEXT,
++                verb        TEXT
++            )
++        """)
++        await db.execute("""
++            CREATE INDEX IF NOT EXISTS idx_automated_pane_activity_expires
++            ON automated_pane_activity(expires_at)
++        """)
++
+         await db.execute("""
+             CREATE TABLE IF NOT EXISTS pending_polls (
+                 poll_id TEXT NOT NULL,
+diff --git a/token-api/main.py b/token-api/main.py
+index 3000787..3c7d61a 100644
+--- a/token-api/main.py
++++ b/token-api/main.py
+@@ -4613,6 +4613,12 @@ async def compute_work_state() -> WorkStateResponse:
+     # productivity layer should drop to IDLE; TimerEngine then gives IDLE 7
+     # more minutes before auto-break. Total grace from last work action: 10 min.
+     work_activity_cutoff = now - timedelta(minutes=3)
++    # Human override for the automated-activation discount: a recent human
++    # keystroke (the same #{client_activity} predicate the send gate uses)
++    # disables the discount this tick, so genuine typing always anchors WORKING.
++    # Client-wide (not per-pane) by design — fail-toward-anchoring; carving it to
++    # per-pane is deferred. Sampled once: the discount is applied uniformly below.
++    human_typing = _typing_guard_active()
+     active_instances: list[AgentRuntime] = []
+     processing_recent_count = 0
+     tracked_panes: set[str] = set()
+@@ -4647,6 +4653,32 @@ async def compute_work_state() -> WorkStateResponse:
+             for r in await pane_activity_cursor.fetchall()
+             if r["last_activity"]
+         }
++        # Automated-activation markers: panes woken by an automated tmuxctl
++        # injection (state-hook fanout / dispatch / enforcement) still inside the
++        # TTL window. Their reflex activity (instance last_activity bump +
++        # work_action) is discounted from productivity below so the mechanicus
++        # pane's reflex wake does not anchor WORKING. injected_at is naive-local
++        # (matches claude_instances.last_activity); a pane's activity is only
++        # discounted when it post-dates the injection (>= injected_at guard).
++        marker_cursor = await db.execute(
++            """
++            SELECT tmux_pane, injected_at
++            FROM automated_pane_activity
++            WHERE datetime(expires_at) >= datetime(?)
++            """,
++            (now.isoformat(),),
++        )
++        automated_panes: dict[str, datetime] = {}
++        for marker_row in await marker_cursor.fetchall():
++            try:
++                automated_panes[marker_row["tmux_pane"]] = datetime.fromisoformat(
++                    marker_row["injected_at"]
++                )
++            except Exception:
++                continue
++
++        # Widen to LIMIT 5 (was 1) so an interleaved human work_action still
++        # anchors even when the most-recent row is a discounted automated wake.
+         recent_work_action_cursor = await db.execute(
+             """
+             SELECT
+@@ -4657,16 +4689,61 @@ async def compute_work_state() -> WorkStateResponse:
+             WHERE event_type = 'work_action'
+               AND datetime(created_at) >= datetime('now', '-3 minutes')
+             ORDER BY created_at DESC
+-            LIMIT 1
++            LIMIT 5
+             """
+         )
+-        recent_work_action = await recent_work_action_cursor.fetchone()
++        work_action_rows = await recent_work_action_cursor.fetchall()
++
++        # Keep the most-recent NON-discounted work_action. An automated injection
++        # wakes the agent → its PromptSubmit fires a prompt_submit work_action
++        # (note=session_id=…); if that pane has a live marker and no human is
++        # typing, the action is attributable to the injection and skipped. A
++        # tmux-typing-guard source is human input and is never discounted.
++        recent_work_action = None
++        for wa_row in work_action_rows:
++            try:
++                wa_details = json.loads(wa_row["details"] or "{}")
++            except Exception:
++                wa_details = {}
++            wa_source = wa_details.get("source")
++            wa_note = wa_details.get("note") or ""
++            discounted = False
++            if (
++                automated_panes
++                and not human_typing
++                and wa_source != "tmux-typing-guard"
++                and wa_note.startswith("session_id=")
++            ):
++                wa_sid = wa_note[len("session_id=") :].strip()
++                if wa_sid:
++                    wa_pane_cursor = await db.execute(
++                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
++                        (wa_sid,),
++                    )
++                    wa_pane_row = await wa_pane_cursor.fetchone()
++                    wa_pane = wa_pane_row["tmux_pane"] if wa_pane_row else None
++                    marker_injected = automated_panes.get(wa_pane) if wa_pane else None
++                    if marker_injected is not None:
++                        # Discount only activity at/after the injection. Compare
++                        # elapsed age (tz-independent): events.created_at is UTC
++                        # while injected_at is local, but both ages derive from
++                        # ~the same instant. age <= injected_age ⟺ created_at >=
++                        # injected_at.
++                        injected_age = (now - marker_injected).total_seconds()
++                        wa_age = wa_row["age_seconds"]
++                        if wa_age is not None and wa_age <= injected_age:
++                            discounted = True
++            if not discounted:
++                recent_work_action = wa_row
++                break
+ 
+     for row in rows:
+         last_activity = row["last_activity"]
+         is_recent = False
++        last_activity_dt: datetime | None = None
+         try:
+-            is_recent = datetime.fromisoformat(last_activity) >= work_activity_cutoff
++            last_activity_dt = datetime.fromisoformat(last_activity)
++            is_recent = last_activity_dt >= work_activity_cutoff
+         except Exception:
+             pass
+         live_pane = None
+@@ -4701,6 +4778,19 @@ async def compute_work_state() -> WorkStateResponse:
+             continue
+         if live_pane is False:
+             continue
++        # Discount an automated-injection reflex wake: this pane has a live
++        # marker, no human is typing, and its last_activity post-dates the
++        # injection — so the bump is attributable to the automated send, not
++        # work. The >= injected_at guard preserves a pane already working before
++        # the injection.
++        marker_injected = automated_panes.get(canonical_tmux_pane) if canonical_tmux_pane else None
++        if (
++            marker_injected is not None
++            and not human_typing
++            and last_activity_dt is not None
++            and last_activity_dt >= marker_injected
++        ):
++            continue
+         if canonical_tmux_pane:
+             tracked_panes.add(canonical_tmux_pane)
+         active_instances.append(
+@@ -4735,10 +4825,21 @@ async def compute_work_state() -> WorkStateResponse:
+         if not pane_last_activity_str:
+             continue
+         try:
+-            if datetime.fromisoformat(pane_last_activity_str) < work_activity_cutoff:
+-                continue
++            pane_last_activity_dt = datetime.fromisoformat(pane_last_activity_str)
+         except Exception:
+             continue
++        if pane_last_activity_dt < work_activity_cutoff:
++            continue
++        # Same automated-injection discount as the instance loop — the observed
++        # and instance paths read the same underlying last_activity, so guarding
++        # only one would leak the reflex wake through the other.
++        marker_injected = automated_panes.get(pane)
++        if (
++            marker_injected is not None
++            and not human_typing
++            and pane_last_activity_dt >= marker_injected
++        ):
++            continue
+         observed_agents.append(
+             AgentRuntime(
+                 id=None,
+@@ -15079,6 +15180,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int =
+         reason = str(gap.get("reason") or "unknown")
+         gap_count_by_reason[reason] = gap_count_by_reason.get(reason, 0) + 1
+ 
++    # A bulk collapse means the detector flagged a wall of anomalies at once —
++    # treated as a systemic false-detection (reverse signal), not real timer
++    # violations. Surface it as "suspect" so the UI doesn't cry "247 anomalies".
++    bulk_record = (
++        anomalies[0]
++        if anomalies and anomalies[0].get("reason") == "bulk_anomaly_suspected"
++        else None
++    )
++
+     return {
+         "generated_at": now.isoformat(),
+         "window_seconds": window_seconds,
+@@ -15090,10 +15200,15 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int =
+         "gaps": gaps,
+         "anomalies": anomalies,
+         "anomaly_summary": {
+-            "count": len(anomalies),
++            # When bulk-suspected, do not count the suppressed wall as real
++            # anomalies — the count is the reverse signal, exposed separately.
++            "count": 0 if bulk_record else len(anomalies),
+             "gap_count": len(gaps),
+             "gap_count_by_reason": gap_count_by_reason,
+-            "latest": anomalies[-1] if anomalies else None,
++            "latest": None if bulk_record else (anomalies[-1] if anomalies else None),
++            "bulk_suspected": bool(bulk_record),
++            "suppressed_count": bulk_record.get("suppressed_count") if bulk_record else 0,
++            "dominant_reason": bulk_record.get("dominant_reason") if bulk_record else None,
+         },
+         "source": "timer_samples+timer_shifts+live_timer_engine",
+     }
+@@ -17327,275 +17442,6 @@ async def phone_heartbeat_worker():
+ 
+ # [MOVED to shared.py / routes/tts.py] — was: def _is_quiet_hours() -> bool:
+ 
+-# ── Morning Enforce ─────────────────────────────────────────
+-# In-memory state for the current day's morning session enforce loop.
+-# Resets each time a new morning session fires.
+-MORNING_ENFORCE_STATE: dict = {
+-    "status": "idle",  # idle | pending | acknowledged | overridden | blocked
+-    "session_type": None,
+-    "fired_at": None,
+-    "acknowledged_at": None,
+-    "override_reason": None,
+-    "escalation_level": 0,  # 0 = none, 1 = TTS repeat, 2 = Discord DM, 3 = blocked
+-}
+-
+-
+-def _register_morning_expected_response(session_type: str = "morning_session") -> None:
+-    """Register an expected response and schedule escalation checks at +5/+10/+15 min."""
+-    MORNING_ENFORCE_STATE.update(
+-        {
+-            "status": "pending",
+-            "session_type": session_type,
+-            "fired_at": datetime.utcnow().isoformat(),
+-            "acknowledged_at": None,
+-            "override_reason": None,
+-            "escalation_level": 0,
+-        }
+-    )
+-
+-    base = datetime.now()
+-    for level, offset_min in [(1, 5), (2, 10), (3, 15)]:
+-        fire_at = base + timedelta(minutes=offset_min)
+-        job_id = f"morning-enforce-l{level}"
+-        try:
+-            scheduler.remove_job(job_id)
+-        except Exception:
+-            pass
+-        scheduler.add_job(
+-            _morning_escalate,
+-            DateTrigger(run_date=fire_at),
+-            args=[level],
+-            id=job_id,
+-            replace_existing=True,
+-            name=f"Morning Enforce L{level}",
+-            misfire_grace_time=120,
+-        )
+-
+-    # Schedule instance health check at +90s — detects 401, crash, dead pane
+-    health_fire_at = base + timedelta(seconds=90)
+-    health_job_id = "morning-health-check"
+-    try:
+-        scheduler.remove_job(health_job_id)
+-    except Exception:
+-        pass
+-    scheduler.add_job(
+-        _morning_health_check,
+-        DateTrigger(run_date=health_fire_at),
+-        id=health_job_id,
+-        replace_existing=True,
+-        name="Morning Health Check",
+-        misfire_grace_time=120,
+-    )
+-    logger.info(
+-        f"Morning enforce registered: {session_type}, escalations at +5/+10/+15 min, health check at +90s"
+-    )
+-
+-
+-@app.post("/api/morning/enforce-register")
+-async def register_morning_enforce():
+-    """Register the morning escalation chain independently of /api/morning/start.
+-
+-    Used by morning_launcher.py which handles session spawning itself but still
+-    needs the enforce escalation pathway (Discord DMs at +5/+10/+15 min).
+-    """
+-    _register_morning_expected_response("morning_session")
+-    await log_event("morning_enforce_registered", device_id="cron")
+-    return {
+-        "status": "registered",
+-        "escalations": [
+-            "+90s health-check",
+-            "+5min phone+TTS",
+-            "+10min phone+beep+Discord",
+-            "+15min zap+blocked+Discord",
+-        ],
+-    }
+-
+-
+-def _cancel_morning_escalations() -> None:
+-    """Cancel all pending escalation jobs and health check (called on acknowledge/override)."""
+-    for job_id in [
+-        "morning-enforce-l1",
+-        "morning-enforce-l2",
+-        "morning-enforce-l3",
+-        "morning-health-check",
+-    ]:
+-        try:
+-            scheduler.remove_job(job_id)
+-        except Exception:
+-            pass
+-
+-
+-def _morning_health_check() -> None:
+-    """APScheduler callback at +90s: verify the morning Claude instance is alive.
+-
+-    Checks if the instance acknowledged (meaning it booted, authenticated, and
+-    ran its first tool). If not, captures the tmux pane to detect 401/crash,
+-    sends TTS alert, and dispatches a self-heal investigation agent.
+-    """
+-    state = MORNING_ENFORCE_STATE
+-    if state["status"] not in ("pending",):
+-        logger.info(f"Morning health check: status={state['status']}, no action needed")
+-        return
+-
+-    # Check if acknowledged_at was set by Emperor-origin Discord/API acknowledgement.
+-    if state.get("acknowledged_at"):
+-        logger.info("Morning health check: already acknowledged, healthy")
+-        return
+-
+-    # Not acknowledged after 90s — check the pane for signs of life
+-    logger.warning("Morning health check: no acknowledgement after 90s, inspecting pane")
+-
+-    pane_id = None
+-    error_signature = None
+-    pane_output = ""
+-
+-    # Read pane_id from state file
+-    try:
+-        today = datetime.now().strftime("%Y-%m-%d")
+-        state_file = Path("/tmp/custodes_morning_sessions") / f"morning_{today}.json"
+-        if state_file.exists():
+-            state_data = json.loads(state_file.read_text())
+-            pane_id = state_data.get("pane_id")
+-    except Exception as e:
+-        logger.warning(f"Morning health check: could not read state file: {e}")
+-
+-    # Capture pane output to detect failure signatures
+-    if pane_id:
+-        try:
+-            result = subprocess.run(
+-                ["tmux", "capture-pane", "-t", pane_id, "-p"],
+-                capture_output=True,
+-                text=True,
+-                timeout=5,
+-            )
+-            pane_output = result.stdout
+-        except Exception as e:
+-            logger.warning(f"Morning health check: pane capture failed: {e}")
+-            pane_output = f"[pane capture error: {e}]"
+-
+-    # Detect known failure signatures
+-    failure_signatures = [
+-        "401",
+-        "/login",
+-        "authentication_error",
+-        "Invalid authentication",
+-        "ECONNREFUSED",
+-    ]
+-    for sig in failure_signatures:
+-        if sig.lower() in pane_output.lower():
+-            error_signature = sig
+-            break
+-
+-    if not error_signature and pane_output.strip():
+-        # Pane has output but no error signature — might just be slow, give benefit of doubt
+-        # Check if there's any sign of Claude running (prompt indicators)
+-        if any(
+-            indicator in pane_output for indicator in ["❯", "⎿", "Claude", "bypass permissions"]
+-        ):
+-            logger.info(
+-                "Morning health check: Claude appears running but hasn't acknowledged yet — deferring to enforce chain"
+-            )
+-            return
+-
+-    # ── Failure confirmed — alert and self-heal ──
+-    failure_reason = error_signature or "no response and no Claude activity detected"
+-    logger.error(f"Morning health check FAILED: {failure_reason}")
+-
+-    # 1. TTS alert
+-    speak_checkin_tts("Morning session launch failed. Dispatching investigation.")
+-
+-    # 2. Log event
+-    try:
+-        loop = asyncio.get_event_loop()
+-        if loop.is_running():
+-            asyncio.run_coroutine_threadsafe(
+-                log_event(
+-                    "morning_health_check_failed",
+-                    details={
+-                        "reason": failure_reason,
+-                        "pane_id": pane_id,
+-                        "pane_snippet": pane_output[-500:] if pane_output else None,
+-                    },
+-                ),
+-                loop,
+-            ).result(timeout=5)
+-    except Exception as e:
+-        logger.warning(f"Morning health check: event log failed: {e}")
+-
+-    # 3. Dispatch self-heal investigation agent
+-    try:
+-        diag_prompt = (
+-            f"Morning session health check failed at +90s. Failure reason: {failure_reason}. "
+-            f"Pane {pane_id or 'unknown'} output snippet: {pane_output[-300:] if pane_output else 'empty'}. "
+-            "Investigate the root cause (auth expiry, CLI crash, network issue, etc.), "
+-            "attempt to fix it if possible (e.g. kill dead pane, re-auth), "
+-            "and report findings to Discord #briefing channel. "
+-            "If the fix requires user interaction (like /login), send TTS instructions."
+-        )
+-        subprocess.Popen(
+-            [
+-                "claude",
+-                "--print",
+-                "--output-format",
+-                "text",
+-                "--model",
+-                "sonnet",
+-                "--allowedTools",
+-                "Bash,Read,Grep,Glob,Write",
+-                "-p",
+-                diag_prompt,
+-            ],
+-            cwd="/Volumes/Imperium/Imperium-ENV",
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.PIPE,
+-        )
+-        logger.info("Morning health check: self-heal agent dispatched")
+-    except Exception as e:
+-        logger.error(f"Morning health check: self-heal dispatch failed: {e}")
+-        # Last resort: just TTS what went wrong
+-        speak_checkin_tts(
+-            f"Morning session failed: {failure_reason}. Could not dispatch self-heal agent."
+-        )
+-
+-
+-def _morning_escalate(level: int) -> None:
+-    """APScheduler callback: fire morning enforce escalation at the given level.
+-
+-    Runs in APScheduler thread — bridges to async enforce via event loop.
+-    L1 is a pure notification; L2/L3 fire atomic shock+TTS at rising intensity.
+-    """
+-    state = MORNING_ENFORCE_STATE
+-    if state["status"] != "pending":
+-        logger.info(f"Morning escalation L{level} skipped: status={state['status']}")
+-        return
+-
+-    state["escalation_level"] = level
+-    logger.warning(f"Morning enforce escalation L{level} fired")
+-
+-    if level == 1:
+-        _notify_sync(NotifyRequest(message="Morning session pending.", type="tts"))
+-    elif level == 2:
+-        _enforce_sync(
+-            EnforceRequest(
+-                message="Morning Session unacknowledged",
+-                intensity=25,
+-                source="morning",
+-            )
+-        )
+-    elif level == 3:
+-        state["status"] = "blocked"
+-        logger.warning("Morning enforce L3: morning_blocked — Custodes will not proceed")
+-        _enforce_sync(
+-            EnforceRequest(
+-                message=(
+-                    "Morning Session BLOCKED (15 min elapsed). "
+-                    "Custodes will not proceed until you respond."
+-                ),
+-                intensity=50,
+-                source="morning",
+-            )
+-        )
+-
+ 
+ # ── Atomic Enforce (stateless emitter) ────────────────────
+ # Every /api/enforce call fires Pavlok (>=25 intensity) AND a notification.
+@@ -17909,7 +17755,6 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
+     # Fallback: no live Custodes — spawn fresh via existing synchronous path
+     # without blocking the event loop.
+     asyncio.create_task(asyncio.to_thread(run_morning_session))
+-    _register_morning_expected_response("morning_session")
+     await log_event(
+         "custodes_morning_brief_dispatched",
+         details={"mode": "spawn", "target_pane": None, "instance_id": None, "date": today},
+@@ -17941,16 +17786,13 @@ async def start_morning_session():
+     # Fire and forget — the synchronous launcher runs in a worker thread.
+     asyncio.create_task(asyncio.to_thread(run_morning_session))
+ 
+-    # Register enforce expected response — escalation chain fires if unanswered
+-    _register_morning_expected_response("morning_session")
+-
+     await log_event("morning_session_start", device_id="phone", details={"date": today})
+     return {"status": "started", "date": today}
+ 
+ 
+ @app.get("/api/morning/status")
+ async def get_morning_session_status():
+-    """Check current morning session state, including enforce escalation status."""
++    """Check current morning session state."""
+     today = datetime.now().strftime("%Y-%m-%d")
+     state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
+     session_state: dict = {}
+@@ -17961,77 +17803,64 @@ async def get_morning_session_status():
+     else:
+         session_state = {"status": "not_started", "date": today}
+ 
+-    # Merge enforce state
+-    session_state["enforce"] = {
+-        "status": MORNING_ENFORCE_STATE["status"],
+-        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+-        "fired_at": MORNING_ENFORCE_STATE["fired_at"],
+-        "acknowledged_at": MORNING_ENFORCE_STATE["acknowledged_at"],
+-        "override_reason": MORNING_ENFORCE_STATE["override_reason"],
+-        "morning_blocked": MORNING_ENFORCE_STATE["status"] == "blocked",
+-    }
+     return session_state
+ 
+ 
+-@app.post("/api/morning/acknowledge")
+-async def acknowledge_morning_session():
+-    """Acknowledge the morning session — clears pending enforce state and cancels escalations."""
+-    state = MORNING_ENFORCE_STATE
+-    if state["status"] not in ("pending", "blocked"):
+-        return {
+-            "status": "noop",
+-            "reason": f"enforce state is '{state['status']}', nothing to acknowledge",
+-        }
+-
+-    _cancel_morning_escalations()
+-    state["acknowledged_at"] = datetime.utcnow().isoformat()
+-    state["status"] = "acknowledged"
+-    logger.info("Morning session acknowledged — enforce escalations cancelled")
++@app.post("/api/morning/end")
++async def end_morning_session():
++    """Officially end the morning session.
+ 
+-    await log_event(
+-        "morning_acknowledged",
+-        details={
+-            "escalation_level": state["escalation_level"],
+-            "fired_at": state["fired_at"],
+-        },
+-    )
+-    return {
+-        "status": "acknowledged",
+-        "escalation_level": state["escalation_level"],
+-        "fired_at": state["fired_at"],
+-        "acknowledged_at": state["acknowledged_at"],
+-    }
+-
+-
+-class MorningOverrideRequest(BaseModel):
+-    reason: str
++    Flips the live Custodes instance off `sync` (→ one_off) via the sanctioned
++    write path so the self-continuing Stop loop in routes/hooks.py terminates: the
++    next Stop is then a normal clean stop instead of re-injecting a keepalive.
++    No live Custodes → nothing to end.
++    """
++    async with aiosqlite.connect(DB_PATH) as db:
++        db.row_factory = aiosqlite.Row
++        cursor = await db.execute(
++            """SELECT id, instance_type
++               FROM claude_instances
++               WHERE legion = 'custodes'
++                 AND status IN ('idle', 'processing')
++                 AND stopped_at IS NULL
++               ORDER BY last_activity DESC
++               LIMIT 1"""
++        )
++        row = await cursor.fetchone()
++        if not row:
++            return {"status": "no_active_custodes"}
+ 
++        instance_id = row["id"]
++        old_type = row["instance_type"] or "one_off"
+ 
+-@app.post("/api/morning/override")
+-async def override_morning_session(request: MorningOverrideRequest):
+-    """Override the morning session enforce — requires a reason. Unblocks Custodes."""
+-    if not request.reason or not request.reason.strip():
+-        raise HTTPException(status_code=400, detail="reason is required for override")
++        await sanctioned_update_instance(
++            db,
++            instance_id=instance_id,
++            updates={"instance_type": "one_off"},
++            mutation_type="instance_updated",
++            write_source="api",
++            actor="morning-end",
++        )
++        await db.commit()
+ 
+-    _cancel_morning_escalations()
+-    MORNING_ENFORCE_STATE["status"] = "overridden"
+-    MORNING_ENFORCE_STATE["override_reason"] = request.reason.strip()
+-    MORNING_ENFORCE_STATE["acknowledged_at"] = datetime.utcnow().isoformat()
+-    logger.info(f"Morning session overridden: {request.reason.strip()}")
++    # Cancel timers when leaving golden_throne or sync (matches set_instance_type).
++    if old_type in ("golden_throne", "sync"):
++        try:
++            scheduler.remove_job(f"golden-throne-{instance_id}")
++        except Exception:
++            pass
++        try:
++            scheduler.remove_job(f"sync-retrigger-{instance_id}")
++        except Exception:
++            pass
+ 
++    logger.info(f"Morning session ended — {instance_id[:12]} flipped {old_type} → one_off")
+     await log_event(
+-        "morning_overridden",
+-        details={
+-            "reason": request.reason.strip(),
+-            "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+-            "fired_at": MORNING_ENFORCE_STATE["fired_at"],
+-        },
++        "morning_session_end",
++        instance_id=instance_id,
++        details={"old_type": old_type, "new_type": "one_off"},
+     )
+-    return {
+-        "status": "overridden",
+-        "reason": request.reason.strip(),
+-        "escalation_level": MORNING_ENFORCE_STATE["escalation_level"],
+-    }
++    return {"instance_id": instance_id, "instance_type": "one_off"}
+ 
+ 
+ _ALARM_DISMISS_JOB_ID = "morning_alarm_dismiss"
+@@ -19239,14 +19068,6 @@ async def receive_discord_message(request: DiscordMessageRequest):
+         asyncio.create_task(_discord_clip(stripped, request))
+         return {"received": True, "message_id": request.message_id}
+ 
+-    # Morning ack shortcut — fastest possible escalation cancel via Discord
+-    if MORNING_ENFORCE_STATE.get("status") == "pending":
+-        lower = content.lower().strip()
+-        if any(kw in lower for kw in ("ack", "acknowledged", "acknowledge", "here", "awake")):
+-            await acknowledge_morning_session()
+-            logger.info(f"Morning ack via Discord from {author_name}")
+-            # Still fall through to inject into synced session if applicable
+-
+     # Trigger 1: @Mechanicus mention → try synced injection, fallback to one-off responder
+     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
+         injected = await _try_discord_injection("mechanicus", request, require_synced=True)
+diff --git a/token-api/morning_session.py b/token-api/morning_session.py
+index f2b4edb..e5e683e 100644
+--- a/token-api/morning_session.py
++++ b/token-api/morning_session.py
+@@ -171,12 +171,6 @@ curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/synced" -H 'C
+ If registration fails, report it immediately — the harness is broken. Do
+ not silently proceed without custodes identity.
+ 
+-Do not acknowledge any pending morning escalation yourself — the
+-acknowledgement signal is user-originated (Emperor answers via Discord
+-voice/text or explicitly calls `/api/morning/acknowledge`). Your job is to
+-prompt for that response and continue once it arrives. On non-alarm
+-triggers there is nothing to acknowledge — this is a no-op.
+-
+ ## Your First Turn
+ 
+ 1. Verify registration (above).
+@@ -216,12 +210,30 @@ Secondary interface: SSH into the tmux pane from phone (Termux) and type
+ directly. Both paths work — voice is lower friction while groggy.
+ 
+ **Use AskUserQuestion between phases** to block and wait for the Emperor's
+-response. This is a real conversation, not a monologue.
++response. This is a real conversation, not a monologue. Blocking on
++AskUserQuestion is also how you pace yourself — its timeout ladder is your
++pacing mechanism, not any external timer.
+ 
+ **Be aggressively interactive.** Don't wait passively. If there's silence
+ for more than a couple minutes, follow up with TTS. You are a presence,
+ not a notification that can be swiped away.
+ 
++**This session is temporally bound, not turn-based.** When your turn ends,
++the Stop hook accepts it and immediately re-injects a fresh timestamped
++keepalive prompt — you cannot go quiet and let the morning drift. Keep
++moving: advance the regiment/plan, prompt the Emperor via `tts` /
++AskUserQuestion. The loop ends ONLY when the Emperor officially says he's
++done, at which point YOU call:
++```bash
++curl -s -X POST http://localhost:7777/api/morning/end
++```
++That flips this instance off `sync` (→ one_off); the next Stop is then a
++normal clean stop. **Rip cord:** if you ever need to force-exit the loop,
++PATCH this instance off `sync` directly:
++```bash
++curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Content-Type: application/json' -d '{{"instance_type":"one_off"}}'
++```
++
+ ## Conversation Phases
+ 
+ Trigger-dependent:
+@@ -229,7 +241,8 @@ Trigger-dependent:
+   ONE AT A TIME, in order: alarm response, bed return, YouTube,
+   treadmill, Pavlok equipped and connected, caffeine, teeth, breakfast,
+   weigh-in) → daily planning → session spawning when settled → sign-off
+-  with regiment score + TTS farewell.
++  with regiment score + TTS farewell, then `POST /api/morning/end` to
++  release the session.
+ - **heartbeat** — registration + briefing → check substance timing (see
+   below), work pace, anything flagged in the daily note → escalate or
+   hand off as needed.
+@@ -599,9 +612,6 @@ def run_morning_session() -> dict:
+         )
+     )
+ 
+-    # Register enforce escalation (idempotent — also done by /api/morning/start endpoint)
+-    _post("/api/morning/enforce-register", {})
+-
+     print(f"Morning session launched in legion pane {pane_id}")
+     return {"status": "launched", "pane_id": pane_id}
+ 
+diff --git a/token-api/routes/hooks.py b/token-api/routes/hooks.py
+index ab0e537..2dc3aeb 100644
+--- a/token-api/routes/hooks.py
++++ b/token-api/routes/hooks.py
+@@ -22,6 +22,7 @@ from collections.abc import Callable
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any
++from zoneinfo import ZoneInfo
+ 
+ import aiosqlite
+ from fastapi import APIRouter, Request
+@@ -53,6 +54,7 @@ from shared import (
+     DESKTOP_STATE,
+     DISCORD_DAEMON_URL,
+     FALLBACK_VOICES,
++    MORNING_KEEPALIVE_PROMPT,
+     PROFILES,
+     ULTIMATE_FALLBACK,
+     VOICE_CHAT_SESSIONS,
+@@ -3009,8 +3011,57 @@ async def handle_stop(payload: dict) -> dict:
+         return result
+ 
+     if instance_type == "sync":
++        # Self-continuing sync (morning) session: accept the Stop, then re-inject a
++        # fresh timestamped keepalive prompt so the session is temporally bound, not
++        # turn-based. The only exit is flipping the instance off `sync` (via
++        # POST /api/morning/end → instance_type=one_off); after that flip this branch
++        # is no longer taken and the next Stop is a normal clean stop.
+         result["action"] = "stop_processed_sync"
+         await log_event("hook_stop", instance_id=session_id, details={"sync": True})
++
++        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
++        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(
++            ts=now_mst.strftime("%H:%M")
++        )
++
++        tmux_pane = instance.get("tmux_pane")
++        if not tmux_pane:
++            # Re-fetch from DB in case the cached instance row didn't capture it.
++            try:
++                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
++                    cursor = await db.execute(
++                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
++                        (session_id,),
++                    )
++                    row = await cursor.fetchone()
++                    if row:
++                        tmux_pane = row[0]
++            except Exception:
++                pass
++
++        if not tmux_pane:
++            logger.warning(
++                f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane"
++            )
++            return result
++
++        try:
++            proc = await _run_subprocess_offloop(
++                ("claude-cmd", "--pane", tmux_pane, keepalive_prompt),
++                stdout=asyncio.subprocess.PIPE,
++                stderr=asyncio.subprocess.PIPE,
++                timeout=10,
++            )
++            if proc.returncode != 0:
++                logger.warning(
++                    f"Hook: Stop {session_id[:12]}... sync keepalive claude-cmd failed: "
++                    f"{proc.stderr.decode()[:200]}"
++                )
++        except Exception as e:
++            logger.warning(
++                f"Hook: Stop {session_id[:12]}... sync keepalive delivery failed: {e}"
++            )
++
+         return result
+ 
+     # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
+@@ -3817,7 +3868,7 @@ async def handle_stop_validate(payload: dict) -> dict:
+         return {}
+ 
+     # ── Questions gate: session docs with non-closed questions block once ──
+-    if instance_type in ("golden_throne", "sync") and instance.get("session_doc_id"):
++    if instance_type in ("golden_throne",) and instance.get("session_doc_id"):
+         session_doc_path = None
+         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+             cursor = await db.execute(
+@@ -3920,8 +3971,10 @@ async def handle_stop_validate(payload: dict) -> dict:
+         )
+         return {}
+ 
+-    # ── Block: golden_throne and sync instances get self-eval prompt ──
+-    if instance_type in ("golden_throne", "sync"):
++    # ── Block: golden_throne instances get self-eval prompt ──
++    # (sync instances fall through to a clean accept — the Stop handler re-injects
++    # a keepalive prompt instead of blocking on self-eval.)
++    if instance_type in ("golden_throne",):
+         _self_eval_pending[session_id] = now
+         blocked_at = datetime.now().isoformat()
+         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+diff --git a/token-api/shared.py b/token-api/shared.py
+index d6ecd2f..b9732f0 100644
+--- a/token-api/shared.py
++++ b/token-api/shared.py
+@@ -695,6 +695,21 @@ ASKQ_BUST_PROMPT = (
+     "notification protocol to escalate."
+ )
+ 
++# Re-injected on every clean Stop of a sync (morning) instance. The morning
++# session is temporally bound, not turn-based: it must not be possible to walk
++# away and have it sit idle. Each Stop yields a fresh timestamped keepalive that
++# pushes the instance to keep moving via tts / AskUserQuestion. The loop's only
++# exit is flipping the instance off `sync` (POST /api/morning/end, which sets
++# instance_type=one_off). Rip cord: PATCH /api/instances/{id}/type to one_off.
++MORNING_KEEPALIVE_PROMPT = (
++    "It is currently {ts} MST. The morning session is still active. Use `tts` or "
++    "AskUserQuestion to keep things moving — advance the regiment/plan, prompt the "
++    "Emperor, pace yourself by blocking on AskUserQuestion between phases. This "
++    "session stays alive until the Emperor officially ends it; when he does, call "
++    "`POST /api/morning/end` (or PATCH /api/instances/{{id}}/type to one_off as a "
++    "rip cord) to exit the loop."
++)
++
+ # Global dictation state — tracks whether Wispr Flow is currently active
+ # Updated by: AHK script-compiler (~^#Space keyboard toggle), ring-remap (right button),
+ #             voice-select-other (explicit on/off during voice chat)
+diff --git a/token-api/tests/test_legion_synced.py b/token-api/tests/test_legion_synced.py
+index edb6e63..b9f43ff 100644
+--- a/token-api/tests/test_legion_synced.py
++++ b/token-api/tests/test_legion_synced.py
+@@ -6,7 +6,6 @@ Covers:
+ - Helpers: _format_discord_injection
+ - Cleanup: synced=0 on stop
+ - Auto-detect: civic legion from working_dir
+-- Morning ack: Discord keyword triggers acknowledge
+ - Cron: legion column on cron_jobs
+ 
+ Uses a temporary SQLite database via TOKEN_API_DB env var.
+@@ -22,7 +21,6 @@ from pathlib import Path
+ import pytest
+ 
+ ALLOWED_LEGIONS = set()
+-MORNING_ENFORCE_STATE = {}
+ _format_discord_injection = None
+ _TEST_DB_PATH = None
+ 
+@@ -37,9 +35,8 @@ def client(app_env):
+ 
+ @pytest.fixture(autouse=True)
+ def _bind_main_globals(app_env):
+-    global ALLOWED_LEGIONS, MORNING_ENFORCE_STATE, _format_discord_injection, _TEST_DB_PATH
++    global ALLOWED_LEGIONS, _format_discord_injection, _TEST_DB_PATH
+     ALLOWED_LEGIONS = app_env.main.ALLOWED_LEGIONS
+-    MORNING_ENFORCE_STATE = app_env.main.MORNING_ENFORCE_STATE
+     _format_discord_injection = app_env.main._format_discord_injection
+     _TEST_DB_PATH = str(app_env.db_path)
+ 
+@@ -366,76 +363,7 @@ class TestCivicAutoDetect:
+         assert row["legion"] == "mechanicus"
+ 
+ 
+-# ── 8. Morning ack via Discord ────────────────────────────────
+-
+-
+-class TestMorningAckViaDiscord:
+-    def _post_discord_message(self, client, content, channel="chat"):
+-        return client.post(
+-            "/api/discord/message",
+-            json={
+-                "channel_id": "test-channel-id",
+-                "channel_name": channel,
+-                "content": content,
+-                "author": {"username": "Emperor", "id": "12345"},
+-            },
+-        )
+-
+-    def test_discord_ack_clears_enforce(self, client):
+-        """'ack' keyword in Discord should clear pending enforce state."""
+-        # Set enforce to pending
+-        MORNING_ENFORCE_STATE.update(
+-            {
+-                "status": "pending",
+-                "session_type": "morning_session",
+-                "fired_at": datetime.utcnow().isoformat(),
+-                "acknowledged_at": None,
+-                "override_reason": None,
+-                "escalation_level": 0,
+-            }
+-        )
+-
+-        resp = self._post_discord_message(client, "ack")
+-        assert resp.status_code == 200
+-        assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
+-
+-    def test_discord_ack_keywords(self, client):
+-        """All ack keywords should work."""
+-        for keyword in ("ack", "acknowledged", "acknowledge", "here", "awake"):
+-            MORNING_ENFORCE_STATE.update(
+-                {
+-                    "status": "pending",
+-                    "session_type": "morning_session",
+-                    "fired_at": datetime.utcnow().isoformat(),
+-                    "acknowledged_at": None,
+-                    "escalation_level": 0,
+-                }
+-            )
+-            self._post_discord_message(client, keyword)
+-            assert MORNING_ENFORCE_STATE["status"] == "acknowledged", f"Keyword '{keyword}' failed"
+-
+-    def test_discord_no_ack_when_idle(self, client):
+-        """'ack' when enforce is idle should not change state."""
+-        MORNING_ENFORCE_STATE["status"] = "idle"
+-        self._post_discord_message(client, "ack")
+-        assert MORNING_ENFORCE_STATE["status"] == "idle"
+-
+-    def test_discord_ack_case_insensitive(self, client):
+-        """Ack keywords should be case-insensitive."""
+-        MORNING_ENFORCE_STATE.update(
+-            {
+-                "status": "pending",
+-                "session_type": "morning_session",
+-                "fired_at": datetime.utcnow().isoformat(),
+-                "acknowledged_at": None,
+-                "escalation_level": 0,
+-            }
+-        )
+-        self._post_discord_message(client, "ACK")
+-        assert MORNING_ENFORCE_STATE["status"] == "acknowledged"
+-
+-
+-# ── 9. Workflow / continuity state ───────────────────────────
++# ── 8. Workflow / continuity state ───────────────────────────
+ 
+ 
+ class TestWorkflowState:
+diff --git a/token-api/tests/test_stop_validate_questions.py b/token-api/tests/test_stop_validate_questions.py
+index 4e1a628..cb4d51d 100644
+--- a/token-api/tests/test_stop_validate_questions.py
++++ b/token-api/tests/test_stop_validate_questions.py
+@@ -21,7 +21,14 @@ def _clear_pending(app_env):
+     hooks._self_eval_pending.clear()
+ 
+ 
+-def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=None):
++def _insert_instance(
++    db_path,
++    *,
++    session_doc_id=None,
++    is_subagent=0,
++    victory_at=None,
++    instance_type="golden_throne",
++):
+     sid = str(uuid.uuid4())
+     now = datetime.now().isoformat()
+     conn = sqlite3.connect(db_path)
+@@ -30,7 +37,7 @@ def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=
+            (id, session_id, tab_name, working_dir, origin_type, device_id,
+             status, registered_at, last_activity, instance_type, workflow_state,
+             stop_allowed, session_doc_id, is_subagent, victory_at)
+-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, 'golden_throne',
++           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, ?,
+                    'worktree', 1, ?, ?, ?)""",
+         (
+             sid,
+@@ -39,6 +46,7 @@ def _insert_instance(db_path, *, session_doc_id=None, is_subagent=0, victory_at=
+             "/tmp",
+             now,
+             now,
++            instance_type,
+             session_doc_id,
+             is_subagent,
+             victory_at,
+@@ -132,6 +140,21 @@ def test_no_questions_key_falls_through_to_existing_self_eval(app_env, client, t
+     assert _row(app_env.db_path, sid)["workflow_blocked_reason"] == "self_eval_required"
+ 
+ 
++def test_sync_instance_not_blocked(app_env, client, tmp_path):
++    """A sync (morning) instance falls through to a clean accept — no self-eval
++    block. The Stop handler re-injects a keepalive prompt instead; the StopValidate
++    gate must not interfere even when the session doc has unclosed questions."""
++    doc_id = _insert_doc(app_env.db_path, _blocked_doc(tmp_path))
++    sid = _insert_instance(app_env.db_path, session_doc_id=doc_id, instance_type="sync")
++
++    resp = client.post("/api/hooks/StopValidate", json={"session_id": sid})
++    assert resp.status_code == 200
++    assert resp.json() == {}
++
++    row = _row(app_env.db_path, sid)
++    assert row["stop_allowed"] == 1
++
++
+ def test_no_block_when_subagent_or_victory(app_env, client, tmp_path):
+     doc_id = _insert_doc(app_env.db_path, _blocked_doc(tmp_path))
+     subagent_sid = _insert_instance(app_env.db_path, session_doc_id=doc_id, is_subagent=1)
+diff --git a/token-api/tests/test_timer_telemetry.py b/token-api/tests/test_timer_telemetry.py
+index 23eafc3..20d956b 100644
+--- a/token-api/tests/test_timer_telemetry.py
++++ b/token-api/tests/test_timer_telemetry.py
+@@ -51,3 +51,56 @@ def test_true_large_jump_is_still_impossible_rate():
+     )
+ 
+     assert any(a["reason"] == "impossible_rate" for a in anomalies)
++
++
++def test_wall_of_anomalies_collapses_to_suspect_detection():
++    # A backfill / clock-skew flood: every other sample swings the balance by a
++    # physically impossible amount. The detector would otherwise flag a wall of
++    # impossible_rate anomalies; that wall is itself a reverse signal.
++    now = datetime.now()
++    points = []
++    for i in range(40):
++        points.append(
++            {
++                "t": (now - timedelta(seconds=(40 - i) * 30)).isoformat(),
++                "mode": "working",
++                # Alternate between 0 and a 10-minute swing every 30s sample.
++                "break_balance_ms": 0 if i % 2 == 0 else -600_000,
++            }
++        )
++
++    gaps, anomalies = annotate_timer_telemetry(
++        points,
++        window_start=now - timedelta(minutes=30),
++        window_end=now,
++    )
++
++    assert len(anomalies) == 1
++    record = anomalies[0]
++    assert record["reason"] == "bulk_anomaly_suspected"
++    assert record["suppressed_count"] >= 12
++    assert record["dominant_reason"] == "impossible_rate"
++    # The per-point anomaly marks and the anomaly-derived gaps are reverted so
++    # the graph line reconnects instead of shattering into point soup.
++    assert not any(point.get("anomaly") for point in points)
++    assert not any(gap.get("anomaly_reason") for gap in gaps)
++
++
++def test_a_handful_of_anomalies_is_not_bulk():
++    # Below the min-count floor, genuine anomalies survive as themselves even
++    # if they are a high fraction of a tiny window.
++    now = datetime.now()
++    points = [
++        {"t": (now - timedelta(seconds=90)).isoformat(), "mode": "working", "break_balance_ms": 0},
++        {"t": (now - timedelta(seconds=60)).isoformat(), "mode": "working", "break_balance_ms": -600_000},
++        {"t": (now - timedelta(seconds=30)).isoformat(), "mode": "working", "break_balance_ms": 0},
++    ]
++
++    _gaps, anomalies = annotate_timer_telemetry(
++        points,
++        window_start=now - timedelta(minutes=15),
++        window_end=now,
++    )
++
++    assert all(a["reason"] != "bulk_anomaly_suspected" for a in anomalies)
++    assert anomalies
+diff --git a/token-api/timer_telemetry.py b/token-api/timer_telemetry.py
+index 43f6133..e812beb 100644
+--- a/token-api/timer_telemetry.py
++++ b/token-api/timer_telemetry.py
+@@ -18,6 +18,17 @@ GAP_THRESHOLD_SECONDS = 90
+ RATE_TOLERANCE_MS = 30_000
+ MATERIAL_DELTA_MS = 5 * 60_000
+ 
++# A wall of anomalies is a reverse signal. When a large share of the sample
++# transitions in a window flag at once, the cause is almost always systemic —
++# clock skew, a telemetry backfill, or a restart flooding the window with
++# out-of-order samples — not dozens of genuine timer violations. Past these
++# bounds we collapse the wall into a single "suspect detection" diagnostic
++# rather than crying "247 anomalies" and shattering the graph into point soup.
++# Both bounds must trip: the ratio catches systemic floods, the min-count
++# stops a tiny window (2-of-3 transitions) from reading as a "wall".
++BULK_ANOMALY_MIN_COUNT = 12
++BULK_ANOMALY_RATIO = 0.34
++
+ RESET_DISCONTINUITY_TRIGGERS = {
+     "daily_reset",
+     "manual_reset",
+@@ -72,6 +83,8 @@ def annotate_timer_telemetry(
+     material_delta_ms: int = MATERIAL_DELTA_MS,
+     no_sample_reason: str = "no_timer_samples",
+     break_penalty_multiplier: float = 1.0,
++    bulk_anomaly_min_count: int = BULK_ANOMALY_MIN_COUNT,
++    bulk_anomaly_ratio: float = BULK_ANOMALY_RATIO,
+ ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+     """Mark point gaps/anomalies and return ``(gaps, anomalies)``.
+ 
+@@ -213,4 +226,58 @@ def annotate_timer_telemetry(
+     if (window_end - last_time).total_seconds() > gap_threshold_seconds:
+         add_gap(last_time, window_end, "sample_gap", None)
+ 
++    # Reverse-signal collapse: if anomalies dominate the window, the detector is
++    # almost certainly wrong about all of them at once. Demote the wall to a
++    # single suspect-detection record rather than rendering point soup.
++    comparisons = max(1, len(parsed) - 1)
++    if (
++        len(anomalies) >= bulk_anomaly_min_count
++        and len(anomalies) >= comparisons * bulk_anomaly_ratio
++    ):
++        anomalies = _collapse_bulk_anomalies(parsed, gaps, anomalies, comparisons)
++        gaps = [gap for gap in gaps if not gap.get("anomaly_reason")]
++
+     return gaps, anomalies
++
++
++def _collapse_bulk_anomalies(
++    parsed: list[tuple[datetime, dict[str, Any]]],
++    gaps: list[dict[str, Any]],
++    anomalies: list[dict[str, Any]],
++    comparisons: int,
++) -> list[dict[str, Any]]:
++    """Undo the per-point anomaly marks and return one bulk-suspect record.
++
++    The individual ``anomaly`` flags drove both the red marker dots and the
++    line-splitting (``gap_before``); clearing them lets the balance line
++    reconnect so the graph reads as "telemetry suspect", not a shattered mess.
++    Genuine telemetry gaps (resets, silence) are untouched — only the
++    anomaly-derived marks are reverted.
++    """
++
++    reason_counts: dict[str, int] = {}
++    for anomaly in anomalies:
++        reason = str(anomaly.get("reason") or "unknown")
++        reason_counts[reason] = reason_counts.get(reason, 0) + 1
++    dominant_reason = max(reason_counts, key=reason_counts.get)
++
++    for _ts, point in parsed:
++        if not point.get("anomaly"):
++            continue
++        point.pop("anomaly", None)
++        point.pop("anomaly_reason", None)
++        point.pop("gap_before", None)
++        point.pop("gap_reason", None)
++        point.pop("expected_abs_rate", None)
++
++    return [
++        {
++            "t": parsed[-1][1].get("t"),
++            "reason": "bulk_anomaly_suspected",
++            "gap_reason": "bulk_anomaly_suspected",
++            "suppressed_count": len(anomalies),
++            "dominant_reason": dominant_reason,
++            "reason_counts": reason_counts,
++            "comparisons": comparisons,
++        }
++    ]
+diff --git a/token-api/web/ops/src/components/TimerGraph.tsx b/token-api/web/ops/src/components/TimerGraph.tsx
+index e3f4130..7155fd3 100644
+--- a/token-api/web/ops/src/components/TimerGraph.tsx
++++ b/token-api/web/ops/src/components/TimerGraph.tsx
+@@ -34,6 +34,10 @@ export function TimerGraph({ history }: Props) {
+   const { points, segments, gaps = [] } = history;
+   const anomalyCount = history.anomaly_summary?.count ?? history.anomalies?.length ?? 0;
+   const gapCount = history.anomaly_summary?.gap_count ?? gaps.length;
++  // A wall of anomalies is a reverse signal — the backend collapses it to a
++  // suspect-detection record. Render it as a calm diagnostic, not a red alarm.
++  const bulkSuspected = history.anomaly_summary?.bulk_suspected ?? false;
++  const suppressedCount = history.anomaly_summary?.suppressed_count ?? 0;
+ 
+   const geom = useMemo(() => {
+     if (points.length === 0) return null;
+@@ -243,7 +247,13 @@ export function TimerGraph({ history }: Props) {
+         />
+       </svg>
+ 
+-      {gapCount > 0 || anomalyCount > 0 ? (
++      {bulkSuspected ? (
++        <div className="chart-warning chart-warning--suspect">
++          telemetry suspect · {suppressedCount} anomalies in one batch reads as
++          false detection, not rendered
++          {gapCount > 0 ? ` · ${gapCount} telemetry gap${gapCount === 1 ? '' : 's'}` : ''}
++        </div>
++      ) : gapCount > 0 || anomalyCount > 0 ? (
+         <div className={`chart-warning${anomalyCount > 0 ? ' chart-warning--bad' : ''}`}>
+           {anomalyCount > 0
+             ? `${anomalyCount} timer anomaly${anomalyCount === 1 ? '' : 'ies'}`
+diff --git a/token-api/web/ops/src/styles.css b/token-api/web/ops/src/styles.css
+index c964346..692c4fe 100644
+--- a/token-api/web/ops/src/styles.css
++++ b/token-api/web/ops/src/styles.css
+@@ -266,6 +266,8 @@ h1 {
+   font-size: 11px;
+ }
+ .chart-warning--bad { color: var(--hazard); }
++/* Bulk anomaly = reverse signal, not a real alarm: brass, not hazard. */
++.chart-warning--suspect { color: var(--brass-bright); font-style: italic; }
+ 
+ .chart-tip {
+   position: absolute; top: 6px; pointer-events: none;
+diff --git a/token-api/web/ops/src/types.ts b/token-api/web/ops/src/types.ts
+index ccfc4fa..3dc7f38 100644
+--- a/token-api/web/ops/src/types.ts
++++ b/token-api/web/ops/src/types.ts
+@@ -257,6 +257,13 @@ export type TimerHistory = {
+     gap_count: number;
+     gap_count_by_reason?: Record<string, number>;
+     latest?: Record<string, unknown> | null;
++    // A wall of anomalies is a reverse signal: when the detector flags a large
++    // share of the window at once the batch is treated as a systemic false
++    // detection, not real timer violations. `count` is then 0 and the
++    // suppressed wall size is reported here for a calmer "suspect" banner.
++    bulk_suspected?: boolean;
++    suppressed_count?: number;
++    dominant_reason?: string | null;
+   };
+   source?: string;
+ };

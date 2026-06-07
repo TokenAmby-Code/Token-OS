@@ -1,0 +1,25 @@
+ M cli-tools/bin/tmux-context
+ M cli-tools/lib/tmuxctl/send_gate.py
+ M cli-tools/lib/tmuxctl/tmux_adapter.py
+M  discord-daemon/daemon.js
+A  discord-daemon/fixer-classify.js
+A  discord-daemon/fixer-classify.test.js
+M  discord-daemon/package.json
+M  discord-daemon/realtime-transcriber.js
+ M token-api/db_schema.py
+ M token-api/main.py
+ M token-api/morning_session.py
+ M token-api/routes/hooks.py
+ M token-api/shared.py
+ M token-api/tests/test_legion_synced.py
+ M token-api/tests/test_stop_validate_questions.py
+ M token-api/tests/test_timer_telemetry.py
+ M token-api/timer_telemetry.py
+ M token-api/web/ops/src/components/TimerGraph.tsx
+ M token-api/web/ops/src/styles.css
+ M token-api/web/ops/src/types.ts
+?? .claude/
+?? .wip-backups/
+?? cli-tools/tests/test_automated_pane_activity.py
+?? token-api/tests/test_work_state_automated_discount.py
+?? token-api/work-session-hot-test-dry.sh
