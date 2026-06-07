@@ -863,6 +863,52 @@ def run_morning_session() -> dict:
             print("Morning session already ended for today, skipping relaunch")
             return {"status": "already_ended"}
 
+    # Phantom guard (#101): require a real day-start latch before launching.
+    # Both the real wake (alarm_silenced -> fire_day_start_internal latches
+    # day_state -> fan-out -> POST /api/morning/start) and the legacy phone-macro
+    # phantom (a bare POST /api/morning/start) converge here on
+    # run_morning_session. They differ only in whether today's day_state was
+    # latched by an official morning source FIRST: the real path latches before
+    # the fan-out reaches us, so it passes; the bare-/start phantom never
+    # latched, so it is refused here without spawning a ghost Custodes. The
+    # double-trigger guard above handles a phantom AFTER a real morning; this
+    # handles a phantom with no real morning at all (today's 07:43/07:57/08:20
+    # misfires). "no_day_start_latch" is a non-active status, so the supervisor's
+    # redundant net still sees no morning and can alert.
+    try:
+        from shared import OFFICIAL_MORNING_SOURCES, get_day_state_sync
+
+        day_state = get_day_state_sync(today)
+        real_ack = bool(
+            day_state
+            and day_state.get("day_started_at")
+            and day_state.get("source") in OFFICIAL_MORNING_SOURCES
+        )
+        if not real_ack:
+            if not day_state or not day_state.get("day_started_at"):
+                reason = "no day_state latch for today"
+            else:
+                reason = f"non-official day-start source {day_state.get('source')!r}"
+            print(
+                f"Morning session refused: {reason} — no official day-start ack "
+                "(likely a legacy /api/morning/start phantom); not launching"
+            )
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "started_at": datetime.now().isoformat(),
+                        "status": "no_day_start_latch",
+                        "reason": reason,
+                        "day_state_source": (day_state or {}).get("source"),
+                    }
+                )
+            )
+            return {"status": "no_day_start_latch", "reason": reason}
+    except ImportError:
+        # shared not importable (isolated context) — fail open so a legitimate
+        # launch is never blocked; the resurrection guard above still applies.
+        pass
+
     print(f"Morning session launcher starting: {today}")
 
     # Phase 0: Ensure NAS is mounted

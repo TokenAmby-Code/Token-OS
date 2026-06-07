@@ -14,7 +14,7 @@ Run:
 
 import json
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -268,6 +268,110 @@ def test_run_morning_session_no_pane_fails_gracefully(isolated_morning_dir):
         result = morning_session.run_morning_session()
 
     assert result["status"] == "no_pane"
+
+
+# ── run_morning_session: day-start latch guard (phantom killer, #101) ─
+
+
+def _no_launch_run(cmd, **kwargs):
+    """subprocess.run stub that fails loudly if the launch path is reached."""
+    raise AssertionError(f"launch path must not run for a phantom: {cmd}")
+
+
+def test_run_morning_session_refuses_without_day_start_latch(isolated_morning_dir):
+    """Phantom: a bare /api/morning/start with NO day_state latch must NOT launch.
+
+    The legacy phone macro POSTs /api/morning/start directly, bypassing the
+    day-start latch. run_morning_session must refuse (status="no_day_start_latch")
+    and never reach create_legion_pane / confirm — no ghost Custodes spawned.
+    """
+    create_pane = MagicMock()
+    confirm = MagicMock()
+    with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: None),
+        patch("morning_session.subprocess.run", side_effect=_no_launch_run),
+        patch("morning_session.ensure_daily_notes", lambda: None),
+        patch("morning_session.get_daily_thread_id", lambda today: "t"),
+        patch("morning_session.create_daily_thread", lambda today: "t"),
+        patch("morning_session.send_tts", lambda msg: None),
+        patch("morning_session.create_legion_pane", create_pane),
+        patch("morning_session.confirm_custodes_registered", confirm),
+        patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
+    ):
+        result = morning_session.run_morning_session()
+
+    assert result["status"] == "no_day_start_latch"
+    create_pane.assert_not_called()
+    confirm.assert_not_called()
+    # State file records the refusal but is NOT an active morning.
+    state = morning_session.read_morning_state()
+    assert state is not None
+    assert state["status"] == "no_day_start_latch"
+    active, _reason = morning_session.morning_session_active()
+    assert active is False
+
+
+def test_run_morning_session_refuses_non_official_day_start_source(isolated_morning_dir):
+    """A day_state latched by a non-official source (e.g. schedule_fallback) is
+    still not an Emperor ack → refuse with a source-specific reason."""
+    create_pane = MagicMock()
+    day_state = {"day_started_at": "2026-06-07T08:30:00", "source": "schedule_fallback"}
+    with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
+        patch("morning_session.subprocess.run", side_effect=_no_launch_run),
+        patch("morning_session.ensure_daily_notes", lambda: None),
+        patch("morning_session.get_daily_thread_id", lambda today: "t"),
+        patch("morning_session.create_daily_thread", lambda today: "t"),
+        patch("morning_session.send_tts", lambda msg: None),
+        patch("morning_session.create_legion_pane", create_pane),
+        patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
+    ):
+        result = morning_session.run_morning_session()
+
+    assert result["status"] == "no_day_start_latch"
+    assert "schedule_fallback" in result["reason"]
+    create_pane.assert_not_called()
+
+
+def test_run_morning_session_proceeds_with_real_alarm_ack(isolated_morning_dir):
+    """Control: the real wake (day_state latched source=alarm_silenced) passes the
+    guard and reaches a normal active launch — the guard must NOT block the real
+    path that this morning's 11:16 wake exercised."""
+
+    def fake_run(cmd, **kwargs):
+        if _cmd_is(cmd, "stack", "enforce"):
+            return _completed(cmd, 0)
+        if _cmd_is(cmd, "resolve-pane"):
+            return _completed(cmd, 0, stdout="%42\n")
+        if _cmd_is(cmd, "assert-instance"):
+            return _completed(cmd, 0, stdout=json.dumps({"ok": True, "action": "noop"}))
+        if _cmd_is(cmd, "send-text"):
+            return _completed(cmd, 0, stdout="")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    confirmed = {
+        "live": True,
+        "instance_id": "cafe1234",
+        "tmux_pane": "%42",
+        "pane_matched": True,
+        "reconciled": True,
+        "waited_s": 0.0,
+    }
+    day_state = {"day_started_at": "2026-06-07T11:16:00", "source": "alarm_silenced"}
+    with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
+        patch("morning_session.subprocess.run", side_effect=fake_run),
+        patch("morning_session.ensure_daily_notes", lambda: None),
+        patch("morning_session.get_daily_thread_id", lambda today: "thread123"),
+        patch("morning_session.create_daily_thread", lambda today: "thread123"),
+        patch("morning_session.send_tts", lambda msg: None),
+        patch("morning_session.confirm_custodes_registered", lambda **kw: confirmed),
+        patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
+    ):
+        result = morning_session.run_morning_session()
+
+    assert result["status"] == "active"
+    assert result["instance_id"] == "cafe1234"
 
 
 # ── find_live_custodes + reconcile: desynced-row upsert ───────
