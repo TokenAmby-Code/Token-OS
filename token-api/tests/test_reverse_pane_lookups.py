@@ -142,11 +142,6 @@ async def test_rename_by_pane_resolves_via_stamp(app_env: Any, monkeypatch: Any)
 
     monkeypatch.setattr(main.shared, "instance_id_for_pane", _stamp)
 
-    async def _noop_label(_pane):
-        return None
-
-    monkeypatch.setattr(main, "_refresh_tmux_pane_label", _noop_label)
-
     result = await main.rename_instance_by_pane(
         main.PaneRenameRequest(tmux_pane="%LIVE", tab_name="Fresh Name")
     )

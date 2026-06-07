@@ -1,8 +1,8 @@
 """tmux-pane-label is retired from the pane-border hot path (Phase 1 Part A).
 
 It now survives only as a deploy-time `--backfill` that seeds @PANE_LABEL on panes
-that pre-date the push path, and the legacy positional invocation is a deliberate
-no-op so a not-yet-reloaded tmux config cannot error or spawn work.
+that pre-date the push path. The legacy positional invocation has been removed; any
+non-`--backfill` call now fails loudly with usage instead of silently no-op'ing.
 """
 
 from __future__ import annotations
@@ -96,13 +96,13 @@ def test_backfill_seeds_pane_label_for_live_panes_only(tmp_path: Path) -> None:
     assert not any("has-name" in c for c in calls)
 
 
-def test_legacy_positional_invocation_is_a_noop(tmp_path: Path) -> None:
+def test_legacy_positional_invocation_fails_loudly(tmp_path: Path) -> None:
     db = tmp_path / "agents.db"
     _make_db(db, [("live1", "auth-refactor", "%1", "idle")])
     bindir, log = _fake_tmux(tmp_path)
 
     proc = _run(["%1", "some-title", "false"], db=db, bindir=bindir, log=log)
 
-    assert proc.returncode == 0
-    assert proc.stdout == ""
-    assert not log.exists(), "legacy hot-path invocation must not shell out to tmux"
+    assert proc.returncode != 0, "a stray positional call must fail, not silently no-op"
+    assert "usage" in proc.stderr.lower()
+    assert not log.exists(), "a rejected invocation must not shell out to tmux"

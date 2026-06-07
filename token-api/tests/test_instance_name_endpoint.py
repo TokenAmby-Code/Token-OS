@@ -7,11 +7,6 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def client(app_env, monkeypatch):
-    async def _noop_refresh(tmux_pane):
-        return None
-
-    monkeypatch.setattr(app_env.main, "_refresh_tmux_pane_label", _noop_refresh)
-
     # The rename route now resolves pane -> instance via the pane's live
     # @INSTANCE_ID stamp (tmuxctl owns resolution). There is no tmux server in
     # tests, so the real resolver fails closed and every rename would 404. Stub it
