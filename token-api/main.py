@@ -124,16 +124,23 @@ from routes.tts import (
 from routes.voice import router as voice_router
 from schedule import router as schedule_router
 from session_doc_helpers import (
+    CODERABBIT_COMMENTS_FIELD,
+    CODERABBIT_KEY_PREFIX,
+    CODERABBIT_NITPICK_KEY,
+    CODERABBIT_PASSED_KEY,
+    CODERABBIT_REVIEW_STATE_FIELD,
     DEFAULT_RUBRIC_KEY,
     RubricStatus,
     _update_doc_agents_list,
     bump_session_doc_up_to_date,
     create_session_doc_file,
+    evaluate_rubric,
     human_filename_stem,
     mark_rubric_acknowledged,
     mark_rubric_notified,
     read_frontmatter,
     read_rubric,
+    reconcile_coderabbit_comments,
     serialize_frontmatter,
     unique_human_path,
     update_frontmatter,
@@ -1447,6 +1454,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         print(f"Morning supervisor recovery: {supervisor_state}")
     except Exception as exc:
         logger.warning(f"Morning supervisor startup recovery failed: {exc}")
+    recovered_cr = await recover_coderabbit_sync_jobs()
+    if recovered_cr:
+        logger.info(f"CodeRabbit sync re-armed {len(recovered_cr)} poller(s)")
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
@@ -3372,10 +3382,15 @@ async def _read_instance_session_doc_rubric(
     if not fp or not fp.exists():
         return None, meta
     try:
-        status = await asyncio.to_thread(read_rubric, fp)
+        fm, _body = await asyncio.to_thread(read_frontmatter, fp)
+        status = evaluate_rubric(fm)
     except Exception as exc:
         logger.warning(f"GT: rubric read failed for {fp}: {exc}")
         return None, meta
+    # Stash the full frontmatter so the fire path's poke renderer can reach the
+    # sibling coderabbit_comments / coderabbit_review_state fields. Both callers
+    # (schedule + followup) tolerate the extra key.
+    meta["frontmatter"] = fm
     return status, meta
 
 
@@ -3441,6 +3456,396 @@ async def _gt_clear_fire(instance_id: str) -> None:
         )
     except Exception as exc:
         logger.debug(f"GT: @GT_FIRE clear failed for {instance_id[:12]} ({pane}): {exc}")
+
+
+# --- CodeRabbit review sync (poller -> reconciler -> rubric) ------------------
+#
+# A dedicated APScheduler interval job per open-PR instance polls CodeRabbit's
+# PR comments and folds them into the session-doc rubric via the pure
+# reconcile_coderabbit_comments(). It runs INDEPENDENTLY of the (idle-gated)
+# Golden Throne fire path so a busy worker's PR still gets its review folded; the
+# proven GT walker then drives the worker through each folded finding. v1 scope:
+# local instances only. `gh` must be on the server's PATH with `gh auth` set up;
+# every gh call fails soft so a missing/unauthed gh just no-ops the poll round.
+
+CODERABBIT_REVIEWER_LOGINS = ("coderabbitai[bot]", "coderabbitai")
+CODERABBIT_COMMIT_STATUS_CONTEXT = "coderabbit"
+CODERABBIT_SYNC_INTERVAL_SECONDS = 75
+# Per gh-call wall-clock cap. _fetch_coderabbit_comments makes four sequential,
+# individually capped gh calls, so the bounded inner total is ~4x this.
+CODERABBIT_GH_TIMEOUT_SECONDS = 20
+# The threadsafe wrapper must wait PAST that bounded inner total (+ buffer for the
+# DB/file IO around it) before giving up — otherwise it abandons a still-running
+# pass on APP_LOOP and the next interval starts a second pass racing it on the same
+# frontmatter. Kept comfortably above 4x the gh cap.
+CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS = 4 * CODERABBIT_GH_TIMEOUT_SECONDS + 30
+CODERABBIT_SYNC_JOB_PREFIX = "coderabbit-sync-"
+# Past this age with no CodeRabbit activity, treat the review as absent so the
+# poke renderer stops implying the worker is stalling on a bot that isn't coming.
+CODERABBIT_ABSENT_AFTER_SECONDS = 30 * 60
+_PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+
+
+def _coderabbit_sync_job_id(instance_id: str) -> str:
+    return f"{CODERABBIT_SYNC_JOB_PREFIX}{instance_id}"
+
+
+def _parse_pr_url(pr_url: str | None) -> tuple[str, str] | None:
+    """Return (repo 'owner/name', pr_number) from a GitHub PR URL, or None."""
+    if not pr_url:
+        return None
+    match = _PR_URL_RE.search(pr_url)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+async def _gh_api_json(path_args: list[str]):
+    """Run `gh api ...` off-loop and parse JSON. Returns None on any failure."""
+    try:
+        proc = await _run_subprocess_offloop(
+            ["gh", "api", *path_args],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=CODERABBIT_GH_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.decode(errors="replace") or "null")
+    except Exception:
+        return None
+
+
+def _coderabbit_fetch_error(reason: str) -> dict:
+    """A fetch result that tells the poller to SKIP this round (no reconcile)."""
+    return {"comments": [], "review_terminal": False, "error": reason}
+
+
+async def _fetch_coderabbit_comments(repo: str, pr_number: str) -> dict:
+    """Fetch CodeRabbit PR comments + review terminality via `gh`.
+
+    Mirrors pr-review-loop's calls: inline review comments, issue (summary)
+    comments filtered to the CodeRabbit bot, and the `coderabbit` commit-status
+    context for terminality (REST has no reliable per-thread `resolved` field —
+    true thread resolution is GraphQL-only and deferred to v2).
+
+    Fetches are FULLY paginated (`--paginate`) and ALL-OR-NOTHING: any failed or
+    incomplete fetch — a list call that errors, PR metadata that isn't a dict, a
+    missing head sha, or a statuses call that errors — returns an error result with
+    empty comments so the poller no-ops that round. The reconciler is therefore
+    never fed truncated data and can never prune coderabbit_* keys or misclassify
+    review terminality from a partial view. review_terminal is computed ONLY from a
+    fully-fetched status list.
+    """
+    inline = await _gh_api_json(
+        [f"repos/{repo}/pulls/{pr_number}/comments?per_page=100", "--paginate"]
+    )
+    if not isinstance(inline, list):
+        return _coderabbit_fetch_error("inline_fetch_failed")
+    issue = await _gh_api_json(
+        [f"repos/{repo}/issues/{pr_number}/comments?per_page=100", "--paginate"]
+    )
+    if not isinstance(issue, list):
+        return _coderabbit_fetch_error("issue_fetch_failed")
+
+    # PR metadata: head sha (for commit status), open/closed, merged, created_at.
+    pr_obj = await _gh_api_json([f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(pr_obj, dict):
+        return _coderabbit_fetch_error("pr_meta_failed")
+    head_sha = (pr_obj.get("head") or {}).get("sha")
+    if not head_sha:
+        return _coderabbit_fetch_error("pr_meta_no_head_sha")
+    pr_state = pr_obj.get("state")
+    pr_created_at = pr_obj.get("created_at")
+    merged = bool(pr_obj.get("merged_at"))
+    if merged or pr_state == "closed":
+        # Terminal PR: the poller is about to disarm on merged/closed. Return now
+        # (error=None) so an unavailable statuses endpoint can't keep it armed.
+        return {
+            "comments": [],
+            "review_terminal": False,
+            "pr_state": pr_state,
+            "merged": merged,
+            "pr_created_at": pr_created_at,
+            "error": None,
+        }
+
+    # Commit statuses (fully paginated) drive review terminality. A failed/partial
+    # statuses fetch must NOT silently read as "not terminal" — skip the round.
+    statuses = await _gh_api_json(
+        [f"repos/{repo}/commits/{head_sha}/statuses?per_page=100", "--paginate"]
+    )
+    if not isinstance(statuses, list):
+        return _coderabbit_fetch_error("statuses_fetch_failed")
+    cr = [
+        s
+        for s in statuses
+        if isinstance(s, dict)
+        and str(s.get("context") or "").lower().startswith(CODERABBIT_COMMIT_STATUS_CONTEXT)
+    ]
+    cr.sort(key=lambda s: s.get("updated_at") or "")
+    review_terminal = bool(cr and cr[-1].get("state") in ("success", "failure"))
+
+    comments: list[dict] = []
+    for raw in inline:
+        if not isinstance(raw, dict):
+            continue
+        if (raw.get("user") or {}).get("login") not in CODERABBIT_REVIEWER_LOGINS:
+            continue
+        comments.append(
+            {
+                "id": raw.get("id"),
+                "body": raw.get("body") or "",
+                "path": raw.get("path"),
+                "line": raw.get("line") or raw.get("original_line"),
+                "comment_type": "inline",
+            }
+        )
+    for raw in issue:
+        if not isinstance(raw, dict):
+            continue
+        if (raw.get("user") or {}).get("login") not in CODERABBIT_REVIEWER_LOGINS:
+            continue
+        comments.append(
+            {
+                "id": raw.get("id"),
+                "body": raw.get("body") or "",
+                "path": None,
+                "line": None,
+                "comment_type": "summary",
+            }
+        )
+
+    return {
+        "comments": comments,
+        "review_terminal": review_terminal,
+        "pr_state": pr_state,
+        "merged": merged,
+        "pr_created_at": pr_created_at,
+        "error": None,
+    }
+
+
+def _coderabbit_review_absent(review_state: str | None, pr_created_at: str | None) -> bool:
+    """True when CodeRabbit has posted nothing and the PR is old enough to give up."""
+    if review_state != "pending" or not pr_created_at:
+        return False
+    try:
+        created = datetime.fromisoformat(pr_created_at)
+    except Exception:
+        return False
+    now = datetime.now(created.tzinfo)
+    return (now - created).total_seconds() > CODERABBIT_ABSENT_AFTER_SECONDS
+
+
+def arm_coderabbit_sync(instance_id: str) -> None:
+    """Arm (or refresh) the per-instance CodeRabbit poller."""
+    scheduler.add_job(
+        _coderabbit_sync_sync,
+        IntervalTrigger(seconds=CODERABBIT_SYNC_INTERVAL_SECONDS),
+        args=[instance_id],
+        id=_coderabbit_sync_job_id(instance_id),
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=CODERABBIT_SYNC_INTERVAL_SECONDS,
+    )
+    logger.info(f"CodeRabbit sync: armed poller for {instance_id[:12]}")
+
+
+def _disarm_coderabbit_sync(instance_id: str) -> None:
+    try:
+        scheduler.remove_job(_coderabbit_sync_job_id(instance_id))
+        logger.info(f"CodeRabbit sync: disarmed poller for {instance_id[:12]}")
+    except Exception:
+        pass
+
+
+def _coderabbit_sync_sync(instance_id: str) -> dict:
+    """APScheduler thread entrypoint; bridges to the async pass (mirrors the GT wrapper).
+
+    The outer wait is sized ABOVE the bounded inner gh budget so a normal pass
+    completes in place. If it still overruns, the in-flight coroutine is cancelled
+    and awaited before returning: this thread must not free its APScheduler slot
+    while a pass is still running on APP_LOOP, or the next interval would start a
+    second pass racing it on the same frontmatter (max_instances guards the thread,
+    not the orphaned coroutine).
+    """
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(_coderabbit_sync_once(instance_id), APP_LOOP)
+            try:
+                return future.result(timeout=CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS)
+            except TimeoutError:
+                future.cancel()
+                # Block until it actually unwinds (a single in-flight gh call is
+                # itself capped) so nothing is left touching the doc when we return.
+                try:
+                    future.result(timeout=CODERABBIT_GH_TIMEOUT_SECONDS + 5)
+                except Exception:
+                    pass
+                logger.warning(
+                    f"CodeRabbit sync: pass exceeded "
+                    f"{CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS}s for {instance_id[:12]}; cancelled"
+                )
+                return {"success": False, "instance_id": instance_id, "error": "pass_timeout"}
+        return asyncio.run(_coderabbit_sync_once(instance_id))
+    except Exception as exc:
+        logger.exception(f"CodeRabbit sync: pass failed for {instance_id[:12]}")
+        return {"success": False, "instance_id": instance_id, "error": str(exc)}
+
+
+async def _coderabbit_sync_once(instance_id: str) -> dict:
+    """One poll+reconcile pass for an instance. Self-disarms when the loop is done.
+
+    Disarm conditions: instance gone, remote (v1 local-only), no/archived session
+    doc, coderabbit_passed already true, doc acknowledged, or PR merged/closed.
+    A missing pr_url or a soft fetch error keeps the job armed and no-ops the round.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+    if not row:
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "instance_not_found"}
+    instance = dict(row)
+
+    if instance.get("device_id") != LOCAL_DEVICE_NAME:
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "remote_instance"}
+
+    parsed = _parse_pr_url(instance.get("pr_url"))
+    if not parsed:
+        return {"reason": "no_pr_url"}  # stay armed; pr_url may land shortly
+    repo, pr_number = parsed
+
+    meta = await _load_instance_session_doc(instance)
+    fp = meta.get("file_path")
+    if not fp or not fp.exists():
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "no_session_doc"}
+    if meta.get("doc_status") == "archived":
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "doc_archived"}
+
+    fm, _body = await asyncio.to_thread(read_frontmatter, fp)
+    rk = fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    victory = fm.get(rk) if isinstance(fm.get(rk), dict) else {}
+    if victory.get(CODERABBIT_PASSED_KEY) is True:
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "coderabbit_passed"}
+    if fm.get(f"{rk}_acknowledged_at"):
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "doc_acknowledged"}
+
+    fetched = await _fetch_coderabbit_comments(repo, pr_number)
+    if fetched.get("error"):
+        return {"reason": "fetch_error", "error": fetched["error"]}  # fail soft, stay armed
+    if fetched.get("merged") or fetched.get("pr_state") == "closed":
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "pr_closed"}
+
+    mutations = await asyncio.to_thread(
+        reconcile_coderabbit_comments,
+        fm,
+        fetched["comments"],
+        review_terminal=fetched["review_terminal"],
+        rubric_key=rk,
+    )
+    if not mutations:
+        return {"reason": "no_rubric"}
+
+    # Poller-level (time-aware) override: a long-quiet PR with no review → absent.
+    if _coderabbit_review_absent(
+        mutations.get(CODERABBIT_REVIEW_STATE_FIELD), fetched.get("pr_created_at")
+    ):
+        mutations[CODERABBIT_REVIEW_STATE_FIELD] = "absent"
+
+    changed = any(fm.get(k) != v for k, v in mutations.items())
+    if changed:
+        await asyncio.to_thread(update_frontmatter, fp, mutations)
+        await log_event(
+            "coderabbit_sync",
+            instance_id=instance_id,
+            details={
+                "repo": repo,
+                "pr": pr_number,
+                "n_comments": len(fetched["comments"]),
+                "review_terminal": fetched["review_terminal"],
+                "review_state": mutations.get(CODERABBIT_REVIEW_STATE_FIELD),
+            },
+        )
+
+    new_victory = mutations.get(rk) if isinstance(mutations.get(rk), dict) else {}
+    if new_victory.get(CODERABBIT_PASSED_KEY) is True:
+        _disarm_coderabbit_sync(instance_id)
+        return {"disarmed": True, "reason": "coderabbit_passed", "changed": changed}
+    return {"changed": changed, "review_state": mutations.get(CODERABBIT_REVIEW_STATE_FIELD)}
+
+
+async def _arm_coderabbit_sync_for_doc(doc_id: int) -> list[str]:
+    """Arm the CodeRabbit poller for local, live instances linked to a doc."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, device_id FROM claude_instances "
+            "WHERE session_doc_id = ? AND status != 'stopped'",
+            (doc_id,),
+        )
+        rows = await cursor.fetchall()
+    armed: list[str] = []
+    for row in rows:
+        if row["device_id"] == LOCAL_DEVICE_NAME:
+            arm_coderabbit_sync(row["id"])
+            armed.append(row["id"])
+    return armed
+
+
+async def recover_coderabbit_sync_jobs() -> list[str]:
+    """Re-arm CodeRabbit pollers after restart.
+
+    APScheduler interval jobs are a runtime concern; a restart drops them. Re-arm
+    for local instances with a linked, non-archived doc whose rubric has
+    pr_opened set and coderabbit_passed not yet true / not acknowledged.
+    """
+    armed: list[str] = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.id AS id, sd.file_path AS file_path
+            FROM claude_instances ci
+            JOIN session_documents sd ON ci.session_doc_id = sd.id
+            WHERE ci.device_id = ?
+              AND ci.pr_url IS NOT NULL
+              AND ci.status != 'stopped'
+              AND (sd.status IS NULL OR sd.status != 'archived')
+            """,
+            (LOCAL_DEVICE_NAME,),
+        )
+        rows = await cursor.fetchall()
+    for row in rows:
+        fp = Path(row["file_path"]) if row["file_path"] else None
+        if not fp or not fp.exists():
+            continue
+        try:
+            fm, _body = await asyncio.to_thread(read_frontmatter, fp)
+        except Exception:
+            continue
+        rk = fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+        victory = fm.get(rk) if isinstance(fm.get(rk), dict) else {}
+        if not victory.get("pr_opened"):
+            continue
+        if victory.get(CODERABBIT_PASSED_KEY) is True:
+            continue
+        if fm.get(f"{rk}_acknowledged_at"):
+            continue
+        arm_coderabbit_sync(row["id"])
+        armed.append(row["id"])
+    return armed
 
 
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
@@ -5988,6 +6393,13 @@ def _humanize_condition_key(key: str) -> str:
     """Turn a frontmatter condition key into a short spoken phrase."""
     if key.startswith("legacy:"):
         return "session"
+    # CodeRabbit per-comment keys carry a numeric comment id — never speak it.
+    if key == CODERABBIT_NITPICK_KEY:
+        return "CodeRabbit nitpicks"
+    if key == CODERABBIT_PASSED_KEY:
+        return "CodeRabbit review"
+    if key.startswith(CODERABBIT_KEY_PREFIX):
+        return "a CodeRabbit finding"
     return key.replace("_", " ")
 
 
@@ -6025,19 +6437,106 @@ def _golden_throne_victorious_bug_banner(human_pane_surface: str) -> str:
     return f"GT bug: {human_pane_surface} victorious but unacked"
 
 
-def _golden_throne_accountability_prompt(status: RubricStatus, doc_path: Path | None) -> str:
+def _coderabbit_comments_from_fm(fm: dict) -> list[dict]:
+    raw = fm.get(CODERABBIT_COMMENTS_FIELD)
+    return [c for c in raw if isinstance(c, dict)] if isinstance(raw, list) else []
+
+
+def _coderabbit_loc(entry: dict) -> str:
+    """Render a comment's file location as 'path:line' (best-effort)."""
+    path = entry.get("path")
+    line = entry.get("line")
+    if path and line:
+        return f"{path}:{line}"
+    return str(path or "")
+
+
+def _coderabbit_excerpt(body: str, cap: int = 140) -> str:
+    """Collapse a CodeRabbit comment body to a compact one-line excerpt."""
+    text = " ".join((body or "").split())
+    return (text[: cap - 1] + "…") if len(text) > cap else text
+
+
+def _render_missing_condition(key: str, fm: dict) -> str:
+    """Human-readable line for one unmet rubric condition.
+
+    CodeRabbit findings are named with their file location and comment excerpt
+    (from the sibling coderabbit_comments array) instead of a bare numeric key.
+    """
+    if key == CODERABBIT_NITPICK_KEY:
+        nits = [c for c in _coderabbit_comments_from_fm(fm) if c.get("category") == "nitpick"]
+        locs = "; ".join(loc for loc in (_coderabbit_loc(c) for c in nits) if loc)
+        suffix = f" ({locs})" if locs else ""
+        return (
+            f"`{key}`: triage {len(nits)} CodeRabbit nitpick(s){suffix}, then flip this flag true"
+        )
+    if key.startswith(CODERABBIT_KEY_PREFIX) and key != CODERABBIT_PASSED_KEY:
+        entry = next((c for c in _coderabbit_comments_from_fm(fm) if c.get("key") == key), None)
+        if entry:
+            loc = _coderabbit_loc(entry)
+            loc_str = f" at {loc}" if loc else ""
+            return f"CodeRabbit finding{loc_str}: {_coderabbit_excerpt(entry.get('body', ''))}"
+        return "CodeRabbit finding (detail unavailable; see the PR)"
+    return f"`{key}`"
+
+
+def _coderabbit_hold_prompt(status: RubricStatus, doc_path: Path | None, review_state: str) -> str:
+    """Benign HOLD: the only unmet condition is CodeRabbit's own pending review."""
+    doc_line = f"  {doc_path}\n\n" if doc_path else "\n"
+    if review_state == "absent":
+        return (
+            f"Golden Throne check — CodeRabbit absent.\n"
+            f"{doc_line}"
+            f"The only remaining victory condition is `{CODERABBIT_PASSED_KEY}`, but "
+            f"CodeRabbit has not reviewed this PR after a long wait. If CodeRabbit is "
+            f"not configured for this repo, either flip `{CODERABBIT_PASSED_KEY}` "
+            f"manually once you're satisfied, or add it to `{status.rubric_key}_skip` "
+            f"with justification in the doc body. Do not Sisyphus-loop waiting on it."
+        )
+    state_phrase = (
+        "is still reviewing" if review_state == "reviewing" else "has not started its review yet"
+    )
+    return (
+        f"Golden Throne check — CodeRabbit hold.\n"
+        f"{doc_line}"
+        f"The only remaining victory condition is `{CODERABBIT_PASSED_KEY}`, and "
+        f"CodeRabbit {state_phrase} on this PR. This is a HOLD, not a miss: there is "
+        f"no action for you to take yet, and this is NOT a Sisyphus loop. Do not force "
+        f"a victory-ack and do not treat the session as unfinished work.\n"
+        f"When CodeRabbit posts its review, each finding will be folded into this "
+        f"doc's rubric automatically and you'll be pinged to address it. Sit tight."
+    )
+
+
+def _golden_throne_accountability_prompt(
+    status: RubricStatus, doc_path: Path | None, fm: dict | None = None
+) -> str:
     """Persona instruction body injected into the agent's pane.
 
     Names specific unmet conditions and the action ladder. Mirrors the
     aspirant-persona dispatch-boundary framing — the rubric is the contract,
-    silently rolling over is not an option.
+    silently rolling over is not an option. When CodeRabbit findings are among
+    the unmet conditions, each is rendered with its file location and comment
+    excerpt; when the SOLE remaining condition is coderabbit_passed and the bot
+    is still mid-review (or absent), a benign HOLD is returned instead of an
+    accountability accusation.
     """
-    missing_list = ", ".join(f"`{m}`" for m in status.missing) or "(rubric not yet complete)"
+    fm = fm or {}
+    review_state = fm.get(CODERABBIT_REVIEW_STATE_FIELD)
+    if status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
+        "pending",
+        "reviewing",
+        "absent",
+    ):
+        return _coderabbit_hold_prompt(status, doc_path, review_state)
+
+    rendered = [_render_missing_condition(m, fm) for m in status.missing]
+    missing_block = "\n".join(f"  - {line}" for line in rendered) or "  (rubric not yet complete)"
     doc_line = f"  {doc_path}\n\n" if doc_path else "\n"
     return (
         f"Golden Throne accountability check for this session doc.\n"
         f"{doc_line}"
-        f"Unmet conditions: {missing_list}.\n"
+        f"Unmet conditions:\n{missing_block}\n\n"
         f"This session is not done. Either:\n"
         f"  1. Address the unmet condition and flip its frontmatter flag, or\n"
         f"  2. Escalate to Emperor via /api/notify if you are blocked, or\n"
@@ -6483,7 +6982,9 @@ async def golden_throne_followup(session_id: str):
     elif rubric_state == "incomplete":
         # The Voice: name the specific unmet rubric conditions instead of the
         # flat SOP. Falls back to legacy SOP for any non-incomplete state.
-        sop_prompt = _golden_throne_accountability_prompt(rubric_status, doc_path)
+        sop_prompt = _golden_throne_accountability_prompt(
+            rubric_status, doc_path, doc_meta.get("frontmatter")
+        )
         logger.info(
             f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
             f"(missing: {rubric_status.missing})"
@@ -8976,6 +9477,9 @@ async def _victory_ack_core(
             timers_cancelled.append(iid)
         except Exception:
             pass
+        # The doc is acked/archived — stop any CodeRabbit poller too (the poller
+        # also self-disarms on doc_acknowledged, this just stops it immediately).
+        _disarm_coderabbit_sync(iid)
     for iid in timers_cancelled:
         await _gt_clear_fire(iid)
 
@@ -9060,6 +9564,15 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
         logger.warning(f"rubric-flip: write failed for doc {doc_id} key={key}: {exc}")
         raise HTTPException(status_code=500, detail=f"frontmatter write failed: {exc}")
 
+    # Auto-arm the CodeRabbit poller when a PR opens. pr-create already calls
+    # `rubric-flip --extra pr_url=... pr_opened true`, so this needs no CLI change.
+    armed_coderabbit: list[str] = []
+    if key == "pr_opened" and value not in (False, None, 0, "", "false", "False", "0"):
+        try:
+            armed_coderabbit = await _arm_coderabbit_sync_for_doc(doc_id)
+        except Exception as exc:
+            logger.warning(f"rubric-flip: CodeRabbit arm failed for doc {doc_id}: {exc}")
+
     await log_event(
         "session_doc_rubric_flip",
         details={
@@ -9068,10 +9581,17 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
             "key": key,
             "value": value,
             "extra": list(extra.keys()),
+            "coderabbit_armed": armed_coderabbit,
         },
     )
     logger.info(f"rubric-flip: doc {doc_id} {rubric_key or 'victory'}.{key} = {value}")
-    return {"doc_id": doc_id, "key": key, "value": value, "extra": list(extra.keys())}
+    return {
+        "doc_id": doc_id,
+        "key": key,
+        "value": value,
+        "extra": list(extra.keys()),
+        "coderabbit_armed": armed_coderabbit,
+    }
 
 
 # Serializes worktree-registry mutations so the demote-prior-active-then-append

@@ -547,6 +547,169 @@ def update_rubric_field(
     return fm
 
 
+# --- CodeRabbit review reconciliation (pure, network-free) -------------------
+#
+# CodeRabbit posts PR review comments minutes after a PR opens. We fold its
+# *actionable* findings into the session-doc victory rubric as per-comment bool
+# keys so the already-proven Golden Throne walker drives the worker through each
+# one. All rich data (path, line, body) lives in a sibling array; rubric values
+# stay strictly bool so evaluate_rubric() keeps treating them as gate conditions.
+
+# Category markers, matched case-insensitively against the comment body. Order is
+# precedence: the first marker that matches wins. Anything substantive matching
+# none of these is treated as 'actionable' (the conservative default).
+_CODERABBIT_CATEGORY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("outside_diff", ("outside diff range",)),
+    ("duplicate", ("duplicate comment",)),
+    ("nitpick", ("nitpick",)),
+)
+
+# Per-comment rubric keys live under this prefix; the batch nitpick key and the
+# aggregate pass key are fixed names. Rich data goes in the sibling fields.
+CODERABBIT_KEY_PREFIX = "coderabbit_"
+CODERABBIT_NITPICK_KEY = "coderabbit_nitpicks"
+CODERABBIT_PASSED_KEY = "coderabbit_passed"
+CODERABBIT_COMMENTS_FIELD = "coderabbit_comments"
+CODERABBIT_REVIEW_STATE_FIELD = "coderabbit_review_state"
+
+# Cap stored comment bodies so frontmatter stays small; the full suggestion
+# always lives on the PR. Render-time truncation shortens further for pokes/TTS.
+_CODERABBIT_BODY_STORE_CAP = 600
+
+
+def classify_coderabbit_comment(body: str) -> str:
+    """Classify a CodeRabbit comment body.
+
+    Returns one of 'actionable' | 'nitpick' | 'duplicate' | 'outside_diff'.
+    Actionable findings each earn their own rubric key; nitpicks collapse into a
+    single batch key; duplicate / outside-diff are stored but never keyed. A
+    substantive inline comment matching no marker defaults to 'actionable'.
+    """
+    text = (body or "").lower()
+    for category, markers in _CODERABBIT_CATEGORY_MARKERS:
+        if any(marker in text for marker in markers):
+            return category
+    return "actionable"
+
+
+def _coderabbit_comment_key(category: str, comment_id: Any) -> str | None:
+    """Rubric key for a comment, or None if its category is never keyed."""
+    if category == "actionable":
+        return f"{CODERABBIT_KEY_PREFIX}{comment_id}"
+    if category == "nitpick":
+        return CODERABBIT_NITPICK_KEY
+    return None
+
+
+def reconcile_coderabbit_comments(
+    fm: dict,
+    fetched: list[dict],
+    *,
+    review_terminal: bool,
+    rubric_key: str | None = None,
+) -> dict:
+    """Pure reconciler: fold fetched CodeRabbit comments into rubric mutations.
+
+    Pure function of (current frontmatter, fetched comments). Never performs I/O
+    and never mutates ``fm``. Returns a flat dict of frontmatter mutations
+    (``victory`` whole dict + ``coderabbit_comments`` + ``coderabbit_review_state``)
+    intended for ONE atomic ``update_frontmatter`` write. The caller writes only
+    if a mutation actually differs from current frontmatter.
+
+    Rules:
+      - Dedup by comment ``id``. Each NEW actionable comment adds
+        ``coderabbit_<id>: false``. Nitpicks collapse into one
+        ``coderabbit_nitpicks: false`` (added iff >=1 nitpick present). Duplicate
+        / outside-diff / summary comments are stored only, never keyed.
+      - Existing rubric values are PRESERVED (a worker's ``true`` is durable; we
+        never reset true->false and never remove a key here except the terminal
+        prune below).
+      - Worker-flipped keys are mirrored into each entry's ``addressed``.
+      - If ``review_terminal`` and no per-comment key remains unmet, set
+        ``coderabbit_passed: true`` and prune the per-comment keys.
+
+    The caller must only invoke this with a *successful* fetch; on a fetch error
+    it should skip reconciliation so a transient empty result never wipes the
+    stored comment array.
+    """
+    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+    existing_rubric = fm.get(rk)
+    if not isinstance(existing_rubric, dict):
+        # No typed rubric to fold into — nothing this reconciler can safely do.
+        return {}
+    victory = dict(existing_rubric)
+    # Once the aggregate pass is set, the loop is closed: never re-key comments
+    # that are still physically on the PR. Keeps reconcile idempotent post-pass
+    # independent of when the poller disarms.
+    already_passed = bool(victory.get(CODERABBIT_PASSED_KEY))
+
+    comments: list[dict] = []
+    have_nitpick = False
+    seen_ids: set = set()
+    for raw in fetched:
+        if not isinstance(raw, dict):
+            continue
+        cid = raw.get("id")
+        if cid is None or cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        comment_type = raw.get("comment_type", "inline")
+        if comment_type == "summary":
+            category = "summary"
+        else:
+            category = classify_coderabbit_comment(raw.get("body", ""))
+        if category == "nitpick":
+            have_nitpick = True
+        comments.append(
+            {
+                "id": cid,
+                "key": _coderabbit_comment_key(category, cid),
+                "category": category,
+                "path": raw.get("path"),
+                "line": raw.get("line"),
+                "body": (raw.get("body") or "")[:_CODERABBIT_BODY_STORE_CAP],
+                "addressed": False,  # recomputed below from rubric values
+            }
+        )
+
+    # Add keys for NEW actionable comments; preserve all existing rubric values.
+    for entry in comments:
+        key = entry["key"]
+        if not already_passed and entry["category"] == "actionable" and key not in victory:
+            victory[key] = False
+    if not already_passed and have_nitpick and CODERABBIT_NITPICK_KEY not in victory:
+        victory[CODERABBIT_NITPICK_KEY] = False
+
+    # Mirror worker-flipped rubric values into each entry's ``addressed``.
+    for entry in comments:
+        key = entry["key"]
+        entry["addressed"] = bool(key and victory.get(key))
+
+    # Derive review state for the (network-free) poke renderer.
+    if review_terminal:
+        review_state = "complete"
+    elif comments:
+        review_state = "reviewing"
+    else:
+        review_state = "pending"
+
+    # Terminal + every per-comment key addressed → pass + prune the per-comment
+    # keys (coderabbit_passed now stands in for them).
+    per_comment_keys = [
+        k for k in victory if k.startswith(CODERABBIT_KEY_PREFIX) and k != CODERABBIT_PASSED_KEY
+    ]
+    if review_terminal and all(bool(victory.get(k)) for k in per_comment_keys):
+        victory[CODERABBIT_PASSED_KEY] = True
+        for k in per_comment_keys:
+            victory.pop(k, None)
+
+    return {
+        rk: victory,
+        CODERABBIT_COMMENTS_FIELD: comments,
+        CODERABBIT_REVIEW_STATE_FIELD: review_state,
+    }
+
+
 def mark_rubric_notified(file_path: Path, rubric_key: str | None = None) -> dict:
     """Stamp <rubric_key>_notified_at = now() — first-touch Emperor notify."""
     fm, body = read_frontmatter(file_path)
