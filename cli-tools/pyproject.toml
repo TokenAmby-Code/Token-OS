@@ -19,6 +19,7 @@ db-query = "cli_tools.db_query.cli:main"
 db-migrate = "cli_tools.db_migrate.cli:main"
 cloud-logs = "cli_tools.cloud_logs.cli:main"
 followup = "cli_tools.followup.cli:main"
+daily-build = "cli_tools.daily_build.cli:main"
 
 [build-system]
 requires = ["hatchling"]
