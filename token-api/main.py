@@ -2610,30 +2610,6 @@ def _validate_instance_name_slug(tab_name: str | None) -> str:
     return clean
 
 
-async def _refresh_tmux_pane_label(tmux_pane: str | None) -> None:
-    """Best-effort refresh for DB-backed tmux pane border labels."""
-    if not tmux_pane:
-        return
-    try:
-        cache_dir = Path(
-            os.environ.get("TMUX_PANE_LABEL_CACHE", "~/.claude/tmux-pane-label-cache")
-        ).expanduser()
-        (cache_dir / tmux_pane.replace("%", "")).unlink(missing_ok=True)
-    except Exception:
-        pass
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "refresh-client",
-            "-S",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=2)
-    except Exception as exc:
-        logger.debug(f"Pane label refresh failed for {tmux_pane}: {exc}")
-
-
 class LogEntry(BaseModel):
     """Single log entry."""
 
@@ -2756,7 +2732,6 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         )
         await db.commit()
 
-    await _refresh_tmux_pane_label(tmux_pane)
     await log_event(
         "instance_renamed",
         instance_id=instance_id,

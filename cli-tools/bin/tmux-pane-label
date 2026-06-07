@@ -12,10 +12,6 @@
 # won't until they rename). Run once after reloading the tmux config:
 #
 #     tmux-pane-label --backfill
-#
-# Invoked the old positional way (pane_id, pane_title, suppress) it is a deliberate
-# no-op exit 0, so a not-yet-reloaded config that still calls it cannot error or spawn
-# work.
 
 from __future__ import annotations
 
@@ -85,8 +81,11 @@ def _backfill() -> int:
 def main(argv: list[str]) -> int:
     if "--backfill" in argv:
         return _backfill()
-    # Legacy hot-path invocation (pane_id [pane_title [suppress]]) — deliberate no-op.
-    return 0
+    # The pane border no longer invokes this script; --backfill is the only mode.
+    # Reject anything else loudly so a stray positional call surfaces instead of
+    # silently no-op'ing.
+    print("usage: tmux-pane-label --backfill", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
