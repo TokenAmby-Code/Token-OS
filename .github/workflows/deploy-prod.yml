@@ -3,11 +3,17 @@ name: Deploy (prod)
 # Triggers ONLY on merge to main. Per-worktree local dev URLs are untouched —
 # there is no "merge to deploy dev" path. Merge means ship.
 #
-# Token-OS is personal software on a local Mac — "deploy to prod" == restart the
-# right local services. A GH-hosted runner cannot reach the Mac directly, so this
-# joins the Emperor's tailnet (ephemeral node) and POSTs the changed-service list
-# to token-api's /api/cd/restart webhook. The endpoint is ACK-FIRST: it returns
-# 200 immediately and restarts detached, so this job does not hang on the restart.
+# Token-OS is personal software on a local Mac — "deploy to prod" == sync the live
+# checkout and restart the right local services. This pipeline is intentionally
+# DUMB: it does NOT figure out what changed. A GH-hosted runner cannot reach the
+# Mac directly, so it joins the Emperor's tailnet (ephemeral node) and POSTs to
+# token-api's /api/cd/restart webhook. The webhook spawns a single git-aware
+# `token-restart --sync`, which ff-only pulls the live checkout to origin/main and
+# restarts ONLY the services whose files the merge changed (see
+# map_changed_to_services in cli-tools/bin/token-restart). All the "what changed →
+# what restarts" intelligence lives there, in one git-aware place — not split
+# across this workflow and the webhook. The endpoint is ACK-FIRST: it returns 200
+# immediately and restarts detached, so this job does not hang on the restart.
 #
 # Required GitHub secrets (provisioned OUTSIDE this repo):
 #   TS_AUTHKEY        — ephemeral, pre-authorized Tailscale auth key (tagged tag:ci)
@@ -29,8 +35,8 @@ permissions:
   contents: read
   pull-requests: read  # resolve the merged PR url for the pr_state→merged badge flip
 
-# Run JS actions (checkout/paths-filter/tailscale) on Node 24 — Node 20 is being
-# removed from runners (Sep 2026). See .github/workflows/README.md.
+# Run JS actions (tailscale) on Node 24 — Node 20 is being removed from runners
+# (Sep 2026). See .github/workflows/README.md.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -39,55 +45,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── What changed? Map globs → service keys the webhook understands. ──
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      services: ${{ steps.assemble.outputs.services }}
-      any: ${{ steps.assemble.outputs.any }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: changes
-        with:
-          filters: |
-            token_api:
-              - 'token-api/**/*.py'
-              - 'token-api/uv.lock'
-              - 'token-api/pyproject.toml'
-            ops_ui:
-              - 'token-api/ui/ops/**'
-              - 'token-api/web/ops/**'
-            discord:
-              - 'discord-daemon/**'
-            satellite:
-              - 'token-api/token-satellite.py'
-            mobile:
-              - 'mobile/**'
-
-      - name: Assemble changed-service list
-        id: assemble
-        run: |
-          svcs=()
-          [ "${{ steps.changes.outputs.token_api }}" = "true" ] && svcs+=("token-api")
-          [ "${{ steps.changes.outputs.ops_ui }}" = "true" ]    && svcs+=("ops-ui")
-          [ "${{ steps.changes.outputs.discord }}" = "true" ]   && svcs+=("discord-daemon")
-          [ "${{ steps.changes.outputs.satellite }}" = "true" ] && svcs+=("satellite")
-          [ "${{ steps.changes.outputs.mobile }}" = "true" ]    && svcs+=("mobile")
-          if [ ${#svcs[@]} -eq 0 ]; then
-            echo "any=false" >> "$GITHUB_OUTPUT"
-            echo "services=[]" >> "$GITHUB_OUTPUT"
-          else
-            json=$(printf '%s\n' "${svcs[@]}" | jq -R . | jq -cs .)
-            echo "any=true" >> "$GITHUB_OUTPUT"
-            echo "services=$json" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Changed services: ${svcs[*]:-(none)}"
-
-  # ── Restart the affected local services via the tailnet webhook. ──
+  # ── Hit the restart endpoint. token-restart (git-aware) does the rest. ──
   restart:
-    needs: [detect-changes]
-    if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -126,16 +85,14 @@ jobs:
       - name: POST restart webhook (ack-first)
         if: steps.gate.outputs.go == 'true'
         env:
-          SERVICES: ${{ needs.detect-changes.outputs.services }}
           PR_URL: ${{ steps.pr.outputs.url }}
           SHA: ${{ github.sha }}
         run: |
           body=$(jq -nc \
-            --argjson services "$SERVICES" \
             --arg sha "$SHA" \
             --arg pr_url "$PR_URL" \
-            '{services: $services, sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
-          echo "Posting restart for services: $SERVICES"
+            '{sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
+          echo "Posting restart for merge $SHA (token-restart decides what ships)"
           # The endpoint acks immediately then restarts detached; a short timeout is
           # fine. A timeout here almost always means the tailnet ACL blocks :7777.
           code=$(curl -sS -o /tmp/cd_resp.json -w '%{http_code}' \
