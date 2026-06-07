@@ -264,6 +264,30 @@ async def test_pane_session_doc_route_resolves_via_stamp(app_env: Any, monkeypat
     assert out["doc_id"] == 501
 
 
+async def test_pane_session_doc_404_for_stopped_instance(app_env: Any, monkeypatch: Any) -> None:
+    """During the stop->stamp-clear race a stopped instance can still resolve; the
+    route filters status != 'stopped' to stay consistent with pane_instance."""
+    main = app_env.main
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "INSERT INTO session_documents (id, title, file_path, project) VALUES (?, ?, ?, ?)",
+            (502, "Doc", "/Volumes/Imperium/Imperium-ENV/Mars/Sessions/y.md", "mars"),
+        )
+        conn.commit()
+    _insert_instance(
+        app_env.db_path, "inst-Gs", tmux_pane="%STALE", session_doc_id=502, status="stopped"
+    )
+
+    async def _stamp(pane):
+        return "inst-Gs" if pane == "%LIVE" else None
+
+    monkeypatch.setattr(main.shared, "instance_id_for_pane", _stamp)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.pane_session_doc("%LIVE")
+    assert exc.value.status_code == 404
+
+
 # ============================================================================
 # Site: _pane_sender_is_custodes
 # ============================================================================

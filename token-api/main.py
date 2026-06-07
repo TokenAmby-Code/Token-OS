@@ -9756,6 +9756,7 @@ async def pane_session_doc(tmux_pane: str):
                FROM claude_instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
                WHERE ci.id = ?
+                 AND COALESCE(ci.status, '') != 'stopped'
                LIMIT 1""",
             (instance_id,),
         )
