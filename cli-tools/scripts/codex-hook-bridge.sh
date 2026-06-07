@@ -17,6 +17,8 @@ fi
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
+TOKEN_API_CODEX_LAUNCHER="${TOKEN_API_LAUNCHER:-codex-hooks}"
+TOKEN_API_CODEX_ENGINE="${TOKEN_API_ENGINE:-codex}"
 RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/scripts/agent-session-end-resume.sh"
 [[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="/Volumes/Imperium/Token-OS/cli-tools/scripts/agent-session-end-resume.sh"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -36,8 +38,8 @@ if command -v jq >/dev/null 2>&1; then
             --arg ssh_client "${SSH_CLIENT:-}" \
             --arg token_session "${TOKEN_API_SESSION_ID:-}" \
             --arg bridge_id "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
-            --arg token_launcher "${TOKEN_API_LAUNCHER:-}" \
-            --arg token_engine "${TOKEN_API_ENGINE:-}" \
+            --arg token_launcher "$TOKEN_API_CODEX_LAUNCHER" \
+            --arg token_engine "$TOKEN_API_CODEX_ENGINE" \
             --arg token_dispatch_target "${TOKEN_API_DISPATCH_TARGET:-}" \
             --arg token_dispatch_window "${TOKEN_API_DISPATCH_WINDOW:-}" \
             --arg token_dispatch_mode "${TOKEN_API_DISPATCH_MODE:-}" \
@@ -57,6 +59,8 @@ if command -v jq >/dev/null 2>&1; then
             --arg token_discord_channel "${TOKEN_API_DISCORD_CHANNEL:-}" \
             --arg token_discord_bot "${TOKEN_API_DISCORD_BOT:-}" \
             '.action = $action
+             | .launcher //= $token_launcher
+             | .engine //= $token_engine
              | .cwd //= $cwd
              | .pid //= ($pid | tonumber)
              | .env //= {}

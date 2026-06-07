@@ -9,6 +9,7 @@
 --   Middle click  -> F17                  -> ". "
 --   Dial CW       -> F13                  -> scroll down/up equivalent
 --   Dial CCW      -> F14                  -> opposite scroll
+--   F15           -> Ctrl+Space           -> tmux prefix (mirrors ahk/script-compiler.ahk)
 
 -- ===== Key codes =====
 local F18_CODE = 79  -- left click
@@ -16,6 +17,7 @@ local F17_CODE = 64  -- middle click
 local F6_CODE  = 97  -- right click, observed with ctrl+shift
 local F13_CODE = 105 -- dial clockwise
 local F14_CODE = 107 -- dial counter-clockwise
+local F15_CODE = 113 -- tmux prefix -> Ctrl+Space
 
 -- ===== Timing config (seconds) =====
 local TAP_THRESHOLD    = 0.200
@@ -84,6 +86,10 @@ end
 
 local function sendPeriodSpace()
     hs.eventtap.keyStrokes(". ")
+end
+
+local function sendTmuxPrefix()
+    hs.eventtap.keyStroke({"ctrl"}, "space")
 end
 
 local function postDialScroll(delta)
@@ -254,6 +260,10 @@ inputTap = hs.eventtap.new(eventTypes, function(e)
         elseif keyCode == F17_CODE then
             sendPeriodSpace()
             log("middle click -> '. '")
+            return true
+        elseif keyCode == F15_CODE then
+            sendTmuxPrefix()
+            log("F15 -> Ctrl+Space (tmux prefix)")
             return true
         elseif keyCode == F6_CODE then
             local flags = e:getFlags()

@@ -39,6 +39,10 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 #Include *i dial-scroll.ahk  ; Antikater dial — enable when F13/F14 mapped
 #Include *i private.ahk  ; Optional include - won't error if missing
 
+; F15 -> Ctrl+Space (tmux prefix). Mirrors hammerspoon/init.lua so the same
+; physical key drives the tmux prefix on either machine.
+F15::Send("^{Space}")
+
 ^Up:: Send "{Up}{Up}{Up}"
 ^Down:: Send "{Down}{Down}{Down}"
 
