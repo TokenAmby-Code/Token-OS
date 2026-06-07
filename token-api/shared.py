@@ -283,102 +283,168 @@ def get_quiet_hours_status(now: datetime | None = None) -> dict:
 
 # ============ Voice Profiles ============
 
+# Voice profiles are named for Warhammer 40k Space Marine chapters. The chapter's
+# canonical colour drives the slot: `cc_color` is the Claude Code `/color` argument
+# (must be one of red|blue|green|yellow|purple|orange|pink|cyan|default), and the hex
+# `color` is a canonical chapter shade for UI widgets only. Each chapter is bound 1:1
+# to a fixed voice (wsl_voice/wsl_rate/mac_voice never change once assigned).
+
+# PRIMARY pool — distinctive foreign-accent voices, assigned first.
 PROFILES = [
     {
-        "name": "profile_1",
-        "wsl_voice": "Microsoft George",
-        "wsl_rate": 2,
-        "mac_voice": "Daniel",
-        "notification_sound": "chimes.wav",
-        "color": "#66cccc",
-        "cc_color": "cyan",
-    },  # UK M
-    {
-        "name": "profile_2",
-        "wsl_voice": "Microsoft Susan",
-        "wsl_rate": 1,
-        "mac_voice": "Karen",
-        "notification_sound": "notify.wav",
-        "color": "#ff66cc",
-        "cc_color": "pink",
-    },  # UK F
-    {
-        "name": "profile_3",
-        "wsl_voice": "Microsoft Catherine",
-        "wsl_rate": 1,
-        "mac_voice": "Karen",
-        "notification_sound": "ding.wav",
-        "color": "#ffcc00",
-        "cc_color": "yellow",
-    },  # AU F
-    {
-        "name": "profile_5",
-        "wsl_voice": "Microsoft Sean",
-        "wsl_rate": 0,
-        "mac_voice": "Moira",
-        "notification_sound": "chord.wav",
-        "color": "#ff9900",
-        "cc_color": "orange",
-    },  # IE M
-    {
-        "name": "profile_7",
-        "wsl_voice": "Microsoft Heera",
-        "wsl_rate": 1,
-        "mac_voice": "Rishi",
-        "notification_sound": "chimes.wav",
-        "color": "#cc66ff",
-        "cc_color": "purple",
-    },  # IN F
-    {
-        "name": "profile_8",
+        "name": "blood-angels",
         "wsl_voice": "Microsoft Ravi",
         "wsl_rate": 1,
         "mac_voice": "Rishi",
         "notification_sound": "notify.wav",
-        "color": "#ff6666",
+        "color": "#b1191e",
         "cc_color": "red",
     },  # IN M
+    {
+        "name": "ultramarines",
+        "wsl_voice": "Microsoft Susan",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "notify.wav",
+        "color": "#1f4e9b",
+        "cc_color": "blue",
+    },  # UK F
+    {
+        "name": "salamanders",
+        "wsl_voice": "Microsoft Sean",
+        "wsl_rate": 0,
+        "mac_voice": "Moira",
+        "notification_sound": "chord.wav",
+        "color": "#1b7a3d",
+        "cc_color": "green",
+    },  # IE M
+    {
+        "name": "imperial-fists",
+        "wsl_voice": "Microsoft Catherine",
+        "wsl_rate": 1,
+        "mac_voice": "Karen",
+        "notification_sound": "ding.wav",
+        "color": "#e6b800",
+        "cc_color": "yellow",
+    },  # AU F
+    {
+        "name": "emperors-children",
+        "wsl_voice": "Microsoft Heera",
+        "wsl_rate": 1,
+        "mac_voice": "Rishi",
+        "notification_sound": "chimes.wav",
+        "color": "#d44d9c",
+        "cc_color": "pink",
+    },  # IN F
 ]
 
+# FALLBACK pool — generic US voices, overflow only (still flags pool_exhausted).
 FALLBACK_VOICES = [
     {
-        "name": "fallback_1",
+        "name": "soul-drinkers",
         "wsl_voice": "Microsoft David",
         "wsl_rate": 1,
         "mac_voice": "Daniel",
         "notification_sound": "tada.wav",
-        "color": "#888888",
-        "cc_color": "default",
-    },
+        "color": "#6a2fa0",
+        "cc_color": "purple",
+    },  # US M
     {
-        "name": "fallback_2",
+        "name": "legion-of-the-damned",
         "wsl_voice": "Microsoft Zira",
         "wsl_rate": 1,
         "mac_voice": "Karen",
         "notification_sound": "chord.wav",
-        "color": "#999999",
-        "cc_color": "default",
-    },
+        "color": "#d35400",
+        "cc_color": "orange",
+    },  # US F
     {
-        "name": "fallback_3",
+        "name": "alpha-legion",
         "wsl_voice": "Microsoft Mark",
         "wsl_rate": 1,
         "mac_voice": "Daniel",
         "notification_sound": "recycle.wav",
-        "color": "#aaaaaa",
-        "cc_color": "default",
-    },
+        "color": "#2f9e9e",
+        "cc_color": "cyan",
+    },  # US M
 ]
 
+# ULTIMATE FALLBACK — shared overflow slot when every chapter is taken. A cross-chapter
+# kill-team that appears only when there is nothing left to assign.
 ULTIMATE_FALLBACK = {
-    "name": "fallback_david",
+    "name": "deathwatch",
     "wsl_voice": "Microsoft David",
     "wsl_rate": 1,
     "mac_voice": "Daniel",
     "notification_sound": "chimes.wav",
-    "color": "#666666",
+    "color": "#1c1c1c",
     "cc_color": "default",
 }
+
+# ============ Persona profiles ============
+# Persona panes (Custodes, Fabricator-General, Administratum, and any future
+# persona) have their ENTIRE background repainted by tmux (LEGION_PANE_COLORS),
+# so they NEVER take a foreground /color — cc_color is always "default" and the
+# themed background carries their identity. `default` is therefore reserved for
+# personas + the deathwatch overflow; no assignable chapter uses it (that frees
+# yellow to belong to Imperial Fists alone).
+#
+# Custodes is the one persona that SPEAKS: enforcement TTS via George, pulled out
+# of the general rotation. CUSTODES_PROFILE is deliberately NOT in
+# PROFILES/FALLBACK_VOICES, so get_next_available_profile() can never hand George
+# to a worker; that exclusion IS the reservation. Every other persona is voiceless
+# (wsl_voice=None) so it never TTSes and never consumes a chapter voice slot.
+CUSTODES_PROFILE = {
+    "name": "custodes",
+    "wsl_voice": "Microsoft George",
+    "wsl_rate": 2,
+    "mac_voice": "Daniel",
+    "notification_sound": "chimes.wav",
+    "color": "#d4af37",
+    "cc_color": "default",
+}
+
+
+def persona_profile_for(name: str, *, color: str = "#302800") -> dict:
+    """Build a voiceless persona profile.
+
+    Voiceless personas (FG, Administratum, any future non-speaking persona) hold
+    NO voice (wsl_voice=None) and take cc_color="default" — their tmux-painted
+    background is their signature, so no foreground /color is queued. `color` is a
+    UI-widget hue only (defaults to the dark-gold persona shade).
+    """
+    return {
+        "name": name,
+        "wsl_voice": None,
+        "wsl_rate": None,
+        "mac_voice": None,
+        "notification_sound": None,
+        "color": color,
+        "cc_color": "default",
+    }
+
+
+# The current persona panes. Adding a persona = add its pane label to
+# PERSONA_PANE_IDENTITY (routes/hooks.py); a VOICED persona also needs a profile
+# here, a VOICELESS one resolves automatically via resolve_persona_profile().
+FABRICATOR_PROFILE = persona_profile_for("fabricator-general", color="#300808")
+ADMINISTRATUM_PROFILE = persona_profile_for("administratum", color="#300808")
+PERSONA_PROFILES = [CUSTODES_PROFILE, FABRICATOR_PROFILE, ADMINISTRATUM_PROFILE]
+
+
+def resolve_persona_profile(primarch: str | None, legion: str | None = None) -> dict:
+    """Resolve the profile for a persona pane from its primarch (or legion).
+
+    Returns the registered profile for a known persona (Custodes/FG/Administratum)
+    or a generic voiceless persona profile for any future persona. Applied at
+    SessionStart the moment a pane is recognised as a persona, overriding whatever
+    random chapter profile it drew at registration.
+    """
+    name = (primarch or legion or "persona").strip().lower()
+    for p in PERSONA_PROFILES:
+        if p["name"] == name:
+            return p
+    return persona_profile_for(name)
 
 
 def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:

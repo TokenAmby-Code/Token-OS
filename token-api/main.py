@@ -155,6 +155,7 @@ from shared import (
     PEDAL_BYPASS_MS,
     PEDAL_DOUBLE_TAP_MS,
     PEDAL_STATE,
+    PERSONA_PROFILES,
     PHONE_CONFIG,
     PHONE_HEARTBEAT,
     PHONE_STATE,
@@ -9565,7 +9566,7 @@ async def list_instances(
             # Resolve cc_color from profile name
             pn = inst.get("profile_name")
             if pn:
-                for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
                     if p["name"] == pn:
                         inst["color"] = p.get("color", "#0099ff")
                         inst["cc_color"] = p.get("cc_color", "default")
@@ -9658,7 +9659,7 @@ async def get_instance(instance_id: str):
         # Resolve color from profile name
         profile_name = instance.get("profile_name")
         if profile_name:
-            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
                 if p["name"] == profile_name:
                     instance["color"] = p.get("color", "#0099ff")
                     instance["cc_color"] = p.get("cc_color", "default")

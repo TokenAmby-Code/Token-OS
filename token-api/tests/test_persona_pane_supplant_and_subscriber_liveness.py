@@ -196,3 +196,95 @@ def test_subscriber_flag_resolves_live_pane_over_dead_id(app_env, monkeypatch):
     # dead id named in the subscription.
     assert _hook_driven(app_env.db_path, "live-sub") == 1
     assert _hook_driven(app_env.db_path, "dead-sub") == 0
+
+
+# ── Custodes reservation: a pane resolving to legion=custodes gets George ───────
+
+
+def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
+    # A fresh session in the legion:custodes pane resolves to the custodes persona,
+    # which must override whatever random chapter it drew at registration with the
+    # reserved Custodes profile (George). George lives outside the rotation pools,
+    # so this hook is the only path that ever assigns it.
+    hooks = sys.modules["routes.hooks"]
+    from shared import CUSTODES_PROFILE
+
+    async def custodes_label(_pane):
+        return hooks.CUSTODES_PANE_LABEL  # "legion:custodes"
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", custodes_label)
+
+    async def run():
+        return await hooks.handle_session_start(
+            {
+                "session_id": "cust-new",
+                "cwd": "/tmp",
+                "env": {"TMUX_PANE": "%cust", "TOKEN_API_ENGINE": "claude"},
+            }
+        )
+
+    result = asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT legion, profile_name, tts_voice, notification_sound "
+        "FROM claude_instances WHERE id = ?",
+        ("cust-new",),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "custodes session must register a row"
+    legion, profile_name, tts_voice, notification_sound = row
+    assert legion == "custodes"
+    assert profile_name == CUSTODES_PROFILE["name"] == "custodes"
+    assert tts_voice == CUSTODES_PROFILE["wsl_voice"] == "Microsoft George"
+    assert notification_sound == CUSTODES_PROFILE["notification_sound"]
+
+    # The SessionStart response drives the queued /color command (generic-hook.sh
+    # reads .cc_color). Custodes is a persona pane — its whole background is gold-
+    # tinted by tmux — so it takes cc_color=default (no foreground /color), not the
+    # random chapter colour it was assigned a moment before it was recognised.
+    assert result["profile"] == "custodes"
+    assert result["cc_color"] == CUSTODES_PROFILE["cc_color"] == "default"
+    assert result["color"] == CUSTODES_PROFILE["color"]
+
+
+def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
+    # FG (and every persona except Custodes) must register with NO voice — it never
+    # TTSes and never consumes a chapter voice slot — and take cc_color=default so
+    # its tmux-painted background carries its identity instead of a /color.
+    hooks = sys.modules["routes.hooks"]
+    from shared import FABRICATOR_PROFILE
+
+    async def fg_label(_pane):
+        return hooks.MECHANICUS_FG_LABEL  # "mechanicus:fabricator-general"
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", fg_label)
+
+    async def run():
+        return await hooks.handle_session_start(
+            {
+                "session_id": "fg-new",
+                "cwd": "/tmp",
+                "env": {"TMUX_PANE": "%fg", "TOKEN_API_ENGINE": "claude"},
+            }
+        )
+
+    result = asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT legion, profile_name, tts_voice FROM claude_instances WHERE id = ?",
+        ("fg-new",),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "FG session must register a row"
+    legion, profile_name, tts_voice = row
+    assert legion == "fabricator"
+    assert profile_name == FABRICATOR_PROFILE["name"] == "fabricator-general"
+    assert tts_voice is None, "FG must hold no voice (frees a chapter voice slot)"
+
+    # Persona pane → no foreground /color; the response carries cc_color=default.
+    assert result["profile"] == "fabricator-general"
+    assert result["cc_color"] == "default"

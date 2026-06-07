@@ -31,10 +31,16 @@ if [[ "$TITLE" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} || "$TITLE" =~ [0-9]{2}:[0-9]{2} ]]
   exit 2
 fi
 
-DOC=$("$(dirname "$0")/tmuxctl" session-doc --pane current --format json 2>/dev/null || true)
+PANE_TARGET="${TMUX_PANE:-current}"
+if [[ "$PANE_TARGET" == %* ]]; then
+  PANE_TARGET=$("$(dirname "$0")/tmuxctl" resolve-pane --format id "$PANE_TARGET" 2>/dev/null || true)
+fi
+[[ -n "$PANE_TARGET" ]] || PANE_TARGET="current"
+
+DOC=$("$(dirname "$0")/tmuxctl" session-doc --pane "$PANE_TARGET" --format json 2>/dev/null || true)
 DOC_ID=$(echo "$DOC" | jq -r '.id // .doc_id // empty' 2>/dev/null || true)
 if [[ -z "$DOC_ID" ]]; then
-  echo "Error: could not resolve session doc for current cardinal pane" >&2
+  echo "Error: could not resolve session doc for pane ${PANE_TARGET}" >&2
   exit 1
 fi
 

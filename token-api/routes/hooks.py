@@ -56,6 +56,7 @@ from shared import (
     FALLBACK_VOICES,
     MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
+    PERSONA_PROFILES,
     PROFILES,
     ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
@@ -64,6 +65,7 @@ from shared import (
     is_subagent_pid,
     log_event,
     resolve_device_from_ip,
+    resolve_persona_profile,
 )
 
 logger = logging.getLogger("token_api")
@@ -2080,7 +2082,7 @@ async def handle_session_start(payload: dict) -> dict:
                 cc_color = "default"
                 hex_color = "#666666"
                 if updated_inst and updated_inst["profile_name"]:
-                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
                         if p["name"] == updated_inst["profile_name"]:
                             cc_color = p.get("cc_color", "default")
                             hex_color = p.get("color", "#666666")
@@ -2380,7 +2382,7 @@ async def handle_session_start(payload: dict) -> dict:
                 cc_color = "default"
                 hex_color = "#666666"
                 if preserved_profile:
-                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK]:
+                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
                         if p["name"] == preserved_profile:
                             cc_color = p.get("cc_color", "default")
                             hex_color = p.get("color", "#666666")
@@ -2652,10 +2654,35 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:
+            legion_updates = {"legion": auto_legion}
+            # Persona panes (Custodes, FG, Administratum, …) are recognised by their
+            # tmux label. The moment one is, fold in its persona profile, overriding
+            # whatever random chapter it drew at registration: Custodes gets the
+            # reserved George voice (the only path to it — George lives outside the
+            # rotation pools); every other persona is voiceless (tts_voice=None) so
+            # it never TTSes and frees the chapter voice it briefly held. All persona
+            # panes take cc_color="default" — their whole background is tmux-painted.
+            if persona_identity:
+                persona_profile = resolve_persona_profile(
+                    persona_identity.get("primarch"), auto_legion
+                )
+                legion_updates.update(
+                    {
+                        "profile_name": persona_profile["name"],
+                        "tts_voice": persona_profile["wsl_voice"],
+                        "notification_sound": persona_profile["notification_sound"],
+                    }
+                )
+                # Rebind the local profile so the SessionStart response carries the
+                # persona name/colour. generic-hook.sh queues `/color` from the
+                # response's cc_color (="default" for personas), so the pane keeps
+                # its themed background instead of the random chapter foreground it
+                # was assigned a moment ago.
+                profile = persona_profile
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"legion": auto_legion},
+                updates=legion_updates,
                 mutation_type="instance_updated",
                 write_source="hooks",
                 actor="SessionStart",

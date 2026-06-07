@@ -397,6 +397,9 @@ class TestPersonaPaneAutoSetup:
         # synced is NOT set at registration (#67): custodes resolves via the
         # pane marker; the morning session flips synced to 1 while live.
         assert row["synced"] == 0
+        # Custodes is the one persona that speaks: reserved George voice.
+        assert row["profile_name"] == "custodes"
+        assert row["tts_voice"] == "Microsoft George"
 
     def test_fabricator_general_pane(self, client):
         # FG owns the dedicated singleton legion "fabricator" (not "mechanicus" —
@@ -406,6 +409,9 @@ class TestPersonaPaneAutoSetup:
         assert row["primarch"] == "fabricator-general"
         assert row["instance_type"] == "hook_driven"
         assert row["synced"] == 0
+        # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
+        assert row["profile_name"] == "fabricator-general"
+        assert row["tts_voice"] is None
 
     def test_administratum_pane(self, client):
         # Administratum resolves on primarch='administratum' — the field that
@@ -415,6 +421,9 @@ class TestPersonaPaneAutoSetup:
         assert row["primarch"] == "administratum"
         assert row["instance_type"] == "hook_driven"
         assert row["synced"] == 0
+        # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
+        assert row["profile_name"] == "administratum"
+        assert row["tts_voice"] is None
 
     def test_worker_pane_defaults(self, client):
         """A non-persona pane (mechanicus worker) still defaults

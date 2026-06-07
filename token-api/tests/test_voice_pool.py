@@ -10,16 +10,37 @@ import pytest
 PROFILES = []
 FALLBACK_VOICES = []
 ULTIMATE_FALLBACK = {}
+CUSTODES_PROFILE = {}
+PERSONA_PROFILES = []
 get_next_available_profile = None
 DB_PATH = None
+
+# The valid argument set for Claude Code's /color command. Every profile's
+# cc_color must be one of these or the queued /color command is rejected.
+VALID_CC_COLORS = {
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "purple",
+    "orange",
+    "pink",
+    "cyan",
+    "default",
+}
 
 
 @pytest.fixture(autouse=True)
 def _bind_main_exports(app_env):
-    global PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK, get_next_available_profile, DB_PATH
+    global PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK, CUSTODES_PROFILE, PERSONA_PROFILES
+    global get_next_available_profile, DB_PATH
     PROFILES = app_env.main.PROFILES
     FALLBACK_VOICES = app_env.main.FALLBACK_VOICES
     ULTIMATE_FALLBACK = app_env.main.ULTIMATE_FALLBACK
+    # CUSTODES_PROFILE / PERSONA_PROFILES live in shared (main no longer re-exports
+    # CUSTODES_PROFILE — only voice.py needs it directly).
+    CUSTODES_PROFILE = app_env.shared.CUSTODES_PROFILE
+    PERSONA_PROFILES = app_env.shared.PERSONA_PROFILES
     get_next_available_profile = app_env.main.get_next_available_profile
     DB_PATH = app_env.main.DB_PATH
 
@@ -37,7 +58,7 @@ class TestLinearProbe:
         assert not exhausted
 
     def test_no_duplicates_in_primary_pool(self):
-        """Filling the primary pool should produce 9 unique voices."""
+        """Filling the primary pool should produce one unique voice per chapter."""
         used = set()
         for _ in range(len(PROFILES)):
             profile, exhausted = get_next_available_profile(used)
@@ -48,7 +69,7 @@ class TestLinearProbe:
         assert len(used) == len(PROFILES)
 
     def test_fallback_after_primary_exhausted(self):
-        """After 9 primary voices, should dip into fallback (David/Zira/Mark)."""
+        """After the primary pool is full, should dip into fallback (David/Zira/Mark)."""
         used = {p["wsl_voice"] for p in PROFILES}
 
         profile, exhausted = get_next_available_profile(used)
@@ -66,7 +87,7 @@ class TestLinearProbe:
             used.add(profile["wsl_voice"])
 
     def test_ultimate_fallback_when_all_exhausted(self):
-        """When all 12 voices are taken, should return ultimate fallback (David)."""
+        """When all rotation voices are taken, should return ultimate fallback (David)."""
         used = {p["wsl_voice"] for p in PROFILES}
         used |= {fb["wsl_voice"] for fb in FALLBACK_VOICES}
 
@@ -77,7 +98,7 @@ class TestLinearProbe:
 
     def test_released_slot_is_reused(self):
         """Stopping an instance should free its voice for reassignment."""
-        used = {p["wsl_voice"] for p in PROFILES}  # All 9 taken
+        used = {p["wsl_voice"] for p in PROFILES}  # All primary taken
         released_voice = PROFILES[3]["wsl_voice"]
         used.discard(released_voice)
 
@@ -110,6 +131,69 @@ class TestLinearProbe:
         # Each voice should be picked at least once in 1000 runs (extremely high probability)
         for voice, count in counts.items():
             assert count > 0, f"{voice} was never assigned in 1000 runs"
+
+
+class TestChapterRosterInvariants:
+    """Invariants for the Space Marine chapter roster and the Custodes reservation."""
+
+    def test_custodes_voice_is_reserved_from_all_pools(self):
+        """George (Custodes) must live outside every rotation pool, so the probe
+        can never hand it to a worker. That exclusion IS the reservation."""
+        assert CUSTODES_PROFILE["wsl_voice"] == "Microsoft George"
+        rotation_voices = {p["wsl_voice"] for p in PROFILES}
+        rotation_voices |= {fb["wsl_voice"] for fb in FALLBACK_VOICES}
+        rotation_voices.add(ULTIMATE_FALLBACK["wsl_voice"])
+        assert CUSTODES_PROFILE["wsl_voice"] not in rotation_voices
+
+    def test_probe_never_returns_george(self):
+        """Even when every voice is exhausted, the probe falls to Deathwatch/David,
+        never to George."""
+        used = {p["wsl_voice"] for p in PROFILES}
+        used |= {fb["wsl_voice"] for fb in FALLBACK_VOICES}
+        used.add(ULTIMATE_FALLBACK["wsl_voice"])
+        for _ in range(50):
+            profile, _exhausted = get_next_available_profile(used)
+            assert profile["wsl_voice"] != CUSTODES_PROFILE["wsl_voice"]
+
+    def test_every_cc_color_is_a_valid_color_argument(self):
+        """Every profile's cc_color must be a valid Claude Code /color argument,
+        or the queued /color command is rejected."""
+        all_slots = [*PROFILES, *FALLBACK_VOICES, ULTIMATE_FALLBACK, *PERSONA_PROFILES]
+        for slot in all_slots:
+            assert slot["cc_color"] in VALID_CC_COLORS, (
+                f"{slot['name']} has invalid cc_color {slot['cc_color']!r}"
+            )
+
+    def test_chapter_names_are_unique_slugs(self):
+        """Each chapter/persona slot has a distinct kebab-case name."""
+        all_slots = [*PROFILES, *FALLBACK_VOICES, ULTIMATE_FALLBACK, *PERSONA_PROFILES]
+        names = [slot["name"] for slot in all_slots]
+        assert len(names) == len(set(names)), f"duplicate slug in {names}"
+        assert all(n == n.lower() and " " not in n for n in names)
+
+    def test_no_assignable_chapter_uses_default(self):
+        """default is reserved for persona panes + the deathwatch overflow; no
+        rotation chapter may use it (that keeps yellow unique to Imperial Fists)."""
+        for slot in [*PROFILES, *FALLBACK_VOICES]:
+            assert slot["cc_color"] != "default", f"{slot['name']} must not be default"
+        # yellow belongs to exactly one rotation chapter now that Custodes vacated it.
+        yellow_chapters = [
+            s["name"] for s in PROFILES + FALLBACK_VOICES if s["cc_color"] == "yellow"
+        ]
+        assert yellow_chapters == ["imperial-fists"]
+
+    def test_persona_panes_are_default_colour(self):
+        """Every persona pane takes cc_color=default — its tmux-painted background
+        is its signature, so no foreground /color is queued."""
+        for p in PERSONA_PROFILES:
+            assert p["cc_color"] == "default", f"{p['name']} persona must be cc_color=default"
+
+    def test_only_custodes_persona_has_a_voice(self):
+        """Custodes is the one persona that speaks (George). Every other persona is
+        voiceless (wsl_voice=None) so it never TTSes and never holds a chapter slot."""
+        voiced = [p for p in PERSONA_PROFILES if p["wsl_voice"]]
+        assert [p["name"] for p in voiced] == ["custodes"]
+        assert all(p["wsl_voice"] is None for p in PERSONA_PROFILES if p["name"] != "custodes")
 
 
 # ============ Integration tests via API ============
