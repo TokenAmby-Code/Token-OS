@@ -251,6 +251,15 @@ sync_venv_if_needed() {
 #     on the current code (degrade to the no-sync behavior).
 
 resolve_live_checkout() {
+    # Explicit override (ops escape hatch / tests): point the sync at a specific
+    # checkout. Honored only if the path exists, so a stale export can't misdirect
+    # the sync; otherwise we fall through to launchd/$TOKEN_OS autodetection.
+    if [[ -n "${CD_LIVE_CHECKOUT:-}" && -d "${CD_LIVE_CHECKOUT}" ]]; then
+        git -C "${CD_LIVE_CHECKOUT}" rev-parse --show-toplevel 2>/dev/null \
+            || printf '%s\n' "${CD_LIVE_CHECKOUT}"
+        return 0
+    fi
+
     # The git toplevel of the launchd-served WorkingDirectory (don't hardcode).
     local workdir="" toplevel=""
     if [[ -f "$PLIST" ]]; then
@@ -334,14 +343,14 @@ sync_live_checkout() {
         return 0
     fi
 
-    local new_head
+    local new_head changed_paths
     new_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
     echo -e "  ${GREEN}✓${NC} CD-sync: fast-forwarded ${old_head:0:9} → ${new_head:0:9}"
-
-    # Record that the checkout advanced + exactly which files the pull changed, so
-    # full_restart() can restart ONLY the affected services (git-aware deploy).
-    SYNC_DID_ADVANCE=true
-    SYNC_CHANGED_PATHS="$(git -C "$dir" diff --name-only "$old_head" "$new_head" 2>/dev/null || true)"
+    # Capture exactly which files the pull changed, but don't advertise the advance
+    # to full_restart() until we KNOW the tree ends up on new_head with WIP intact.
+    # A conflicting pop rolls back to old_head, where we must restart on the current
+    # (old) code — NOT smart-deploy files that never actually shipped.
+    changed_paths="$(git -C "$dir" diff --name-only "$old_head" "$new_head" 2>/dev/null || true)"
 
     # Reapply WIP on top of the new HEAD.
     if [[ -n "$my_stash" ]]; then
@@ -361,8 +370,16 @@ sync_live_checkout() {
                 git -C "$dir" reset --hard "$old_head" >/dev/null 2>&1 || true
                 echo -e "  ${RED}✗${NC} CD-sync: rolled back to ${old_head:0:9}; WIP preserved in stash (${my_stash:0:9}) — manual 'git stash pop' needed"
             fi
+            # Tree is back on old_head → leave SYNC_DID_ADVANCE=false so
+            # full_restart() restarts the standard set on the current code.
+            return 0
         fi
     fi
+
+    # Tree is on new_head (clean ff, or ff + clean WIP pop): advertise the advance
+    # so full_restart() restarts ONLY the services this pull changed.
+    SYNC_DID_ADVANCE=true
+    SYNC_CHANGED_PATHS="$changed_paths"
     return 0
 }
 

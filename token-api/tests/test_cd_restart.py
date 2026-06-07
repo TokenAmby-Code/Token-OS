@@ -159,11 +159,25 @@ def test_merged_pr_flips_instance_badge(client):
 # ── Time-window coalescing ───────────────────────────────────
 
 
-def test_concurrent_restart_coalesces(client, spawned):
+def test_duplicate_sha_coalesces(client, spawned):
+    # Two webhooks for the SAME merge (duplicate/retry delivery) inside the window
+    # collapse to a single token-restart.
     first = client.post("/api/cd/restart", json={"sha": "a"}, headers=_auth())
-    second = client.post("/api/cd/restart", json={"sha": "b"}, headers=_auth())
+    second = client.post("/api/cd/restart", json={"sha": "a"}, headers=_auth())
     assert first.status_code == 200 and second.status_code == 200
     assert "scheduled" in first.json()["restart"]
     assert "coalesced" in second.json()["restart"]
     # only ONE token-restart spawned despite two webhooks in the same window
     assert len(_self_restarts(spawned)) == 1
+
+
+def test_distinct_sha_not_coalesced(client, spawned):
+    # A DIFFERENT sha inside the window is a real later deploy — the first
+    # token-restart --sync may have already fetched origin/main before this merge
+    # landed, so it must spawn its own sync rather than be swallowed as a dupe.
+    first = client.post("/api/cd/restart", json={"sha": "a"}, headers=_auth())
+    second = client.post("/api/cd/restart", json={"sha": "b"}, headers=_auth())
+    assert first.status_code == 200 and second.status_code == 200
+    assert "scheduled" in first.json()["restart"]
+    assert "scheduled" in second.json()["restart"]
+    assert len(_self_restarts(spawned)) == 2

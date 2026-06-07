@@ -34,8 +34,12 @@ def _stub_env(tmp_path: Path, changed_paths: str, *, no_advance: bool = False):
     logfile = tmp_path / "calls.log"
     logfile.touch()
 
-    # The live checkout the fake sync "advances". nas-path.sh exports
-    # TOKEN_OS=$IMPERIUM/Token-OS, so point IMPERIUM here and create that dir.
+    # The live checkout the fake sync "advances". We point token-restart at it
+    # via CD_LIVE_CHECKOUT (its explicit override seam) — NOT via IMPERIUM, which
+    # nas-path.sh unconditionally re-derives from the machine config (so on a
+    # Linux CI runner TOKEN_OS would be /mnt/imperium/Token-OS, which doesn't
+    # exist, and resolve_live_checkout would abort → full-restart fallback). The
+    # override must point at a real dir, so create it.
     repo = tmp_path / "Token-OS"
     repo.mkdir(exist_ok=True)
 
@@ -92,7 +96,7 @@ esac
         **os.environ,
         "PATH": f"{stub_bin}:{os.environ['PATH']}",
         "IMPERIUM_MACHINE": "mac",
-        "IMPERIUM": str(tmp_path),
+        "CD_LIVE_CHECKOUT": str(repo),
         "STUB_REPO": str(repo),
         "STUB_CHANGED_PATHS": changed_paths,
     }

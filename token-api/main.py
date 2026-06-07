@@ -14823,13 +14823,17 @@ async def cancel_shutdown():
 # not a substitute for the secret.
 _CD_SECRET_ENV = "CD_RESTART_SECRET"
 
-# In-flight guard: coalesce duplicate restart webhooks by a short time window.
-# A latched boolean can't work anymore — a git-aware token-restart may NOT restart
-# token-api (e.g. a discord-only or mobile-only deploy), so this process survives
-# and a stuck boolean would block every future deploy. Distinct merges are
-# serialized minutes apart by the workflow's concurrency group, so a window this
-# short only ever swallows a genuine same-event duplicate, never a real 2nd deploy.
+# In-flight guard: coalesce duplicate restart webhooks for the SAME commit within
+# a short time window. A latched boolean can't work anymore — a git-aware
+# token-restart may NOT restart token-api (e.g. a discord-only or mobile-only
+# deploy), so this process survives and a stuck boolean would block every future
+# deploy. Keying on the sha (not time alone) is load-bearing: a distinct later
+# merge arriving inside the window is a REAL 2nd deploy that the first
+# `token-restart --sync` may have already missed in its fetch, so it must still
+# spawn its own sync. Only an identical sha (a duplicate/retry of the same event)
+# is swallowed.
 _cd_last_restart_spawn = 0.0  # time.monotonic() of the last token-restart spawn
+_cd_last_restart_sha: str | None = None  # sha of that spawn (coalesce only true dupes)
 _CD_COALESCE_WINDOW_S = 15.0
 
 
@@ -14884,7 +14888,7 @@ async def cd_restart(request: Request):
     Returns immediately; the restart is deferred to a detached child so this 200
     flushes first.
     """
-    global _cd_last_restart_spawn
+    global _cd_last_restart_spawn, _cd_last_restart_sha
 
     configured = os.environ.get(_CD_SECRET_ENV, "").strip()
     if not configured:
@@ -14922,15 +14926,17 @@ async def cd_restart(request: Request):
     # ff-only pulls the live checkout to origin/main so the merge actually ships,
     # then restarts ONLY the services it changed. (--sync is token-restart's
     # default now; we still pass it explicitly so the CD path always syncs
-    # regardless of any future default change.) Coalesce duplicate webhooks by a
-    # short time window — see _CD_COALESCE_WINDOW_S. save_restart_state() guards
-    # against kickstart -k skipping a graceful lifespan shutdown.
+    # regardless of any future default change.) Coalesce only an identical sha
+    # inside the window (a duplicate/retry of the same merge) — see
+    # _CD_COALESCE_WINDOW_S; a different sha is a real later deploy and must spawn.
+    # save_restart_state() guards against kickstart -k skipping a graceful
+    # lifespan shutdown. Record the window AFTER a successful spawn so a spawn
+    # failure doesn't suppress retries.
     now = time.monotonic()
-    if now - _cd_last_restart_spawn < _CD_COALESCE_WINDOW_S:
+    if sha and sha == _cd_last_restart_sha and now - _cd_last_restart_spawn < _CD_COALESCE_WINDOW_S:
         restart = "coalesced (recent restart in flight)"
         logger.info("CD: restart coalesced (sha=%s, services=%s)", sha, services)
     else:
-        _cd_last_restart_spawn = now
         try:
             save_restart_state()
         except Exception as e:
@@ -14940,6 +14946,8 @@ async def cd_restart(request: Request):
             ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
             log_name="self-restart",
         )
+        _cd_last_restart_spawn = now
+        _cd_last_restart_sha = sha
         restart = "scheduled (detached, ~2s)"
         logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
 
