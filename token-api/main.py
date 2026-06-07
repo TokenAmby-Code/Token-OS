@@ -3496,6 +3496,14 @@ async def _gt_clear_fire(instance_id: str) -> None:
 CODERABBIT_REVIEWER_LOGINS = ("coderabbitai[bot]", "coderabbitai")
 CODERABBIT_COMMIT_STATUS_CONTEXT = "coderabbit"
 CODERABBIT_SYNC_INTERVAL_SECONDS = 75
+# Per gh-call wall-clock cap. _fetch_coderabbit_comments makes four sequential,
+# individually capped gh calls, so the bounded inner total is ~4x this.
+CODERABBIT_GH_TIMEOUT_SECONDS = 20
+# The threadsafe wrapper must wait PAST that bounded inner total (+ buffer for the
+# DB/file IO around it) before giving up — otherwise it abandons a still-running
+# pass on APP_LOOP and the next interval starts a second pass racing it on the same
+# frontmatter. Kept comfortably above 4x the gh cap.
+CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS = 4 * CODERABBIT_GH_TIMEOUT_SECONDS + 30
 CODERABBIT_SYNC_JOB_PREFIX = "coderabbit-sync-"
 # Past this age with no CodeRabbit activity, treat the review as absent so the
 # poke renderer stops implying the worker is stalling on a bot that isn't coming.
@@ -3524,7 +3532,7 @@ async def _gh_api_json(path_args: list[str]):
             ["gh", "api", *path_args],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            timeout=20,
+            timeout=CODERABBIT_GH_TIMEOUT_SECONDS,
         )
     except Exception:
         return None
@@ -3536,25 +3544,67 @@ async def _gh_api_json(path_args: list[str]):
         return None
 
 
+def _coderabbit_fetch_error(reason: str) -> dict:
+    """A fetch result that tells the poller to SKIP this round (no reconcile)."""
+    return {"comments": [], "review_terminal": False, "error": reason}
+
+
 async def _fetch_coderabbit_comments(repo: str, pr_number: str) -> dict:
     """Fetch CodeRabbit PR comments + review terminality via `gh`.
 
     Mirrors pr-review-loop's calls: inline review comments, issue (summary)
     comments filtered to the CodeRabbit bot, and the `coderabbit` commit-status
     context for terminality (REST has no reliable per-thread `resolved` field —
-    true thread resolution is GraphQL-only and deferred to v2). Fails SOFT: any
-    error returns error set + empty comments so the poller no-ops that round and
-    never corrupts frontmatter.
+    true thread resolution is GraphQL-only and deferred to v2).
+
+    Fetches are FULLY paginated (`--paginate`) and ALL-OR-NOTHING: any failed or
+    incomplete fetch — a list call that errors, PR metadata that isn't a dict, a
+    missing head sha, or a statuses call that errors — returns an error result with
+    empty comments so the poller no-ops that round. The reconciler is therefore
+    never fed truncated data and can never prune coderabbit_* keys or misclassify
+    review terminality from a partial view. review_terminal is computed ONLY from a
+    fully-fetched status list.
     """
-    inline = await _gh_api_json([f"repos/{repo}/pulls/{pr_number}/comments?per_page=100"])
-    if inline is None:
-        return {"comments": [], "review_terminal": False, "error": "inline_fetch_failed"}
-    issue = await _gh_api_json([f"repos/{repo}/issues/{pr_number}/comments?per_page=100"])
+    inline = await _gh_api_json(
+        [f"repos/{repo}/pulls/{pr_number}/comments?per_page=100", "--paginate"]
+    )
+    if not isinstance(inline, list):
+        return _coderabbit_fetch_error("inline_fetch_failed")
+    issue = await _gh_api_json(
+        [f"repos/{repo}/issues/{pr_number}/comments?per_page=100", "--paginate"]
+    )
     if not isinstance(issue, list):
-        issue = []
+        return _coderabbit_fetch_error("issue_fetch_failed")
+
+    # PR metadata: head sha (for commit status), open/closed, merged, created_at.
+    pr_obj = await _gh_api_json([f"repos/{repo}/pulls/{pr_number}"])
+    if not isinstance(pr_obj, dict):
+        return _coderabbit_fetch_error("pr_meta_failed")
+    head_sha = (pr_obj.get("head") or {}).get("sha")
+    if not head_sha:
+        return _coderabbit_fetch_error("pr_meta_no_head_sha")
+    pr_state = pr_obj.get("state")
+    pr_created_at = pr_obj.get("created_at")
+    merged = bool(pr_obj.get("merged_at"))
+
+    # Commit statuses (fully paginated) drive review terminality. A failed/partial
+    # statuses fetch must NOT silently read as "not terminal" — skip the round.
+    statuses = await _gh_api_json(
+        [f"repos/{repo}/commits/{head_sha}/statuses?per_page=100", "--paginate"]
+    )
+    if not isinstance(statuses, list):
+        return _coderabbit_fetch_error("statuses_fetch_failed")
+    cr = [
+        s
+        for s in statuses
+        if isinstance(s, dict)
+        and str(s.get("context") or "").lower().startswith(CODERABBIT_COMMIT_STATUS_CONTEXT)
+    ]
+    cr.sort(key=lambda s: s.get("updated_at") or "")
+    review_terminal = bool(cr and cr[-1].get("state") in ("success", "failure"))
 
     comments: list[dict] = []
-    for raw in inline if isinstance(inline, list) else []:
+    for raw in inline:
         if not isinstance(raw, dict):
             continue
         if (raw.get("user") or {}).get("login") not in CODERABBIT_REVIEWER_LOGINS:
@@ -3582,30 +3632,6 @@ async def _fetch_coderabbit_comments(repo: str, pr_number: str) -> dict:
                 "comment_type": "summary",
             }
         )
-
-    # PR metadata: head sha (for commit status), open/closed, merged, created_at.
-    pr_obj = await _gh_api_json([f"repos/{repo}/pulls/{pr_number}"])
-    head_sha = pr_state = pr_created_at = None
-    merged = False
-    if isinstance(pr_obj, dict):
-        head_sha = (pr_obj.get("head") or {}).get("sha")
-        pr_state = pr_obj.get("state")
-        pr_created_at = pr_obj.get("created_at")
-        merged = bool(pr_obj.get("merged_at"))
-
-    review_terminal = False
-    if head_sha:
-        statuses = await _gh_api_json([f"repos/{repo}/commits/{head_sha}/statuses?per_page=100"])
-        if isinstance(statuses, list):
-            cr = [
-                s
-                for s in statuses
-                if isinstance(s, dict)
-                and str(s.get("context") or "").lower().startswith(CODERABBIT_COMMIT_STATUS_CONTEXT)
-            ]
-            cr.sort(key=lambda s: s.get("updated_at") or "")
-            if cr and cr[-1].get("state") in ("success", "failure"):
-                review_terminal = True
 
     return {
         "comments": comments,
@@ -3652,11 +3678,33 @@ def _disarm_coderabbit_sync(instance_id: str) -> None:
 
 
 def _coderabbit_sync_sync(instance_id: str) -> dict:
-    """APScheduler thread entrypoint; bridges to the async pass (mirrors the GT wrapper)."""
+    """APScheduler thread entrypoint; bridges to the async pass (mirrors the GT wrapper).
+
+    The outer wait is sized ABOVE the bounded inner gh budget so a normal pass
+    completes in place. If it still overruns, the in-flight coroutine is cancelled
+    and awaited before returning: this thread must not free its APScheduler slot
+    while a pass is still running on APP_LOOP, or the next interval would start a
+    second pass racing it on the same frontmatter (max_instances guards the thread,
+    not the orphaned coroutine).
+    """
     try:
         if APP_LOOP and APP_LOOP.is_running():
             future = asyncio.run_coroutine_threadsafe(_coderabbit_sync_once(instance_id), APP_LOOP)
-            return future.result(timeout=60)
+            try:
+                return future.result(timeout=CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS)
+            except TimeoutError:
+                future.cancel()
+                # Block until it actually unwinds (a single in-flight gh call is
+                # itself capped) so nothing is left touching the doc when we return.
+                try:
+                    future.result(timeout=CODERABBIT_GH_TIMEOUT_SECONDS + 5)
+                except Exception:
+                    pass
+                logger.warning(
+                    f"CodeRabbit sync: pass exceeded "
+                    f"{CODERABBIT_SYNC_PASS_TIMEOUT_SECONDS}s for {instance_id[:12]}; cancelled"
+                )
+                return {"success": False, "instance_id": instance_id, "error": "pass_timeout"}
         return asyncio.run(_coderabbit_sync_once(instance_id))
     except Exception as exc:
         logger.exception(f"CodeRabbit sync: pass failed for {instance_id[:12]}")

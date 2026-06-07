@@ -577,7 +577,7 @@ CODERABBIT_REVIEW_STATE_FIELD = "coderabbit_review_state"
 _CODERABBIT_BODY_STORE_CAP = 600
 
 
-def classify_coderabbit_comment(body: str, comment_type: str = "inline") -> str:
+def classify_coderabbit_comment(body: str) -> str:
     """Classify a CodeRabbit comment body.
 
     Returns one of 'actionable' | 'nitpick' | 'duplicate' | 'outside_diff'.
@@ -657,7 +657,7 @@ def reconcile_coderabbit_comments(
         if comment_type == "summary":
             category = "summary"
         else:
-            category = classify_coderabbit_comment(raw.get("body", ""), comment_type)
+            category = classify_coderabbit_comment(raw.get("body", ""))
         if category == "nitpick":
             have_nitpick = True
         comments.append(
