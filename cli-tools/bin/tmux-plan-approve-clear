@@ -115,7 +115,11 @@ while true; do
     fi
     now=$(date +%s)
     if (( now - start >= TIMEOUT )); then
-        set_planning_state planning
+        # Leave planning_state at `approving` (set at launch) — the accurate
+        # "approval requested, outcome unobserved" state. The post-approval
+        # Write/Edit (PostToolUse auto-clear) or the next SessionStart resolves it
+        # to `none`. This watcher is no longer the authority for that transition;
+        # it stays only as the auto-clicker for the clear-context modal.
         $DRY_RUN && echo "action=none timeout"
         exit 0
     fi
