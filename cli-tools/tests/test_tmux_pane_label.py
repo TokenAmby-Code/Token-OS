@@ -1,3 +1,10 @@
+"""tmux-pane-label is retired from the pane-border hot path (Phase 1 Part A).
+
+It now survives only as a deploy-time `--backfill` that seeds @PANE_LABEL on panes
+that pre-date the push path, and the legacy positional invocation is a deliberate
+no-op so a not-yet-reloaded tmux config cannot error or spawn work.
+"""
+
 from __future__ import annotations
 
 import os
@@ -10,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "tmux-pane-label"
 
 
-def _make_db(path: Path, *, status: str) -> None:
+def _make_db(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
+    """rows: (id, tab_name, tmux_pane, status)."""
     conn = sqlite3.connect(path)
     try:
         conn.execute(
@@ -18,38 +26,42 @@ def _make_db(path: Path, *, status: str) -> None:
             CREATE TABLE claude_instances (
                 id TEXT PRIMARY KEY,
                 tab_name TEXT,
-                engine TEXT,
-                zealotry INTEGER,
                 tmux_pane TEXT,
-                status TEXT,
-                last_activity TEXT
+                status TEXT
             )
             """
         )
-        conn.execute(
-            """
-            INSERT INTO claude_instances
-                (id, tab_name, engine, zealotry, tmux_pane, status, last_activity)
-            VALUES
-                ('abc123', 'Old Agent', 'claude', 4, '%1', ?, '2026-05-05T12:00:00')
-            """,
-            (status,),
+        conn.executemany(
+            "INSERT INTO claude_instances (id, tab_name, tmux_pane, status) VALUES (?, ?, ?, ?)",
+            rows,
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def _run_label(tmp_path: Path, db: Path) -> subprocess.CompletedProcess[str]:
+def _fake_tmux(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake `tmux` on PATH that logs each invocation's args to a file."""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "tmux-calls.log"
+    fake = bindir / "tmux"
+    fake.write_text('#!/bin/sh\necho "$*" >> "$TMUX_CALL_LOG"\nexit 0\n')
+    fake.chmod(0o755)
+    return bindir, log
+
+
+def _run(
+    script_args: list[str], *, db: Path, bindir: Path, log: Path
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "AGENTS_DB": str(db),
-        "APSCHEDULER_DB": str(tmp_path / "missing-scheduler.db"),
-        "TMUX_PANE_LABEL_CACHE": str(tmp_path / "cache"),
-        "TOKEN_API_URL": "http://127.0.0.1:9",
+        "TMUX_CALL_LOG": str(log),
+        "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
     }
     return subprocess.run(
-        [sys.executable, str(SCRIPT), "%1"],
+        [sys.executable, str(SCRIPT), *script_args],
         text=True,
         capture_output=True,
         check=False,
@@ -57,25 +69,40 @@ def _run_label(tmp_path: Path, db: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_active_instance_renders_label(tmp_path: Path) -> None:
+def test_backfill_seeds_pane_label_for_live_panes_only(tmp_path: Path) -> None:
     db = tmp_path / "agents.db"
-    _make_db(db, status="idle")
+    _make_db(
+        db,
+        [
+            ("live1", "auth-refactor", "%1", "idle"),
+            ("live2", "docs-fix", "%3", "processing"),
+            ("dead1", "gone", "%2", "stopped"),  # excluded: stopped
+            ("noname", "", "%4", "idle"),  # excluded: empty name
+            ("nopane", "has-name", "", "idle"),  # excluded: empty pane
+        ],
+    )
+    bindir, log = _fake_tmux(tmp_path)
 
-    proc = _run_label(tmp_path, db)
+    proc = _run(["--backfill"], db=db, bindir=bindir, log=log)
 
-    assert proc.returncode == 0
-    assert "Old Agent" in proc.stdout
+    assert proc.returncode == 0, proc.stderr
+    assert "2 pane(s)" in proc.stdout
+    calls = log.read_text().splitlines() if log.exists() else []
+    assert "set-option -p -t %1 @PANE_LABEL auth-refactor" in calls
+    assert "set-option -p -t %3 @PANE_LABEL docs-fix" in calls
+    # Excluded rows never touch tmux.
+    assert not any("%2" in c for c in calls)
+    assert not any("%4" in c for c in calls)
+    assert not any("has-name" in c for c in calls)
 
 
-def test_stopped_instance_does_not_render_or_keep_cached_label(tmp_path: Path) -> None:
+def test_legacy_positional_invocation_is_a_noop(tmp_path: Path) -> None:
     db = tmp_path / "agents.db"
-    _make_db(db, status="stopped")
-    cache_file = tmp_path / "cache" / "1"
-    cache_file.parent.mkdir()
-    cache_file.write_text("stale label")
+    _make_db(db, [("live1", "auth-refactor", "%1", "idle")])
+    bindir, log = _fake_tmux(tmp_path)
 
-    proc = _run_label(tmp_path, db)
+    proc = _run(["%1", "some-title", "false"], db=db, bindir=bindir, log=log)
 
     assert proc.returncode == 0
     assert proc.stdout == ""
-    assert not cache_file.exists()
+    assert not log.exists(), "legacy hot-path invocation must not shell out to tmux"

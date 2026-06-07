@@ -1,196 +1,93 @@
 #!/usr/bin/env python3
-# tmux-pane-label - DB-backed tmux pane border identity segment
+# tmux-pane-label - One-shot @PANE_LABEL backfill for live tmux panes
 # TAGS: tmux, token-api
 # AUDIENCE: human, agent
+#
+# RETIRED FROM THE HOT PATH (Phase 1 Part A). The pane border no longer shells out
+# to this script every status-interval; it reads the in-memory @PANE_LABEL pushed by
+# Token-API (SessionStart hydration + trg_tab_name_pane_state → pane_state_worker).
+#
+# This survives only as a deploy-time backfill: seed @PANE_LABEL on panes that were
+# already alive before Phase 1 shipped (they never got a SessionStart hydration and
+# won't until they rename). Run once after reloading the tmux config:
+#
+#     tmux-pane-label --backfill
+#
+# Invoked the old positional way (pane_id, pane_title, suppress) it is a deliberate
+# no-op exit 0, so a not-yet-reloaded config that still calls it cannot error or spawn
+# work.
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
+import subprocess
 import sys
-from datetime import datetime
-from pathlib import Path
 
-
-API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
 AGENTS_DB = os.environ.get("AGENTS_DB", os.path.expanduser("~/.claude/agents.db"))
-SCHEDULER_DB = os.environ.get(
-    "APSCHEDULER_DB", os.path.expanduser("~/.claude/apscheduler.db")
-)
-GT_TOTAL_SECONDS_BY_ZEALOTRY = {
-    4: 30 * 60,
-    5: 20 * 60,
-    6: 15 * 60,
-    7: 10 * 60,
-    8: 7 * 60,
-    9: 5 * 60,
-    10: 60,
-}
-BAR_WIDTH = 14
-CACHE_DIR = Path(os.environ.get("TMUX_PANE_LABEL_CACHE", "~/.claude/tmux-pane-label-cache")).expanduser()
 
 
-def _get_json(path: str, timeout: float = 0.5):
-    import urllib.request
+def _live_labels() -> list[tuple[str, str]]:
+    """Return (tmux_pane, tab_name) for every non-stopped instance with both set.
 
+    Best-effort seed: uses the stored tmux_pane (what the trigger also stamps). The
+    pane_state_worker keeps @PANE_LABEL fresh after this; this only covers panes that
+    pre-date the push path.
+    """
     try:
-        with urllib.request.urlopen(f"{API_URL}{path}", timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except Exception:
-        return None
-
-
-def _parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _get_instance_by_pane(pane: str) -> dict | None:
-    try:
-        conn = sqlite3.connect(f"file:{AGENTS_DB}?mode=ro", uri=True, timeout=0.75)
-        conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(f"file:{AGENTS_DB}?mode=ro", uri=True, timeout=1.0)
         try:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT id, tab_name, engine, zealotry
+                SELECT tmux_pane, tab_name
                 FROM claude_instances
-                WHERE tmux_pane = ?
-                  AND status != 'stopped'
-                ORDER BY last_activity DESC
-                LIMIT 1
-                """,
-                (pane,),
-            ).fetchone()
-            return dict(row) if row else None
+                WHERE status != 'stopped'
+                  AND tmux_pane IS NOT NULL AND tmux_pane != ''
+                  AND tab_name IS NOT NULL AND tab_name != ''
+                """
+            ).fetchall()
         finally:
             conn.close()
-    except Exception:
-        return None
+    except Exception as exc:
+        print(f"tmux-pane-label: DB read failed: {exc}", file=sys.stderr)
+        return []
+    return [(str(p), str(n)) for p, n in rows]
 
 
-def _get_gt_next_fire(instance_id: str) -> str | None:
-    try:
-        conn = sqlite3.connect(f"file:{SCHEDULER_DB}?mode=ro", uri=True, timeout=0.75)
+def _backfill() -> int:
+    pairs = _live_labels()
+    if not pairs:
+        print("tmux-pane-label: no live panes to backfill")
+        return 0
+    applied = 0
+    failed = 0
+    for pane, name in pairs:
         try:
-            row = conn.execute(
-                "SELECT next_run_time FROM apscheduler_jobs WHERE id = ?",
-                (f"golden-throne-{instance_id}",),
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row or row[0] is None:
-            return None
-        return datetime.fromtimestamp(float(row[0])).isoformat()
-    except Exception:
-        return None
+            proc = subprocess.run(
+                ("tmux", "set-option", "-p", "-t", pane, "@PANE_LABEL", name),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                applied += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    summary = f"tmux-pane-label: backfilled @PANE_LABEL on {applied} pane(s)"
+    if failed:
+        summary += f", {failed} failed"
+    print(summary)
+    return 0
 
 
-def _remaining_seconds(next_fire: str | None) -> int | None:
-    fire_at = _parse_time(next_fire)
-    if not fire_at:
-        return None
-    now = datetime.now(fire_at.tzinfo) if fire_at.tzinfo else datetime.now()
-    return int((fire_at - now).total_seconds())
-
-
-def _format_remaining(seconds: int | None) -> str:
-    if seconds is None:
-        return ""
-    if seconds <= 0:
-        return "GT due"
-    minutes = (seconds + 59) // 60
-    if minutes < 60:
-        return f"GT {minutes}m"
-    hours = minutes // 60
-    rem = minutes % 60
-    return f"GT {hours}h{rem:02d}m" if rem else f"GT {hours}h"
-
-
-def _gt_bar(seconds: int | None, zealotry: int | None) -> str:
-    if seconds is None:
-        return ""
-    if seconds <= 0:
-        return "#[fg=colour231,bg=red,bold,blink] GT DUE #[default]"
-
-    total = GT_TOTAL_SECONDS_BY_ZEALOTRY.get(zealotry or 4, GT_TOTAL_SECONDS_BY_ZEALOTRY[4])
-    ratio = max(0.0, min(1.0, seconds / total))
-    filled = max(1, round(BAR_WIDTH * ratio))
-    empty = BAR_WIDTH - filled
-
-    if ratio > 0.66:
-        fg = "green"
-    elif ratio > 0.33:
-        fg = "yellow"
-    else:
-        fg = "red"
-
-    return f"#[fg={fg},bold][{'#' * filled}{'-' * empty}]#[default]"
-
-
-def _cache_path(pane: str) -> Path:
-    return CACHE_DIR / pane.replace("%", "")
-
-
-def _write_cached_label(pane: str, label: str) -> None:
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _cache_path(pane).write_text(label)
-    except Exception:
-        pass
-
-
-def _clear_cached_label(pane: str) -> None:
-    try:
-        _cache_path(pane).unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-def main() -> int:
-    pane = sys.argv[1] if len(sys.argv) > 1 else ""
-    pane_title = sys.argv[2].strip() if len(sys.argv) > 2 else ""
-    suppress_title = (sys.argv[3].strip().lower() if len(sys.argv) > 3 else "") == "true"
-    if not pane:
-        return 0
-
-    match = _get_instance_by_pane(pane)
-    if not match:
-        instances = _get_json("/api/instances") or []
-        pane_matches = [inst for inst in instances if inst.get("tmux_pane") == pane]
-        match = next((inst for inst in pane_matches if inst.get("status") != "stopped"), None)
-    if not match:
-        _clear_cached_label(pane)
-        if pane_title and not suppress_title:
-            print(f"#[fg=colour231,bg=colour31,bold] {pane_title} #[default]")
-        return 0
-
-    name = (match.get("tab_name") or "").strip()
-    if not name:
-        name = (match.get("engine") or "agent").strip()
-
-    next_fire = match.get("gt_next_fire") or _get_gt_next_fire(match["id"])
-    remaining = _remaining_seconds(next_fire)
-    gt = _format_remaining(remaining)
-    zealotry = match.get("zealotry")
-    try:
-        zealotry = int(zealotry) if zealotry is not None else None
-    except (TypeError, ValueError):
-        zealotry = None
-
-    parts = [f"#[fg=colour231,bg=colour31,bold] {name} #[default]"]
-    if gt:
-        parts.append(_gt_bar(remaining, zealotry))
-        parts.append(f"#[fg=colour220,bold]{gt}#[default]")
-    label = " ".join(parts)
-    _write_cached_label(pane, label)
-    print(label)
+def main(argv: list[str]) -> int:
+    if "--backfill" in argv:
+        return _backfill()
+    # Legacy hot-path invocation (pane_id [pane_title [suppress]]) — deliberate no-op.
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
