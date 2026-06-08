@@ -133,5 +133,6 @@ def test_run_records_marker_before_send_and_skips_suppressed(monkeypatch, db_pat
     # Gate closed (typing) → send suppressed → no new marker for a fresh pane.
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda **kw: True)
     monkeypatch.setattr(send_gate, "sanctioned_override", lambda: None)
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
     adapter.run("send-keys", "-t", "%8", "blocked")
     assert all(r[0] != "%8" for r in _markers(db_path)), "suppressed send must write no marker"

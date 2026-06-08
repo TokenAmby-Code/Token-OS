@@ -65,6 +65,7 @@ def test_send_text_then_submit_raises_when_gate_suppresses(monkeypatch, captured
     _force_quiet(monkeypatch, False)
     _force_typing(monkeypatch, True)
     _no_override(monkeypatch)
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
     monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
 
     adapter = TmuxAdapter(tmux_binary="tmux")
