@@ -7,6 +7,9 @@
   Tunables below are env overrides for the script's defaults — edit here to tune
   without touching code. GC_PATTERN may be added here to opt build tools in (see
   the script header for the daemon-kill caveat).
+  Log growth is bounded by in-script self-truncation: the script keeps the last
+  ~1000 lines of its own ~/.claude/process-gc-watchdog.log once it exceeds 2000
+  (one summary line per run); the StdOut/StdErr logs below stay ~empty.
   ProgramArguments points at a LOCAL copy of the script, NOT the NAS path. launchd's
   context cannot read/execve a file off the SMB mount (macOS Sequoia TCC gates
   network-volume access per-binary; system bash under launchd lacks it → exit 126

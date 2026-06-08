@@ -36,9 +36,21 @@
 # see the install block in the plist. The script touches the NAS not at all at
 # runtime, so the local copy is fully self-contained.
 
-set -u
+set -euo pipefail
 
 LOG_FILE="$HOME/.claude/process-gc-watchdog.log"
+
+# Keep our own log bounded (one summary line per 5-min run). launchd's
+# stdout/stderr logs stay ~empty, so only this file needs trimming. The
+# if-condition keeps this exempt from `set -e`; the mv is atomic, and the
+# tmp file is removed on any failure.
+if [[ -f "$LOG_FILE" ]] && (( $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) > 2000 )); then
+  if tail -n 1000 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null; then
+    mv -f "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null || true
+  else
+    rm -f "$LOG_FILE.tmp"
+  fi
+fi
 
 # --- Tunables (env-overridable via the plist) -------------------------------
 GC_CPU_MIN="${GC_CPU_MIN:-40}"       # integer %CPU; reap only above this
