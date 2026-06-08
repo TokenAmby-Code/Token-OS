@@ -44,6 +44,13 @@ if [[ -z "$PANE" ]]; then
     PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
 fi
 
+# Real actions target $PANE (agent-cmd / tmux send-keys); refuse to proceed with
+# an empty target. Dry-run is purely informational, so let it through.
+if [[ -z "$PANE" ]] && ! $DRY_RUN; then
+    echo "tmux-plan-menu: no target pane (pass --pane or run inside tmux)" >&2
+    exit 1
+fi
+
 json_escape() {
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
@@ -91,24 +98,39 @@ else:
 # recommends it; the payload here remains the default plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
-    local body
+    local body rc=0
     body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
     curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
-        -H 'Content-Type: application/json' -d "$body" >/dev/null || true
+        -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
+    if (( rc != 0 )); then
+        echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/hooks/subscribe failed (curl exit $rc)" >&2
+        return "$rc"
+    fi
 }
 
 set_planning_state() {
     local state="$1"
     tmux set-option -p -t "$PANE" @PLANNING_STATE "$state" 2>/dev/null || true
     [[ -z "$API_URL" ]] && return 0
-    local body
+    local body rc=0
     body="{\"tmux_pane\":$(json_escape "$PANE"),\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-menu\"}"
     curl -sf --max-time 1 -X POST "${API_URL}/api/planning/state" \
-        -H 'Content-Type: application/json' -d "$body" >/dev/null || true
+        -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
+    if (( rc != 0 )); then
+        echo "tmux-plan-menu: set_planning_state POST ${API_URL}/api/planning/state failed (curl exit $rc)" >&2
+        return "$rc"
+    fi
 }
 
+# agent-cmd resolves its backend from TOKEN_API_URL (nas-path.sh keeps an
+# inherited non-empty value), so propagate our resolved URL that way to keep one
+# action on one backend. Leave it unset when we have none, so agent-cmd resolves.
 send_to_pane() {
-    "${_script_dir}/agent-cmd" --pane "$PANE" "$1"
+    if [[ -n "$API_URL" ]]; then
+        TOKEN_API_URL="$API_URL" "${_script_dir}/agent-cmd" --pane "$PANE" "$1"
+    else
+        "${_script_dir}/agent-cmd" --pane "$PANE" "$1"
+    fi
 }
 
 # Pick the action via fzf unless one was supplied (--selection, for tests/scripting).
@@ -138,13 +160,16 @@ case "$SELECTION" in
                 "$PANE" "$AGENT_RESOLVED" "$leader"
             exit 0
         fi
-        subscribe_preplan
-        set_planning_state preplanning
+        if ! subscribe_preplan; then
+            echo "tmux-plan-menu: aborting preplan — could not arm the plan auto-submit subscription" >&2
+            exit 1
+        fi
+        set_planning_state preplanning || true   # advisory hint; never block the leader send
         send_to_pane "$leader"
         ;;
     plan)
         if $DRY_RUN; then printf 'pane=%s selection=plan send:/plan state:planning\n' "$PANE"; exit 0; fi
-        set_planning_state planning
+        set_planning_state planning || true   # advisory hint; /plan is independent of token-api
         send_to_pane "/plan"
         ;;
     compact)
