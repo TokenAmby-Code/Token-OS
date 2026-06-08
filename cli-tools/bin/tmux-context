@@ -7,7 +7,6 @@
 2. Sets @CONTEXT_INFO pane option for tmux pane border display
 3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
 4. Nudges agent to plan mode at 250k token threshold (non-blocking)
-5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
 
 Enriches display with Token-API instance data (voice, session doc).
 
@@ -33,7 +32,6 @@ import urllib.request
 STATE_DIR = "/tmp/claude-panes"
 FLUSH_TOKEN_THRESHOLD = 250_000  # used context tokens — nudge agent to plan mode for refocus
 FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
-MODE_ENFORCE_COOLDOWN = 8  # seconds — don't re-check mode within 8s of last correction
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 # ANSI colors for status line output
@@ -292,70 +290,6 @@ def check_pre_compact(pane_id, pct, total_tokens):
     subprocess.Popen([agent_cmd, "--pane", pane_id, msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def enforce_bypass_mode(pane_id):
-    """Detect invalid mode and correct: accept-edits → bypass, no-mode → plan.
-
-    Only plan and bypass are valid modes. Fires tmux-mode-toggle in
-    background to correct. No-mode targets plan (instance lacks bypass flag).
-    """
-    if not pane_id or not os.environ.get("TMUX"):
-        return
-
-    safe_id = pane_id.lstrip("%")
-    marker = os.path.join(STATE_DIR, f"mode-enforce-{safe_id}.ts")
-
-    # Cooldown: skip if we corrected recently
-    try:
-        if os.path.exists(marker):
-            with open(marker) as f:
-                last = float(f.read().strip())
-            if time.time() - last < MODE_ENFORCE_COOLDOWN:
-                return
-    except Exception:
-        pass
-
-    # Capture last 5 lines to detect mode (same technique as tmux-mode-toggle)
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-5"],
-            capture_output=True, text=True, timeout=1
-        )
-        tail = result.stdout
-    except Exception:
-        return
-
-    # Valid modes — no correction needed
-    if "bypass permissions on" in tail or "plan mode on" in tail:
-        return
-
-    # Invalid: "accept edits on" is unambiguous
-    is_accept = "accept edits on" in tail
-    # Invalid: no mode indicator at all = "none" mode
-    is_none = (not is_accept
-               and "bypass permissions" not in tail
-               and "plan mode" not in tail
-               and "accept edits" not in tail)
-
-    if not is_accept and not is_none:
-        return
-
-    # Write cooldown BEFORE correction to prevent re-entrancy
-    os.makedirs(STATE_DIR, exist_ok=True)
-    try:
-        with open(marker, "w") as f:
-            f.write(str(time.time()))
-    except Exception:
-        pass
-
-    # Fire correction in background (non-blocking)
-    subprocess.Popen(
-        ["tmux-mode-toggle", "--pane", pane_id],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def main():
     data = read_input()
     if not data:
@@ -422,9 +356,6 @@ def main():
     doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
 
     print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{voice_str}{doc_str}")
-
-    # --- 5. Enforce bypass mode (auto-correct accept-edits/no-mode) ---
-    enforce_bypass_mode(pane_id)
 
 
 if __name__ == "__main__":
