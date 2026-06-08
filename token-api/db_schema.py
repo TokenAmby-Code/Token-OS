@@ -162,26 +162,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "planning_source",
                 "ALTER TABLE claude_instances ADD COLUMN planning_source TEXT",
             ),
-            # "Agent has a PR open" flag (Phase 1). Additive + nullable, no backfill
-            # lock. pr_state ∈ {open, merged}; surfaced as a /ui/ops badge. pr_state is
-            # flipped to 'merged' by the CD restart-on-merge webhook (Phase 2).
-            (
-                "pr_url",
-                "ALTER TABLE claude_instances ADD COLUMN pr_url TEXT",
-            ),
-            (
-                "pr_state",
-                "ALTER TABLE claude_instances ADD COLUMN pr_state TEXT",
-            ),
-            # Per-instance "this instance is being driven autonomously, not by the
-            # Emperor" flag. Set =1 before an automated / agent-to-agent wake is sent
-            # to the target; cleared =0 on Stop/SessionEnd. compute_work_state discounts
-            # hook_driven instances at read-time (belt-and-suspenders with the low-level
-            # automated_pane_activity marker). See hook_driven redesign.
-            (
-                "hook_driven",
-                "ALTER TABLE claude_instances ADD COLUMN hook_driven INTEGER DEFAULT 0",
-            ),
         ]
         for column_name, sql in instance_migrations:
             if column_name not in columns:
@@ -948,23 +928,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
-        # A rename queues the raw display name to @PANE_LABEL (Phase 1 Part A).
-        # The pane border reads @PANE_LABEL in-format (zero fork per redraw) instead
-        # of shelling out to tmux-pane-label every status-interval. Mirrors
-        # trg_status_pane_state; pane_state_worker pushes it generically. Styling
-        # stays in the format string — the var carries data, not presentation.
-        # NEW.tab_name IS NOT NULL guards the queue's NOT NULL value column: a rename
-        # to NULL would otherwise abort the parent UPDATE on the constraint.
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_tab_name_pane_state
-            AFTER UPDATE OF tab_name ON claude_instances
-            WHEN OLD.tab_name IS NOT NEW.tab_name AND NEW.tab_name IS NOT NULL
-            BEGIN
-                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                VALUES (NEW.id, '@PANE_LABEL', NEW.tab_name, NEW.tmux_pane);
-            END
-        """)
-
         # ── Session Doc Sync Queue ──
         # Trigger-driven session doc frontmatter updates. Fires on status change,
         # tab rename, doc link, and doc unlink — keeps agents: list coherent.
@@ -1078,14 +1041,11 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 1,
             ),
             (
-                "morning_supervisor_arm",
-                "Morning Supervisor Arm",
-                "Bookkeeping check (the only fixed day-start cron): derive expected wake "
-                "empirically from the last same-type real ack and arm the relative "
-                "morning-session watchdog poller. The reactive day-start stays "
-                "event-driven (alarm_silenced); there is no magic-number wake cron.",
+                "day_start_schedule_fallback",
+                "Day Start Schedule Fallback",
+                "Fire the unified day-start hook at the default wake anchor if not already fired",
                 "cron",
-                "0 4 * * *",
+                "30 8 * * *",
                 0,
             ),
         ]
@@ -1097,14 +1057,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             """,
                 (task_id, name, description, task_type, schedule, max_retries),
             )
-
-        # Retire the legacy magic-number day-start fallback. There is no fixed
-        # wake-anchor cron anymore: the reactive day-start is event-driven
-        # (alarm_silenced), and "expected wake" lives only in the morning
-        # supervisor. Drop any pre-existing row so an older DB stops firing the
-        # phantom 08:30 morning session. History in task_executions is retained.
-        await db.execute("DELETE FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'")
-        await db.execute("DELETE FROM task_locks WHERE task_id = 'day_start_schedule_fallback'")
 
         checkin_tasks = [
             (

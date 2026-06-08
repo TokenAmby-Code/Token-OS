@@ -16,16 +16,8 @@ permissions:
   pull-requests: read
   checks: write
 
-# Run JS actions (checkout/setup-python/upload-artifact) on Node 24 — Node 20 is
-# being removed from runners (Sep 2026). See .github/workflows/README.md.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
-  # Renamed from "quality" so the blocking pr.yml job is the ONLY "quality" check
-  # — branch protection requires "quality" unambiguously (this advisory run also
-  # fires on the PR's head-branch push and would otherwise collide by name).
-  push-advisory:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

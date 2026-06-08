@@ -413,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
                     target = control.adapter.run(
                         "display-message", "-t", pane, "-p", "#{session_name}:#{window_index}"
                     ).strip()
-                layout_result = enforce_stack_layout(
+                result = enforce_stack_layout(
                     control.adapter,
                     target,
                     focused_pane=pane,
@@ -421,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
                     admit=args.admit,
                     kill_pending_clear=args.kill_pending_clear,
                 )
-                print(layout_result)
+                print(result)
                 return 0
 
         if args.command == "legion":

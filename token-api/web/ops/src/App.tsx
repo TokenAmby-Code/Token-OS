@@ -1,13 +1,11 @@
 import { useEffect, useRef } from 'react';
-import { useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
+import { useOpsState, useTimerHistory, useOpsGraph } from './api';
 import { formatClock } from './format';
-import { HudRings } from './components/TopStrip';
+import { TopStrip } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
 import { InstancesPanel } from './components/InstancesPanel';
 import { AssertionsPanel, AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
 import { VoiceQueuePanel } from './components/VoiceQueuePanel';
-import { TtsStrip } from './components/TtsStrip';
-import { PipelinePanel } from './components/PipelinePanel';
 import { OpsGraph } from './components/OpsGraph';
 
 function Panel({
@@ -36,7 +34,6 @@ export function App() {
   const ops = useOpsState();
   const timer = useTimerHistory();
   const graph = useOpsGraph();
-  const docs = useSessionDocs();
 
   const state = ops.data;
   const initialBuildId = useRef<string | null | undefined>(undefined);
@@ -59,17 +56,6 @@ export function App() {
   return (
     <div className="cockpit">
       <div className="cockpit__grain" aria-hidden />
-
-      {/* Free-floating, corner-aligned dials. Fixed to the viewport, overlays
-          content, scroll-independent. Not a banner — just the gauges. */}
-      {state ? (
-        <div className="dials" aria-hidden>
-          <HudRings state={state} />
-        </div>
-      ) : null}
-
-      {/* Identity + connection scroll with the page — deliberately NOT part of
-          the persistent overlay. */}
       <header className="masthead">
         <div className="masthead__id">
           <span className="masthead__sigil">⛭</span>
@@ -93,10 +79,6 @@ export function App() {
         </div>
       </header>
 
-      {/* Slim, TTS-specific control strip — in flow after the masthead, pins to
-          the top on scroll (sticky). Not a banner; below the floating dials. */}
-      {state ? <TtsStrip state={state} refresh={ops.refresh} /> : null}
-
       {ops.loading && !state ? (
         <div className="boot">
           <div className="boot__bar"><span /></div>
@@ -109,6 +91,8 @@ export function App() {
         </div>
       ) : (
         <>
+          <TopStrip state={state} />
+
           <Panel
             title="State assertions"
             meta={<span className="panel__meta-note">what Token-API believes is true</span>}
@@ -147,23 +131,6 @@ export function App() {
             <InstancesPanel instances={state.instances.active} />
           </Panel>
 
-          <Panel
-            title="Session pipeline"
-            meta={
-              <span className="panel__meta-note">
-                read-only · authored in Obsidian
-                {docs.data ? ` · ${docs.data.docs.length} docs` : ''}
-                {docs.error ? ' · offline' : ''}
-              </span>
-            }
-          >
-            {docs.data ? (
-              <PipelinePanel feed={docs.data} />
-            ) : (
-              <div className="chart-empty">Loading pipeline…</div>
-            )}
-          </Panel>
-
           <div className="row row--split">
             <Panel title="Attention evidence">
               <AttentionPanel state={state} />
@@ -186,12 +153,11 @@ export function App() {
               </span>
             }
           >
-            <VoiceQueuePanel state={state} refresh={ops.refresh} />
+            <VoiceQueuePanel state={state} />
           </Panel>
 
           <Panel
             title="Relationship graph"
-            className="panel--graph"
             meta={<span className="panel__meta-note">{graph.data?.graph ?? '—'}{graph.error ? ' · mock' : ''}</span>}
           >
             {graph.data ? <OpsGraph graph={graph.data} /> : <div className="chart-empty">Loading graph…</div>}

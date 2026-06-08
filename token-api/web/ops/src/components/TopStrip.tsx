@@ -1,187 +1,77 @@
-// The persistent glanceable HUD: the <2s "am I working / in debt / distracted /
-// blocked?" readout, rendered as a cluster of floating circular gauges that
-// live in the fixed top bar (bound to the viewport, never to scroll position).
-// Magnitudes become arcs; enum/bool states become center glyphs (per the rule
-// that app *names* — free text — get a short label, everything else a gauge).
+// Persistent glanceable strip: the <2s "am I working / in debt / distracted /
+// blocked?" readout. Single row on desktop, wraps to a grid on narrow frames.
 
-import { useEffect, useRef, useState } from 'react';
 import type { OpsState } from '../types';
-import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
-import { formatSignedClock, formatClock } from '../format';
-import { clearPhoneAttention } from '../api';
-import { Ring } from './Ring';
+import { modeVisual } from '../modes';
+import { formatSignedDuration } from '../format';
 
-// One banked hour of break fills the ring; debt fills it in hazard.
-const BREAK_SCALE_MS = 60 * 60 * 1000;
-
-// Two-tap arm window for the "I'm not on my phone" clear: first tap arms the
-// Phone dial (glyph → "clear?"), a second tap within this window commits, and
-// otherwise it silently disarms — no accidental one-tap clears.
-const PHONE_CLEAR_ARM_MS = 3000;
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+function Stat({
+  label,
+  value,
+  detail,
+  tone,
+  accent,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+  tone?: 'good' | 'bad' | 'warn' | 'neutral';
+  accent?: string;
+}) {
+  return (
+    <div className={`stat ${tone ? `stat--${tone}` : ''}`}>
+      <span className="stat__label">{label}</span>
+      <strong className="stat__value" style={accent ? { color: accent } : undefined}>{value}</strong>
+      {detail ? <span className="stat__detail">{detail}</span> : null}
+    </div>
+  );
 }
 
-// Work-action staleness fade endpoints (RGB), interpolated each poll.
-const WA_FRESH: [number, number, number] = [147, 217, 79]; // --m-working
-const WA_STALE: [number, number, number] = [255, 91, 61]; // --hazard
-
-function waFadeColor(ratio: number): string {
-  const mix = (a: number, b: number) => Math.round(a + (b - a) * ratio);
-  return `rgb(${mix(WA_FRESH[0], WA_STALE[0])}, ${mix(WA_FRESH[1], WA_STALE[1])}, ${mix(WA_FRESH[2], WA_STALE[2])})`;
-}
-
-function waAgo(minutes: number): string {
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${Math.round(minutes)}m ago`;
-  const h = Math.floor(minutes / 60);
-  return `${h}h ${Math.round(minutes % 60).toString().padStart(2, '0')}m`;
-}
-
-export function HudRings({ state }: { state: OpsState }) {
+export function TopStrip({ state }: { state: OpsState }) {
   const mv = modeVisual(state.timer.mode);
-  const bal = state.timer.break_balance_ms;
   const debt = state.timer.is_in_backlog;
-  const breakRatio = Math.min(1, Math.abs(bal) / BREAK_SCALE_MS);
-
-  const desk = state.attention.desktop;
-  const phone = state.attention.phone;
+  const phoneDistracted = state.attention.phone.is_distracted;
   const pending = state.enforcement.pending_count;
-  const active = state.instances.counts.active;
-  const stale = state.instances.counts.stale;
-
-  const alarmAcked = state.alarm?.acked ?? false;
-  const alarmTime = state.alarm?.day_started_at ? formatClock(state.alarm.day_started_at) : null;
-
-  // Work-action dial #1 (load-bearing): today's count, with a green→red fade as
-  // the last explicit action goes stale — the "log a work action" nudge.
-  const wa = state.work_actions;
-  const waFadeMin = wa?.stale_fade_minutes || 30;
-  const waLastMs = wa?.last_at ? Date.parse(wa.last_at) : NaN;
-  const waHasLast = Number.isFinite(waLastMs);
-  const waMinsSince = waHasLast ? Math.max(0, (Date.now() - waLastMs) / 60000) : null;
-  const waStale = waMinsSince == null ? 0 : Math.max(0, Math.min(1, waMinsSince / waFadeMin));
-  const waColor = waHasLast ? waFadeColor(waStale) : 'var(--muted)';
-  const waDetail = !waHasLast ? 'none today' : waStale >= 1 ? 'log one' : waAgo(waMinsSince ?? 0);
-  const waTone: 'good' | 'warn' | 'bad' | 'neutral' = !waHasLast
-    ? 'neutral'
-    : waStale >= 1
-      ? 'bad'
-      : waStale >= 0.5
-        ? 'warn'
-        : 'good';
-
-  const deskLabel = desk.steam_app_name
-    ? truncate(desk.steam_app_name, 11)
-    : desk.work_mode || desk.mode || '—';
-  const phoneLabel = phone.app ? truncate(phone.app, 11) : 'clear';
-
-  // Phone dial doubles as the "I'm not on my phone" clear: arm on first tap,
-  // commit on a second tap within PHONE_CLEAR_ARM_MS, else auto-disarm.
-  const [phoneArmed, setPhoneArmed] = useState(false);
-  const phoneArmTimer = useRef<number | undefined>(undefined);
-  useEffect(() => () => window.clearTimeout(phoneArmTimer.current), []);
-  function tapPhoneDial() {
-    if (phoneArmed) {
-      window.clearTimeout(phoneArmTimer.current);
-      setPhoneArmed(false);
-      clearPhoneAttention().catch((err) => console.error('phone clear failed', err));
-      return;
-    }
-    setPhoneArmed(true);
-    phoneArmTimer.current = window.setTimeout(() => setPhoneArmed(false), PHONE_CLEAR_ARM_MS);
-  }
 
   return (
-    <div className="rings">
-      <Ring
-        label="Timer"
-        glyph={mv.glyph}
-        detail={mv.label.toLowerCase()}
-        color={mv.color}
-        title={`Timer mode · ${mv.label}`}
-      />
-      <Ring
-        label="Break"
-        value={formatSignedClock(bal)}
-        detail={debt ? 'in debt' : 'banked'}
-        color={debt ? 'var(--hazard)' : 'var(--phosphor)'}
-        ratio={breakRatio}
+    <div className="strip">
+      <div className="strip__mode" style={{ '--mode-c': mv.color } as React.CSSProperties}>
+        <span className="strip__glyph">{mv.glyph}</span>
+        <div>
+          <span className="stat__label">Timer</span>
+          <strong className="strip__modename">{mv.label}</strong>
+        </div>
+      </div>
+
+      <Stat
+        label="Break balance"
+        value={formatSignedDuration(state.timer.break_balance_ms)}
+        detail={debt ? 'in debt' : 'available'}
         tone={debt ? 'bad' : 'good'}
-        title="Break balance"
       />
-      <Ring
+      <Stat
         label="Desktop"
-        glyph={desktopGlyph(desk)}
-        detail={deskLabel}
-        color="var(--cyan)"
-        tone={desk.steam_app_name ? 'warn' : 'neutral'}
-        title={`Desktop · ${deskLabel}`}
+        value={state.attention.desktop.mode || '—'}
+        detail={state.attention.desktop.steam_app_name ?? state.attention.desktop.work_mode}
       />
-      <Ring
+      <Stat
         label="Phone"
-        glyph={phoneArmed ? undefined : phoneGlyph(phone)}
-        value={phoneArmed ? 'clear?' : undefined}
-        detail={phoneArmed ? 'tap to confirm' : phoneLabel}
-        color={phoneArmed ? 'var(--brass)' : phone.is_distracted ? 'var(--hazard)' : 'var(--muted)'}
-        tone={phoneArmed ? 'warn' : phone.is_distracted ? 'bad' : 'neutral'}
-        title={`Phone · ${phoneLabel} · tap: I'm not on my phone (2-tap clear, no zap)`}
-        onClick={tapPhoneDial}
+        value={state.attention.phone.app ?? 'clear'}
+        detail={phoneDistracted ? 'distracted' : 'no distraction'}
+        tone={phoneDistracted ? 'bad' : 'neutral'}
       />
-      <Ring
+      <Stat
         label="Fleet"
-        value={`${active}`}
-        detail={stale > 0 ? `${stale} stale` : 'all fresh'}
-        color="var(--brass)"
-        ratio={active > 0 ? 1 - Math.min(1, stale / active) : undefined}
-        tone={stale > 0 ? 'warn' : 'good'}
-        title="Active fleet"
+        value={`${state.instances.counts.active}`}
+        detail={`${state.instances.counts.stale} stale`}
+        tone={state.instances.counts.stale > 0 ? 'warn' : 'good'}
       />
-      <Ring
-        label="Enforce"
+      <Stat
+        label="Enforcement"
         value={`${pending}`}
         detail={`tts q ${state.tts.queue_length}`}
-        color={pending > 0 ? 'var(--hazard)' : 'var(--muted)'}
-        ratio={pending > 0 ? 1 : undefined}
         tone={pending > 0 ? 'bad' : 'neutral'}
-        pulse={pending > 0}
-        title="Enforcement pending"
       />
-      <Ring
-        label="Alarm"
-        glyph={alarmAcked ? '✓' : '○'}
-        detail={alarmAcked ? (alarmTime ?? 'acked') : 'pending'}
-        color={alarmAcked ? 'var(--phosphor)' : 'var(--muted)'}
-        tone={alarmAcked ? 'good' : 'neutral'}
-        title="Alarm ack — tap to simulate"
-        onClick={alarmAcked ? undefined : () => { fetch('/api/alarm/ack', { method: 'POST' }); }}
-      />
-      {wa ? (
-        <Ring
-          label="Work"
-          value={`${wa.count}`}
-          detail={waDetail}
-          color={waColor}
-          ratio={waHasLast ? waStale : undefined}
-          tone={waTone}
-          pulse={waStale >= 1}
-          title={
-            waHasLast
-              ? `${wa.count} work action${wa.count === 1 ? '' : 's'} today · last ${formatClock(wa.last_at)}`
-              : 'No work actions logged today'
-          }
-        />
-      ) : null}
-      {typeof wa?.score === 'number' ? (
-        <Ring
-          label="Activity"
-          value={`${wa.score}`}
-          detail="all signals"
-          color="var(--brass)"
-          title="Aggregate work signals today (non-load-bearing)"
-        />
-      ) : null}
     </div>
   );
 }

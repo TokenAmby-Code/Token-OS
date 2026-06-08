@@ -18,20 +18,6 @@ export function formatSignedDuration(ms: number): string {
   return ms < 0 ? `-${body}` : `+${body}`;
 }
 
-// Letter-free signed clock for tight HUD dials — H:MM past an hour, bare
-// minutes under it. Lets the numbers breathe (no "h"/"m" units).
-export function formatSignedClock(ms: number): string {
-  const sign = ms < 0 ? '-' : '+';
-  const totalMin = Math.round(Math.abs(ms) / 60000);
-  if (totalMin < 1) return '0';
-  if (totalMin >= 60) {
-    const h = Math.floor(totalMin / 60);
-    const m = totalMin % 60;
-    return `${sign}${h}:${m.toString().padStart(2, '0')}`;
-  }
-  return `${sign}${totalMin}`;
-}
-
 export function formatAge(seconds: number | null | undefined): string {
   if (seconds === null || seconds === undefined) return '—';
   return formatDuration(seconds * 1000);

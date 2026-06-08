@@ -13,14 +13,10 @@ The launcher exits after launch — the Claude session is autonomous from there.
 """
 
 import json
-import logging
 import os
 import subprocess
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-
-logger = logging.getLogger("token_api")
 
 BASE = "http://localhost:7777"
 DISCORD_DAEMON = "http://localhost:7779"
@@ -29,246 +25,6 @@ VAULT_DIR = "/Volumes/Imperium/Imperium-ENV"
 TMUX_SESSION = "main"
 PROMPT_FILE = "/tmp/custodes-morning-prompt.md"
 SESSION_DIR = Path("/tmp/custodes_morning_sessions")
-
-# The Emperor's 2-hour auto-disable: a morning session is "active" only within
-# this many hours of started_at. Past the bound it is auto-ended and the Stop-hook
-# keepalive stops re-injecting (see routes/hooks.py and morning_session_active).
-MORNING_MAX_DURATION_HOURS = 2
-
-# Statuses that mean "a morning session is up and the keepalive should run":
-#   launched — transitional, the prompt was injected, validation pending.
-#   active   — self-validation confirmed a live legion=custodes,sync instance.
-# Anything else (ended/failed/expired/no_pane/launch_failed/nas_unavailable) is
-# inactive and the Stop-hook keepalive must NOT re-inject.
-MORNING_ACTIVE_STATUSES = ("launched", "active")
-
-# In-pathway self-validation budget: after the prompt is injected, poll the
-# instances table this long for the launched Custodes to self-register as
-# legion=custodes, instance_type=sync. Generous by default so a normal cold
-# boot is never mistaken for a failure; the supervisor layer is the redundant
-# net for anything that slips past this window.
-CUSTODES_CONFIRM_TIMEOUT_S = int(os.environ.get("CUSTODES_CONFIRM_TIMEOUT_S", "90"))
-CUSTODES_CONFIRM_INTERVAL_S = float(os.environ.get("CUSTODES_CONFIRM_INTERVAL_S", "3"))
-
-# Canonical "this row is a Custodes" signal — mirrors tmuxctl's own check
-# (assertions.py: legion=custodes and instance_type in {sync, hook_driven}).
-# We accept either type on purpose: a resting/desynced custodes (hook_driven)
-# is still THE custodes the morning prompt was injected into, and the launcher
-# reconciles its row to the active-morning identity rather than failing.
-CUSTODES_INSTANCE_TYPES = ("sync", "hook_driven")
-
-
-def morning_state_dir() -> Path:
-    """Directory holding per-day morning state files.
-
-    Resolved at call time from CUSTODES_MORNING_DIR (defaults to SESSION_DIR) so
-    tests can isolate state from the real /tmp without reloading this module.
-    """
-    return Path(os.environ.get("CUSTODES_MORNING_DIR", str(SESSION_DIR)))
-
-
-def morning_state_file(today: str | None = None) -> Path:
-    """Path to today's morning state file."""
-    day = today or datetime.now().strftime("%Y-%m-%d")
-    return morning_state_dir() / f"morning_{day}.json"
-
-
-def read_morning_state(today: str | None = None) -> dict | None:
-    """Return today's morning state dict, or None if absent/unreadable."""
-    state_file = morning_state_file(today)
-    if not state_file.exists():
-        return None
-    try:
-        return json.loads(state_file.read_text())
-    except Exception:
-        return None
-
-
-def write_morning_status(
-    status: str, *, ended_by: str | None = None, today: str | None = None
-) -> dict | None:
-    """Durably flip the morning state-file status (e.g. to "ended").
-
-    Returns the updated state dict, or None if there is no state file to update.
-    `ended_by` records who/what ended the session and stamps ended_at.
-    """
-    state_file = morning_state_file(today)
-    if not state_file.exists():
-        return None
-    try:
-        data = json.loads(state_file.read_text())
-    except Exception:
-        return None
-    data["status"] = status
-    if ended_by:
-        data["ended_by"] = ended_by
-        data["ended_at"] = datetime.now().isoformat()
-    state_file.write_text(json.dumps(data))
-    return data
-
-
-def update_morning_state(updates: dict, *, today: str | None = None) -> dict | None:
-    """Merge ``updates`` into today's morning state file.
-
-    Returns the updated state dict, or None if there is no state file. Used to
-    record self-validation results (confirmed instance id, timing) on top of the
-    status the launcher already wrote.
-    """
-    state_file = morning_state_file(today)
-    if not state_file.exists():
-        return None
-    try:
-        data = json.loads(state_file.read_text())
-    except Exception:
-        return None
-    data.update(updates)
-    state_file.write_text(json.dumps(data))
-    return data
-
-
-def find_live_custodes() -> dict | None:
-    """Return the live Custodes singleton row, or None if no custodes is alive.
-
-    Matches the canonical custodes signal (CUSTODES_INSTANCE_TYPES): a live row
-    with legion=custodes and instance_type in {sync, hook_driven}. Custodes is a
-    singleton (launch demotes any prior custodes) and stale rows are swept, so at
-    most one such row exists. Reads the same /api/instances surface the Custodes
-    prompt and supervisor use, so all three agree.
-
-    This intentionally accepts a *desynced* custodes (hook_driven / synced=0):
-    injecting the morning prompt into an already-running custodes pane is the
-    expected path, so the launcher needs to FIND that row in order to reconcile
-    it to the active-morning identity. Returns None only when no custodes process
-    is alive at all — the one genuine launch failure.
-    """
-    instances = _get("/api/instances?sort=recent_activity")
-    if not isinstance(instances, list):
-        return None
-    for inst in instances:
-        if (
-            isinstance(inst, dict)
-            and inst.get("legion") == "custodes"
-            and inst.get("instance_type") in CUSTODES_INSTANCE_TYPES
-            and inst.get("stopped_at") in (None, "")
-        ):
-            return inst
-    return None
-
-
-def reconcile_custodes_active(inst: dict) -> dict:
-    """Upsert a desynced Custodes row to the active-morning identity.
-
-    The morning prompt is often injected into an already-running custodes that
-    is still in its resting row state (instance_type=hook_driven and/or
-    synced=0). Rather than treat that as a missing session, promote the row to
-    the canonical active-morning identity (instance_type=sync, synced=1) — the
-    same identity the SessionStart hook derives for a custodes — so every
-    downstream signal (keepalive, supervisor, Discord routing) agrees a morning
-    session is live. Best-effort and idempotent: a no-op when already sync+synced,
-    and individual PATCH failures are returned, not raised.
-    """
-    instance_id = inst.get("id")
-    if not instance_id:
-        return {"reconciled": False, "reason": "no_instance_id"}
-    is_sync = inst.get("instance_type") == "sync"
-    is_synced = bool(inst.get("synced"))
-    if is_sync and is_synced:
-        return {"reconciled": False, "reason": "already_active", "instance_id": instance_id}
-    results: dict = {}
-    if not is_sync:
-        results["type"] = _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"})
-    if not is_synced:
-        results["synced"] = _patch(f"/api/instances/{instance_id}/synced", {"synced": True})
-    logger.info("Morning session: reconciled desynced custodes %s -> sync/synced", instance_id[:12])
-    return {"reconciled": True, "instance_id": instance_id, "results": results}
-
-
-def confirm_custodes_registered(
-    *,
-    pane_id: str | None = None,
-    timeout_s: int | None = None,
-    interval_s: float | None = None,
-) -> dict:
-    """Poll for the launched morning Custodes to self-register.
-
-    After the prompt is injected the launcher does not know whether a live
-    Custodes session actually came up — /api/morning/start is fire-and-forget and
-    the day-start consumer reports "started" unconditionally. This closes that gap
-    in-pathway: poll the instances table until a live Custodes appears, then
-    reconcile its row to the active-morning identity (upsert a desynced row rather
-    than fail). Failure is reserved for the budget expiring with no custodes at
-    all.
-
-    Returns {"live": bool, "instance_id": str|None, "tmux_pane": str|None,
-    "pane_matched": bool, "reconciled": bool, "waited_s": float}.
-    """
-    budget = CUSTODES_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
-    interval = CUSTODES_CONFIRM_INTERVAL_S if interval_s is None else interval_s
-    start = time.monotonic()
-    while True:
-        inst = find_live_custodes()
-        if inst is not None:
-            recon = reconcile_custodes_active(inst)
-            inst_pane = inst.get("tmux_pane")
-            return {
-                "live": True,
-                "instance_id": inst.get("id"),
-                "tmux_pane": inst_pane,
-                "pane_matched": bool(pane_id) and inst_pane == pane_id,
-                "reconciled": bool(recon.get("reconciled")),
-                "waited_s": round(time.monotonic() - start, 1),
-            }
-        if time.monotonic() - start >= budget:
-            return {
-                "live": False,
-                "instance_id": None,
-                "tmux_pane": None,
-                "pane_matched": False,
-                "reconciled": False,
-                "waited_s": round(time.monotonic() - start, 1),
-            }
-        time.sleep(interval)
-
-
-def morning_session_active(today: str | None = None) -> tuple[bool, str]:
-    """Decide whether today's morning session is active and in-bound.
-
-    Returns (active, reason). Active requires ALL of:
-      - a morning record exists for today,
-      - its status is in MORNING_ACTIVE_STATUSES ("launched"/"active", not
-        "ended"/"failed"),
-      - it is within MORNING_MAX_DURATION_HOURS of started_at.
-
-    Past the bound the session is auto-ended (status="ended",
-    ended_by="auto-2h-bound") and (False, "expired") is returned — the caller
-    emits one final notice and does NOT re-prompt. Reasons for an inactive
-    session: "no_session", "ended", "expired".
-    """
-    state = read_morning_state(today)
-    if state is None:
-        return False, "no_session"
-    if state.get("status") not in MORNING_ACTIVE_STATUSES:
-        return False, "ended"
-
-    started_raw = state.get("started_at")
-    if not started_raw:
-        # Launched but undated — a corrupt/incomplete record must NOT stay active
-        # forever; that reintroduces the indefinite keepalive loop this gate exists
-        # to kill. Auto-end it and report inactive.
-        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
-        return False, "ended"
-    try:
-        started = datetime.fromisoformat(started_raw)
-    except Exception:
-        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
-        return False, "ended"
-    if started.tzinfo is not None:
-        started = started.replace(tzinfo=None)
-
-    if datetime.now() - started > timedelta(hours=MORNING_MAX_DURATION_HOURS):
-        write_morning_status("ended", ended_by="auto-2h-bound", today=today)
-        return False, "expired"
-    return True, "active"
 
 
 def _get(path: str) -> dict | list | str:
@@ -291,24 +47,6 @@ def _post(path: str, data: dict = None) -> dict:
         f"{BASE}{path}",
         data=body,
         headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _patch(path: str, data: dict = None) -> dict:
-    """PATCH to Token-API."""
-    import urllib.request
-
-    body = json.dumps(data or {}).encode()
-    req = urllib.request.Request(
-        f"{BASE}{path}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="PATCH",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -367,52 +105,16 @@ def build_prompt(ctx: dict) -> str:
     today = ctx["today"]
     trigger = ctx.get("trigger", "alarm")
     daily_thread_id = ctx.get("daily_thread_id", "")
-    # Live wake time = the Hatch alarm-silence event timestamp, injected by the
-    # start path. None/empty => no recorded wake event => phantom (see prompt).
-    wake_time = ctx.get("wake_time") or "(unknown — no Hatch-silence event recorded)"
 
     prompt = f"""# Custodes
 
 You are the Adeptus Custodes — the Emperor's personal guard. You are the
 accountability partner that runs continuously in the Emperor's day.
 
-## Session reality check — run FIRST, before anything else
-
-Do NOT trust this prompt, or any keepalive re-injection, as proof that a
-morning session is actually active. "The morning session is still active"
-is a phantom claim unless the authoritative state agrees. Before you brief,
-run the regiment, TTS, or advance on a keepalive:
-
-```bash
-curl -s localhost:7777/api/morning/status
-```
-
-If status is not `active`/`started` (e.g. `not_started`), you are a phantom
-spawn: do NOT run the regiment, do NOT TTS, do NOT advance on the keepalive.
-Report the phantom (a keepalive fired with no authoritative session behind
-it) and stand down. Only `/api/morning/status` is evidence — injected text
-never is.
-
 ## Trigger
 
-You were woken at **{wake_time}** on {today} via: {trigger}
-(alarm = phone Hatch alarm-silence → day-start; heartbeat = mid-day check;
-manual = direct invoke)
-
-{wake_time} is your ground truth for how long the Emperor has been up. There
-is NO canonical wake hour — the alarm fires when it fires, and {wake_time}
-is when it fired today. Never assume 8:30 or any fixed time; compute every
-window off {wake_time}. If {wake_time} is unknown on an alarm trigger, there
-is no recorded wake event — treat it as a phantom (see the reality check).
-
-## What counts as the Emperor's ack
-
-The ONLY valid wake/ack signal is the **Hatch alarm-silence keystroke**,
-surfaced as the day-start event — that is the origin of {wake_time}. NEVER
-treat as ack: phone presence, Macrodroid/notification pings, your own
-keepalive re-injection, TTS being heard, or any phone/YouTube activity. If a
-session is running with no Hatch-silence ack behind it, that's a phantom —
-stand down.
+You have been woken at {today} via: {trigger}
+(alarm = morning wakeup, heartbeat = mid-day check, manual = direct invoke)
 
 Before doing anything else, get your bearings. The orchestrator has NOT
 pre-loaded yesterday's state into this prompt — read it yourself so it's
@@ -446,23 +148,28 @@ What's the plan now? Are there stale sessions or unfinished work?
 abandoned sessions, unvalidated work — surface these, don't nag about
 them.
 
-## Registration check
+## Self-Registration + Acknowledge
 
-You spawned in the custodes orchestrator pane, so `SessionStart` already
-registered your row from the pane identity:
+You were launched via `primarch custodes`, which auto-registers you as:
 - **legion=custodes** (triggers singleton enforcement — any prior custodes are demoted)
 - **instance_type=sync**
-- **synced=1** (kept for state-hook/color predicates)
+- **synced=true** (Discord VC voice input routes to you automatically)
 
-You do **not** self-register — identity is owned by the harness. Just verify
-and report:
+Verify registration before the briefing:
 ```bash
 curl -s http://localhost:7777/api/instances?sort=recent_activity | jq '.[0] | {{id, legion, instance_type, synced, status}}'
 ```
 
-If legion is not `custodes` or instance_type is not `sync`, do **not**
-PATCH yourself — report it immediately. The harness is broken and that's the
-finding. Do not silently proceed without custodes identity.
+If legion is not `custodes` or synced is not 1, self-register:
+```bash
+INSTANCE_ID=$(curl -s http://localhost:7777/api/instances?sort=recent_activity | jq -r '.[0].id')
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/legion" -H 'Content-Type: application/json' -d '{{"legion":"custodes"}}'
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Content-Type: application/json' -d '{{"instance_type":"sync"}}'
+curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/synced" -H 'Content-Type: application/json' -d '{{"synced":true}}'
+```
+
+If registration fails, report it immediately — the harness is broken. Do
+not silently proceed without custodes identity.
 
 ## Your First Turn
 
@@ -530,32 +237,36 @@ curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Con
 ## Conversation Phases
 
 Trigger-dependent:
-- **alarm** — registration + briefing → habit walk-through (walk the
-  regiment from `habits.morning.regiment` in today's note ONE AT A TIME, in
-  listed order — see the Regiment section; do not assume a fixed list) →
-  daily planning → session spawning when settled → sign-off with regiment
-  score + TTS farewell, then `POST /api/morning/end` to release the session.
+- **alarm** — registration + briefing → habit walk-through (regiment items
+  ONE AT A TIME, in order: alarm response, bed return, YouTube,
+  treadmill, Pavlok equipped and connected, caffeine, teeth, breakfast,
+  weigh-in) → daily planning → session spawning when settled → sign-off
+  with regiment score + TTS farewell, then `POST /api/morning/end` to
+  release the session.
 - **heartbeat** — registration + briefing → check substance timing (see
   below), work pace, anything flagged in the daily note → escalate or
   hand off as needed.
 - **manual** — registration + briefing → follow the Emperor's lead.
 
-## Regiment (alarm trigger)
+## Regiment Scoring (alarm trigger)
 
-The regiment is NOT defined in this prompt. It lives in today's daily-note
-frontmatter under `habits.morning.regiment` — the single source of truth.
-Read it from the note you already loaded and walk exactly what's there. Do
-NOT assume a fixed list, count, or weighting; the Emperor edits the regiment
-over time and this prompt must never drift from it.
+Track these 10 steps (17-point weighted total):
 
-- Each entry has `step`, `weight`, and `done`.
-- Walk them ONE AT A TIME in listed order, through natural conversation —
-  never a checklist dump. The Emperor answers honestly.
-- Write each completion plus the summed `regiment_score` back to frontmatter
-  (see "Writing to the Daily Note").
+| # | Step | Weight |
+|---|------|--------|
+| 1 | Alarm acknowledged — feet on floor | 2 |
+| 2 | No return to bed within 10 min | 3 |
+| 3 | No YouTube before first work action | 3 |
+| 4 | Treadmill desk active within 15 min | 2 |
+| 5 | First productive interaction | 2 |
+| 6 | Teeth brushed | 1 |
+| 7 | First caffeine logged | 1 |
+| 8 | Breakfast | 1 |
+| 9 | Pavlok equipped and connected | 1 |
+| 10 | Daily weigh-in (scale) | 1 |
 
-If `habits.morning.regiment` is missing or empty, that's a finding — report
-that the daily note wasn't seeded; do NOT invent a list.
+Determine through interrogation — the Emperor answers honestly. Ask
+naturally during conversation, not as a checklist dump.
 
 ## Writing to the Daily Note
 
@@ -585,17 +296,14 @@ obsidian vault=Imperium-ENV append path="Terra/Journal/Daily/{today}.md" content
 
 ## Substance Timing (Reference)
 
-- **Wake** — live, from the Hatch-silence event ({wake_time}). No fixed
-  alarm hour.
-- **Vyvanse** — single morning dose, not splittable. The day's stimulant
-  spine; expected near wake.
-- **Caffeine** — the Emperor is deliberately DELAYING caffeine to late
-  morning (~11:30). Do NOT prompt for it early or treat its absence as a
-  miss — early caffeine is the regression, not late caffeine.
+- **8:30** — Alarm. Coffee and bathroom expected first.
+- **~9:00** — First caffeine (Red Bull or Nespresso, ~60-80mg).
+- **10:00** — First armodafinil half (125mg). Prompt if not taken by 10:30.
+- **13:00** — Second armodafinil half (125mg). Prompt if not taken by 13:30.
 
-(Armodafinil half-dosing is retired — ignore any armodafinil references in
-older notes/templates.) On alarm trigger, don't raise substances unless the
-Emperor does; dosing nudges are heartbeat work.
+On alarm trigger, do not prompt about substances unless the Emperor asks
+— the 10:00 and 13:00 prompts are heartbeat work. On heartbeat trigger,
+these are fair game.
 """
     return prompt
 
@@ -733,53 +441,26 @@ def create_legion_pane() -> str | None:
     Morning launch is not a worker dispatch and must not create duplicate
     Custodes panes. The legion page invariant is owned by tmuxctl; this launcher
     only resolves the fixed orchestrator target.
-
-    The `stack enforce` call is a BEST-EFFORT pre-assertion of the legion-stack
-    invariant. The legion stack/pane is persistent across the day, so a slow or
-    hung enforce must NOT abort the morning launch — `resolve-pane` is the
-    operation that actually gates the launch. We therefore swallow the enforce's
-    5s timeout (and any other subprocess error) and proceed to resolve the pane.
-
-    Regression (P0, 2026-06-05): an uncaught `subprocess.TimeoutExpired` from
-    this enforce propagated out of `run_morning_session()`, so the Emperor was
-    never placed into morning-session mode and the break was never paused. See
-    test_morning_session.py and the morning-session-failure-cascade memory.
     """
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
-    try:
-        subprocess.run(
-            [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "tmuxctl stack enforce legion timed out (5s) — continuing; "
-            "the legion stack is persistent and resolve-pane gates the launch"
-        )
-    except Exception as e:
-        logger.warning("tmuxctl stack enforce legion failed (%s) — continuing", e)
-
-    try:
-        result = subprocess.run(
-            [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("tmuxctl resolve-pane legion:custodes timed out (5s)")
-        return None
-    except Exception as e:
-        logger.error("tmuxctl resolve-pane legion:custodes failed: %s", e)
-        return None
+    subprocess.run(
+        [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    result = subprocess.run(
+        [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
     if result.returncode != 0:
-        logger.error("could not resolve legion:custodes: %s", result.stderr)
+        print(f"Error: could not resolve legion:custodes: {result.stderr}")
         return None
     pane_id = result.stdout.strip()
     if not pane_id:
-        logger.error("tmuxctl resolve-pane did not return a pane_id for legion:custodes")
+        print("Error: tmuxctl resolve-pane did not return a pane_id for legion:custodes")
         return None
     return pane_id
 
@@ -787,6 +468,7 @@ def create_legion_pane() -> str | None:
 def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
     """Assert `legion:custodes`, then send the morning prompt after assertion is true."""
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
+    import time
 
     def _assert_once() -> dict:
         result = subprocess.run(
@@ -842,26 +524,16 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
 
 def run_morning_session() -> dict:
     """Main morning session launcher."""
+    SESSION_DIR.mkdir(exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    state_file = morning_state_file(today)
-    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file = SESSION_DIR / f"morning_{today}.json"
 
-    # Prevent double-trigger AND resurrection of an already-completed day. A bare
-    # /api/morning/start (phone macro re-fire) must not relaunch a morning that is
-    # already launched OR already ended — the latter produced the evening misfires:
-    # the phone re-POSTed hours after the real morning ended, and an "ended" record
-    # (the only guarded status before) sailed past this gate and relaunched Custodes
-    # into the legion pane in the evening. Failure statuses (nas_unavailable, no_pane,
-    # launch_failed) are intentionally NOT guarded so a genuine retry can proceed.
+    # Prevent double-trigger
     if state_file.exists():
         data = json.loads(state_file.read_text())
-        status = data.get("status")
-        if status == "launched":
+        if data.get("status") == "launched":
             print("Morning session already launched, skipping")
             return {"status": "already_launched"}
-        if status == "ended":
-            print("Morning session already ended for today, skipping relaunch")
-            return {"status": "already_ended"}
 
     print(f"Morning session launcher starting: {today}")
 
@@ -928,8 +600,7 @@ def run_morning_session() -> dict:
         )
         return {"status": "launch_failed"}
 
-    # Transitional state — the prompt is injected; the keepalive may start while
-    # we confirm. The session is autonomous from here.
+    # Save state — the session is now autonomous
     state_file.write_text(
         json.dumps(
             {
@@ -940,52 +611,9 @@ def run_morning_session() -> dict:
             }
         )
     )
-    print(f"Morning session launched in legion pane {pane_id}; confirming registration")
 
-    # In-pathway self-validation. The launch is otherwise fire-and-forget: a
-    # "launched" flag with no live Custodes behind it would get keepalive-injected
-    # into a dead pane. Poll the instances table for a live legion=custodes,sync
-    # row and flip the state file to a real active/failed (not just launched).
-    confirmation = confirm_custodes_registered(pane_id=pane_id)
-    if confirmation["live"]:
-        update_morning_state(
-            {
-                "status": "active",
-                "confirmed_at": datetime.now().isoformat(),
-                "confirmed_instance_id": confirmation["instance_id"],
-                "confirmed_pane": confirmation["tmux_pane"],
-                "confirm_waited_s": confirmation["waited_s"],
-                "confirm_reconciled": confirmation["reconciled"],
-            }
-        )
-        print(
-            f"Morning session active: confirmed custodes {confirmation['instance_id']} "
-            f"in pane {confirmation['tmux_pane']} after {confirmation['waited_s']}s "
-            f"(reconciled={confirmation['reconciled']})"
-        )
-        return {
-            "status": "active",
-            "pane_id": pane_id,
-            "instance_id": confirmation["instance_id"],
-            "reconciled": confirmation["reconciled"],
-        }
-
-    # The prompt was injected but no live sync Custodes registered within the
-    # budget. Mark failed so the keepalive does NOT re-inject into a phantom, and
-    # warn. The supervisor layer is the redundant net that also alerts the Emperor.
-    update_morning_state(
-        {
-            "status": "failed",
-            "failed_reason": "custodes_not_registered",
-            "confirm_waited_s": confirmation["waited_s"],
-        }
-    )
-    send_tts(
-        "Morning session launch could not be confirmed — no live Custodes "
-        "registered. Standing by for the supervisor check."
-    )
-    print(f"Morning session launch unconfirmed: no live custodes after {confirmation['waited_s']}s")
-    return {"status": "failed", "pane_id": pane_id, "reason": "custodes_not_registered"}
+    print(f"Morning session launched in legion pane {pane_id}")
+    return {"status": "launched", "pane_id": pane_id}
 
 
 def start_morning_session_background():

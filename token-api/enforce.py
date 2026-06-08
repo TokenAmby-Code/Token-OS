@@ -9,7 +9,6 @@ Golden Throne — not here.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 
 from pydantic import BaseModel
 
@@ -31,28 +30,15 @@ class EnforceRequest(BaseModel):
 
 _is_quiet_hours = None
 _typing_guard_active = None
-_dictation_active = None
-_enforcement_gate = None
 
 
-def init_deps(
-    *,
-    is_quiet_hours: Callable[[], bool] | None = None,
-    typing_guard_active: Callable[[], bool] | None = None,
-    dictation_active: Callable[[], bool] | None = None,
-    enforcement_gate: Callable[[str], str | None] | None = None,
-) -> None:
+def init_deps(*, is_quiet_hours=None, typing_guard_active=None) -> None:
     """Late-bind dependencies from main.py to avoid circular imports."""
-    global _is_quiet_hours, _typing_guard_active, _dictation_active
-    global _enforcement_gate
+    global _is_quiet_hours, _typing_guard_active
     if is_quiet_hours is not None:
         _is_quiet_hours = is_quiet_hours
     if typing_guard_active is not None:
         _typing_guard_active = typing_guard_active
-    if dictation_active is not None:
-        _dictation_active = dictation_active
-    if enforcement_gate is not None:
-        _enforcement_gate = enforcement_gate
 
 
 def _in_meeting() -> bool:
@@ -70,7 +56,6 @@ async def enforce(request: EnforceRequest) -> dict:
             "enforce_blocked",
             details={
                 "reason": "quiet_hours",
-                "disposition": "suppress",
                 "source": request.source,
                 "message": request.message[:200],
             },
@@ -79,66 +64,28 @@ async def enforce(request: EnforceRequest) -> dict:
 
     # The physical Pavlok stays typing-guard-blocked: typing IS the appeal — if the
     # Emperor is actively at the keyboard the shock is held, not fired (D2, Emperor
-    # 2026-05-31). This is a DEFER, not a drop: enforcement stalls and re-checks
-    # staleness — "we don't lose, we stall." Mirrors the universal send gate's
-    # typing-guard predicate.
+    # 2026-05-31). Mirrors the universal send gate's typing-guard predicate.
     if _typing_guard_active and _typing_guard_active():
         await log_event(
             "enforce_blocked",
             details={
                 "reason": "typing_guard",
-                "disposition": "defer",
                 "source": request.source,
                 "message": request.message[:200],
             },
         )
         return {"fired": False, "blocked_by": "typing_guard"}
 
-    # Live dictation/voice is also active work — same DEFER semantics as typing:
-    # the shock is held while the Emperor is dictating, and re-checked once the
-    # dictation lock clears (instrumented via observe_work_signal:dictation).
-    if _dictation_active and _dictation_active():
-        await log_event(
-            "enforce_blocked",
-            details={
-                "reason": "dictation",
-                "disposition": "defer",
-                "source": request.source,
-                "message": request.message[:200],
-            },
-        )
-        return {"fired": False, "blocked_by": "dictation"}
-
     if _in_meeting():
         await log_event(
             "enforce_blocked",
             details={
                 "reason": "meeting",
-                "disposition": "suppress",
                 "source": request.source,
                 "message": request.message[:200],
             },
         )
         return {"fired": False, "blocked_by": "meeting"}
-
-    # Sidecar mutual-exclusion gate: when another subsystem owns enforcement
-    # (e.g. an active work session), it blocks the generic emitter from outside
-    # so that subsystem can assume it is the only enforcer. The predicate is
-    # late-bound from main.py and decides per-source whether to suppress; the
-    # owning subsystem's own sources are allowlisted there.
-    if _enforcement_gate:
-        gate_block = _enforcement_gate(request.source)
-        if gate_block:
-            await log_event(
-                "enforce_blocked",
-                details={
-                    "reason": gate_block,
-                    "disposition": "suppress",
-                    "source": request.source,
-                    "message": request.message[:200],
-                },
-            )
-            return {"fired": False, "blocked_by": gate_block}
 
     intensity = max(int(request.intensity), ENFORCE_MIN_INTENSITY)
     pavlok_result = send_pavlok_stimulus(

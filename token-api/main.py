@@ -10,7 +10,6 @@ This server provides:
 
 import asyncio
 import hashlib
-import hmac
 import inspect
 import json
 import logging
@@ -19,11 +18,11 @@ import os
 import re
 import shlex
 import signal
+import socket
 import time
 import uuid
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,7 +77,6 @@ from instance_mutation import (
     reconcile_instance,
     sanctioned_update_instance,
 )
-from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     DEFAULT_TAB_NAME_RX,
     PLACEHOLDER_TAB_NAME_RX,
@@ -94,12 +92,11 @@ from pane_surface import (
 )
 from phone_service import (
     _send_to_phone,
-    load_zap_count_from_daily_note,
     push_phone_widget_async,
     send_pavlok_stimulus,
 )
 from questions_gate import trials_clear
-from routes.day_start import fire_day_start_internal
+from routes.day_start import fire_day_start_internal, sync_day_start_schedule_from_daily_note
 from routes.day_start import router as day_start_router
 from routes.hooks import (
     NUDGE_COOLDOWN_SECONDS,
@@ -134,11 +131,9 @@ from session_doc_helpers import (
     mark_rubric_notified,
     read_frontmatter,
     read_rubric,
-    serialize_frontmatter,
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
-    update_session_doc_worktrees,
 )
 from shared import (
     CRASH_LOG_PATH,
@@ -193,8 +188,10 @@ from timer_telemetry import (
     parse_timer_timestamp,
 )
 
+DESKFLOW_SERVER_PORT = 24800
 DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
 DESKFLOW_KEYMAP_GUARD = SCRIPTS_DIR / "Shell" / "deskflow-keymap-guard.sh"
+MAC_KVM_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -425,6 +422,18 @@ APP_LOOP: asyncio.AbstractEventLoop | None = None
 
 # Cron engine (initialized after DB in lifespan)
 cron_engine: CronEngine = None
+mac_kvm_supervisor_task = None
+
+MAC_KVM_STATE = {
+    "state": "starting",
+    "server_host": None,
+    "server_reachable": None,
+    "client_running": None,
+    "retry_attempts": 0,
+    "next_probe_at": 0.0,
+    "last_action": None,
+    "last_changed": None,
+}
 
 
 # Pydantic Models
@@ -1121,10 +1130,10 @@ async def purge_old_events() -> dict:
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
     "purge_old_events": purge_old_events,
-    # The only fixed day-start cron: 04:00 bookkeeping that derives expected wake
-    # from history and arms the relative morning watchdog. It never launches a
-    # session — that stays event-driven via /api/morning/alarm-silenced.
-    "morning_supervisor_arm": arm_morning_supervisor,
+    "day_start_schedule_fallback": lambda: fire_day_start_internal(
+        source="schedule_fallback",
+        details={"schedule": "wake_anchor"},
+    ),
     "checkin_morning_start": lambda: trigger_checkin("morning_start"),
     "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
     "checkin_decision_point": lambda: trigger_checkin("decision_point"),
@@ -1355,8 +1364,8 @@ async def run_overdue_tasks():
 
 # Lifespan context manager
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global stale_flag_cleaner_task, timer_worker_task, APP_LOOP
+async def lifespan(app: FastAPI):
+    global stale_flag_cleaner_task, timer_worker_task, mac_kvm_supervisor_task, APP_LOOP
     import routes.tts as _tts_mod  # For mutable tts_worker_task assignment
 
     # Install asyncio exception handler for this loop
@@ -1374,9 +1383,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Startup
     await init_database_async(DB_PATH)
+    try:
+        day_start_schedule = await sync_day_start_schedule_from_daily_note()
+        print(
+            "Day-start schedule fallback synced "
+            f"to wake_anchor={day_start_schedule['wake_anchor']} "
+            f"({day_start_schedule['cron']})"
+        )
+    except Exception as exc:
+        logger.warning(f"Day-start schedule fallback sync failed: {exc}")
     await load_tasks_from_db()
     timer_load_from_db()
-    load_zap_count_from_daily_note()
     restore_restart_state()
     recovered_phone_distraction = await recover_recent_phone_distraction_state()
     # Sync timer activity layer with restored desktop mode
@@ -1439,14 +1456,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     recovered_gt = await recover_recent_stopped_golden_throne_timers()
     if recovered_gt:
         print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
-    # Re-arm the morning supervisor poller if we restarted inside today's
-    # supervision window (the relative poller lives in the in-memory jobstore
-    # and is otherwise lost across a restart; the 04:00 cron only re-arms daily).
-    try:
-        supervisor_state = await arm_morning_supervisor(recover=True)
-        print(f"Morning supervisor recovery: {supervisor_state}")
-    except Exception as exc:
-        logger.warning(f"Morning supervisor startup recovery failed: {exc}")
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
@@ -1474,9 +1483,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start Custodes enforcement defer flusher (L2 hold-and-queue under typing guard)
     asyncio.create_task(_custodes_enforcement_defer_worker())
     print("Custodes enforcement defer flusher started")
-    # Mac-side Deskflow lifecycle is event-driven: the WSL satellite invites this
-    # Mac via POST /api/kvm/start when its log follower sees the server come up.
-    # No Mac-side probe/supervisor (it spammed the server with secure-socket errors).
+    # Start Mac-side Deskflow backoff supervisor
+    mac_kvm_supervisor_task = asyncio.create_task(mac_kvm_supervisor())
+    print("Mac KVM supervisor started")
     # Legion pane tint is event-driven (shared.apply_pane_tint / clear_pane_tint),
     # fired on persona register/change, pane vacate, and close — no polling worker.
     # Start pane state worker (@CC_STATE)
@@ -1519,6 +1528,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timer_worker_task.cancel()
         try:
             await timer_worker_task
+        except asyncio.CancelledError:
+            pass
+    if mac_kvm_supervisor_task:
+        mac_kvm_supervisor_task.cancel()
+        try:
+            await mac_kvm_supervisor_task
         except asyncio.CancelledError:
             pass
     scheduler.shutdown(wait=True)
@@ -1696,9 +1711,6 @@ async def orchestrator_naming_nudge(request: NamingNudgeRequest):
         source=NAMING_NUDGE_QUEUE_SOURCE,
         purpose=NAMING_NUDGE_QUEUE_PURPOSE,
         payload=message,
-        # System-originated nudge to the agent — autonomous wake (classification:
-        # golden-throne followup / naming nudge → hook_driven by principle).
-        hook_driven=True,
     )
     queue_results = await process_pane_write_queue_once(queued["id"])
     queue_result = queue_results[0] if queue_results else queued
@@ -1861,7 +1873,7 @@ async def stop_instance(instance_id: str):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0), tmux_pane FROM claude_instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1870,13 +1882,7 @@ async def stop_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         is_subagent = row[2]
-
-        # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
-        # the tint-clear below — never the stored tmux_pane column. resolve-instance
-        # only returns a pane that still carries THIS instance's @INSTANCE_ID stamp,
-        # so a truthy result is unambiguously ours to vacate; a dead, reused, or
-        # taken-over pane resolves to None and we leave the tint to its current owner.
-        stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
+        stopped_tmux_pane = row[3]
 
         await sanctioned_update_instance(
             db,
@@ -1902,10 +1908,20 @@ async def stop_instance(instance_id: str):
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
 
+        # Has another live instance already taken over this pane? If so, leave its
+        # tint alone — only clear when the vacated pane is genuinely unowned.
+        pane_still_owned = False
+        if stopped_tmux_pane:
+            cursor = await db.execute(
+                "SELECT 1 FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' AND id != ? LIMIT 1",
+                (stopped_tmux_pane, instance_id),
+            )
+            pane_still_owned = (await cursor.fetchone()) is not None
+
     # Event-driven tint: the persona vacated this pane — clear its legion tint
     # back to default. No queue, no poll.
-    if stopped_pane:
-        await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
+    if stopped_tmux_pane and not pane_still_owned:
+        await asyncio.to_thread(shared.clear_pane_tint, stopped_tmux_pane, source="stop-instance")
 
     # Log event
     await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
@@ -2723,22 +2739,17 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         raise HTTPException(status_code=400, detail="tmux_pane is required")
     tab_name = _validate_instance_name_slug(request.tab_name)
 
-    # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp rather
-    # than querying the stored tmux_pane column. The CLI passes the agent's own live
-    # $TMUX_PANE, so the stamp is authoritative and current.
-    pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
-    if not pane_instance_id:
-        raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
-
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tab_name
+            """SELECT id, tab_name, tmux_pane
                FROM claude_instances
-               WHERE id = ?
+               WHERE tmux_pane = ?
                  AND COALESCE(status, '') != 'stopped'
+               ORDER BY datetime(COALESCE(last_activity, registered_at, '1970-01-01')) DESC,
+                        registered_at DESC
                LIMIT 1""",
-            (pane_instance_id,),
+            (tmux_pane,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -2875,16 +2886,10 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         )
         new_status = "processing"
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
-        # Prompt submit is a SATISFY work signal: it clears this instance's acks
-        # plus distraction/backlog acks. Productivity for instances is owned by
-        # the timer worker, so this signal does not flip productivity itself.
-        signal = await observe_work_signal(
-            source="api",
-            kind="prompt_submit",
-            instance_id=instance_id,
-            set_productivity=False,
-        )
-        acknowledged_acks = signal["resolved_acks"]
+        acknowledged_acks = await acknowledge_pending_acks_for_instance(instance_id)
+        acknowledged_acks += await acknowledge_pending_work_action_acks()
+        _mark_mewgenics_work_action("prompt_submit", f"instance_id={instance_id}")
+        stop_enforcement_cascade(reason="prompt_submit")
     elif request.action == "stop":
         new_status = "idle"
         acknowledged_acks = 0
@@ -3272,12 +3277,13 @@ async def record_golden_throne_resume(instance: dict) -> dict:
     )
     if enforced:
         tab_name = instance.get("tab_name") or "session"
-        # Surfaces are stamped live (from tmuxctl resolution) by
-        # golden_throne_followup before this runs. Never fall back to the stored
-        # pane columns — those go stale and re-introduce ghosts like "1:NE".
-        pane_surface = instance.get("pane_surface") or tab_name
+        pane_surface = (
+            instance.get("pane_surface") or instance.get("pane_label") or instance.get("tmux_pane")
+        )
         human_surface = instance.get("human_pane_surface") or _golden_throne_human_surface(
-            tab_name, None, None
+            tab_name,
+            instance.get("tmux_pane"),
+            instance.get("pane_label"),
         )
         payload = _enforcement_state_payload(
             source="golden_throne",
@@ -3324,7 +3330,6 @@ async def golden_throne_user_activity(instance_id: str, source: str = "prompt_su
         scheduler.remove_job(f"golden-throne-{instance_id}")
     except Exception:
         pass
-    await _gt_clear_fire(instance_id)
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await sanctioned_update_instance(
@@ -3425,49 +3430,6 @@ def _golden_throne_rubric_state(status: RubricStatus | None) -> str:
     return "ready_for_ack"
 
 
-async def _gt_push_fire(instance_id: str, fire_at_epoch: int) -> None:
-    """Push @GT_FIRE (absolute fire epoch) to a GT instance's live pane.
-
-    The pane border renders the countdown from @GT_FIRE in-format via strftime %s
-    (current epoch) + #{e|} integer math — ceil(minutes) = (fire − now + 59) / 60 —
-    so it ticks each redraw with zero fork. Resolves the LIVE pane (same owner as
-    pane_state_worker) and fails closed; best-effort, never raises.
-    """
-    pane, _role = await shared.resolve_instance_pane(instance_id)
-    if not pane:
-        return
-    try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-t", pane, "@GT_FIRE", str(fire_at_epoch)),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception as exc:
-        logger.debug(f"GT: @GT_FIRE push failed for {instance_id[:12]} ({pane}): {exc}")
-
-
-async def _gt_clear_fire(instance_id: str) -> None:
-    """Unset @GT_FIRE on a GT instance's live pane (timer disarmed / fired / reset).
-
-    Idempotent: unsetting an absent option is a no-op, and a pane that no longer
-    resolves (closed / moved) is skipped — its pane-scoped option died with it.
-    Best-effort, never raises.
-    """
-    pane, _role = await shared.resolve_instance_pane(instance_id)
-    if not pane:
-        return
-    try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-u", "-t", pane, "@GT_FIRE"),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception as exc:
-        logger.debug(f"GT: @GT_FIRE clear failed for {instance_id[:12]} ({pane}): {exc}")
-
-
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
     """Arm the one-shot Golden Throne follow-up timer for an idle instance.
 
@@ -3489,7 +3451,6 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
-        await _gt_clear_fire(instance_id)
         return {
             "scheduled": False,
             "reason": "session_doc_acknowledged",
@@ -3501,7 +3462,6 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
-        await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
 
     delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, ZEALOTRY_DELAY_MAP[4])
@@ -3520,9 +3480,6 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         replace_existing=True,
         misfire_grace_time=ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS,
     )
-    # Project the fire epoch onto the pane so the border renders a zero-fork
-    # countdown (see _gt_push_fire / pane-border-format @GT_FIRE).
-    await _gt_push_fire(instance_id, int(fire_at.timestamp()))
     details = {
         "zealotry": zealotry,
         "delay_seconds": delay_seconds,
@@ -4069,63 +4026,6 @@ async def _tmux_pane_has_pending_input(tmux_pane: str) -> bool:
     return _pane_input_line_has_text(lines[-1])
 
 
-async def _flag_hook_driven(
-    instance_id: str | None = None, *, tmux_pane: str | None = None, actor: str
-) -> None:
-    """Mark a target instance hook_driven=1 — "being driven autonomously, not by
-    the Emperor" (agent-to-agent / system fanout / automated wake). MUST commit
-    before the wake byte reaches the pane so the agent's PromptSubmit can't observe
-    a stale 0. Cleared on Stop/SessionEnd. Best-effort: a flag-write failure must
-    never block the actual send.
-
-    Resolves the concrete instance row by ``id`` first, then by live ``tmux_pane``
-    (the talk/brief queue path passes a pane id in the instance_id slot)."""
-    if not (instance_id or "").strip() and not (tmux_pane or "").strip():
-        return
-    try:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            db.row_factory = aiosqlite.Row
-            target_id: str | None = None
-            if (instance_id or "").strip():
-                cur = await db.execute(
-                    "SELECT id FROM claude_instances WHERE id = ?", (instance_id,)
-                )
-                row = await cur.fetchone()
-                if row:
-                    target_id = row["id"]
-            if target_id is None and (tmux_pane or "").strip():
-                # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID
-                # stamp, then confirm the row by id (never query the stored column).
-                pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
-                if pane_instance_id:
-                    cur = await db.execute(
-                        "SELECT id FROM claude_instances WHERE id = ? AND status != 'stopped'",
-                        (pane_instance_id,),
-                    )
-                    row = await cur.fetchone()
-                    if row:
-                        target_id = row["id"]
-            if target_id is None:
-                # Target row not registered yet — nothing to flag (rare race).
-                return
-            await sanctioned_update_instance(
-                db,
-                instance_id=target_id,
-                updates={"hook_driven": 1},
-                mutation_type="status_changed",
-                write_source="dispatch",
-                actor=actor,
-            )
-            await db.commit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "hook_driven flag failed for %s (%s): %s",
-            (instance_id or tmux_pane or "?")[:24],
-            actor,
-            exc,
-        )
-
-
 async def enqueue_pane_write(
     *,
     instance_id: str,
@@ -4133,15 +4033,9 @@ async def enqueue_pane_write(
     source: str,
     purpose: str,
     payload: str,
-    hook_driven: bool = False,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
-    # Caller-classified autonomous wake: flag the target BEFORE the write lands so
-    # its PromptSubmit observes hook_driven=1 (read-time discount). See classification
-    # table — Emperor-proxied (Custodes-out) / direct-Emperor sends pass hook_driven=False.
-    if hook_driven:
-        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
     queue_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4340,34 +4234,14 @@ async def process_pane_write_queue_once(
     results: list[dict] = []
     for row in rows:
         item = dict(row)
-        instance_id = item["instance_id"]
-        stored_pane = item["tmux_pane"]
-        # tmuxctl owns instance_id -> pane. Resolve the LIVE pane at dequeue rather
-        # than trusting the stored column: the periodic worker may drain this item
-        # long after enqueue, by which time the stored %N can be stale (pane moved,
-        # tmux server cycled, agent died). Fail closed when the pane no longer
-        # resolves — never deliver an automated write to a stale or reused pane.
-        live_pane, _live_role = await shared.resolve_instance_pane(instance_id)
-        pane = live_pane
+        pane = item["tmux_pane"]
         base = {
             "queue_id": item["id"],
-            "instance_id": instance_id,
+            "instance_id": item["instance_id"],
             "tmux_pane": pane,
-            "stored_pane": stored_pane,
             "source": item["source"],
             "purpose": item["purpose"],
         }
-        if not pane:
-            # Pane gone: terminal for this item (cancel, do not retry or send).
-            result = {**base, "status": PANE_WRITE_CANCELLED, "reason": "pane_unresolved"}
-            await _mark_pane_write(
-                item["id"],
-                status=PANE_WRITE_CANCELLED,
-                result=result,
-                error="pane_unresolved",
-            )
-            results.append(result)
-            continue
         is_brief = item["source"] == "brief"
         try:
             # brief clears/replaces a stale composer rather than deferring on it
@@ -4721,29 +4595,6 @@ def _activity_icons() -> list[ActivityIconState]:
 WORK_ACTION_BUFFER_SECONDS = 3 * 60
 TYPING_GUARD_ACTIVE_SECONDS = 15
 
-# ---- Action-based enforcement response (ack → action redesign) ----
-# Enforcement is satisfied/deferred by work-signal ACTIONS, not by acking.
-# SATISFY kinds clear the triggering condition → resolve the pending ack.
-# Everything else (ambient live work: dictation/voice) DEFERS — stall, don't lose.
-WORK_SIGNAL_SATISFY_KINDS = frozenset({"work_action", "prompt_submit"})
-# Work-action staleness window for the cockpit HUD dial: the green→red fade runs
-# over this many minutes since the last explicit work-action. Named (not magic)
-# and surfaced in the cockpit read model so the frontend fade and any future
-# backend nudge agree on "you haven't logged a work action in a while."
-WORK_ACTION_STALE_FADE_MINUTES = 30
-# Ack sources a generic productivity signal is allowed to clear. Distraction +
-# backlog acks are cleared by "I'm working now"; agent-pane acks (golden_throne,
-# askq) are only cleared by activity on that specific instance.
-WORK_SIGNAL_SATISFY_SOURCES = frozenset({"phone_distraction", "backlog_violation", "phone_gaming"})
-# Live dictation holds the Pavlok like typing does, re-checked for staleness so a
-# stuck lock can't suppress enforcement forever.
-DICTATION_GUARD_WINDOW_SECONDS = 120
-# The demoted ack's one-time courtesy: the FIRST ack in an enforcement sequence
-# grants a small break credit (Pavlok-connectivity confirm), never repeated.
-ACK_FIRST_BREAK_BOOST_SECONDS = 30
-# Sequence state for the one-time boost; reset when a fresh ack sequence opens.
-ACK_BREAK_BOOST_STATE = {"granted_in_sequence": False}
-
 
 def _format_countdown_seconds(seconds: int | None) -> str | None:
     if seconds is None:
@@ -4780,7 +4631,7 @@ async def compute_work_state() -> WorkStateResponse:
         cursor = await db.execute(
             """
             SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id,
-                   last_activity, legion, COALESCE(hook_driven, 0) AS hook_driven
+                   last_activity, legion
             FROM claude_instances
             WHERE status IN ('processing', 'idle')
               AND COALESCE(is_subagent, 0) = 0
@@ -4789,9 +4640,7 @@ async def compute_work_state() -> WorkStateResponse:
         rows = await cursor.fetchall()
         pane_activity_cursor = await db.execute(
             """
-            SELECT tmux_pane,
-                   MAX(last_activity) AS last_activity,
-                   MAX(COALESCE(hook_driven, 0)) AS hook_driven
+            SELECT tmux_pane, MAX(last_activity) AS last_activity
             FROM claude_instances
             WHERE tmux_pane IS NOT NULL
               AND device_id = ?
@@ -4799,15 +4648,10 @@ async def compute_work_state() -> WorkStateResponse:
             """,
             (LOCAL_DEVICE_NAME,),
         )
-        pane_activity_rows = await pane_activity_cursor.fetchall()
         pane_last_activity: dict[str, str] = {
-            r["tmux_pane"]: r["last_activity"] for r in pane_activity_rows if r["last_activity"]
-        }
-        # Panes whose (non-stopped — Stop clears the flag) instance is hook_driven=1,
-        # i.e. being driven autonomously / agent-to-agent. Discounted at read-time
-        # alongside the low-level automated_pane_activity marker (belt-and-suspenders).
-        pane_hook_driven: set[str] = {
-            r["tmux_pane"] for r in pane_activity_rows if r["hook_driven"]
+            r["tmux_pane"]: r["last_activity"]
+            for r in await pane_activity_cursor.fetchall()
+            if r["last_activity"]
         }
         # Automated-activation markers: panes woken by an automated tmuxctl
         # injection (state-hook fanout / dispatch / enforcement) still inside the
@@ -4865,28 +4709,21 @@ async def compute_work_state() -> WorkStateResponse:
             wa_note = wa_details.get("note") or ""
             discounted = False
             if (
-                not human_typing
+                automated_panes
+                and not human_typing
                 and wa_source != "tmux-typing-guard"
                 and wa_note.startswith("session_id=")
             ):
                 wa_sid = wa_note[len("session_id=") :].strip()
                 if wa_sid:
                     wa_pane_cursor = await db.execute(
-                        "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
-                        "FROM claude_instances WHERE id = ?",
+                        "SELECT tmux_pane FROM claude_instances WHERE id = ?",
                         (wa_sid,),
                     )
                     wa_pane_row = await wa_pane_cursor.fetchone()
                     wa_pane = wa_pane_row["tmux_pane"] if wa_pane_row else None
-                    wa_hook_driven = bool(wa_pane_row["hook_driven"]) if wa_pane_row else False
                     marker_injected = automated_panes.get(wa_pane) if wa_pane else None
-                    if wa_hook_driven:
-                        # hook_driven: the instance is being driven autonomously, so
-                        # its prompt_submit work_action is not the Emperor's work.
-                        # Discount unconditionally (no injected_at timestamp to gate
-                        # against — the flag is durable, not a TTL marker).
-                        discounted = True
-                    elif marker_injected is not None:
+                    if marker_injected is not None:
                         # Discount only activity at/after the injection. Compare
                         # elapsed age (tz-independent): events.created_at is UTC
                         # while injected_at is local, but both ages derive from
@@ -4941,23 +4778,18 @@ async def compute_work_state() -> WorkStateResponse:
             continue
         if live_pane is False:
             continue
-        # Discount an automated/autonomous wake (no human typing this tick). Two
-        # independent signals, either suffices (belt-and-suspenders):
-        #   • marker: this pane has a live automated_pane_activity marker and its
-        #     last_activity post-dates the injection — the bump is attributable to
-        #     the automated send. The >= injected_at guard preserves a pane already
-        #     working before the injection.
-        #   • hook_driven: this instance is flagged as driven autonomously /
-        #     agent-to-agent (set before the wake, cleared on Stop). Durable flag,
-        #     no timestamp gate.
+        # Discount an automated-injection reflex wake: this pane has a live
+        # marker, no human is typing, and its last_activity post-dates the
+        # injection — so the bump is attributable to the automated send, not
+        # work. The >= injected_at guard preserves a pane already working before
+        # the injection.
         marker_injected = automated_panes.get(canonical_tmux_pane) if canonical_tmux_pane else None
-        marker_discount = (
+        if (
             marker_injected is not None
+            and not human_typing
             and last_activity_dt is not None
             and last_activity_dt >= marker_injected
-        )
-        hook_driven_discount = bool(row["hook_driven"])
-        if (marker_discount or hook_driven_discount) and not human_typing:
+        ):
             continue
         if canonical_tmux_pane:
             tracked_panes.add(canonical_tmux_pane)
@@ -4998,14 +4830,15 @@ async def compute_work_state() -> WorkStateResponse:
             continue
         if pane_last_activity_dt < work_activity_cutoff:
             continue
-        # Same automated/autonomous discount as the instance loop — the observed
+        # Same automated-injection discount as the instance loop — the observed
         # and instance paths read the same underlying last_activity, so guarding
-        # only one would leak the reflex wake through the other. marker (TTL) OR
-        # hook_driven (durable, per-pane), gated by no human typing.
+        # only one would leak the reflex wake through the other.
         marker_injected = automated_panes.get(pane)
-        marker_discount = marker_injected is not None and pane_last_activity_dt >= marker_injected
-        hook_driven_discount = pane in pane_hook_driven
-        if (marker_discount or hook_driven_discount) and not human_typing:
+        if (
+            marker_injected is not None
+            and not human_typing
+            and pane_last_activity_dt >= marker_injected
+        ):
             continue
         observed_agents.append(
             AgentRuntime(
@@ -5222,15 +5055,6 @@ async def create_expected_ack(
                 _schedule_expected_ack_remaining(ack)
                 return ack
 
-        # A fresh ack SEQUENCE opens when this is the first pending ack — arm the
-        # one-time first-ack break boost (the demoted ack's courtesy credit).
-        pending_cursor = await db.execute(
-            "SELECT COUNT(*) FROM expected_acknowledgements WHERE status = 'pending'"
-        )
-        (pending_before,) = await pending_cursor.fetchone()
-        if pending_before == 0:
-            ACK_BREAK_BOOST_STATE["granted_in_sequence"] = False
-
         ack_id = str(uuid.uuid4())
         deadlines = _expected_ack_deadlines(
             ack_delay=ack_delay, level2_delay=level2_delay, pavlok_delay=pavlok_delay
@@ -5348,15 +5172,6 @@ async def _find_expected_ack(
     return _expected_ack_row_to_dict(row) if row else None
 
 
-async def _has_pending_acks() -> bool:
-    """True if any enforcement sequence is currently pending."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM expected_acknowledgements WHERE status = 'pending' LIMIT 1"
-        )
-        return await cursor.fetchone() is not None
-
-
 async def _resolve_expected_ack(
     *,
     ack_id: str | None,
@@ -5364,7 +5179,6 @@ async def _resolve_expected_ack(
     instance_id: str | None,
     status: str,
     bailout_reason: str | None = None,
-    resolved_by: str | None = None,
 ) -> dict:
     ack = await _find_expected_ack(ack_id, source, instance_id)
     if not ack:
@@ -5399,16 +5213,11 @@ async def _resolve_expected_ack(
     event_type = (
         "expected_ack_acknowledged" if status == "acknowledged" else "expected_ack_bailed_out"
     )
-    # Every resolution carries an explicit reason — no silent paths. resolved_by
-    # records WHICH work signal cleared the condition (e.g. "work_signal:work_action").
-    details = {**ack, "resolved_by": resolved_by}
-    await log_event(event_type, instance_id=ack["instance_id"], details=details)
-    return {"updated": True, "ack": ack, "resolved_by": resolved_by}
+    await log_event(event_type, instance_id=ack["instance_id"], details=ack)
+    return {"updated": True, "ack": ack}
 
 
-async def acknowledge_pending_acks_for_instance(
-    instance_id: str, source: str | None = None, resolved_by: str | None = None
-) -> int:
+async def acknowledge_pending_acks_for_instance(instance_id: str, source: str | None = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if source:
@@ -5432,46 +5241,36 @@ async def acknowledge_pending_acks_for_instance(
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"],
-            source=None,
-            instance_id=None,
-            status="acknowledged",
-            resolved_by=resolved_by,
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
         )
         if result["updated"]:
             count += 1
     return count
 
 
-async def acknowledge_pending_work_action_acks(resolved_by: str | None = None) -> int:
-    placeholders = ", ".join("?" for _ in WORK_SIGNAL_SATISFY_SOURCES)
+async def acknowledge_pending_work_action_acks() -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            f"""
+            """
             SELECT id FROM expected_acknowledgements
             WHERE status = 'pending'
-              AND source IN ({placeholders})
-            """,
-            tuple(WORK_SIGNAL_SATISFY_SOURCES),
+              AND source IN ('phone_distraction', 'backlog_violation')
+            """
         )
         rows = await cursor.fetchall()
 
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"],
-            source=None,
-            instance_id=None,
-            status="acknowledged",
-            resolved_by=resolved_by,
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
         )
         if result.get("updated"):
             count += 1
     return count
 
 
-async def acknowledge_backlog_surface_acks(surface: str, resolved_by: str | None = None) -> int:
+async def acknowledge_backlog_surface_acks(surface: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -5488,141 +5287,11 @@ async def acknowledge_backlog_surface_acks(surface: str, resolved_by: str | None
     count = 0
     for row in rows:
         result = await _resolve_expected_ack(
-            ack_id=row["id"],
-            source=None,
-            instance_id=None,
-            status="acknowledged",
-            resolved_by=resolved_by,
+            ack_id=row["id"], source=None, instance_id=None, status="acknowledged"
         )
         if result.get("updated"):
             count += 1
     return count
-
-
-async def _resume_productivity_timer(trigger: str) -> dict:
-    """Flip the timer to productive-now and roll the session if we left idle.
-
-    Shared by every work signal that proves the Emperor is actively working.
-    Returns a small summary the caller can surface; phone/desktop distraction
-    state is intentionally left untouched (a work action proves work resumed,
-    not that the distraction ended)."""
-    global _current_session_id, _session_start_ms
-    now_ms = int(time.monotonic() * 1000)
-    old_mode = timer_engine.current_mode.value
-    result = timer_engine.set_productivity(True, now_ms)
-    exited_idle = TimerEvent.MODE_CHANGED in result.events
-    if exited_idle:
-        new_mode = timer_engine.current_mode.value
-        today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_shift(old_mode, new_mode, trigger=trigger, source="api")
-        if _current_session_id > 0:
-            duration_ms = now_ms - _session_start_ms
-            await timer_end_session(_current_session_id, duration_ms)
-        _current_session_id = await timer_start_session(new_mode, today)
-        _session_start_ms = now_ms
-        logger.info("TIMER: %s exited %s → %s", trigger, old_mode, new_mode)
-    return {
-        "old_mode": old_mode,
-        "exited_idle": exited_idle,
-        "current_mode": timer_engine.current_mode.value,
-    }
-
-
-async def observe_work_signal(
-    *,
-    source: str,
-    kind: str,
-    instance_id: str | None = None,
-    details: dict | None = None,
-    set_productivity: bool = True,
-) -> dict:
-    """The one work-signal sink. ALL work signals route through here.
-
-    Responsibilities (single router, no bolt-on side paths):
-      (a) optionally flip the timer to productive-now,
-      (b) decide DEFER vs SATISFY against currently-pending enforcement,
-      (c) for SATISFY, resolve the matching acks via ``_resolve_expected_ack``
-          with an explicit ``resolved_by="work_signal:<kind>"`` reason,
-      (d) log one canonical ``work_signal`` event — never a silent path.
-
-    SATISFY kinds clear the triggering condition (work-action bind, prompt
-    submit). Ambient live work (dictation, voice) DEFERS — it stalls enforcement
-    and holds the Pavlok (see enforce()'s dictation guard) but does not resolve
-    the ack; the escalation ladder re-checks staleness. "We don't lose, we stall."
-    """
-    disposition = "satisfy" if kind in WORK_SIGNAL_SATISFY_KINDS else "defer"
-
-    productivity: dict | None = None
-    if set_productivity:
-        productivity = await _resume_productivity_timer(kind)
-
-    # Work evidence + legacy cascade shim fire for any work signal.
-    _mark_mewgenics_work_action(source, (details or {}).get("note") if details else None)
-    stop_enforcement_cascade(reason=f"work_signal:{kind}")
-
-    resolved_acks = 0
-    if disposition == "satisfy":
-        resolved_by = f"work_signal:{kind}"
-        resolved_acks += await acknowledge_pending_work_action_acks(resolved_by=resolved_by)
-        if instance_id:
-            resolved_acks += await acknowledge_pending_acks_for_instance(
-                instance_id, resolved_by=resolved_by
-            )
-
-    payload = {
-        "source": source,
-        "kind": kind,
-        "instance_id": instance_id,
-        "disposition": disposition,
-        "resolved_acks": resolved_acks,
-    }
-    if details:
-        payload["details"] = details
-    if productivity:
-        payload["timer"] = productivity
-    await log_event("work_signal", instance_id=instance_id, details=payload)
-
-    return {
-        "disposition": disposition,
-        "kind": kind,
-        "resolved_acks": resolved_acks,
-        "timer": productivity,
-    }
-
-
-async def grant_break_credit(seconds: int, *, reason: str, source: str) -> dict:
-    """Structured one-off break credit (replaces the debug set-break poke for
-    real credits). Adds positive break balance, logs an explicit reason, persists."""
-    now_ms = int(time.monotonic() * 1000)
-    timer_engine.credit_break(max(0, seconds) * 1000, now_ms)
-    await log_event(
-        "break_credit",
-        details={
-            "reason": reason,
-            "source": source,
-            "seconds": seconds,
-            "break_balance_ms": timer_engine.break_balance_ms,
-        },
-    )
-    await timer_save_to_db()
-    return {"seconds": seconds, "break_balance_ms": timer_engine.break_balance_ms}
-
-
-async def maybe_grant_first_ack_break_boost(eligible: bool = True) -> dict:
-    """Grant the one-time ~30s break boost for the FIRST ack in a sequence only.
-
-    ``eligible`` gates the credit on a real enforcement sequence + a connected
-    Pavlok (the boost is a connectivity confirm, not free credit) — an ack with
-    no pending sequence or an unreachable device mints nothing. The sequence flag
-    is reset when a fresh ack sequence opens (see create_expected_ack), so
-    subsequent acks in the same sequence grant nothing either."""
-    if not eligible or ACK_BREAK_BOOST_STATE["granted_in_sequence"]:
-        return {"granted": False, "seconds": 0}
-    ACK_BREAK_BOOST_STATE["granted_in_sequence"] = True
-    await grant_break_credit(
-        ACK_FIRST_BREAK_BOOST_SECONDS, reason="ack_connectivity", source="enforcement_ack"
-    )
-    return {"granted": True, "seconds": ACK_FIRST_BREAK_BOOST_SECONDS}
 
 
 async def _terminal_backlog_ack_for_active_span(
@@ -6341,68 +6010,6 @@ def _golden_throne_rate_limit_delay(now: float | None = None) -> tuple[float | N
     return None, details
 
 
-async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> None:
-    """Fail closed when tmuxctl finds no live pane for this instance UUID.
-
-    The pane is gone (agent died / tmux server cycled / never stamped). Do not
-    send, do not count a resume, do not fabricate a position or speak one. Mark
-    the instance stopped so liveness reflects reality and the Golden Throne timer
-    stops re-firing at a vanished pane.
-    """
-    now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
-            db,
-            instance_id=session_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
-            mutation_type="instance_stopped",
-            write_source="golden_throne",
-            actor="golden-throne-instance-gone",
-        )
-        await db.commit()
-    await log_event(
-        "golden_throne_instance_gone",
-        instance_id=session_id,
-        details={"engine": engine, "reason": "pane_unresolved"},
-    )
-    logger.info(
-        f"Golden Throne: {session_id[:12]} pane unresolved (instance gone); "
-        f"marked stopped, no resume counted"
-    )
-
-
-async def _resolve_remote_instance_pane(
-    session_id: str, device_id: str
-) -> tuple[str | None, str | None]:
-    """Resolve a remote instance's live ``(pane_id, role)`` on its own host.
-
-    tmux panes are host-local, so token-api never resolves a remote pane against
-    its own tmux server (a stale remote %N would mis-map onto an unrelated local
-    pane) and keeps no stored remote-pane perspective. It asks the pane's host —
-    the satellite — which shells its local ``tmuxctl resolve-instance``. Fails
-    closed: any miss, unreachable satellite, or error returns ``(None, None)`` so
-    the caller marks the instance stopped instead of speaking a stale position.
-    """
-    if not session_id:
-        return (None, None)
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(
-                f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tmux/resolve-instance",
-                params={"session_id": session_id},
-            )
-        if resp.status_code >= 400:
-            return (None, None)
-        payload = resp.json()
-    except Exception:
-        return (None, None)
-    if not isinstance(payload, dict) or not payload.get("found"):
-        return (None, None)
-    pane_id = (payload.get("pane_id") or "").strip() or None
-    role = (payload.get("pane_role") or "").strip() or None
-    return (pane_id, role)
-
-
 async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -6415,12 +6022,6 @@ async def golden_throne_followup(session_id: str):
         return
 
     instance = dict(instance)
-
-    # The one-shot timer has fired and is consumed, so the pane is no longer
-    # "armed": clear @GT_FIRE now. A reschedule below (quiet-hours / rate-limit)
-    # re-pushes a fresh epoch; a dispatch leaves it cleared until the next stop
-    # hook re-arms, and a skip leaves it cleared (correct — no countdown).
-    await _gt_clear_fire(session_id)
 
     # Skip if already processing (user beat us to it)
     # Sync instances are permanently processing — never skip them
@@ -6515,22 +6116,13 @@ async def golden_throne_followup(session_id: str):
         )
     else:
         sop_prompt = _load_golden_throne_sop()
+    tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
     engine = _agent_engine(instance)
-    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-    # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
-    # perspective, so a stale stored %N can no longer drive a send or speak a
-    # stale position (this is what produced the "1:NE" ghost). Local instances
-    # resolve via the local tmuxctl; remote panes live on another tmux server, so
-    # the satellite resolves them on their own host by UUID. Both fail closed.
-    if device_id == LOCAL_DEVICE_NAME:
-        tmux_pane, pane_label = await shared.resolve_instance_pane(session_id)
-    else:
-        tmux_pane, pane_label = await _resolve_remote_instance_pane(session_id, device_id)
+    pane_label = await _tmux_pane_label(tmux_pane)
     pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
     human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
-    instance["tmux_pane"] = tmux_pane
     instance["pane_label"] = pane_label
     instance["pane_surface"] = pane_surface
     instance["human_pane_surface"] = human_pane_surface
@@ -6568,13 +6160,8 @@ async def golden_throne_followup(session_id: str):
         )
         return
 
-    # Dispatch: local for instances on this machine, satellite for remote.
-    # Fail closed for ANY device: an instance whose pane no longer resolves — a
-    # local tmuxctl miss or a remote satellite miss/unreachable — must not be sent
-    # to, counted as a resume, or spoken with a fabricated position.
-    if not tmux_pane:
-        await _golden_throne_handle_instance_gone(session_id, engine)
-        return
+    # Dispatch: local for instances on this machine, satellite for remote
+    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     followup_id = str(uuid.uuid4())
     dispatch_details = {
         "followup_id": followup_id,
@@ -6636,8 +6223,6 @@ async def golden_throne_followup(session_id: str):
                     source="golden_throne",
                     purpose="followup",
                     payload=inject_prompt,
-                    # Golden-throne followup is a system-originated autonomous wake.
-                    hook_driven=True,
                 )
                 queue_results = await process_pane_write_queue_once(queued["id"])
                 queue_result = queue_results[0] if queue_results else queued
@@ -6786,11 +6371,6 @@ async def golden_throne_followup(session_id: str):
                     f"Golden Throne: follow-up dispatched for {session_id[:12]} "
                     f"via {result.get('transport', '?')}"
                 )
-                # The pane vanished on its host between resolve and dispatch —
-                # fail closed: mark stopped, no resume counted, no stale position.
-                if result.get("status") == "instance_gone":
-                    await _golden_throne_handle_instance_gone(session_id, engine)
-                    return
         except Exception as e:
             dispatch_details.update(
                 {
@@ -6932,7 +6512,6 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
         logger.info(f"Nudge: cancelled golden throne timer for {instance_id[:12]}")
     except Exception:
         pass
-    await _gt_clear_fire(instance_id)
 
     tmux_pane = instance.get("tmux_pane")
     working_dir = instance.get("working_dir") or "~"
@@ -7056,28 +6635,6 @@ def _typing_guard_active() -> bool:
         return False
     age = int(time.time()) - activity
     return 0 <= age <= max(1, _TYPING_GUARD_WINDOW_SECONDS)
-
-
-def _dictation_active() -> bool:
-    """Live dictation/voice predicate (sync): the Emperor is dictating right now.
-
-    Reads the shared DICTATION_STATE toggle (set by AHK / voice-chat listening)
-    with a staleness window so a lock that never toggled off can't suppress the
-    Pavlok indefinitely. Same DEFER role as ``_typing_guard_active``: while live,
-    enforcement stalls rather than fires.
-    """
-    if not DICTATION_STATE.get("active"):
-        return False
-    updated_at = DICTATION_STATE.get("updated_at")
-    if not updated_at:
-        # Active with no timestamp — honour the toggle but bounded by nothing we
-        # can stale-check; treat as live (fail toward stalling, never losing).
-        return True
-    try:
-        age = (datetime.now() - datetime.fromisoformat(updated_at)).total_seconds()
-    except (ValueError, TypeError):
-        return True
-    return 0 <= age <= DICTATION_GUARD_WINDOW_SECONDS
 
 
 async def _custodes_state_snapshot() -> dict:
@@ -7294,12 +6851,6 @@ async def _inject_custodes_prompt_to_pane(
         canceled = await cancel_check("pre_pane_inject")
         if canceled:
             return canceled
-    # State-hook fanout wake (custodes-in / Administratum record — both route
-    # through this helper). The target is being driven autonomously, NOT acting
-    # outbound, so flag hook_driven=1 before the byte lands; its reflex PromptSubmit
-    # is then discounted at read-time. Custodes-OUT (talk/brief/dispatch) never
-    # reaches this helper.
-    await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor="state-hook-fanout")
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
@@ -8609,7 +8160,6 @@ async def set_zealotry(instance_id: str, request: Request):
             timer_cancelled = True
         except Exception:
             pass
-        await _gt_clear_fire(instance_id)
 
     logger.info(f"Golden Throne: zealotry={zealotry} for {instance_id[:12]}")
     return {"instance_id": instance_id, "zealotry": zealotry, "timer_cancelled": timer_cancelled}
@@ -8748,47 +8298,6 @@ async def set_instance_synced(instance_id: str, request: Request):
 
     logger.info(f"Synced: {instance_id[:12]} → synced={synced_int} (legion={legion})")
     return {"instance_id": instance_id, "synced": bool(synced_int), "legion": legion}
-
-
-@app.patch("/api/instances/{instance_id}/pr")
-async def set_instance_pr(instance_id: str, request: Request):
-    """Set the "agent has a PR open" flag (pr_url + pr_state) for an instance.
-
-    Phase 1: pr-create calls this best-effort after `gh pr create`, keyed off
-    $TOKEN_API_INSTANCE_ID, so /ui/ops badges the originating instance. pr_state is
-    flipped to 'merged' by the CD restart-on-merge webhook (Phase 2). Writes go
-    through sanctioned_update_instance (pr_url/pr_state are registered mutable fields).
-    """
-    body = await request.json()
-    pr_state = body.get("pr_state")
-    if pr_state is not None and pr_state not in ("open", "merged", "closed"):
-        raise HTTPException(status_code=400, detail="pr_state must be open|merged|closed")
-
-    updates: dict = {}
-    if "pr_url" in body:
-        updates["pr_url"] = body.get("pr_url")
-    if "pr_state" in body:
-        updates["pr_state"] = pr_state
-    if not updates:
-        raise HTTPException(status_code=400, detail="no pr fields provided (pr_url, pr_state)")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates=updates,
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="set-pr",
-        )
-        await db.commit()
-
-    logger.info(f"PR flag: {instance_id[:12]} → {updates}")
-    return {"instance_id": instance_id, **updates}
 
 
 @app.patch("/api/instances/{instance_id}/discord")
@@ -9001,8 +8510,6 @@ async def _victory_ack_core(
             timers_cancelled.append(iid)
         except Exception:
             pass
-    for iid in timers_cancelled:
-        await _gt_clear_fire(iid)
 
     victory_surface = ", ".join(instance_surfaces) or doc_title
     try:
@@ -9099,58 +8606,6 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
     return {"doc_id": doc_id, "key": key, "value": value, "extra": list(extra.keys())}
 
 
-# Serializes worktree-registry mutations so the demote-prior-active-then-append
-# stays atomic under concurrent claims (Phase 3, one-active invariant).
-_worktree_registry_lock = asyncio.Lock()
-
-
-@app.post("/api/session-docs/{doc_id}/worktrees")
-async def session_doc_worktrees(doc_id: int, request: Request):
-    """Mutate a session doc's worktree registry (Phase 3).
-
-    Body: {"action": "claim"|"archive", "path": str, "branch"?, "port"?,
-    "claimed_at"?}. The demote-active-then-append happens server-side under a
-    lock to hold the one-active invariant. Registry lives in session-doc
-    frontmatter — NOT the dormant `worktrees` DB table.
-    """
-    body = await request.json()
-    action = body.get("action")
-    if action not in ("claim", "archive"):
-        raise HTTPException(status_code=400, detail="action must be claim|archive")
-    path = body.get("path")
-    if not path:
-        raise HTTPException(status_code=400, detail="path is required")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
-        row = await cursor.fetchone()
-    if not row or not row[0]:
-        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
-    fp = Path(row[0])
-    if not fp.exists():
-        raise HTTPException(status_code=404, detail=f"Session doc file missing: {fp}")
-
-    async with _worktree_registry_lock:
-        try:
-            wts = await asyncio.to_thread(
-                update_session_doc_worktrees,
-                fp,
-                action=action,
-                path=path,
-                branch=body.get("branch"),
-                port=body.get("port"),
-                claimed_at=body.get("claimed_at"),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except Exception as exc:
-            logger.warning(f"worktrees: write failed for doc {doc_id}: {exc}")
-            raise HTTPException(status_code=500, detail=f"worktree registry write failed: {exc}")
-
-    logger.info(f"worktrees: doc {doc_id} {action} {path}")
-    return {"doc_id": doc_id, "action": action, "worktrees": wts}
-
-
 @app.post("/api/session-docs/{doc_id}/victory-ack")
 async def victory_ack_session_doc(doc_id: int, request: Request):
     """Emperor's final ack on a session doc.
@@ -9235,7 +8690,6 @@ async def declare_victory(instance_id: str, request: Request):
         timer_cancelled = True
     except Exception:
         pass
-    await _gt_clear_fire(instance_id)
 
     victory_surface = tab_name if _is_meaningful_tab_name(tab_name) else instance_id[:12]
     try:
@@ -9346,7 +8800,6 @@ async def set_instance_type(instance_id: str, request: Request):
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
-        await _gt_clear_fire(instance_id)
         try:
             scheduler.remove_job(f"sync-retrigger-{instance_id}")
         except Exception:
@@ -9804,11 +9257,6 @@ async def pane_session_doc(tmux_pane: str):
     Returns {vault, file_path (vault-relative), absolute_path, title, doc_id,
     instance_id}. 404 if no instance for the pane, or no linked session doc.
     """
-    # tmuxctl owns pane -> instance: resolve the pane's live @INSTANCE_ID stamp,
-    # then look up the row by id (no stored tmux_pane query).
-    instance_id = await shared.instance_id_for_pane(tmux_pane)
-    if not instance_id:
-        raise HTTPException(404, f"No instance for pane {tmux_pane}")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -9816,10 +9264,10 @@ async def pane_session_doc(tmux_pane: str):
                       sd.title, sd.project
                FROM claude_instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.id = ?
-                 AND COALESCE(ci.status, '') != 'stopped'
+               WHERE ci.tmux_pane = ?
+               ORDER BY ci.last_activity DESC
                LIMIT 1""",
-            (instance_id,),
+            (tmux_pane,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -9841,20 +9289,16 @@ async def pane_session_doc(tmux_pane: str):
 
 @app.get("/api/panes/{tmux_pane}/instance")
 async def pane_instance(tmux_pane: str):
-    """Resolve the active instance bound to a tmux pane."""
-    # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp, then
-    # look up the row by id (no stored tmux_pane query).
-    instance_id = await shared.instance_id_for_pane(tmux_pane)
-    if not instance_id:
-        raise HTTPException(404, f"No active instance for pane {tmux_pane}")
+    """Resolve the most recent active instance bound to a tmux pane."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT *
                FROM claude_instances
-               WHERE id = ? AND status != 'stopped'
+               WHERE tmux_pane = ? AND status != 'stopped'
+               ORDER BY last_activity DESC
                LIMIT 1""",
-            (instance_id,),
+            (tmux_pane,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -10101,32 +9545,7 @@ async def disarm_pane_tap(instance_id: str):
 # --- Trinity Chunk 1: talk / brief inter-persona comm primitives ------------
 
 
-async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
-    """Classify a talk/brief sender as Custodes. The Emperor acts THROUGH Custodes,
-    so Custodes' OUTBOUND sends count as the Emperor's work and must NOT flag the
-    target hook_driven (Emperor-proxied, custodes-out). Every other sender is
-    agent-to-agent → flag the target. Sender legion is the attribution key."""
-    if not (caller_pane or "").strip():
-        return False
-    try:
-        # tmuxctl owns pane -> instance: identify the sender via the pane's live
-        # @INSTANCE_ID stamp, then read its legion by id (no stored tmux_pane query).
-        caller_instance_id = await shared.instance_id_for_pane(caller_pane)
-        if not caller_instance_id:
-            return False
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT legion FROM claude_instances WHERE id = ? AND status != 'stopped'",
-                (caller_instance_id,),
-            )
-            row = await cur.fetchone()
-    except Exception:
-        return False
-    return bool(row) and (row["legion"] or "").lower() == "custodes"
-
-
-async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
+async def _talk_send_payload(target_pane: str, payload: str) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
     Drained synchronously so a CLI long-poll sees an actual delivery state.
@@ -10137,7 +9556,6 @@ async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: boo
         source="talk",
         purpose="talk_send",
         payload=payload,
-        hook_driven=hook_driven,
     )
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
@@ -10163,10 +9581,6 @@ async def talk_send(request: TalkSendRequest):
     if caller_pane == target_pane:
         raise HTTPException(status_code=400, detail="caller_pane and target_pane are the same")
 
-    # hook_driven classification: flag the target unless the SENDER is Custodes
-    # (Emperor-proxied, custodes-out → no flag). Sender = resolved caller_pane.
-    talk_hook_driven = not await _pane_sender_is_custodes(caller_pane)
-
     # Explicit-return shortcut: if the SWAPPED pair (caller=target, target=caller)
     # is already open, this call IS the return.
     returned = await talk_service.return_talk(
@@ -10178,9 +9592,7 @@ async def talk_send(request: TalkSendRequest):
         # Still deliver the message into the original caller's pane so the
         # listener actually sees the response in its input stream.
         try:
-            send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
-            )
+            send_result = await _talk_send_payload(target_pane, request.payload)
         except Exception as exc:  # noqa: BLE001
             send_result = {"status": "failed", "error": str(exc)}
         return {
@@ -10201,9 +9613,7 @@ async def talk_send(request: TalkSendRequest):
         engine=target_engine,
     )
     try:
-        send_result = await _talk_send_payload(
-            target_pane, request.payload, hook_driven=talk_hook_driven
-        )
+        send_result = await _talk_send_payload(target_pane, request.payload)
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
         raise HTTPException(status_code=502, detail=f"talk delivery failed: {exc}") from exc
@@ -10242,14 +9652,6 @@ async def brief_send(request: BriefSendRequest):
     if not request.panes and not request.pages:
         raise HTTPException(status_code=400, detail="at least one --pane or --page required")
 
-    # hook_driven classification: flag each target unless the SENDER is Custodes
-    # (Emperor-proxied → no flag). An absent/unknown caller is not Custodes →
-    # flag (agent-to-agent / system default; typing-guard still overrides).
-    caller_resolved = (
-        await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
-    )
-    brief_hook_driven = not await _pane_sender_is_custodes(caller_resolved)
-
     resolved, unresolved = await talk_service.resolve_brief_targets(
         panes=request.panes,
         pages=request.pages,
@@ -10268,11 +9670,7 @@ async def brief_send(request: BriefSendRequest):
         pane_id = target["pane_id"]
         try:
             if request.ephemeral:
-                # Reuse the temp_message side-channel infra (/btw or /side). The
-                # temp_message queue_sender path doesn't carry hook_driven, so flag
-                # the target directly before the send (still before the byte lands).
-                if brief_hook_driven:
-                    await _flag_hook_driven(pane_id, tmux_pane=pane_id, actor="brief:ephemeral")
+                # Reuse the temp_message side-channel infra (/btw or /side).
                 instance = await talk_service.lookup_instance_for_pane(pane_id)
                 engine = (instance or {}).get("engine")
                 receipt = await temp_message_service.send_temp_message(
@@ -10291,7 +9689,6 @@ async def brief_send(request: BriefSendRequest):
                     source="brief",
                     purpose="brief_send",
                     payload=request.payload,
-                    hook_driven=brief_hook_driven,
                 )
                 drained = await process_pane_write_queue_once(queued["id"])
                 receipt = drained[0] if drained else queued
@@ -10710,35 +10107,6 @@ def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
     except Exception as e:
         logger.error(f"Failed to write daily note: {e}")
         return False
-
-
-def _append_work_action_to_daily_note(at: str, source: str) -> None:
-    """Append one {at, source} to today's daily-note `work_actions` frontmatter.
-
-    The canonical, durable store for explicit work-actions (count = len). Resolves
-    the vault from IMPERIUM_ENV at call time — unlike the module-level
-    DAILY_NOTE_DIR — so a temp test vault and a relocated NAS mount both land in
-    the right note. Create-if-missing keeps a pre-day-start press from being
-    dropped; day_start still owns the rich daily note.
-    """
-    vault = os.environ.get("IMPERIUM_ENV")
-    root = (
-        Path(vault)
-        if vault
-        else Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV"
-    )
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    note_path = root / "Terra" / "Journal" / "Daily" / f"{date_str}.md"
-    if not note_path.exists():
-        note_path.parent.mkdir(parents=True, exist_ok=True)
-        note_path.write_text(
-            serialize_frontmatter({"date": date_str, "type": "daily-note"}, f"# {date_str}\n"),
-            encoding="utf-8",
-        )
-    fm, _body = read_frontmatter(note_path)
-    actions = list(fm.get("work_actions") or [])
-    actions.append({"at": at, "source": source})
-    update_frontmatter(note_path, {"work_actions": actions})
 
 
 @app.get("/api/daily-note")
@@ -12096,38 +11464,12 @@ from enforce import EnforceRequest, enforce
 from enforce import init_deps as enforce_init_deps
 from notify import NotifyRequest, dispatch_notification
 
-# Work-session enforcement sidecar. While a declared work session owns
-# enforcement it fires its own authoritative zap@100 + redirect; the generic
-# enforcement system is the blocked party. These are the only sources allowed
-# through the sidecar gate — everything else (cascade@50, negative-break) is
-# suppressed at the single enforce() chokepoint so the work session is the sole
-# enforcer for the duration. See _work_session_enforcement_gate.
-WORK_SESSION_ENFORCE_SOURCES = {"work_session_negative", "work_session_failed"}
-
-
-def _work_session_enforcement_gate(source: str) -> str | None:
-    """Sidecar mutual-exclusion: while a work session owns enforcement, the
-    generic enforcement system is the blocked party. Only the work session's
-    own zaps pass; everything else is suppressed at this single chokepoint."""
-    if timer_engine.work_session_active and source not in WORK_SESSION_ENFORCE_SOURCES:
-        return "work_session_sidecar"
-    return None
-
-
-enforce_init_deps(
-    is_quiet_hours=is_quiet_hours,
-    typing_guard_active=_typing_guard_active,
-    dictation_active=_dictation_active,
-    enforcement_gate=_work_session_enforcement_gate,
-)
+enforce_init_deps(is_quiet_hours=is_quiet_hours, typing_guard_active=_typing_guard_active)
 
 # Wire voice route dependencies
 from routes.voice import init_deps as voice_init_deps
 
-voice_init_deps(
-    schedule_pedal_enter=_schedule_pedal_enter,
-    observe_work_signal=observe_work_signal,
-)
+voice_init_deps(schedule_pedal_enter=_schedule_pedal_enter)
 
 
 def _enforcement_state_payload(
@@ -12443,9 +11785,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             "scrolling",
             "gaming",
         ):
-            acknowledged_acks = await acknowledge_backlog_surface_acks(
-                "desktop", resolved_by="negative_edge:desktop"
-            )
+            acknowledged_acks = await acknowledge_backlog_surface_acks("desktop")
             await log_event(
                 "enforcement_negative_edge",
                 details={
@@ -13935,12 +13275,7 @@ async def get_timer_shifts():
 async def enter_break_mode():
     """Enter break mode (for Stream Deck / TUI / manual control)."""
     global _current_session_id, _session_start_ms
-    # During a work session the engine balance is the local 0, so the normal
-    # "no balance, no break" guard would make declaring a break impossible —
-    # and dipping below local 0 is exactly the work-session failure path. Let
-    # the break through while a session is active; the session's own −30s
-    # cancel + dip-zap governs it.
-    if timer_engine.break_balance_ms <= 0 and not timer_engine.work_session_active:
+    if timer_engine.break_balance_ms <= 0:
         raise HTTPException(status_code=400, detail="No break time available")
 
     now_ms = int(time.monotonic() * 1000)
@@ -14117,89 +13452,60 @@ async def reset_timer():
 
 
 @app.post("/api/work-action")
-async def work_action(request: WorkActionRequest | None = None) -> dict:
-    """Manual work action signal — the canonical SATISFY work signal.
-
-    Routes through the unified observe_work_signal sink: sets productivity active
-    and resolves distraction/backlog acks with a logged work_signal:work_action
-    reason. A work action proves productivity resumed; it does not prove phone/
-    desktop distraction ended, so attention-source state is left untouched
-    (productivity + YouTube → MULTITASKING, not a false clear to WORKING).
-
-    This HTTP entry point is an EXPLICIT user press (Stream Deck, work-action
-    bind, Custodes-logged). Hook-driven satisfy signals (prompt_submit, etc.)
-    reach the same logic via hook_work_action_callback with explicit=False."""
-    return await _work_action(request or WorkActionRequest(), explicit=True)
-
-
-async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
-    """Core work-action handler, shared by the explicit HTTP endpoint and the
-    hook callback.
-
-    `explicit` marks a genuine user press. Only explicit presses are stamped
-    ``explicit: true`` in the event, persisted to the daily-note ``work_actions``
-    array, and counted by the cockpit work-action dial/ticks. Hook-driven satisfy
-    signals (prompt_submit / ask_user_question / typing-guard) still route here
-    for enforcement, but must NOT pollute the explicit-press visualization or the
-    durable daily-note log."""
+async def work_action(request: WorkActionRequest | None = None):
+    """Manual work action signal — sets productivity active and resolves distraction acks."""
+    global _current_session_id, _session_start_ms
+    request = request or WorkActionRequest()
     await bust_quiet_state(
         "api",
         "work_action",
         {"source": request.source, "note": request.note},
     )
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    result = timer_engine.set_productivity(True, now_ms)
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
 
-    # Only an EXPLICIT user press (Stream Deck / work-action bind) flips global
-    # productivity. Hook-driven satisfy signals (prompt_submit / ask_user_question,
-    # explicit=False) still resolve expected-acks and bust quiet-state, but no
-    # longer anchor global productivity — that is now the read-time calculus's job
-    # (compute_work_state). This removes the idle-clock-reset vector at its root.
-    signal = await observe_work_signal(
-        source=request.source,
-        kind="work_action",
-        details={"note": request.note} if request.note else None,
-        set_productivity=explicit,
-    )
-    acknowledged_acks = signal["resolved_acks"]
-    timer = signal["timer"] or {}
+    if exited_idle:
+        new_mode = timer_engine.current_mode.value
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_shift(old_mode, new_mode, trigger="work_action", source="api")
+        if _current_session_id > 0:
+            duration_ms = now_ms - _session_start_ms
+            await timer_end_session(_current_session_id, duration_ms)
+        _current_session_id = await timer_start_session(new_mode, today)
+        _session_start_ms = now_ms
+        print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
 
-    # Local-ISO press time, stamped into the event so the cockpit timeline ticks
-    # land in the same time domain as timer samples (events.created_at is UTC).
-    action_at = datetime.now().isoformat()
+    acknowledged_acks = await acknowledge_pending_work_action_acks()
+    _mark_mewgenics_work_action(request.source, request.note)
+    stop_enforcement_cascade(reason=f"work_action:{request.source}")
+    # A work action proves productivity resumed; it does not prove phone/desktop
+    # distraction ended. Preserve attention-source state so productivity + YouTube
+    # becomes MULTITASKING instead of falsely clearing to WORKING. Phone app state
+    # must be ended by explicit close/new-app telemetry or a dedicated correction.
+
     await log_event(
         "work_action",
         details={
             "source": request.source,
             "note": request.note,
-            "at": action_at,
-            "explicit": explicit,
-            "old_mode": timer.get("old_mode"),
+            "old_mode": old_mode,
             "current_mode": timer_engine.current_mode.value,
             "acknowledged_expected_acks": acknowledged_acks,
         },
     )
 
-    # Canonical, durable record: append to today's daily-note frontmatter — only
-    # for explicit presses, never hook-driven satisfy signals (prompt_submit etc.
-    # come through with explicit=False). Best-effort — a vault-write failure must
-    # never break the work-action path (mirrors the dictation guard).
-    if explicit:
-        try:
-            await asyncio.to_thread(_append_work_action_to_daily_note, action_at, request.source)
-        except Exception as exc:
-            logger.warning("work_action: daily-note persist failed: %s", exc)
-
     return {
         "idle_timer_reset": True,
-        "exited_idle": timer.get("exited_idle", False),
+        "exited_idle": exited_idle,
         "current_mode": timer_engine.current_mode.value,
         "acknowledged_expected_acks": acknowledged_acks,
     }
 
 
 async def hook_work_action_callback(source: str, note: str | None = None):
-    # Hook-driven satisfy signal (prompt_submit / ask_user_question / typing-
-    # guard): not an explicit press — keep it out of the daily note + cockpit.
-    return await _work_action(WorkActionRequest(source=source, note=note), explicit=False)
+    return await work_action(WorkActionRequest(source=source, note=note))
 
 
 # ============ Work Mode / Geofence Endpoints ============
@@ -14879,165 +14185,12 @@ async def cancel_shutdown():
         return {"success": False, "message": str(e)}
 
 
-# ============ CD: restart-on-merge webhook (Phase 2) ============
-#
-# Token-OS is personal software on a local Mac — "deploy to prod" means restart
-# the right local services. deploy-prod.yml (push→main) joins the tailnet via an
-# ephemeral GHA node and POSTs here with the changed-service list. Design choice:
-# ACK-FIRST, RESTART-DETACHED — validate the secret, spawn a fully detached restart,
-# and return 200 *before* token-api restarts itself, so the response flushes while
-# the runner is still waiting. The self-restart child survives our death
-# (start_new_session) and kicks launchd externally; restore_restart_state()
-# rehydrates ephemeral state on boot.
-#
-# CD auto-deploy proof (2026-06-06): this comment reached the live serving
-# checkout via the fixed pipeline alone — deploy-prod.yml → webhook →
-# `token-restart --sync` ff-forwarded the checkout to this commit and restarted,
-# with NO manual git step. See #92 for the fix that made merges self-deploying.
-
-# The shared secret lives OUTSIDE the repo — injected into token-api's launchd
-# environment (or read from Keychain) as CD_RESTART_SECRET. Fail-closed: if it is
-# unset/blank the endpoint refuses every request. Tailscale is defense-in-depth,
-# not a substitute for the secret.
-_CD_SECRET_ENV = "CD_RESTART_SECRET"
-
-# In-flight guard: coalesce duplicate restart webhooks for the SAME commit within
-# a short time window. A latched boolean can't work anymore — a git-aware
-# token-restart may NOT restart token-api (e.g. a discord-only or mobile-only
-# deploy), so this process survives and a stuck boolean would block every future
-# deploy. Keying on the sha (not time alone) is load-bearing: a distinct later
-# merge arriving inside the window is a REAL 2nd deploy that the first
-# `token-restart --sync` may have already missed in its fetch, so it must still
-# spawn its own sync. Only an identical sha (a duplicate/retry of the same event)
-# is swallowed.
-_cd_last_restart_spawn = 0.0  # time.monotonic() of the last token-restart spawn
-_cd_last_restart_sha: str | None = None  # sha of that spawn (coalesce only true dupes)
-_CD_COALESCE_WINDOW_S = 15.0
-
-
-def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
-    """Fire-and-forget a detached child that survives our own restart."""
-    log_path = Path(f"/tmp/cd-{log_name}.log")
-    handle = log_path.open("a")
-    try:
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-    finally:
-        handle.close()
-
-
-async def _cd_flip_pr_merged(pr_url: str) -> int:
-    """Flip pr_state→merged for instances whose pr_url matches the merged PR."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE pr_url = ? AND pr_state = 'open'",
-            (pr_url,),
-        )
-        ids = [r[0] for r in await cursor.fetchall()]
-        for iid in ids:
-            await sanctioned_update_instance(
-                db,
-                instance_id=iid,
-                updates={"pr_state": "merged"},
-                mutation_type="instance_updated",
-                write_source="cd",
-                actor="cd-restart",
-            )
-        await db.commit()
-    return len(ids)
-
-
-@app.post("/api/cd/restart")
-async def cd_restart(request: Request):
-    """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
-
-    Body: {"sha": "...", "pr_url": "..."}. The merge to main is shipped by a single
-    detached, git-aware `token-restart --sync`: it ff-only pulls the live checkout
-    to origin/main and then restarts ONLY the services whose files the merge
-    changed (see map_changed_to_services in cli-tools/bin/token-restart). The CD
-    pipeline no longer routes services — it just hits this endpoint. Any legacy
-    `services` field is accepted but informational (logged, not acted on).
-    Returns immediately; the restart is deferred to a detached child so this 200
-    flushes first.
-    """
-    global _cd_last_restart_spawn, _cd_last_restart_sha
-
-    configured = os.environ.get(_CD_SECRET_ENV, "").strip()
-    if not configured:
-        # Fail-closed: never accept when no secret is provisioned.
-        logger.error("CD: /api/cd/restart called but %s is unset — refusing", _CD_SECRET_ENV)
-        raise HTTPException(status_code=503, detail="CD restart not configured")
-
-    auth = request.headers.get("Authorization", "")
-    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
-    if not presented or not hmac.compare_digest(presented, configured):
-        logger.warning("CD: rejected /api/cd/restart — bad/missing bearer secret")
-        raise HTTPException(status_code=401, detail="invalid credentials")
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    sha = body.get("sha")
-    pr_url = body.get("pr_url")
-    # Informational only: token-restart derives the real changed-service set from
-    # the git diff of the sync it performs. Kept for logging + backward-compat with
-    # the pre-git-aware workflow body.
-    services = body.get("services")
-
-    # Flip the merged PR's originating instance badge (Phase 1 → merged).
-    merged_flips = 0
-    if pr_url:
-        try:
-            merged_flips = await _cd_flip_pr_merged(pr_url)
-        except Exception as e:
-            logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
-
-    # Spawn ONE detached, git-aware token-restart AFTER acking (the child sleeps so
-    # this 200 fully flushes before launchd may kick us). `token-restart --sync`
-    # ff-only pulls the live checkout to origin/main so the merge actually ships,
-    # then restarts ONLY the services it changed. (--sync is token-restart's
-    # default now; we still pass it explicitly so the CD path always syncs
-    # regardless of any future default change.) Coalesce only an identical sha
-    # inside the window (a duplicate/retry of the same merge) — see
-    # _CD_COALESCE_WINDOW_S; a different sha is a real later deploy and must spawn.
-    # save_restart_state() guards against kickstart -k skipping a graceful
-    # lifespan shutdown. Record the window AFTER a successful spawn so a spawn
-    # failure doesn't suppress retries.
-    now = time.monotonic()
-    if sha and sha == _cd_last_restart_sha and now - _cd_last_restart_spawn < _CD_COALESCE_WINDOW_S:
-        restart = "coalesced (recent restart in flight)"
-        logger.info("CD: restart coalesced (sha=%s, services=%s)", sha, services)
-    else:
-        try:
-            save_restart_state()
-        except Exception as e:
-            logger.warning("CD: save_restart_state failed (continuing): %s", e)
-        token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
-        _cd_spawn_detached(
-            ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
-            log_name="self-restart",
-        )
-        _cd_last_restart_spawn = now
-        _cd_last_restart_sha = sha
-        restart = "scheduled (detached, ~2s)"
-        logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
-
-    return {
-        "ok": True,
-        "sha": sha,
-        "restart": restart,
-        "pr_merged_flips": merged_flips,
-    }
-
-
 # ============ KVM (Deskflow) ============
+
+
+def _mac_kvm_set_state(**updates):
+    MAC_KVM_STATE.update(updates)
+    MAC_KVM_STATE["last_changed"] = datetime.now().isoformat()
 
 
 def _deskflow_client_remote_host() -> str:
@@ -15066,6 +14219,15 @@ def _deskflow_client_remote_host() -> str:
         f"KVM: Deskflow client config has no [client] remoteHost; falling back to {DESKTOP_CONFIG['host']}"
     )
     return DESKTOP_CONFIG["host"]
+
+
+def _wsl_deskflow_server_reachable() -> tuple[bool, str]:
+    host = _deskflow_client_remote_host()
+    try:
+        with socket.create_connection((host, DESKFLOW_SERVER_PORT), timeout=2):
+            return True, host
+    except OSError:
+        return False, host
 
 
 def _mac_deskflow_pids() -> list[str]:
@@ -15132,27 +14294,75 @@ def _stop_mac_deskflow_client(reason: str):
     logger.info(f"KVM: Stopped Deskflow client ({reason}, exit={result.returncode})")
 
 
-@app.post("/api/kvm/start")
-async def kvm_start() -> dict[str, object]:
-    """Start (or re-converge) the Deskflow client on this Mac.
+async def mac_kvm_supervisor():
+    """Mac-side guard that prevents Deskflow's native client from retry-spamming.
 
-    This is the satellite's invitation receiver. With Deskflow's native auto-retry
-    disabled, a client that is *running but disconnected* (stale socket) will not
-    re-dial on its own, so "already running" must NOT no-op — that would leave a
-    dead client wedged. We stop+start to converge a known-good client. The keymap
-    guard runs pre/post inside _start_mac_deskflow_client.
+    If the WSL Deskflow server port is absent, the Mac client is stopped so
+    deskflow-core cannot loop internally. Token-API then probes with exponential
+    backoff and starts the client only after the server port is reachable.
     """
+    await asyncio.sleep(5)
+    while True:
+        try:
+            server_reachable, server_host = await asyncio.to_thread(_wsl_deskflow_server_reachable)
+            client_running = await asyncio.to_thread(_mac_deskflow_running)
+
+            if server_reachable:
+                if not client_running:
+                    await asyncio.to_thread(_start_mac_deskflow_client, "server_reachable")
+                    client_running = True
+                    action = "client_started"
+                else:
+                    action = "server_reachable"
+                _mac_kvm_set_state(
+                    state="running",
+                    server_host=server_host,
+                    server_reachable=True,
+                    client_running=client_running,
+                    retry_attempts=0,
+                    next_probe_at=0.0,
+                    last_action=action,
+                )
+                await asyncio.sleep(30)
+                continue
+
+            stopped_client = False
+            if client_running:
+                await asyncio.to_thread(_stop_mac_deskflow_client, "server_unreachable")
+                client_running = False
+                stopped_client = True
+
+            attempts = int(MAC_KVM_STATE.get("retry_attempts") or 0) + 1
+            delay = MAC_KVM_BACKOFF_SECONDS[min(attempts - 1, len(MAC_KVM_BACKOFF_SECONDS) - 1)]
+            next_probe_at = time.time() + delay
+            _mac_kvm_set_state(
+                state="backoff",
+                server_host=server_host,
+                server_reachable=False,
+                client_running=False,
+                retry_attempts=attempts,
+                next_probe_at=next_probe_at,
+                last_action="client_stopped_backoff" if stopped_client else "server_absent_backoff",
+            )
+            logger.info(f"KVM: WSL Deskflow server absent; next Mac probe in {delay}s")
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"KVM supervisor error: {e}")
+            _mac_kvm_set_state(state="error", last_action=str(e)[:200])
+            await asyncio.sleep(60)
+
+
+@app.post("/api/kvm/start")
+async def kvm_start():
+    """Start Deskflow client (software KVM) on this Mac."""
     try:
-        was_running = _mac_deskflow_running()
-        if was_running:
-            _stop_mac_deskflow_client("api_start_restart")
-            await asyncio.sleep(1)  # let killall -9 tear down before reopening
+        if _mac_deskflow_running():
+            return {"success": True, "message": "Deskflow already running", "already_running": True}
+
         _start_mac_deskflow_client("api_start")
-        return {
-            "success": True,
-            "message": "Deskflow restarted" if was_running else "Deskflow started",
-            "already_running": was_running,
-        }
+        return {"success": True, "message": "Deskflow started", "already_running": False}
     except Exception as e:
         logger.error(f"KVM: Failed to start Deskflow: {e}")
         return {"success": False, "message": str(e)}
@@ -15185,18 +14395,21 @@ async def kvm_stop():
 
 
 @app.get("/api/kvm/status")
-async def kvm_status() -> dict[str, object]:
-    """Check if Deskflow is running on this Mac.
-
-    Lifecycle now lives on the WSL satellite's event-driven watchdog; the Mac
-    only reports process liveness. The satellite's _get_mac_kvm_status reads
-    only ``running``, so dropping the old ``supervisor`` block is safe.
-    """
+async def kvm_status():
+    """Check if Deskflow is running on this Mac."""
     pids = _mac_deskflow_pids()
     running = bool(pids)
     return {
         "running": running,
         "pids": pids,
+        "supervisor": {
+            **MAC_KVM_STATE,
+            "next_probe_at": (
+                datetime.fromtimestamp(MAC_KVM_STATE["next_probe_at"]).isoformat()
+                if MAC_KVM_STATE.get("next_probe_at")
+                else None
+            ),
+        },
     }
 
 
@@ -15893,97 +15106,6 @@ def _ops_shift_to_annotation(row: dict) -> dict:
     }
 
 
-def _ops_parse_local_dt(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp to a naive *local* datetime, or None.
-
-    Work-action `at` is stamped as naive local ISO; the DB created_at fallback is
-    naive UTC. Tz-aware strings are converted to local. Used to position ticks
-    against the timer graph's local-time window."""
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone().replace(tzinfo=None)
-    return parsed
-
-
-async def _ops_read_work_actions(
-    *, window_start: datetime | None = None, now: datetime | None = None
-) -> dict:
-    """Work-action visualization read model, served from the `events` table.
-
-    Load-bearing: `count`/`ticks`/`last_at` cover EXPLICIT work-actions only —
-    `event_type='work_action'` with `details.explicit = true` — since local
-    midnight. The explicit flag is essential: work_action() is also the hook
-    callback for prompt_submit / ask_user_question / typing-guard (which satisfy
-    enforcement), and those must not inflate the press count or daily note.
-    `ticks` carries the press `at` + `source`; when `window_start` is given
-    (timer graph) ticks are clipped to that window, otherwise they span today.
-    `last_at` drives the HUD dial's staleness fade. The optional, non-load-bearing
-    `score` aggregates ALL work signals (event_type='work_signal') for the day —
-    kept in a separate field, never joined to the timer-graph series.
-    """
-    now = now or datetime.now()
-    # "Today" = since local midnight. events.created_at is stored UTC, so compare
-    # against the UTC instant of local midnight — the day boundary tracks the
-    # operator, not the server clock.
-    local_midnight = datetime(now.year, now.month, now.day)
-    utc_floor = local_midnight.astimezone(UTC).replace(tzinfo=None)
-    floor_iso = utc_floor.isoformat(sep=" ")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT created_at, details
-            FROM events
-            WHERE event_type = 'work_action'
-              AND json_extract(details, '$.explicit') = 1
-              AND datetime(created_at) >= datetime(?)
-            ORDER BY created_at ASC, id ASC
-            """,
-            (floor_iso,),
-        )
-        action_rows = [dict(row) for row in await cursor.fetchall()]
-        cursor = await db.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM events
-            WHERE event_type = 'work_signal' AND datetime(created_at) >= datetime(?)
-            """,
-            (floor_iso,),
-        )
-        score_row = await cursor.fetchone()
-
-    ticks: list[dict] = []
-    count = 0
-    last_at: str | None = None
-    for row in action_rows:
-        details = _ops_parse_event_details(row.get("details"))
-        details = details if isinstance(details, dict) else {}
-        at = details.get("at") or row.get("created_at")
-        if not at:
-            continue
-        count += 1
-        last_at = at
-        if window_start is not None:
-            parsed = _ops_parse_local_dt(at)
-            if parsed is None or parsed < window_start:
-                continue
-        ticks.append({"at": at, "source": details.get("source")})
-
-    return {
-        "count": count,
-        "ticks": ticks,
-        "last_at": last_at,
-        "score": int(score_row["n"]) if score_row else 0,
-        "stale_fade_minutes": WORK_ACTION_STALE_FADE_MINUTES,
-    }
-
-
 async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = "60s") -> dict:
     """Return live timer history for the ops graph.
 
@@ -16146,8 +15268,6 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         else None
     )
 
-    work_actions = await _ops_read_work_actions(window_start=start, now=now)
-
     return {
         "generated_at": now.isoformat(),
         "window_seconds": window_seconds,
@@ -16155,7 +15275,6 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
         "gap_threshold_seconds": gap_threshold_seconds,
         "points": points,
         "segments": segments,
-        "work_action_ticks": work_actions["ticks"],
         "annotations": [_ops_shift_to_annotation(row) for row in shift_rows],
         "gaps": gaps,
         "anomalies": anomalies,
@@ -16347,10 +15466,6 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "legion": inst.get("legion"),
                 "work_class": work_class,
                 "instance_type": inst.get("instance_type"),
-                # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
-                # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
-                "pr_url": inst.get("pr_url"),
-                "pr_state": inst.get("pr_state"),
                 "workflow_state": inst.get("workflow_state"),
                 "next_required_action": inst.get("next_required_action"),
                 "stop_allowed": bool(inst.get("stop_allowed"))
@@ -16868,7 +15983,6 @@ async def get_ops_display_state():
     cron_summary = await _ops_read_cron_summary()
     enforcement_summary = await _ops_read_enforcement_summary()
     tts_summary = get_tts_queue_status()
-    work_actions = await _ops_read_work_actions(now=now)
     assertions = _ops_build_state_assertions(
         generated_at=now,
         work_state=work_state,
@@ -16936,228 +16050,11 @@ async def get_ops_display_state():
             "backend": tts_summary.get("backend"),
             "satellite_available": tts_summary.get("satellite_available"),
             "global_mode": tts_summary.get("global_mode"),
-            "routing": tts_summary.get("routing"),
         },
         "voice_drafts": [
             _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
         ],
         "enforcement": enforcement_summary,
-        "work_actions": work_actions,
-    }
-
-
-@app.post("/api/ui/ops/phone/clear")
-async def ops_clear_phone_attention(request: Request) -> dict:
-    """Manual presence override — the "I'm not on my phone" button.
-
-    Force-clears the phone attention substate when telemetry is wrong (e.g. a
-    YouTube playback-edge flap leaves `current_app` asserting open while the
-    phone is actually idle). This is a *correction*, not enforcement: it never
-    zaps and never touches the desktop substate. Composite timer activity is
-    recomputed from whatever real attention sources remain, and any pending
-    phone-distraction / gaming / backlog ack from the false signal is resolved.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    source = body.get("source") or "ops_ui"
-
-    before = {
-        "current_app": PHONE_STATE.get("current_app"),
-        "is_distracted": PHONE_STATE.get("is_distracted", False),
-    }
-    # App to resolve acks for: whatever telemetry last asserted, falling back to
-    # the app that opened the still-pending ack.
-    ack_app = (before["current_app"] or PHONE_STATE.get("distraction_ack_app") or "").lower()
-
-    old_timer_mode = timer_engine.current_mode.value
-    PHONE_STATE["current_app"] = None
-    PHONE_STATE["app_opened_at"] = None
-    PHONE_STATE["is_distracted"] = False
-    PHONE_STATE["last_activity"] = datetime.now().isoformat()
-
-    now_ms = int(time.monotonic() * 1000)
-    timer_updated = _sync_activity_from_remaining_distraction_signals(now_ms)
-    if timer_updated:
-        await timer_log_shift(
-            old_timer_mode,
-            timer_engine.current_mode.value,
-            trigger="phone_presence_override",
-            source=source,
-            phone_app=before["current_app"],
-        )
-
-    acknowledged_acks = await acknowledge_phone_acks(ack_app) if ack_app else 0
-    stop_enforcement_cascade(reason="phone_presence_override")
-
-    logger.info(f"Phone presence override (source={source}) -> cleared {before['current_app']!r}")
-    await log_event(
-        "phone_presence_override",
-        device_id="phone",
-        details={
-            "source": source,
-            "before": before,
-            "acknowledged_acks": acknowledged_acks,
-            "timer_updated": timer_updated,
-        },
-    )
-    return {
-        "ok": True,
-        "before": before,
-        "after": {"current_app": None, "is_distracted": False},
-        "acknowledged_acks": acknowledged_acks,
-        "timer_updated": timer_updated,
-    }
-
-
-def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
-    """First meaningful prose line of a session-doc body — a *head*, never the
-    whole document. The cockpit is a glance surface; Obsidian renders the doc.
-
-    Skips blank lines, markdown heading/quote/list markers, and HTML comments,
-    then returns one trimmed line capped at `limit` chars.
-    """
-    if not body:
-        return None
-    for raw in body.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("<!--", "%%", "---", "![", "|")):
-            continue
-        # strip leading markdown markers (#, >, -, *, +, digits.) so the head
-        # reads as prose rather than syntax
-        line = re.sub(r"^([#>\-*+]+\s*|\d+\.\s+)", "", line).strip()
-        if not line:
-            continue
-        return (line[: limit - 1] + "…") if len(line) > limit else line
-    return None
-
-
-@app.get("/api/ui/ops/session-docs")
-async def get_ops_session_docs(
-    include_archived: bool = False,
-    limit_per_lane: int = 12,
-):
-    """Read-only pipeline-board feed for the ops cockpit.
-
-    Groups DB-registered session docs into status lanes, each doc carrying a
-    one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
-    renders more than the head — the document is authored and read in Obsidian
-    (the single writer of `status:`). This endpoint performs no mutations.
-
-    `archived` docs are excluded by default (there are hundreds). Each lane is
-    capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
-    carries the true per-status counts so the board reports what it dropped
-    rather than silently truncating. Ordering is by `created_at` because
-    `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
-    surfaces docs that have been open a long time.
-    """
-    from urllib.parse import quote
-
-    vault_root = Path(
-        os.environ.get("IMPERIUM_ENV")
-        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
-    )
-    vault_name = vault_root.name
-    now = datetime.now()
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        query = (
-            "SELECT id, file_path, title, project, primarch_name, cron_job_id, "
-            "status, created_at, updated_at FROM session_documents"
-        )
-        if not include_archived:
-            query += " WHERE status != 'archived'"
-        query += " ORDER BY created_at DESC"
-        cursor = await db.execute(query)
-        rows = await cursor.fetchall()
-        linked: dict[int, int] = {}
-        cnt = await db.execute(
-            "SELECT session_doc_id, COUNT(*) FROM claude_instances "
-            "WHERE session_doc_id IS NOT NULL GROUP BY session_doc_id"
-        )
-        for r in await cnt.fetchall():
-            linked[r[0]] = r[1]
-
-    # True per-lane totals (pre-cap) so the board never lies about coverage.
-    lane_totals: dict[str, int] = {}
-    for row in rows:
-        status = (row["status"] or "unknown").lower()
-        lane_totals[status] = lane_totals.get(status, 0) + 1
-
-    # Cap each lane to the most-recent N. Reading frontmatter is the only
-    # filesystem cost, so it happens *after* the cap — never on hundreds of docs.
-    per_lane_count: dict[str, int] = {}
-    docs = []
-    for row in rows:
-        d = dict(row)
-        status = (d.get("status") or "unknown").lower()
-        if per_lane_count.get(status, 0) >= max(1, limit_per_lane):
-            continue
-        per_lane_count[status] = per_lane_count.get(status, 0) + 1
-
-        fp_str = d.get("file_path")
-        head: str | None = None
-        fm: dict = {}
-        note_rel: str | None = None
-        if fp_str:
-            fp = Path(fp_str)
-            if not fp.is_absolute():
-                fp = vault_root / fp_str  # file_path is stored vault-relative
-            try:
-                if fp.is_file():
-                    fm, body = await asyncio.to_thread(read_frontmatter, fp)
-                    head = _ops_session_doc_head(body)
-            except Exception:
-                fm, head = {}, None
-            try:
-                note_rel = str(fp.relative_to(vault_root))
-            except ValueError:
-                note_rel = str(fp_str)
-
-        obsidian_uri = None
-        if note_rel:
-            note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
-            obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
-
-        created = d.get("created_at")
-        age_seconds = None
-        if created:
-            try:
-                parsed = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
-                if parsed.tzinfo is not None:
-                    parsed = parsed.replace(tzinfo=None)
-                age_seconds = max(0, int((now - parsed).total_seconds()))
-            except Exception:
-                age_seconds = None
-
-        docs.append(
-            {
-                "id": d.get("id"),
-                "title": d.get("title") or (Path(str(fp_str)).stem if fp_str else None),
-                "path": fp_str,
-                "vault_rel": note_rel,
-                "obsidian_uri": obsidian_uri,
-                "status": status,
-                "project": d.get("project") or fm.get("project"),
-                "primarch": d.get("primarch_name") or fm.get("primarch"),
-                "legion": fm.get("legion"),
-                "instance_type": fm.get("instance_type"),
-                "head": head,
-                "created_at": created,
-                "age_seconds": age_seconds,
-                "linked_instances": linked.get(d.get("id"), 0),
-            }
-        )
-
-    return {
-        "generated_at": now.isoformat(),
-        "lane_totals": lane_totals,
-        "limit_per_lane": max(1, limit_per_lane),
-        "docs": docs,
     }
 
 
@@ -17192,12 +16089,13 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
     try:
         sit = _negative_break_situation
 
-        # During an active work session the work-session gate owns enforcement
-        # (stricter: straight to 100 + redirect + auto-cancel). This loop still
-        # runs, but its zap is suppressed at the enforce() sidecar chokepoint
-        # (source="negative_break_loop" is not allowlisted): a suppressed enforce
-        # returns fired:False, so rep/last_fire below are never committed and no
-        # escalation accumulates. No scattered work_session_active check needed.
+        # During an active work session the work-session gate owns negative-balance
+        # enforcement (stricter: straight to 100 + redirect + auto-cancel). Defer
+        # and keep this loop reset so it carries no stale escalation afterward.
+        if timer_engine.work_session_active:
+            sit["rep"] = 0
+            sit["last_fire_mono_ms"] = None
+            return None
 
         # Double-fire avoidance: on the tick where balance crosses 0 → negative,
         # the BREAK_EXHAUSTED handler fires the rep0 entry vibe. Seed the record
@@ -17261,9 +16159,8 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
     balance falls to WORK_SESSION_CANCEL_THRESHOLD_MS (-30s) the session is
     auto-cancelled — the saved original balance is restored and the earned break
     is forfeited — with a final 100 zap + redirect. Never raises into the tick
-    loop. Runs AFTER the negative-break gate; while a session is active that
-    gate's zap is suppressed at the enforce() sidecar chokepoint, so only this
-    gate's work_session_* zaps fire — the two never zap on the same tick.
+    loop. Runs AFTER the negative-break gate (which defers while a session is
+    active), so the two never enforce on the same tick.
     """
     try:
         sit = _work_session_situation
@@ -17288,22 +16185,11 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
         # so it waits a full re-fire interval before its own next zap.
         if action == "cancel":
             original_ms = timer_engine.work_session_original_break_ms
-            old_mode = timer_engine.current_mode.value
             cancel_info = timer_engine.cancel_work_session()
             sit["zapped"] = False
             await timer_save_to_db()
             await log_event(
                 "work_session_failed",
-                details={"break_balance_ms": bal, **cancel_info},
-            )
-            # Mirror the manual cancel endpoint so an auto-failed session also
-            # lands a work_session_cancel timer_shift — otherwise auto-failures
-            # are invisible on the ops timer graph (no WS✕ divider).
-            await timer_log_shift(
-                old_mode,
-                timer_engine.current_mode.value,
-                trigger="work_session_cancel",
-                source="work_session_failed",
                 details={"break_balance_ms": bal, **cancel_info},
             )
             _negative_break_situation["rep"] = 1
@@ -17534,9 +16420,8 @@ async def timer_worker():
             # the gate must live outside it). Fires a zap + TTS while the break
             # balance is negative and the timer is on break, escalating every
             # 10 min. See: Negative-Balance Break Enforcement Loop spec.
-            # Negative-break runs first; while a work session is active its zap is
-            # suppressed at the enforce() sidecar chokepoint, so it and the
-            # work-session gate never zap on the same tick.
+            # Negative-break runs first; it defers while a work session is active,
+            # so it and the work-session gate never enforce on the same tick.
             await _negative_break_enforce_tick(now_ms, result)
 
             # Work-session gate: a declared work session fails if the balance dips
@@ -17720,116 +16605,80 @@ async def enforce_break_exhausted_impl() -> dict:
     }
 
 
-async def process_pane_state_queue_once() -> list[dict]:
-    """Drain pane_state_queue once — push tmux pane variables (@CC_STATE etc).
-
-    tmuxctl is the sole owner of ``instance_id -> pane`` resolution. This drainer
-    resolves the LIVE pane per row via ``shared.resolve_instance_pane`` rather than
-    trusting the stored ``pane_state_queue.tmux_pane`` (which the trigger stamped
-    from ``claude_instances.tmux_pane`` and which goes stale the moment geometry
-    changes, a pane is reused, or the agent dies). It fails closed when the pane no
-    longer resolves: no ``set-option``, no close-down assertion — but the queue row
-    is still drained so a dead instance cannot wedge the queue. The
-    ``@CC_STATE=stopped`` assert-persona decision keys on the *live role*, not a
-    stored ``pane_label``. Returns one result dict per drained row.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT id, instance_id, variable, value FROM pane_state_queue ORDER BY id"
-        )
-        rows = await cursor.fetchall()
-        if not rows:
-            return []
-
-        processed: list[int] = []
-        results: list[dict] = []
-        # Track the FINAL queued @CC_STATE per instance in this drain. A status that
-        # bounces (stopped -> idle) inserts two rows in one batch; asserting off the
-        # early "stopped" row would fire a false close-down against a pane whose
-        # final drained state is no longer stopped. Keep only the last @CC_STATE per
-        # instance and assert after the loop. (instance_id -> (value, role, pane).)
-        latest_cc_state: dict[str, tuple[str, str | None, str | None]] = {}
-        for row in rows:
-            # Resolve the live pane and fail closed. A pane that no longer resolves
-            # (agent died, geometry changed, tmux server cycled) must never receive
-            # a set-option nor spawn a stale close-down assertion. The row drains
-            # either way.
-            pane, role = await shared.resolve_instance_pane(row["instance_id"])
-            if row["variable"] == "@CC_STATE":
-                latest_cc_state[row["instance_id"]] = (row["value"], role, pane)
-            if not pane:
-                processed.append(row["id"])
-                results.append(
-                    {
-                        "queue_id": row["id"],
-                        "instance_id": row["instance_id"],
-                        "variable": row["variable"],
-                        "value": row["value"],
-                        "tmux_pane": None,
-                        "status": "skipped",
-                        "reason": "pane_unresolved",
-                    }
-                )
-                continue
-            status = "applied"
-            try:
-                await _run_subprocess_offloop(
-                    (
-                        "tmux",
-                        "set-option",
-                        "-p",
-                        "-t",
-                        pane,
-                        row["variable"],
-                        row["value"],
-                    ),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    timeout=5,
-                )
-                logger.info(
-                    f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
-                )
-            except Exception as e:
-                status = "error"
-                logger.warning(f"Pane state set failed for {pane}: {e}")
-            processed.append(row["id"])
-            results.append(
-                {
-                    "queue_id": row["id"],
-                    "instance_id": row["instance_id"],
-                    "variable": row["variable"],
-                    "value": row["value"],
-                    "tmux_pane": pane,
-                    "status": status,
-                    "reason": None,
-                }
-            )
-
-        if processed:
-            ph = ",".join("?" * len(processed))
-            await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
-            await db.commit()
-    # Spawn a close-down assertion only for instances whose FINAL @CC_STATE this
-    # drain is "stopped", whose pane still resolves live, and whose live role is not
-    # an asserted persona. Keyed on the live role, never a stored pane_label.
-    for instance_id, (value, role, pane) in latest_cc_state.items():
-        if value == "stopped" and pane and not _is_assert_persona_label(role):
-            spawn_tmux_assert_instance(role or pane, instance_id, "pane-state-stopped")
-    return results
-
-
 async def pane_state_worker():
     """Process pane_state_queue — push tmux pane variables (@CC_STATE etc).
 
     The SQLite trigger `trg_status_pane_state` fires on any UPDATE to the status
-    column, inserting a row here. This worker polls every second and drains the
-    queue via `process_pane_state_queue_once`.
+    column, inserting a row here. This worker polls every second, reads pending
+    state changes, and applies `tmux set-option -p` to each pane.
     """
     while True:
         try:
-            await process_pane_state_queue_once()
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id, instance_id, variable, value, tmux_pane FROM pane_state_queue ORDER BY id"
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(1)
+                    continue
+
+                processed = []
+                stopped_assertions: list[tuple[str, str]] = []
+                for row in rows:
+                    pane = row["tmux_pane"]
+                    pane_label = None
+                    if not pane:
+                        cur2 = await db.execute(
+                            "SELECT tmux_pane, pane_label FROM claude_instances WHERE id = ?",
+                            (row["instance_id"],),
+                        )
+                        r = await cur2.fetchone()
+                        pane = r["tmux_pane"] if r else None
+                        pane_label = r["pane_label"] if r else None
+                    else:
+                        cur2 = await db.execute(
+                            "SELECT pane_label FROM claude_instances WHERE id = ?",
+                            (row["instance_id"],),
+                        )
+                        r = await cur2.fetchone()
+                        pane_label = r["pane_label"] if r else None
+                    if pane:
+                        try:
+                            await _run_subprocess_offloop(
+                                (
+                                    "tmux",
+                                    "set-option",
+                                    "-p",
+                                    "-t",
+                                    pane,
+                                    row["variable"],
+                                    row["value"],
+                                ),
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                                timeout=5,
+                            )
+                            logger.info(
+                                f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Pane state set failed for {pane}: {e}")
+                    if (
+                        row["variable"] == "@CC_STATE"
+                        and row["value"] == "stopped"
+                        and not _is_assert_persona_label(pane_label)
+                    ):
+                        stopped_assertions.append((pane_label or pane, row["instance_id"]))
+                    processed.append(row["id"])
+
+                if processed:
+                    ph = ",".join("?" * len(processed))
+                    await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
+                    await db.commit()
+                for pane_target, instance_id in stopped_assertions:
+                    spawn_tmux_assert_instance(pane_target, instance_id, "pane-state-stopped")
         except Exception as e:
             logger.error(f"Pane state worker error: {e}")
         await asyncio.sleep(1)
@@ -17941,21 +16790,12 @@ def _derive_session_doc_slug(file_path: str | None) -> str | None:
     return match.group(1) if match else (name or None)
 
 
-_DAILY_NOTE_DATE_SLUG_RX = re.compile(r"\d{4}-\d{2}-\d{2}$")
-
-
 def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) -> bool:
     cleaned = _clean_tab_name(tab_name)
     if not cleaned or _is_placeholder_tab_name(tab_name):
         return False
     slug = _derive_session_doc_slug(file_path)
     if not slug:
-        return False
-    # A date-named daily note (YYYY-MM-DD) is never a real mismatch against a
-    # persona tab: the custodes/persona binds to the day's note, whose slug is
-    # the date, not the persona name. (Satisfies the rescued WIP test-first
-    # spec, tests/test_legion_synced.py::TestTabNameMismatchDailyNote.)
-    if _DAILY_NOTE_DATE_SLUG_RX.match(slug):
         return False
     a = cleaned.lower()
     b = slug.lower()
@@ -18564,52 +17404,16 @@ async def enforce_endpoint(request: EnforceRequest):
 
 
 @app.post("/api/enforcement/ack")
-async def enforcement_ack(request: EnforcementAckRequest) -> dict:
-    """DEMOTED ack: a Pavlok-connectivity confirm, NOT an enforcement terminator.
-
-    Acking no longer resolves enforcement — only a real work-signal ACTION does
-    (see observe_work_signal / work-action / stand-down). What the ack still buys:
-    it confirms the Pavlok is reachable, and the FIRST ack in a sequence grants a
-    one-time ~30s break credit (ACK_FIRST_BREAK_BOOST_SECONDS). The boost is gated
-    on a real pending sequence AND a reachable device, so a stale/bogus ack_id or
-    an unreachable Pavlok mints nothing. Never repeated, never resolves an ack on
-    its own. The Emperor's words: "acking should never be an end in itself."
-    """
-    connectivity = await asyncio.to_thread(check_phone_reachable)
-    reachable = bool(connectivity.get("reachable"))
-
-    # A boost only makes sense against a live enforcement sequence: a specific
-    # pending ack if one was named, otherwise any pending ack.
-    if request.ack_id or (request.source and request.instance_id):
-        ack = await _find_expected_ack(request.ack_id, request.source, request.instance_id)
-        pending_exists = bool(ack and ack["status"] == "pending")
-    else:
-        pending_exists = await _has_pending_acks()
-
-    boost = await maybe_grant_first_ack_break_boost(eligible=reachable and pending_exists)
-
-    await log_event(
-        "enforcement_ack_connectivity",
+async def enforcement_ack(request: EnforcementAckRequest):
+    """Acknowledge a pending expected acknowledgement."""
+    if not request.ack_id and not (request.source and request.instance_id):
+        raise HTTPException(status_code=400, detail="ack_id or source+instance_id is required")
+    return await _resolve_expected_ack(
+        ack_id=request.ack_id,
+        source=request.source,
         instance_id=request.instance_id,
-        details={
-            "reason": "ack_connectivity",
-            "ack_id": request.ack_id,
-            "source": request.source,
-            "instance_id": request.instance_id,
-            "pavlok_reachable": reachable,
-            "pending_ack": pending_exists,
-            "break_boost_granted": boost["granted"],
-            "break_boost_seconds": boost["seconds"],
-        },
+        status="acknowledged",
     )
-
-    return {
-        "resolved": False,
-        "pavlok_connectivity": connectivity,
-        "break_boost_granted": boost["granted"],
-        "break_boost_seconds": boost["seconds"],
-        "break_balance_seconds": round(timer_engine.break_balance_ms / 1000),
-    }
 
 
 @app.post("/api/enforcement/expect")
@@ -18910,18 +17714,11 @@ async def get_morning_session_status():
 async def end_morning_session():
     """Officially end the morning session.
 
-    Durably flips the state file to status="ended" so the Stop-hook keepalive gate
-    (routes/hooks.py → morning_session_active) stops re-injecting, regardless of the
-    live instance's type. Also flips the live Custodes instance off `sync` (→ one_off)
-    via the sanctioned write path. The state-file write is the authoritative loop
-    terminator; the type flip preserves the historical clean-exit contract.
+    Flips the live Custodes instance off `sync` (→ one_off) via the sanctioned
+    write path so the self-continuing Stop loop in routes/hooks.py terminates: the
+    next Stop is then a normal clean stop instead of re-injecting a keepalive.
+    No live Custodes → nothing to end.
     """
-    from morning_session import write_morning_status
-
-    # Authoritative: end the session in the state file even if no live row is found.
-    ended_state = write_morning_status("ended", ended_by="morning-end")
-    morning_status = "ended" if ended_state is not None else "no_session"
-
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -18935,7 +17732,7 @@ async def end_morning_session():
         )
         row = await cursor.fetchone()
         if not row:
-            return {"status": "no_active_custodes", "morning_status": morning_status}
+            return {"status": "no_active_custodes"}
 
         instance_id = row["id"]
         old_type = row["instance_type"] or "one_off"
@@ -18956,7 +17753,6 @@ async def end_morning_session():
             scheduler.remove_job(f"golden-throne-{instance_id}")
         except Exception:
             pass
-        await _gt_clear_fire(instance_id)
         try:
             scheduler.remove_job(f"sync-retrigger-{instance_id}")
         except Exception:
@@ -18966,13 +17762,9 @@ async def end_morning_session():
     await log_event(
         "morning_session_end",
         instance_id=instance_id,
-        details={"old_type": old_type, "new_type": "one_off", "morning_status": morning_status},
+        details={"old_type": old_type, "new_type": "one_off"},
     )
-    return {
-        "instance_id": instance_id,
-        "instance_type": "one_off",
-        "morning_status": morning_status,
-    }
+    return {"instance_id": instance_id, "instance_type": "one_off"}
 
 
 _ALARM_DISMISS_JOB_ID = "morning_alarm_dismiss"
@@ -19023,89 +17815,6 @@ async def alarm_dismiss(delay_minutes: int = 0):
     )
     await log_event(
         "morning_alarm_dismiss",
-        device_id="phone",
-        details={
-            "delay_minutes": delay_minutes,
-            "fires_at": fires_at.isoformat(),
-        },
-    )
-
-    return {
-        "scheduled_at": now.isoformat(),
-        "fires_at": fires_at.isoformat(),
-    }
-
-
-_ALARM_SILENCED_JOB_ID = "morning_alarm_silenced"
-
-
-@app.post("/api/morning/alarm-silenced")
-async def alarm_silenced(delay_minutes: int = 0):
-    """Fire the unified day-start hook when the Hatch alarm is silenced.
-
-    The Hatch alarm-silence keystroke is the Emperor's canonical wake/ack
-    signal (distinct from snooze/dismiss), so silencing it starts the day:
-    fire_day_start_internal(source="alarm_silenced") latches day_state and runs
-    the day-start fan-out, whose custodes_morning_session consumer launches the
-    morning session. Idempotent by construction — set_day_started_at reports
-    already_started on a repeat, so a re-silence never double-launches morning.
-
-    delay_minutes (0–120, default 0) mirrors alarm_dismiss for phone-macro
-    parity: 0 fires now; >0 schedules an idempotent (replace_existing) job so a
-    re-silence within the window reschedules rather than stacking.
-
-    Args:
-        delay_minutes: Minutes to wait before firing (default 0, max 120).
-    """
-    delay_minutes = max(0, min(delay_minutes, 120))
-    now = datetime.now()
-
-    if delay_minutes == 0:
-        result = await fire_day_start_internal(source="alarm_silenced")
-        await log_event(
-            "morning_alarm_silenced",
-            device_id="phone",
-            details={
-                "delay_minutes": 0,
-                "fired_at": now.isoformat(),
-                "already_started": result.get("already_started", False),
-            },
-        )
-        return {
-            "fired_at": now.isoformat(),
-            "already_started": result.get("already_started", False),
-            "day_state": result.get("day_state"),
-        }
-
-    fires_at = now + timedelta(minutes=delay_minutes)
-
-    async def _fire_day_start():
-        try:
-            await fire_day_start_internal(source="alarm_silenced")
-        except Exception as exc:
-            logger.error(f"alarm-silenced day-start fire failed: {exc}")
-
-    # Cancel any existing pending job (idempotent)
-    try:
-        scheduler.remove_job(_ALARM_SILENCED_JOB_ID)
-        logger.info("alarm-silenced: cancelled previous pending job")
-    except Exception:
-        pass  # No existing job — fine
-
-    scheduler.add_job(
-        _fire_day_start,
-        DateTrigger(run_date=fires_at),
-        id=_ALARM_SILENCED_JOB_ID,
-        replace_existing=True,
-        name="Morning Alarm Silenced",
-        misfire_grace_time=300,
-    )
-
-    logger.info(
-        f"alarm-silenced: day-start scheduled for {fires_at.isoformat()} (delay={delay_minutes}min)"
-    )
-    await log_event(
-        "morning_alarm_silenced",
         device_id="phone",
         details={
             "delay_minutes": delay_minutes,
@@ -19530,20 +18239,72 @@ async def _discord_voice_error(legion: str, transcript: str):
     await _discord_voice_error_message(legion, error_msg)
 
 
-async def _agent_cmd_inject(
-    legion: str,
-    instance_id: str | None,
-    tmux_pane: str | None,
-    formatted: str,
-    channel_name: str | None,
-) -> bool:
-    """Deliver `formatted` to an already-resolved target via agent-cmd.
+async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
+    """Try to inject a Discord message into a live instance for a legion.
 
-    Prefers --instance (best routing); falls back to --pane. Returns False if
-    neither a target instance nor a pane was supplied.
+    Args:
+        require_synced: If True, only target instances with synced=1 (Mechanicus pattern).
+                        If False, target any live instance (Custodes singleton pattern).
+    Returns True if injection succeeded, False if no matching instance or injection failed.
     """
-    if not instance_id and not tmux_pane:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if require_synced:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,),
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT id, tmux_pane, device_id FROM claude_instances
+                   WHERE legion = ? AND status IN ('idle', 'processing')
+                   LIMIT 1""",
+                (legion,),
+            )
+        row = await cursor.fetchone()
+
+    instance_id = row[0] if row else None
+    tmux_pane = row[1] if row else None
+
+    # Custodes is a singleton pane.  The DB row is often stale after compaction,
+    # restarts, or manual pane recovery, while tmux still has the authoritative
+    # legion:custodes marker.  Recover from tmux instead of returning a false
+    # target failure.
+    if (not tmux_pane) and legion == "custodes" and not require_synced:
+        recovered = await _find_custodes_tmux_pane()
+        if recovered:
+            tmux_pane = recovered
+            logger.info(f"Discord injection: recovered Custodes pane {tmux_pane}")
+
+    formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
+
+    if not tmux_pane and legion == "custodes" and not require_synced:
+        # Voice Custodes should not degrade to a target-failure readback just
+        # because the singleton row is stale or currently stopped.  Delegate
+        # upsert-vs-launch to the same tmuxctl owner used by state hooks.
+        try:
+            result = await _assert_and_send_custodes(formatted, source="Discord injection")
+            if result.get("dispatched"):
+                logger.info(
+                    f"Discord injection: custodes → {result.get('pane')} via assert-instance legion:custodes"
+                )
+                return True
+            logger.warning(
+                f"Discord injection: assert-instance legion:custodes failed: {result.get('reason')}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"Discord injection: assert-instance legion:custodes error: {e}")
+            return False
+
+    if not tmux_pane:
+        if instance_id:
+            logger.warning(f"Discord injection: {instance_id[:12]} has no tmux_pane")
+        else:
+            logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
         return False
+
     try:
         agent_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "agent-cmd"
         cmd = [str(agent_cmd)]
@@ -19573,7 +18334,7 @@ async def _agent_cmd_inject(
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode == 0:
             target = instance_id[:12] if instance_id else tmux_pane
-            logger.info(f"Discord injection: {legion} → {target} (#{channel_name})")
+            logger.info(f"Discord injection: {legion} → {target} (#{message.channel_name})")
             return True
         logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
         return False
@@ -19584,92 +18345,6 @@ async def _agent_cmd_inject(
     except Exception as e:
         logger.warning(f"Discord injection error: {e}")
         return False
-
-
-async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str | None) -> bool:
-    """Resolve the Custodes Discord target deterministically from the singleton lock.
-
-    The authoritative Custodes identity is the `legion:custodes` tmux pane marker —
-    NOT a live/`synced` DB row. The pane is resolved from the marker; the DB is
-    consulted only to supply an instance_id for that already-identified pane (better
-    agent-cmd routing), never to decide the target. When no marked pane is alive,
-    delegate upsert-vs-launch to the same tmuxctl assert-instance owner the state
-    hooks use. This holds even when the DB row is stale/`one_off`/`synced=0`.
-    """
-    tmux_pane = await _find_custodes_tmux_pane()
-    if tmux_pane:
-        # The pane is already identified from the marker; the DB is consulted only
-        # to supply an instance_id for better agent-cmd routing. tmuxctl owns
-        # pane -> instance, so read the pane's live @INSTANCE_ID stamp directly
-        # rather than querying the stored tmux_pane column.
-        instance_id = await shared.instance_id_for_pane(tmux_pane)
-        return await _agent_cmd_inject("custodes", instance_id, tmux_pane, formatted, channel_name)
-
-    # No live legion:custodes pane → assert (upsert-or-launch) then send. Voice/mention
-    # Custodes must not degrade to a target-failure readback just because no pane is up.
-    try:
-        result = await _assert_and_send_custodes(formatted, source="Discord injection")
-        if result.get("dispatched"):
-            logger.info(
-                f"Discord injection: custodes → {result.get('pane')} via assert-instance legion:custodes"
-            )
-            return True
-        logger.warning(
-            f"Discord injection: assert-instance legion:custodes failed: {result.get('reason')}"
-        )
-        return False
-    except Exception as e:
-        logger.warning(f"Discord injection: assert-instance legion:custodes error: {e}")
-        return False
-
-
-async def _try_discord_injection(legion: str, message, *, require_synced: bool = False) -> bool:
-    """Try to inject a Discord message into a live instance for a legion.
-
-    Custodes resolves deterministically via the `legion:custodes` singleton pane
-    marker — Discord holds no perspective on sync sessions, so `require_synced` does
-    NOT apply to Custodes. Other legions (e.g. Mechanicus) route through a live DB
-    row, optionally gated on synced=1 (the intentional Mechanicus pattern).
-
-    Returns True if injection succeeded, False if no matching instance or injection failed.
-    """
-    formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
-
-    if legion == "custodes":
-        return await _inject_custodes_via_singleton_pane(formatted, message.channel_name)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        if require_synced:
-            cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
-                   LIMIT 1""",
-                (legion,),
-            )
-        else:
-            cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND status IN ('idle', 'processing')
-                   LIMIT 1""",
-                (legion,),
-            )
-        row = await cursor.fetchone()
-
-    instance_id = row[0] if row else None
-    tmux_pane = row[1] if row else None
-
-    if not tmux_pane:
-        if instance_id:
-            # Pane is null/stale but the row is live — agent-cmd still routes by
-            # --instance (its preferred path). Don't hard-fail a recoverable target.
-            logger.info(
-                f"Discord injection: {legion} {instance_id[:12]} has no tmux_pane — routing via --instance"
-            )
-        else:
-            logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
-            return False
-
-    return await _agent_cmd_inject(legion, instance_id, tmux_pane, formatted, message.channel_name)
 
 
 # Dedup cache for Discord messages (daemon sometimes delivers twice)
@@ -19879,16 +18554,6 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
         logger.warning(f"Voice draft [imperial_guard]: supplied target pane invalid/dead: {pane!r}")
         return None
 
-    if bot == "custodes":
-        # Custodes singleton: resolve the voice target from the `legion:custodes`
-        # pane marker, not a live/`synced` DB row. Discord holds no perspective on
-        # sync sessions — the marker is the authoritative identity.
-        pane = await _find_custodes_tmux_pane()
-        if pane and await _tmux_pane_exists(pane):
-            return pane
-        logger.warning("Voice draft [custodes]: no live legion:custodes pane")
-        return None
-
     require_synced = bot == "mechanicus"
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
@@ -19907,6 +18572,8 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
             )
         row = await cursor.fetchone()
     pane = row[0] if row else None
+    if (not pane) and bot == "custodes":
+        pane = await _find_custodes_tmux_pane()
     if pane and await _tmux_pane_exists(pane):
         return pane
     logger.warning(f"Voice draft [{bot}]: no live target pane")
@@ -20281,21 +18948,6 @@ async def receive_discord_message(request: DiscordMessageRequest):
 
     # Trigger V: Voice transcription → route to matching legion's instance
     if request.is_voice and request.bot_name:
-        # A completed voice transcription is verbal work — emit a work signal so
-        # speaking to the Custodes/FG defers/satisfies enforcement like typing
-        # does, instead of only registering as indirect instance activity.
-        try:
-            await observe_work_signal(
-                source="voice",
-                kind="voice_transcription",
-                details={
-                    "bot_name": request.bot_name,
-                    "content_len": len(request.content or ""),
-                },
-                set_productivity=True,
-            )
-        except Exception as e:
-            logger.warning(f"Voice work signal failed: {e}")
         voice_result = await _handle_discord_voice_draft(request)
         try:
             await log_event(
@@ -24212,7 +22864,6 @@ hooks_init_deps(
     schedule_golden_throne_callback=schedule_golden_throne_followup,
     golden_throne_activity_callback=golden_throne_user_activity,
     askq_level1_callback=_askq_level1_callback,
-    tmux_send_payload_then_submit=_tmux_send_payload_then_submit,
 )
 
 

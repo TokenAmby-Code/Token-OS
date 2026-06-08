@@ -46,22 +46,6 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`pill pill--${statusTone(status)}`}>{status}</span>;
 }
 
-// "Agent has a PR open" badge (Phase 1). Links to the PR when open; shows a muted
-// state once the CD webhook flips pr_state→merged (Phase 2). Renders nothing otherwise.
-function PrBadge({ inst }: { inst: OpsInstance }) {
-  if (inst.pr_state !== 'open' && inst.pr_state !== 'merged') return null;
-  const label = inst.pr_state === 'merged' ? '⛗ merged' : '⇡ PR open';
-  const cls = `tag tag--pr tag--pr-${inst.pr_state}`;
-  if (inst.pr_url) {
-    return (
-      <a className={cls} href={inst.pr_url} target="_blank" rel="noreferrer" title={inst.pr_url}>
-        {label}
-      </a>
-    );
-  }
-  return <span className={cls}>{label}</span>;
-}
-
 export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
   if (instances.length === 0) {
     return <p className="empty">No active instances reported. The fleet is dormant.</p>;
@@ -87,7 +71,7 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
             {instances.map((inst) => (
               <tr key={inst.id} className={inst.stale.is_stale ? 'isStale' : ''}>
                 <td>
-                  <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
+                  <strong>{inst.display_name}</strong>
                   <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
                 </td>
                 <td><StatusPill status={inst.status} /></td>
@@ -114,7 +98,7 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
         {instances.map((inst) => (
           <article key={inst.id} className={`fcard ${inst.stale.is_stale ? 'isStale' : ''}`}>
             <header className="fcard__head">
-              <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
+              <strong>{inst.display_name}</strong>
               <StatusPill status={inst.status} />
             </header>
             <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>

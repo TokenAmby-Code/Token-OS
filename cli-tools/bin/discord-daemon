@@ -3,21 +3,18 @@
 # TAGS: claw, discord
 # AUDIENCE: human, agent
 #
-# Usage: discord-daemon <status|logs>           # read-only inspection
-#        discord-daemon <start|stop|restart>    # delegate to launchd
+# Usage: discord-daemon <start|stop|restart|status|logs>
 #
-# The daemon maintains a persistent WebSocket connection to Discord and exposes a
-# local HTTP API on localhost:7779. It is launchd-supervised (ai.tokenclaw.discord).
-# Mutating commands route to the AUTHORITATIVE `token-restart --discord` path; the
-# old pidfile+nohup manager split-brained against launchd KeepAlive and is gone.
+# The daemon maintains a persistent WebSocket connection to Discord
+# and exposes a local HTTP API on localhost:7779.
 
 set -euo pipefail
 
 DAEMON_DIR="$HOME/.discord-cli"
+NODE_DIR="/Volumes/Imperium/Token-OS/discord-daemon"
 PID_FILE="$DAEMON_DIR/daemon.pid"
 LOG_DIR="$DAEMON_DIR/logs"
 DAEMON_URL="http://127.0.0.1:7779"
-LABEL="ai.tokenclaw.discord"   # launchd label — restart via token-restart --discord
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -25,30 +22,92 @@ get_pid() {
   [[ -f "$PID_FILE" ]] && cat "$PID_FILE" || echo ""
 }
 
-# start/restart/stop are launchd operations. The daemon is supervised by launchd
-# (KeepAlive), so the ONLY safe restart is `launchctl kickstart`, surfaced through
-# the authoritative `token-restart --discord`. The previous pidfile+nohup logic
-# started a SECOND daemon that raced launchd's for port 7779 (split-brain).
-
-cmd_restart() {
-  echo "discord-daemon is launchd-supervised — delegating to the authoritative path:" >&2
-  echo "  token-restart --discord" >&2
-  exec token-restart --discord
+is_running() {
+  local pid
+  pid=$(get_pid)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
 cmd_start() {
-  # kickstart starts the service if it isn't running, so start == restart here.
-  cmd_restart
+  if is_running; then
+    echo "Daemon already running (PID $(get_pid))"
+    exit 0
+  fi
+
+  # Check node_modules
+  if [[ ! -d "$NODE_DIR/node_modules" ]]; then
+    echo "Installing dependencies..."
+    pushd "$NODE_DIR" > /dev/null 2>&1
+    /opt/homebrew/bin/npm install 2>&1
+    popd > /dev/null 2>&1
+  fi
+
+  echo "Starting Discord daemon..."
+  mkdir -p "$LOG_DIR"
+
+  # Start daemon in background
+  nohup /opt/homebrew/bin/node "$NODE_DIR/daemon.js" \
+    >> "$LOG_DIR/daemon-$(date +%Y-%m-%d).log" 2>&1 &
+
+  local new_pid=$!
+  echo "$new_pid" > "$PID_FILE"
+
+  # Wait a moment and verify it started
+  sleep 2
+  if kill -0 "$new_pid" 2>/dev/null; then
+    echo "Daemon started (PID $new_pid)"
+    # Quick health check
+    sleep 1
+    if curl -sf "$DAEMON_URL/status" >/dev/null 2>&1; then
+      echo "Health check: OK"
+    else
+      echo "Health check: Waiting for Discord connection..."
+    fi
+  else
+    echo "Daemon failed to start. Check logs:"
+    echo "  tail -20 $LOG_DIR/daemon-$(date +%Y-%m-%d).log"
+    rm -f "$PID_FILE"
+    exit 1
+  fi
 }
 
 cmd_stop() {
-  echo "Stopping launchd-supervised Discord daemon (ai.tokenclaw.discord)..."
-  echo "(bootout disables KeepAlive — stays down until 'token-restart --discord')"
-  if launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+  local pid
+  pid=$(get_pid)
+
+  if [[ -z "$pid" ]]; then
+    echo "Daemon not running (no PID file)"
+    exit 0
+  fi
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Stopping daemon (PID $pid)..."
+    kill "$pid"
+
+    # Wait for graceful shutdown
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
+      sleep 0.5
+      ((i++))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Force killing..."
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+
     echo "Daemon stopped."
   else
-    echo "Daemon already stopped or not loaded."
+    echo "Daemon not running (stale PID file)"
   fi
+
+  rm -f "$PID_FILE"
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
 }
 
 cmd_status() {
@@ -103,11 +162,6 @@ case "$1" in
   restart) cmd_restart ;;
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
-  -h|--help)
-    echo "Usage: discord-daemon <status|logs|start|stop|restart>"
-    echo "  status, logs        read-only inspection"
-    echo "  start, restart      -> token-restart --discord (authoritative, launchd)"
-    echo "  stop                -> launchctl bootout (disables KeepAlive)"
-    exit 0 ;;
+  -h|--help) echo "Usage: discord-daemon <start|stop|restart|status|logs>"; exit 0 ;;
   *) die "Unknown command: $1" ;;
 esac

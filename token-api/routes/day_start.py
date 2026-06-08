@@ -6,10 +6,14 @@ morning fan-out work. Keep it side-effect-light until each consumer is wired.
 
 import asyncio
 import logging
+import os
 import re
+from datetime import time as datetime_time
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import yaml
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -26,6 +30,86 @@ from shared import (
 logger = logging.getLogger("token_api")
 
 router = APIRouter()
+
+WAKE_ANCHOR_DEFAULT = "08:30"
+WAKE_ANCHOR_TASK_ID = "day_start_schedule_fallback"
+WAKE_ANCHOR_RE = re.compile(r"^(?P<hour>[0-2]?\d):(?P<minute>[0-5]\d)$")
+
+
+def _imperium_env_root() -> Path:
+    return Path(os.environ.get("IMPERIUM_ENV", "/Volumes/Imperium/Imperium-ENV"))
+
+
+def _daily_note_dir() -> Path:
+    return _imperium_env_root() / "Terra" / "Journal" / "Daily"
+
+
+def _normalize_wake_anchor(value: Any) -> str | None:
+    """Normalize daily-note wake_anchor values to HH:MM."""
+    if value is None:
+        return None
+    if isinstance(value, datetime_time):
+        return f"{value.hour:02d}:{value.minute:02d}"
+    text = str(value).strip().strip("'\"")
+    match = WAKE_ANCHOR_RE.match(text)
+    if not match:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if hour > 23:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def wake_anchor_to_cron(anchor: str) -> str:
+    """Convert HH:MM wake anchor to a daily cron expression."""
+    normalized = _normalize_wake_anchor(anchor)
+    if normalized is None:
+        raise ValueError(f"invalid wake_anchor: {anchor!r}")
+    hour, minute = normalized.split(":", 1)
+    return f"{int(minute)} {int(hour)} * * *"
+
+
+def read_wake_anchor_from_daily_note(date_str: str | None = None) -> str:
+    """Read wake_anchor from today's daily-note frontmatter, defaulting safely."""
+    local_date = date_str or quiet_hours_local_now().date().isoformat()
+    note_path = _daily_note_dir() / f"{local_date}.md"
+    if not note_path.exists():
+        return WAKE_ANCHOR_DEFAULT
+
+    text = note_path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return WAKE_ANCHOR_DEFAULT
+    end = text.find("\n---", 4)
+    if end == -1:
+        return WAKE_ANCHOR_DEFAULT
+
+    try:
+        frontmatter = yaml.safe_load(text[4:end]) or {}
+    except Exception as exc:
+        logger.warning("day-start wake_anchor frontmatter parse failed: %s", exc)
+        return WAKE_ANCHOR_DEFAULT
+
+    return _normalize_wake_anchor(frontmatter.get("wake_anchor")) or WAKE_ANCHOR_DEFAULT
+
+
+async def sync_day_start_schedule_from_daily_note(
+    *, date_str: str | None = None, db_path: Path | None = None
+) -> dict:
+    """Update the schedule-fallback task to today's daily-note wake_anchor."""
+    anchor = await asyncio.to_thread(read_wake_anchor_from_daily_note, date_str)
+    cron = wake_anchor_to_cron(anchor)
+    async with aiosqlite.connect(db_path or DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET schedule = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (cron, WAKE_ANCHOR_TASK_ID),
+        )
+        await db.commit()
+    return {"wake_anchor": anchor, "cron": cron, "task_id": WAKE_ANCHOR_TASK_ID}
 
 
 class DayStartFireRequest(BaseModel):
@@ -71,80 +155,6 @@ async def _consumer_custodes_morning_session() -> dict:
         return {"status": "error", "error": str(exc)}
 
 
-_DAILY_NOTE_BASENAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
-
-
-async def _consumer_custodes_doc_rebind() -> dict:
-    """Rebind a live custodes bound to a prior-day daily note onto today's note.
-
-    A custodes alive across midnight stays bound to yesterday's daily note. Only
-    date-named daily-note bindings are rebound; bespoke dockets are left untouched.
-    """
-    from instance_mutation import sanctioned_update_instance
-    from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
-
-    rebound: list[dict] = []
-    skipped: list[dict] = []
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-        db.row_factory = aiosqlite.Row
-        today_id = await resolve_or_create_today_daily_note_session_doc(db)
-
-        # Canonical "today" date string from the resolved note's own path so the
-        # comparison matches whatever date the helper minted.
-        cursor = await db.execute(
-            "SELECT file_path FROM session_documents WHERE id = ?", (today_id,)
-        )
-        today_row = await cursor.fetchone()
-        today_match = (
-            _DAILY_NOTE_BASENAME_RE.search(today_row["file_path"])
-            if today_row and today_row["file_path"]
-            else None
-        )
-        today_date = today_match.group(1) if today_match else None
-
-        cursor = await db.execute(
-            """
-            SELECT ci.id AS id, ci.session_doc_id AS session_doc_id, sd.file_path AS file_path
-            FROM claude_instances ci
-            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-            WHERE ci.legion = 'custodes'
-              AND ci.status IN ('idle', 'processing')
-              AND ci.stopped_at IS NULL
-            """
-        )
-        live = await cursor.fetchall()
-
-        for row in live:
-            file_path = row["file_path"]
-            match = _DAILY_NOTE_BASENAME_RE.search(file_path) if file_path else None
-            if not match:
-                # No doc, or a bespoke docket — leave the binding untouched.
-                skipped.append({"instance_id": row["id"], "reason": "not_daily_note"})
-                continue
-            if today_date and match.group(1) == today_date:
-                skipped.append({"instance_id": row["id"], "reason": "already_today"})
-                continue
-
-            await sanctioned_update_instance(
-                db,
-                instance_id=row["id"],
-                updates={"session_doc_id": today_id},
-                mutation_type="instance_updated",
-                write_source="day_start",
-                actor="day_start:custodes_doc_rebind",
-            )
-            rebound.append({"instance_id": row["id"], "from_date": match.group(1)})
-
-        if rebound:
-            await db.commit()
-            await log_event(
-                "custodes_doc_rebound",
-                details={"today_doc_id": today_id, "rebound": rebound},
-            )
-
-    return {"status": "ok", "rebound": rebound, "skipped": skipped}
-
-
 async def _consumer_stub(name: str, follow_up: str) -> dict:
     return {"status": "stubbed", "consumer": name, "follow_up": follow_up}
 
@@ -171,7 +181,6 @@ async def _day_start_fanout(day_state: dict) -> list[dict]:
     consumers = [
         ("quiet_hours", _consumer_quiet_hours(day_state)),
         ("tts_suppression", _consumer_tts_suppression(day_state)),
-        ("custodes_doc_rebind", _consumer_custodes_doc_rebind()),
         ("custodes_morning_session", _consumer_custodes_morning_session()),
         (
             "pavlok_daily_warmup",

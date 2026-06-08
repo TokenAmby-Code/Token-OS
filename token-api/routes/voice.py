@@ -15,7 +15,6 @@ Does NOT own:
 
 import logging
 import random
-from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import aiosqlite
@@ -45,23 +44,16 @@ router = APIRouter()
 # Set by init_deps() called from main.py after import.
 
 _schedule_pedal_enter = None
-_observe_work_signal = None
 
 
-def init_deps(
-    *,
-    schedule_pedal_enter: Callable[..., None] | None = None,
-    observe_work_signal: Callable[..., Awaitable[dict]] | None = None,
-):
+def init_deps(*, schedule_pedal_enter=None):
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.
     """
-    global _schedule_pedal_enter, _observe_work_signal
+    global _schedule_pedal_enter
     if schedule_pedal_enter is not None:
         _schedule_pedal_enter = schedule_pedal_enter
-    if observe_work_signal is not None:
-        _observe_work_signal = observe_work_signal
 
 
 # ============ Pydantic Models ============
@@ -345,16 +337,6 @@ async def toggle_listening(instance_id: str, active: bool = True):
     logger.info(
         f"Dictation {'ON' if active else 'OFF'} (via voice-chat/listening for {instance_id[:12]})"
     )
-    if active and _observe_work_signal:
-        # Dictation start is live work — DEFER: it stalls enforcement and holds
-        # the Pavlok while active, without resolving any ack. Guarded so a sink
-        # failure can't 500 the high-frequency toggle after the state is set.
-        try:
-            await _observe_work_signal(
-                source="voice-chat", kind="dictation", instance_id=instance_id
-            )
-        except Exception:
-            logger.exception("observe_work_signal failed for dictation (voice-chat)")
     return {"instance_id": instance_id, "listening": active}
 
 
@@ -367,15 +349,6 @@ async def set_dictation_state(active: bool):
     DICTATION_STATE["active"] = active
     DICTATION_STATE["updated_at"] = datetime.now().isoformat()
     logger.info(f"Dictation {'ON' if active else 'OFF'}")
-
-    if active and _observe_work_signal:
-        # Dictation start is live work — DEFER: it stalls enforcement and holds
-        # the Pavlok while active, without resolving any ack. Guarded so a sink
-        # failure can't 500 the high-frequency AHK toggle after the state is set.
-        try:
-            await _observe_work_signal(source="dictation", kind="dictation")
-        except Exception:
-            logger.exception("observe_work_signal failed for dictation")
 
     # When dictation ends, flush any queued pedal enter after buffer delay
     if not active and PEDAL_STATE["enter_queued"] and _schedule_pedal_enter:

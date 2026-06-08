@@ -28,10 +28,8 @@ def test_quiet_hours_morning_latch_released_by_day_start(app_env):
 
     assert app_env.main._is_quiet_hours(morning) is True
 
-    # A non-official source must NOT release the morning latch — that was the
-    # overnight-bypass regression. (schedule_fallback is used here only as a
-    # representative non-official source; the magic-number fallback cron that
-    # produced it has been removed — wake is event-driven via alarm_silenced.)
+    # A non-official source (the automated schedule_fallback wake-anchor) must
+    # NOT release the morning latch — that was the overnight-bypass regression.
     app_env.shared.set_day_started_at_sync(
         source="schedule_fallback",
         at=morning,
@@ -90,57 +88,32 @@ def test_day_start_endpoint_sets_state_and_fanout(app_env, monkeypatch):
     assert second["fanout"] == []
 
 
-def test_alarm_silenced_fires_day_start_and_launches_morning(app_env, monkeypatch):
-    """Silencing the Hatch alarm fires day-start and launches the morning session.
-
-    Pins Problem B's wiring: the alarm-silenced ingress calls
-    fire_day_start_internal(source="alarm_silenced"), which latches day_state
-    (non-null) and runs the fan-out whose custodes_morning_session consumer
-    launches morning. A re-silence is idempotent — no second launch.
-    """
-    from fastapi.testclient import TestClient
+def test_wake_anchor_schedule_sync_reads_daily_note_frontmatter(app_env):
+    import asyncio
 
     import routes.day_start as day_start
 
-    launches: list[bool] = []
+    daily_dir = app_env.db_path.parent / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "2026-05-10.md").write_text(
+        "---\ntitle: 2026-05-10\nwake_anchor: 09:15\n---\n\n# Daily\n",
+        encoding="utf-8",
+    )
 
-    async def fake_morning():
-        launches.append(True)
-        return {"status": "ok", "result": "launched", "pane_id": "%99"}
+    result = asyncio.run(
+        day_start.sync_day_start_schedule_from_daily_note(
+            date_str="2026-05-10",
+            db_path=app_env.db_path,
+        )
+    )
 
-    async def fake_phone(_state):
-        return {"status": "ok", "reachable": True}
-
-    async def fake_rebind():
-        return {"status": "ok", "rebound": [], "skipped": []}
-
-    # Stub the network/DB-touching consumers so the test exercises the wiring,
-    # not localhost:7777 or the daily-note rebind path.
-    monkeypatch.setattr(day_start, "_consumer_custodes_morning_session", fake_morning)
-    monkeypatch.setattr(day_start, "_consumer_phone_reachability", fake_phone)
-    monkeypatch.setattr(day_start, "_consumer_custodes_doc_rebind", fake_rebind)
-
-    client = TestClient(app_env.main.app)
-    resp = client.post("/api/morning/alarm-silenced")
-
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["already_started"] is False
-    # day_state goes non-null — the core "no morning session at all" fix.
-    assert data["day_state"]["day_started_at"]
-    assert data["day_state"]["source"] == "alarm_silenced"
-    # The morning session was launched via the day-start fan-out.
-    assert launches == [True]
-
+    assert result == {
+        "wake_anchor": "09:15",
+        "cron": "15 9 * * *",
+        "task_id": "day_start_schedule_fallback",
+    }
     row = _row(
         app_env.db_path,
-        "SELECT * FROM day_state WHERE date = ?",
-        (data["day_state"]["date"],),
+        "SELECT schedule FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'",
     )
-    assert row["day_started_at"] == data["day_state"]["day_started_at"]
-    assert row["source"] == "alarm_silenced"
-
-    # Idempotent: a re-silence does not re-fire the fan-out or re-launch morning.
-    second = client.post("/api/morning/alarm-silenced").json()
-    assert second["already_started"] is True
-    assert launches == [True]
+    assert row["schedule"] == "15 9 * * *"

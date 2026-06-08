@@ -84,39 +84,6 @@ export function nodeTypeColor(type: string): string {
   }
 }
 
-// Desktop attention → a monochrome HUD glyph (enum, not a number). Glyphs are
-// geometric so they take the ring's accent color rather than rendering as
-// multicolor emoji.
-export function desktopGlyph(d: { mode: string; in_meeting: boolean; steam_app_name: string | null }): string {
-  if (d.steam_app_name) return '◈'; // gaming
-  if (d.in_meeting) return '◎'; // meeting
-  return '▣'; // at the desk
-}
-
-// Phone attention → bool/enum glyph: distracted, app-open, or clear.
-export function phoneGlyph(p: { app: string | null; is_distracted: boolean }): string {
-  if (p.is_distracted) return '✕';
-  if (p.app) return '◌';
-  return '✓';
-}
-
-// Session-doc status → pipeline lane (label, accent, column order). Unknown
-// statuses fall to a trailing generic lane rather than being dropped.
-export type LaneVisual = { key: string; label: string; color: string; order: number };
-
-const LANES: Record<string, LaneVisual> = {
-  backlog: { key: 'backlog', label: 'Backlog', color: 'var(--muted)', order: 0 },
-  active: { key: 'active', label: 'Active', color: 'var(--phosphor)', order: 1 },
-  blocked: { key: 'blocked', label: 'Blocked', color: 'var(--hazard)', order: 2 },
-  deployment: { key: 'deployment', label: 'Deployment', color: 'var(--cyan)', order: 3 },
-  completed: { key: 'completed', label: 'Completed', color: 'var(--brass)', order: 4 },
-};
-
-export function pipelineLane(status: string | null | undefined): LaneVisual {
-  const key = (status ?? 'unknown').toLowerCase();
-  return LANES[key] ?? { key, label: key, color: 'var(--line-bright)', order: 9 };
-}
-
 // Zealotry (0..3+) → intensity tone for the fervor pips.
 export function zealotryTone(z: number): 'low' | 'mid' | 'high' {
   if (z >= 3) return 'high';

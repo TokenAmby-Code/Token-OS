@@ -584,9 +584,7 @@ def row(name, s):
     state = "connected" if s.get("connected") else "disconnected"
     mode = "listening" if s.get("listening") else "idle"
     channel = s.get("channelId") or s.get("assignedChannel") or "-"
-    listeners = s.get("activeListeners", 0)
-    conn = s.get("connectionState", "?")
-    print(f"{name}: {state} | {mode} | streams: {listeners} | channel: {channel} | state: {conn}")
+    print(f"{name}: {state} | {mode} | streams: {s.get(\"activeListeners\",0)} | channel: {channel} | state: {s.get(\"connectionState\",\"?\")}")
 if "connected" in d:
     row("voice", d)
 else:

@@ -20,12 +20,7 @@ concurrency:
   group: pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-# Run JS actions on Node 24 — Node 20 is being removed from runners (Sep 2026).
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
-  # "quality" is the canonical blocking check required by branch protection on main.
   quality:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest

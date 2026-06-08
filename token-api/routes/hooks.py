@@ -54,7 +54,6 @@ from shared import (
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
     FALLBACK_VOICES,
-    MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
     PROFILES,
     ULTIMATE_FALLBACK,
@@ -65,6 +64,7 @@ from shared import (
     log_event,
     resolve_device_from_ip,
 )
+from timer import TimerEvent
 
 logger = logging.getLogger("token_api")
 
@@ -164,11 +164,6 @@ _golden_throne_activity_callback: Callable[..., Any] | None = None
 _askq_level1_callback: Callable[..., Any] | None = None
 _askq_touch2_callback: Callable[..., Any] | None = None
 _askq_level3_callback: Callable[..., Any] | None = None
-# main.py's gate-aware, verification-tracked pane-write primitive. Hooks route
-# live prompt delivery through this instead of a bespoke send so the universal
-# send gate is honored and delivery truth (gated/unverified/submitted) is not
-# faked. Tests wire a fake directly onto this module global.
-_tmux_send_payload_then_submit: Callable[..., Any] | None = None
 
 
 def init_deps(
@@ -182,13 +177,12 @@ def init_deps(
     schedule_golden_throne_callback=None,
     golden_throne_activity_callback=None,
     askq_level1_callback=None,
-    tmux_send_payload_then_submit=None,
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
     global _run_stop_evaluators, _auto_name_instance, _work_action_callback
     global _schedule_golden_throne_callback, _golden_throne_activity_callback
-    global _askq_level1_callback, _tmux_send_payload_then_submit
+    global _askq_level1_callback
 
     _scheduler = scheduler
     _timer_engine = timer_engine
@@ -199,7 +193,6 @@ def init_deps(
     _schedule_golden_throne_callback = schedule_golden_throne_callback
     _golden_throne_activity_callback = golden_throne_activity_callback
     _askq_level1_callback = askq_level1_callback
-    _tmux_send_payload_then_submit = tmux_send_payload_then_submit
 
 
 def _require_dep(name: str, value):
@@ -293,49 +286,6 @@ SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
-CUSTODES_PANE_LABEL = "legion:custodes"
-
-# Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
-# stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
-# persona, so we derive its row identity (legion + primarch + instance_type) from
-# the pane. This makes "SessionStart from
-# a persona pane registers correctly" an infrastructure invariant — no persona
-# ever has to self-PATCH legion/type/synced. The fields chosen match each
-# persona's own resolution key: custodes resolves on the legion:custodes pane marker,
-# FG on its pane label, Administratum on primarch='administratum'.
-#
-# Worker panes (mechanicus:N, mechanicus:worker-N) are intentionally absent — they
-# are not personas and resolve their legion from dispatch env / working-dir
-# auto-detect, not from a fixed identity.
-PERSONA_PANE_IDENTITY: dict[str, dict] = {
-    CUSTODES_PANE_LABEL: {
-        "legion": "custodes",
-        "primarch": "custodes",
-        "instance_type": "sync",
-        # synced is NOT derived at registration: custodes now resolves via the
-        # legion:custodes pane marker, not synced (#67), so the correct startup
-        # default is synced=0. The morning session flips it to 1 while live.
-        "synced": False,
-    },
-    MECHANICUS_FG_LABEL: {
-        # FG owns a dedicated singleton legion ("fabricator", see ALLOWED_LEGIONS /
-        # SINGLETON_LEGIONS and assertions._row_matches_persona). The "mechanicus:"
-        # prefix is the tmux page/region, NOT the legion.
-        "legion": "fabricator",
-        "primarch": "fabricator-general",
-        "instance_type": "hook_driven",
-        "synced": False,
-    },
-    MECHANICUS_ADMIN_LABEL: {
-        # Administratum has no dedicated legion; it registers under the shared
-        # mechanicus legion. Its load-bearing resolution key is primarch (token-api
-        # _resolve_administratum_instance keys on primarch='administratum').
-        "legion": "mechanicus",
-        "primarch": "administratum",
-        "instance_type": "hook_driven",
-        "synced": False,
-    },
-}
 
 
 async def _run_subprocess_offloop(
@@ -378,12 +328,8 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     return None
 
 
-async def _stamp_instance_id(
-    tmux_pane: str | None,
-    session_id: str | None,
-    display_name: str | None = None,
-) -> None:
-    """Stamp ``@INSTANCE_ID=<session_id>`` (and optionally ``@PANE_LABEL``) on the pane.
+async def _stamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
+    """Stamp ``@INSTANCE_ID=<session_id>`` on the agent's tmux pane.
 
     tmux becomes the source of truth for ``instance_id -> pane`` resolution; the
     stamp lives and dies with the pane. Done in the same critical section as the
@@ -391,11 +337,6 @@ async def _stamp_instance_id(
     Best-effort: a failed stamp is logged, not raised — the row write must not be
     blocked by tmux being unavailable (e.g. remote/satellite-hosted panes whose
     ``%N`` is not addressable from this host).
-
-    ``display_name`` is the instance's ``tab_name`` (NOT the persona ``pane_label``
-    column). When provided, it hydrates ``@PANE_LABEL`` so the border shows the name
-    *before* the first rename — a fresh register INSERTs, so ``trg_tab_name_pane_state``
-    (AFTER UPDATE) never fires for it. Renames thereafter flow through the trigger.
     """
     if not tmux_pane or not session_id:
         return
@@ -413,19 +354,6 @@ async def _stamp_instance_id(
             )
     except Exception as exc:
         logger.debug(f"Hook: @INSTANCE_ID stamp errored for {tmux_pane}: {exc}")
-
-    label = (display_name or "").strip()
-    if not label:
-        return
-    try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-t", tmux_pane, "@PANE_LABEL", label),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception as exc:
-        logger.debug(f"Hook: @PANE_LABEL stamp errored for {tmux_pane}: {exc}")
 
 
 async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
@@ -1247,101 +1175,29 @@ def _stop_event_key(session_id: str, payload: dict) -> str:
 
 
 async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
-    """Live prompt delivery through the verified pane-write primitive.
-
-    Routes through main.py's gate-aware ``_tmux_send_payload_then_submit``
-    (injected via init_deps) instead of the old bespoke send that discarded the
-    adapter's result and hardcoded ``{"status": "sent"}`` — and then fell back to
-    a raw ``tmux send-keys`` that reported ``sent`` on rc==0 alone, with no
-    delivery proof and no respect for the universal send gate. Both were lies:
-    "fired but nothing arrived" while the system believed it delivered.
-
-    Reports the truth instead:
-
-      * ``sent``       — submission verified (the composer cleared after submit)
-      * ``unverified`` — bytes were issued but delivery is not yet proven; the
-                          proof belt (UserPromptSubmit correlation) confirms it
-                          asynchronously
-      * ``gated``      — the universal send gate suppressed the write (NO bytes
-                          reached the pane); never reported as delivered
-      * ``failed``     — the send errored
-
-    The full primitive result is returned under ``send`` so callers can persist
-    the verification record.
-    """
-    send = _tmux_send_payload_then_submit
-    if send is None:
-        return {"status": "failed", "error": "pane-write primitive not initialized"}
-    result = await send(tmux_pane, payload)
-    if result.get("gated"):
-        # Gate suppressed the send — no bytes issued. NOT a delivery.
-        return {
-            "status": "gated",
-            "verification_status": result.get("verification_status", "gated"),
-            "gate_reason": result.get("gate_reason"),
-            "send": result,
-        }
-    if result.get("returncode") == 0:
-        # Bytes issued. Only a confirmed submission (composer cleared) is
-        # "sent"; otherwise it is honestly "unverified" until the proof belt
-        # correlates a UserPromptSubmit. Never default bytes-issued to "sent".
-        verified = result.get("verification_status") == "submitted"
-        return {
-            "status": "sent" if verified else "unverified",
-            "verification_status": result.get("verification_status"),
-            "operation": result.get("operation"),
-            "send": result,
-        }
-    return {
-        "status": "failed",
-        "error": result.get("stderr") or result.get("error"),
-        "send": result,
-    }
-
-
-async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
-    """Flag a stop-subscription subscriber hook_driven=1 before delivery — the
-    subscriber (e.g. FG watching its stack workers) is being woken autonomously by
-    the watched instance's Stop, NOT by the Emperor. Resolve by the LIVE occupant of
-    subscriber_pane first, falling back to subscriber_instance_id only when the pane
-    yields no live row. A subscriber's instance id rotates on resume while it keeps
-    its pane (the live `1402f092`→`f55ac307`-at-`%96` FG split); trusting the recorded
-    id first would flag a now-dead row (a silent no-op) and the autonomous-wakeup
-    marker would never reach the live subscriber. Committed by the caller before the
-    byte lands (see the commit preceding _direct_pane_write). Best-effort."""
-    declared_id = _normalize_text(subscription.get("subscriber_instance_id"))
-    pane = _normalize_text(subscription.get("subscriber_pane"))
-    target_id = None
+    """Best-effort live prompt delivery used from hooks without importing main.py."""
     try:
-        if pane:
-            prev_factory = getattr(db, "row_factory", None)
-            db.row_factory = aiosqlite.Row
-            try:
-                cur = await db.execute(
-                    "SELECT id FROM claude_instances WHERE tmux_pane = ? "
-                    "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
-                    (pane,),
-                )
-                row = await cur.fetchone()
-            finally:
-                db.row_factory = prev_factory
-            if row:
-                target_id = row["id"]
-        # Fall back to the recorded subscriber id only when the pane has no live row.
-        if not target_id:
-            target_id = declared_id
-        if not target_id:
-            return
-        await sanctioned_update_instance(
-            db,
-            instance_id=target_id,
-            updates={"hook_driven": 1},
-            mutation_type="status_changed",
-            write_source="hooks",
-            actor="stop-subscription-delivery",
+        from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError
+
+        adapter = TmuxAdapter()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(adapter.send_text_then_submit, tmux_pane, payload),
+                timeout=10,
+            )
+            return {"status": "sent", "operation": "tmuxctl.send_text_then_submit"}
+        except TmuxError as exc:
+            return {"status": "failed", "error": str(exc)}
+    except Exception:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "send-keys", "-t", tmux_pane, payload, "Enter"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=10,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("hook_driven flag (stop-subscription) failed: %s", exc)
+        if proc.returncode == 0:
+            return {"status": "sent", "operation": "tmux.send-keys"}
+        return {"status": "failed", "error": proc.stderr.decode(errors="replace")}
 
 
 async def _enqueue_and_send_stop_delivery(
@@ -1351,10 +1207,6 @@ async def _enqueue_and_send_stop_delivery(
     stop_event_key: str,
     payload: str,
 ) -> dict:
-    # Subscriber is woken autonomously by this Stop — flag it before the send. The
-    # flag is committed together with the delivery rows below (db.commit precedes
-    # _direct_pane_write), so the subscriber's PromptSubmit can't observe a stale 0.
-    await _flag_subscriber_hook_driven(db, subscription)
     delivery_id: int | None = None
     queue_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -1398,41 +1250,19 @@ async def _enqueue_and_send_stop_delivery(
     await db.commit()
 
     send_result = await _direct_pane_write(subscription["subscriber_pane"], payload)
-    delivery_status = send_result.get("status")
-    # Map delivery truth onto the durable queue row + the delivery record:
-    #   sent/unverified -> bytes were issued, so the queue row is terminal
-    #       'sent' (re-queuing would double the send); the proof belt upgrades
-    #       an 'unverified' delivery asynchronously.
-    #   gated           -> the universal gate suppressed the write (NO bytes).
-    #       Keep the pane_write_queue row 'pending' so the periodic worker
-    #       re-drains it when the gate clears — never reported as delivered.
-    #   failed          -> the send errored.
-    bytes_issued = delivery_status in ("sent", "unverified")
-    if delivery_status == "gated":
-        queue_status = "pending"
-    elif bytes_issued:
-        queue_status = "sent"
-    else:
-        queue_status = "failed"
-    # The delivery record carries the precise truth, including 'unverified'.
-    delivery_record_status = (
-        delivery_status
-        if delivery_status in ("sent", "unverified", "gated", "failed")
-        else "failed"
-    )
-    delivered_at = datetime.now().isoformat() if bytes_issued else None
-    error = send_result.get("error") or send_result.get("gate_reason")
+    sent = send_result.get("status") == "sent"
+    final_status = "sent" if sent else "failed"
     await db.execute(
         """UPDATE pane_write_queue
            SET status = ?, attempted_at = ?, sent_at = ?, updated_at = ?,
                last_error = ?, last_result_json = ?
            WHERE id = ?""",
         (
-            queue_status,
+            final_status,
             now,
-            now if bytes_issued else None,
+            now if sent else None,
             datetime.now().isoformat(),
-            error,
+            send_result.get("error"),
             json.dumps(send_result, sort_keys=True),
             queue_id,
         ),
@@ -1442,15 +1272,15 @@ async def _enqueue_and_send_stop_delivery(
            SET status = ?, delivered_at = ?, error = ?
            WHERE id = ?""",
         (
-            delivery_record_status,
-            delivered_at,
-            error,
+            final_status,
+            datetime.now().isoformat() if sent else None,
+            send_result.get("error"),
             delivery_id,
         ),
     )
     await db.commit()
     return {
-        "status": delivery_status,
+        "status": final_status,
         "delivery_id": delivery_id,
         "queue_id": queue_id,
         "subscriber_pane": subscription["subscriber_pane"],
@@ -1790,23 +1620,6 @@ async def handle_session_start(payload: dict) -> dict:
     )
     if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
         launch_instance_type = None
-    # Persona/orchestrator pane (tmuxctl stamps a stable @PANE_ID like
-    # "legion:custodes" / "mechanicus:fabricator-general" / "mechanicus:admin").
-    # A fresh spawn in one of these panes IS that persona — derive its row identity
-    # from the pane so the agent never self-PATCHes legion/primarch/type/synced.
-    # The pane is authoritative for the persona's legion (written below in the
-    # auto_legion block regardless of env); here we only fill the blanks the launch
-    # left in the env-derived fields (dispatch_legion for doc resolution, primarch,
-    # instance_type) so an explicit dispatch can still tune those.
-    persona_identity = PERSONA_PANE_IDENTITY.get(pane_label or "")
-    if persona_identity:
-        if not dispatch_legion:
-            dispatch_legion = persona_identity["legion"]
-        if not primarch_name:
-            primarch_name = persona_identity.get("primarch") or ""
-        if launch_instance_type is None:
-            launch_instance_type = persona_identity.get("instance_type")
-    persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
     )
@@ -1864,36 +1677,6 @@ async def handle_session_start(payload: dict) -> dict:
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE primarch = ? ORDER BY registered_at DESC LIMIT 1",
                 (primarch_name,),
-            )
-            row = await cursor.fetchone()
-            if row:
-                supplant_id = row["id"]
-
-        # 3b. Persona pane-label singleton (FG / Administratum / Custodes). A persona
-        # pane is bound by its tmux pane label, and the `primarch` derived above comes
-        # from that label via PERSONA_PANE_IDENTITY — but ONLY when the label resolves
-        # at SessionStart. On a fresh persona resume the @PANE_ID may not be stamped
-        # yet, so `_tmux_pane_label` returns nothing, no primarch is derived, and the
-        # primarch-singleton case (3) cannot fire. The result is a *duplicate* persona
-        # row while the prior row lingers un-demoted (its stop subscriptions orphaned —
-        # the live `1402f092`/`f55ac307`-at-`%96` split). Supplant the persona row
-        # already occupying this pane, keyed off ITS persisted primarch rather than the
-        # (possibly-unresolved) new registration's label.
-        if not supplant_id and tmux_pane:
-            # Gate strictly to the KNOWN persona primarchs (from PERSONA_PANE_IDENTITY).
-            # `primarch` can be set on non-persona rows too, so matching any non-empty
-            # primarch would let a recycled non-persona pane inherit a stale row's
-            # identity/session metadata instead of registering clean. (CodeRabbit #83.)
-            persona_primarchs = sorted(
-                {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
-            )
-            placeholders = ",".join("?" for _ in persona_primarchs)
-            cursor = await db.execute(
-                f"""SELECT id FROM claude_instances
-                    WHERE tmux_pane = ? AND id != ?
-                      AND TRIM(primarch) IN ({placeholders})
-                    ORDER BY registered_at DESC LIMIT 1""",
-                (tmux_pane, session_id, *persona_primarchs),
             )
             row = await cursor.fetchone()
             if row:
@@ -2005,9 +1788,7 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
-                await _stamp_instance_id(
-                    tmux_pane, session_id, display_name=existing_row["tab_name"]
-                )
+                await _stamp_instance_id(tmux_pane, session_id)
                 if old_tmux_pane and old_tmux_pane != tmux_pane:
                     await _unstamp_instance_id(old_tmux_pane, session_id)
                 await _apply_instance_workflow_state(
@@ -2146,11 +1927,7 @@ async def handle_session_start(payload: dict) -> dict:
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
-                await _stamp_instance_id(
-                    tmux_pane or existing_row["tmux_pane"],
-                    session_id,
-                    display_name=existing_row["tab_name"],
-                )
+                await _stamp_instance_id(tmux_pane or existing_row["tmux_pane"], session_id)
                 if (
                     tmux_pane
                     and existing_row["tmux_pane"]
@@ -2289,7 +2066,7 @@ async def handle_session_start(payload: dict) -> dict:
                     where_clause="id = ?",
                     where_params=(supplant_id,),
                 )
-                await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["tab_name"])
+                await _stamp_instance_id(tmux_pane, session_id)
 
                 # Auto-link primarch session doc if applicable
                 session_doc_id = resolved_session_doc_id or old_inst["session_doc_id"]
@@ -2506,22 +2283,6 @@ async def handle_session_start(payload: dict) -> dict:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
 
-        # Dispatch → worker classification (hook_driven column, distinct from the
-        # instance_type='hook_driven' enum). A worker dispatched by a non-Custodes
-        # agent (e.g. Fabricator General) is driven autonomously → hook_driven=1; a
-        # Custodes-dispatched worker is Emperor-proxied → 0; a direct-Emperor launch
-        # has no agent parent → 0. parent_instance_id is the resolved dispatcher.
-        # Cleared on the worker's first Stop. (Default tuple row factory here.)
-        launch_hook_driven = 0
-        if parent_instance_id and not is_subagent:
-            cursor = await db.execute(
-                "SELECT legion FROM claude_instances WHERE id = ? LIMIT 1",
-                (parent_instance_id,),
-            )
-            _parent_row = await cursor.fetchone()
-            if _parent_row and (_parent_row[0] or "").lower() != "custodes":
-                launch_hook_driven = 1
-
         # Insert instance
         now = datetime.now().isoformat()
         internal_session_id = str(uuid.uuid4())
@@ -2541,7 +2302,7 @@ async def handle_session_start(payload: dict) -> dict:
                 "pid": payload.get("pid"),
                 "status": "idle",
                 "legion": _prior_legion or "astartes",
-                "synced": 1 if persona_synced else 0,
+                "synced": 0,
                 "input_lock": None,
                 "is_subagent": is_subagent,
                 "tmux_pane": tmux_pane,
@@ -2559,7 +2320,6 @@ async def handle_session_start(payload: dict) -> dict:
                 "launch_mode": launch_mode,
                 "parent_instance_id": parent_instance_id,
                 "transplant_expected": 1 if transplant_expected else 0,
-                "hook_driven": launch_hook_driven,
                 "instance_type": launch_instance_type or "one_off",
                 "zealotry": launch_zealotry if launch_zealotry is not None else 4,
                 "session_doc_policy": session_doc_policy,
@@ -2573,7 +2333,7 @@ async def handle_session_start(payload: dict) -> dict:
             actor="SessionStart",
             wrapper_launch_id=wrapper_launch_id,
         )
-        await _stamp_instance_id(tmux_pane, session_id, display_name=tab_name)
+        await _stamp_instance_id(tmux_pane, session_id)
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
             db,
@@ -2645,10 +2405,6 @@ async def handle_session_start(payload: dict) -> dict:
                 auto_legion = "mechanicus"
         elif working_dir and ("pax-env" in working_dir.lower() or "/pax/" in working_dir.lower()):
             auto_legion = "civic"
-        elif persona_identity:
-            # Fresh persona singleton: the INSERT wrote _prior_legion or "astartes",
-            # never dispatch_legion — so write the pane's canonical legion here.
-            auto_legion = persona_identity["legion"]
 
         # Restore prior legion if no auto-detect, or apply auto-detect
         if auto_legion:
@@ -2847,7 +2603,6 @@ async def handle_session_end(payload: dict) -> dict:
                 "status": "stopped",
                 "synced": 0,
                 "stopped_at": now,
-                "hook_driven": 0,
                 "workflow_state": "closed",
                 "workflow_updated_at": now,
                 "workflow_blocked_reason": None,
@@ -2978,13 +2733,15 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
         await db.commit()
 
-    # NOTE: this hook no longer flips global productivity. Productivity is now a
-    # read-time calculus in compute_work_state (the 10s poll), which discounts
-    # hook_driven / automated-marker panes. An automated wake that triggers a fresh
-    # PromptSubmit therefore can no longer reset the idle clock. The work_action
-    # callback still fires (resolves expected-acks, busts quiet-state) but, for this
-    # non-explicit source, no longer sets global productivity (see _work_action).
-    exited_idle = False
+    # Signal productivity — sets prod active, exits IDLE if needed
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = shared.timer_engine.current_mode.value
+    result = shared.timer_engine.set_productivity(True, now_ms)
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
+    if exited_idle:
+        new_mode = shared.timer_engine.current_mode.value
+        await shared.timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
+        logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
     if _work_action_callback:
         await _work_action_callback(source="prompt_submit", note=f"session_id={session_id}")
 
@@ -3084,11 +2841,9 @@ async def handle_post_tool_use(payload: dict) -> dict:
         )
         await db.commit()
 
-    # NOTE: no longer flips global productivity (read-time calculus owns it now —
-    # see handle_prompt_submit / compute_work_state). The status/last_activity
-    # heartbeat above is unchanged so stopped instances still resurrect and a
-    # missed PromptSubmit is still caught. Liveness is preserved; only the
-    # productivity flip is removed.
+    # Signal productivity — active tool use = real work
+    now_ms = int(time.monotonic() * 1000)
+    shared.timer_engine.set_productivity(True, now_ms)
     if tool_name == "AskUserQuestion" and _work_action_callback:
         await _work_action_callback(
             source="ask_user_question_answered", note=f"session_id={session_id}"
@@ -3177,14 +2932,11 @@ async def handle_stop(payload: dict) -> dict:
     )
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-        # Stop clears hook_driven=0 — the autonomous wake that flagged this instance
-        # has run its course. Idempotent (clearing an already-0 row is a no-op), so
-        # this is a safe generic clear on every Stop regardless of how it was woken.
         if will_evaluate or is_sync_instance:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"last_activity": now, "hook_driven": 0},
+                updates={"last_activity": now},
                 mutation_type="instance_updated",
                 write_source="hooks",
                 actor="Stop",
@@ -3193,7 +2945,7 @@ async def handle_stop(payload: dict) -> dict:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"status": "idle", "last_activity": now, "hook_driven": 0},
+                updates={"status": "idle", "last_activity": now},
                 mutation_type="status_changed",
                 write_source="hooks",
                 actor="Stop",
@@ -3257,7 +3009,7 @@ async def handle_stop(payload: dict) -> dict:
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"status": "idle", "last_activity": now, "hook_driven": 0},
+                updates={"status": "idle", "last_activity": now},
                 mutation_type="status_changed",
                 write_source="hooks",
                 actor="Stop-golden-throne-idle",
@@ -3360,22 +3112,17 @@ async def handle_stop(payload: dict) -> dict:
         return result
 
     if instance_type == "sync":
-        # Self-continuing morning session. The keepalive is gated on an ACTIVE
-        # morning session — NOT on instance_type alone. `sync` is NECESSARY (a
-        # non-sync instance never reaches here) but NOT SUFFICIENT: a correctly
-        # registered Custodes singleton stays `sync` for state-hook interventions,
-        # yet must stop looping once the morning session is ended (POST
-        # /api/morning/end) or past the Emperor's MORNING_MAX_DURATION_HOURS bound.
-        from morning_session import MORNING_MAX_DURATION_HOURS, morning_session_active
+        # Self-continuing sync (morning) session: accept the Stop, then re-inject a
+        # fresh timestamped keepalive prompt so the session is temporally bound, not
+        # turn-based. The only exit is flipping the instance off `sync` (via
+        # POST /api/morning/end → instance_type=one_off); after that flip this branch
+        # is no longer taken and the next Stop is a normal clean stop.
+        result["action"] = "stop_processed_sync"
+        await log_event("hook_stop", instance_id=session_id, details={"sync": True})
 
-        active, morning_reason = morning_session_active()
-        await log_event(
-            "hook_stop",
-            instance_id=session_id,
-            details={"sync": True, "keepalive": active, "morning": morning_reason},
-        )
+        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
+        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(ts=now_mst.strftime("%H:%M"))
 
-        # Resolve the pane once — needed for the keepalive OR the expiry notice.
         tmux_pane = instance.get("tmux_pane")
         if not tmux_pane:
             # Re-fetch from DB in case the cached instance row didn't capture it.
@@ -3390,41 +3137,6 @@ async def handle_stop(payload: dict) -> dict:
                         tmux_pane = row[0]
             except Exception:
                 pass
-
-        if not active:
-            # No active morning session → clean Stop, no keepalive re-injection.
-            # When the 2h bound just tripped, morning_session_active() already
-            # auto-ended the state file; emit ONE final in-band notice and then go
-            # quiet — do NOT keep re-prompting.
-            if morning_reason == "expired":
-                result["action"] = "stop_processed_sync_expired"
-                if tmux_pane:
-                    notice = MORNING_EXPIRY_NOTICE.format(hours=MORNING_MAX_DURATION_HOURS)
-                    try:
-                        proc = await _run_subprocess_offloop(
-                            ("claude-cmd", "--pane", tmux_pane, notice),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            timeout=10,
-                        )
-                        if proc.returncode != 0:
-                            logger.warning(
-                                f"Hook: Stop {session_id[:12]}... morning expiry notice claude-cmd failed: "
-                                f"{proc.stderr.decode()[:200]}"
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"Hook: Stop {session_id[:12]}... morning expiry notice failed: {e}"
-                        )
-            else:
-                result["action"] = f"stop_processed_sync_idle:{morning_reason}"
-            return result
-
-        # Active, in-bound morning session → re-inject a fresh timestamped keepalive
-        # so the session stays temporally bound, not turn-based.
-        result["action"] = "stop_processed_sync"
-        now_mst = datetime.now(ZoneInfo("America/Phoenix"))
-        keepalive_prompt = MORNING_KEEPALIVE_PROMPT.format(ts=now_mst.strftime("%H:%M"))
 
         if not tmux_pane:
             logger.warning(f"Hook: Stop {session_id[:12]}... sync keepalive skipped — no tmux_pane")

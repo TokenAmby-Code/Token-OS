@@ -7,36 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _stub_instance_pane_resolution(app_env, monkeypatch):
-    """tmuxctl owns instance_id -> pane resolution.
-
-    These Golden-Throne tests insert a local instance with a stored ``tmux_pane``
-    and assert the fire dispatches to it. After the Phase-3 reader cutover the
-    fire path resolves the pane live by UUID, so mimic a correctly-stamped live
-    pane here: resolve to the instance's stored ``tmux_pane`` and derive its role
-    via ``_tmux_pane_label`` (which individual tests monkeypatch) — the dual-write
-    reality where the stored pane still matches the live one. Scoped to this file
-    so tests of the real ``resolve_instance_pane`` elsewhere are untouched.
-    """
-    main = app_env.main
-
-    async def _resolve_instance_pane(instance_id):
-        conn = sqlite3.connect(app_env.db_path)
-        try:
-            row = conn.execute(
-                "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        pane = row[0] if row else None
-        if not pane:
-            return (None, None)
-        return (pane, await main._tmux_pane_label(pane))
-
-    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
-
-
 def _rows(db_path, query, params=()):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -372,13 +342,7 @@ async def test_pane_write_queue_submits_with_separate_literal_text_and_enter(app
             "operation": "tmuxctl.send_text_then_submit",
         }
 
-    async def _resolve_live(_instance_id):
-        # Tier 2(b): the drain resolves the pane live by instance_id; this
-        # instance has no DB row, so resolve directly to its live pane.
-        return ("%10", "palace:N")
-
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_pending_input", pane_has_input)
-    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve_live)
     monkeypatch.setattr(
         app_env.main,
         "_tmux_send_payload_then_submit",
@@ -656,12 +620,8 @@ async def test_expected_ack_creation_persists_deadlines_and_logs_event(app_env):
     assert json.loads(event["details"])["id"] == ack["id"]
 
 
-def test_enforcement_ack_endpoint_is_demoted_and_does_not_resolve(app_env, monkeypatch) -> None:
-    """The ack is demoted: pressing it confirms Pavlok connectivity but never
-    resolves enforcement. Replaces the old ack-as-terminator contract."""
+def test_enforcement_ack_endpoint_resolves_pending_ack(app_env):
     from fastapi.testclient import TestClient
-
-    monkeypatch.setattr(app_env.main, "check_phone_reachable", lambda: {"reachable": True})
 
     client = TestClient(app_env.main.app)
     ack = app_env.main._expected_ack_deadlines()
@@ -690,13 +650,11 @@ def test_enforcement_ack_endpoint_is_demoted_and_does_not_resolve(app_env, monke
 
     resp = client.post("/api/enforcement/ack", json={"ack_id": "ack-1"})
     assert resp.status_code == 200
-    assert resp.json()["resolved"] is False
-    assert resp.json()["pavlok_connectivity"] == {"reachable": True}
+    assert resp.json()["updated"] is True
 
-    # The ack is untouched — only a real work signal resolves enforcement.
     row = _rows(app_env.db_path, "SELECT status, acknowledged_at FROM expected_acknowledgements")[0]
-    assert row["status"] == "pending"
-    assert row["acknowledged_at"] is None
+    assert row["status"] == "acknowledged"
+    assert row["acknowledged_at"]
 
 
 def test_enforcement_expect_endpoint_creates_manual_ack(app_env):

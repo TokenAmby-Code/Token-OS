@@ -4,70 +4,27 @@
 # AUDIENCE: human, agent
 """Show a compact tmux status segment while recent user typing is active.
 
-Dependency-free mirror of the canonical typing-guard predicate
-(`tmuxctl.send_gate.typing_guard_active`): reads tmux's #{client_activity}
+Thin reader of the ONE canonical typing-guard predicate
+(`tmuxctl.send_gate.typing_guard_active`), which reads tmux's #{client_activity}
 timestamp and stays active for TMUX_TYPING_GUARD_WINDOW seconds after the last
-keystroke. Silent outside tmux or on failure.
-
-This segment runs on tmux's per-redraw hot path (status-interval). It must NOT
-import the tmuxctl package: `from tmuxctl.send_gate import ...` triggers
-`tmuxctl/__init__` → `.service`, eagerly pulling ~22 sibling modules over the
-NAS/SMB mount *every refresh* — the load that wedged the tmux server loop under
-SMB latency (2026-06-05 hard restart). The client_activity check is trivial and
-stable, so we inline it here with zero tmuxctl imports. Keep this byte-for-byte
-aligned with `send_gate.typing_guard_active` (the canonical source of truth).
+keystroke. Keeping the client_activity logic in a single place means the status
+segment, tmux-guard.sh, and the universal send gate can never disagree. Silent
+outside tmux or on failure.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
+import pathlib
 import sys
-import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "lib"))
 
-def _client_activity_epoch() -> int | None:
-    """Last client-input epoch from tmux, or None. Mirror of send_gate's helper."""
-    try:
-        proc = subprocess.run(
-            ["tmux", "display-message", "-p", "#{client_activity}"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    value = proc.stdout.strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+try:
+    from tmuxctl.send_gate import typing_guard_active
+except Exception:  # fail-open: render nothing if the predicate can't be imported
 
-
-def typing_guard_active(*, window_seconds: int | None = None) -> bool:
-    """True if a client typed within the last TMUX_TYPING_GUARD_WINDOW seconds.
-
-    Fail-open: if tmux is unreachable or reports nothing, returns False. Inlined
-    copy of tmuxctl.send_gate.typing_guard_active — keep the two in sync.
-    """
-    if window_seconds is None:
-        try:
-            window_seconds = int(os.environ.get("TMUX_TYPING_GUARD_WINDOW", "10"))
-        except (TypeError, ValueError):
-            window_seconds = 10
-    window_seconds = max(1, window_seconds)
-
-    activity = _client_activity_epoch()
-    if activity is None:
+    def typing_guard_active(**_kwargs) -> bool:
         return False
-    age = int(time.time()) - activity
-    return 0 <= age <= window_seconds
 
 
 def main() -> int:

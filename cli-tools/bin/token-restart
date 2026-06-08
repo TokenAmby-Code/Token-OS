@@ -4,36 +4,20 @@
 # AUDIENCE: human, agent
 #
 # Usage:
-#   token-restart              # Git-aware smart deploy: sync the live checkout,
-#                              #   then restart ONLY the services whose files changed
-#   token-restart --no-sync    # Skip the git sync; full restart on current code
-#   token-restart --discord    # Restart the Discord daemon only (launchd)
+#   token-restart              # Full restart: Mac + WSL satellite
 #   token-restart --from <dir> # Update plist to serve from <dir>, then restart
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
-#   token-restart --sync       # Accepted no-op alias (sync is now the default)
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
 # After healthy restart, reloads any open /ui/ops browser tabs on Mac.
-#
-# GIT-AWARE SMART DEPLOY (the mantra: a merge to main → one restart endpoint hit →
-# this script syncs + intelligently restarts):
-#   By DEFAULT token-restart ff-only pulls the live serving checkout
-#   (/Volumes/Imperium/Token-OS) to origin/main BEFORE restarting, so a
-#   merge-to-main actually ships new code. It then DIFFS what the pull changed and
-#   restarts ONLY the affected services (token-api / ops-ui / discord / WSL
-#   satellite / mobile) — see map_changed_to_services(). If the sync pulled nothing
-#   new (already current, or --no-sync), it falls back to a full restart of the
-#   standard set, preserving the human "restart my stuff now" workflow.
-#   The sync is ff-only + stash-guarded + abort-on-conflict (degrades to a plain
-#   restart on any trouble) — see sync_live_checkout().
+# NAS era: no git sync needed — all devices read from /Volumes/Imperium/Token-OS.
 
 set -euo pipefail
 
-_BIN_DIR="$(dirname "$(readlink -f "$0")")"
-_LIB_DIR="${_BIN_DIR}/../lib"
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 
 # Colors
@@ -54,57 +38,35 @@ WSL_PORT=7777
 LABEL="ai.openclaw.tokenapi"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
-# Discord daemon — launchd-supervised, Mac-only. token-restart is the
-# AUTHORITATIVE restart path: launchctl kickstart against KeepAlive. Never use
-# `discord-daemon start/restart` (pidfile+nohup) — it split-brains against launchd.
-DISCORD_LABEL="ai.tokenclaw.discord"
-DISCORD_PLIST="$HOME/Library/LaunchAgents/${DISCORD_LABEL}.plist"
-DISCORD_URL="http://127.0.0.1:7779"
-
 is_mac() {
     [[ "$IMPERIUM_MACHINE" == "mac" ]]
 }
 
 show_help() {
     cat << 'EOF'
-token-restart - Git-aware smart deploy + multi-device restart orchestrator
+token-restart - Multi-device restart orchestrator
 
 Usage:
-    token-restart              Sync live checkout, restart ONLY changed services
-    token-restart --no-sync    Skip git sync; full restart on current code
-    token-restart --discord    Restart the Discord daemon only (launchd)
+    token-restart              Full restart (Mac → WSL)
     token-restart --from <dir> Update plist to serve from <dir>, then restart
     token-restart --wsl-only   WSL satellite only
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
-    token-restart --sync       Accepted no-op alias (sync is the default)
     token-restart -h, --help   Show this help
 
     When run from a non-Mac device, proxies to Mac via SSH.
 
-Smart-deploy flow (default):
-    0. ff-only pull the live checkout to origin/main (stash-guarded)
-    1. If the pull advanced HEAD: diff old→new and restart ONLY the services
-       whose files changed:
-         token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
-         token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
-         discord-daemon/**                          → Discord daemon (launchd)
-         token-api/token-satellite.py               → WSL satellite
-         mobile/**                                  → push-mobile -a (phone)
-    2. If the pull was a no-op (already current) or --no-sync: full restart of
-       the standard set (Mac token-api → Discord → WSL), preserving the human
-       "restart my stuff now" workflow.
-    3. Health-check what was restarted, print summary.
+Flow:
+    1. Restart Mac token-api (launchctl)
+    2. Restart WSL satellite (HTTP → restart, SSH fallback)
+    3. Health-check all, print summary
 
 Notes:
-    - Sync is ff-only + stash-guarded + abort-on-conflict; degrades to a plain
-      restart on any trouble (WIP never lost, tree never broken).
+    - All devices read from NAS (/Volumes/Imperium/Token-OS) — no sync needed
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
-    - Discord daemon managed by launchd (ai.tokenclaw.discord) — this is the
-      AUTHORITATIVE restart path; do NOT use `discord-daemon restart`
     - Open /ui/ops browser tabs are reloaded after a healthy restart
 EOF
 }
@@ -118,12 +80,9 @@ remote_restart() {
 
     echo -e "${BLUE}→${NC} Proxying restart to Mac ($MAC_HOST)..."
 
-    # Pass through relevant flags. Sync is the default on the Mac side, so only
-    # the opt-out needs forwarding.
+    # Pass through relevant flags
     local flags=""
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
-    [[ "${ACTION}" == "discord" ]] && flags="$flags --discord"
-    [[ "${SYNC_BEFORE_RESTART}" == false ]] && flags="$flags --no-sync"
 
     if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "$(imperium_cfg nas_imperium mac)/Token-OS/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
@@ -231,158 +190,6 @@ sync_venv_if_needed() {
     fi
 }
 
-# ============ Code-sync (default; opt out with --no-sync) ============
-#
-# Before restarting, fast-forward the LIVE serving checkout to origin/main so a
-# merge-to-main actually ships new code (the restart alone runs whatever is
-# already checked out). This is the DEFAULT now; --no-sync skips it. On a
-# successful advance it records SYNC_DID_ADVANCE + SYNC_CHANGED_PATHS so
-# full_restart() can restart only the services the pull changed.
-#
-# SAFETY (load-bearing — losing WIP or breaking the live tree is worse than not
-# shipping):
-#   - Fast-forward ONLY. We never `reset --hard` to force the sync forward and we
-#     never force. If origin/main is not a fast-forward of HEAD, we abort.
-#   - Stash-guard tracked WIP first; reapply it after the ff. We only ever touch
-#     the stash THIS run pushed, matched back by its commit SHA — a pre-existing
-#     unrelated stash (e.g. an old hydra-merge-wave stash) is never popped.
-#   - On ANY trouble (resolve/fetch failure, not-a-ff, stash push/pop conflict)
-#     we abort the sync cleanly, restore WIP, leave the tree clean, and restart
-#     on the current code (degrade to the no-sync behavior).
-
-resolve_live_checkout() {
-    # Explicit override (ops escape hatch / tests): point the sync at a specific
-    # checkout. Honored only if the path exists, so a stale export can't misdirect
-    # the sync; otherwise we fall through to launchd/$TOKEN_OS autodetection.
-    if [[ -n "${CD_LIVE_CHECKOUT:-}" && -d "${CD_LIVE_CHECKOUT}" ]]; then
-        git -C "${CD_LIVE_CHECKOUT}" rev-parse --show-toplevel 2>/dev/null \
-            || printf '%s\n' "${CD_LIVE_CHECKOUT}"
-        return 0
-    fi
-
-    # The git toplevel of the launchd-served WorkingDirectory (don't hardcode).
-    local workdir="" toplevel=""
-    if [[ -f "$PLIST" ]]; then
-        workdir="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$PLIST" 2>/dev/null || true)"
-    fi
-    [[ -z "$workdir" || ! -d "$workdir" ]] && workdir="${TOKEN_OS:-}"
-    [[ -z "$workdir" || ! -d "$workdir" ]] && return 1
-    toplevel="$(git -C "$workdir" rev-parse --show-toplevel 2>/dev/null || true)"
-    [[ -z "$toplevel" ]] && return 1
-    printf '%s\n' "$toplevel"
-}
-
-_cd_sync_stash_ref_for() {
-    # Echo the stash@{N} selector whose commit SHA == $2 (in repo $1), else fail.
-    # Lets us pop ONLY the stash we pushed, never an unrelated pre-existing one.
-    local dir="$1" want="$2" sel sha
-    [[ -z "$want" ]] && return 1
-    while read -r sel sha; do
-        [[ "$sha" == "$want" ]] && { printf '%s\n' "$sel"; return 0; }
-    done < <(git -C "$dir" stash list --format='%gd %H' 2>/dev/null)
-    return 1
-}
-
-_cd_sync_pop_mine() {
-    # Pop the stash we pushed (repo $1, stash commit-sha $2), matched by SHA.
-    # Returns 0 on a clean pop; non-zero on conflict/failure (stash left intact).
-    local dir="$1" mysha="$2" ref
-    ref="$(_cd_sync_stash_ref_for "$dir" "$mysha")" || return 1
-    git -C "$dir" stash pop "$ref" >/dev/null 2>&1
-}
-
-sync_live_checkout() {
-    local dir
-    dir="$(resolve_live_checkout)" || {
-        echo -e "  ${YELLOW}⚠${NC} CD-sync: could not resolve live checkout — restarting on current code"
-        return 0
-    }
-    echo -e "${BLUE}→${NC} CD-sync: fast-forwarding ${dir} → origin/main..."
-
-    if ! git -C "$dir" fetch origin main >/dev/null 2>&1; then
-        echo -e "  ${YELLOW}⚠${NC} CD-sync: 'git fetch origin main' failed — restarting on current code"
-        return 0
-    fi
-
-    # Use FETCH_HEAD (exactly what we just fetched) — robust even if the
-    # remote-tracking origin/main ref lags behind the fetch.
-    local old_head target
-    old_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-    target="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || true)"
-    if [[ -z "$old_head" || -z "$target" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} CD-sync: could not resolve HEAD/FETCH_HEAD — restarting on current code"
-        return 0
-    fi
-    if [[ "$old_head" == "$target" ]]; then
-        echo -e "  ${GREEN}✓${NC} CD-sync: already at origin/main (${old_head:0:9}) — no sync needed"
-        return 0
-    fi
-
-    # Stash-guard tracked WIP (only if dirty). Untracked files are left in place;
-    # if one would collide, the ff-merge aborts cleanly and we degrade below.
-    local my_stash=""
-    if ! git -C "$dir" diff --quiet 2>/dev/null || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
-        if git -C "$dir" stash push -m "cd-sync auto-stash ${old_head}" >/dev/null 2>&1; then
-            my_stash="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
-            echo -e "  ${BLUE}→${NC} CD-sync: stashed local WIP (${my_stash:0:9})"
-        else
-            echo -e "  ${YELLOW}⚠${NC} CD-sync: 'git stash push' failed — restarting on current code"
-            return 0
-        fi
-    fi
-
-    # Fast-forward ONLY. Never reset --hard, never force.
-    if ! git -C "$dir" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
-        echo -e "  ${RED}✗${NC} CD-sync: NOT a fast-forward (or merge refused) — ABORTING sync"
-        # HEAD is untouched; just restore our WIP, then restart on current code.
-        if [[ -n "$my_stash" ]]; then
-            _cd_sync_pop_mine "$dir" "$my_stash" \
-                || echo -e "  ${RED}✗${NC} CD-sync: WIP preserved in stash (${my_stash:0:9}); manual 'git stash pop' needed"
-        fi
-        echo -e "  ${YELLOW}⚠${NC} CD-sync: restarting on current code (${old_head:0:9})"
-        return 0
-    fi
-
-    local new_head changed_paths
-    new_head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-    echo -e "  ${GREEN}✓${NC} CD-sync: fast-forwarded ${old_head:0:9} → ${new_head:0:9}"
-    # Capture exactly which files the pull changed, but don't advertise the advance
-    # to full_restart() until we KNOW the tree ends up on new_head with WIP intact.
-    # A conflicting pop rolls back to old_head, where we must restart on the current
-    # (old) code — NOT smart-deploy files that never actually shipped.
-    changed_paths="$(git -C "$dir" diff --name-only "$old_head" "$new_head" 2>/dev/null || true)"
-
-    # Reapply WIP on top of the new HEAD.
-    if [[ -n "$my_stash" ]]; then
-        if _cd_sync_pop_mine "$dir" "$my_stash"; then
-            echo -e "  ${GREEN}✓${NC} CD-sync: restored local WIP"
-        else
-            # Pop conflicted against the new code. Roll the working tree back to
-            # the captured pre-sync commit (where the WIP cleanly belongs) and
-            # reapply it, so we never ship a half-merged tree or strand WIP. This
-            # reset is to a known-good pre-sync SHA (NOT a forced sync to
-            # origin/main) and is immediately followed by restoring the WIP.
-            echo -e "  ${RED}✗${NC} CD-sync: WIP did not reapply on new HEAD — rolling the sync back"
-            git -C "$dir" reset --hard "$old_head" >/dev/null 2>&1 || true
-            if _cd_sync_pop_mine "$dir" "$my_stash"; then
-                echo -e "  ${YELLOW}⚠${NC} CD-sync: rolled back to ${old_head:0:9}, WIP restored — restarting on current code"
-            else
-                git -C "$dir" reset --hard "$old_head" >/dev/null 2>&1 || true
-                echo -e "  ${RED}✗${NC} CD-sync: rolled back to ${old_head:0:9}; WIP preserved in stash (${my_stash:0:9}) — manual 'git stash pop' needed"
-            fi
-            # Tree is back on old_head → leave SYNC_DID_ADVANCE=false so
-            # full_restart() restarts the standard set on the current code.
-            return 0
-        fi
-    fi
-
-    # Tree is on new_head (clean ff, or ff + clean WIP pop): advertise the advance
-    # so full_restart() restarts ONLY the services this pull changed.
-    SYNC_DID_ADVANCE=true
-    SYNC_CHANGED_PATHS="$changed_paths"
-    return 0
-}
-
 restart_mac() {
     echo -e "${BLUE}→${NC} Restarting Mac token-api..."
 
@@ -409,65 +216,6 @@ restart_mac() {
     echo -e "  ${RED}✗${NC} Mac server failed to start within ${max_attempts}s"
     echo "  Check logs: tail ~/.claude/token-api-stderr.log"
     return 1
-}
-
-# ============ Discord ============
-
-check_discord_health() {
-    # Healthy = daemon up AND actually connected to Discord. A 200 from /status
-    # alone isn't enough (the HTTP API binds before the gateway connects), so
-    # require "connected": true in the body.
-    curl -sf "${DISCORD_URL}/status" 2>/dev/null \
-        | grep -q '"connected"[[:space:]]*:[[:space:]]*true'
-}
-
-get_discord_status() {
-    echo -e "${BOLD}Discord daemon${NC} (${DISCORD_URL})"
-
-    if launchctl print "gui/$(id -u)/${DISCORD_LABEL}" > /dev/null 2>&1; then
-        echo -e "  Launchd: ${GREEN}loaded${NC}"
-    else
-        echo -e "  Launchd: ${RED}not loaded${NC}"
-    fi
-
-    if check_discord_health; then
-        echo -e "  Health:  ${GREEN}●${NC} connected"
-    else
-        echo -e "  Health:  ${RED}●${NC} not responding"
-    fi
-}
-
-restart_discord() {
-    echo -e "${BLUE}→${NC} Restarting Discord daemon (launchd)..."
-
-    launchctl kickstart -k "gui/$(id -u)/${DISCORD_LABEL}" 2>/dev/null || {
-        echo "  Service not loaded, bootstrapping..."
-        launchctl bootstrap "gui/$(id -u)" "$DISCORD_PLIST" 2>/dev/null || true
-    }
-
-    # The kickstart above already succeeded — launchd (KeepAlive) now owns
-    # liveness. This loop only waits to CONFIRM the daemon is back. Cold-start
-    # from the NAS is slow (node loads node_modules over SMB in an uninterruptible
-    # read, ~1-3 min on a cold mount cache), so confirmation is best-effort.
-    local attempts=0
-    local max_attempts=45
-
-    printf '  waiting for Discord daemon'
-    while [[ $attempts -lt $max_attempts ]]; do
-        sleep 1
-        if check_discord_health; then
-            printf '\n'
-            echo -e "  ${GREEN}✓${NC} Discord daemon is up and connected"
-            return 0
-        fi
-        printf '.'
-        attempts=$((attempts + 1))
-    done
-    printf '\n'
-
-    echo -e "  ${YELLOW}○${NC} Kickstart issued; daemon still cold-loading from NAS."
-    echo -e "    launchd will bring it up — confirm with: discord-daemon status"
-    return 0
 }
 
 # ============ WSL ============
@@ -639,8 +387,6 @@ get_status_all() {
     echo ""
     get_mac_status
     echo ""
-    get_discord_status
-    echo ""
     get_wsl_status
     echo ""
     get_phone_status
@@ -679,171 +425,39 @@ PYEOF
     echo -e "  ${GREEN}✓${NC} Plist updated"
 }
 
-# ============ Mobile ============
-
-restart_mobile() {
-    echo -e "${BLUE}→${NC} Deploying mobile (push-mobile -a)..."
-    # Resolve PATH-first (the standard cli-tools push-mobile), falling back to our
-    # sibling in _BIN_DIR if PATH doesn't carry it (e.g. a bare CD environment).
-    local push_mobile
-    push_mobile="$(command -v push-mobile 2>/dev/null || true)"
-    [[ -n "$push_mobile" ]] || push_mobile="${_BIN_DIR}/push-mobile"
-    if [[ ! -x "$push_mobile" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} push-mobile not found — skipping mobile deploy"
-        return 0
-    fi
-    # push-mobile validates + pushes the mobile/ tree to the phone. Fire it but
-    # never let a phone-unreachable push fail the whole deploy.
-    if "$push_mobile" -a; then
-        echo -e "  ${GREEN}✓${NC} push-mobile completed"
-    else
-        echo -e "  ${YELLOW}⚠${NC} push-mobile failed (continuing)"
-    fi
-}
-
-# ============ Git-aware service mapping ============
-#
-# Map the files a sync just pulled (SYNC_CHANGED_PATHS, one path per line) to the
-# services that must restart, setting the RESTART_* globals. This is the SINGLE
-# SOURCE OF TRUTH for path→service routing: deploy-prod.yml no longer filters
-# paths — it just hits the restart endpoint and lets this script decide from git.
-#
-# NOTE: in bash `case` patterns, `*` matches `/` (unlike filename globbing), so
-# `token-api/*.py` covers nested files too. Order matters — the first matching
-# arm wins, so specific paths (satellite, ops) precede the general .py arm.
-
-map_changed_to_services() {
-    local path
-    while IFS= read -r path; do
-        [[ -z "$path" ]] && continue
-        case "$path" in
-            token-api/token-satellite.py)
-                # Satellite code lives under token-api/ but runs on WSL. (Also a
-                # *.py, so token-api restarts too — matches old paths-filter.)
-                RESTART_WSL=true
-                RESTART_TOKENAPI=true
-                ;;
-            token-api/ui/ops/* | token-api/web/ops/*)
-                # Ops cockpit is served by token-api; a restart bumps the build-id
-                # so connected browsers reload, and we also refresh open tabs.
-                RESTART_OPS=true
-                RESTART_TOKENAPI=true
-                ;;
-            token-api/*.py | token-api/uv.lock | token-api/pyproject.toml)
-                RESTART_TOKENAPI=true
-                ;;
-            discord-daemon/*)
-                RESTART_DISCORD=true
-                ;;
-            mobile/*)
-                RESTART_MOBILE=true
-                ;;
-            *)
-                : # unmapped (docs, cli-tools, workflows, tmux/ahk/hammerspoon):
-                  # no long-lived service to bounce — nothing to do.
-                ;;
-        esac
-    done <<< "$SYNC_CHANGED_PATHS"
-    return 0
-}
-
 # ============ Full Restart ============
 
 full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 0. Git sync (default): ff-only pull the live checkout so a merge ships
-    #    before we restart. Sets SYNC_DID_ADVANCE + SYNC_CHANGED_PATHS. Always
-    #    degrades gracefully — a failed/uneventful sync just leaves the flags off.
-    if [[ "$SYNC_BEFORE_RESTART" == true ]]; then
-        sync_live_checkout || true
-        echo ""
-    fi
+    # 1. Mac restart
+    restart_mac || true
+    echo ""
 
-    # 1. Decide what to restart.
-    if [[ "$SYNC_DID_ADVANCE" == true ]]; then
-        # Smart deploy: restart ONLY the services whose files the pull changed.
-        map_changed_to_services
-        if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
-            && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true ]]; then
-            echo -e "${GREEN}✓${NC} No deployable services changed — nothing to restart."
-            return 0
-        fi
-        local changed_list=""
-        [[ "$RESTART_TOKENAPI" == true ]] && changed_list+=" token-api"
-        [[ "$RESTART_OPS" == true ]] && changed_list+=" ops-ui"
-        [[ "$RESTART_DISCORD" == true ]] && changed_list+=" discord"
-        [[ "$RESTART_WSL" == true ]] && changed_list+=" wsl"
-        [[ "$RESTART_MOBILE" == true ]] && changed_list+=" mobile"
-        echo -e "${BLUE}→${NC} Changed services:${changed_list}"
-        echo ""
-    else
-        # No new commits (already current / --no-sync / sync degraded): full
-        # restart of the standard set — the human "restart my stuff now" path.
-        RESTART_TOKENAPI=true
-        RESTART_DISCORD=true
-        RESTART_WSL=true
-    fi
+    # 2. WSL restart
+    restart_wsl &
+    local wsl_pid=$!
 
-    # 2. Mac token-api
-    if [[ "$RESTART_TOKENAPI" == true ]]; then
-        restart_mac || true
-        echo ""
-    fi
+    wait $wsl_pid 2>/dev/null || true
 
-    # 3. Discord daemon (Mac-only, launchd-supervised)
-    if [[ "$RESTART_DISCORD" == true ]]; then
-        restart_discord || true
-        echo ""
-    fi
-
-    # 4. WSL satellite (background; never blocks the deploy)
-    local wsl_pid=""
-    if [[ "$RESTART_WSL" == true ]]; then
-        restart_wsl &
-        wsl_pid=$!
-    fi
-
-    # 5. Mobile (phone push)
-    if [[ "$RESTART_MOBILE" == true ]]; then
-        restart_mobile || true
-        echo ""
-    fi
-
-    [[ -n "$wsl_pid" ]] && { wait "$wsl_pid" 2>/dev/null || true; }
-
-    # 6. Browser cockpit refresh — only if token-api was (re)started and healthy.
-    if [[ "$RESTART_TOKENAPI" == true ]] && check_mac_health; then
+    # 3. Browser cockpit refresh (replaces legacy TUI restart signaling)
+    if check_mac_health; then
         refresh_ops_browser_gui || true
     fi
 
-    # 7. Summary — report only what we touched.
+    # 4. Summary
     echo ""
     echo -e "${BOLD}=== Summary ===${NC}"
-    if [[ "$RESTART_TOKENAPI" == true ]]; then
-        if check_mac_health; then
-            echo -e "  Mac:     ${GREEN}●${NC} healthy"
-        else
-            echo -e "  Mac:     ${RED}●${NC} not responding"
-        fi
+    if check_mac_health; then
+        echo -e "  Mac:   ${GREEN}●${NC} healthy"
+    else
+        echo -e "  Mac:   ${RED}●${NC} not responding"
     fi
-    if [[ "$RESTART_DISCORD" == true ]]; then
-        if check_discord_health; then
-            echo -e "  Discord: ${GREEN}●${NC} connected"
-        else
-            echo -e "  Discord: ${RED}●${NC} not responding"
-        fi
-    fi
-    if [[ "$RESTART_WSL" == true ]]; then
-        if check_wsl_health; then
-            echo -e "  WSL:     ${GREEN}●${NC} healthy"
-        else
-            echo -e "  WSL:     ${YELLOW}○${NC} unknown"
-        fi
-    fi
-    if [[ "$RESTART_MOBILE" == true ]]; then
-        echo -e "  Mobile:  ${GREEN}●${NC} push-mobile dispatched"
+    if check_wsl_health; then
+        echo -e "  WSL:   ${GREEN}●${NC} healthy"
+    else
+        echo -e "  WSL:   ${YELLOW}○${NC} unknown"
     fi
 }
 
@@ -851,36 +465,12 @@ full_restart() {
 
 ACTION="restart"
 DEPLOY_FROM=""
-# Sync is the DEFAULT now (the git-aware deploy mantra: always ship fresh code).
-# --no-sync opts out; --sync is an accepted no-op alias.
-SYNC_BEFORE_RESTART=true
-# Set by sync_live_checkout() when the pull advances HEAD, plus the changed paths.
-SYNC_DID_ADVANCE=false
-SYNC_CHANGED_PATHS=""
-# Which services to restart — set by map_changed_to_services() (smart mode) or
-# forced on in the full-restart fallback. Must be initialised for `set -u`.
-RESTART_TOKENAPI=false
-RESTART_OPS=false
-RESTART_DISCORD=false
-RESTART_WSL=false
-RESTART_MOBILE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             show_help
             exit 0
-            ;;
-        --sync)
-            # No-op alias: sync is the default now. Kept so existing callers
-            # (e.g. the CD webhook, which passes --sync explicitly) don't break.
-            SYNC_BEFORE_RESTART=true
-            shift
-            ;;
-        --no-sync)
-            # Opt out of the git sync: full restart on whatever is checked out.
-            SYNC_BEFORE_RESTART=false
-            shift
             ;;
         --kill)
             ACTION="kill"
@@ -896,10 +486,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --wsl-only)
             ACTION="wsl-only"
-            shift
-            ;;
-        --discord)
-            ACTION="discord"
             shift
             ;;
         --no-push)
@@ -949,9 +535,6 @@ case "$ACTION" in
         ;;
     wsl-only)
         restart_wsl
-        ;;
-    discord)
-        restart_discord
         ;;
     restart)
         if [[ -n "$DEPLOY_FROM" ]]; then

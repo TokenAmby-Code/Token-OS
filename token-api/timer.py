@@ -1150,13 +1150,3 @@ class TimerEngine:
         self._break_balance_ms += break_delta_ms
         if was_positive and self._break_balance_ms <= 0:
             result.events.append(TimerEvent.BREAK_EXHAUSTED)
-
-    def credit_break(self, credit_ms: int, now_mono_ms: int) -> TickResult:
-        """Structured one-off positive break credit (e.g. the first-ack
-        connectivity boost). Advances accrual to now so no elapsed time is lost,
-        then adds the credit to the balance. Positive credit only — a no-op for
-        non-positive values so callers can pass a clamped amount safely."""
-        result = self._advance(now_mono_ms)
-        if credit_ms > 0:
-            self._break_balance_ms += credit_ms
-        return result

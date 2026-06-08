@@ -45,8 +45,6 @@ export type OpsInstance = {
   is_subagent: boolean;
   legion: string | null;
   instance_type: string | null;
-  pr_url: string | null;
-  pr_state: string | null; // "open" | "merged" | null
   workflow_state: string | null;
   next_required_action: string | null;
   stop_allowed: boolean | null;
@@ -66,29 +64,11 @@ export type OpsInstance = {
 export type TtsQueueItem = {
   instance_id: string;
   tab_name: string | null;
-  message: string; // full text — UI clamps with CSS, expands on click
-  voice: string | null;
-  queue: string; // "hot" | "pause"
-  status?: string; // queued | playing | completed
-  queued_at: string; // ISO timestamp
-};
-
-export type TtsCurrent = {
-  instance_id: string;
-  tab_name: string | null;
   message: string;
   voice: string | null;
-  backend?: string | null;
-  started_at?: string | null; // ISO; present when cheaply available
+  queue: string; // "hot" | "pause"
+  queued_at: string; // ISO timestamp
 };
-
-export type TtsRouting = {
-  device: string; // wsl | phone | mac | discord
-  reason: string; // why this device
-  context?: Record<string, unknown>;
-};
-
-export type TtsGlobalMode = 'verbose' | 'muted' | 'silent';
 
 export type VoiceDraft = {
   bot_name: string;
@@ -201,8 +181,7 @@ export type OpsState = {
     error?: string;
   };
   tts: {
-    current: TtsCurrent | null;
-    routing?: TtsRouting | null;
+    current: Record<string, unknown> | null;
     hot_queue: TtsQueueItem[];
     pause_queue: TtsQueueItem[];
     hot_queue_length: number;
@@ -220,27 +199,6 @@ export type OpsState = {
     pavlok: Record<string, unknown>;
     error?: string;
   };
-  alarm?: {
-    acked: boolean;
-    day_started_at: string | null;
-    source: string | null;
-  };
-  work_actions?: WorkActionSummary;
-};
-
-// One explicit work-action press: timeline tick + dial input.
-export type WorkActionTick = {
-  at: string; // local ISO timestamp of the press
-  source: string | null;
-};
-
-// Work-action visualization read model (GET /api/ui/ops/state → work_actions).
-export type WorkActionSummary = {
-  count: number; // load-bearing: explicit work-actions today
-  ticks: WorkActionTick[];
-  last_at: string | null; // drives the staleness green→red fade
-  score: number; // non-load-bearing: all work_signal events today
-  stale_fade_minutes: number; // fade window; backend + frontend agree
 };
 
 // ── Timer history read-model (GET /api/ui/ops/timer/history) ──────────────
@@ -291,9 +249,6 @@ export type TimerHistory = {
   gap_threshold_seconds?: number;
   points: TimerHistoryPoint[];
   segments: TimerHistorySegment[];
-  // Explicit work-action presses within the graph window — drawn as vertical
-  // ticks, distinct from the timer_shifts mode bands and session dividers.
-  work_action_ticks?: WorkActionTick[];
   annotations?: TimerHistoryAnnotation[];
   gaps?: Array<{ start: string; end: string; reason: string; anomaly_reason?: string }>;
   anomalies?: Array<Record<string, unknown>>;
@@ -311,35 +266,6 @@ export type TimerHistory = {
     dominant_reason?: string | null;
   };
   source?: string;
-};
-
-// ── Session-doc pipeline read-model (GET /api/ui/ops/session-docs) ────────
-// Read-only board feed. The cockpit groups these into status lanes and never
-// renders more than `head` (one line); the document itself lives in Obsidian.
-
-export type PipelineDoc = {
-  id: number | null;
-  title: string | null;
-  path: string | null;
-  vault_rel: string | null;
-  obsidian_uri: string | null;
-  status: string;
-  project: string | null;
-  primarch: string | null;
-  legion: string | null;
-  instance_type: string | null;
-  head: string | null; // one-line excerpt only — never the full document
-  created_at: string | null;
-  age_seconds: number | null; // since creation — surfaces long-open docs honestly
-  linked_instances: number;
-};
-
-export type SessionDocsFeed = {
-  generated_at: string;
-  /** true per-status counts before per-lane capping — so the board never lies */
-  lane_totals: Record<string, number>;
-  limit_per_lane: number;
-  docs: PipelineDoc[];
 };
 
 // ── Arbitrary node/edge graph read-model (GET /api/ui/ops/graph/{name}) ───
