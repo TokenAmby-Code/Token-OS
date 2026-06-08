@@ -41,6 +41,13 @@ const TITLE_PREFIX = {
   custodes: 'CUST🔒',
 };
 
+// Cadia voice locks are active-pane locks, so the operator needs an unmistakable
+// visual target. This tint is owned only by the voice draft lock lifecycle: set
+// when the lock is born, cleared only after the lock is deleted. If a lock goes
+// stale, the tint intentionally stays stale with it.
+const CADIA_LOCK_STYLE = 'bg=#2b1645';
+const VOICE_LOCK_OPTION = '@DISCORD_VOICE_LOCK';
+
 function execFileAsync(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(file, args, opts, (err, stdout, stderr) => {
@@ -200,13 +207,58 @@ async function setPaneTitle(target, title) {
   }
 }
 
+async function setPaneStyle(target, style) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) throw new Error(`target not live: ${target}`);
+  await execFileAsync('tmux', ['select-pane', '-t', pane, '-P', style || 'bg=default'], {
+    timeout: 3000,
+    env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-style' }),
+  });
+}
+
+async function setPaneOption(target, option, value) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) throw new Error(`target not live: ${target}`);
+  await execFileAsync('tmux', ['set-option', '-p', '-t', pane, option, value], {
+    timeout: 3000,
+    env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-option' }),
+  });
+}
+
+async function applyLockOverlay(state) {
+  if (!state?.lockOverlay) return;
+  await setPaneOption(state.target, VOICE_LOCK_OPTION, '1');
+  try {
+    await setPaneStyle(state.target, CADIA_LOCK_STYLE);
+  } catch (err) {
+    try {
+      await setPaneOption(state.target, VOICE_LOCK_OPTION, '0');
+    } catch {}
+    throw err;
+  }
+}
+
+async function restoreLockOverlay(state) {
+  if (!state?.lockOverlay) return;
+  try {
+    await setPaneStyle(state.target, state.paneStyle || 'bg=default');
+    await setPaneOption(state.target, VOICE_LOCK_OPTION, '0');
+  } catch {
+    // Best effort only after the lock has already been cleared.
+  }
+}
+
 async function typeIntoTarget(target, text, { bypassGuard = false } = {}) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
   await execFileAsync(TMUX_DICTATE, ['-t', pane, text], {
     timeout: 15_000,
     maxBuffer: 1024 * 1024,
-    env: tmuxEnv(bypassGuard ? { TMUX_GUARD_SKIP: '1' } : {}),
+    env: tmuxEnv({
+      ...(bypassGuard ? { TMUX_GUARD_SKIP: '1' } : {}),
+      TMUX_SEND_GATE_ALLOW: 'discord-voice-direct-input',
+      TMUX_SEND_GATE_POLICY: 'pierce',
+    }),
   });
 }
 
@@ -269,6 +321,7 @@ export function createVoiceTranscriptRouter({ logger, voiceManager = null } = {}
     if (!state) return null;
     drafts.delete(key.value);
     await restoreTitle(state);
+    await restoreLockOverlay(state);
     return summarize(key, state);
   }
 
@@ -340,23 +393,40 @@ export function createVoiceTranscriptRouter({ logger, voiceManager = null } = {}
         return { routed: false, reason: 'no_target' };
       }
       const oldTitle = displayValue(target, '#{pane_title}');
+      const oldStyle = displayValue(target, '#{pane_style}');
       const prefix = TITLE_PREFIX[key.bot] || `${key.bot.toUpperCase().slice(0, 4)}🔒`;
       if (!oldTitle.startsWith(prefix)) await setPaneTitle(target, `${prefix} ${oldTitle}`.trim());
-      state = { target, title: oldTitle, createdAt: new Date().toISOString(), utterances: 0 };
+      state = {
+        target,
+        title: oldTitle,
+        paneStyle: oldStyle,
+        lockOverlay: key.bot === 'imperial_guard',
+        createdAt: new Date().toISOString(),
+        utterances: 0,
+      };
       drafts.set(key.value, state);
+      try {
+        await applyLockOverlay(state);
+      } catch (err) {
+        drafts.delete(key.value);
+        await restoreTitle(state);
+        await restoreLockOverlay(state);
+        throw err;
+      }
       logger?.info?.(`Voice route [${key.bot}/${key.userId}]: locked ${target} (${pane})`);
     }
 
     const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
     try {
-      // Discord voice is already explicit human dictation into the locked pane.
-      // The generic tmux typing guard has false positives on Claude/Codex panes
-      // and previously caused silent drops; bypass it for all voice draft text.
+      // Discord voice is explicit Emperor/user dictation into the locked pane.
+      // It pierces the universal recent-typing gate as direct input, while still
+      // being audited via TMUX_SEND_GATE_ALLOW.
       await typeIntoTarget(state.target, segment, { bypassGuard: true });
     } catch (err) {
       if ((state.utterances || 0) === 0) {
         drafts.delete(key.value);
         await restoreTitle(state);
+        await restoreLockOverlay(state);
       }
       throw err;
     }

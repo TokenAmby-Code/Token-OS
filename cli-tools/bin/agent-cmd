@@ -131,22 +131,22 @@ send_command() {
     dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
     hash=$(printf '%s' "$cmd" | payload_hash)
 
-    if [[ -n "${INSTANCE_ID:-}" ]]; then
-        for _ in {1..20}; do
-            lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
-                -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
-            if echo "$lock_resp" | grep -q '"acquired": *true'; then
-                locked=true
-                break
-            fi
-            sleep 0.5
-        done
-    fi
-
-    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-10}"; then
+    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-0}"; then
         echo "Warning: user input not cleared in $pane — aborting injection" >&2
         rc=1
     else
+        if [[ -n "${INSTANCE_ID:-}" ]]; then
+            for _ in {1..20}; do
+                lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
+                    -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
+                if echo "$lock_resp" | grep -q '"acquired": *true'; then
+                    locked=true
+                    break
+                fi
+                sleep 0.5
+            done
+        fi
+
         out=$("${_BIN_DIR}/tmuxctl" send-text --pane "$pane" --text "$cmd" 2>&1) || {
             echo "$out" >&2
             rc=1

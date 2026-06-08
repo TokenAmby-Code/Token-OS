@@ -9,7 +9,7 @@
 # All other tmux subcommands pass through to the real binary unmodified.
 #
 # Opt-out: TMUX_GUARD_SKIP=1 bypasses the guard for a single invocation.
-# Timeout: TMUX_GUARD_TIMEOUT=N seconds to wait for clear (default: 10).
+# Timeout: TMUX_GUARD_TIMEOUT=N seconds to wait for clear (default: 0 = wait indefinitely).
 #
 # Usage:
 #   source /path/to/cli-tools/lib/tmux-guard-wrapper.sh
@@ -293,7 +293,7 @@ PY
         return
     fi
 
-    local timeout="${TMUX_GUARD_TIMEOUT:-10}"
+    local timeout="${TMUX_GUARD_TIMEOUT:-0}"
 
     if ! tmux_wait_for_clear "$pane" "$timeout"; then
         echo "tmux-guard: BLOCKED send-keys to $pane — user has pending input (waited ${timeout}s)" >&2
