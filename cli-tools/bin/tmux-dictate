@@ -110,6 +110,11 @@ if [[ -z "$TEXT" ]]; then
     exit 1
 fi
 
+# Dictation is direct Emperor/user input, not automation. It may pierce the
+# universal recent-typing gate and is still audited by tmuxctl.send_gate.
+export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-dictate-direct-input}"
+export TMUX_SEND_GATE_POLICY="${TMUX_SEND_GATE_POLICY:-pierce}"
+
 # Submit through the canonical live-agent prompt primitive.
 if $SUBMIT; then
     if [[ -n "$TARGET" ]]; then
@@ -120,11 +125,6 @@ if $SUBMIT; then
     fi
     exit 0
 fi
-
-# Dictation is direct Emperor/user input, not automation. It may pierce the
-# universal recent-typing gate and is still audited by tmuxctl.send_gate.
-export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-dictate-direct-input}"
-export TMUX_SEND_GATE_POLICY="${TMUX_SEND_GATE_POLICY:-pierce}"
 
 # --- Build send-keys command ---
 SEND_ARGS=()

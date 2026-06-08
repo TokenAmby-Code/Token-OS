@@ -228,7 +228,14 @@ async function setPaneOption(target, option, value) {
 async function applyLockOverlay(state) {
   if (!state?.lockOverlay) return;
   await setPaneOption(state.target, VOICE_LOCK_OPTION, '1');
-  await setPaneStyle(state.target, CADIA_LOCK_STYLE);
+  try {
+    await setPaneStyle(state.target, CADIA_LOCK_STYLE);
+  } catch (err) {
+    try {
+      await setPaneOption(state.target, VOICE_LOCK_OPTION, '0');
+    } catch {}
+    throw err;
+  }
 }
 
 async function restoreLockOverlay(state) {
@@ -403,6 +410,7 @@ export function createVoiceTranscriptRouter({ logger, voiceManager = null } = {}
       } catch (err) {
         drafts.delete(key.value);
         await restoreTitle(state);
+        await restoreLockOverlay(state);
         throw err;
       }
       logger?.info?.(`Voice route [${key.bot}/${key.userId}]: locked ${target} (${pane})`);

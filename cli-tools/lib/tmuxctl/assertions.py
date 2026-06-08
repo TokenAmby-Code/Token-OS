@@ -348,7 +348,9 @@ def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
         "@DISCORD_VOICE_LOCK",
         allow_failure=True,
     ).strip()
-    if current == pane_id and voice_locked != "1":
+    if voice_locked == "1":
+        return
+    if current == pane_id:
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
     adapter.run(
