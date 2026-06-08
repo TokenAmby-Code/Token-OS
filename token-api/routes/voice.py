@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
 from shared import (
+    CUSTODES_PROFILE,
     DB_PATH,
     DICTATION_STATE,
     FALLBACK_VOICES,
@@ -119,6 +120,19 @@ async def list_voices():
                 "fallback": is_fallback,
             }
         )
+    # Surface the reserved Custodes voice (George) for display only. It lives
+    # outside PROFILES/FALLBACK_VOICES, so it never enters rotation or the
+    # PATCH .../voice validation set — workers can never be assigned it.
+    voices.append(
+        {
+            "voice": CUSTODES_PROFILE["wsl_voice"],
+            "mac_voice": CUSTODES_PROFILE["mac_voice"],
+            "short_name": CUSTODES_PROFILE["wsl_voice"].replace("Microsoft ", ""),
+            "profile_name": CUSTODES_PROFILE["name"],
+            "fallback": False,
+            "reserved": "custodes",
+        }
+    )
     return {"voices": voices}
 
 

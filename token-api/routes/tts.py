@@ -39,6 +39,7 @@ from shared import (
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
     FALLBACK_VOICES,
+    PERSONA_PROFILES,
     PROFILES,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
@@ -619,7 +620,7 @@ async def dispatch_notify(
                 row = await cursor.fetchone()
             if row and row["tts_voice"]:
                 wsl_voice = row["tts_voice"]
-                for p in PROFILES + FALLBACK_VOICES:
+                for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
                     if p["wsl_voice"] == wsl_voice:
                         voice = p.get("mac_voice", "Daniel")
                         wsl_rate = p.get("wsl_rate", 0)
@@ -932,7 +933,7 @@ async def tts_queue_worker():
                     wsl_voice = tts_current.voice
                     mac_voice = "Daniel"  # default fallback
                     wsl_rate = 0
-                    for p in PROFILES + FALLBACK_VOICES:
+                    for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
                         if p["wsl_voice"] == wsl_voice:
                             mac_voice = p.get("mac_voice", "Daniel")
                             wsl_rate = p.get("wsl_rate", 0)
