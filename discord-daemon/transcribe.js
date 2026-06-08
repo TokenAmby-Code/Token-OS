@@ -50,7 +50,11 @@ export function createTranscriber(config, logger) {
       if (realtime) realtime.closeUser(userId, botName);
     },
     commitUser(userId, botName, meta) {
-      if (realtime) realtime.commitUser(userId, botName, meta);
+      if (realtime) return realtime.commitUser(userId, botName, meta);
+      return false;
+    },
+    dropBot(botName) {
+      return realtime ? realtime.dropBot(botName) : 0;
     },
     closeAll() {
       if (realtime) realtime.closeAll();
