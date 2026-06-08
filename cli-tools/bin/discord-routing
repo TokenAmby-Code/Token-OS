@@ -60,7 +60,10 @@ def get_live_panes():
     """Return set of alive tmux pane IDs."""
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"], capture_output=True, text=True
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             return set(result.stdout.strip().split("\n"))
