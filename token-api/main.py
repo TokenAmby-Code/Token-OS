@@ -178,6 +178,7 @@ from shared import (
     is_local_device,
     is_pid_claude,
     log_event,
+    profile_by_name,
     resolve_device_from_ip,
 )
 from timer import (
@@ -10072,6 +10073,7 @@ async def list_instances(
                     if p["name"] == pn:
                         inst["color"] = p.get("color", "#0099ff")
                         inst["cc_color"] = p.get("cc_color", "default")
+                        inst["chapter"] = p.get("chapter")
                         break
             # Golden Throne: enrich with pending timer state
             gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
@@ -10165,6 +10167,7 @@ async def get_instance(instance_id: str):
                 if p["name"] == profile_name:
                     instance["color"] = p.get("color", "#0099ff")
                     instance["cc_color"] = p.get("cc_color", "default")
+                    instance["chapter"] = p.get("chapter")
                     break
         return instance
 
@@ -16830,12 +16833,19 @@ async def _ops_read_instances(now: datetime) -> dict:
         if staleness["is_stale"]:
             stale_count += 1
         gt_job = scheduler.get_job(f"golden-throne-{inst.get('id')}")
+        _prof = profile_by_name(inst.get("profile_name"))
         active.append(
             {
                 "id": inst.get("id"),
                 "session_id": inst.get("session_id"),
                 "display_name": _ops_display_name(inst),
                 "tab_name": inst.get("tab_name"),
+                # Chapter (40k voice/persona identity), resolved at read-time from
+                # profile_name — same pattern as color/cc_color. chapter_color is the
+                # hex shade for the cockpit chip; cc_color is the named tmux colour.
+                "chapter": _prof.get("chapter") if _prof else None,
+                "chapter_color": _prof.get("color") if _prof else None,
+                "cc_color": _prof.get("cc_color") if _prof else None,
                 "status": status,
                 "engine": engine,
                 "device_id": inst.get("device_id"),

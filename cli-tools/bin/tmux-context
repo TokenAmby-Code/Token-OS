@@ -9,7 +9,7 @@
 4. Nudges agent to plan mode at 250k token threshold (non-blocking)
 5. Enforces valid mode (plan or bypass) — auto-corrects accept-edits/no-mode
 
-Enriches display with Token-API instance data (voice, session doc).
+Enriches display with Token-API instance data (chapter, session doc).
 
 Receives JSON on stdin from Claude Code's status line system.
 Outputs formatted text for Claude Code to display.
@@ -44,6 +44,20 @@ CYAN = "\033[36m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+# Map a profile's named cc_color (the same palette tmux uses on the pane border)
+# to an ANSI escape for the Claude Code status line. default/unknown -> no tint.
+CC_ANSI = {
+    "red": RED,
+    "green": GREEN,
+    "yellow": YELLOW,
+    "cyan": CYAN,
+    "blue": "\033[34m",
+    "purple": "\033[35m",
+    "orange": "\033[38;5;208m",
+    "pink": "\033[38;5;213m",
+    "default": "",
+}
 
 
 def tmux_pane_has_input(pane_id):
@@ -169,15 +183,6 @@ def context_color(pct):
     return GREEN
 
 
-def short_voice(voice_str):
-    """Extract short voice name: 'Microsoft Mark' -> 'Mark'."""
-    if not voice_str:
-        return ""
-    parts = voice_str.split()
-    # Drop 'Microsoft' prefix if present
-    return parts[-1] if len(parts) > 1 and parts[0] == "Microsoft" else voice_str
-
-
 def short_cwd(cwd):
     """Abbreviate CWD: /mnt/imperium/Imperium-ENV -> Imperium-ENV."""
     if not cwd:
@@ -240,6 +245,7 @@ def write_state(pane_id, data, pct, model_name, session_id, instance):
     }
     if instance:
         state["voice"] = instance.get("tts_voice")
+        state["chapter"] = instance.get("chapter")
         state["session_doc_id"] = instance.get("session_doc_id")
         state["tab_name"] = instance.get("tab_name")
         state["instance_id"] = instance.get("id")
@@ -379,7 +385,11 @@ def main():
 
     # Fetch instance data and TTS state from Token-API
     instance = get_instance_by_pane(pane_id)
-    voice = short_voice(instance.get("tts_voice")) if instance else ""
+    # Chapter is the operator-facing identity (40k chapter / persona). Since
+    # chapter<->voice is 1:1, the chapter name implies the voice — we surface the
+    # chapter (coloured by its cc_color) instead of the raw TTS voice short-name.
+    chapter = instance.get("chapter") if instance else ""
+    cc = instance.get("cc_color") if instance else ""
     # Use resolved title if available, fall back to short_session_doc on raw ID
     session_doc = ""
     if instance:
@@ -399,8 +409,13 @@ def main():
     border_parts = [
         f"{model_name} {pct_str} {used_str}/{total_str}",
     ]
-    if voice:
-        border_parts.append(voice)
+    if chapter:
+        # tmux interprets #[...] styles in pane-border-format (see tmux-base.conf);
+        # tint via the named cc_color. default/empty -> no tint (persona panes carry
+        # their identity in the themed pane background already).
+        border_parts.append(
+            f"#[fg={cc}]{chapter}#[default]" if cc and cc != "default" else chapter
+        )
     if session_doc:
         border_parts.append(session_doc)
     if cwd:
@@ -418,10 +433,10 @@ def main():
     color = context_color(pct)
     pct_display = f"{pct}%" if pct is not None else "..."
     cost_str = f" ${cost_usd:.2f}" if cost_usd is not None else ""
-    voice_str = f" {DIM}{voice}{RESET}" if voice else ""
+    chapter_str = f" {CC_ANSI.get(cc, '')}{chapter}{RESET}" if chapter else ""
     doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
 
-    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{voice_str}{doc_str}")
+    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{chapter_str}{doc_str}")
 
     # --- 5. Enforce bypass mode (auto-correct accept-edits/no-mode) ---
     enforce_bypass_mode(pane_id)

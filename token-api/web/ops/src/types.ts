@@ -44,6 +44,8 @@ export type OpsInstance = {
   age_minutes: number | null;
   is_subagent: boolean;
   legion: string | null;
+  chapter: string | null; // 40k chapter / persona display name (implies the voice)
+  chapter_color: string | null; // hex shade for the chip tint
   instance_type: string | null;
   pr_url: string | null;
   pr_state: string | null; // "open" | "merged" | null

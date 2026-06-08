@@ -46,6 +46,23 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`pill pill--${statusTone(status)}`}>{status}</span>;
 }
 
+// 40k chapter / persona identity, tinted by its canonical hex shade. The chapter
+// name implies the voice (chapter<->voice is 1:1), so this replaces any raw voice
+// surface. null (e.g. a legacy pre-rename profile_name) renders a muted dash.
+function ChapterChip({ inst }: { inst: OpsInstance }) {
+  if (!inst.chapter) return <span className="faint">—</span>;
+  return (
+    <span
+      className="chapter-chip"
+      style={{ '--chip': inst.chapter_color ?? 'var(--muted)' } as React.CSSProperties}
+      title={inst.chapter}
+    >
+      <span className="chapter-chip__dot" />
+      {inst.chapter}
+    </span>
+  );
+}
+
 // "Agent has a PR open" badge (Phase 1). Links to the PR when open; shows a muted
 // state once the CD webhook flips pr_state→merged (Phase 2). Renders nothing otherwise.
 function PrBadge({ inst }: { inst: OpsInstance }) {
@@ -74,6 +91,7 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
           <thead>
             <tr>
               <th>Instance</th>
+              <th>Chapter</th>
               <th>Status</th>
               <th>Age</th>
               <th>Fervor</th>
@@ -90,6 +108,7 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
                   <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
                   <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
                 </td>
+                <td><ChapterChip inst={inst} /></td>
                 <td><StatusPill status={inst.status} /></td>
                 <td className="num">
                   {formatAge(inst.age_seconds)}
@@ -119,6 +138,7 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
             </header>
             <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
             <div className="fcard__grid">
+              <div><span className="k">chapter</span><ChapterChip inst={inst} /></div>
               <div><span className="k">age</span>{formatAge(inst.age_seconds)}{inst.stale.is_stale ? ' · stale' : ''}</div>
               <div><span className="k">fervor</span><Zealotry value={inst.zealotry} /></div>
               <div><span className="k">pane</span>{inst.pane_label ?? inst.tmux_pane ?? '—'}</div>

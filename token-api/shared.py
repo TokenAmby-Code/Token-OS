@@ -293,6 +293,7 @@ def get_quiet_hours_status(now: datetime | None = None) -> dict:
 PROFILES = [
     {
         "name": "blood-angels",
+        "chapter": "Blood Angels",
         "wsl_voice": "Microsoft Ravi",
         "wsl_rate": 1,
         "mac_voice": "Rishi",
@@ -302,6 +303,7 @@ PROFILES = [
     },  # IN M
     {
         "name": "ultramarines",
+        "chapter": "Ultramarines",
         "wsl_voice": "Microsoft Susan",
         "wsl_rate": 1,
         "mac_voice": "Karen",
@@ -311,6 +313,7 @@ PROFILES = [
     },  # UK F
     {
         "name": "salamanders",
+        "chapter": "Salamanders",
         "wsl_voice": "Microsoft Sean",
         "wsl_rate": 0,
         "mac_voice": "Moira",
@@ -320,6 +323,7 @@ PROFILES = [
     },  # IE M
     {
         "name": "imperial-fists",
+        "chapter": "Imperial Fists",
         "wsl_voice": "Microsoft Catherine",
         "wsl_rate": 1,
         "mac_voice": "Karen",
@@ -329,6 +333,7 @@ PROFILES = [
     },  # AU F
     {
         "name": "emperors-children",
+        "chapter": "Emperor's Children",
         "wsl_voice": "Microsoft Heera",
         "wsl_rate": 1,
         "mac_voice": "Rishi",
@@ -342,6 +347,7 @@ PROFILES = [
 FALLBACK_VOICES = [
     {
         "name": "soul-drinkers",
+        "chapter": "Soul Drinkers",
         "wsl_voice": "Microsoft David",
         "wsl_rate": 1,
         "mac_voice": "Daniel",
@@ -351,6 +357,7 @@ FALLBACK_VOICES = [
     },  # US M
     {
         "name": "legion-of-the-damned",
+        "chapter": "Legion of the Damned",
         "wsl_voice": "Microsoft Zira",
         "wsl_rate": 1,
         "mac_voice": "Karen",
@@ -360,6 +367,7 @@ FALLBACK_VOICES = [
     },  # US F
     {
         "name": "alpha-legion",
+        "chapter": "Alpha Legion",
         "wsl_voice": "Microsoft Mark",
         "wsl_rate": 1,
         "mac_voice": "Daniel",
@@ -373,6 +381,7 @@ FALLBACK_VOICES = [
 # kill-team that appears only when there is nothing left to assign.
 ULTIMATE_FALLBACK = {
     "name": "deathwatch",
+    "chapter": "Deathwatch",
     "wsl_voice": "Microsoft David",
     "wsl_rate": 1,
     "mac_voice": "Daniel",
@@ -396,6 +405,7 @@ ULTIMATE_FALLBACK = {
 # (wsl_voice=None) so it never TTSes and never consumes a chapter voice slot.
 CUSTODES_PROFILE = {
     "name": "custodes",
+    "chapter": "Custodes",
     "wsl_voice": "Microsoft George",
     "wsl_rate": 2,
     "mac_voice": "Daniel",
@@ -411,10 +421,13 @@ def persona_profile_for(name: str, *, color: str = "#302800") -> dict:
     Voiceless personas (FG, Administratum, any future non-speaking persona) hold
     NO voice (wsl_voice=None) and take cc_color="default" — their tmux-painted
     background is their signature, so no foreground /color is queued. `color` is a
-    UI-widget hue only (defaults to the dark-gold persona shade).
+    UI-widget hue only (defaults to the dark-gold persona shade). The display
+    ``chapter`` is derived from the slug (``fabricator-general`` -> ``Fabricator
+    General``) so any future persona resolves a sensible operator-facing name.
     """
     return {
         "name": name,
+        "chapter": name.replace("-", " ").title(),
         "wsl_voice": None,
         "wsl_rate": None,
         "mac_voice": None,
@@ -445,6 +458,18 @@ def resolve_persona_profile(primarch: str | None, legion: str | None = None) -> 
         if p["name"] == name:
             return p
     return persona_profile_for(name)
+
+
+def profile_by_name(profile_name: str | None) -> dict | None:
+    """Resolve a stored ``profile_name`` (chapter slug or persona slug) to its
+    profile dict, or ``None`` if it matches nothing (e.g. a legacy pre-rename
+    name). Centralises the chapter/persona lookup the instance APIs do ad hoc."""
+    if not profile_name:
+        return None
+    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
+        if p["name"] == profile_name:
+            return p
+    return None
 
 
 def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:

@@ -530,6 +530,22 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
 .tag--pr-open:hover { background: rgba(88, 196, 99, 0.2); }
 .tag--pr-merged { color: #a779e0; border: 1px solid rgba(167, 121, 224, 0.45); background: rgba(167, 121, 224, 0.08); }
 
+/* chapter / persona identity chip — tinted by its canonical hex (--chip set inline) */
+.chapter-chip {
+  --chip: var(--line-bright);
+
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px; font-size: 11px; white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--chip) 55%, transparent);
+  background: color-mix(in srgb, var(--chip) 12%, var(--surface-2));
+  color: color-mix(in srgb, var(--chip) 65%, var(--text));
+}
+.chapter-chip__dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--chip);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--chip) 60%, transparent);
+}
+
 /* zealotry pips */
 .zeal { display: inline-flex; gap: 3px; align-items: center; }
 .zeal__pip { width: 7px; height: 12px; border-radius: 2px; background: var(--surface-3); border: 1px solid var(--line-bright); }
