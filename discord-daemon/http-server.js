@@ -477,8 +477,16 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
       json(res, { error: 'Not found' }, 404);
 
     } catch (err) {
-      logger.error(`HTTP error on ${method} ${path}: ${err.message}`);
-      json(res, { error: err.message }, 500);
+      const message = err?.message || String(err);
+      if (method === 'POST' && path === '/voice/tts' && message.includes('not connected to a voice channel')) {
+        // Expected when a caller asks for voice feedback after the operator has
+        // left Discord voice or before auto-join. This is a routing miss for the
+        // caller, not a daemon fault; do not page the Fixer via ERROR logging.
+        logger.warn(`HTTP voice/tts unavailable: ${message}`);
+        return json(res, { error: message, played: false, connected: false }, 409);
+      }
+      logger.error(`HTTP error on ${method} ${path}: ${message}`);
+      json(res, { error: message }, 500);
     }
   });
 

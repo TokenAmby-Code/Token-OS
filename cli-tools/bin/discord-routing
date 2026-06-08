@@ -16,6 +16,8 @@ Usage:
     discord-routing -h, --help   # Show help
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -82,6 +84,7 @@ def get_custodes_marked_pane() -> str | None:
         )
         if result.returncode != 0:
             return None
+        marker_fallbacks = []
         for line in result.stdout.strip().split("\n"):
             parts = line.split("\t")
             if len(parts) < 3:
@@ -89,9 +92,15 @@ def get_custodes_marked_pane() -> str | None:
             pane_id, marker, cmd = parts[0], parts[1], parts[2]
             if marker != "legion:custodes":
                 continue
+            marker_fallbacks.append(pane_id)
             cmd_is_claude = "claude" in cmd.lower() or (cmd[:1].isdigit() and "." in cmd)
             if cmd_is_claude:
                 return pane_id
+        # The marker is the singleton identity. tmux can report the wrapper
+        # shell (bash/zsh/node) while the TUI is live, so current_command is only
+        # a preference, not a hard gate.
+        if marker_fallbacks:
+            return marker_fallbacks[0]
     except Exception:
         pass
     return None
