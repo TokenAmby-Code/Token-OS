@@ -14,13 +14,14 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def gt(app_env, monkeypatch):
+def gt(app_env, monkeypatch) -> SimpleNamespace:
     main = app_env.main
     # Deterministic + hermetic: never defer on real quiet-hours, and resolve no
     # live pane (so schedule's @GT_FIRE push no-ops without a tmux server).
@@ -68,11 +69,10 @@ async def test_sweep_recovery_rearms_lost_gt_timer(gt, tmp_path):
     iid = _insert_gt(gt.db_path, doc_path=doc, status="idle")
     job_id = f"golden-throne-{iid}"
 
-    # Simulate a restart that dropped the in-memory timer.
-    try:
+    # Simulate a restart that dropped the in-memory timer. Idempotent + narrow:
+    # only remove when present, so no broad except masks an unexpected error.
+    if main.scheduler.get_job(job_id) is not None:
         main.scheduler.remove_job(job_id)
-    except Exception:
-        pass
     assert main.scheduler.get_job(job_id) is None
 
     # The sweep's underlying recovery re-arms it.
