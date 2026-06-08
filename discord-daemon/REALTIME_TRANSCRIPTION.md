@@ -34,9 +34,23 @@ There is no legacy bridge, local WAV conversion, or local audio-file retry path 
 
 ## Voice Draft Lifecycle
 
-The daemon is transport only: every completed realtime transcript is forwarded to Token API with the bot/user metadata and, for Imperial Guard, the daemon-supplied `target_tmux_pane`. There is no short-fragment debounce, false-positive drop list, pooling, or daemon-side auto-submit.
+The daemon owns voice delivery directly. Every completed realtime transcript is
+routed to tmux without consulting Token API or `claude_instances`:
 
-Token API owns the visible draft lifecycle:
+- `custodes` routes by the stable tmuxctl public target `3:0`
+  (`legion:custodes`) and resolves physical `%pane` only at send time;
+- `mechanicus` routes by the stable tmuxctl public target `4:0`
+  (`mechanicus:fabricator-general`) and resolves physical `%pane` only at send
+  time;
+- `imperial_guard` captures the active pane at speech start (Cadia-style active
+  pane routing), converts it to a tmuxctl public target when possible, and
+  resolves physical `%pane` only at send time.
+
+Token API may still audit normal Discord messages and expose higher-level state,
+but it is not in the critical path for voice transcript delivery. Stale DB rows
+must not make a stable persona pane disappear.
+
+The daemon owns the visible draft lifecycle:
 
 - first non-command utterance creates one draft lock for `(bot_name, author_id)` and types into the target pane without Enter;
 - later non-command utterances append to that same locked pane;
@@ -65,7 +79,7 @@ From the realtime log sample (`n=8`):
 
 - Requires `OPENAI_API_KEY` or `openai_api_key` in Discord config.
 - This is transcription-only, not a full speech-to-speech Realtime agent.
-- Short standalone utterances are forwarded losslessly to Token API; draft lifecycle command handling decides whether they become text or control actions.
+- Short standalone utterances are routed losslessly to the daemon draft lifecycle; command handling decides whether they become text or control actions.
 
 
 ## Latency Defaults

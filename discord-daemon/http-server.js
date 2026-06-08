@@ -3,7 +3,14 @@
 
 import { createServer } from 'http';
 
-export function createHttpServer(botClients, messageStore, config, logger, voiceManager = null) {
+export function createHttpServer(
+  botClients,
+  messageStore,
+  config,
+  logger,
+  voiceManager = null,
+  voiceTranscriptRouter = null,
+) {
   // botClients: { mechanicus: client, custodes: client, ... } OR a single client object (legacy)
   // Normalize to a clients map
   const clients = (botClients && typeof botClients.sendMessage === 'function')
@@ -428,6 +435,24 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
         return json(res, voiceManager.getStatus(query.bot));
       }
 
+      // GET /voice/drafts — inspect daemon-local voice draft locks
+      if (method === 'GET' && path === '/voice/drafts') {
+        if (!voiceTranscriptRouter) return json(res, { count: 0, drafts: [] });
+        const drafts = voiceTranscriptRouter.listDrafts();
+        return json(res, { count: drafts.length, drafts });
+      }
+
+      // POST /voice/drafts/clear — clear daemon-local voice draft locks
+      if (method === 'POST' && path === '/voice/drafts/clear') {
+        if (!voiceTranscriptRouter) return json(res, { cleared: 0, drafts: [] });
+        const body = await parseBody(req);
+        const cleared = await voiceTranscriptRouter.clear({
+          bot: body.bot_name || body.bot,
+          userId: body.author_id || body.user_id,
+        });
+        return json(res, { cleared: cleared.length, drafts: cleared });
+      }
+
       // POST /voice/play — Play an audio file in voice channel
       if (method === 'POST' && path === '/voice/play') {
         if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
@@ -477,8 +502,16 @@ export function createHttpServer(botClients, messageStore, config, logger, voice
       json(res, { error: 'Not found' }, 404);
 
     } catch (err) {
-      logger.error(`HTTP error on ${method} ${path}: ${err.message}`);
-      json(res, { error: err.message }, 500);
+      const message = err?.message || String(err);
+      if (method === 'POST' && path === '/voice/tts' && message.includes('not connected to a voice channel')) {
+        // Expected when a caller asks for voice feedback after the operator has
+        // left Discord voice or before auto-join. This is a routing miss for the
+        // caller, not a daemon fault; do not page the Fixer via ERROR logging.
+        logger.warn(`HTTP voice/tts unavailable: ${message}`);
+        return json(res, { error: message, played: false, connected: false }, 409);
+      }
+      logger.error(`HTTP error on ${method} ${path}: ${message}`);
+      json(res, { error: message }, 500);
     }
   });
 

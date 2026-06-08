@@ -1,0 +1,333 @@
+// voice-transcript-router.js — route Discord voice transcripts directly to tmux.
+//
+// The routing source of truth for persona panes is tmux, not Token API:
+//   custodes       -> tmuxctl public target 3:0 (legion:custodes)
+//   mechanicus     -> tmuxctl public target 4:0 (mechanicus:fabricator-general)
+//   imperial_guard -> daemon-locked live pane converted to a tmuxctl public target
+//
+// Token API may audit/control higher-level state, but voice delivery must not
+// fail because a DB row is stale.
+
+import { execFile, execFileSync } from 'child_process';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const BASE_DIR = join(__dirname, '..');
+const CLI_DIR = join(BASE_DIR, 'cli-tools', 'bin');
+const TMUXCTL = join(CLI_DIR, 'tmuxctl');
+const TMUX_DICTATE = join(CLI_DIR, 'tmux-dictate');
+const BOT_TARGETS = {
+  // Public tmuxctl aliases in the static DMUX layout. tmuxctl resolves these
+  // to the underlying role labels and finally to a physical %pane at send time.
+  custodes: '3:0',
+  mechanicus: '4:0',
+};
+
+export function defaultVoiceTargetForBot(botName) {
+  return BOT_TARGETS[normalizeBot(botName)] || null;
+}
+
+const TITLE_PREFIX = {
+  imperial_guard: 'IG🔒',
+  mechanicus: 'MECH🔒',
+  custodes: 'CUST🔒',
+};
+
+function execFileAsync(file, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, opts, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+function tmuxEnv(extra = {}) {
+  return {
+    ...process.env,
+    PATH: [CLI_DIR, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || ''].join(':'),
+    ...extra,
+  };
+}
+
+function normalizeBot(botName) {
+  return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');
+}
+
+export function normalizeVoiceCommand(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function parseVoiceCommand(text) {
+  let normalized = normalizeVoiceCommand(text);
+  if (normalized.startsWith('command ')) normalized = normalized.slice('command '.length).trim();
+
+  const commands = [
+    ['scratch that', 'scratch'],
+    ['reset target', 'clear'],
+    ['clear target', 'clear'],
+    ['clear lock', 'clear'],
+    ['ship it', 'ship'],
+    ['scratch', 'scratch'],
+    ['retarget', 'clear'],
+    ['unlock', 'clear'],
+    ['unmute', 'unmute'],
+    ['ship', 'ship'],
+    ['mute', 'mute'],
+  ];
+
+  for (const [phrase, command] of commands) {
+    if (normalized === phrase) return { command, draftText: '' };
+    const suffix = ` ${phrase}`;
+    if (normalized.endsWith(suffix)) {
+      const words = String(text || '').trim().split(/\s+/);
+      return { command, draftText: words.slice(0, -phrase.split(' ').length).join(' ').trim() };
+    }
+  }
+  return { command: null, draftText: String(text || '').trim() };
+}
+
+function paneExists(pane) {
+  if (!pane || !String(pane).startsWith('%')) return false;
+  try {
+    execFileSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveTargetToPane(target) {
+  try {
+    const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'physical', target], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: tmuxEnv(),
+    }).trim();
+    if (out.startsWith('%') && paneExists(out)) return out;
+  } catch {
+    // caller logs context
+  }
+  return null;
+}
+
+function publicTargetForPane(pane) {
+  try {
+    const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'id', pane], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: tmuxEnv(),
+    }).trim();
+    return out || pane;
+  } catch {
+    return pane;
+  }
+}
+
+function displayValue(target, format) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) return '';
+  try {
+    return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
+      encoding: 'utf8',
+      timeout: 3000,
+      env: tmuxEnv(),
+    }).replace(/\n$/, '');
+  } catch {
+    return '';
+  }
+}
+
+async function setPaneTitle(target, title) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) return;
+  try {
+    await execFileAsync('tmux', ['select-pane', '-t', pane, '-T', title || ''], {
+      timeout: 3000,
+      env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-title' }),
+    });
+  } catch {
+    // title restore is cosmetic
+  }
+}
+
+async function typeIntoTarget(target, text, { bypassGuard = false } = {}) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) throw new Error(`target not live: ${target}`);
+  await execFileAsync(TMUX_DICTATE, ['-t', pane, text], {
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+    env: tmuxEnv(bypassGuard ? { TMUX_GUARD_SKIP: '1' } : {}),
+  });
+}
+
+async function sendKey(target, key) {
+  const pane = resolveTargetToPane(target);
+  if (!pane) throw new Error(`target not live: ${target}`);
+  await execFileAsync('tmux', ['send-keys', '-t', pane, key], {
+    timeout: 5000,
+    env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-command' }),
+  });
+}
+
+function resolveInitialTarget(bot, result) {
+  if (bot === 'imperial_guard') {
+    const pane = result.lockedTmuxPane || result.commitMeta?.lockedTmuxPane || null;
+    return paneExists(pane) ? publicTargetForPane(pane) : null;
+  }
+  const target = defaultVoiceTargetForBot(bot);
+  if (!target) return null;
+  return resolveTargetToPane(target) ? target : null;
+}
+
+function summarize(key, state) {
+  return {
+    bot_name: key.bot,
+    author_id: key.userId,
+    target: state.target,
+    pane: resolveTargetToPane(state.target),
+    created_at: state.createdAt,
+    utterances: state.utterances || 0,
+    pane_alive: !!resolveTargetToPane(state.target),
+  };
+}
+
+export function createVoiceTranscriptRouter({ logger, voiceManager = null } = {}) {
+  const drafts = new Map();
+
+  function keyFor(result) {
+    return {
+      bot: normalizeBot(result.botName || 'voice'),
+      userId: String(result.userId || 'unknown'),
+      value: `${normalizeBot(result.botName || 'voice')}:${String(result.userId || 'unknown')}`,
+    };
+  }
+
+  async function restoreTitle(state) {
+    if (state?.target && resolveTargetToPane(state.target)) await setPaneTitle(state.target, state.title || '');
+  }
+
+  async function clearDraft(key) {
+    const state = drafts.get(key.value);
+    if (!state) return null;
+    drafts.delete(key.value);
+    await restoreTitle(state);
+    return summarize(key, state);
+  }
+
+  async function route(result) {
+    const key = keyFor(result);
+    const text = String(result.text || '').trim();
+    const parsed = parseVoiceCommand(text);
+    let state = drafts.get(key.value);
+
+    if (state && !resolveTargetToPane(state.target)) {
+      drafts.delete(key.value);
+      logger?.warn?.(`Voice route [${key.bot}/${key.userId}]: locked pane died; cleared draft`);
+      state = null;
+    }
+
+    if (parsed.command === 'clear') {
+      const cleared = await clearDraft(key);
+      logger?.info?.(`Voice route [${key.bot}/${key.userId}]: lock clear (${cleared ? 'cleared' : 'none'})`);
+      return { routed: true, command: 'clear', cleared: !!cleared };
+    }
+
+    if (parsed.command === 'scratch') {
+      if (!state) return { routed: false, command: 'scratch', reason: 'no_draft' };
+      await sendKey(state.target, 'C-c');
+      await clearDraft(key);
+      logger?.info?.(`Voice route [${key.bot}/${key.userId}]: scratched ${state.target}`);
+      return { routed: true, command: 'scratch', target: state.target, pane: resolveTargetToPane(state.target) };
+    }
+
+    if (parsed.command === 'mute') {
+      if (parsed.draftText && state) {
+        const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
+        await typeIntoTarget(state.target, segment, { bypassGuard: true });
+        state.utterances = (state.utterances || 0) + 1;
+      }
+      const muted = voiceManager?.muteMember
+        ? await voiceManager.muteMember(key.userId, key.bot, 15_000).then(r => !!r?.muted).catch(() => false)
+        : false;
+      return { routed: muted, command: 'mute', muted, temporary: true, duration_ms: 15000 };
+    }
+
+    if (parsed.command === 'unmute') {
+      const unmuted = voiceManager?.unmuteMember
+        ? await voiceManager.unmuteMember(key.userId, key.bot).then(r => !!r?.unmuted).catch(() => false)
+        : false;
+      return { routed: unmuted, command: 'unmute', unmuted };
+    }
+
+    if (parsed.command === 'ship') {
+      if (!state) return { routed: false, command: 'ship', reason: 'no_draft' };
+      if (parsed.draftText) {
+        const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
+        await typeIntoTarget(state.target, segment, { bypassGuard: true });
+        state.utterances = (state.utterances || 0) + 1;
+      }
+      await sendKey(state.target, 'Enter');
+      await clearDraft(key);
+      logger?.info?.(`Voice route [${key.bot}/${key.userId}]: shipped ${state.target}`);
+      return { routed: true, command: 'ship', target: state.target, pane: resolveTargetToPane(state.target) };
+    }
+
+    if (!parsed.draftText) return { routed: false, reason: 'empty' };
+
+    if (!state) {
+      const target = resolveInitialTarget(key.bot, result);
+      const pane = target ? resolveTargetToPane(target) : null;
+      if (!target || !pane) {
+        logger?.warn?.(`Voice route [${key.bot}/${key.userId}]: no target pane`);
+        return { routed: false, reason: 'no_target' };
+      }
+      const oldTitle = displayValue(target, '#{pane_title}');
+      const prefix = TITLE_PREFIX[key.bot] || `${key.bot.toUpperCase().slice(0, 4)}🔒`;
+      if (!oldTitle.startsWith(prefix)) await setPaneTitle(target, `${prefix} ${oldTitle}`.trim());
+      state = { target, title: oldTitle, createdAt: new Date().toISOString(), utterances: 0 };
+      drafts.set(key.value, state);
+      logger?.info?.(`Voice route [${key.bot}/${key.userId}]: locked ${target} (${pane})`);
+    }
+
+    const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
+    await typeIntoTarget(state.target, segment, { bypassGuard: state.utterances > 0 });
+    state.utterances = (state.utterances || 0) + 1;
+    return { routed: true, drafting: true, target: state.target, pane: resolveTargetToPane(state.target) };
+  }
+
+  return {
+    route,
+    listDrafts() {
+      return [...drafts.entries()].map(([value, state]) => {
+        const [bot, userId] = value.split(':', 2);
+        return summarize({ bot, userId, value }, state);
+      });
+    },
+    async clear(filter = {}) {
+      const cleared = [];
+      for (const value of [...drafts.keys()]) {
+        const [bot, userId] = value.split(':', 2);
+        if (filter.bot && filter.bot !== bot) continue;
+        if (filter.userId && filter.userId !== userId) continue;
+        const item = await clearDraft({ bot, userId, value });
+        if (item) cleared.push(item);
+      }
+      return cleared;
+    },
+  };
+}
