@@ -24,6 +24,13 @@ const BOT_TARGETS = {
   mechanicus: '4:0',
 };
 
+const TARGET_MARKER_FALLBACKS = {
+  '3:0': 'legion:custodes',
+  'legion:custodes': 'legion:custodes',
+  '4:0': 'mechanicus:fabricator-general',
+  'mechanicus:fabricator-general': 'mechanicus:fabricator-general',
+};
+
 export function defaultVoiceTargetForBot(botName) {
   return BOT_TARGETS[normalizeBot(botName)] || null;
 }
@@ -111,18 +118,46 @@ function paneExists(pane) {
   }
 }
 
-function resolveTargetToPane(target) {
+function markerFallbackPane(target) {
+  const marker = TARGET_MARKER_FALLBACKS[String(target || '')];
+  if (!marker) return null;
   try {
-    const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'physical', target], {
+    const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{@PANE_ID}'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const [pane, paneMarker] = line.split('\t', 2);
+      if (pane?.startsWith('%') && paneMarker === marker && paneExists(pane)) return pane;
+    }
+  } catch {
+    // caller logs context
+  }
+  return null;
+}
+
+function resolveTargetToPane(target) {
+  const raw = String(target || '').trim();
+  if (!raw) return null;
+
+  // Physical %pane targets are already fully resolved. Do not ask tmuxctl to
+  // reverse-resolve them first: stale tombstones can make a live marked pane
+  // such as legion:custodes look absent even while %9 exists.
+  if (raw.startsWith('%') && paneExists(raw)) return raw;
+
+  try {
+    const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'physical', raw], {
       encoding: 'utf8',
       timeout: 5000,
       env: tmuxEnv(),
     }).trim();
     if (out.startsWith('%') && paneExists(out)) return out;
   } catch {
-    // caller logs context
+    // Fall through to marker fallback.
   }
-  return null;
+
+  return markerFallbackPane(raw);
 }
 
 function publicTargetForPane(pane) {
@@ -184,14 +219,22 @@ async function sendKey(target, key) {
   });
 }
 
+function lockedPaneTarget(result) {
+  const pane = result.lockedTmuxPane || result.commitMeta?.lockedTmuxPane || null;
+  return paneExists(pane) ? publicTargetForPane(pane) : null;
+}
+
 function resolveInitialTarget(bot, result) {
-  if (bot === 'imperial_guard') {
-    const pane = result.lockedTmuxPane || result.commitMeta?.lockedTmuxPane || null;
-    return paneExists(pane) ? publicTargetForPane(pane) : null;
-  }
+  if (bot === 'imperial_guard') return lockedPaneTarget(result);
+
   const target = defaultVoiceTargetForBot(bot);
-  if (!target) return null;
-  return resolveTargetToPane(target) ? target : null;
+  if (target && resolveTargetToPane(target)) return target;
+
+  // Persona routes prefer stable tmuxctl targets, but if the static alias is
+  // missing/stale, use the pane locked at speech start instead of silently
+  // dropping the transcript. This preserves Terra/Cadia live behavior while the
+  // static layout heals.
+  return lockedPaneTarget(result);
 }
 
 function summarize(key, state) {
@@ -305,7 +348,18 @@ export function createVoiceTranscriptRouter({ logger, voiceManager = null } = {}
     }
 
     const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
-    await typeIntoTarget(state.target, segment, { bypassGuard: state.utterances > 0 });
+    try {
+      // Discord voice is already explicit human dictation into the locked pane.
+      // The generic tmux typing guard has false positives on Claude/Codex panes
+      // and previously caused silent drops; bypass it for all voice draft text.
+      await typeIntoTarget(state.target, segment, { bypassGuard: true });
+    } catch (err) {
+      if ((state.utterances || 0) === 0) {
+        drafts.delete(key.value);
+        await restoreTitle(state);
+      }
+      throw err;
+    }
     state.utterances = (state.utterances || 0) + 1;
     return { routed: true, drafting: true, target: state.target, pane: resolveTargetToPane(state.target) };
   }

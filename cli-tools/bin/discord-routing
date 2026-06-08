@@ -69,8 +69,30 @@ def get_live_panes():
     return set()
 
 
+def get_marker_physical_pane(marker: str) -> str | None:
+    """Resolve a live pane by its @PANE_ID marker."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{@PANE_ID}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0].startswith("%") and parts[1] == marker:
+                return parts[0]
+    except Exception:
+        pass
+    return None
+
+
 def get_tmuxctl_physical_pane(target: str) -> str | None:
     """Resolve a public tmuxctl target to the current physical %pane."""
+    if target.startswith("%") and target in get_live_panes():
+        return target
     try:
         result = subprocess.run(
             ["tmuxctl", "resolve-pane", "--format", "physical", target],
@@ -83,7 +105,15 @@ def get_tmuxctl_physical_pane(target: str) -> str | None:
             return pane
     except Exception:
         pass
-    return None
+
+    marker_fallbacks = {
+        "3:0": "legion:custodes",
+        "legion:custodes": "legion:custodes",
+        "4:0": "mechanicus:fabricator-general",
+        "mechanicus:fabricator-general": "mechanicus:fabricator-general",
+    }
+    marker = marker_fallbacks.get(target)
+    return get_marker_physical_pane(marker) if marker else None
 
 
 def check_api_reachable():

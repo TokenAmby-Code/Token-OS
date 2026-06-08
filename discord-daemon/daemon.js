@@ -297,8 +297,17 @@ async function main() {
     try {
       const routed = await voiceTranscriptRouter.route(result);
       logger.info(`Transcription [${botLabel}]: tmux route ${JSON.stringify(routed)}`);
+      if (routed && routed.routed === false && routed.reason) {
+        try {
+          await voiceManager.playTTS(`Voice route failed: ${routed.reason}`, botLabel);
+        } catch {}
+      }
     } catch (err) {
-      logger.warn(`Transcription [${botLabel}]: tmux route failed: ${err.message}`);
+      const message = err?.message || String(err);
+      logger.warn(`Transcription [${botLabel}]: tmux route failed: ${message}`);
+      try {
+        await voiceManager.playTTS('Voice route failed. Check Discord daemon logs.', botLabel);
+      } catch {}
     }
   });
 
