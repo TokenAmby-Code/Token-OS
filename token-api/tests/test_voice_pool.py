@@ -13,6 +13,7 @@ ULTIMATE_FALLBACK = {}
 CUSTODES_PROFILE = {}
 PERSONA_PROFILES = []
 get_next_available_profile = None
+profile_by_name = None
 DB_PATH = None
 
 # The valid argument set for Claude Code's /color command. Every profile's
@@ -33,7 +34,7 @@ VALID_CC_COLORS = {
 @pytest.fixture(autouse=True)
 def _bind_main_exports(app_env):
     global PROFILES, FALLBACK_VOICES, ULTIMATE_FALLBACK, CUSTODES_PROFILE, PERSONA_PROFILES
-    global get_next_available_profile, DB_PATH
+    global get_next_available_profile, profile_by_name, DB_PATH
     PROFILES = app_env.main.PROFILES
     FALLBACK_VOICES = app_env.main.FALLBACK_VOICES
     ULTIMATE_FALLBACK = app_env.main.ULTIMATE_FALLBACK
@@ -42,6 +43,7 @@ def _bind_main_exports(app_env):
     CUSTODES_PROFILE = app_env.shared.CUSTODES_PROFILE
     PERSONA_PROFILES = app_env.shared.PERSONA_PROFILES
     get_next_available_profile = app_env.main.get_next_available_profile
+    profile_by_name = app_env.shared.profile_by_name
     DB_PATH = app_env.main.DB_PATH
 
 
@@ -194,6 +196,27 @@ class TestChapterRosterInvariants:
         voiced = [p for p in PERSONA_PROFILES if p["wsl_voice"]]
         assert [p["name"] for p in voiced] == ["custodes"]
         assert all(p["wsl_voice"] is None for p in PERSONA_PROFILES if p["name"] != "custodes")
+
+    def test_every_slot_has_a_chapter_display_name(self):
+        """Every chapter/persona slot exposes a non-empty human chapter name — the
+        operator-facing identity that replaces the raw TTS voice on the pane + ops."""
+        all_slots = [*PROFILES, *FALLBACK_VOICES, ULTIMATE_FALLBACK, *PERSONA_PROFILES]
+        for slot in all_slots:
+            assert slot.get("chapter"), f"{slot['name']} missing chapter display name"
+        # Explicit strings (not title-cased slugs) where casing would be wrong.
+        by_name = {s["name"]: s["chapter"] for s in all_slots}
+        assert by_name["emperors-children"] == "Emperor's Children"
+        assert by_name["legion-of-the-damned"] == "Legion of the Damned"
+
+    def test_profile_by_name_round_trips(self):
+        """profile_by_name resolves every slug back to its exact dict; empty and
+        unknown (legacy pre-rename) names resolve to None."""
+        all_slots = [*PROFILES, *FALLBACK_VOICES, ULTIMATE_FALLBACK, *PERSONA_PROFILES]
+        for slot in all_slots:
+            assert profile_by_name(slot["name"]) is slot
+        assert profile_by_name(None) is None
+        assert profile_by_name("") is None
+        assert profile_by_name("profile_3") is None  # legacy pre-rename name
 
 
 # ============ Integration tests via API ============
