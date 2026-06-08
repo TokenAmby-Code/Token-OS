@@ -291,6 +291,37 @@ _cd_sync_pop_mine() {
     git -C "$dir" stash pop "$ref" >/dev/null 2>&1
 }
 
+_cd_sync_ff_with_retry() {
+    # Fast-forward $1 to FETCH_HEAD (ff-only). SMB EBUSY unlink locks make git exit
+    # non-zero for a TRANSIENT reason that looks identical to a real non-ff; retry those
+    # with bounded backoff before giving up. On success: return 0. On a genuine
+    # non-ff/conflict, or after retries exhaust: stash the real stderr in
+    # CD_SYNC_MERGE_ERR and return 1 (caller surfaces it + aborts the sync).
+    local dir="$1" attempt=1 max=3 merge_err=""
+    while (( attempt <= max )); do
+        # 2>&1 >/dev/null  → capture ONLY stderr (stdout→/dev/null, stderr→the capture).
+        # Capture INSIDE the `if` so set -e does not abort on a non-zero merge.
+        if merge_err="$(git -C "$dir" merge --ff-only FETCH_HEAD 2>&1 >/dev/null)"; then
+            return 0
+        fi
+        case "$merge_err" in
+            *"Resource busy"*|*"unable to unlink"*|*"Device or resource busy"*|*"os error 66"*)
+                if (( attempt < max )); then
+                    echo -e "  ${YELLOW}→${NC} CD-sync: ff blocked by transient SMB lock (attempt ${attempt}/${max}), retrying…"
+                    sleep 2
+                    attempt=$(( attempt + 1 ))     # assignment, not (( ++ )) — safe under set -e
+                    continue
+                fi
+                ;;
+        esac
+        # Genuine non-ff/conflict, OR transient but retries exhausted.
+        CD_SYNC_MERGE_ERR="$merge_err"
+        return 1
+    done
+    CD_SYNC_MERGE_ERR="$merge_err"
+    return 1
+}
+
 sync_live_checkout() {
     local dir
     dir="$(resolve_live_checkout)" || {
@@ -331,10 +362,11 @@ sync_live_checkout() {
         fi
     fi
 
-    # Fast-forward ONLY. Never reset --hard, never force.
-    if ! git -C "$dir" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
-        echo -e "  ${RED}✗${NC} CD-sync: NOT a fast-forward (or merge refused) — ABORTING sync"
-        # HEAD is untouched; just restore our WIP, then restart on current code.
+    # Fast-forward ONLY. Never reset --hard, never force. Retry transient SMB unlink
+    # locks (EBUSY) before treating a non-zero merge as a real non-ff.
+    if ! _cd_sync_ff_with_retry "$dir"; then
+        echo -e "  ${RED}✗${NC} CD-sync: ff-merge failed (not a fast-forward, or merge refused) — ABORTING sync: ${CD_SYNC_MERGE_ERR}"
+        # HEAD is untouched; restore our WIP, then restart on current code.
         if [[ -n "$my_stash" ]]; then
             _cd_sync_pop_mine "$dir" "$my_stash" \
                 || echo -e "  ${RED}✗${NC} CD-sync: WIP preserved in stash (${my_stash:0:9}); manual 'git stash pop' needed"
@@ -857,6 +889,9 @@ SYNC_BEFORE_RESTART=true
 # Set by sync_live_checkout() when the pull advances HEAD, plus the changed paths.
 SYNC_DID_ADVANCE=false
 SYNC_CHANGED_PATHS=""
+# Stderr from the last failed ff-merge attempt — surfaced on a genuine non-ff so the
+# failure is never silent (see _cd_sync_ff_with_retry / sync_live_checkout).
+CD_SYNC_MERGE_ERR=""
 # Which services to restart — set by map_changed_to_services() (smart mode) or
 # forced on in the full-restart fallback. Must be initialised for `set -u`.
 RESTART_TOKENAPI=false
