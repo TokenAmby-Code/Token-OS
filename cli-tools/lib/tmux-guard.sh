@@ -114,7 +114,7 @@ tmux_wait_for_clear() {
         fi
         sleep "$interval"
         elapsed=$(echo "$elapsed + $interval" | bc)
-        if (( $(echo "$elapsed >= $timeout" | bc -l) )); then
+        if [[ "$timeout" != "0" ]] && (( $(echo "$elapsed >= $timeout" | bc -l) )); then
             echo "tmux-guard: timed out waiting for clear input in $pane (${timeout}s)" >&2
             return 1
         fi
@@ -144,8 +144,8 @@ tmux_typing_guard_active() {
 # protection (don't inject into a half-typed prompt) and stays.
 #
 # Special env vars:
-#   TMUX_GUARD_TIMEOUT   — max seconds to wait (default: 10)
-#   TMUX_GUARD_SKIP      — set to "1" to bypass guard entirely
+#   TMUX_GUARD_TIMEOUT   — max seconds to wait (default: 0 = wait indefinitely)
+#   TMUX_GUARD_SKIP      — set to "1" to bypass the pane-line guard entirely
 #   TMUX_SEND_GATE_ALLOW — sanctioned-send reason (default "tmux-guard")
 tmux_send_guarded() {
     local allow="${TMUX_SEND_GATE_ALLOW:-tmux-guard}"
@@ -173,7 +173,7 @@ tmux_send_guarded() {
         return
     fi
 
-    local timeout="${TMUX_GUARD_TIMEOUT:-10}"
+    local timeout="${TMUX_GUARD_TIMEOUT:-0}"
 
     if ! tmux_wait_for_clear "$pane" "$timeout"; then
         echo "tmux-guard: ABORTED send-keys to $pane — user input not cleared after ${timeout}s" >&2

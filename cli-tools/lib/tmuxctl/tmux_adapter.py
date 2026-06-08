@@ -255,14 +255,21 @@ class TmuxAdapter:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
         # tmuxctl CLI, enforcement, pane recovery) funnels through run(), so
-        # gating here means no byte reaches a pane while quiet hours OR the
-        # typing guard is active. Reads pass through untouched; sanctioned
-        # human-initiated sends are allowed but logged. Never raises.
+        # gating here means automated bytes do not race direct operator input:
+        # quiet hours cancel by default, typing guard delays by default, and
+        # sanctioned direct-input sends pierce with audit. Reads pass through
+        # untouched. Never raises.
         args_tuple = tuple(args)
         # Clear any prior suppression payload so an allowed send (which also
         # returns empty stdout) is never misread as suppressed by callers/tests.
         self.last_send_gate_result = None
         gate = send_gate.evaluate(args_tuple)
+        if gate is not None and gate.get("policy") == "delay":
+            send_gate.record_suppression(gate)
+            if send_gate.wait_for_gate_clear(args_tuple):
+                gate = None
+            else:
+                gate = {**gate, "policy": "cancel", "suppressed": True, "delay_failed": True}
         if gate is not None:
             send_gate.record_suppression(gate)
             if gate.get("suppressed"):

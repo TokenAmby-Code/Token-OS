@@ -143,7 +143,7 @@ send_command() {
         done
     fi
 
-    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-10}"; then
+    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-0}"; then
         echo "Warning: user input not cleared in $pane — aborting injection" >&2
         rc=1
     else

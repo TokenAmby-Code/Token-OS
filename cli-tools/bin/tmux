@@ -99,11 +99,13 @@ resolve_target() {
 # `tmux send-keys` in the repo resolves to via PATH, so gating here closes the
 # shell escape hatch around TmuxAdapter.run()'s Python gate — together they make
 # the sentinel inescapable across both languages. Only the mutating send verbs
-# are gated (reads pass through). Sanctioned human-initiated sends
-# (TMUX_SEND_GATE_ALLOW set) are still routed through the canonical predicate so
-# the override is allowed AND audited (send_gate_override) — never silently
-# bypassed. Any check error fails open so a transient fault never bricks all
-# pane writes. Returns 0 (true) to SUPPRESS.
+# are gated (reads pass through). Sanctioned direct-input sends
+# (TMUX_SEND_GATE_ALLOW set, optionally TMUX_SEND_GATE_POLICY=pierce) are still
+# routed through the canonical predicate so the override is allowed AND audited
+# (send_gate_override) — never silently bypassed. Typing-guarded automation
+# delays by default; cancellation is explicit policy or quiet-hours default. Any
+# check error fails open so a transient fault never bricks all pane writes.
+# Returns 0 (true) only to CANCEL/SUPPRESS.
 send_gate_suppresses() {
     case "${1:-}" in
         send-keys|send-key|send|paste-buffer) ;;
@@ -332,7 +334,7 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
         fi
     done
     if send_gate_suppresses "${args[@]}"; then
-        exit 0  # quiet hours OR typing guard active — silent no-op, no PTY write
+        exit 0  # cancel policy (e.g. quiet hours): no PTY write
     fi
     exec "$_REAL_TMUX" "${args[@]}"
 fi

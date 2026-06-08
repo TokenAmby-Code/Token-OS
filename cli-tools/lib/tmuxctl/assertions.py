@@ -321,6 +321,16 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
     current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
     if current != pane_id:
         return
+    voice_locked = adapter.run(
+        "show-options",
+        "-pqv",
+        "-t",
+        pane_id,
+        "@DISCORD_VOICE_LOCK",
+        allow_failure=True,
+    ).strip()
+    if voice_locked == "1":
+        return
     if spec.persona == "custodes":
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=#302800", allow_failure=True)
     elif spec.persona == "fabricator-general":
@@ -330,7 +340,15 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
     """Clear transient operator chrome without touching durable pane identity."""
     current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
-    if current == pane_id:
+    voice_locked = adapter.run(
+        "show-options",
+        "-pqv",
+        "-t",
+        pane_id,
+        "@DISCORD_VOICE_LOCK",
+        allow_failure=True,
+    ).strip()
+    if current == pane_id and voice_locked != "1":
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
     adapter.run(

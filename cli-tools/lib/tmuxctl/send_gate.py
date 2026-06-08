@@ -10,9 +10,11 @@ entrypoints:
     ``cli-tools/bin/tmux`` shim before reaching real tmux.
 
 This module is the ONE predicate both entrypoints consult. The invariant it
-enforces: **nothing reaches any pane while quiet hours OR the typing guard is
-active.** It is filtered to the mutating send verbs only (reads such as
-``capture-pane`` / ``display-message`` are never gated).
+enforces: **automated pane writes do not race the Emperor's direct input**.
+Quiet hours still cancel automated writes by default; the typing guard delays
+automation by default; sanctioned direct-input sends may pierce. It is filtered
+to the mutating send verbs only (reads such as ``capture-pane`` /
+``display-message`` are never gated).
 
 Design properties:
 
@@ -23,13 +25,16 @@ Design properties:
     The gate refuses only when it can positively determine quiet-hours or
     typing-guard is active. If it cannot read the DB or tmux, it allows the
     send (so a transient fault never bricks all pane writes) and logs.
+  * **Explicit disposition.** ``TMUX_SEND_GATE_POLICY`` is a delay/cancel/pierce
+    enum. If unset, sanctioned human/direct-input sends pierce, typing-guarded
+    automation delays, and quiet-hours automation cancels.
   * **Sanctioned, audited override.** Human-initiated sends (dictation, the
     pedal-enter, an operator-driven transplant) set ``TMUX_SEND_GATE_ALLOW`` to
     a reason string; the gate then allows but logs ``send_gate_override``.
-    Automated senders never set it, so they are always gated. The gate is never
-    silently escapable.
-  * **Never raises into callers.** Suppression returns a structured result; the
-    caller treats a suppressed send as a silent no-op.
+    Automated senders never set it, so they are delayed/cancelled by policy.
+    The gate is never silently escapable.
+  * **Never raises into callers.** Cancellation returns a structured result;
+    delay waits until the gate clears; pierce writes and audits.
 """
 
 from __future__ import annotations
@@ -53,8 +58,16 @@ logger = logging.getLogger("tmuxctl.send_gate")
 MUTATING_SEND_VERBS = frozenset({"send-keys", "send-key", "send", "paste-buffer"})
 
 # Environment override: a non-empty value is a sanctioned reason for a
-# human-initiated send. Allowed, but always logged.
+# human/direct-input send. Allowed, but always logged.
 _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
+
+# Explicit disposition enum for a positive gate signal. Valid values:
+#   delay  — wait until the gate clears, then send (default for typing guard)
+#   cancel — suppress/no-op (default for quiet hours)
+#   pierce — send now and audit (default when TMUX_SEND_GATE_ALLOW is set)
+_SEND_GATE_POLICY_ENV = "TMUX_SEND_GATE_POLICY"
+_SEND_GATE_POLICIES = frozenset({"delay", "cancel", "pierce"})
+_SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no timeout
 
 # Recent-keystroke window (seconds) for the typing guard. Mirrors
 # bin/tmux-typing-guard-status' TMUX_TYPING_GUARD_WINDOW.
@@ -315,6 +328,64 @@ def sanctioned_override() -> str | None:
     return reason or None
 
 
+def send_gate_policy(*, override: str | None = None, reason: str | None = None) -> str:
+    """Return the delay/cancel/pierce disposition for a positive gate signal.
+
+    Default policy is intentionally asymmetric: quiet-hours automation cancels
+    (waiting overnight would wedge callers), typing-guard automation delays
+    (never drop a prompt merely because the Emperor was typing), and sanctioned
+    direct-input sends pierce.
+    """
+    explicit = os.environ.get(_SEND_GATE_POLICY_ENV, "").strip().lower()
+    if explicit in _SEND_GATE_POLICIES:
+        return explicit
+    if override:
+        return "pierce"
+    if reason == "typing_guard":
+        return "delay"
+    return "cancel"
+
+
+def _delay_timeout_seconds() -> float | None:
+    raw = os.environ.get(_SEND_GATE_DELAY_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def wait_for_gate_clear(
+    args: tuple[str, ...] | list[str],
+    *,
+    db_path: Path | None = None,
+    now: datetime | None = None,
+    timeout_seconds: float | None = None,
+    interval_seconds: float = 0.25,
+) -> bool:
+    """Wait while policy remains ``delay``; return True once sending is allowed.
+
+    Returns False if the policy changes to cancel or an explicit timeout expires.
+    With the default no-timeout setting, typing-guard delays clear shortly after
+    the operator stops typing because the guard itself is a recent-activity
+    window, not a permanent latch.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = _delay_timeout_seconds()
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    while True:
+        result = evaluate(tuple(args), db_path=db_path, now=now)
+        if result is None or not result.get("suppressed"):
+            return True
+        if result.get("policy") != "delay":
+            return False
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0.05, interval_seconds))
+
+
 def evaluate(
     args: tuple[str, ...] | list[str],
     *,
@@ -340,8 +411,10 @@ def evaluate(
         return None
 
     reason = "quiet_hours" if quiet else "typing_guard"
+    policy = send_gate_policy(override=override, reason=reason)
     result = {
-        "suppressed": override is None,
+        "suppressed": policy != "pierce",
+        "policy": policy,
         "reason": reason,
         "verb": args[0],
         "target": _extract_target(args),
@@ -361,9 +434,19 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
     override = result.get("override")
     reason = result.get("reason")
     target = result.get("target")
-    if override is not None:
+    policy = result.get("policy") or ("pierce" if override else "cancel")
+    if override is not None or policy == "pierce":
         event_type = "send_gate_override"
-        logger.warning("send_gate OVERRIDE reason=%s gate=%s target=%s", override, reason, target)
+        logger.warning(
+            "send_gate OVERRIDE reason=%s policy=%s gate=%s target=%s",
+            override,
+            policy,
+            reason,
+            target,
+        )
+    elif policy == "delay":
+        event_type = "quiet_hours_delayed" if reason == "quiet_hours" else "typing_guard_delayed"
+        logger.warning("send_gate DELAY reason=%s target=%s", reason, target)
     else:
         event_type = (
             "quiet_hours_suppressed" if reason == "quiet_hours" else "typing_guard_suppressed"
@@ -448,7 +531,7 @@ def _cli(argv: list[str]) -> int:
     """CLI for the shell readers (bin/tmux shim, tmux-guard.sh, status segment).
 
     Subcommands:
-      * ``check <verb> [args...]`` — gate a tmux command. Exit 0 allow / 100 suppress.
+      * ``check <verb> [args...]`` — gate a tmux command. Exit 0 allow after any delay / 100 cancel.
       * ``typing`` — typing-guard predicate. Exit 0 active / 1 inactive.
       * ``quiet``  — quiet-hours predicate.  Exit 0 active / 1 inactive.
     """
@@ -459,6 +542,11 @@ def _cli(argv: list[str]) -> int:
     if cmd == "check":
         verb_args = argv[1:]
         result = evaluate(tuple(verb_args))
+        if result is not None and result.get("policy") == "delay":
+            record_suppression(result)
+            if wait_for_gate_clear(tuple(verb_args)):
+                return 0
+            result = {**result, "policy": "cancel", "suppressed": True, "delay_failed": True}
         if result is None or not result.get("suppressed"):
             if result is not None and result.get("override") is not None:
                 record_suppression(result)

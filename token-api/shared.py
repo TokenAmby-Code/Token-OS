@@ -673,6 +673,16 @@ def apply_pane_tint(
         return
     try:
         adapter = TmuxAdapter()
+        voice_locked = adapter.run(
+            "show-options",
+            "-pqv",
+            "-t",
+            tmux_pane,
+            "@DISCORD_VOICE_LOCK",
+            allow_failure=True,
+        ).strip()
+        if voice_locked == "1":
+            return
         with preserve_focus(adapter, source=source, attempted_target=tmux_pane):
             adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
     except Exception as exc:
