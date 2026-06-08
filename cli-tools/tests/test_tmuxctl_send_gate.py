@@ -178,7 +178,6 @@ def test_evaluate_returns_structured_result(monkeypatch):
     assert result["policy"] == "cancel"
 
 
-
 def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
     _force_quiet(monkeypatch, False)
     _force_typing(monkeypatch, True)
