@@ -114,6 +114,11 @@ async def test_over_cap_defers_via_date_trigger_and_logs(gt_env, monkeypatch):
     monkeypatch.setenv("GT_RATE_WINDOW_SECONDS", "60")
     instance_id = _insert_instance(gt_env.db_path)
     gt_env.main._golden_throne_fire_times.append(time.time())
+    # Exercise the rate-limit defer path, not quiet-hours suppression (which
+    # short-circuits earlier); pin non-quiet so this is not wall-clock-dependent.
+    monkeypatch.setattr(
+        gt_env.main.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False}
+    )
 
     added_jobs = []
 
