@@ -75,12 +75,14 @@ preplan_leader() {
 }
 
 # Resolve the harness bound to PANE via the instances API. Only preplan needs
-# this (the leader differs); plan/compact are universal. Defaults to claude.
+# this (the leader differs); plan/compact are universal. Echoes "unknown" when it
+# genuinely can't resolve (API unset/unreachable, or pane not registered) so the
+# caller can fail closed instead of guessing a leader.
 detect_agent() {
-    [[ -z "$API_URL" ]] && { echo claude; return; }
+    [[ -z "$API_URL" ]] && { echo unknown; return; }
     local resp
     resp=$(curl -sf --max-time 2 "${API_URL}/api/instances" 2>/dev/null || true)
-    [[ -z "$resp" ]] && { echo claude; return; }
+    [[ -z "$resp" ]] && { echo unknown; return; }
     RESP="$resp" PANE="$PANE" python3 -c '
 import json, os
 pane = os.environ["PANE"]
@@ -93,7 +95,7 @@ for r in rows:
         print(r.get("engine") or r.get("agent") or "claude")
         break
 else:
-    print("claude")
+    print("unknown")
 '
 }
 
@@ -164,10 +166,19 @@ SELECTION="${SELECTION%%$'\t'*}"   # tolerate a tab-delimited label, keep the ke
 AGENT_RESOLVED="$(normalize_agent "$AGENT")"
 if [[ "$SELECTION" == "preplan" ]]; then
     if [[ "$AGENT_RESOLVED" == "auto" ]]; then
-        if $DRY_RUN; then AGENT_RESOLVED="claude"; else AGENT_RESOLVED="$(detect_agent)"; fi
+        if $DRY_RUN; then
+            AGENT_RESOLVED="claude"   # dry-run never sends; default for tests/inspection
+        else
+            AGENT_RESOLVED="$(normalize_agent "$(detect_agent)")"
+        fi
     fi
-    AGENT_RESOLVED="$(normalize_agent "$AGENT_RESOLVED")"
-    [[ "$AGENT_RESOLVED" == "auto" ]] && AGENT_RESOLVED="claude"
+    # Fail closed: a real preplan must resolve to a concrete harness. Guessing
+    # claude here would send /preplan to a Codex pane (wrong leader) and mask the
+    # detection miss, so abort and point at the explicit --agent override instead.
+    if [[ "$AGENT_RESOLVED" == "auto" ]]; then
+        echo "tmux-plan-menu: could not detect the harness for pane ${PANE:-?}; re-run with --agent claude|codex" >&2
+        exit 1
+    fi
 fi
 
 case "$SELECTION" in
