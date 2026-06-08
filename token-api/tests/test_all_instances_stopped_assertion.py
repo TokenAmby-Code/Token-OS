@@ -14,10 +14,16 @@ work-action buffer). These tests pin both halves:
   * A SessionEnd that zeroes the raw count while ``compute_work_state`` would
     still report ``productivity_active=True`` (a recent ``work_action``) must
     emit NO phone-direct TTS at all.
-  * The re-homed emitter (``_announce_idle_if_all_stopped``) speaks exactly once
-    on a genuine WORKING -> IDLE transition, routes through the geofence router
-    (``speak_tts``), and stays silent when work is still active, when the mode is
-    not IDLE, or during quiet hours.
+  * The re-homed emitter (``_announce_idle_if_all_stopped``) records the
+    ``all_instances_stopped`` state event on a genuine WORKING -> IDLE
+    transition (and only then — silent when work is still active or the mode is
+    not IDLE), backing the idle metric.
+
+Update 2026-06-07 (Emperor): the SPOKEN assertion is DISABLED — it fired at the
+momentary stop boundary and was hyper-spammy. The state event is retained (it
+backs the idle metric and the frozen ``idle_buffer``/``idle`` namespace rework);
+only the TTS is suppressed, so the emitter now never speaks and the quiet-hours
+gate (which only guarded the speak) is gone.
 """
 
 import sqlite3
@@ -141,10 +147,12 @@ def test_delete_instance_zeroing_count_does_not_emit_all_stopped(app_env, monkey
 
 
 @pytest.mark.asyncio
-async def test_announce_idle_speaks_once_on_working_to_idle(app_env, monkeypatch):
-    """The re-homed emitter speaks exactly once, via the geofence router, on a
-    genuine productivity_inactive WORKING -> IDLE transition (outside quiet
-    hours). RED until ``_announce_idle_if_all_stopped`` exists."""
+async def test_announce_idle_logs_event_but_does_not_speak(app_env, monkeypatch):
+    """TTS DISABLED 2026-06-07 (Emperor): a genuine productivity_inactive
+    WORKING -> IDLE transition still RECORDS the ``all_instances_stopped`` state
+    event (it backs the idle metric and the frozen ``idle_buffer``/``idle``
+    namespace rework) but speaks NOTHING — the spoken assertion was hyper-spammy
+    at the momentary stop boundary. Returns False (never speaks)."""
     import asyncio
 
     main = app_env.main
@@ -153,18 +161,25 @@ async def test_announce_idle_speaks_once_on_working_to_idle(app_env, monkeypatch
     monkeypatch.setattr(
         main, "speak_tts", lambda *a, **k: spoken.append((a, k)) or {"success": True}
     )
+    logged = []
+
+    async def fake_log_event(event_type, **kwargs):
+        logged.append((event_type, kwargs))
+
+    monkeypatch.setattr(main, "log_event", fake_log_event)
     monkeypatch.setattr(main, "is_quiet_hours", lambda *a, **k: False)
     monkeypatch.setattr(main.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
 
     result = await main._announce_idle_if_all_stopped("working", "idle", False)
-    assert result is True
+    assert result is False
 
-    # speak_tts is dispatched fire-and-forget through run_in_executor; give the
-    # default thread pool a moment to run it.
+    # The state event is still recorded (metric preserved) ...
+    assert [et for (et, _k) in logged] == ["all_instances_stopped"], (
+        f"expected the state event to be logged once, got {logged}"
+    )
+    # ... but no TTS is ever emitted (the spam is gone).
     await asyncio.sleep(0.1)
-    assert len(spoken) == 1, f"expected exactly one TTS emission, got {spoken}"
-    spoken_text = spoken[0][0][0]
-    assert "stopped" in spoken_text.lower()
+    assert spoken == [], f"expected no TTS emission, got {spoken}"
 
 
 @pytest.mark.asyncio
@@ -199,23 +214,5 @@ async def test_announce_idle_silent_when_not_idle_mode(app_env, monkeypatch):
     monkeypatch.setattr(main.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
 
     result = await main._announce_idle_if_all_stopped("working", "break", False)
-    assert result is False
-    assert spoken == []
-
-
-@pytest.mark.asyncio
-async def test_announce_idle_silent_during_quiet_hours(app_env, monkeypatch):
-    """Quiet hours suppresses the spoken assertion (parity with the canonical
-    /api/notify/tts quiet-hours gate)."""
-    main = app_env.main
-
-    spoken = []
-    monkeypatch.setattr(
-        main, "speak_tts", lambda *a, **k: spoken.append((a, k)) or {"success": True}
-    )
-    monkeypatch.setattr(main, "is_quiet_hours", lambda *a, **k: True)
-    monkeypatch.setattr(main.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
-
-    result = await main._announce_idle_if_all_stopped("working", "idle", False)
     assert result is False
     assert spoken == []
