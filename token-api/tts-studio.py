@@ -176,7 +176,17 @@ MAC_VOICE_PAIRS = {
 
 
 def generate_profile_code(voices: list[VoiceConfig]) -> str:
-    """Generate the PROFILES code for main.py (unified WSL + Mac format)."""
+    """Generate the PROFILES code for main.py (unified WSL + Mac format).
+
+    ⚠️ DO NOT USE the "save" path against the current codebase. PROFILES is now a
+    hand-maintained Warhammer 40k chapter roster in ``shared.py`` (chapter slugs like
+    "blood-angels", canonical chapter colours, a 1:1 chapter↔voice binding, and a
+    reserved Custodes/George profile). This generator still emits ``profile_N`` names
+    and arbitrary hex colours, and its save regex targets ``main.py`` (where PROFILES
+    no longer lives — it is imported from shared). Using save would either no-op or
+    clobber the chapter roster. FOLLOW-UP: teach this generator the chapter list and
+    point it at shared.py, or retire it. Until then it is preview-only.
+    """
     selected = [v for v in voices if v.selected]
     if not selected:
         return "# No voices selected"
@@ -395,6 +405,10 @@ def main():
                 console.print("\n[yellow]Save this to main.py? (y/n)[/yellow] ", end="")
                 confirm = read_char()
                 if confirm.lower() == "y":
+                    # ⚠️ STALE: PROFILES now lives in shared.py as a hand-maintained
+                    # 40k chapter roster (see generate_profile_code docstring). This
+                    # regex targets main.py and emits profile_N names — it will no-op
+                    # or clobber the chapter roster. Do not rely on this save path.
                     # Actually update main.py
                     try:
                         _token_os = os.environ.get(
