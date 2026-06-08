@@ -75,9 +75,7 @@ def _post_tool(app_env, monkeypatch, session_id, tool_name):
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
 
     async def run():
-        return await hooks.handle_post_tool_use(
-            {"session_id": session_id, "tool_name": tool_name}
-        )
+        return await hooks.handle_post_tool_use({"session_id": session_id, "tool_name": tool_name})
 
     return asyncio.run(run())
 
