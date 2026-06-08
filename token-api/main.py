@@ -7867,6 +7867,7 @@ async def _find_custodes_tmux_pane() -> str | None:
         return None
 
     candidates: list[str] = []
+    marker_fallbacks: list[str] = []
     for line in stdout.decode().splitlines():
         try:
             pane_id, pane_marker, current_cmd = line.split("\t", 2)
@@ -7874,13 +7875,19 @@ async def _find_custodes_tmux_pane() -> str | None:
             continue
         if pane_marker != "legion:custodes":
             continue
+        marker_fallbacks.append(pane_id)
         cmd_is_claude = "claude" in current_cmd.lower() or (
             current_cmd[0:1].isdigit() and "." in current_cmd
         )
         if cmd_is_claude:
             candidates.append(pane_id)
 
-    return candidates[0] if candidates else None
+    # The pane marker is the authoritative singleton identity. In practice
+    # tmux often reports the wrapper shell (bash/zsh/node) as pane_current_command
+    # even while the Claude/Codex TUI is live, so using current_command as a hard
+    # gate makes the static Custodes pane disappear. Prefer obvious Claude-like
+    # runtimes when present, but fall back to the marked live pane.
+    return candidates[0] if candidates else (marker_fallbacks[0] if marker_fallbacks else None)
 
 
 async def _create_custodes_legion_pane() -> str | None:

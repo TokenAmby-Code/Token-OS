@@ -23,8 +23,9 @@ export function createTranscriber(config, logger) {
       text = text.trim();
       logger.info(`Transcriber [${botName || 'unknown'}]: [${userId}] "${text}"`);
 
-      // Lossless forwarding: every completed transcription reaches Token API.
-      // Draft lifecycle (lock/append/ship/scratch) is owned by Token API.
+      // Lossless forwarding: every completed transcription reaches registered
+      // handlers. The daemon's voice transcript router owns the visible draft
+      // lifecycle (lock/append/ship/scratch) and routes directly to tmux.
       const result = { userId, text, timestamp, botName, realtime, ...extra };
       for (const handler of resultHandlers) {
         try {
