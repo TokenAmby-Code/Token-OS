@@ -183,6 +183,9 @@ def test_golden_throne_transport_uses_instance_engine(app_env):
 @pytest.mark.asyncio
 async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, monkeypatch):
     _insert_gt_instance(app_env.db_path, "gt-dispatch-fail")
+    # Exercise the dispatch path, not the quiet-hours suppression branch (covered
+    # separately); pin non-quiet so this is not wall-clock-dependent in CI.
+    monkeypatch.setattr(app_env.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
     calls = []
 
     async def no_label(pane):
@@ -253,6 +256,9 @@ async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, mo
 @pytest.mark.asyncio
 async def test_golden_throne_validated_dispatch_counts_without_ack(app_env, monkeypatch):
     _insert_gt_instance(app_env.db_path, "gt-dispatch-ok")
+    # Exercise the dispatch path, not the quiet-hours suppression branch (covered
+    # separately); pin non-quiet so this is not wall-clock-dependent in CI.
+    monkeypatch.setattr(app_env.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
 
     async def pane_label(pane):
         return "palace:NE"
@@ -423,6 +429,9 @@ def test_golden_throne_human_surface_includes_page_number(app_env):
 @pytest.mark.asyncio
 async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_env, monkeypatch):
     _insert_gt_instance(app_env.db_path, "gt-bash-codex", tmux_pane="%134")
+    # Exercise the dispatch path, not the quiet-hours suppression branch (covered
+    # separately); pin non-quiet so this is not wall-clock-dependent in CI.
+    monkeypatch.setattr(app_env.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
     calls = []
 
     async def pane_label(pane):
@@ -486,6 +495,9 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
 @pytest.mark.asyncio
 async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch):
     _insert_gt_instance(app_env.db_path, "gt-empty-legion", tmux_pane="%134")
+    # Exercise the dispatch path, not the quiet-hours suppression branch (covered
+    # separately); pin non-quiet so this is not wall-clock-dependent in CI.
+    monkeypatch.setattr(app_env.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
     calls = []
 
     async def pane_label(pane):
@@ -541,6 +553,9 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
 @pytest.mark.asyncio
 async def test_golden_throne_typing_block_defers_without_counting(app_env, monkeypatch):
     _insert_gt_instance(app_env.db_path, "gt-dispatch-defer")
+    # Exercise the dispatch path, not the quiet-hours suppression branch (covered
+    # separately); pin non-quiet so this is not wall-clock-dependent in CI.
+    monkeypatch.setattr(app_env.shared, "get_quiet_hours_status", lambda *a, **k: {"active": False})
 
     async def pane_label(pane):
         return "palace:NE"
