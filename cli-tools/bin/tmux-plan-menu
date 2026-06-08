@@ -23,13 +23,17 @@ AGENT="auto"
 DRY_RUN=false
 API_URL=""
 
+# Guard value-taking flags so a missing operand is a clean error, not a `set -u`
+# "unbound variable $2" crash.
+_require_arg() { [[ $1 -ge 2 ]] || { echo "tmux-plan-menu: $2 requires a value" >&2; exit 1; }; }
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pane) PANE="$2"; shift 2 ;;
-        --selection) SELECTION="$2"; shift 2 ;;
-        --agent) AGENT="$2"; shift 2 ;;
+        --pane) _require_arg $# --pane; PANE="$2"; shift 2 ;;
+        --selection) _require_arg $# --selection; SELECTION="$2"; shift 2 ;;
+        --agent) _require_arg $# --agent; AGENT="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
-        --api-url) API_URL="$2"; shift 2 ;;
+        --api-url) _require_arg $# --api-url; API_URL="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -98,13 +102,27 @@ else:
 # recommends it; the payload here remains the default plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
-    local body rc=0
+    local body resp rc=0
     body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
-    curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
-        -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
+    resp=$(curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
+        -H 'Content-Type: application/json' -d "$body") || rc=$?
     if (( rc != 0 )); then
         echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/hooks/subscribe failed (curl exit $rc)" >&2
         return "$rc"
+    fi
+    # /api/hooks/subscribe returns HTTP 200 with {"success": false} when the pane
+    # can't be resolved (target_unresolved/subscriber_unresolved), so a 2xx is not
+    # enough — confirm the one-shot actually armed before the caller sends a leader.
+    if ! RESP="$resp" python3 -c '
+import json, os, sys
+try:
+    ok = bool(json.loads(os.environ["RESP"] or "{}").get("success"))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+'; then
+        echo "tmux-plan-menu: subscribe_preplan did not arm (response: ${resp:-<empty>})" >&2
+        return 1
     fi
 }
 
