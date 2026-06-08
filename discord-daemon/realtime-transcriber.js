@@ -10,6 +10,7 @@ const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 
 export function createRealtimeTranscriber(config, logger, emitTranscript) {
   const apiKey = config.openai_api_key || process.env.OPENAI_API_KEY;
+  const WebSocketImpl = config._websocket_class || WebSocket;
   const realtimeModel = config.realtime_model || DEFAULT_REALTIME_MODEL;
   const transcriptionModel = config.realtime_transcription_model || DEFAULT_TRANSCRIBE_MODEL;
   const language = config.realtime_language || config.language || 'en';
@@ -29,7 +30,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
 
     const key = keyFor(botName, userId);
     const url = `${REALTIME_URL}?intent=transcription`;
-    const ws = new WebSocket(url, {
+    const ws = new WebSocketImpl(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
@@ -105,6 +106,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           logger.info(
             `Realtime [${botName}]: session expired (60-min max) for user ${userId}; reconnecting on next audio`
           );
+          cleanupSession(session);
           return;
         }
         logger.error(`Realtime [${botName}]: ${message}`, {
@@ -314,6 +316,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (!session) return;
     if (sessions.get(session.key) === session) sessions.delete(session.key);
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+    session.closed = true;
     try { session.ws.close(); } catch {}
   }
 
