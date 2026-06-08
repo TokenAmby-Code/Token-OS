@@ -65,7 +65,13 @@ def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
     return "auto"
 
 
-def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "auto") -> str:
+def resolve_agent_for_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    requested: str = "auto",
+    *,
+    default: str = "claude",
+) -> str:
     explicit = normalize_agent(requested)
     if explicit != "auto":
         return explicit
@@ -106,7 +112,7 @@ def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "au
     hinted_agent = normalize_agent(hinted)
     if hinted_agent != "auto":
         return hinted_agent
-    return "claude"
+    return default
 
 
 def insert_at_prompt_start(
