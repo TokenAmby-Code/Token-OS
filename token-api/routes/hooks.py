@@ -1973,6 +1973,13 @@ async def handle_session_start(payload: dict) -> dict:
                         "victory_at": None,
                         "victory_reason": None,
                         "input_lock": None,
+                        # A resumed session is never mid-modal — reconcile any
+                        # stuck planning_state (the transplant case is the classic
+                        # offender). No-op for rows already at `none` (the trigger's
+                        # WHEN guard suppresses noise).
+                        "planning_state": "none",
+                        "planning_updated_at": now,
+                        "planning_source": "auto-clear:session-start",
                         "transplant_target_session": None,
                         "primarch": primarch_name or existing_row["primarch"]
                         if hasattr(existing_row, "__getitem__")
@@ -2116,6 +2123,11 @@ async def handle_session_start(payload: dict) -> dict:
                     "victory_at": None,
                     "victory_reason": None,
                     "input_lock": None,
+                    # A resumed session is never mid-modal — reconcile any stuck
+                    # planning_state. No-op for rows already at `none`.
+                    "planning_state": "none",
+                    "planning_updated_at": now,
+                    "planning_source": "auto-clear:session-start",
                     "wrapper_launch_id": wrapper_launch_id or existing_row["wrapper_launch_id"],
                     "launcher": launcher or existing_row["launcher"],
                     "engine": engine or existing_row["engine"],
@@ -2261,6 +2273,11 @@ async def handle_session_start(payload: dict) -> dict:
                         "victory_at": None,
                         "victory_reason": None,
                         "input_lock": None,
+                        # A supplanted session is never mid-modal — reconcile any
+                        # stuck planning_state. No-op for rows already at `none`.
+                        "planning_state": "none",
+                        "planning_updated_at": now,
+                        "planning_source": "auto-clear:session-start",
                         "primarch": primarch_name or old_inst["primarch"],
                         "session_doc_id": resolved_session_doc_id or old_inst["session_doc_id"],
                         "wrapper_launch_id": wrapper_launch_id or old_inst["wrapper_launch_id"],
@@ -3045,6 +3062,30 @@ async def handle_post_tool_use(payload: dict) -> dict:
             reason="answered",
             answer=_askq_extract_answer(payload),
         )
+
+    # Plan approved → clear planning_state. Mutating tools are blocked in Claude
+    # plan mode, so the first Write/Edit after approval is a poll-free, race-proof
+    # "planning ended" signal — it owns the planning→none transition, replacing the
+    # screen-scrape watcher's 10s-timeout race. Done before the debounce (like the
+    # AskUserQuestion cancel above) because the debounce early-returns before
+    # instance resolution, so a prior tool's debounce window would otherwise
+    # swallow the approval edit. The only_if_in gate excludes `preplanning` (a
+    # /preplan session-doc edit must not false-clear) and `none` (ordinary edits
+    # no-op); `tool_name in MUTATING_TOOLS` short-circuits first so the common
+    # non-mutating path adds zero cost.
+    if tool_name in MUTATING_TOOLS:
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            db.row_factory = aiosqlite.Row
+            ev = await _set_planning_state(
+                db,
+                session_id,
+                "none",
+                source="auto-clear:tool-exec",
+                only_if_in=("planning", "approving"),
+            )
+            await db.commit()
+        if ev:
+            await log_event("planning_state_changed", instance_id=session_id, details=ev)
 
     # Debounce: only update every 2 seconds per session
     current_time = time.time()
@@ -4472,6 +4513,76 @@ PLANNING_CYCLE = {
     "planning": "none",
     "approving": "none",
 }
+# Tools Claude blocks while in plan mode. The first one to fire after the user
+# approves a plan is a poll-free, race-proof "planning ended" signal (see
+# handle_post_tool_use). Bash and read tools run freely in plan mode and would
+# false-clear, so they are deliberately excluded.
+MUTATING_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+
+async def _set_planning_state(
+    db,
+    instance_id: str,
+    new_state: str,
+    source: str,
+    *,
+    only_if_in: tuple[str, ...] | None = None,
+    write_source: str = "hooks",
+    actor: str = "planning-state",
+) -> dict | None:
+    """Core planning_state transition shared by the /api/planning/state endpoint
+    and the event-driven auto-clear paths.
+
+    SELECTs the current state, optionally CAS-gates on ``only_if_in`` (returns
+    ``None`` when the row is not in one of those states — makes re-fires
+    idempotent), then writes the three ``planning_*`` fields via the sanctioned
+    path (the ``trg_planning_pane_state`` trigger auto-projects ``@PLANNING_STATE``
+    when the value changes; a reassert queues an explicit projection). Returns the
+    event detail dict for the caller to ``log_event`` AFTER its own ``db.commit()``
+    — this function neither commits nor logs (``log_event`` opens its own
+    connection, so ordering must stay caller-owned). Returns ``None`` on a missing
+    row, a failed gate, or an invalid ``new_state``.
+    """
+    cursor = await db.execute(
+        "SELECT planning_state, tmux_pane FROM claude_instances WHERE id = ?",
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    previous = row["planning_state"] or "none"
+    if only_if_in is not None and previous not in only_if_in:
+        return None
+    if new_state not in PLANNING_STATES:
+        return None
+    tmux_pane = row["tmux_pane"]
+    now = datetime.now().isoformat()
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates={
+            "planning_state": new_state,
+            "planning_updated_at": now,
+            "planning_source": source,
+        },
+        mutation_type="planning_state_changed",
+        write_source=write_source,
+        actor=actor,
+    )
+    # The DB trigger enqueues @PLANNING_STATE when the value changes.  If the
+    # state is reasserted, queue an explicit projection so tmux hints recover.
+    if previous == new_state:
+        await db.execute(
+            """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+               VALUES (?, '@PLANNING_STATE', ?, ?)""",
+            (instance_id, new_state, tmux_pane),
+        )
+    return {
+        "old_state": previous,
+        "new_state": new_state,
+        "source": source,
+        "tmux_pane": tmux_pane,
+    }
 
 
 @router.post("/api/planning/state")
@@ -4502,39 +4613,20 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
         if new_state not in PLANNING_STATES:
             return {"success": False, "action": "invalid_state", "state": new_state}
         tmux_pane = tmux_pane or row["tmux_pane"]
-        now = datetime.now().isoformat()
-        await sanctioned_update_instance(
+        event_details = await _set_planning_state(
             db,
-            instance_id=instance_id,
-            updates={
-                "planning_state": new_state,
-                "planning_updated_at": now,
-                "planning_source": source,
-            },
-            mutation_type="planning_state_changed",
+            instance_id,
+            new_state,
+            source,
             write_source="api",
-            actor="planning-state",
         )
-        # The DB trigger enqueues @PLANNING_STATE when the value changes.  If the
-        # state is reasserted, queue an explicit projection so tmux hints recover.
-        if previous == new_state:
-            await db.execute(
-                """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                   VALUES (?, '@PLANNING_STATE', ?, ?)""",
-                (instance_id, new_state, tmux_pane),
-            )
         await db.commit()
-        event_details = {
-            "old_state": previous,
-            "new_state": new_state,
-            "source": source,
-            "tmux_pane": tmux_pane,
-        }
-    await log_event(
-        "planning_state_changed",
-        instance_id=instance_id,
-        details=event_details,
-    )
+    if event_details:
+        await log_event(
+            "planning_state_changed",
+            instance_id=instance_id,
+            details=event_details,
+        )
     return {
         "success": True,
         "action": "planning_state_changed",
