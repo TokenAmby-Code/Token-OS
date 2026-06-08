@@ -47,6 +47,9 @@ const TITLE_PREFIX = {
 // stale, the tint intentionally stays stale with it.
 const CADIA_LOCK_STYLE = 'bg=#2b1645';
 const VOICE_LOCK_OPTION = '@DISCORD_VOICE_LOCK';
+const TMUX_RESOLVE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_RESOLVE_TIMEOUT_MS || 1500);
+const TMUX_WRITE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_WRITE_TIMEOUT_MS || 8000);
+const TMUX_COMMAND_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_COMMAND_TIMEOUT_MS || 3000);
 
 function execFileAsync(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -116,7 +119,7 @@ function paneExists(pane) {
   try {
     execFileSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], {
       encoding: 'utf8',
-      timeout: 3000,
+      timeout: TMUX_RESOLVE_TIMEOUT_MS,
       env: tmuxEnv(),
     });
     return true;
@@ -131,7 +134,7 @@ function markerFallbackPane(target) {
   try {
     const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{@PANE_ID}'], {
       encoding: 'utf8',
-      timeout: 3000,
+      timeout: TMUX_RESOLVE_TIMEOUT_MS,
       env: tmuxEnv(),
     });
     for (const line of out.split(/\r?\n/)) {
@@ -156,7 +159,7 @@ function resolveTargetToPane(target) {
   try {
     const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'physical', raw], {
       encoding: 'utf8',
-      timeout: 5000,
+      timeout: TMUX_RESOLVE_TIMEOUT_MS,
       env: tmuxEnv(),
     }).trim();
     if (out.startsWith('%') && paneExists(out)) return out;
@@ -171,7 +174,7 @@ function publicTargetForPane(pane) {
   try {
     const out = execFileSync(TMUXCTL, ['resolve-pane', '--format', 'id', pane], {
       encoding: 'utf8',
-      timeout: 5000,
+      timeout: TMUX_RESOLVE_TIMEOUT_MS,
       env: tmuxEnv(),
     }).trim();
     return out || pane;
@@ -186,7 +189,7 @@ function displayValue(target, format) {
   try {
     return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
       encoding: 'utf8',
-      timeout: 3000,
+      timeout: TMUX_RESOLVE_TIMEOUT_MS,
       env: tmuxEnv(),
     }).replace(/\n$/, '');
   } catch {
@@ -199,7 +202,7 @@ async function setPaneTitle(target, title) {
   if (!pane) return;
   try {
     await execFileAsync('tmux', ['select-pane', '-t', pane, '-T', title || ''], {
-      timeout: 3000,
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
       env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-title' }),
     });
   } catch {
@@ -211,7 +214,7 @@ async function setPaneStyle(target, style) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
   await execFileAsync('tmux', ['select-pane', '-t', pane, '-P', style || 'bg=default'], {
-    timeout: 3000,
+    timeout: TMUX_COMMAND_TIMEOUT_MS,
     env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-style' }),
   });
 }
@@ -220,7 +223,7 @@ async function setPaneOption(target, option, value) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
   await execFileAsync('tmux', ['set-option', '-p', '-t', pane, option, value], {
-    timeout: 3000,
+    timeout: TMUX_COMMAND_TIMEOUT_MS,
     env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-option' }),
   });
 }
@@ -252,7 +255,7 @@ async function typeIntoTarget(target, text, { bypassGuard = false } = {}) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
   await execFileAsync(TMUX_DICTATE, ['-t', pane, text], {
-    timeout: 15_000,
+    timeout: TMUX_WRITE_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,
     env: tmuxEnv({
       ...(bypassGuard ? { TMUX_GUARD_SKIP: '1' } : {}),
@@ -266,7 +269,7 @@ async function sendKey(target, key) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
   await execFileAsync('tmux', ['send-keys', '-t', pane, key], {
-    timeout: 5000,
+    timeout: TMUX_COMMAND_TIMEOUT_MS,
     env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-command' }),
   });
 }

@@ -14,6 +14,7 @@ import { SlashCommandBuilder, Events } from 'discord.js';
 import { execFile, execFileSync } from 'child_process';
 import { isBenignFixerError } from './fixer-classify.js';
 import { createVoiceTranscriptRouter } from './voice-transcript-router.js';
+import { routeVoiceTranscriptWithRetry } from './voice-route-retry.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -295,7 +296,13 @@ async function main() {
     const botLabel = result.botName || 'voice';
     logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);
     try {
-      const routed = await voiceTranscriptRouter.route(result);
+      const routed = await routeVoiceTranscriptWithRetry({
+        router: voiceTranscriptRouter,
+        voiceManager,
+        logger,
+        result,
+        botLabel,
+      });
       logger.info(`Transcription [${botLabel}]: tmux route ${JSON.stringify(routed)}`);
       if (routed && routed.routed === false && routed.reason) {
         try {
