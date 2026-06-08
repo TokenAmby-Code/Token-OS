@@ -533,6 +533,7 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
 /* chapter / persona identity chip — tinted by its canonical hex (--chip set inline) */
 .chapter-chip {
   --chip: var(--line-bright);
+
   display: inline-flex; align-items: center; gap: 6px;
   padding: 2px 9px; border-radius: 999px; font-size: 11px; white-space: nowrap;
   border: 1px solid color-mix(in srgb, var(--chip) 55%, transparent);

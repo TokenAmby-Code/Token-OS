@@ -54,7 +54,7 @@ function ChapterChip({ inst }: { inst: OpsInstance }) {
   return (
     <span
       className="chapter-chip"
-      style={{ '--chip': inst.chapter_color ?? '#8a8f98' } as React.CSSProperties}
+      style={{ '--chip': inst.chapter_color ?? 'var(--muted)' } as React.CSSProperties}
       title={inst.chapter}
     >
       <span className="chapter-chip__dot" />
