@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -376,6 +377,79 @@ def resolve_beautifier_state(fm: dict) -> tuple[str | None, int | None]:
     return None, None
 
 
+# --- Derived rubric subconditions --------------------------------------------
+#
+# Some rubric keys are NOT read from their literal frontmatter value: they are
+# recomputed from a canonical surface every time the rubric is evaluated, so an
+# Emperor edit to that surface gates victory immediately. The literal value (if
+# any) is overwritten by the derived computation — editing it by hand has no
+# effect. Keeping the compute + explain functions in one registry lets
+# evaluate_rubric() and the diagnostic surfaces stay in lockstep (a missing
+# derived condition can then say *why* it is unmet, instead of looking like a
+# stale/cached read).
+
+
+def _derive_sanguinius_satisfied(fm: dict) -> bool:
+    _, state_int = resolve_beautifier_state(fm)
+    return state_int is not None and state_int >= BEAUTIFIER_TERMINAL_INT
+
+
+def _explain_sanguinius_satisfied(fm: dict) -> dict:
+    persona, state_int = resolve_beautifier_state(fm)
+    is_field = f"{persona}_is" if persona else "<persona>_is"
+    raw = fm.get(is_field) if persona else None
+    if state_int is not None:
+        detail = (
+            f"derived from '{is_field}' (currently {raw!r} → {state_int}); "
+            f"needs ≥ {BEAUTIFIER_TERMINAL_INT} ('folding my wings'). "
+            f"Editing the literal 'sanguinius_satisfied' has no effect — "
+            f"advance '{is_field}' instead."
+        )
+    else:
+        detail = (
+            "derived from a beautifier '<persona>_is' field that is absent or "
+            "unrecognized (e.g. set sanguinius_is: 'folding my wings'). "
+            "Editing the literal 'sanguinius_satisfied' has no effect."
+        )
+    return {
+        "derived_from": is_field,
+        "source_value": raw,
+        "resolved_int": state_int,
+        "terminal_int": BEAUTIFIER_TERMINAL_INT,
+        "detail": detail,
+    }
+
+
+def _derive_commentary_resolved(fm: dict) -> bool:
+    return fm.get("commentary") is None
+
+
+def _explain_commentary_resolved(fm: dict) -> dict:
+    val = fm.get("commentary")
+    if val is not None:
+        detail = (
+            "derived: True iff frontmatter 'commentary' is empty — currently "
+            "set. Reconcile and clear the 'commentary' field to satisfy this."
+        )
+    else:
+        detail = "derived: 'commentary' is empty (satisfied)."
+    return {"derived_from": "commentary", "source_value": val, "detail": detail}
+
+
+# field name → (compute effective bool from fm). Only fields PRESENT in a
+# rubric dict are derived; declaring the key is what opts it in.
+DERIVED_RUBRIC_FIELDS: dict[str, Callable[[dict], bool]] = {
+    "sanguinius_satisfied": _derive_sanguinius_satisfied,
+    "commentary_resolved": _derive_commentary_resolved,
+}
+
+# field name → (human-facing provenance dict). Mirrors DERIVED_RUBRIC_FIELDS.
+DERIVED_RUBRIC_EXPLAINERS: dict[str, Callable[[dict], dict]] = {
+    "sanguinius_satisfied": _explain_sanguinius_satisfied,
+    "commentary_resolved": _explain_commentary_resolved,
+}
+
+
 @dataclass
 class RubricStatus:
     """Evaluated rubric state. Returned by evaluate_rubric/read_rubric."""
@@ -476,29 +550,17 @@ def evaluate_rubric(fm: dict, rubric_key: str | None = None) -> RubricStatus:
         )
 
     # Derived subconditions: always recomputed from canonical frontmatter
-    # surfaces so Emperor edits gate victory immediately.
+    # surfaces so Emperor edits gate victory immediately. The literal value in
+    # the rubric dict is overwritten — see DERIVED_RUBRIC_FIELDS for the source
+    # surfaces (e.g. `sanguinius_satisfied` ← beautifier `<persona>_is` state;
+    # `commentary_resolved` ← `commentary` being empty).
     derived_dirty = False
-
-    # `commentary_resolved`: True iff fm['commentary'] is None. Emperor sets
-    # `commentary: "..."` as an inbox; the next Astartes reconciles it and
-    # clears the field.
-    if "commentary_resolved" in rubric_value:
-        if not derived_dirty:
-            rubric_value = dict(rubric_value)
-            derived_dirty = True
-        rubric_value["commentary_resolved"] = fm.get("commentary") is None
-
-    # `sanguinius_satisfied`: True iff a beautifier `<persona>_is` field
-    # resolves to its terminal integer (>=3, "folding my wings"). Generic so
-    # the same gate works under `designer_is` in vaults that swap the theme.
-    if "sanguinius_satisfied" in rubric_value:
-        if not derived_dirty:
-            rubric_value = dict(rubric_value)
-            derived_dirty = True
-        _, state_int = resolve_beautifier_state(fm)
-        rubric_value["sanguinius_satisfied"] = (
-            state_int is not None and state_int >= BEAUTIFIER_TERMINAL_INT
-        )
+    for dkey, compute in DERIVED_RUBRIC_FIELDS.items():
+        if dkey in rubric_value:
+            if not derived_dirty:
+                rubric_value = dict(rubric_value)
+                derived_dirty = True
+            rubric_value[dkey] = compute(fm)
 
     skip_set = set(skip)
     missing = [k for k, v in rubric_value.items() if not bool(v) and k not in skip_set]
@@ -521,6 +583,65 @@ def read_rubric(file_path: Path, rubric_key: str | None = None) -> RubricStatus:
     """Read frontmatter from disk and evaluate the rubric."""
     fm, _ = read_frontmatter(file_path)
     return evaluate_rubric(fm, rubric_key)
+
+
+def describe_rubric(fm: dict, rubric_key: str | None = None) -> dict:
+    """Rich, human-facing breakdown of a rubric: effective values + provenance.
+
+    Returns the evaluated status plus, per declared field, whether it is derived
+    and from what surface — so an operator can see (e.g.) that
+    `sanguinius_satisfied` is computed from the beautifier `<persona>_is` state
+    and that editing the literal field does nothing. Pure: never touches disk
+    (caller supplies fm) and never mutates.
+    """
+    status = evaluate_rubric(fm, rubric_key)
+    rubric = status.rubric if isinstance(status.rubric, dict) else {}
+    skip_set = set(status.skipped)
+    fields: dict[str, dict] = {}
+    for key, value in rubric.items():
+        entry: dict[str, Any] = {
+            "value": bool(value),
+            "derived": key in DERIVED_RUBRIC_FIELDS,
+            "skipped": key in skip_set,
+            "unmet": (not bool(value)) and key not in skip_set,
+        }
+        explainer = DERIVED_RUBRIC_EXPLAINERS.get(key)
+        if explainer is not None:
+            entry.update(explainer(fm))
+        fields[key] = entry
+    return {
+        "rubric_key": status.rubric_key,
+        "present": status.present,
+        "legacy_string": status.legacy_string,
+        "complete": status.complete,
+        "missing": status.missing,
+        "skipped": status.skipped,
+        "fields": fields,
+        "acknowledged_at": status.acknowledged_at,
+        "notified_at": status.notified_at,
+        "reason": status.reason,
+    }
+
+
+def explain_unmet(fm: dict, missing: list[str], rubric_key: str | None = None) -> list[dict]:
+    """Build per-field explanations for unmet rubric conditions.
+
+    Used by the victory-ack 409 path so a derived condition surfaces *why* it is
+    unmet (and that editing its literal won't help) rather than reading like a
+    stale file.
+    """
+    diag = describe_rubric(fm, rubric_key)
+    out: list[dict] = []
+    for name in missing:
+        field = diag["fields"].get(name, {})
+        out.append(
+            {
+                "field": name,
+                "derived": field.get("derived", False),
+                "detail": field.get("detail"),
+            }
+        )
+    return out
 
 
 def update_rubric_field(

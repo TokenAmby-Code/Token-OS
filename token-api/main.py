@@ -134,7 +134,9 @@ from session_doc_helpers import (
     _update_doc_agents_list,
     bump_session_doc_up_to_date,
     create_session_doc_file,
+    describe_rubric,
     evaluate_rubric,
+    explain_unmet,
     human_filename_stem,
     mark_rubric_acknowledged,
     mark_rubric_notified,
@@ -1447,6 +1449,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     recovered_gt = await recover_recent_stopped_golden_throne_timers()
     if recovered_gt:
         print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
+    # Safety net: re-run GT recovery on an interval so a timer the in-memory
+    # scheduler loses *after* startup (restart mid-wait, transient stale-pane
+    # skip) self-heals instead of stranding the session until the next restart.
+    scheduler.add_job(
+        _golden_throne_sweep_sync,
+        IntervalTrigger(seconds=GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS),
+        id="golden_throne_timer_sweep",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     # Re-arm the morning supervisor poller if we restarted inside today's
     # supervision window (the relative poller lives in the in-memory jobstore
     # and is otherwise lost across a restart; the 04:00 cron only re-arms daily).
@@ -3007,6 +3020,16 @@ ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 60}
 GT_ENFORCEMENT_RESUME_THRESHOLD = 2
 GT_RESUME_WINDOW = timedelta(hours=24)
 GOLDEN_THRONE_QUIET_HOURS_BUFFER = timedelta(minutes=5)
+# Safety-net cadence for re-arming GT timers the in-memory scheduler lost. The
+# scheduler has no persistent jobstore (by design — see the morning-supervisor
+# recovery note), so a token-api restart mid-wait drops every pending GT
+# date-job, and the one-shot startup recovery runs only once. Without a periodic
+# re-run, a dropped timer (or one skipped by a transient stale-pane check)
+# strands the session until the next restart or a human intervenes — the >12h
+# stall seen in the GT proof. This interval bounds that stranding. Env-tunable.
+GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS = int(
+    os.environ.get("TOKEN_API_GT_SWEEP_INTERVAL_SECONDS", "120")
+)
 
 EXPECTED_ACK_PENDING = "pending"
 EXPECTED_ACK_TERMINAL_STATUSES = {
@@ -3849,6 +3872,27 @@ async def recover_coderabbit_sync_jobs() -> list[str]:
     return armed
 
 
+def _zealotry_delay_seconds(zealotry: int) -> int:
+    """Map a zealotry level to its GT re-poke delay, clamped to the table.
+
+    ZEALOTRY_DELAY_MAP is keyed 4..10 (4 = loosest 1800s, 10 = tightest 60s). The
+    old `.get(zealotry, MAP[4])` silently resolved ANY out-of-range value to the
+    LOOSEST delay — so a >10 zealotry (which should be the *tightest* leash) would
+    quietly become 1800s. Ingress is guarded (PATCH + launch parse reject >10),
+    but guard the read too: clamp to the nearest valid level and log loudly, so a
+    bad value can never silently loosen the leash.
+    """
+    lo, hi = min(ZEALOTRY_DELAY_MAP), max(ZEALOTRY_DELAY_MAP)
+    if zealotry not in ZEALOTRY_DELAY_MAP:
+        clamped = max(lo, min(zealotry, hi))
+        logger.warning(
+            f"Golden Throne: zealotry={zealotry} out of range {lo}-{hi}; "
+            f"clamping to {clamped} (never silent-loosest)"
+        )
+        zealotry = clamped
+    return ZEALOTRY_DELAY_MAP[zealotry]
+
+
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
     """Arm the one-shot Golden Throne follow-up timer for an idle instance.
 
@@ -3885,7 +3929,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
 
-    delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, ZEALOTRY_DELAY_MAP[4])
+    delay_seconds = _zealotry_delay_seconds(zealotry)
     original_fire_at = datetime.now() + timedelta(seconds=delay_seconds)
     fire_at = original_fire_at
     quiet_hours = shared.get_quiet_hours_status()
@@ -4005,6 +4049,29 @@ async def recover_recent_stopped_golden_throne_timers(
         )
         logger.info(f"Golden Throne: recovered {len(recovered)} stopped GT timer(s)")
     return recovered
+
+
+def _golden_throne_sweep_sync() -> dict:
+    """Interval-job entry: periodically re-run GT timer recovery.
+
+    The one-shot startup recovery cannot heal a timer dropped *after* startup (a
+    restart mid-wait, or a session whose pane was transiently stale at startup).
+    Running the same idempotent recovery on an interval lets such timers
+    self-heal within GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS instead of stranding
+    the session. Bridges to the loop like _golden_throne_followup_sync.
+    """
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                recover_recent_stopped_golden_throne_timers(), APP_LOOP
+            )
+            recovered = future.result(timeout=120)
+        else:
+            recovered = asyncio.run(recover_recent_stopped_golden_throne_timers())
+        return {"success": True, "recovered": len(recovered)}
+    except Exception as exc:
+        logger.exception("Golden Throne: periodic timer sweep failed")
+        return {"success": False, "error": str(exc)}
 
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
@@ -9414,6 +9481,26 @@ async def _victory_ack_core(
             and not rubric_status.legacy_string
         ):
             if not rubric_status.complete:
+                # Explain each unmet condition. Derived fields (e.g.
+                # sanguinius_satisfied ← beautifier <persona>_is state) report
+                # their source so an operator does not mistake the derivation for
+                # a stale/cached file read and waste time touching the literal.
+                try:
+                    fm_now, _ = await asyncio.to_thread(read_frontmatter, doc_path)
+                    unmet = explain_unmet(fm_now, rubric_status.missing, rubric_status.rubric_key)
+                except Exception as exc:
+                    logger.warning(f"victory-ack: unmet-explain failed for {doc_path}: {exc}")
+                    unmet = [
+                        {"field": m, "derived": False, "detail": None}
+                        for m in rubric_status.missing
+                    ]
+                derived_unmet = [u for u in unmet if u.get("derived") and u.get("detail")]
+                derived_note = (
+                    " Note — these are DERIVED, not literal fields: "
+                    + "; ".join(f"{u['field']} {u['detail']}" for u in derived_unmet)
+                    if derived_unmet
+                    else ""
+                )
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -9421,23 +9508,27 @@ async def _victory_ack_core(
                         "doc_id": doc_id,
                         "missing": rubric_status.missing,
                         "skipped": rubric_status.skipped,
+                        "unmet": unmet,
                         "message": (
                             "Cannot ack victory — these conditions are unmet: "
                             + ", ".join(rubric_status.missing)
                             + ". Address them, mark inapplicable ones in "
-                            f"{rubric_status.rubric_key}_skip, or pass force=true."
+                            f"{rubric_status.rubric_key}_skip, or pass force=true." + derived_note
                         ),
                     },
                 )
 
-        # Stamp rubric ack on the session-doc frontmatter (modern path).
+        # Stamp rubric ack on the session-doc frontmatter (modern path) and
+        # mirror the archive status onto the file. Without the status write the
+        # file frontmatter keeps `status: active` while the DB row below flips to
+        # `archived` — the DB↔file divergence observed during the GT proof.
         if doc_path and doc_path.exists():
             try:
                 await asyncio.to_thread(mark_rubric_acknowledged, doc_path, reason)
+                file_updates = {"status": "archived"}
                 if deliverables:
-                    await asyncio.to_thread(
-                        update_frontmatter, doc_path, {"deliverables": deliverables}
-                    )
+                    file_updates["deliverables"] = deliverables
+                await asyncio.to_thread(update_frontmatter, doc_path, file_updates)
             except Exception as exc:
                 logger.warning(f"victory-ack: frontmatter ack failed for {doc_path}: {exc}")
 
@@ -23420,6 +23511,140 @@ async def get_session_doc_content(doc_id: int):
         raise HTTPException(status_code=404, detail=f"File not found: {fp}")
 
     return {"id": doc_id, "title": row[1], "file_path": str(fp), "content": fp.read_text()}
+
+
+@app.get("/api/session-docs/{doc_id}/rubric")
+async def get_session_doc_rubric(doc_id: int):
+    """Diagnostic: surface exactly what victory-ack sees for a doc's rubric.
+
+    Resolves the rubric the same way victory-ack does (fresh disk read +
+    evaluate_rubric) and reports per-field provenance — crucially, which
+    subconditions are DERIVED (e.g. `sanguinius_satisfied` is computed from the
+    beautifier `<persona>_is` state, not a literal field; `commentary_resolved`
+    from `commentary` being empty). Also surfaces DB↔file `status` divergence and
+    the file mtime so a "stale read?" hunch can be confirmed or dismissed at a
+    glance. Read-only; never mutates.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, file_path, title, status FROM session_documents WHERE id = ?",
+            (doc_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+    doc_path = Path(row["file_path"]) if row["file_path"] else None
+    db_status = row["status"]
+
+    file_exists = bool(doc_path and doc_path.exists())
+    file_status = None
+    file_mtime = None
+    rubric_diag = None
+    read_error = None
+    if file_exists:
+        try:
+            fm, _ = await asyncio.to_thread(read_frontmatter, doc_path)
+            file_status = fm.get("status")
+            rubric_diag = describe_rubric(fm)
+            stat = await asyncio.to_thread(doc_path.stat)
+            file_mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        except Exception as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "doc_id": doc_id,
+        "title": row["title"],
+        "file_path": str(doc_path) if doc_path else None,
+        "file_exists": file_exists,
+        "file_mtime": file_mtime,
+        "db_status": db_status,
+        "file_status": file_status,
+        "status_divergent": file_status is not None and db_status != file_status,
+        "ackable_without_force": bool(rubric_diag and rubric_diag["complete"]),
+        "rubric": rubric_diag,
+        "read_error": read_error,
+    }
+
+
+@app.get("/api/golden-throne/timers")
+async def get_golden_throne_timers():
+    """Diagnostic: GT timer liveness for every live (pre-ack) Golden Throne
+    instance — is a follow-up job armed, when does it next fire, and is it
+    overdue?
+
+    The driven agent has no in-thread signal distinguishing "leash loosened"
+    (longer zealotry delay) from "timer stalled" (job lost on a restart). This
+    surfaces the actual scheduler state — armed/next_fire/overdue — so liveness
+    is auditable from outside the thread. `unarmed`/`overdue` counts > 0 mean the
+    next sweep (every sweep_interval_seconds) should re-arm them. Read-only.
+    """
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.id, ci.tab_name, ci.status, ci.zealotry, ci.device_id,
+                   ci.session_doc_id, sd.status AS doc_status
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+            WHERE ci.instance_type = 'golden_throne'
+              AND ci.status IN ('idle', 'stopped')
+              AND COALESCE(ci.zealotry, 4) >= 4
+              AND (sd.status IS NULL OR sd.status != 'archived')
+            ORDER BY ci.last_activity DESC
+            """,
+        )
+        rows = await cursor.fetchall()
+
+    timers = []
+    unarmed = 0
+    overdue_count = 0
+    for row in rows:
+        iid = row["id"]
+        zealotry = int(row["zealotry"] or 4)
+        job = scheduler.get_job(f"golden-throne-{iid}")
+        armed = job is not None
+        next_fire = None
+        seconds_until = None
+        # A pending job on a not-yet-started scheduler carries the `undefined`
+        # sentinel rather than a datetime — guard so this never 500s.
+        nrt = getattr(job, "next_run_time", None) if job is not None else None
+        if isinstance(nrt, datetime):
+            next_fire = nrt.isoformat()
+            seconds_until = nrt.timestamp() - now.timestamp()
+        overdue = (not armed) or (
+            seconds_until is not None and seconds_until < -ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS
+        )
+        if not armed:
+            unarmed += 1
+        if overdue:
+            overdue_count += 1
+        timers.append(
+            {
+                "instance_id": iid,
+                "tab_name": row["tab_name"],
+                "status": row["status"],
+                "zealotry": zealotry,
+                "expected_delay_seconds": _zealotry_delay_seconds(zealotry),
+                "device_id": row["device_id"],
+                "doc_id": row["session_doc_id"],
+                "armed": armed,
+                "next_fire": next_fire,
+                "seconds_until_fire": seconds_until,
+                "overdue": overdue,
+            }
+        )
+
+    return {
+        "now": now.isoformat(),
+        "sweep_interval_seconds": GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS,
+        "count": len(timers),
+        "unarmed": unarmed,
+        "overdue": overdue_count,
+        "timers": timers,
+    }
 
 
 @app.patch("/api/session-docs/{doc_id}")
