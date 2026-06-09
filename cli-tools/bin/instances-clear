@@ -25,10 +25,33 @@ from datetime import datetime
 DB_PATH = Path.home() / ".claude" / "agents.db"
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
+# Persona singleton rows are the canonical DB identity of the orchestrator panes
+# (custodes / Fabricator-General / Administratum). They are resolved by the
+# state-hook dispatcher (e.g. `_resolve_administratum_instance` keys on
+# `primarch='administratum'`) and reactivated in-place by the tmuxctl persona
+# watchdog when their pane goes idle. Hard-deleting a *stopped* persona row
+# stranded the live runtime as "live_runtime_missing_registry": the watchdog
+# could no longer reactivate it, fell back to re-injecting `/persona <name>`
+# (a no-op for singleton panes), and span that correction every ~5 min forever.
+# So: never auto-clear a persona row — preserve it for reactivation.
+PERSONA_PRIMARCHS = {"custodes", "fabricator-general", "administratum"}
+PERSONA_PANE_LABELS = {
+    "legion:custodes",
+    "mechanicus:fabricator-general",
+    "mechanicus:admin",
+}
+
+def _is_persona_row(inst: dict) -> bool:
+    """True when the row is an orchestrator-persona singleton (never auto-clear)."""
+    return (
+        (inst.get("primarch") or "") in PERSONA_PRIMARCHS
+        or (inst.get("pane_label") or "") in PERSONA_PANE_LABELS
+    )
+
 def get_instances(include_active: bool = False):
-    """Get instances from the database."""
+    """Get instances from the database (excluding persona singleton rows)."""
     if not DB_PATH.exists():
-        return []
+        return [], 0
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -39,9 +62,13 @@ def get_instances(include_active: bool = False):
         query = "SELECT * FROM claude_instances WHERE status = 'stopped' ORDER BY stopped_at DESC"
 
     cursor = conn.execute(query)
-    instances = [dict(row) for row in cursor.fetchall()]
+    rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
-    return instances
+
+    # Persona singleton rows are protected from clearing regardless of --all.
+    instances = [r for r in rows if not _is_persona_row(r)]
+    preserved = len(rows) - len(instances)
+    return instances, preserved
 
 def delete_instance(instance_id: str) -> bool:
     """Delete an instance from the database."""
@@ -92,15 +119,19 @@ def main():
         print("Error: --all requires --confirm (this would delete active instances!)", file=sys.stderr)
         sys.exit(1)
 
-    instances = get_instances(include_active=include_active)
+    instances, preserved = get_instances(include_active=include_active)
+
+    persona_note = (
+        f" ({preserved} persona singleton row(s) preserved)" if preserved else ""
+    )
 
     if not instances:
-        print("No stopped instances to clear")
+        print(f"No stopped instances to clear{persona_note}")
         sys.exit(0)
 
     if not confirm:
         # Dry run - just show what would be deleted
-        print(f"Stopped instances ({len(instances)}):")
+        print(f"Stopped instances ({len(instances)}):{persona_note}")
         for inst in instances:
             print(format_instance(inst))
         print(f"\nRun with --confirm to delete these {len(instances)} instance(s)")

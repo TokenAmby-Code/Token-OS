@@ -53,6 +53,7 @@ def build_registry_snapshot(
                 engine=str(row.get("engine", "") or ""),
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
+                primarch=str(row.get("primarch", "") or ""),
             )
         )
     return InstanceRegistrySnapshot(device_id=device_id, instances=tuple(normalized))

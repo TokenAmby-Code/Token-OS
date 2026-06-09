@@ -338,6 +338,17 @@ if [[ -d "$PROFILE_DIR" ]]; then
     if [[ -f "$PROFILE_DIR/settings.json" ]]; then
         PROFILE_FLAGS+=(--settings "$PROFILE_DIR/settings.json")
     fi
+    # Pin the model for cost-bounded personas. The Administratum recorder is
+    # explicitly a Sonnet pane (it stays hot on the state-hook firehose and must
+    # not burn Opus). A `model` file in the profile dir (e.g. "sonnet") forces
+    # --model on launch; without it the persona inherits the global default.
+    if [[ -f "$PROFILE_DIR/model" ]]; then
+        PROFILE_MODEL="$(tr -d '[:space:]' < "$PROFILE_DIR/model")"
+        if [[ -n "$PROFILE_MODEL" ]]; then
+            PROFILE_FLAGS+=(--model "$PROFILE_MODEL")
+            echo -e "${DIM}Model: $PROFILE_MODEL${NC}"
+        fi
+    fi
     [[ ${#PROFILE_FLAGS[@]} -gt 0 ]] && echo -e "${DIM}Profile: $PROFILE_DIR${NC}"
 fi
 
