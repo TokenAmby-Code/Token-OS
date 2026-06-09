@@ -29,22 +29,15 @@ else
     SESSION_ID="$(printf '%s' "$INPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("session_id") or d.get("conversation_id") or "")' 2>/dev/null || true)"
 fi
 
-case "$AGENT" in
-    claude)
-        [[ -n "$SESSION_ID" ]] && RESUME_CMD="claude --resume ${SESSION_ID}" || RESUME_CMD=""
-        ;;
-    codex)
-        if [[ -n "$SESSION_ID" ]]; then
-            printf -v RESUME_CMD 'dispatch --direct --engine codex --resume %q --pane %q --dir "$PWD" --prompt %q' \
-                "$SESSION_ID" "$PANE" "Resume this Codex session."
-        else
-            RESUME_CMD=""
-        fi
-        ;;
-    *)
-        RESUME_CMD=""
-        ;;
-esac
+INSTANCE_ID=""
+if command -v tmux >/dev/null 2>&1; then
+    INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
+fi
+RESUME_ID="${INSTANCE_ID:-$SESSION_ID}"
+RESUME_CMD=""
+if [[ -n "$RESUME_ID" ]]; then
+    printf -v RESUME_CMD 'dispatch --id %q --pane self' "$RESUME_ID"
+fi
 
 SENTINEL="/tmp/agent-resume-${PANE}"
 TMP="${SENTINEL}.tmp.$$"
@@ -52,7 +45,7 @@ printf '%s\n%s\n%s\n' "$AGENT" "$OLD_PWD" "$RESUME_CMD" > "$TMP"
 mv "$TMP" "$SENTINEL"
 
 # Compatibility for already-open shells that only know about the old Claude
-# sentinel name. The sentinel payload is just a command, so it is agent-agnostic.
+# sentinel name. Payload is still the generic dispatch resume command.
 LEGACY="/tmp/claude-resume-${PANE}"
 LEGACY_TMP="${LEGACY}.tmp.$$"
 printf '%s' "$RESUME_CMD" > "$LEGACY_TMP"
