@@ -3483,6 +3483,97 @@ async def _gt_clear_fire(instance_id: str) -> None:
         logger.debug(f"GT: @GT_FIRE clear failed for {instance_id[:12]} ({pane}): {exc}")
 
 
+# --- Timer status segment push (@TIMER_SEG) ----------------------------------
+#
+# status-right used to fork `#(tmux-status)` every status-interval — a blocking
+# urllib GET /api/timer to an SMB-resident Python script on EVERY render. Instead
+# the timer worker pushes a pre-formatted segment to the GLOBAL tmux option
+# @TIMER_SEG; the bar reads `#{@TIMER_SEG}` in-format with ZERO fork. Formatting
+# is ported byte-for-byte from cli-tools/bin/tmux-status (kept as a `--plain`
+# debug tool) so the rendered bar is identical — the test cross-checks both.
+
+# Icon glyphs match cli-tools/bin/tmux-status byte-for-byte — verified by the
+# cross-check test, which diffs this against the legacy script's own output.
+# Note "distracted" carries the U+FE0F emoji variation selector after U+26A0.
+_TIMER_MODE_ICONS = {
+    "working": "\U0001f4bc",  # 💼
+    "multitasking": "⚡",  # ⚡
+    "idle": "⏸",  # ⏸
+    "distracted": "⚠️",  # ⚠️
+    "break": "☕",  # ☕
+    "sleeping": "\U0001f319",  # 🌙
+}
+
+# Modes where showing the break balance is meaningful (ported from tmux-status).
+_TIMER_BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+
+
+def _fmt_timer_balance_compact(seconds: int) -> str:
+    """Compact balance string: +14m, -2m, +2h3m, +45s.
+
+    Ported byte-for-byte from cli-tools/bin/tmux-status.fmt_balance_compact.
+    """
+    sign = "+" if seconds >= 0 else "-"
+    abs_s = abs(int(seconds))
+    if abs_s < 60:
+        return f"{sign}{abs_s}s"
+    elif abs_s < 3600:
+        return f"{sign}{abs_s // 60}m"
+    else:
+        h = abs_s // 3600
+        m = (abs_s % 3600) // 60
+        if m == 0:
+            return f"{sign}{h}h"
+        return f"{sign}{h}h{m:02d}m"
+
+
+def _format_timer_status_segment(mode: str | None, break_balance_ms: int) -> str:
+    """Build the tmux-colored timer segment (icon + signed balance).
+
+    Mirrors the default (no-flag) output of cli-tools/bin/tmux-status exactly,
+    deriving from the live engine the same fields /api/timer exposes to the script:
+      is_in_backlog             = break_balance_ms < 0
+      break_backlog_ms          = abs(min(0, break_balance_ms))
+      accumulated_break_seconds = round(max(0, break_balance_ms) / 1000)
+    Returns e.g. "💼 #[fg=green]+14m#[default]" or "🌙" (no balance for that mode).
+    """
+    mode = (mode or "").lower()
+    icon = _TIMER_MODE_ICONS.get(mode, "?")
+    parts = [icon]
+    if mode in _TIMER_BALANCE_MODES:
+        if break_balance_ms < 0:
+            bal_s = -round(abs(min(0, break_balance_ms)) / 1000)
+        else:
+            bal_s = round(max(0, break_balance_ms) / 1000)
+        bal_str = _fmt_timer_balance_compact(bal_s)
+        if bal_s > 1800:
+            fg = "green"
+        elif bal_s > 0:
+            fg = "yellow"
+        else:
+            fg = "red"
+        parts.append(f"#[fg={fg}]{bal_str}#[default]")
+    return " ".join(parts)
+
+
+async def _timer_push_segment(segment: str) -> None:
+    """Push the pre-formatted timer segment to the GLOBAL @TIMER_SEG tmux option.
+
+    The bar renders `#{@TIMER_SEG}` in-format (zero fork) instead of forking
+    `#(tmux-status)` every status-interval. Global (-g), not pane-scoped: the timer
+    is a singleton. Best-effort, never raises — no tmux server just no-ops.
+    """
+    try:
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-g", "@TIMER_SEG", segment),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"TIMER: @TIMER_SEG push failed: {exc}")
+
+
 # --- CodeRabbit review sync (poller -> reconciler -> rubric) ------------------
 #
 # A dedicated APScheduler interval job per open-PR instance polls CodeRabbit's
@@ -17939,11 +18030,20 @@ async def timer_worker():
     last_db_save = 0.0
     last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
+    last_pushed_seg: str | None = None
     today = datetime.now().strftime("%Y-%m-%d")
 
     # Start initial session
     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
     _session_start_ms = int(time.monotonic() * 1000)
+
+    # Hydrate @TIMER_SEG immediately so a freshly (re)started server populates the
+    # status bar at once, instead of leaving the last (now-stale) value or a blank
+    # until the first tick lands.
+    last_pushed_seg = _format_timer_status_segment(
+        timer_engine.current_mode.value, timer_engine.break_balance_ms
+    )
+    await _timer_push_segment(last_pushed_seg)
 
     while True:
         try:
@@ -18218,6 +18318,18 @@ async def timer_worker():
             if now - last_db_save >= 10:
                 await timer_save_to_db()
                 last_db_save = now
+
+            # Push the pre-formatted timer segment to @TIMER_SEG when it changes,
+            # so the status bar reads it in-format with zero per-render fork (the
+            # #(tmux-status) HTTP-poll shell-out is gone). The segment changes only
+            # on a mode flip (icon) or a minute/threshold rollover of the balance —
+            # ~1 push/min plus instant mode transitions, not once per tick.
+            seg = _format_timer_status_segment(
+                timer_engine.current_mode.value, timer_engine.break_balance_ms
+            )
+            if seg != last_pushed_seg:
+                await _timer_push_segment(seg)
+                last_pushed_seg = seg
 
         except asyncio.CancelledError:
             # Save state on shutdown
