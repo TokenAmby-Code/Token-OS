@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shlex
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -87,7 +88,7 @@ def _run_action_capturing_send_env(
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\n%s\\n" "$TMUX_SEND_GATE_POLICY" "$TMUX_SEND_GATE_ALLOW" > "{recorder}"\n'
+        f'printf "%s\\n%s\\n" "$TMUX_SEND_GATE_POLICY" "$TMUX_SEND_GATE_ALLOW" > {shlex.quote(str(recorder))}\n'
         "exit 0\n"
     )
     fake_tmux.chmod(0o755)
