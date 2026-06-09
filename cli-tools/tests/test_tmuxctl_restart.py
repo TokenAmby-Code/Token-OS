@@ -176,7 +176,8 @@ def test_restart_plan_flags_busy_targets_and_pane_id_drift():
 
     codes = {issue.code: issue.severity for issue in plan.coherence_issues}
     assert codes["pane_id_mismatch"] is CoherenceSeverity.WARNING
-    assert codes["target_busy"] is CoherenceSeverity.ERROR
+    assert codes["target_busy"] is CoherenceSeverity.WARNING
+    assert not plan.has_errors
 
 
 def test_restart_plan_flags_codex_targets_busy():
@@ -189,7 +190,8 @@ def test_restart_plan_flags_codex_targets_busy():
     plan = build_restart_plan(workspace, registry)
 
     codes = {issue.code: issue.severity for issue in plan.coherence_issues}
-    assert codes["target_busy"] is CoherenceSeverity.ERROR
+    assert codes["target_busy"] is CoherenceSeverity.WARNING
+    assert not plan.has_errors
 
 
 def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
