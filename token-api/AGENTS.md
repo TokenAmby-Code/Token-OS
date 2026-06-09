@@ -423,28 +423,22 @@ token-ping notify/test           # or: curl -s http://localhost:7777/api/notify/
 
 **Testing TTS:** After running a TTS test, sleep for ~10 seconds before continuing so the user can confirm whether they heard sound and/or speech.
 
-## Profile System
+## Persona Registry
 
-### Voice Pool (9 foreign accents + 3 fallback)
+The `personas` SQLite table is the runtime authority for display identity,
+chip color, pane tint, TTS voice/rate, notification sound, and assignment
+order. Astartes instances receive the first unlocked seeded Astartes persona
+in assignment order; active `processing`/`idle` rows lock their persona, and
+stopped rows release it. `claude_instances.profile_name` temporarily stores the
+persona slug until the instances-table refactor adds first-class `persona_id`.
 
-Voices assigned via **random-start linear probe** (open addressing): one random call per slot, increment on collision. Only active instances (`processing`/`idle`) hold a voice — stopped instances release theirs.
+Manual `/api/instances/{id}/voice` changes are persona changes: the requested
+voice must map to a seeded Astartes persona, `profile_name` and TTS fields are
+updated together, and another active instance is never bumped by voice.
 
-**Primary pool** (foreign accents, distinct and identifiable):
-
-| Profile | WSL Voice | Mac Fallback | Region | Sound |
-|---------|-----------|-------------|--------|-------|
-| profile_1 | Microsoft George | Daniel | UK M | chimes.wav |
-| profile_2 | Microsoft Susan | Karen | UK F | notify.wav |
-| profile_3 | Microsoft Catherine | Karen | AU F | ding.wav |
-| profile_4 | Microsoft James | Daniel | AU M | tada.wav |
-| profile_5 | Microsoft Sean | Moira | IE M | chord.wav |
-| profile_6 | Microsoft Hazel | Moira | IE F | recycle.wav |
-| profile_7 | Microsoft Heera | Rishi | IN F | chimes.wav |
-| profile_8 | Microsoft Ravi | Rishi | IN M | notify.wav |
-| profile_9 | Microsoft Linda | Karen | CA F | ding.wav |
-
-**Fallback pool** (US English, used when primary is exhausted):
-- David, Zira, Mark → less distinct, but functional
+Custodes is a singleton persona with reserved George TTS. Fabricator-General,
+Administratum, Inquisitor, and Primarch personas are silent (`tts_voice NULL`)
+unless explicitly changed in the seeded registry.
 
 ## Provenance And Reconciliation
 

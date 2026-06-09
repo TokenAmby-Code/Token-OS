@@ -512,3 +512,76 @@ ALL_COMPAT_PROFILES = [
     *PERSONA_COMPAT_PROFILES,
 ]
 PROFILE_BY_SLUG = {p["name"]: p for p in ALL_COMPAT_PROFILES}
+
+
+def profile_by_tts_voice(tts_voice: str | None, *, default_rank: str | None = None) -> dict | None:
+    """Resolve a seeded persona compatibility profile by its Windows TTS voice.
+
+    ``tts_voice`` is not globally unique forever (the Deathwatch overflow uses
+    the same emergency voice as a backup chapter), so results are ordered the
+    same way assignment is ordered: primary Astartes, backup Astartes, overflow,
+    then singleton/Primarch compatibility profiles.
+    """
+    if not tts_voice:
+        return None
+    for profile in ALL_COMPAT_PROFILES:
+        if profile.get("wsl_voice") != tts_voice:
+            continue
+        if default_rank and profile.get("default_rank") != default_rank:
+            continue
+        return profile
+    return None
+
+
+def voice_settings_for_tts_voice(tts_voice: str | None) -> dict:
+    """Return TTS playback settings for a seeded persona voice.
+
+    Unknown voices keep the historical safe defaults so direct notification
+    overrides still work, but normal queued/runtime instance voices resolve
+    through the persona registry projection instead of hand-iterating pools.
+    """
+    profile = profile_by_tts_voice(tts_voice)
+    return {
+        "wsl_voice": tts_voice,
+        "mac_voice": (profile or {}).get("mac_voice") or "Daniel",
+        "wsl_rate": (profile or {}).get("wsl_rate") or 0,
+        "profile": profile,
+    }
+
+
+async def astartes_persona_by_tts_voice(db: aiosqlite.Connection, tts_voice: str) -> dict | None:
+    """Resolve a selectable Astartes persona row for a requested TTS voice."""
+    cursor = await db.execute(
+        """
+        SELECT *
+        FROM personas
+        WHERE default_rank = 'astartes'
+          AND assignment_pool IN ('primary', 'backup')
+          AND tts_voice = ?
+        ORDER BY CASE assignment_pool WHEN 'primary' THEN 0 WHEN 'backup' THEN 1 ELSE 2 END,
+                 assignment_order IS NULL,
+                 assignment_order,
+                 slug
+        LIMIT 1
+        """,
+        (tts_voice,),
+    )
+    return _row_to_dict(await cursor.fetchone())
+
+
+async def selectable_astartes_personas(db: aiosqlite.Connection) -> list[dict]:
+    """Return seeded Astartes rows available for manual voice selection."""
+    cursor = await db.execute(
+        """
+        SELECT *
+        FROM personas
+        WHERE default_rank = 'astartes'
+          AND assignment_pool IN ('primary', 'backup')
+          AND tts_voice IS NOT NULL
+        ORDER BY CASE assignment_pool WHEN 'primary' THEN 0 WHEN 'backup' THEN 1 ELSE 2 END,
+                 assignment_order IS NULL,
+                 assignment_order,
+                 slug
+        """
+    )
+    return [_row_to_dict(row) for row in await cursor.fetchall()]
