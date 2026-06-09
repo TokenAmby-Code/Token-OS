@@ -177,6 +177,21 @@ def _send_persona_command(adapter: TmuxAdapter, pane_id: str, persona: str) -> t
 # the independent per-tick invocations, matching the @CC_STATE/@TTS_STATE idiom.
 PERSONA_GUARD_OPTION = "@PERSONA_ASSERT_GUARD"
 PERSONA_GUARD_BACKOFF_SECONDS = 300.0
+PANE_CLOSE_TRANSIENT_OPTIONS = (
+    "@INSTANCE_ID",
+    "@PANE_LABEL",
+    "@CC_STATE",
+    "@TTS_STATE",
+    "@CONTEXT_INFO",
+    "@STACK_PENDING",
+    "@ACTIVE_TITLE",
+    "@PROGRESS_TITLE",
+    "@PANE_PROGRESS",
+    "@GT_FIRE",
+    "@PLANNING_STATE",
+    "@PLANNING_AGENT",
+    "@DISCORD_VOICE_LOCK",
+)
 
 
 def _observed_row_hash(row, spec: PersonaSpec) -> str:
@@ -338,34 +353,19 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
 
 
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
-    """Clear transient operator chrome without touching durable pane identity."""
+    """Clear close-time pane chrome/state without touching durable pane identity."""
     current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
-    voice_locked = adapter.run(
-        "show-options",
-        "-pqv",
-        "-t",
-        pane_id,
-        "@DISCORD_VOICE_LOCK",
-        allow_failure=True,
-    ).strip()
-    if voice_locked == "1":
-        return
+    pane_label = adapter.show_pane_option(pane_id, "@PANE_ID")
     if current == pane_id:
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
     adapter.run(
         "set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True
     )
-    for option in (
-        "@CC_STATE",
-        "@TTS_STATE",
-        "@CONTEXT_INFO",
-        "@STACK_PENDING",
-        "@ACTIVE_TITLE",
-        "@PROGRESS_TITLE",
-        "@PANE_PROGRESS",
-    ):
+    for option in PANE_CLOSE_TRANSIENT_OPTIONS:
         adapter.run("set-option", "-pu", "-t", pane_id, option, allow_failure=True)
+    if pane_label not in PERSONA_LABELS:
+        adapter.run("set-option", "-pu", "-t", pane_id, PERSONA_GUARD_OPTION, allow_failure=True)
 
 
 def _row_matches_persona(row, spec: PersonaSpec) -> bool:
