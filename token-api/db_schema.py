@@ -14,7 +14,7 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
-from personas import ensure_personas_table
+from personas import ensure_personas_table, repair_legacy_instance_personas
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
@@ -1183,6 +1183,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
             """,
                 habit,
             )
+
+        repaired_personas = await repair_legacy_instance_personas(db)
+        if repaired_personas:
+            print(f"Repaired {repaired_personas} legacy active persona assignments")
 
         await db.commit()
         print(f"Database initialized at {db_path}")
