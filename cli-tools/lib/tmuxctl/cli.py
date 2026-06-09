@@ -104,6 +104,19 @@ def build_parser() -> argparse.ArgumentParser:
     invoke_skill_parser.add_argument("--agent", default="auto")
     invoke_skill_parser.add_argument("--dry-run", action="store_true")
 
+    resolve_agent_parser = subparsers.add_parser(
+        "resolve-agent",
+        help="Print the harness (claude|codex) bound to a pane.",
+    )
+    resolve_agent_parser.add_argument("--pane", default="current")
+    resolve_agent_parser.add_argument("--agent", default="auto")
+    resolve_agent_parser.add_argument(
+        "--default",
+        default="claude",
+        choices=["claude", "codex", "auto"],
+        help="Value to print when detection is inconclusive (use 'auto' to fail closed).",
+    )
+
     audience_parser = subparsers.add_parser("audience")
     audience_subparsers = audience_parser.add_subparsers(dest="audience_command", required=True)
 
@@ -330,6 +343,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(skill_invocation_text(args.skill, agent))
                 return 0
             print(control.invoke_skill(pane, args.skill, agent=args.agent), end="")
+            return 0
+
+        if args.command == "resolve-agent":
+            from .skill_invoke import resolve_agent_for_pane
+
+            print(
+                resolve_agent_for_pane(
+                    control.adapter,
+                    args.pane,
+                    args.agent,
+                    default=args.default,
+                )
+            )
             return 0
 
         if args.command == "audience":

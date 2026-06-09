@@ -127,3 +127,30 @@ def test_resolve_agent_for_pane_falls_back_to_pane_hint(monkeypatch):
     )
 
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "codex"
+
+
+def test_resolve_agent_for_pane_default_when_inconclusive(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(
+        skill_invoke, "fetch_instance_registry", lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+
+    def fake_run(cmd, **kwargs):
+        # Pane process is a plain shell — no claude/codex marker to detect.
+        return subprocess.CompletedProcess(cmd, 0, "bash -l\n", "")
+
+    monkeypatch.setattr(skill_invoke.subprocess, "run", fake_run)
+
+    # No registry, no harness in the pane process, no @PLANNING_AGENT hint: the
+    # default decides. tmux-plan-menu passes default="auto" so preplan fails
+    # closed instead of inserting a guessed leader.
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "claude"
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42", default="auto") == "auto"
+
+
+def test_resolve_agent_for_pane_rejects_invalid_default():
+    # default must stay inside the claude|codex|auto contract — an arbitrary
+    # value must never escape as the resolved harness.
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError):
+        skill_invoke.resolve_agent_for_pane(adapter, "%42", default="bogus")

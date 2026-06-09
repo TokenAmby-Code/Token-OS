@@ -4,16 +4,20 @@
 # AUDIENCE: human
 #
 # Bare Shift+Tab opens this picker: preplan / plan / compact / shift+tab / cancel.
-#   preplan   -> send the preplan skill (/preplan for Claude, $preplan for Codex)
-#                and arm a one-shot Stop subscription that submits the plan turn
-#   plan      -> send /plan    (universal — slash for both harnesses)
-#   compact   -> send /compact (universal — slash for both harnesses)
+#   preplan   -> insert the preplan leader (/preplan for Claude, $preplan for
+#                Codex) at the prompt START and arm a one-shot Stop subscription
+#                that delivers the plan turn after this pane next stops
+#   plan      -> insert /plan    at the prompt start (universal slash, both harnesses)
+#   compact   -> insert /compact at the prompt start (universal slash, both harnesses)
 #   shift+tab -> forward ONE literal Shift+Tab (native mode cycle)
 #   cancel    -> no-op
 #
-# Replaces the old tmux-plan-prefix in-prompt text-manipulation cycle: every
-# action is a clean gated send (agent-cmd) or a single keystroke, never a
-# screen-scrape-and-edit of the live prompt buffer.
+# Actions never auto-submit: each drops the command at the FRONT of the prompt
+# and returns the cursor to the END (via tmuxctl invoke-skill -> insert at prompt
+# start), so the operator keeps typing and submits when ready. The harness probe
+# preplan needs runs in the background while the picker is open, so a preplan
+# pick reads a ready answer instead of stalling on detection. Replaces the old
+# tmux-plan-prefix screen-scrape-and-edit cycle.
 
 set -euo pipefail
 
@@ -44,14 +48,27 @@ _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${_script_dir}/../lib/nas-path.sh" >/dev/null 2>&1 || true
 API_URL="${API_URL:-${TOKEN_API_URL:-}}"
 
-if [[ -z "$PANE" ]]; then
-    PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+# --- pane resolution -------------------------------------------------------
+# A bare Shift+Tab routes through:  display-popup -e "BTAB_PANE=#{pane_id}"
+# tmux expands #{pane_id} against the focused pane when the key is dispatched and
+# exports it into the popup environment. Inside the popup neither a command-line
+# #{pane_id} (display-popup does not expand its shell-command) nor $TMUX_PANE
+# (unset by the popup, tmux 3.6) survive, so BTAB_PANE is the lock on the
+# invoking pane. Accept only a real %id; otherwise fall back to the popup
+# client's active pane, which display-message resolves to the launching pane.
+_is_pane_id() { [[ "${1:-}" == %* ]]; }
+if ! _is_pane_id "$PANE"; then
+    if _is_pane_id "${BTAB_PANE:-}"; then
+        PANE="$BTAB_PANE"
+    else
+        PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+    fi
 fi
 
-# Real actions target $PANE (agent-cmd / tmux send-keys); refuse to proceed with
-# an empty target. Dry-run is purely informational, so let it through.
+# Real actions target $PANE (invoke-skill / tmux send-keys); refuse to proceed
+# with an empty target. Dry-run is purely informational, so let it through.
 if [[ -z "$PANE" ]] && ! $DRY_RUN; then
-    echo "tmux-plan-menu: no target pane (pass --pane or run inside tmux)" >&2
+    echo "tmux-plan-menu: no target pane (pass --pane, set BTAB_PANE, or run inside tmux)" >&2
     exit 1
 fi
 
@@ -62,7 +79,7 @@ json_escape() {
 normalize_agent() {
     case "${1:-auto}" in
         codex|openai) echo codex ;;
-        claude|claude-code) echo claude ;;
+        claude|claude-code|anthropic) echo claude ;;
         *) echo auto ;;
     esac
 }
@@ -74,34 +91,48 @@ preplan_leader() {
     esac
 }
 
-# Resolve the harness bound to PANE via the instances API. Only preplan needs
-# this (the leader differs); plan/compact are universal. Echoes "unknown" when it
-# genuinely can't resolve (API unset/unreachable, or pane not registered) so the
-# caller can fail closed instead of guessing a leader.
-detect_agent() {
-    [[ -z "$API_URL" ]] && { echo unknown; return; }
-    local resp
-    resp=$(curl -sf --max-time 2 "${API_URL}/api/instances" 2>/dev/null || true)
-    [[ -z "$resp" ]] && { echo unknown; return; }
-    RESP="$resp" PANE="$PANE" python3 -c '
-import json, os
-pane = os.environ["PANE"]
-try:
-    rows = json.loads(os.environ["RESP"])
-except Exception:
-    rows = []
-for r in rows:
-    if r.get("tmux_pane") == pane and r.get("status") != "stopped":
-        print(r.get("engine") or r.get("agent") or "claude")
-        break
-else:
-    print("unknown")
-'
+# --- background harness detection (preplan only) ---------------------------
+# `tmuxctl resolve-agent` probes the instance registry, then the live pane
+# process (ps on the pane tty), then the @PLANNING_AGENT hint. Kick it off while
+# fzf is open so a preplan pick reads a ready answer instead of paying the probe
+# latency after selection. --default auto makes it echo "auto" (not a guessed
+# "claude") when detection is genuinely inconclusive, so preplan can fail closed.
+# plan/compact are universal slash commands and never consult this.
+_AGENT_FILE=""
+# Always return 0: under `set -e` a falsey final command in the EXIT trap (when
+# _AGENT_FILE is empty) would override the script's real exit status with 1.
+_cleanup() { [[ -n "$_AGENT_FILE" ]] && rm -f "$_AGENT_FILE"; return 0; }
+trap _cleanup EXIT
+
+_start_agent_detect() {
+    $DRY_RUN && return 0
+    [[ "$(normalize_agent "$AGENT")" != auto ]] && return 0   # explicit override: no probe
+    [[ -z "$PANE" ]] && return 0
+    _AGENT_FILE=$(mktemp -t tmux-plan-menu-agent.XXXXXX 2>/dev/null) || { _AGENT_FILE=""; return 0; }
+    ( "${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto \
+        >"$_AGENT_FILE" 2>/dev/null || true ) &
 }
 
-# One-shot Stop subscription: when this pane next stops after /preplan, deliver
-# the plan turn. PR#2b routes this to /compact when the preplan response
-# recommends it; the payload here remains the default plan submission.
+# Resolve the harness for preplan: prefer the async result (wait up to ~1s for
+# the background probe), then fall back to a synchronous probe. Echoes the
+# normalized harness, or "auto" when detection fails.
+_detect_agent() {
+    local a="" i
+    if [[ -n "$_AGENT_FILE" ]]; then
+        for i in $(seq 1 10); do
+            a="$(normalize_agent "$(cat "$_AGENT_FILE" 2>/dev/null)")"
+            [[ "$a" != auto ]] && { echo "$a"; return 0; }
+            sleep 0.1
+        done
+    fi
+    a="$(normalize_agent "$("${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto 2>/dev/null)")"
+    echo "$a"
+}
+
+# One-shot Stop subscription: when this pane next stops after the operator
+# submits the preplan turn, deliver the plan turn. PR#2b routes this to /compact
+# when the preplan response recommends it; the payload here remains the default
+# plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
     local body resp rc=0
@@ -114,7 +145,7 @@ subscribe_preplan() {
     fi
     # /api/hooks/subscribe returns HTTP 200 with {"success": false} when the pane
     # can't be resolved (target_unresolved/subscriber_unresolved), so a 2xx is not
-    # enough — confirm the one-shot actually armed before the caller sends a leader.
+    # enough — confirm the one-shot actually armed before the caller inserts a leader.
     if ! RESP="$resp" python3 -c '
 import json, os, sys
 try:
@@ -142,16 +173,16 @@ set_planning_state() {
     fi
 }
 
-# agent-cmd resolves its backend from TOKEN_API_URL (nas-path.sh keeps an
-# inherited non-empty value), so propagate our resolved URL that way to keep one
-# action on one backend. Leave it unset when we have none, so agent-cmd resolves.
-send_to_pane() {
-    if [[ -n "$API_URL" ]]; then
-        TOKEN_API_URL="$API_URL" "${_script_dir}/agent-cmd" --pane "$PANE" "$1"
-    else
-        "${_script_dir}/agent-cmd" --pane "$PANE" "$1"
-    fi
+# insert_at_prompt_start (via invoke-skill) drops the leader at the prompt START
+# and returns the cursor to the END without submitting — the operator keeps
+# typing and submits when ready. plan/compact force the claude leader so they
+# stay universal "/" commands (not codex "$") for both harnesses.
+invoke_skill() {
+    "${_script_dir}/tmuxctl" invoke-skill "$1" --pane "$PANE" --agent "$2"
 }
+
+# Kick off harness detection before the picker opens so it overlaps the choice.
+_start_agent_detect
 
 # Pick the action via fzf unless one was supplied (--selection, for tests/scripting).
 if [[ -z "$SELECTION" ]]; then
@@ -162,19 +193,19 @@ fi
 SELECTION="${SELECTION%%$'\t'*}"   # tolerate a tab-delimited label, keep the key
 [[ -z "$SELECTION" ]] && SELECTION=cancel
 
-# Resolve the harness only for preplan, and only when we must (skip network on dry-run).
+# Resolve the harness only for preplan (its leader differs); skip network on dry-run.
 AGENT_RESOLVED="$(normalize_agent "$AGENT")"
 if [[ "$SELECTION" == "preplan" ]]; then
     if [[ "$AGENT_RESOLVED" == "auto" ]]; then
         if $DRY_RUN; then
-            AGENT_RESOLVED="claude"   # dry-run never sends; default for tests/inspection
+            AGENT_RESOLVED="claude"   # dry-run never inserts; default for tests/inspection
         else
-            AGENT_RESOLVED="$(normalize_agent "$(detect_agent)")"
+            AGENT_RESOLVED="$(_detect_agent)"
         fi
     fi
-    # Fail closed: a real preplan must resolve to a concrete harness. Guessing
-    # claude here would send /preplan to a Codex pane (wrong leader) and mask the
-    # detection miss, so abort and point at the explicit --agent override instead.
+    # Fail closed: a real preplan must resolve to a concrete harness. Inserting
+    # /preplan into a Codex pane (wrong leader) would mask the detection miss, so
+    # abort and point at the explicit --agent override instead.
     if [[ "$AGENT_RESOLVED" == "auto" ]]; then
         echo "tmux-plan-menu: could not detect the harness for pane ${PANE:-?}; re-run with --agent claude|codex" >&2
         exit 1
@@ -183,27 +214,28 @@ fi
 
 case "$SELECTION" in
     preplan)
-        leader="$(preplan_leader "$AGENT_RESOLVED")"
         if $DRY_RUN; then
-            printf 'pane=%s selection=preplan agent=%s send:%s subscribe:preplan_plan state:preplanning\n' \
-                "$PANE" "$AGENT_RESOLVED" "$leader"
+            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning\n' \
+                "$PANE" "$AGENT_RESOLVED" "$(preplan_leader "$AGENT_RESOLVED")"
             exit 0
         fi
+        # Arm the handoff before inserting so it is in place by the time the
+        # operator submits the preplan turn.
         if ! subscribe_preplan; then
             echo "tmux-plan-menu: aborting preplan — could not arm the plan auto-submit subscription" >&2
             exit 1
         fi
-        set_planning_state preplanning || true   # advisory hint; never block the leader send
-        send_to_pane "$leader"
+        set_planning_state preplanning || true   # advisory hint; never block the insert
+        invoke_skill preplan "$AGENT_RESOLVED"
         ;;
     plan)
-        if $DRY_RUN; then printf 'pane=%s selection=plan send:/plan state:planning\n' "$PANE"; exit 0; fi
+        if $DRY_RUN; then printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE"; exit 0; fi
         set_planning_state planning || true   # advisory hint; /plan is independent of token-api
-        send_to_pane "/plan"
+        invoke_skill plan claude
         ;;
     compact)
-        if $DRY_RUN; then printf 'pane=%s selection=compact send:/compact\n' "$PANE"; exit 0; fi
-        send_to_pane "/compact"
+        if $DRY_RUN; then printf 'pane=%s selection=compact insert:/compact\n' "$PANE"; exit 0; fi
+        invoke_skill compact claude
         ;;
     shift+tab|shifttab)
         if $DRY_RUN; then printf 'pane=%s selection=shift+tab send-keys:BTab\n' "$PANE"; exit 0; fi
