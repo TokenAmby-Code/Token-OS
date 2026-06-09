@@ -40,6 +40,16 @@ fi
 # Fallback to no-op if claude-cmd is not found anywhere
 : "${CLAUDE_CMD:=false}"
 
+# Resolve pending-ui-flush the same way (sibling of claude-cmd) — it owns the
+# guarded drain/enqueue/sweep of the pane-branding queue.
+PENDING_UI_FLUSH=$(command -v pending-ui-flush 2>/dev/null) || true
+if [[ -z "$PENDING_UI_FLUSH" ]]; then
+  for _p in /Volumes/Imperium/Token-OS/cli-tools/bin/pending-ui-flush /mnt/imperium/Token-OS/cli-tools/bin/pending-ui-flush; do
+    if [[ -x "$_p" ]]; then PENDING_UI_FLUSH="$_p"; break; fi
+  done
+fi
+: "${PENDING_UI_FLUSH:=false}"
+
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
 if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "$TOKEN_API_PRIMARCH" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
@@ -206,35 +216,20 @@ if [[ "$ACTION_TYPE" == "Stop" ]]; then
   fi
 fi
 
-# Drain pending UI commands on UserPromptSubmit (user just pressed Enter, prompt bar is empty)
+# Drain pending UI commands on UserPromptSubmit (user just pressed Enter, prompt bar is empty).
+# pending-ui-flush applies the typing-guard HOLD, epoch/TTL/dead-pane purge, and
+# human-attached skip before any send-keys — see cli-tools/bin/pending-ui-flush.
+# It never injects while the target pane is being typed in or actively viewed,
+# never replays a stale or foreign-epoch entry, and never drops a held command.
 if [[ "$ACTION_TYPE" == "UserPromptSubmit" ]]; then
   PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" ]]; then
-    PANE_SAFE=$(echo "$PANE" | tr -d '%')
-    PENDING_FILE="${HOME}/.claude/pending-ui-cmds/${PANE_SAFE}"
-    if [[ -f "$PENDING_FILE" ]]; then
-      DRAIN_FILE="${PENDING_FILE}.drain.$$"
-      mv "$PENDING_FILE" "$DRAIN_FILE" 2>/dev/null || true
-      if [[ -f "$DRAIN_FILE" ]]; then
-        (
-          exec 0</dev/null 1>/dev/null 2>/dev/null
-          first=true
-          last_pane=""
-          while IFS=' ' read -r cmd_pane cmd_rest; do
-            last_pane="$cmd_pane"
-            if [[ "$first" == true ]]; then
-              $CLAUDE_CMD --no-escape --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
-              first=false
-            else
-              $CLAUDE_CMD --pane "$cmd_pane" "$cmd_rest" 2>/dev/null || true
-            fi
-          done < "$DRAIN_FILE"
-          [[ -n "$last_pane" ]] && tmux send-keys -t "$last_pane" C-u 2>/dev/null || true
-          rm -f "$DRAIN_FILE"
-        ) </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-      fi
-    fi
+    SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+    (
+      exec 0</dev/null 1>/dev/null 2>/dev/null
+      "$PENDING_UI_FLUSH" flush --pane "$PANE" --session "$SESSION_ID"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
 fi
 
@@ -281,12 +276,15 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null)
   PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" && ( -n "$COLOR" || -n "$TAB_NAME" ) ]]; then
-    PENDING_DIR="${HOME}/.claude/pending-ui-cmds"
-    mkdir -p "$PENDING_DIR"
-    PANE_SAFE=$(echo "$PANE" | tr -d '%')
-    [[ -n "$TAB_NAME" ]] && echo "$PANE /rename $TAB_NAME" >> "$PENDING_DIR/${PANE_SAFE}"
-    [[ -n "$COLOR" ]] && echo "$PANE /color $COLOR" >> "$PENDING_DIR/${PANE_SAFE}"
+    SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+    ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID")
+    [[ -n "$TAB_NAME" ]] && ENQ_ARGS+=(--rename "$TAB_NAME")
+    [[ -n "$COLOR" ]] && ENQ_ARGS+=(--color "$COLOR")
+    "$PENDING_UI_FLUSH" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
   fi
+  # Prune legacy/expired/dead-pane queue files every relaunch so the queue never
+  # grows append-only (the 58-file, April-backlog failure mode).
+  "$PENDING_UI_FLUSH" sweep >/dev/null 2>&1 || true
 else
   (
     exec 0</dev/null 1>/dev/null 2>/dev/null
