@@ -15,6 +15,7 @@ from tmuxctl.models import InstanceRegistryEntry, InstanceRegistrySnapshot
 from tmuxctl.skill_invoke import (
     invoke_skill_in_pane,
     normalize_skill_name,
+    send_skill_invocation_to_pane,
     skill_invocation_text,
 )
 from tmuxctl.tmux_adapter import TmuxAdapter
@@ -48,6 +49,17 @@ def test_skill_invocation_text_uses_claude_slash():
     assert skill_invocation_text("preplan", "auto") == "/preplan "
 
 
+def test_skill_invocation_text_appends_arguments_without_trailing_padding():
+    assert (
+        skill_invocation_text(
+            "golden-throne-sop",
+            "codex",
+            'victory condition "needs tests passing" is unmet',
+        )
+        == '$golden-throne-sop victory condition "needs tests passing" is unmet'
+    )
+
+
 def test_normalize_skill_name_rejects_empty_or_spaced():
     with pytest.raises(ValueError):
         normalize_skill_name("/$")
@@ -67,6 +79,26 @@ def test_invoke_skill_in_pane_inserts_at_prompt_start_with_harness_prefix(monkey
     ]
     assert ("send-keys", "-t", "%42", "-l", "$preplan ") in adapter.calls
     assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
+
+
+def test_send_skill_invocation_to_pane_submits_through_gated_adapter(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    text = send_skill_invocation_to_pane(
+        adapter,
+        "%42",
+        "golden-throne-sop",
+        agent="codex",
+        arguments='victory condition "needs tests passing" is unmet',
+    )
+
+    assert text == '$golden-throne-sop victory condition "needs tests passing" is unmet'
+    assert ("send-keys", "-t", "%42", "-l", text) in adapter.calls
+    assert adapter.calls[-2:] == [
+        ("send-keys", "-t", "%42", "C-m"),
+        ("send-keys", "-t", "%42", "C-m"),
+    ]
 
 
 def test_resolve_agent_for_pane_uses_registry_engine(monkeypatch):
