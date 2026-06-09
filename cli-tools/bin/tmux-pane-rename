@@ -12,8 +12,9 @@ API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 PANE="${1:-}"
 NAME="${2:-}"
 
-if [[ -z "$PANE" || -z "$NAME" ]]; then
-    tmux display-message "rename: pane and name required" 2>/dev/null || true
+# Pane is always required; an empty NAME is valid and triggers the interview.
+if [[ -z "$PANE" ]]; then
+    tmux display-message "rename: pane required" 2>/dev/null || true
     exit 1
 fi
 
@@ -24,6 +25,15 @@ INSTANCE_ID=$(printf '%s' "$INSTANCES" | jq -r --arg pane "$PANE" \
 if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
     tmux display-message "rename: no active instance for $PANE" 2>/dev/null || true
     exit 1
+fi
+
+# Empty input → interview: ask the agent to name itself (no synthesis here).
+if [[ -z "$NAME" ]]; then
+    curl -s --connect-timeout 2 -X POST "$API_URL/api/orchestrator/naming_nudge" \
+        -H "Content-Type: application/json" \
+        -d "{\"instance_id\": \"$INSTANCE_ID\"}" >/dev/null 2>&1 || true
+    tmux display-message "interview: asked $INSTANCE_ID to name itself" 2>/dev/null || true
+    exit 0
 fi
 
 if RESPONSE=$(instance-name "$NAME" --id "$INSTANCE_ID" --no-ui 2>&1); then

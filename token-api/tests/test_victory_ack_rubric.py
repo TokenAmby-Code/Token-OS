@@ -1,0 +1,115 @@
+"""Victory-ack enforcement of the derived `instance_named` rubric criterion.
+
+The criterion is DERIVED: `evaluate_rubric` recomputes it from the live tab
+name(s) of the linked instance(s), which `_victory_ack_core` injects as
+`fm['_instance_tab_names']`. A stale `needs-name` placeholder blocks the ack
+(409 rubric_incomplete); a real agent-authored name lets it through. A doc with
+no linked instance derives True and is never falsely blocked.
+"""
+
+import sqlite3
+import types
+from pathlib import Path
+
+import pytest
+from fastapi import HTTPException
+
+
+def _write_doc(docs_dir: Path, frontmatter: str) -> Path:
+    doc = docs_dir / "victory-ack-doc.md"
+    doc.write_text(f"---\n{frontmatter}\n---\n\n# session\n", encoding="utf-8")
+    return doc
+
+
+def _seed(db_path: Path, doc_path: Path, *, tab_name: str | None, link: bool) -> int:
+    """Insert an active doc and (optionally) a linked instance. Returns doc_id."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO session_documents (file_path, title, status) VALUES (?, ?, 'active')",
+        (str(doc_path), "Victory Ack Test"),
+    )
+    doc_id = cur.lastrowid
+    if link:
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, session_doc_id)
+               VALUES ('inst-va', 'sess-va', ?, '/tmp', 'local', 'Mac-Mini',
+                       'idle', ?)""",
+            (tab_name, doc_id),
+        )
+    conn.commit()
+    conn.close()
+    return doc_id
+
+
+def _no_discord(monkeypatch, main):
+    """Stub the outbound Discord notify so the ack never sends a real message."""
+
+    def fake_run(*_a, **_k):
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+
+def _doc_status(db_path: Path, doc_id: int) -> str:
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status FROM session_documents WHERE id = ?", (doc_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+@pytest.mark.asyncio
+async def test_victory_ack_blocks_on_unnamed_instance(app_env, monkeypatch):
+    main = app_env.main
+    _no_discord(monkeypatch, main)
+    doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
+    doc_id = _seed(app_env.db_path, doc, tab_name="needs-name", link=True)
+
+    with pytest.raises(HTTPException) as exc:
+        await main._victory_ack_core(doc_id, "done", [])
+
+    assert exc.value.status_code == 409
+    detail = exc.value.detail
+    assert detail["error"] == "rubric_incomplete"
+    assert "instance_named" in detail["missing"]
+    # The block is non-destructive: the doc stays active.
+    assert _doc_status(app_env.db_path, doc_id) == "active"
+
+
+@pytest.mark.asyncio
+async def test_victory_ack_passes_after_instance_named(app_env, monkeypatch):
+    main = app_env.main
+    _no_discord(monkeypatch, main)
+    doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
+    doc_id = _seed(app_env.db_path, doc, tab_name="needs-name", link=True)
+
+    # Blocked while unnamed.
+    with pytest.raises(HTTPException):
+        await main._victory_ack_core(doc_id, "done", [])
+
+    # Agent self-names → criterion derives True → ack succeeds and archives.
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "UPDATE claude_instances SET tab_name = 'shipped-the-feature' WHERE id = 'inst-va'"
+    )
+    conn.commit()
+    conn.close()
+
+    result = await main._victory_ack_core(doc_id, "done", [])
+    assert result["victory"] is True and result["archived"] is True
+    assert _doc_status(app_env.db_path, doc_id) == "archived"
+
+
+@pytest.mark.asyncio
+async def test_victory_ack_no_linked_instance_still_acks(app_env, monkeypatch):
+    """No linked instance → empty surface → instance_named derives True → no
+    false block. Default-True-when-absent is what keeps legacy/unbound docs safe."""
+    main = app_env.main
+    _no_discord(monkeypatch, main)
+    doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
+    doc_id = _seed(app_env.db_path, doc, tab_name=None, link=False)
+
+    result = await main._victory_ack_core(doc_id, "done", [])
+    assert result["victory"] is True and result["archived"] is True
+    assert _doc_status(app_env.db_path, doc_id) == "archived"

@@ -158,6 +158,9 @@ _timer_engine: Any = None
 _timer_log_shift: Callable[..., Any] | None = None
 _run_stop_evaluators: Callable[..., Any] | None = None
 _auto_name_instance: Callable[..., Any] | None = None
+# Server-side naming interview (main._maybe_naming_nudge). Fired on Stop so
+# Codex panes — which have no naming-nudge.sh Stop shim — get interviewed too.
+_maybe_naming_nudge: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
 _golden_throne_activity_callback: Callable[..., Any] | None = None
@@ -180,6 +183,7 @@ def init_deps(
     timer_log_shift=None,
     run_stop_evaluators=None,
     auto_name_instance=None,
+    maybe_naming_nudge=None,
     work_action_callback=None,
     schedule_golden_throne_callback=None,
     golden_throne_activity_callback=None,
@@ -188,7 +192,8 @@ def init_deps(
 ):
     """Wire runtime-owned dependencies from main.py."""
     global _scheduler, _timer_engine, _timer_log_shift
-    global _run_stop_evaluators, _auto_name_instance, _work_action_callback
+    global _run_stop_evaluators, _auto_name_instance, _maybe_naming_nudge
+    global _work_action_callback
     global _schedule_golden_throne_callback, _golden_throne_activity_callback
     global _askq_level1_callback, _tmux_send_payload_then_submit
 
@@ -197,6 +202,7 @@ def init_deps(
     _timer_log_shift = timer_log_shift
     _run_stop_evaluators = run_stop_evaluators
     _auto_name_instance = auto_name_instance
+    _maybe_naming_nudge = maybe_naming_nudge
     _work_action_callback = work_action_callback
     _schedule_golden_throne_callback = schedule_golden_throne_callback
     _golden_throne_activity_callback = golden_throne_activity_callback
@@ -3267,6 +3273,13 @@ async def handle_stop(payload: dict) -> dict:
                 actor="Stop",
             )
         await db.commit()
+
+    # Interview unnamed panes on Stop. Engine-agnostic — this is the only path
+    # Codex panes get (no naming-nudge.sh shim), and it is harmlessly idempotent
+    # for Claude, which also fires naming-nudge.sh. The core self-guards on
+    # placeholder name, missing pane, pending nudge, and the 3-nudge cap, so a
+    # named pane is a cheap no-op. Fire-and-forget so Stop latency is unaffected.
+    asyncio.create_task(_require_dep("maybe_naming_nudge", _maybe_naming_nudge)(session_id))
 
     # Trinity Chunk 1: resolve any open `talk` pairs awaiting natural-stop
     # slash-copy of this target's final response. Fires for every Stop hook —
