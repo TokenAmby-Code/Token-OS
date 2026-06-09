@@ -255,6 +255,7 @@ def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
     # carries its identity; no Claude slash-color command is emitted.
     hooks = sys.modules["routes.hooks"]
     from shared import profile_by_name
+
     FABRICATOR_PROFILE = profile_by_name("fabricator-general")
 
     async def fg_label(_pane):
