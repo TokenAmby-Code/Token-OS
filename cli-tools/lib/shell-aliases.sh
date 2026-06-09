@@ -313,6 +313,22 @@ _dispatch_has_flag() {
     return 1
 }
 
+_dispatch_kind_is_aspirant() {
+    local previous=""
+    local arg
+    for arg in "$@"; do
+        if [[ "$previous" == "--kind" ]]; then
+            [[ "$arg" == "aspirant" ]] && return 0
+            previous=""
+        fi
+        case "$arg" in
+            --kind=aspirant) return 0 ;;
+            --kind) previous="--kind" ;;
+        esac
+    done
+    return 1
+}
+
 _dispatch_human_surface() {
     local origin="$1"
     local do_clear="$2"
@@ -337,7 +353,7 @@ _dispatch_human_surface() {
         args=(--interactive "${args[@]}")
     fi
     if ! _dispatch_has_flag --aspirant "${args[@]}" \
-        && { _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_has_flag --kind "${args[@]}"; }; then
+        && { _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_kind_is_aspirant "${args[@]}"; }; then
         args=(--aspirant "${args[@]}")
     fi
 

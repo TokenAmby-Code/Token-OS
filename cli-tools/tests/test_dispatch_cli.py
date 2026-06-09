@@ -185,7 +185,7 @@ def test_dispatch_worktree_metadata_does_not_override_explicit(tmp_path):
     assert "objective:      My Objective" in result.stdout
 
 
-def test_dispatch_default_one_off_but_sync_keeps_gt_zealotry():
+def test_dispatch_default_one_off_but_sync_keeps_gt_zealotry() -> None:
     default = subprocess.run(
         [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "default work"],
         capture_output=True,
@@ -271,8 +271,9 @@ def test_dispatch_kind_alias_requires_aspirant():
     assert "--kind is only valid" in result.stderr
 
 
-def test_dispatch_human_origin_no_longer_auto_aspirant(monkeypatch):
+def test_dispatch_human_origin_no_longer_auto_aspirant(monkeypatch) -> None:
     monkeypatch.delenv("TOKEN_API_INTERNAL_DISPATCH", raising=False)
+    monkeypatch.delenv("TOKEN_API_DISPATCH_AUTO_ASPIRANT", raising=False)
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "make this a tracked worker goal"],
@@ -288,7 +289,7 @@ def test_dispatch_human_origin_no_longer_auto_aspirant(monkeypatch):
     assert "instance_type:   one_off" in result.stdout
 
 
-def test_dispatch_auto_aspirant_can_be_enabled_by_env(monkeypatch):
+def test_dispatch_auto_aspirant_can_be_enabled_by_env(monkeypatch) -> None:
     monkeypatch.delenv("TOKEN_API_INTERNAL_DISPATCH", raising=False)
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     monkeypatch.setenv("TOKEN_API_DISPATCH_AUTO_ASPIRANT", "1")
@@ -459,7 +460,7 @@ def test_dispatch_auto_policy_ignores_internal_dispatch(monkeypatch):
     assert "dispatch aspirant dry-run" not in result.stdout
 
 
-def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_path):
+def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "dispatch.log"
@@ -562,7 +563,7 @@ def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
     assert "instance_type:   one_off" in result.stdout
 
 
-def test_dispatch_persona_engine_bindings_and_generic_engine_choice():
+def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     custodes = subprocess.run(
         [
             str(DISPATCH),
@@ -638,7 +639,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice():
     assert "primarch vulkan" not in vulkan.stdout
 
 
-def test_dispatch_rejects_deprecated_primarch_flag():
+def test_dispatch_rejects_deprecated_primarch_flag() -> None:
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "--primarch", "vulkan", "work"],
         capture_output=True,
@@ -777,7 +778,9 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "## Trials" in staged
 
 
-def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_prompt(tmp_path):
+def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_prompt(
+    tmp_path,
+) -> None:
     vault = tmp_path / "Imperium-ENV"
     vault.mkdir()
     fake_bin = tmp_path / "bin"

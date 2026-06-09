@@ -359,7 +359,7 @@ normalize_persona_key() {
 persona_engine_binding() {
   case "$(normalize_persona_key "$1")" in
     custodes) printf 'claude' ;;
-    inquisitor|inquisition) printf 'codex' ;;
+    inquisitor|inquisition|sisters|sisters-of-battle) printf 'codex' ;;
   esac
 }
 
@@ -415,19 +415,11 @@ persona_vault_root() {
     Imperium-ENV|imperium|Imperium)
       if [[ -n "${IMPERIUM:-}" && -d "${IMPERIUM}/Imperium-ENV" ]]; then
         printf '%s/Imperium-ENV' "$IMPERIUM"
-      elif [[ -d "/Volumes/Imperium/Imperium-ENV" ]]; then
-        printf '%s' "/Volumes/Imperium/Imperium-ENV"
-      elif [[ -d "/mnt/imperium/Imperium-ENV" ]]; then
-        printf '%s' "/mnt/imperium/Imperium-ENV"
       fi
       ;;
     Pax-ENV|civic|Civic)
       if [[ -n "${CIVIC:-}" && -d "${CIVIC}/Pax-ENV" ]]; then
         printf '%s/Pax-ENV' "$CIVIC"
-      elif [[ -d "/Volumes/Civic/Pax-ENV" ]]; then
-        printf '%s' "/Volumes/Civic/Pax-ENV"
-      elif [[ -d "/mnt/civic/Pax-ENV" ]]; then
-        printf '%s' "/mnt/civic/Pax-ENV"
       fi
       ;;
   esac
@@ -1059,6 +1051,7 @@ launch_dispatch_aspirant_session() {
     "$mode_flag"
     --zealotry "$ZEALOTRY"
   )
+  [[ -n "$PERSONA" ]] && launch_args+=(--persona "$PERSONA")
   if [[ "$ENGINE" == "claude" ]]; then
     persona_prompt="$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-/Volumes/Imperium/Scripts}/cli-tools/prompts/aspirant-persona.md")"
     launch_args+=(--system-prompt-file "$persona_prompt")
@@ -1070,6 +1063,7 @@ launch_dispatch_aspirant_session() {
   printf '\n'
   TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
   TOKEN_API_INTERNAL_DISPATCH=1 \
+  TOKEN_API_PRIMARCH="${PERSONA:-${TOKEN_API_PRIMARCH:-}}" \
   TOKEN_API_CODEX_PROFILE="$CODEX_PROFILE" \
   "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
 }
@@ -1379,7 +1373,7 @@ if [[ -n "$DISCORD_CHANNEL" ]]; then
     "TOKEN_API_DISCORD_BOT=${DISCORD_BOT}"
   )
 fi
-if [[ -n "$RESUME_PRIMARCH" ]]; then
+if [[ -n "$RESUME_PRIMARCH" && -z "$PERSONA" ]]; then
   COMMON_ENV+=("TOKEN_API_PRIMARCH=${RESUME_PRIMARCH}")
 fi
 if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "$AUTO_PARENT_INSTANCE_ID" ]]; then

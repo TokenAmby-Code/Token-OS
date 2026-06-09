@@ -504,16 +504,16 @@ build_restart_cmd() {
         persona_q="$(shell_quote "$primarch_name")"
         if [[ -n "$resume_prompt" ]]; then
             prompt_q="$(shell_quote "$resume_prompt")"
-            echo "cd ${target_q} && dispatch --persona ${persona_q} --resume ${session_q} --prompt ${prompt_q}"
+            echo "dispatch --persona ${persona_q} --dir ${target_q} --resume ${session_q} --prompt ${prompt_q}"
         else
-            echo "cd ${target_q} && dispatch --persona ${persona_q} --resume ${session_q}"
+            echo "dispatch --persona ${persona_q} --dir ${target_q} --resume ${session_q}"
         fi
     else
         if [[ -n "$resume_prompt" ]]; then
             prompt_q="$(shell_quote "$resume_prompt")"
-            echo "cd ${target_q} && dispatch --engine claude --dir ${target_q} --resume ${session_q} --prompt ${prompt_q}"
+            echo "dispatch --engine claude --dir ${target_q} --resume ${session_q} --prompt ${prompt_q}"
         else
-            echo "cd ${target_q} && dispatch --engine claude --dir ${target_q} --resume ${session_q}"
+            echo "dispatch --engine claude --dir ${target_q} --resume ${session_q}"
         fi
     fi
 }
