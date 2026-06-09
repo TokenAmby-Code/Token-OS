@@ -267,7 +267,7 @@ do_dispatch() {
         log_dry "DRY RUN — no changes will be made"
         echo ""
         log_dry "Claude binary: ${claude_bin}"
-        [[ -n "$primarch_name" ]] && log_dry "Via primarch: ${primarch_name}"
+        [[ -n "$primarch_name" ]] && log_dry "Via persona: ${primarch_name}"
         log_dry "Working dir: ${VAULT_DIR}"
         echo ""
         log_dry "Dispatch prompt:"
@@ -292,14 +292,14 @@ do_dispatch() {
     tmux send-keys -t "$target_pane" "clear" Enter
     sleep 0.3
 
-    # Build and send the launch command — reads prompt from temp file, then cleans up
+    # Build and send the launch command — dispatch is the sole launch engine.
     if [[ -n "$primarch_name" ]]; then
-        tmux send-keys -t "$target_pane" "cd '${VAULT_DIR}' && primarch ${primarch_name} \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
+        tmux send-keys -t "$target_pane" "dispatch --direct --dir '${VAULT_DIR}' --persona ${primarch_name} --prompt \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
     else
-        tmux send-keys -t "$target_pane" "cd '${VAULT_DIR}' && ${claude_bin} --dangerously-skip-permissions \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
+        tmux send-keys -t "$target_pane" "dispatch --direct --dir '${VAULT_DIR}' --prompt \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
     fi
 
-    log_success "Claude launched in vault"
+    log_success "Agent launched via dispatch"
 
     # --- Background: set zealotry after instance registers ---
     (

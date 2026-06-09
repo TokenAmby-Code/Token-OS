@@ -8,7 +8,7 @@
 # Kills the current Claude session and restarts it in the target directory
 # with conversation history preserved via --resume --continue.
 #
-# Supports local, remote (headless/relay), and primarch relaunch modes.
+# Supports local, remote (headless/relay), and persona relaunch modes.
 # Uses instance-name for identity transfer instead of manual API calls.
 #
 # Examples:
@@ -77,7 +77,7 @@ with conversation history preserved via --resume --continue.
 Options:
   -h, --help          Show this help message
   --pane <id>         Target tmux pane (default: same pane)
-  --primarch [name]   Relaunch via primarch (auto-detects from env if no name)
+  --primarch [name]   Deprecated alias for persona relaunch (auto-detects from env if no name)
   --host <name>       Target device: mac, wsl, or phone
   --relay             Interactive relay mode (with --host)
   --dry-run           Show what would happen without executing
@@ -188,9 +188,9 @@ build_fallback_cmd() {
         claude_bin="\$HOME/.local/bin/claude"
     fi
     if [[ -n "$primarch_name" ]]; then
-        echo "cd '${source_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
+        echo "cd '${source_dir}' && dispatch --persona ${primarch_name} --resume '${session_id}' --prompt 'Transplant FAILED. Restored original session in ${source_dir}.'"
     else
-        echo "cd '${source_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue 'Transplant FAILED. Restored original session in ${source_dir}.'"
+        echo "cd '${source_dir}' && dispatch --engine claude --dir '${source_dir}' --resume '${session_id}' --prompt 'Transplant FAILED. Restored original session in ${source_dir}.'"
     fi
 }
 
@@ -510,9 +510,9 @@ build_restart_cmd() {
     fi
 
     if [[ -n "$primarch_name" ]]; then
-        echo "cd '${target_dir}' && primarch ${primarch_name} --resume '${session_id}' --continue${prompt_arg}"
+        echo "cd '${target_dir}' && dispatch --persona ${primarch_name} --resume '${session_id}'${prompt_arg:+ --prompt${prompt_arg}}"
     else
-        echo "cd '${target_dir}' && ${claude_bin} --dangerously-skip-permissions --resume '${session_id}' --continue${prompt_arg}"
+        echo "cd '${target_dir}' && dispatch --engine claude --dir '${target_dir}' --resume '${session_id}'${prompt_arg:+ --prompt${prompt_arg}}"
     fi
 }
 
@@ -1034,9 +1034,9 @@ if [[ -n "$REMOTE_HOST" ]]; then
         remote_prompt=""
         [[ -n "$RESUME_PROMPT" ]] && remote_prompt=" '${RESUME_PROMPT}'"
         if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_cmd="cd '$TARGET_DIR' && primarch $PRIMARCH_NAME --resume '$session_id' --continue${remote_prompt}"
+            remote_cmd="cd '$TARGET_DIR' && dispatch --persona $PRIMARCH_NAME --resume '$session_id'${remote_prompt:+ --prompt${remote_prompt}}"
         else
-            remote_cmd="cd '$TARGET_DIR' && \\\$HOME/.local/bin/claude --resume '$session_id' --continue${remote_prompt}"
+            remote_cmd="cd '$TARGET_DIR' && dispatch --engine claude --dir '$TARGET_DIR' --resume '$session_id'${remote_prompt:+ --prompt${remote_prompt}}"
         fi
         relay_restart_cmd="ssh -t $ssh_target \"$remote_cmd\""
 
@@ -1061,15 +1061,15 @@ RELAY_EOF
         kill_local_claude "$claude_pid"
     else
         # Headless remote
-        log_info "Spawning headless Claude on $REMOTE_HOST..."
+        log_info "Spawning headless agent via dispatch on $REMOTE_HOST..."
         local_remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
         remote_launch=""
         headless_prompt=""
         [[ -n "$RESUME_PROMPT" ]] && headless_prompt=" '${RESUME_PROMPT}'"
         if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_launch="primarch $PRIMARCH_NAME --resume '$session_id' --continue${headless_prompt}"
+            remote_launch="dispatch --persona $PRIMARCH_NAME --resume '$session_id'${headless_prompt:+ --prompt${headless_prompt}}"
         else
-            remote_launch="\$HOME/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --continue${headless_prompt}"
+            remote_launch="dispatch --engine claude --dir '$TARGET_DIR' --resume '$session_id'${headless_prompt:+ --prompt${headless_prompt}}"
         fi
         ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup $remote_launch > $local_remote_log 2>&1 &"
         log_success "Remote agent spawned"

@@ -72,7 +72,7 @@ Options:
   --kind <kind>               Compatibility alias for --aspirant-kind; requires --aspirant
   --direct                    Force direct launch; disable auto-aspirant policy
   --session-domain <domain>   Aspirant session-doc domain hint: terra or mars
-  --persona <name>             Persona name (Claude/primarch backend)
+  --persona <name>             Persona name (dispatch-managed)
   --dir <path>                 Working directory (aspirant default: Imperium-ENV vault root)
   --title <text>               Aspirant title metadata
   --objective <text>           Aspirant objective metadata
@@ -85,8 +85,8 @@ Options:
   --system-prompt-file <path>  Read appended Claude system prompt from file
   --target <target>            legion:new, mechanicus:new, or a tmux pane id
   --pane <tmux-pane-id>        Alias for --target; with --id, pane to resume into
-  --gt | --no-gt               Golden Throne lane toggle (default: --gt)
-  --zealotry <1-10>            Golden Throne zealotry (default: 5 with --gt, 3 with --no-gt)
+  --gt | --no-gt               Golden Throne lane toggle (default: --no-gt)
+  --zealotry <1-10>            Zealotry (default: 5 with --gt, 3 with --no-gt)
   --sync                       Sync-session lane
   --instance-type <type>        Explicit instance type (one_off, sync, golden_throne, hook_driven)
   --with-browser               Request browser MCP/profile metadata
@@ -130,7 +130,7 @@ SYSTEM_PROMPT=""
 SYSTEM_PROMPT_FILE=""
 SYSTEM_PROMPT_INLINE_USED=false
 TARGET=""
-GT_MODE=true
+GT_MODE=false
 ZEALOTRY=""
 SYNC=false
 INSTANCE_TYPE_OVERRIDE=""
@@ -138,6 +138,7 @@ REPO=""
 WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
+CODEX_PROFILE="${TOKEN_API_CODEX_PROFILE:-}"
 DISCORD_CHANNEL=""
 NO_WORKTREE=false
 WORKTREE_BRANCH=""
@@ -175,7 +176,8 @@ while [[ $# -gt 0 ]]; do
     --kind) ASPIRANT_KIND="${2:-}"; KIND_ALIAS_USED=true; shift 2 ;;
     --direct) DIRECT=true; shift ;;
     --session-domain) SESSION_DOMAIN="${2:-}"; shift 2 ;;
-    --persona|--primarch) PERSONA="${2:-}"; shift 2 ;;
+    --persona) PERSONA="${2:-}"; shift 2 ;;
+    --primarch) err "--primarch is deprecated; use --persona"; exit 64 ;;
     --dir|-C) WORK_DIR="${2:-}"; WORK_DIR_EXPLICIT=true; shift 2 ;;
     --title) TITLE="${2:-}"; shift 2 ;;
     --objective) OBJECTIVE="${2:-}"; shift 2 ;;
@@ -190,7 +192,7 @@ while [[ $# -gt 0 ]]; do
     --gt) GT_MODE=true; shift ;;
     --no-gt) GT_MODE=false; shift ;;
     --zealotry) ZEALOTRY="${2:-}"; shift 2 ;;
-    --sync) SYNC=true; shift ;;
+    --sync) SYNC=true; GT_MODE=true; shift ;;
     --instance-type) INSTANCE_TYPE_OVERRIDE="${2:-}"; shift 2 ;;
     --with-browser) WITH_BROWSER=true; shift ;;
     --with-desktop) WITH_DESKTOP=true; shift ;;
@@ -227,9 +229,10 @@ dispatch_menu_already_consumed() {
 }
 
 # d/cdc are human launcher surfaces. They should always get the interactive
-# selector, even when --direct is present to bypass aspirant intake. But a
-# dispatch launch chain gets exactly one menu; recursive dispatches spawned
-# after an interactive selection must not re-open fzf.
+# selector. Aspirant intake is no longer the default path; it remains available
+# only through explicit --aspirant. A dispatch launch chain gets exactly one
+# menu; recursive dispatches spawned after an interactive selection must not
+# re-open fzf.
 if dispatch_menu_already_consumed; then
   INTERACTIVE=false
 elif ! $INTERACTIVE && dispatch_origin_is_human_surface; then
@@ -349,6 +352,161 @@ infer_engine() {
   fi
 }
 
+normalize_persona_key() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr '_' '-'
+}
+
+persona_engine_binding() {
+  case "$(normalize_persona_key "$1")" in
+    custodes) printf 'claude' ;;
+    inquisitor|inquisition) printf 'codex' ;;
+  esac
+}
+
+persona_codex_profile() {
+  case "$(normalize_persona_key "$1")" in
+    inquisitor|inquisition) printf 'inquisitor' ;;
+    sisters|sisters-of-battle) printf 'sisters-of-battle' ;;
+  esac
+}
+
+apply_persona_engine_binding() {
+  local bound=""
+  [[ -n "$PERSONA" ]] || return 0
+  bound="$(persona_engine_binding "$PERSONA")"
+  [[ -n "$bound" ]] && ENGINE="$bound"
+  return 0
+}
+
+apply_codex_profile_default() {
+  [[ "$ENGINE" == "codex" ]] || return 0
+  [[ -z "$CODEX_PROFILE" && -n "$PERSONA" ]] && CODEX_PROFILE="$(persona_codex_profile "$PERSONA")"
+  [[ -z "$CODEX_PROFILE" && -z "$PERSONA" ]] && CODEX_PROFILE="sisters-of-battle"
+  return 0
+}
+
+resolve_persona_name() {
+  local input="$1" input_sql row
+  [[ -n "$input" ]] || return 0
+  input_sql="$(sql_literal "$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]')")"
+  row="$(sqlite_query "
+    SELECT name
+    FROM primarchs
+    WHERE LOWER(name) = '${input_sql}'
+       OR LOWER(COALESCE(aliases, '')) LIKE '%\"${input_sql}\"%'
+    ORDER BY CASE WHEN LOWER(name) = '${input_sql}' THEN 0 ELSE 1 END
+    LIMIT 1;
+  ")"
+  [[ -n "$row" ]] && printf '%s' "$row"
+  return 0
+}
+
+canonicalize_persona() {
+  local canonical
+  [[ -n "$PERSONA" ]] || return 0
+  canonical="$(resolve_persona_name "$PERSONA")"
+  [[ -n "$canonical" ]] && PERSONA="$canonical"
+  return 0
+}
+
+persona_vault_root() {
+  local vault_name="$1"
+  case "$vault_name" in
+    Imperium-ENV|imperium|Imperium)
+      if [[ -n "${IMPERIUM:-}" && -d "${IMPERIUM}/Imperium-ENV" ]]; then
+        printf '%s/Imperium-ENV' "$IMPERIUM"
+      elif [[ -d "/Volumes/Imperium/Imperium-ENV" ]]; then
+        printf '%s' "/Volumes/Imperium/Imperium-ENV"
+      elif [[ -d "/mnt/imperium/Imperium-ENV" ]]; then
+        printf '%s' "/mnt/imperium/Imperium-ENV"
+      fi
+      ;;
+    Pax-ENV|civic|Civic)
+      if [[ -n "${CIVIC:-}" && -d "${CIVIC}/Pax-ENV" ]]; then
+        printf '%s/Pax-ENV' "$CIVIC"
+      elif [[ -d "/Volumes/Civic/Pax-ENV" ]]; then
+        printf '%s' "/Volumes/Civic/Pax-ENV"
+      elif [[ -d "/mnt/civic/Pax-ENV" ]]; then
+        printf '%s' "/mnt/civic/Pax-ENV"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+find_local_persona_file() {
+  local name="$1" dir candidate cap_name
+  cap_name="$(printf '%s' "$name" | awk -F- '{for(i=1;i<=NF;i++){ $i=toupper(substr($i,1,1)) substr($i,2)}; print}' OFS='-')"
+  for dir in "$WORK_DIR" "$(pwd)" "$(vault_root_for_aspirant 2>/dev/null || true)"; do
+    [[ -n "$dir" && -d "$dir/Personas" ]] || continue
+    for candidate in "$dir/Personas/${name}.md" "$dir/Personas/${cap_name}.md"; do
+      [[ -f "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    candidate="$(find "$dir/Personas" -maxdepth 1 -type f -iname "${name}.md" -print -quit 2>/dev/null || true)"
+    [[ -n "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 0
+}
+
+extract_persona_system_prompt() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  python3 - "$file" <<'PY_EXTRACT_PERSONA'
+import sys
+from pathlib import Path
+content = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+marker = "## System Prompt"
+idx = content.find(marker)
+if idx < 0:
+    parts = content.split("---", 2)
+    body = parts[2].strip() if len(parts) >= 3 else content.strip()
+else:
+    rest = content[idx + len(marker):].strip()
+    next_h2 = rest.find("\n## ")
+    body = rest[:next_h2].strip() if next_h2 >= 0 else rest
+print(body)
+PY_EXTRACT_PERSONA
+}
+
+build_claude_persona_system_prompt() {
+  local persona="$1" persona_sql row title vault_name prefix note_path vault_root persona_file doc_id prompt
+  [[ -n "$persona" ]] || return 1
+  persona_sql="$(sql_literal "$persona")"
+  row="$(sqlite_query_usv "
+    SELECT COALESCE(title, ''), COALESCE(vault, ''), COALESCE(instance_name_prefix, name), COALESCE(vault_note_path, '')
+    FROM primarchs
+    WHERE name = '${persona_sql}'
+    LIMIT 1;
+  ")"
+  if [[ -n "$row" ]]; then
+    IFS=$'\x1f' read -r title vault_name prefix note_path <<< "$row"
+    vault_root="$(persona_vault_root "$vault_name")"
+    [[ -n "$vault_root" && -n "$note_path" ]] && persona_file="$vault_root/$note_path"
+  fi
+  if [[ -z "${persona_file:-}" || ! -f "$persona_file" ]]; then
+    persona_file="$(find_local_persona_file "$persona")"
+  fi
+  [[ -n "$persona_file" && -f "$persona_file" ]] || { err "persona file not found for --persona $persona"; return 66; }
+  [[ -n "${title:-}" ]] || title="$persona"
+  [[ -n "${vault_name:-}" ]] || vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
+  [[ -n "${prefix:-}" ]] || prefix="$persona"
+  prompt="$(extract_persona_system_prompt "$persona_file")" || return $?
+  prompt="${prompt}
+
+Vault domain: ${vault_name}
+Instance name prefix: ${prefix}"
+  doc_id="$(sqlite_query "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '${persona_sql}' AND unlinked_at IS NULL LIMIT 1;")"
+  if [[ -n "$doc_id" ]]; then
+    prompt="${prompt}
+
+You have a linked session document (ID: ${doc_id}). Invoke the vault-mind skill on startup to load it."
+  fi
+  prompt="${prompt}
+
+On startup, name this instance with: instance-name \"${prefix}-<task-description>\""
+  printf '%s' "$prompt"
+}
+
 dedupe_tsv() {
   awk -F '\t' 'NF && !seen[$1]++'
 }
@@ -458,6 +616,7 @@ mode_candidates() {
   [[ "$default_mode" != "golden_throne" ]] && printf 'golden_throne\tGolden Throne (--gt, zealotry 5)\n'
   [[ "$default_mode" != "sync" ]] && printf 'sync\tSync session (--sync, zealotry 5)\n'
   [[ "$default_mode" != "one_off" ]] && printf 'one_off\tOne-off (--no-gt, zealotry 3)\n'
+  return 0
 }
 
 interactive_override_for() {
@@ -553,7 +712,6 @@ run_interactive_selection() {
       ;;
     *)
       PERSONA="$selected"
-      ENGINE="claude"
       ;;
   esac
 
@@ -565,7 +723,7 @@ run_interactive_selection() {
     one_off)       GT_MODE=false; SYNC=false ;;
     *) err "unknown interactive mode: $selected"; exit 64 ;;
   esac
-
+  return 0
 }
 
 if $INTERACTIVE && [[ -z "$RESUME_ID" ]]; then
@@ -593,6 +751,11 @@ if $ASPIRANT && $DIRECT; then
 fi
 
 auto_aspirant_policy_applies() {
+  # Temporary safety valve while the Aspirant + Golden Throne systems are not
+  # reliable enough to be defaults. Explicit --aspirant still works, and the
+  # old auto-intake behavior can be restored per-call/session by setting
+  # TOKEN_API_DISPATCH_AUTO_ASPIRANT=1.
+  [[ "${TOKEN_API_DISPATCH_AUTO_ASPIRANT:-}" == "1" ]] || return 1
   $DIRECT && return 1
   [[ -n "$RESUME_ID" ]] && return 1
   [[ -n "${TOKEN_API_INTERNAL_DISPATCH:-}" ]] && return 1
@@ -691,6 +854,10 @@ if [[ -n "$RESUME_ID" ]]; then
   resolve_resume_id
 fi
 
+canonicalize_persona
+apply_persona_engine_binding
+apply_codex_profile_default
+
 case "$ENGINE" in
   claude|codex) ;;
   *) err "--engine must be claude or codex"; exit 64 ;;
@@ -735,10 +902,6 @@ if [[ -n "$SYSTEM_PROMPT" && "$ENGINE" == "codex" ]]; then
 fi
 if $ASPIRANT && $SYSTEM_PROMPT_INLINE_USED; then
   err "--system-prompt text is not supported with --aspirant yet; use --system-prompt-file"
-  exit 64
-fi
-if [[ -n "$SYSTEM_PROMPT" && -n "$PERSONA" && "$ASPIRANT" != true ]]; then
-  err "--system-prompt/--system-prompt-file are only supported for direct Claude wrapper launches, not --persona"
   exit 64
 fi
 
@@ -869,26 +1032,46 @@ EOF_ASPIRANT_PROMPT
 }
 
 launch_dispatch_aspirant_session() {
-  local result_json="$1" note_rel session_doc_rel vault prompt_file
+  local result_json="$1" note_rel session_doc_rel vault prompt_file session_doc_abs persona_prompt mode_flag
+  local -a launch_args
   note_rel="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("note_path") or "")' <<<"$result_json")"
   session_doc_rel="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_doc") or "")' <<<"$result_json")"
   [[ -n "$note_rel" && -n "$session_doc_rel" ]] || { err "aspirant creation did not return note/session paths"; return 70; }
   vault="$(vault_root_for_aspirant)"
+  session_doc_abs="$(abs_vault_path "$session_doc_rel")"
   prompt_file="$(build_aspirant_launch_prompt_file "$note_rel" "$session_doc_rel")"
 
-  printf 'launch_action: dispatch --direct --engine claude --dir %q --target legion:new --session-doc %q --system-prompt-file %q --prompt-file %q --gt\n' \
-    "$vault" "$(abs_vault_path "$session_doc_rel")" "$(aspirant_persona_prompt_path)" "$prompt_file"
+  if [[ "$INSTANCE_TYPE" == "sync" ]]; then
+    mode_flag="--sync"
+  elif [[ "$INSTANCE_TYPE" == "golden_throne" ]]; then
+    mode_flag="--gt"
+  else
+    mode_flag="--no-gt"
+  fi
+
+  launch_args=(
+    --direct
+    --engine "$ENGINE"
+    --dir "$vault"
+    --target legion:new
+    --session-doc "$session_doc_abs"
+    --prompt-file "$prompt_file"
+    "$mode_flag"
+    --zealotry "$ZEALOTRY"
+  )
+  if [[ "$ENGINE" == "claude" ]]; then
+    persona_prompt="$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-/Volumes/Imperium/Scripts}/cli-tools/prompts/aspirant-persona.md")"
+    launch_args+=(--system-prompt-file "$persona_prompt")
+  fi
+
+  printf 'launch_action: dispatch'
+  local arg
+  for arg in "${launch_args[@]}"; do printf ' %q' "$arg"; done
+  printf '\n'
   TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
   TOKEN_API_INTERNAL_DISPATCH=1 \
-  "${SCRIPT_DIR}/dispatch" \
-    --direct \
-    --engine claude \
-    --dir "$vault" \
-    --target legion:new \
-    --session-doc "$(abs_vault_path "$session_doc_rel")" \
-    --system-prompt-file "$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-/Volumes/Imperium/Scripts}/cli-tools/prompts/aspirant-persona.md")" \
-    --prompt-file "$prompt_file" \
-    --gt
+  TOKEN_API_CODEX_PROFILE="$CODEX_PROFILE" \
+  "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
 }
 
 aspirant_persona_prompt_path() {
@@ -1132,8 +1315,6 @@ fi
 
 # Derive the instance legion so automated launches (GT/state-hook dispatch,
 # cron) that bypass --persona still bind Custodes to its shared daily note.
-# This is an independent signal in COMMON_ENV: it survives even when the
-# primarch wrapper fails to propagate TOKEN_API_PRIMARCH.
 LEGION="${TOKEN_API_LEGION:-}"
 if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
   case "$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')" in
@@ -1188,7 +1369,9 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_WITH_BROWSER=${WITH_BROWSER}"
   "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
   "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
+  "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
 )
+[[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PRIMARCH=${PERSONA}")
 if [[ -n "$DISCORD_CHANNEL" ]]; then
   COMMON_ENV+=(
     "TOKEN_API_DISCORD_HOSTED=1"
@@ -1420,13 +1603,33 @@ build_agent_command() {
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
-    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "" "${PROMPT:-}")
-  elif [[ -n "$PERSONA" ]]; then
-    cmd=("${SCRIPT_DIR}/primarch" "$PERSONA")
-    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline "\$@"" dispatch-codex "" "${PROMPT:-}")
   else
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
-    [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
+    if [[ -n "$PERSONA" ]]; then
+      local persona_prompt profile_dir line
+      persona_prompt="$(build_claude_persona_system_prompt "$PERSONA")"
+      [[ -n "$SYSTEM_PROMPT" ]] && persona_prompt="${persona_prompt}"$'
+
+'"${SYSTEM_PROMPT}"
+      cmd+=(--append-system-prompt "$persona_prompt")
+      profile_dir="$HOME/.claude/profiles/$PERSONA"
+      if [[ -d "$profile_dir" ]]; then
+        [[ -f "$profile_dir/.mcp.json" ]] && cmd+=(--mcp-config "$profile_dir/.mcp.json" --strict-mcp-config)
+        if [[ -f "$profile_dir/disallowed-tools.txt" ]]; then
+          while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
+            cmd+=(--disallowedTools "$line")
+          done < "$profile_dir/disallowed-tools.txt"
+        fi
+        [[ -f "$profile_dir/settings.json" ]] && cmd+=(--settings "$profile_dir/settings.json")
+      fi
+    else
+      [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
+    fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
   printf 'cd %q && env TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
