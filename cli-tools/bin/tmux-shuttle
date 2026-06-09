@@ -131,41 +131,53 @@ if [[ "$current_type" == "tombstone" ]]; then
     PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.cli "${args[@]}"
 fi
 
-# --- DEMOTE: somnium → legion ---
+# --- DEMOTE: palace/somnium → legion stack ---
 demote() {
-    # Ensure legion window exists; resolve actual name (may have instance count suffix)
-    local legion_win
-    legion_win=$(resolve_window legion)
-    if ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -q "^legion"; then
-        tmux new-window -t "$SESSION" -n legion -d -c "$HOME"
-        pane_tag "${SESSION}:legion.1" "legion:custodes"
-        legion_win="legion"
-    fi
-
-    # Remember the slot tag and working directory before we move
+    # Remember the slot tag and working directory before we swap.
     local slot_tag="$current_tag"
     local wdir
     wdir=$(tmux display-message -t "$current_pane" -p '#{pane_current_path}')
 
-    # Spawn a fresh shell in the same spot BEFORE moving the pane out.
-    # split-window creates a sibling; the old pane is still there.
-    # Then we move the old pane to legion.
-    local new_pane
-    new_pane=$(tmux split-window -t "$current_pane" -P -F '#{pane_id}' -c "${wdir:-$HOME}")
+    # Allocate a real managed stack worker first, then swap the live pane into
+    # that stack slot. Raw `move-pane -t main:legion` can target the orchestrator
+    # side of the stack and clobber the Custodes pane. `tmuxctl stack add`
+    # centralizes split geometry, worker tagging, pending flags, and spillover.
+    local stack_pane stack_tag
+    stack_pane=$(PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli stack add legion \
+            --session "$SESSION" \
+            --cwd "${wdir:-$HOME}" \
+            --no-focus)
+    [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate legion stack pane"; return 1; }
+    stack_tag=$(pane_id_of "$stack_pane")
+    [[ -n "$stack_tag" ]] || stack_tag="legion:worker"
 
-    # Tag the replacement pane with the original slot tag
-    pane_tag "$new_pane" "$slot_tag"
-    tmux set-option -p -t "$new_pane" @GRID_RESERVED "false"
+    # After swap, pane IDs follow content: current_pane is in the managed stack
+    # slot; stack_pane is the fresh shell now occupying the original palace/
+    # somnium slot.
+    tmux swap-pane -d -s "$current_pane" -t "$stack_pane" || {
+        tmux kill-pane -t "$stack_pane" 2>/dev/null || true
+        tmux display-message "Shuttle: swap into legion stack failed"
+        return 1
+    }
 
-    # Tag and move the original pane to legion
-    pane_tag "$current_pane" "legion:demoted"
-    tmux set-option -p -t "$current_pane" @PANE_TYPE "legion"
-    tmux move-pane -s "$current_pane" -t "${SESSION}:${legion_win}" -d
+    # Preserve the managed stack identity on the demoted live pane and restore
+    # the original slot identity on the fresh shell replacement.
+    pane_tag "$current_pane" "$stack_tag" || true
+    tmux set-option -p -t "$current_pane" @PANE_TYPE "stack-worker" 2>/dev/null || true
+    tmux set-option -pu -t "$current_pane" @STACK_PENDING 2>/dev/null || true
+    pane_tag "$stack_pane" "$slot_tag" || true
+    tmux set-option -p -t "$stack_pane" @GRID_RESERVED "false" 2>/dev/null || true
+    tmux set-option -pu -t "$stack_pane" @STACK_PENDING 2>/dev/null || true
+
     PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.cli legion focus-selected --pane "$current_pane" >/dev/null 2>&1 || true
 
     # Update Token-API DB so orchestration sees the new location
-    relocate_pane "$current_pane" "legion:demoted"
+    relocate_pane "$current_pane" "$stack_tag"
+
+    # Keep the user's camera on the fresh shell replacement in the original slot.
+    tmux select-pane -t "$stack_pane" 2>/dev/null || true
 
     # Refresh somnium layout so the replacement pane fills the correct geometry
     tmux-refresh-layout 2>/dev/null || true
@@ -173,7 +185,7 @@ demote() {
     # Trigger workspace audit (backburner cleanup, etc.) — fire and forget
     tmux-audit --force &
 
-    tmux display-message "Shipped to legion"
+    tmux display-message "Shipped to legion stack"
 }
 
 # --- PROMOTE: legion/mechanicus → somnium (selector) ---

@@ -167,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
     stack_add.add_argument("--cwd", default=None)
     stack_add.add_argument("--session", default="main")
+    stack_add.add_argument("--no-focus", action="store_true")
     stack_dispatch = stack_subparsers.add_parser("dispatch")
     stack_dispatch.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
     stack_dispatch.add_argument("--cwd", default=None)
@@ -447,7 +448,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.stack_command == "add":
                 from .stack import add_stack_pane
 
-                pane_id = add_stack_pane(control.adapter, args.session, args.base, cwd=args.cwd)
+                pane_id = add_stack_pane(
+                    control.adapter,
+                    args.session,
+                    args.base,
+                    cwd=args.cwd,
+                    focus=not args.no_focus,
+                )
                 print(pane_id)
                 return 0
             if args.stack_command == "dispatch":
