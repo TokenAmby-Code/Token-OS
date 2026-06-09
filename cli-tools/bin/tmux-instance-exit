@@ -144,6 +144,12 @@ _enforce_stack_window() {
     fi
 }
 
+
+_clear_resume_sentinels() {
+    [[ -n "$PANE" ]] || return 0
+    rm -f "/tmp/agent-resume-${PANE}" "/tmp/claude-resume-${PANE}" 2>/dev/null || true
+}
+
 _focus_stack_orchestrator() {
     local window_target="$1"
     [[ -n "$window_target" ]] || return 0
@@ -175,6 +181,7 @@ done
 # pane's live @INSTANCE_ID over scraping agent-specific resume blurbs: dispatch
 # resolves both Claude and Codex rows by id/session and owns engine routing.
 sleep 1
+_clear_resume_sentinels
 
 if [[ -n "$STACK_WINDOW" ]]; then
     _clear_closeout_chrome
