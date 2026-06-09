@@ -181,16 +181,16 @@ kill_local_claude() {
 # Build a fallback command that restores the original session in its original directory
 build_fallback_cmd() {
     local source_dir="$1" session_id="$2" primarch_name="$3"
-    local claude_bin
-    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
-        claude_bin="claude"
-    else
-        claude_bin="\$HOME/.local/bin/claude"
-    fi
+    local source_q session_q prompt prompt_q persona_q
+    source_q="$(shell_quote "$source_dir")"
+    session_q="$(shell_quote "$session_id")"
+    prompt="Transplant FAILED. Restored original session in ${source_dir}."
+    prompt_q="$(shell_quote "$prompt")"
     if [[ -n "$primarch_name" ]]; then
-        echo "cd '${source_dir}' && dispatch --persona ${primarch_name} --resume '${session_id}' --prompt 'Transplant FAILED. Restored original session in ${source_dir}.'"
+        persona_q="$(shell_quote "$primarch_name")"
+        echo "cd ${source_q} && dispatch --persona ${persona_q} --resume ${session_q} --prompt ${prompt_q}"
     else
-        echo "cd '${source_dir}' && dispatch --engine claude --dir '${source_dir}' --resume '${session_id}' --prompt 'Transplant FAILED. Restored original session in ${source_dir}.'"
+        echo "cd ${source_q} && dispatch --engine claude --dir ${source_q} --resume ${session_q} --prompt ${prompt_q}"
     fi
 }
 
@@ -496,23 +496,25 @@ write_transplant_handoff() {
 # --- Build restart command ---
 build_restart_cmd() {
     local target_dir="$1" session_id="$2" primarch_name="$3" resume_prompt="$4"
-    local claude_bin
-    if [[ "${IMPERIUM_MACHINE:-}" == "mac" ]]; then
-        claude_bin="claude"
-    else
-        claude_bin="\$HOME/.local/bin/claude"
-    fi
-
-    local prompt_arg=""
-    if [[ -n "$resume_prompt" ]]; then
-        # Positional prompt arg goes after all flags (NOT -p, which is --print mode)
-        prompt_arg=" '${resume_prompt}'"
-    fi
+    local target_q session_q persona_q prompt_q
+    target_q="$(shell_quote "$target_dir")"
+    session_q="$(shell_quote "$session_id")"
 
     if [[ -n "$primarch_name" ]]; then
-        echo "cd '${target_dir}' && dispatch --persona ${primarch_name} --resume '${session_id}'${prompt_arg:+ --prompt${prompt_arg}}"
+        persona_q="$(shell_quote "$primarch_name")"
+        if [[ -n "$resume_prompt" ]]; then
+            prompt_q="$(shell_quote "$resume_prompt")"
+            echo "cd ${target_q} && dispatch --persona ${persona_q} --resume ${session_q} --prompt ${prompt_q}"
+        else
+            echo "cd ${target_q} && dispatch --persona ${persona_q} --resume ${session_q}"
+        fi
     else
-        echo "cd '${target_dir}' && dispatch --engine claude --dir '${target_dir}' --resume '${session_id}'${prompt_arg:+ --prompt${prompt_arg}}"
+        if [[ -n "$resume_prompt" ]]; then
+            prompt_q="$(shell_quote "$resume_prompt")"
+            echo "cd ${target_q} && dispatch --engine claude --dir ${target_q} --resume ${session_q} --prompt ${prompt_q}"
+        else
+            echo "cd ${target_q} && dispatch --engine claude --dir ${target_q} --resume ${session_q}"
+        fi
     fi
 }
 
@@ -1030,14 +1032,7 @@ if [[ -n "$REMOTE_HOST" ]]; then
         echo ""
 
         # Build relay restart command (ssh wrapping the remote claude command)
-        remote_cmd=""
-        remote_prompt=""
-        [[ -n "$RESUME_PROMPT" ]] && remote_prompt=" '${RESUME_PROMPT}'"
-        if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_cmd="cd '$TARGET_DIR' && dispatch --persona $PRIMARCH_NAME --resume '$session_id'${remote_prompt:+ --prompt${remote_prompt}}"
-        else
-            remote_cmd="cd '$TARGET_DIR' && dispatch --engine claude --dir '$TARGET_DIR' --resume '$session_id'${remote_prompt:+ --prompt${remote_prompt}}"
-        fi
+        remote_cmd="$(build_restart_cmd "$TARGET_DIR" "$session_id" "$PRIMARCH_NAME" "$RESUME_PROMPT")"
         relay_restart_cmd="ssh -t $ssh_target \"$remote_cmd\""
 
         # Build fallback for recovery
@@ -1063,14 +1058,7 @@ RELAY_EOF
         # Headless remote
         log_info "Spawning headless agent via dispatch on $REMOTE_HOST..."
         local_remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
-        remote_launch=""
-        headless_prompt=""
-        [[ -n "$RESUME_PROMPT" ]] && headless_prompt=" '${RESUME_PROMPT}'"
-        if [[ -n "$PRIMARCH_NAME" ]]; then
-            remote_launch="dispatch --persona $PRIMARCH_NAME --resume '$session_id'${headless_prompt:+ --prompt${headless_prompt}}"
-        else
-            remote_launch="dispatch --engine claude --dir '$TARGET_DIR' --resume '$session_id'${headless_prompt:+ --prompt${headless_prompt}}"
-        fi
+        remote_launch="$(build_restart_cmd "$TARGET_DIR" "$session_id" "$PRIMARCH_NAME" "$RESUME_PROMPT")"
         ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup $remote_launch > $local_remote_log 2>&1 &"
         log_success "Remote agent spawned"
 

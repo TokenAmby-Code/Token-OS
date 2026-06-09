@@ -1603,7 +1603,7 @@ build_agent_command() {
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
-    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline "\$@"" dispatch-codex "" "${PROMPT:-}")
+    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "" "${PROMPT:-}")
   else
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
     if [[ -n "$PERSONA" ]]; then

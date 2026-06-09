@@ -293,10 +293,14 @@ do_dispatch() {
     sleep 0.3
 
     # Build and send the launch command — dispatch is the sole launch engine.
+    local vault_q prompt_file_q persona_q
+    vault_q="$(shell_quote "$VAULT_DIR")"
+    prompt_file_q="$(shell_quote "$prompt_file")"
     if [[ -n "$primarch_name" ]]; then
-        tmux send-keys -t "$target_pane" "dispatch --direct --dir '${VAULT_DIR}' --persona ${primarch_name} --prompt \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
+        persona_q="$(shell_quote "$primarch_name")"
+        tmux send-keys -t "$target_pane" "dispatch --direct --dir ${vault_q} --persona ${persona_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}" Enter
     else
-        tmux send-keys -t "$target_pane" "dispatch --direct --dir '${VAULT_DIR}' --prompt \"\$(cat ${prompt_file})\" ; rm -f ${prompt_file}" Enter
+        tmux send-keys -t "$target_pane" "dispatch --direct --dir ${vault_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}" Enter
     fi
 
     log_success "Agent launched via dispatch"
@@ -488,6 +492,10 @@ do_status() {
 # ═══════════════════════════════════════════════════════════════
 # MAIN — Route subcommand
 # ═══════════════════════════════════════════════════════════════
+shell_quote() {
+    printf '%q' "$1"
+}
+
 usage() {
     cat << 'EOF'
 work-loop — Full vault-to-worktree-to-vault work cycle orchestration
