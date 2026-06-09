@@ -185,7 +185,6 @@ def test_dispatch_worktree_metadata_does_not_override_explicit(tmp_path):
     assert "objective:      My Objective" in result.stdout
 
 
-
 def test_dispatch_default_one_off_but_sync_keeps_gt_zealotry():
     default = subprocess.run(
         [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "default work"],
@@ -208,6 +207,7 @@ def test_dispatch_default_one_off_but_sync_keeps_gt_zealotry():
     assert sync.returncode == 0, sync.stderr
     assert "instance_type:   sync" in sync.stdout
     assert "zealotry:        5" in sync.stdout
+
 
 def test_dispatch_codex_rejects_system_prompt(tmp_path):
     system_file = tmp_path / "system.txt"
@@ -562,7 +562,6 @@ def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
     assert "instance_type:   one_off" in result.stdout
 
 
-
 def test_dispatch_persona_engine_bindings_and_generic_engine_choice():
     custodes = subprocess.run(
         [
@@ -650,6 +649,7 @@ def test_dispatch_rejects_deprecated_primarch_flag():
 
     assert result.returncode == 64
     assert "--primarch is deprecated; use --persona" in result.stderr
+
 
 def test_dispatch_aspirant_rejects_inline_system_prompt():
     result = subprocess.run(
@@ -777,7 +777,6 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "## Trials" in staged
 
 
-
 def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_prompt(tmp_path):
     vault = tmp_path / "Imperium-ENV"
     vault.mkdir()
@@ -843,6 +842,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     assert "dispatch_codex_launch_inline" in staged
     assert "--append-system-prompt" not in staged
     assert "Aspirant Session Startup" in staged
+
 
 def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp_path):
     vault = tmp_path / "Imperium-ENV"
