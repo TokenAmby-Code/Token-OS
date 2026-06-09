@@ -72,6 +72,10 @@ def resolve_agent_for_pane(
     *,
     default: str = "claude",
 ) -> str:
+    normalized_default = normalize_agent(default)
+    if normalized_default == "auto" and (default or "").strip().lower() != "auto":
+        raise ValueError("default must be one of: claude, codex, or auto")
+
     explicit = normalize_agent(requested)
     if explicit != "auto":
         return explicit
@@ -112,7 +116,7 @@ def resolve_agent_for_pane(
     hinted_agent = normalize_agent(hinted)
     if hinted_agent != "auto":
         return hinted_agent
-    return default
+    return normalized_default
 
 
 def insert_at_prompt_start(

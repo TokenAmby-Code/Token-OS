@@ -113,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_agent_parser.add_argument(
         "--default",
         default="claude",
+        choices=["claude", "codex", "auto"],
         help="Value to print when detection is inconclusive (use 'auto' to fail closed).",
     )
 

@@ -146,3 +146,11 @@ def test_resolve_agent_for_pane_default_when_inconclusive(monkeypatch):
     # closed instead of inserting a guessed leader.
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "claude"
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42", default="auto") == "auto"
+
+
+def test_resolve_agent_for_pane_rejects_invalid_default():
+    # default must stay inside the claude|codex|auto contract — an arbitrary
+    # value must never escape as the resolved harness.
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError):
+        skill_invoke.resolve_agent_for_pane(adapter, "%42", default="bogus")
