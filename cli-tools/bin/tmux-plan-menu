@@ -72,6 +72,17 @@ if [[ -z "$PANE" ]] && ! $DRY_RUN; then
     exit 1
 fi
 
+# A bare Shift+Tab is the Emperor pressing a key: every action this menu fires —
+# the preplan/plan/compact inserts (via `tmuxctl invoke-skill`) and the literal
+# Shift+Tab forward — is direct Emperor input, NOT automation. Mark the sends
+# sanctioned so they PIERCE the universal recent-typing gate instead of delaying
+# behind the very keystroke that opened this menu (a delay the popup outlives, so
+# the insert silently never lands). Same pierce `tmux-dictate` uses, which Discord
+# active-pane injection reuses through it. Still audited by tmuxctl.send_gate as a
+# send_gate_override. `${VAR:-default}` so an explicit outer disposition still wins.
+export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-plan-menu-direct-input}"
+export TMUX_SEND_GATE_POLICY="${TMUX_SEND_GATE_POLICY:-pierce}"
+
 json_escape() {
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
