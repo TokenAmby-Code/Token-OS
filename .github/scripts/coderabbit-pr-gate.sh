@@ -4,11 +4,12 @@
 # Responsibilities:
 #   1. Fail closed if CodeRabbit is absent, still pending after timeout, failed, or
 #      reports a disabled/free-trial/credit-skipped review.
-#   2. When CodeRabbit has succeeded on the current head SHA, dismiss stale
-#      CodeRabbit CHANGES_REQUESTED review objects left on older commits. This
-#      handles the observed bot failure mode where the commit status is current
-#      and green but GitHub reviewDecision remains CHANGES_REQUESTED from an
-#      already-addressed assessment.
+#   2. When CodeRabbit has succeeded on the current head SHA and the latest
+#      CodeRabbit review for that SHA is non-blocking, dismiss stale CodeRabbit
+#      CHANGES_REQUESTED review objects left on older commits. This handles the
+#      observed bot failure mode where the commit status is current and green
+#      but GitHub reviewDecision remains CHANGES_REQUESTED from an already-
+#      addressed assessment.
 
 set -euo pipefail
 
@@ -38,8 +39,11 @@ wait_for_coderabbit_status() {
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
-    line="$(gh api --method GET "repos/$REPO/commits/$SHA/status" \
-      --jq '[.statuses[]? | select(((.context // "") | ascii_downcase) == "coderabbit")] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end' || true)"
+    if ! line="$(gh api --method GET "repos/$REPO/commits/$SHA/status" \
+      --jq '[.statuses[]? | select((((.context // "") | ascii_downcase) | startswith("coderabbit")))] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end')"; then
+      echo "::error::Failed to query CodeRabbit commit status for $SHA. Check GH_TOKEN, REPO, SHA, and statuses: read."
+      exit 1
+    fi
 
     if [[ -n "$line" ]]; then
       IFS=$'\t' read -r context state description updated_at <<< "$line"
@@ -73,14 +77,21 @@ wait_for_coderabbit_status() {
   done
 }
 
-assert_no_current_head_changes_requested() {
-  local current_blockers
-  current_blockers="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
-    --jq '.[] | select(.user.login == "'"$CODERABBIT_LOGIN"'" and .state == "CHANGES_REQUESTED" and .commit_id == "'"$SHA"'") | [.id, .submitted_at, (.html_url // "")] | @tsv')"
+assert_latest_current_head_review_non_blocking() {
+  local latest_review id state submitted_at url
+  latest_review="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+    --jq '[.[] | select(.user.login == "'"$CODERABBIT_LOGIN"'" and .commit_id == "'"$SHA"'")] | sort_by(.submitted_at // "") | if length == 0 then empty else last | [.id, .state, .submitted_at, (.html_url // "")] | @tsv end')"
 
-  if [[ -n "$current_blockers" ]]; then
-    echo "::error::CodeRabbit requested changes on the current head SHA ($SHA). Address the current review; refusing to dismiss it."
-    printf '%s\n' "$current_blockers"
+  if [[ -z "$latest_review" ]]; then
+    echo "No CodeRabbit review object exists on current head; relying on successful current-head CodeRabbit status."
+    return 0
+  fi
+
+  IFS=$'\t' read -r id state submitted_at url <<< "$latest_review"
+  echo "Latest CodeRabbit review for current head: id=$id state=$state submitted_at=$submitted_at url=$url"
+
+  if [[ "$state" == "CHANGES_REQUESTED" ]]; then
+    echo "::error::CodeRabbit's latest review on current head ($SHA) requested changes. Address the current review; refusing to dismiss it."
     exit 1
   fi
 }
@@ -99,7 +110,7 @@ dismiss_stale_changes_requested_reviews() {
   while IFS=$'\t' read -r id commit_id submitted_at url; do
     [[ -n "$id" ]] || continue
     short_sha="${commit_id:0:12}"
-    message="Dismiss stale CodeRabbit CHANGES_REQUESTED from $short_sha: CodeRabbit commit status is success on current head ${SHA:0:12}."
+    message="Dismiss stale CodeRabbit CHANGES_REQUESTED from $short_sha: CodeRabbit commit status is success on current head ${SHA:0:12}, and the latest CodeRabbit review on current head is non-blocking."
     echo "Dismissing stale CodeRabbit review id=$id commit=$commit_id submitted_at=$submitted_at url=$url"
     if ! gh api --method PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$id/dismissals" -f "message=$message" >/dev/null; then
       echo "::error::Failed to dismiss stale CodeRabbit review id=$id. Grant this workflow pull-requests: write or dismiss the stale review manually."
@@ -113,5 +124,5 @@ dismiss_stale_changes_requested_reviews() {
 }
 
 wait_for_coderabbit_status
-assert_no_current_head_changes_requested
+assert_latest_current_head_review_non_blocking
 dismiss_stale_changes_requested_reviews

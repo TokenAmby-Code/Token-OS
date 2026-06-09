@@ -13,7 +13,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
   statuses: read
   checks: write
 
@@ -28,6 +28,11 @@ env:
 jobs:
   # "quality" is the canonical blocking check required by branch protection on main.
   quality:
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: read
+      checks: write
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
