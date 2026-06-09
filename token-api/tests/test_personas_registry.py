@@ -62,7 +62,9 @@ async def test_assignment_exhausts_primary_before_backup(app_env):
         assert first["slug"] == "blood-angels"
         assert exhausted is False
 
-        primary_ids = {personas.persona_id_for_slug(seed.slug) for seed in personas.PRIMARY_ASTARTES}
+        primary_ids = {
+            personas.persona_id_for_slug(seed.slug) for seed in personas.PRIMARY_ASTARTES
+        }
         backup, exhausted = await personas.assign_astartes_persona(db, active_ids=primary_ids)
         assert backup["slug"] == "space-wolves"
         assert backup["assignment_pool"] == "backup"
@@ -146,7 +148,7 @@ async def test_null_tts_voice_queues_as_silent_not_fallback(app_env):
         )
         await db.commit()
 
-    result = await queue_tts('fg-silent', 'Should not speak')
+    result = await queue_tts("fg-silent", "Should not speak")
     assert result == {"success": True, "queued": False, "reason": "persona_silent"}
 
 
@@ -167,16 +169,16 @@ async def test_future_instances_rank_retired_does_not_lock_persona(app_env):
         )
         await db.execute(
             "INSERT INTO instances (id, persona_id, rank, status) VALUES ('retired', ?, 'retired', 'active')",
-            (personas.persona_id_for_slug('blood-angels'),),
+            (personas.persona_id_for_slug("blood-angels"),),
         )
         await db.execute(
             "INSERT INTO instances (id, persona_id, rank, status) VALUES ('active', ?, 'astartes', 'active')",
-            (personas.persona_id_for_slug('ultramarines'),),
+            (personas.persona_id_for_slug("ultramarines"),),
         )
         await db.commit()
 
         locked = await personas.active_non_retired_persona_ids(db)
-        assert personas.persona_id_for_slug('blood-angels') not in locked
-        assert personas.persona_id_for_slug('ultramarines') in locked
+        assert personas.persona_id_for_slug("blood-angels") not in locked
+        assert personas.persona_id_for_slug("ultramarines") in locked
         assigned, _ = await personas.assign_astartes_persona(db)
-        assert assigned['slug'] == 'blood-angels'
+        assert assigned["slug"] == "blood-angels"

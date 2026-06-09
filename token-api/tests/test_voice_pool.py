@@ -17,9 +17,7 @@ def test_compat_profiles_have_no_cc_color(app_env):
     assert all("cc_color" not in slot for slot in all_slots)
     assert app_env.shared.CUSTODES_PROFILE["wsl_voice"] == "Microsoft George"
     assert all(
-        p["wsl_voice"] is None
-        for p in app_env.shared.PERSONA_PROFILES
-        if p["name"] != "custodes"
+        p["wsl_voice"] is None for p in app_env.shared.PERSONA_PROFILES if p["name"] != "custodes"
     )
 
 
@@ -47,7 +45,9 @@ async def test_persona_assignment_primary_then_backup(app_env):
 
 
 def test_custodes_voice_reserved_from_astartes_assignment(app_env):
-    rotation_voices = {p["wsl_voice"] for p in app_env.shared.PROFILES + app_env.shared.FALLBACK_VOICES}
+    rotation_voices = {
+        p["wsl_voice"] for p in app_env.shared.PROFILES + app_env.shared.FALLBACK_VOICES
+    }
     rotation_voices.add(app_env.shared.ULTIMATE_FALLBACK["wsl_voice"])
     assert app_env.shared.CUSTODES_PROFILE["wsl_voice"] not in rotation_voices
 

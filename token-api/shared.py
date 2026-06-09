@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import sqlite3
 import subprocess
 import threading
@@ -339,7 +338,6 @@ def profile_by_name(profile_name: str | None) -> dict | None:
     if not profile_name:
         return None
     return PROFILE_BY_SLUG.get(profile_name)
-
 
 
 # ============ TTS State ============
