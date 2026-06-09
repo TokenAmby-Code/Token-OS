@@ -152,7 +152,6 @@ api-ping() {
 # =============================================================================
 # Claude Code — unified launcher
 # =============================================================================
-# Primarch dispatch: uses _primarch_launch (mac .zsh_aliases) or primarch binary (WSL cli-tools)
 # Smart resume: queries token-api if session not found locally
 
 _resolve_dispatch_bin() {
@@ -244,8 +243,8 @@ claude() {
                 shift
                 ;;
             --primarch|-P)
-                primarch="$2"
-                shift 2
+                echo "claude --primarch is deprecated; use dispatch --persona <name>" >&2
+                return 64
                 ;;
             -r|--resume)
                 args+=("$1")
@@ -265,24 +264,7 @@ claude() {
     done
 
     if $use_codex; then
-        if [[ -n "$primarch" ]]; then
-            echo "--codex cannot be combined with --primarch" >&2
-            return 1
-        fi
         _codex_launch "${args[@]}"
-        return
-    fi
-
-    # Primarch dispatch — try inline launcher (mac), then CLI binary (WSL)
-    if [[ -n "$primarch" ]]; then
-        if type _primarch_launch &>/dev/null; then
-            _primarch_launch "$primarch" "${args[@]}"
-        elif command -v primarch &>/dev/null; then
-            command primarch "$primarch" "${args[@]}"
-        else
-            echo "Primarch system not available" >&2
-            return 1
-        fi
         return
     fi
 
@@ -331,6 +313,22 @@ _dispatch_has_flag() {
     return 1
 }
 
+_dispatch_kind_is_aspirant() {
+    local previous=""
+    local arg
+    for arg in "$@"; do
+        if [[ "$previous" == "--kind" ]]; then
+            [[ "$arg" == "aspirant" ]] && return 0
+            previous=""
+        fi
+        case "$arg" in
+            --kind=aspirant) return 0 ;;
+            --kind) previous="--kind" ;;
+        esac
+    done
+    return 1
+}
+
 _dispatch_human_surface() {
     local origin="$1"
     local do_clear="$2"
@@ -348,22 +346,15 @@ _dispatch_human_surface() {
     args=("$@")
 
     # Human launcher surfaces are canonical dispatch entrypoints. Always enter the
-    # dispatch selector and default to dispatch aspirant intake unless explicitly
-    # overridden with --direct, --aspirant, --id/--resume, or -r.
+    # dispatch selector by default. Aspirant intake is explicit-only for now
+    # because the Aspirant pipeline is not reliable enough to be the default.
     if [[ -z "${TOKEN_API_DISPATCH_MENU_CONSUMED:-${DISPATCH_MENU_CONSUMED:-}}" ]] \
         && ! _dispatch_has_flag --interactive "${args[@]}"; then
         args=(--interactive "${args[@]}")
     fi
-    if ! _dispatch_has_flag --direct "${args[@]}" \
-        && ! _dispatch_has_flag --aspirant "${args[@]}" \
-        && ! _dispatch_has_flag --id "${args[@]}" \
-        && ! _dispatch_has_flag --resume "${args[@]}" \
-        && ! _dispatch_has_flag -r "${args[@]}"; then
-        if _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_has_flag --kind "${args[@]}"; then
-            args=(--aspirant "${args[@]}")
-        else
-            args=(--aspirant --aspirant-kind dispatch "${args[@]}")
-        fi
+    if ! _dispatch_has_flag --aspirant "${args[@]}" \
+        && { _dispatch_has_flag --aspirant-kind "${args[@]}" || _dispatch_kind_is_aspirant "${args[@]}"; }; then
+        args=(--aspirant "${args[@]}")
     fi
 
     TOKEN_API_DISPATCH_ORIGIN="$origin" "$dispatch_bin" "${args[@]}"
@@ -374,7 +365,7 @@ _dispatch_human_surface() {
 unalias c cc d 2>/dev/null || true
 unset -f cc d 2>/dev/null || true
 
-# cdc — cd + clear + dispatch aspirant selector; bypasses directory selection
+# cdc — cd + clear + direct dispatch selector; bypasses directory selection
 cdc() {
     if [[ $# -gt 0 && "$1" != -* ]]; then
         local dir="$1"
@@ -385,7 +376,7 @@ cdc() {
     _dispatch_human_surface cdc true --dir "$PWD" "$@"
 }
 
-# d — dispatch aspirant selector
+# d — direct dispatch selector
 # Replaces cc as the human dispatch namespace.
 d() {
     _dispatch_human_surface d false "$@"

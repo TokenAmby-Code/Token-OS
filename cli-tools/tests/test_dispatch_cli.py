@@ -185,6 +185,30 @@ def test_dispatch_worktree_metadata_does_not_override_explicit(tmp_path):
     assert "objective:      My Objective" in result.stdout
 
 
+def test_dispatch_default_one_off_but_sync_keeps_gt_zealotry() -> None:
+    default = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "default work"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert default.returncode == 0, default.stderr
+    assert "instance_type:   one_off" in default.stdout
+    assert "zealotry:        3" in default.stdout
+
+    sync = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--sync", "--dir", str(ROOT), "sync work"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert sync.returncode == 0, sync.stderr
+    assert "instance_type:   sync" in sync.stdout
+    assert "zealotry:        5" in sync.stdout
+
+
 def test_dispatch_codex_rejects_system_prompt(tmp_path):
     system_file = tmp_path / "system.txt"
     system_file.write_text("unsupported", encoding="utf-8")
@@ -247,9 +271,28 @@ def test_dispatch_kind_alias_requires_aspirant():
     assert "--kind is only valid" in result.stderr
 
 
-def test_dispatch_auto_policy_uses_origin_env(monkeypatch):
+def test_dispatch_human_origin_no_longer_auto_aspirant(monkeypatch) -> None:
+    monkeypatch.delenv("TOKEN_API_INTERNAL_DISPATCH", raising=False)
+    monkeypatch.delenv("TOKEN_API_DISPATCH_AUTO_ASPIRANT", raising=False)
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "make this a tracked worker goal"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0
+    assert "dispatch dry-run" in result.stdout
+    assert "dispatch aspirant dry-run" not in result.stdout
+    assert "instance_type:   one_off" in result.stdout
+
+
+def test_dispatch_auto_aspirant_can_be_enabled_by_env(monkeypatch) -> None:
     monkeypatch.delenv("TOKEN_API_INTERNAL_DISPATCH", raising=False)
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_AUTO_ASPIRANT", "1")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "make this a tracked worker goal"],
         capture_output=True,
@@ -417,7 +460,7 @@ def test_dispatch_auto_policy_ignores_internal_dispatch(monkeypatch):
     assert "dispatch aspirant dry-run" not in result.stdout
 
 
-def test_human_shell_surfaces_call_dispatch_interactive_aspirants(tmp_path):
+def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "dispatch.log"
@@ -460,8 +503,8 @@ def test_human_shell_surfaces_call_dispatch_interactive_aspirants(tmp_path):
 
     assert result.returncode == 0, result.stderr
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "d|--aspirant --aspirant-kind dispatch --interactive do more"
-    assert lines[1] == f"cdc|--aspirant --aspirant-kind dispatch --interactive --dir {ROOT} do cdc"
+    assert lines[0] == "d|--interactive do more"
+    assert lines[1] == f"cdc|--interactive --dir {ROOT} do cdc"
     assert lines[2] == "d|--interactive --direct direct work"
     assert lines[3] == f"cdc|--interactive --dir {ROOT} --direct direct cdc"
     assert lines[4] == "d|--interactive --resume resume-session-id"
@@ -517,7 +560,96 @@ def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
     assert result.returncode == 0, result.stderr
     assert "dispatch dry-run" in result.stdout
     assert "engine:          claude" in result.stdout
-    assert "instance_type:   golden_throne" in result.stdout
+    assert "instance_type:   one_off" in result.stdout
+
+
+def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
+    custodes = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--no-worktree",
+            "--engine",
+            "codex",
+            "--persona",
+            "custodes",
+            "--dir",
+            str(ROOT),
+            "custodes work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert custodes.returncode == 0, custodes.stderr
+    assert "engine:          claude" in custodes.stdout
+    assert "primarch custodes" not in custodes.stdout
+    assert "claude-wrapper.sh" in custodes.stdout
+    assert "TOKEN_API_PRIMARCH=custodes" in custodes.stdout
+
+    inquisitor = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--no-worktree",
+            "--engine",
+            "claude",
+            "--persona",
+            "inquisitor",
+            "--dir",
+            str(ROOT),
+            "inquisitor work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert inquisitor.returncode == 0, inquisitor.stderr
+    assert "engine:          codex" in inquisitor.stdout
+    assert "TOKEN_API_CODEX_PROFILE=inquisitor" in inquisitor.stdout
+    assert "TOKEN_API_PRIMARCH=inquisitor" in inquisitor.stdout
+    assert "dispatch_codex_launch_inline" in inquisitor.stdout
+
+    vulkan = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--no-worktree",
+            "--engine",
+            "codex",
+            "--persona",
+            "vulkan",
+            "--dir",
+            str(ROOT),
+            "vulkan work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert vulkan.returncode == 0, vulkan.stderr
+    assert "engine:          codex" in vulkan.stdout
+    assert "TOKEN_API_PRIMARCH=vulkan" in vulkan.stdout
+    assert "primarch vulkan" not in vulkan.stdout
+
+
+def test_dispatch_rejects_deprecated_primarch_flag() -> None:
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--primarch", "vulkan", "work"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 64
+    assert "--primarch is deprecated; use --persona" in result.stderr
 
 
 def test_dispatch_aspirant_rejects_inline_system_prompt():
@@ -644,6 +776,75 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "Aspirant Session Startup" in staged
     assert "## Implantation" in staged
     assert "## Trials" in staged
+
+
+def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_prompt(
+    tmp_path,
+) -> None:
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmuxctl_log = tmp_path / "tmuxctl.log"
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%84\\n"\n',
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+    tmux_log = tmp_path / "tmux.log"
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$TMUX_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+    env = os.environ.copy()
+    env["IMPERIUM"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TMUXCTL_LOG"] = str(tmuxctl_log)
+    env["TMUX_LOG"] = str(tmux_log)
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--aspirant",
+            "--aspirant-kind",
+            "dispatch",
+            "--engine",
+            "codex",
+            "--persona",
+            "vulkan",
+            "--dir",
+            str(ROOT),
+            "--target",
+            "legion:new",
+            "--victory-condition",
+            "Tests pass",
+            "Implement with codex",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout.splitlines()[0])
+    assert data["status"] == "aspirant_trials"
+    assert "launch_action: dispatch --direct --engine codex" in result.stdout
+    assert "--no-gt" in result.stdout
+    assert "--system-prompt-file" not in result.stdout
+    assert "dispatched codex to legion:new" in result.stdout
+
+    tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
+    send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %84 bash " in line)
+    staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
+    staged = staged_path.read_text(encoding="utf-8", errors="replace")
+    assert "dispatch_codex_launch_inline" in staged
+    assert "--append-system-prompt" not in staged
+    assert "Aspirant Session Startup" in staged
 
 
 def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp_path):
@@ -861,6 +1062,7 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
             "mechanicus:new",
             "--dir",
             str(ROOT),
+            "--no-worktree",
             "--no-gt",
             "--prompt",
             "noop",
