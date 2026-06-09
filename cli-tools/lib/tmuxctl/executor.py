@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
-from pathlib import Path
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from .builder import build_workspace
 from .enums import AttachmentClass, RestartPhase
