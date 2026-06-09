@@ -14,6 +14,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  statuses: read
   checks: write
 
 concurrency:
@@ -91,6 +92,50 @@ jobs:
           if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
             (cd token-api && uv run --python 3.11 --group dev pytest --tb=short)
           fi
+
+      - name: CodeRabbit free-tier skip guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          needle="Review skipped: free tier disabled"
+          deadline=$((SECONDS + 600))
+          line=""
+
+          while true; do
+            line="$(gh api --method GET "repos/$REPO/commits/$SHA/status" \
+              --jq '[.statuses[]? | select(((.context // "") | ascii_downcase) == "coderabbit")] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end' || true)"
+
+            if [ -n "$line" ]; then
+              IFS="$(printf '\t')" read -r context state description updated_at <<< "$line"
+              echo "CodeRabbit status: context=$context state=$state updated_at=$updated_at description=$description"
+
+              if [ "$description" = "$needle" ]; then
+                echo "::error::CodeRabbit reported '$needle'. Failing PR Gate so a disabled/free-tier-skipped review cannot merge silently."
+                exit 1
+              fi
+
+              if [ "$state" = "success" ]; then
+                exit 0
+              fi
+
+              if [ "$state" != "pending" ]; then
+                echo "::error::CodeRabbit status is $state: $description"
+                exit 1
+              fi
+            fi
+
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for CodeRabbit commit status on $SHA. Failing closed so skipped/disabled reviews cannot merge silently."
+              exit 1
+            fi
+
+            echo "Waiting for CodeRabbit commit status on $SHA..."
+            sleep 15
+          done
 
   # CodeRabbit GitHub App posts its own `coderabbit` commit status. Branch
   # protection on main is configured to require BOTH "PR Gate (blocking) /
