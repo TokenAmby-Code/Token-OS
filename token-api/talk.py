@@ -27,7 +27,7 @@ from typing import Any
 
 import aiosqlite
 
-from shared import DB_PATH
+from shared import DB_PATH, instance_id_for_pane
 
 # --- in-memory state ----------------------------------------------------------
 
@@ -129,22 +129,32 @@ async def resolve_pane(identifier: str) -> str | None:
 
 
 async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
+    instance_id = await instance_id_for_pane(pane_id)
+    if not instance_id:
+        return None
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id, tmux_pane, working_dir, engine, tab_name, status,
-                   pane_label, last_activity
+            SELECT id, working_dir, engine, tab_name, status, last_activity
             FROM claude_instances
-            WHERE tmux_pane = ?
+            WHERE id = ?
               AND status IN ('processing', 'idle', 'active', 'stopped')
             ORDER BY last_activity DESC
             LIMIT 1
             """,
-            (pane_id,),
+            (instance_id,),
         )
         row = await cursor.fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["tmux_pane"] = pane_id
+    for pane in await _tmux_list_panes():
+        if pane.get("pane_id") == pane_id and pane.get("position_id"):
+            result["pane_label"] = pane["position_id"]
+            break
+    return result
 
 
 # --- talk pair lifecycle ------------------------------------------------------
