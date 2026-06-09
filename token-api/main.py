@@ -1103,6 +1103,7 @@ async def cleanup_stale_instances() -> dict:
                 updates={
                     "status": "stopped",
                     "synced": 0,
+                    "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
                 },
                 mutation_type="instance_stopped",
@@ -1907,7 +1908,12 @@ async def stop_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="stop-instance",
@@ -2035,7 +2041,12 @@ async def kill_instance(instance_id: str):
                     await sanctioned_update_instance(
                         db,
                         instance_id=instance_id,
-                        updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                        updates={
+                            "status": "stopped",
+                            "synced": 0,
+                            "input_lock": None,
+                            "stopped_at": now,
+                        },
                         mutation_type="instance_stopped",
                         write_source="api",
                         actor="kill-instance",
@@ -2057,7 +2068,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2083,7 +2099,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2108,7 +2129,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2202,7 +2228,12 @@ async def kill_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="kill-instance",
@@ -2912,6 +2943,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
                 updates={
                     "status": "stopped",
                     "synced": 0,
+                    "input_lock": None,
                     "stopped_at": now,
                 },
                 mutation_type="instance_stopped",
@@ -7047,7 +7079,12 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="golden_throne",
             actor="golden-throne-instance-gone",
@@ -19085,6 +19122,7 @@ async def clear_stale_processing_flags():
                             updates={
                                 "status": "stopped",
                                 "synced": 0,
+                                "input_lock": None,
                                 "stopped_at": datetime.now().isoformat(),
                             },
                             mutation_type="instance_stopped",

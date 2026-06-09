@@ -479,6 +479,7 @@ async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) ->
         updates={
             "status": "stopped",
             "synced": 0,
+            "input_lock": None,
             "stopped_at": datetime.now().isoformat(),
         },
         mutation_type="instance_stopped",
@@ -2890,6 +2891,7 @@ async def handle_session_end(payload: dict) -> dict:
             updates={
                 "status": "stopped",
                 "synced": 0,
+                "input_lock": None,
                 "stopped_at": now,
                 "hook_driven": 0,
                 "workflow_state": "closed",
