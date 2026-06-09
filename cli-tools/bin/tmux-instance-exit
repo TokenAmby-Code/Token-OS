@@ -10,7 +10,7 @@
 #
 # Usage:
 #     tmux-instance-exit              # Current pane
-#     tmux-instance-exit --pane %4    # Target a specific pane
+#     tmux-instance-exit --pane self  # Target the invoking pane for resume
 
 set -euo pipefail
 
@@ -222,18 +222,13 @@ fi
 
 RESUME_CMD=""
 if [[ -n "$RESUME_ID" ]]; then
-    RESUME_CMD="dispatch --id $(printf '%q' "$RESUME_ID")"
-    [[ -n "$PANE" ]] && RESUME_CMD+=" --pane $(printf '%q' "$PANE")"
+    RESUME_CMD="dispatch --id $(printf '%q' "$RESUME_ID") --pane self"
 fi
-OLD_PWD="$(_tmux display-message -p '#{pane_current_path}' 2>/dev/null || printf '%s' "$HOME")"
-[[ -z "$OLD_PWD" ]] && OLD_PWD="$HOME"
-HISTORY_CMD=""
-if [[ -n "$RESUME_CMD" ]]; then
-    HISTORY_CMD="cd $(printf '%q' "$OLD_PWD") && $RESUME_CMD"
-fi
+HISTORY_CMD="$RESUME_CMD"
 
-# Move the visible shell home, clear, then stage a history command that returns
-# to the old pane directory before resuming.
+# Move the visible shell home, clear, then stage a resume command. Dispatch
+# resolves the instance working directory from Token-API on --id resume; do not
+# bake stale cwd state into shell history.
 PANE_SHELL=$(_tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo "")
 _clear_closeout_chrome
 if [[ -z "$HISTORY_CMD" ]]; then

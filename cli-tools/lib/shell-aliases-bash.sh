@@ -16,8 +16,8 @@ alias reload='builtin source ~/.bashrc'
 
 
 # Agent exit cleanup: hooks stage /tmp/agent-resume-${TMUX_PANE}; the next shell
-# prompt returns to ~, clears the terminal, and records a "cd back && resume"
-# command in bash history.
+# prompt returns to ~, clears the terminal, and records the resume command
+# directly; dispatch resolves cwd from Token-API.
 _agent_resume_prompt_command() {
     local pane="${TMUX_PANE:-}"
     [[ -z "$pane" ]] && return
@@ -25,14 +25,11 @@ _agent_resume_prompt_command() {
     local f="/tmp/agent-resume-${pane}"
     local legacy="/tmp/claude-resume-${pane}"
     local cmd=""
-    local old_pwd=""
 
     if [[ -f "$f" ]]; then
-        old_pwd="$(sed -n '2p' "$f" 2>/dev/null)"
         cmd="$(sed -n '3p' "$f" 2>/dev/null)"
         if [[ -z "$cmd" ]]; then
-            cmd="$old_pwd"
-            old_pwd=""
+            cmd="$(sed -n '2p' "$f" 2>/dev/null)"
         fi
         rm -f "$f"
     elif [[ -f "$legacy" ]]; then
@@ -42,13 +39,10 @@ _agent_resume_prompt_command() {
         return
     fi
 
-    [[ -z "$old_pwd" ]] && old_pwd="$PWD"
     cd ~ 2>/dev/null || true
     clear
     [[ -z "$cmd" ]] && return
-    local staged_cmd
-    staged_cmd="cd $(printf '%q' "$old_pwd") && $cmd"
-    history -s "$staged_cmd"
+    history -s "$cmd"
 }
 
 case ";${PROMPT_COMMAND:-};" in

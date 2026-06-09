@@ -139,10 +139,10 @@ class RestartExecutor:
                     )
                     continue
 
-                localized_dir = self._localize_path(resume.working_dir)
+                pane_target = resume.pane_label or target_pane_id
                 self.adapter.send_keys(
                     target_pane_id,
-                    f"cd {shlex.quote(localized_dir or '$HOME')} && dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(target_pane_id)}",
+                    f"dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(pane_target)}",
                     "Enter",
                 )
                 time.sleep(1.5)

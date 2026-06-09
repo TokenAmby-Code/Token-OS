@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Compatibility shim. Use tmux-instance-exit.
-set -euo pipefail
-exec tmux-instance-exit "$@"

@@ -84,7 +84,7 @@ Options:
   --system-prompt <text>       Append a Claude system prompt
   --system-prompt-file <path>  Read appended Claude system prompt from file
   --target <target>            legion:new, mechanicus:new, or a tmux pane id
-  --pane <tmux-pane-id>        Alias for --target; with --id, pane to resume into
+  --pane <target|self>         Alias for --target; with --id, pane to resume into
   --gt | --no-gt               Golden Throne lane toggle (default: --no-gt)
   --zealotry <1-10>            Zealotry (default: 5 with --gt, 3 with --no-gt)
   --sync                       Sync-session lane
@@ -1224,7 +1224,14 @@ if [[ -n "$RESUME_ID" ]]; then
   [[ -n "$RESUME_DISPATCH_SLOT" && -z "$TARGET" ]] && DISPATCH_SLOT="$RESUME_DISPATCH_SLOT"
   [[ -n "$RESUME_LAUNCH_MODE" ]] && LAUNCH_MODE="$RESUME_LAUNCH_MODE"
   if [[ -n "$TARGET" ]]; then
-    if [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
+    if [[ "$TARGET" == "self" || "$TARGET" == "current" ]]; then
+      if [[ -z "${TMUX_PANE:-}" ]]; then
+        err "--pane $TARGET requires TMUX_PANE"
+        exit 69
+      fi
+      LAUNCH_MODE="direct"
+      RESOLVED_PHYSICAL_TARGET="$TMUX_PANE"
+    elif [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
       LAUNCH_MODE="direct"
     elif [[ "$TARGET" == *:new ]]; then
       # Resume into a freshly allocated stack pane: keep the tmux_stack_new path
@@ -1246,6 +1253,9 @@ resolve_dispatch_public_target() {
   local target="$1" resolved
   [[ -n "$target" ]] || return 0
   [[ "$target" == *:new ]] && return 0
+  if [[ ( "$target" == "self" || "$target" == "current" ) && -n "${TMUX_PANE:-}" ]]; then
+    target="$TMUX_PANE"
+  fi
   if command -v tmuxctl >/dev/null 2>&1; then
     resolved="$(tmuxctl resolve-pane --format id "$target" 2>/dev/null || true)"
     [[ -n "$resolved" ]] && printf '%s' "$resolved"
@@ -1259,6 +1269,10 @@ resolve_dispatch_public_target() {
 resolve_dispatch_physical_target() {
   local target="$1" resolved
   [[ -n "$target" ]] || return 1
+  if [[ ( "$target" == "self" || "$target" == "current" ) && -n "${TMUX_PANE:-}" ]]; then
+    printf '%s' "$TMUX_PANE"
+    return 0
+  fi
   if command -v tmuxctl >/dev/null 2>&1; then
     resolved="$(tmuxctl resolve-pane --format physical "$target" 2>/dev/null || true)"
     [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
