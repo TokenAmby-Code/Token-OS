@@ -101,7 +101,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     invoke_skill_parser.add_argument("skill")
     invoke_skill_parser.add_argument("--pane", default="current")
+    invoke_skill_parser.add_argument(
+        "--instance-id",
+        default="",
+        help="Resolve a live pane by instance UUID instead of --pane.",
+    )
     invoke_skill_parser.add_argument("--agent", default="auto")
+    invoke_skill_parser.add_argument(
+        "--arguments",
+        default="",
+        help="Text appended after the skill invocation.",
+    )
+    invoke_skill_parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="Submit the skill invocation through tmuxctl's gated send primitive.",
+    )
+    invoke_skill_parser.add_argument(
+        "--clear-prompt",
+        action="store_true",
+        help="Clear the prompt before --submit delivery.",
+    )
     invoke_skill_parser.add_argument("--dry-run", action="store_true")
 
     resolve_agent_parser = subparsers.add_parser(
@@ -333,16 +353,45 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "invoke-skill":
             from .skill_invoke import normalize_agent, skill_invocation_text
 
+            if args.instance_id and args.pane != "current":
+                raise ValueError("use either --instance-id or --pane, not both")
+            if args.clear_prompt and not args.submit:
+                raise ValueError("--clear-prompt requires --submit")
             pane = args.pane
+            if args.instance_id:
+                instance_resolution = control.resolve_instance(args.instance_id)
+                if not instance_resolution["found"]:
+                    raise ValueError(f"instance has no live pane: {args.instance_id}")
+                pane = str(instance_resolution["pane_id"])
             if pane == "current" and not args.dry_run:
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
             if args.dry_run:
                 agent = normalize_agent(args.agent)
                 if agent == "auto":
                     agent = "claude"
-                print(skill_invocation_text(args.skill, agent))
+                print(skill_invocation_text(args.skill, agent, args.arguments))
                 return 0
-            print(control.invoke_skill(pane, args.skill, agent=args.agent), end="")
+            if args.submit:
+                print(
+                    control.send_skill(
+                        pane,
+                        args.skill,
+                        agent=args.agent,
+                        arguments=args.arguments,
+                        clear_prompt=args.clear_prompt,
+                    ),
+                    end="",
+                )
+            else:
+                print(
+                    control.invoke_skill(
+                        pane,
+                        args.skill,
+                        agent=args.agent,
+                        arguments=args.arguments,
+                    ),
+                    end="",
+                )
             return 0
 
         if args.command == "resolve-agent":

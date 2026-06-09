@@ -261,6 +261,7 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
+from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
@@ -6580,6 +6581,28 @@ def _golden_throne_inline_rubric_summary(
     return f"GT {human_pane_surface} needs {head}{suffix}"
 
 
+def _quote_skill_argument(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _golden_throne_skill_invocation_prompt(
+    status: RubricStatus,
+    *,
+    engine: str,
+) -> str:
+    """Harness-correct explicit skill wake for incomplete rubric fires."""
+    if status.missing:
+        head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+        remaining = len(status.missing) - 3
+        if remaining > 0:
+            head = f"{head} (+{remaining} more)"
+    else:
+        head = "session rubric"
+    arguments = f"victory condition {_quote_skill_argument(f'needs {head}')} is unmet"
+    return _tmuxctl_skill_invocation_text("golden-throne-sop", engine, arguments)
+
+
 def _clip_one_line(text: str, max_len: int) -> str:
     compact = " ".join(str(text).split())
     if max_len <= 0:
@@ -6699,6 +6722,15 @@ def _coderabbit_hold_prompt(status: RubricStatus, doc_path: Path | None, review_
     )
 
 
+def _golden_throne_is_coderabbit_hold(status: RubricStatus, fm: dict | None = None) -> bool:
+    review_state = (fm or {}).get(CODERABBIT_REVIEW_STATE_FIELD)
+    return status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
+        "pending",
+        "reviewing",
+        "absent",
+    )
+
+
 def _golden_throne_accountability_prompt(
     status: RubricStatus, doc_path: Path | None, fm: dict | None = None
 ) -> str:
@@ -6714,11 +6746,7 @@ def _golden_throne_accountability_prompt(
     """
     fm = fm or {}
     review_state = fm.get(CODERABBIT_REVIEW_STATE_FIELD)
-    if status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
-        "pending",
-        "reviewing",
-        "absent",
-    ):
+    if _golden_throne_is_coderabbit_hold(status, fm):
         return _coderabbit_hold_prompt(status, doc_path, review_state)
 
     rendered = [_render_missing_condition(m, fm) for m in status.missing]
@@ -7161,6 +7189,7 @@ async def golden_throne_followup(session_id: str):
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     doc_path = doc_meta.get("file_path")
+    engine = _agent_engine(instance)
     rubric_prompt_active = False
     if custom_sop_path:
         # Explicit per-instance override wins over the rubric-derived prompt.
@@ -7172,21 +7201,27 @@ async def golden_throne_followup(session_id: str):
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
     elif rubric_state == "incomplete":
-        # The Voice: name the specific unmet rubric conditions instead of the
-        # flat SOP. Falls back to legacy SOP for any non-incomplete state.
-        sop_prompt = _golden_throne_accountability_prompt(
-            rubric_status, doc_path, doc_meta.get("frontmatter")
-        )
-        rubric_prompt_active = True
-        logger.info(
-            f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
-            f"(missing: {rubric_status.missing})"
-        )
+        fm = doc_meta.get("frontmatter")
+        if _golden_throne_is_coderabbit_hold(rubric_status, fm):
+            # A pending CodeRabbit review is not agent work. Preserve the benign
+            # hold prompt rather than invoking a work SOP and creating a loop.
+            sop_prompt = _golden_throne_accountability_prompt(rubric_status, doc_path, fm)
+            logger.info(f"Golden Throne: using CodeRabbit hold prompt for {session_id[:12]}")
+        else:
+            # The Voice: wake the agent through the explicit Golden Throne skill
+            # so the injected turn is first-class procedure, not prose saying
+            # "execute this SOP". The skill then reads the session doc and acts
+            # on the named rubric condition.
+            sop_prompt = _golden_throne_skill_invocation_prompt(rubric_status, engine=engine)
+            rubric_prompt_active = True
+            logger.info(
+                f"Golden Throne: using rubric skill invocation for {session_id[:12]} "
+                f"(missing: {rubric_status.missing})"
+            )
     else:
         sop_prompt = _load_golden_throne_sop()
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
-    engine = _agent_engine(instance)
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
     # perspective, so a stale stored %N can no longer drive a send or speak a

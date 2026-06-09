@@ -87,7 +87,14 @@ def _write_doc(docs_dir: Path, frontmatter: str) -> Path:
     return doc
 
 
-def _insert(db_path: Path, *, device_id: str, doc_path: Path | None, tmux_pane: str = "%10") -> str:
+def _insert(
+    db_path: Path,
+    *,
+    device_id: str,
+    doc_path: Path | None,
+    tmux_pane: str = "%10",
+    engine: str = "claude",
+) -> str:
     """Insert a golden_throne instance, optionally linked to a session doc.
 
     ``tmux_pane`` is the *stored* column value; for local instances the fire path
@@ -108,9 +115,20 @@ def _insert(db_path: Path, *, device_id: str, doc_path: Path | None, tmux_pane: 
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             tmux_pane, status, instance_type, zealotry, session_doc_id,
-            registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', ?, ?, 'idle', 'golden_throne', 4, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"gt-{iid[:8]}", "/tmp", device_id, tmux_pane, doc_id, now, now),
+            registered_at, last_activity, engine)
+           VALUES (?, ?, ?, ?, 'local', ?, ?, 'idle', 'golden_throne', 4, ?, ?, ?, ?)""",
+        (
+            iid,
+            str(uuid.uuid4()),
+            f"gt-{iid[:8]}",
+            "/tmp",
+            device_id,
+            tmux_pane,
+            doc_id,
+            now,
+            now,
+            engine,
+        ),
     )
     conn.commit()
     conn.close()
@@ -190,21 +208,24 @@ class _Recorder:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_rubric_fires_accountability_prompt_not_sop(gt_env, monkeypatch):
+async def test_incomplete_rubric_fires_skill_invocation_not_sop(gt_env, monkeypatch):
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
     doc = _write_doc(gt_env.docs_dir, "victory:\n  a: true\n  b: false")
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME + "-remote",
+        doc_path=doc,
+        engine="codex",
+    )
 
     await main.golden_throne_followup(iid)
 
     assert len(rec.posts) == 1, "incomplete instance should dispatch to the remote pane"
     prompt = rec.posts[0]["json"]["prompt"]
     prompt_summary = rec.posts[0]["json"]["prompt_summary"]
-    # Names the specific unmet condition and is the accountability prompt...
-    assert "`b`" in prompt
-    assert "Unmet conditions" in prompt
-    assert "accountability" in prompt.lower()
+    # Names the specific unmet condition via the explicit GT skill invocation...
+    assert prompt == '$golden-throne-sop victory condition "needs b" is unmet'
     # ...NOT the flat static SOP.
     assert prompt != main._load_golden_throne_sop()
     assert "Read your session doc. Assess what remains." not in prompt
@@ -221,12 +242,17 @@ async def test_incomplete_rubric_humanizes_underscored_condition(gt_env, monkeyp
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
     doc = _write_doc(gt_env.docs_dir, "victory:\n  deploy_done: true\n  tests_passing: false")
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME + "-remote",
+        doc_path=doc,
+        engine="codex",
+    )
 
     await main.golden_throne_followup(iid)
 
     prompt = rec.posts[0]["json"]["prompt"]
-    assert "`tests_passing`" in prompt  # raw key in the prompt
+    assert prompt == ('$golden-throne-sop victory condition "needs tests passing" is unmet')
     # Spoken form humanizes the underscore.
     assert "needs tests passing" in rec.notifies[0]["message"]
 
@@ -404,13 +430,11 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
 
 
 @pytest.mark.asyncio
-async def test_local_live_agent_file_bridge_names_missing_condition(gt_env, monkeypatch):
-    """When a criteria-specific accountability prompt is too long for direct
-    send-keys, the visible bridge line still names the missing criterion.
-
-    Regression guard for the bad behavior where TTS said "needs X" but the
-    agent pane only received "execute this SOP".
-    """
+async def test_local_live_agent_receives_skill_invocation_for_missing_condition(
+    gt_env, monkeypatch
+):
+    """Regression guard for the bad behavior where TTS said "needs X" but the
+    agent pane only received generic prose telling it to execute an SOP."""
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
 
@@ -435,14 +459,18 @@ async def test_local_live_agent_file_bridge_names_missing_condition(gt_env, monk
     monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
 
     doc = _write_doc(gt_env.docs_dir, "victory:\n  deploy_done: true\n  tests_passing: false")
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=doc)
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME,
+        doc_path=doc,
+        engine="codex",
+    )
 
     await main.golden_throne_followup(iid)
 
     assert rec.enqueues, "live agent should receive a guarded pane write"
     payload = rec.enqueues[0]["payload"]
-    assert "needs tests passing" in payload
-    assert "cat /tmp/golden-throne-sop-" in payload
+    assert payload == ('$golden-throne-sop victory condition "needs tests passing" is unmet')
     assert "execute that SOP" not in payload
 
 
@@ -528,8 +556,8 @@ async def test_remote_fire_resolves_via_satellite_not_stored_column(gt_env, monk
 
 @pytest.mark.asyncio
 async def test_coderabbit_finding_poke_names_body_and_location_not_bare_key(gt_env, monkeypatch):
-    """An unmet coderabbit_<id> condition renders the comment's file location and
-    body excerpt — not just the bare numeric rubric key."""
+    """An unmet coderabbit_<id> condition invokes the GT skill with a humanized
+    criterion, never the bare numeric rubric key."""
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
     fm = (
@@ -547,16 +575,19 @@ async def test_coderabbit_finding_poke_names_body_and_location_not_bare_key(gt_e
         "    addressed: false\n"
     )
     doc = _write_doc(gt_env.docs_dir, fm)
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+    iid = _insert(
+        gt_env.db_path,
+        device_id=main.LOCAL_DEVICE_NAME + "-remote",
+        doc_path=doc,
+        engine="codex",
+    )
 
     await main.golden_throne_followup(iid)
 
     assert len(rec.posts) == 1
     prompt = rec.posts[0]["json"]["prompt"]
-    assert "token-api/main.py:42" in prompt
-    assert "dereferences foo before the null guard" in prompt
-    assert "CodeRabbit" in prompt
-    # The bare numeric rubric key is never surfaced in the accountability prompt.
+    assert prompt == ('$golden-throne-sop victory condition "needs a CodeRabbit finding" is unmet')
+    # The bare numeric rubric key is never surfaced in the wake prompt.
     assert "coderabbit_555" not in prompt
 
 
