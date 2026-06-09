@@ -32,8 +32,14 @@ def normalize_skill_name(skill: str) -> str:
     return name
 
 
-def skill_invocation_text(skill: str, agent: str | None) -> str:
-    return f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)} "
+def skill_invocation_text(
+    skill: str,
+    agent: str | None,
+    arguments: str | None = None,
+) -> str:
+    prefix = f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)}"
+    args = (arguments or "").strip()
+    return f"{prefix} {args}" if args else f"{prefix} "
 
 
 def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
@@ -141,9 +147,31 @@ def invoke_skill_in_pane(
     skill: str,
     *,
     agent: str = "auto",
+    arguments: str | None = None,
     settle_seconds: float = 0.05,
 ) -> str:
     resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
-    text = skill_invocation_text(skill, resolved_agent)
+    text = skill_invocation_text(skill, resolved_agent, arguments)
     insert_at_prompt_start(adapter, pane, text, settle_seconds=settle_seconds)
+    return text
+
+
+def send_skill_invocation_to_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    skill: str,
+    *,
+    agent: str = "auto",
+    arguments: str | None = None,
+    clear_prompt: bool = False,
+) -> str:
+    """Build a harness-correct skill invocation, send it, and submit it.
+
+    This is the generic automation primitive for systems that need to wake an
+    agent with a skill rather than prose instructions. Target resolution and the
+    universal send gate stay inside ``TmuxAdapter.send_text_then_submit``.
+    """
+    resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
+    text = skill_invocation_text(skill, resolved_agent, arguments)
+    adapter.send_text_then_submit(pane, text, clear_prompt=clear_prompt)
     return text

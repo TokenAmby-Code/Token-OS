@@ -8,7 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import custodes
-from tmuxctl.custodes import assert_custodes, pane_has_active_claude
+from tmuxctl.custodes import assert_custodes, pane_has_active_agent, pane_has_active_claude
 
 
 class FakeAdapter:
@@ -61,6 +61,40 @@ def test_detector_finds_claude_via_node_argv():
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
         assert pane_has_active_claude(100) is True
+
+
+def test_agent_detector_finds_codex_runtime():
+    children, commands = _tree(
+        parent_pid=100,
+        descendants={
+            200: (100, "/opt/homebrew/bin/node /opt/homebrew/bin/codex"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_agent(100) is True
+        assert pane_has_active_claude(100) is False
+
+
+def test_agent_detector_finds_claude_runtime():
+    children, commands = _tree(
+        parent_pid=100,
+        descendants={
+            200: (100, "/usr/local/bin/node /Users/x/.claude/bin/claude.js"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_agent(100) is True
+        assert pane_has_active_claude(100) is True
+
+
+def test_agent_detector_false_for_missing_pid():
+    assert pane_has_active_agent(None) is False
+    assert pane_has_active_agent(0) is False
+
+
+def test_agent_detector_false_when_ps_returns_empty():
+    with patch.object(custodes, "_process_tree", return_value=({}, {})):
+        assert pane_has_active_agent(1234) is False
 
 
 def test_detector_false_for_plain_shell_pane():

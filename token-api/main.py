@@ -262,6 +262,7 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
+from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
@@ -1103,6 +1104,7 @@ async def cleanup_stale_instances() -> dict:
                 updates={
                     "status": "stopped",
                     "synced": 0,
+                    "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
                 },
                 mutation_type="instance_stopped",
@@ -1910,7 +1912,12 @@ async def stop_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="stop-instance",
@@ -2038,7 +2045,12 @@ async def kill_instance(instance_id: str):
                     await sanctioned_update_instance(
                         db,
                         instance_id=instance_id,
-                        updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                        updates={
+                            "status": "stopped",
+                            "synced": 0,
+                            "input_lock": None,
+                            "stopped_at": now,
+                        },
                         mutation_type="instance_stopped",
                         write_source="api",
                         actor="kill-instance",
@@ -2060,7 +2072,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2086,7 +2103,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2111,7 +2133,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2205,7 +2232,12 @@ async def kill_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="kill-instance",
@@ -2908,6 +2940,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
 
         # Do not consult stored tmux pane columns here. Runtime liveness belongs
         # to tmuxctl; if a caller needs pane truth it must resolve it live.
+
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
@@ -6500,6 +6533,77 @@ def _golden_throne_banner_text_for_rubric(human_pane_surface: str, status: Rubri
     return f"GT {human_pane_surface}: missing {head}"
 
 
+def _golden_throne_inline_rubric_summary(
+    human_pane_surface: str,
+    status: RubricStatus | None,
+) -> str | None:
+    """One-line, criteria-specific GT summary for live pane injection.
+
+    The full accountability prompt often has to go through a temp file because
+    multi-line send-keys payloads are unreliable. The visible injection line
+    must still name the triggering criterion; otherwise the agent sees only a
+    generic "execute this SOP" nudge while the Emperor hears specific TTS.
+    """
+    if status is None or not status.missing:
+        return None
+    head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+    remaining = len(status.missing) - 3
+    suffix = f" (+{remaining} more)" if remaining > 0 else ""
+    return f"GT {human_pane_surface} needs {head}{suffix}"
+
+
+def _quote_skill_argument(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _golden_throne_skill_invocation_prompt(
+    status: RubricStatus,
+    *,
+    engine: str,
+) -> str:
+    """Harness-correct explicit skill wake for incomplete rubric fires."""
+    if status.missing:
+        head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+        remaining = len(status.missing) - 3
+        if remaining > 0:
+            head = f"{head} (+{remaining} more)"
+    else:
+        head = "session rubric"
+    arguments = f"victory condition {_quote_skill_argument(f'needs {head}')} is unmet"
+    return _tmuxctl_skill_invocation_text("golden-throne-sop", engine, arguments)
+
+
+def _clip_one_line(text: str, max_len: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(compact) <= max_len:
+        return compact
+    if max_len == 1:
+        return "…"
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _golden_throne_file_bridge_prompt(
+    sop_file: str,
+    *,
+    rubric_summary: str | None = None,
+    max_len: int = 200,
+) -> str:
+    """Short live-agent prompt that points to the full temp-file instruction.
+
+    For rubric-driven fires, keep the line criteria-specific. Legacy/custom
+    long prompts still use a generic bridge because no structured criterion is
+    available.
+    """
+    if rubric_summary:
+        tail = f". Run: cat {sop_file}, then address those criteria."
+        return f"{_clip_one_line(rubric_summary, max_len - len(tail))}{tail}"
+    text = f"Golden Throne follow-up. Run: cat {sop_file}, then resume this thread."
+    return _clip_one_line(text, max_len)
+
+
 def _golden_throne_ready_for_ack_tts(human_pane_surface: str) -> str:
     """Notify-only TTS when rubric just went complete."""
     return f"{human_pane_surface} ready for ack"
@@ -6589,6 +6693,15 @@ def _coderabbit_hold_prompt(status: RubricStatus, doc_path: Path | None, review_
     )
 
 
+def _golden_throne_is_coderabbit_hold(status: RubricStatus, fm: dict | None = None) -> bool:
+    review_state = (fm or {}).get(CODERABBIT_REVIEW_STATE_FIELD)
+    return status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
+        "pending",
+        "reviewing",
+        "absent",
+    )
+
+
 def _golden_throne_accountability_prompt(
     status: RubricStatus, doc_path: Path | None, fm: dict | None = None
 ) -> str:
@@ -6604,11 +6717,7 @@ def _golden_throne_accountability_prompt(
     """
     fm = fm or {}
     review_state = fm.get(CODERABBIT_REVIEW_STATE_FIELD)
-    if status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
-        "pending",
-        "reviewing",
-        "absent",
-    ):
+    if _golden_throne_is_coderabbit_hold(status, fm):
         return _coderabbit_hold_prompt(status, doc_path, review_state)
 
     rendered = [_render_missing_condition(m, fm) for m in status.missing]
@@ -6909,7 +7018,12 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="golden_throne",
             actor="golden-throne-instance-gone",
@@ -7051,6 +7165,8 @@ async def golden_throne_followup(session_id: str):
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     doc_path = doc_meta.get("file_path")
+    engine = _agent_engine(instance)
+    rubric_prompt_active = False
     if custom_sop_path:
         # Explicit per-instance override wins over the rubric-derived prompt.
         expanded = Path(custom_sop_path).expanduser()
@@ -7061,20 +7177,27 @@ async def golden_throne_followup(session_id: str):
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
     elif rubric_state == "incomplete":
-        # The Voice: name the specific unmet rubric conditions instead of the
-        # flat SOP. Falls back to legacy SOP for any non-incomplete state.
-        sop_prompt = _golden_throne_accountability_prompt(
-            rubric_status, doc_path, doc_meta.get("frontmatter")
-        )
-        logger.info(
-            f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
-            f"(missing: {rubric_status.missing})"
-        )
+        fm = doc_meta.get("frontmatter")
+        if _golden_throne_is_coderabbit_hold(rubric_status, fm):
+            # A pending CodeRabbit review is not agent work. Preserve the benign
+            # hold prompt rather than invoking a work SOP and creating a loop.
+            sop_prompt = _golden_throne_accountability_prompt(rubric_status, doc_path, fm)
+            logger.info(f"Golden Throne: using CodeRabbit hold prompt for {session_id[:12]}")
+        else:
+            # The Voice: wake the agent through the explicit Golden Throne skill
+            # so the injected turn is first-class procedure, not prose saying
+            # "execute this SOP". The skill then reads the session doc and acts
+            # on the named rubric condition.
+            sop_prompt = _golden_throne_skill_invocation_prompt(rubric_status, engine=engine)
+            rubric_prompt_active = True
+            logger.info(
+                f"Golden Throne: using rubric skill invocation for {session_id[:12]} "
+                f"(missing: {rubric_status.missing})"
+            )
     else:
         sop_prompt = _load_golden_throne_sop()
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
-    engine = _agent_engine(instance)
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
     # perspective, so a stale stored %N can no longer drive a send or speak a
@@ -7087,6 +7210,11 @@ async def golden_throne_followup(session_id: str):
         tmux_pane, pane_label = await _resolve_remote_instance_pane(session_id, device_id)
     pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
     human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    rubric_injection_summary = (
+        _golden_throne_inline_rubric_summary(human_pane_surface, rubric_status)
+        if rubric_prompt_active
+        else None
+    )
     instance["tmux_pane"] = tmux_pane
     instance["pane_label"] = pane_label
     instance["pane_surface"] = pane_surface
@@ -7183,8 +7311,10 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                inject_prompt = (
-                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                inject_prompt = _golden_throne_file_bridge_prompt(
+                    sop_file,
+                    rubric_summary=rubric_injection_summary,
+                    max_len=MAX_SENDKEYS_LEN,
                 )
             try:
                 queued = await enqueue_pane_write(
@@ -7316,6 +7446,7 @@ async def golden_throne_followup(session_id: str):
                         "tmux_pane": tmux_pane,
                         "working_dir": working_dir,
                         "prompt": sop_prompt,
+                        "prompt_summary": rubric_injection_summary,
                         "engine": engine,
                     },
                 )
@@ -18895,6 +19026,7 @@ async def clear_stale_processing_flags():
                             updates={
                                 "status": "stopped",
                                 "synced": 0,
+                                "input_lock": None,
                                 "stopped_at": datetime.now().isoformat(),
                             },
                             mutation_type="instance_stopped",

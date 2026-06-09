@@ -834,6 +834,9 @@ case "$CMD" in
     inspect)
         run_tmuxctl inspect "$@"
         ;;
+    restart-plan)
+        run_tmuxctl inspect restart-plan "$@"
+        ;;
     resolve|resolve-pane)
         if [[ $# -eq 0 ]]; then
             log_error "Usage: tx resolve <pane-id>"
