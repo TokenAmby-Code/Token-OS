@@ -7,6 +7,7 @@ sites are bridged here until the instances table grows ``persona_id``/``rank``.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Sequence
@@ -392,10 +393,14 @@ def assign_astartes_persona_from_rows(
 
 
 async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        return set()
     try:
+        # PRAGMA table_info does not accept a bind parameter for the table name;
+        # the identifier is validated above before interpolation.
         cursor = await db.execute(f"PRAGMA table_info({table})")
         return {row[1] for row in await cursor.fetchall()}
-    except Exception:
+    except (aiosqlite.Error, sqlite3.Error):
         return set()
 
 

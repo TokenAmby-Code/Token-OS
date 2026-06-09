@@ -23,8 +23,8 @@ from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
 from personas import (
-    astartes_persona_by_tts_voice,
     assign_astartes_persona,
+    astartes_persona_by_tts_voice,
     persona_to_profile,
     selectable_astartes_personas,
 )
