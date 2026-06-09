@@ -43,7 +43,7 @@ def _seed(db_path: Path, doc_path: Path, *, tab_name: str | None, link: bool) ->
     return doc_id
 
 
-def _no_discord(monkeypatch, main):
+def _no_discord(monkeypatch, main) -> None:
     """Stub the outbound Discord notify so the ack never sends a real message."""
 
     def fake_run(*_a, **_k):
@@ -113,3 +113,20 @@ async def test_victory_ack_no_linked_instance_still_acks(app_env, monkeypatch):
     result = await main._victory_ack_core(doc_id, "done", [])
     assert result["victory"] is True and result["archived"] is True
     assert _doc_status(app_env.db_path, doc_id) == "archived"
+
+
+@pytest.mark.asyncio
+async def test_victory_ack_blocks_on_null_named_instance(app_env, monkeypatch):
+    """A *linked* instance with a NULL tab_name is unnamed, not absent — it must
+    block. (A None entry is not a placeholder, so it must still fail the gate.)"""
+    main = app_env.main
+    _no_discord(monkeypatch, main)
+    doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
+    doc_id = _seed(app_env.db_path, doc, tab_name=None, link=True)
+
+    with pytest.raises(HTTPException) as exc:
+        await main._victory_ack_core(doc_id, "done", [])
+
+    assert exc.value.status_code == 409
+    assert "instance_named" in exc.value.detail["missing"]
+    assert _doc_status(app_env.db_path, doc_id) == "active"

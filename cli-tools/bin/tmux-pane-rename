@@ -29,10 +29,15 @@ fi
 
 # Empty input → interview: ask the agent to name itself (no synthesis here).
 if [[ -z "$NAME" ]]; then
-    curl -s --connect-timeout 2 -X POST "$API_URL/api/orchestrator/naming_nudge" \
-        -H "Content-Type: application/json" \
-        -d "{\"instance_id\": \"$INSTANCE_ID\"}" >/dev/null 2>&1 || true
-    tmux display-message "interview: asked $INSTANCE_ID to name itself" 2>/dev/null || true
+    PAYLOAD=$(jq -n --arg id "$INSTANCE_ID" '{instance_id: $id}')
+    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 \
+        -X POST "$API_URL/api/orchestrator/naming_nudge" \
+        -H "Content-Type: application/json" -d "$PAYLOAD" 2>/dev/null || true)
+    if [[ "$HTTP_CODE" == 2* ]]; then
+        tmux display-message "interview: asked $INSTANCE_ID to name itself" 2>/dev/null || true
+    else
+        tmux display-message "interview: request failed (HTTP ${HTTP_CODE:-?})" 2>/dev/null || true
+    fi
     exit 0
 fi
 

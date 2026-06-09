@@ -517,8 +517,12 @@ def evaluate_rubric(fm: dict, rubric_key: str | None = None) -> RubricStatus:
             rubric_value = dict(rubric_value)
             derived_dirty = True
         names = fm.get("_instance_tab_names")
+        # `n and ...`: a None/empty name is *absence of a name*, not a real one —
+        # is_placeholder_tab_name(None) is False, so without the truthy guard a
+        # NULL tab_name would wrongly satisfy the criterion (and mask a sibling
+        # placeholder). Require a truthy, non-placeholder name.
         rubric_value["instance_named"] = (not names) or any(
-            not is_placeholder_tab_name(n) for n in names
+            n and not is_placeholder_tab_name(n) for n in names
         )
 
     skip_set = set(skip)

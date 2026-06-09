@@ -219,6 +219,18 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(app_env
     assert 'instance-name "your-title"' in payload
     assert "session-doc-name" not in payload
 
+    row = _fetchone(
+        app_env.db_path,
+        "SELECT workflow_blocked_reason FROM claude_instances WHERE id = 'inst-naming'",
+    )
+    assert row["workflow_blocked_reason"] == "tab_name_placeholder"
+
+    event = _fetchone(
+        app_env.db_path,
+        "SELECT event_type FROM events WHERE instance_id = 'inst-naming'",
+    )
+    assert event["event_type"] == "naming_nudge_sent"
+
 
 @pytest.mark.asyncio
 async def test_naming_nudge_noops_for_null_doc_instance(app_env, monkeypatch):

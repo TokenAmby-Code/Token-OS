@@ -3278,8 +3278,15 @@ async def handle_stop(payload: dict) -> dict:
     # Codex panes get (no naming-nudge.sh shim), and it is harmlessly idempotent
     # for Claude, which also fires naming-nudge.sh. The core self-guards on
     # placeholder name, missing pane, pending nudge, and the 3-nudge cap, so a
-    # named pane is a cheap no-op. Fire-and-forget so Stop latency is unaffected.
-    asyncio.create_task(_require_dep("maybe_naming_nudge", _maybe_naming_nudge)(session_id))
+    # named pane is a cheap no-op. Fire-and-forget so Stop latency is unaffected;
+    # the wrapper logs (never raises) so an unforeseen error can't strand the task.
+    async def _safe_naming_nudge() -> None:
+        try:
+            await _require_dep("maybe_naming_nudge", _maybe_naming_nudge)(session_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort nudge, must not break Stop
+            logger.warning("Stop: naming nudge failed for %s: %s", session_id[:12], exc)
+
+    asyncio.create_task(_safe_naming_nudge())
 
     # Trinity Chunk 1: resolve any open `talk` pairs awaiting natural-stop
     # slash-copy of this target's final response. Fires for every Stop hook —
