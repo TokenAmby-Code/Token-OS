@@ -200,6 +200,7 @@ async def test_incomplete_rubric_fires_accountability_prompt_not_sop(gt_env, mon
 
     assert len(rec.posts) == 1, "incomplete instance should dispatch to the remote pane"
     prompt = rec.posts[0]["json"]["prompt"]
+    prompt_summary = rec.posts[0]["json"]["prompt_summary"]
     # Names the specific unmet condition and is the accountability prompt...
     assert "`b`" in prompt
     assert "Unmet conditions" in prompt
@@ -209,6 +210,7 @@ async def test_incomplete_rubric_fires_accountability_prompt_not_sop(gt_env, mon
     assert "Read your session doc. Assess what remains." not in prompt
 
     # Condition-specific TTS/banner (the _for_rubric variants), not generic.
+    assert "needs b" in prompt_summary
     assert len(rec.notifies) == 1
     assert "needs b" in rec.notifies[0]["message"]
     assert "missing b" in rec.notifies[0]["banner"]
@@ -399,6 +401,49 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
     # The spoken surface uses the LIVE role's position (palace:N -> 1:N).
     assert rec.notifies, "a delivered local fire notifies the Emperor"
     assert "1:N" in rec.notifies[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_local_live_agent_file_bridge_names_missing_condition(gt_env, monkeypatch):
+    """When a criteria-specific accountability prompt is too long for direct
+    send-keys, the visible bridge line still names the missing criterion.
+
+    Regression guard for the bad behavior where TTS said "needs X" but the
+    agent pane only received "execute this SOP".
+    """
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+
+    async def _resolved(_instance_id):
+        return ("%77", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolved)
+
+    async def _alive(*a, **k):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_has_agent_process", _alive)
+
+    async def _sent(*a, **k):
+        return [{"status": main.PANE_WRITE_SENT, "returncode": 0, "stdout": "", "stderr": ""}]
+
+    monkeypatch.setattr(main, "process_pane_write_queue_once", _sent)
+
+    async def _pane_exists(_pane):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
+
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  deploy_done: true\n  tests_passing: false")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=doc)
+
+    await main.golden_throne_followup(iid)
+
+    assert rec.enqueues, "live agent should receive a guarded pane write"
+    payload = rec.enqueues[0]["payload"]
+    assert "needs tests passing" in payload
+    assert "cat /tmp/golden-throne-sop-" in payload
+    assert "execute that SOP" not in payload
 
 
 # --- Phase 3 Tier 1b: satellite owns remote instance_id -> pane resolution ---
