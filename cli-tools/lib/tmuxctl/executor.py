@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import time
@@ -55,10 +56,8 @@ class RestartExecutor:
         recreated = 0
         resume_results: list[ResumeResult] = []
 
-        holding_session = "_tmuxctl_restart"
-        self.adapter.run(
-            "new-session", "-d", "-s", holding_session, "-x", "80", "-y", "24", allow_failure=True
-        )
+        holding_session = "_stash"
+        self._create_holding_session(holding_session)
         for attachment in plan.client_attachments:
             if attachment.attachment_class in {
                 AttachmentClass.REMOTE_LEADER,
@@ -67,14 +66,7 @@ class RestartExecutor:
                 self.adapter.run("detach-client", "-t", attachment.client_tty, allow_failure=True)
                 detached += 1
             else:
-                self.adapter.run(
-                    "switch-client",
-                    "-c",
-                    attachment.client_tty,
-                    "-t",
-                    holding_session,
-                    allow_failure=True,
-                )
+                self._switch_client(attachment.client_tty, holding_session)
                 parked += 1
 
         grouped_sessions = [
@@ -179,6 +171,8 @@ class RestartExecutor:
                 )
             )
 
+        persistent_violations = self._assert_persistent_runtime_panes(plan.session_name)
+
         for grouped in grouped_sessions:
             self.adapter.run(
                 "new-session",
@@ -190,7 +184,7 @@ class RestartExecutor:
                 allow_failure=True,
             )
             if grouped.selected_window_name:
-                self.adapter.run(
+                self._run_focus_restore(
                     "select-window",
                     "-t",
                     f"{grouped.session_name}:{grouped.selected_window_name}",
@@ -200,19 +194,12 @@ class RestartExecutor:
 
         for attachment in plan.client_attachments:
             target_session = attachment.session_name
-            self.adapter.run(
-                "switch-client",
-                "-c",
-                attachment.client_tty,
-                "-t",
-                target_session,
-                allow_failure=True,
-            )
+            self._switch_client(attachment.client_tty, target_session)
             restored += 1
 
         self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
 
-        verification = self._verify(plan, rebuilt, resume_results)
+        verification = persistent_violations + self._verify(plan, rebuilt, resume_results)
         return RestartExecutionResult(
             session_name=plan.session_name,
             phase=RestartPhase.COMPLETE if not verification else RestartPhase.VERIFY,
@@ -226,6 +213,240 @@ class RestartExecutor:
             clients_restored=restored,
             grouped_sessions_recreated=recreated,
         )
+
+    def _run_focus_restore(self, *args: str, allow_failure: bool = False) -> str:
+        previous = os.environ.get("IMPERIUM_TMUX_FOCUS_RESTORE")
+        os.environ["IMPERIUM_TMUX_FOCUS_RESTORE"] = "1"
+        try:
+            return self.adapter.run(*args, allow_failure=allow_failure)
+        finally:
+            if previous is None:
+                os.environ.pop("IMPERIUM_TMUX_FOCUS_RESTORE", None)
+            else:
+                os.environ["IMPERIUM_TMUX_FOCUS_RESTORE"] = previous
+
+    def _switch_client(self, client_tty: str, target_session: str) -> None:
+        self._run_focus_restore(
+            "switch-client",
+            "-c",
+            client_tty,
+            "-t",
+            target_session,
+            allow_failure=True,
+        )
+
+    def _create_holding_session(self, holding_session: str) -> None:
+        # Clean up failed pre-patch holding sessions and any stale stash before
+        # creating the visible parking page for this restart.
+        for stale in ("_tmuxctl_restart", holding_session):
+            self.adapter.run("kill-session", "-t", stale, allow_failure=True)
+        self.adapter.run(
+            "new-session",
+            "-d",
+            "-s",
+            holding_session,
+            "-n",
+            "_stash",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            self._holding_shell_command(),
+            allow_failure=True,
+        )
+        self.adapter.run(
+            "set-option",
+            "-t",
+            holding_session,
+            "status-left",
+            "#[bold] tx restart #[default]",
+            allow_failure=True,
+        )
+        self.adapter.run(
+            "set-option",
+            "-t",
+            holding_session,
+            "status-right",
+            "returning to main when rebuild completes",
+            allow_failure=True,
+        )
+
+    def _holding_shell_command(self) -> str:
+        script = r"""
+clear
+tput civis 2>/dev/null || true
+trap 'tput cnorm 2>/dev/null || true; exit 0' INT TERM EXIT
+cat <<'ART'
+
+        __            __             __
+  _____/ /____ ______/ /_     ____  / /_
+ / ___/ __/ _ `/ ___/ __ \   / __ \/ __/
+(__  ) /_/  __/ /__/ / / /  / /_/ / /_
+/____/\__/\_,_/\___/_/ /_/  \____/\__/
+
+        tx restart is rebuilding main
+        remain in _stash until returned
+
+ART
+frames='|/-\'
+i=0
+while :; do
+  frame=${frames:$((i % 4)):1}
+  width=34
+  pos=$((i % (width + 1)))
+  bar=''
+  j=0
+  while [ $j -lt $width ]; do
+    if [ $j -lt $pos ]; then bar="${bar}#"; else bar="${bar}."; fi
+    j=$((j + 1))
+  done
+  pct=$((pos * 100 / width))
+  printf '\r  %s sealing construction zone [%s] %3d%%  ' "$frame" "$bar" "$pct"
+  i=$((i + 1))
+  sleep 0.12
+done
+""".strip()
+        return f"bash -lc {shlex.quote(script)}"
+
+    def _assert_persistent_runtime_panes(self, session_name: str) -> list[str]:
+        """Best-effort post-rebuild repair for panes that should host daemons.
+
+        The restart planner restores registry-backed instances. Some standing
+        panes are intentionally hook-driven and may not have a fresh resumable
+        registry row after teardown. Assert them after restore so `tx restart`
+        leaves the workspace operational instead of with blank FG/Admin shells.
+
+        The civic reservist pane is a special case: `civic-thread fallthrough`
+        injects through tmux-resume, which requires an already-running agent TUI.
+        If the reservist pane is only a shell, seed a low-cost idle Claude in the
+        Civic working dir; the invariant can then deliver its activation prompt.
+        """
+        violations: list[str] = []
+
+        try:
+            from .assertions import assert_instance
+
+            for pane_label in (
+                "legion:custodes",
+                "mechanicus:fabricator-general",
+                "mechanicus:admin",
+            ):
+                try:
+                    result = assert_instance(self.adapter, pane_label)
+                except Exception as exc:
+                    violations.append(f"persistent pane assertion failed for {pane_label}: {exc}")
+                    continue
+                if not result.get("ok") and result.get("action") not in {
+                    "launched",
+                    "persona_correction_sent",
+                    "registry_reactivated",
+                }:
+                    violations.append(
+                        f"persistent pane assertion failed for {pane_label}: "
+                        f"{result.get('action') or 'none'} {result.get('reason') or ''}".strip()
+                    )
+        except Exception as exc:
+            violations.append(f"persistent persona assertion unavailable: {exc}")
+
+        try:
+            civic_violation = self._ensure_civic_reservist_runtime()
+            if civic_violation:
+                violations.append(civic_violation)
+        except Exception as exc:
+            violations.append(f"civic reservist assertion failed: {exc}")
+
+        return violations
+
+    def _ensure_civic_reservist_runtime(self) -> str:
+        target = "reservists:civic"
+        pane_id = self._resolve_optional_pane(target)
+        if not pane_id:
+            return "civic reservist pane missing after rebuild"
+
+        command = (
+            self.adapter.run(
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{pane_current_command}",
+                allow_failure=True,
+            )
+            .strip()
+            .lower()
+        )
+        if any(agent in command for agent in ("claude", "codex", "node")):
+            return ""
+
+        civic_dir = os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")
+        if not os.path.isdir(civic_dir):
+            civic_dir = os.path.expanduser("~")
+        prompt = (
+            "Stand by as the civic reservist runtime. Do not start new work. "
+            "Wait for civic-thread fallthrough or operator instructions."
+        )
+        dispatch_bin = self._dispatch_binary()
+        proc = subprocess.run(
+            [
+                dispatch_bin,
+                "--direct",
+                "--engine",
+                "claude",
+                "--pane",
+                pane_id,
+                "--dir",
+                civic_dir,
+                "--instance-type",
+                "hook_driven",
+                "--no-gt",
+                "--prompt",
+                prompt,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip()[:160]
+            return f"civic reservist dispatch failed rc={proc.returncode}: {stderr}"
+        time.sleep(1.0)
+        command = (
+            self.adapter.run(
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{pane_current_command}",
+                allow_failure=True,
+            )
+            .strip()
+            .lower()
+        )
+        if not any(agent in command for agent in ("claude", "codex", "node", "bash")):
+            return "civic reservist launch did not appear to start"
+        return ""
+
+    def _resolve_optional_pane(self, target: str) -> str:
+        try:
+            from .resolver import resolve_pane
+
+            return resolve_pane(self.adapter, target).pane_id
+        except Exception:
+            return ""
+
+    def _dispatch_binary(self) -> str:
+        candidate = subprocess.run(
+            ["bash", "-lc", "command -v dispatch"],
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout.strip()
+        if candidate:
+            return candidate
+        from pathlib import Path
+
+        return str(Path(__file__).resolve().parents[2] / "bin" / "dispatch")
 
     def _localize_path(self, path: str) -> str:
         imperium = subprocess.run(

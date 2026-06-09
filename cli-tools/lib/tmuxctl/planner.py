@@ -136,9 +136,15 @@ def build_restart_plan(
 
         current_command = target_pane.current_command.lower()
         if any(agent in current_command for agent in ("claude", "codex", "node")):
+            # A full restart tears the managed session down before restore, so a
+            # target pane already running an agent is the normal precondition for
+            # resumable work, not a reason to abort the restart. Keep it visible
+            # in the plan as a warning for diagnostics, but do not set
+            # plan.has_errors. Otherwise `tx restart` wedges exactly when active
+            # agents exist.
             issues.append(
                 CoherenceIssue(
-                    severity=CoherenceSeverity.ERROR,
+                    severity=CoherenceSeverity.WARNING,
                     code="target_busy",
                     message=f"target pane {target_pane.pane_id} already appears to be running an agent",
                     instance_id=inst.instance_id,
