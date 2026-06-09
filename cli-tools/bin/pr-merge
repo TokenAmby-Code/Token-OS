@@ -236,7 +236,7 @@ if [[ "$NO_CLEANUP" == "false" ]]; then
         echo "    4. Delete local branch: ${BRANCH_NAME}"
     fi
 
-    echo "    5. Pull latest main"
+    echo "    5. Fast-forward main (guarded; no checkout in a worktree)"
     echo "    6. Clean up bash aliases"
 else
     echo "  Actions:"
@@ -352,10 +352,36 @@ fi
 
 echo ""
 
-# Pull main
-log "${PULL} Pulling main..."
-MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null | sed "s@^refs/remotes/${GIT_GITHUB_REMOTE}/@@" || echo "main")
-git pull "$GIT_GITHUB_REMOTE" "$MAIN_BRANCH" 2>&1 | sed 's/^/   /'
+# Update main as a separate, guarded fast-forward.
+#
+# In the NAS bare-repo + worktree layout there is no `main` working tree to
+# pull into: MAIN_WORKTREE_PATH is the bare repo and `main` is held by the
+# bare repo's HEAD (which is exactly why any local `main` checkout — including
+# `gh pr merge --delete-branch` — errors with "already checked out"). A plain
+# `git pull` here fails with "must be run in a work tree" and would abort
+# cleanup *after* the remote merge already landed. So fan out by context and
+# never let this step be fatal:
+#   - bare repo / no main work tree: fast-forward the local `main` ref only,
+#     without a checkout, tolerating refusal.
+#   - real `main` working tree: guarded `--ff-only` pull.
+MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null | sed "s@^refs/remotes/${GIT_GITHUB_REMOTE}/@@")
+[[ -z "$MAIN_BRANCH" ]] && MAIN_BRANCH="main"
+log "${PULL} Updating ${MAIN_BRANCH}..."
+
+if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+    # No working tree: fast-forward the local ref directly (no checkout). The
+    # refspec without a leading '+' only allows fast-forwards, so it is safe
+    # even though `main` is the bare repo's HEAD branch.
+    if git fetch "$GIT_GITHUB_REMOTE" "${MAIN_BRANCH}:${MAIN_BRANCH}" 2>&1 | sed 's/^/   /'; then
+        info "${MAIN_BRANCH} synced (bare repo, no checkout)"
+    else
+        info "${MAIN_BRANCH} left as-is (not a fast-forward — diverged?)"
+    fi
+else
+    # Real working tree on ${MAIN_BRANCH}: guarded fast-forward only.
+    git pull --ff-only "$GIT_GITHUB_REMOTE" "$MAIN_BRANCH" 2>&1 | sed 's/^/   /' \
+        || warn "Could not fast-forward ${MAIN_BRANCH} (diverged?); update it manually."
+fi
 
 echo ""
 
@@ -404,6 +430,10 @@ fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-success "${SUCCESS} Done! Back on ${MAIN_BRANCH}."
+if [[ "$IN_WORKTREE" == "true" ]]; then
+    success "${SUCCESS} Done! Merged, cleaned up, and ${MAIN_BRANCH} refreshed."
+else
+    success "${SUCCESS} Done! Back on ${MAIN_BRANCH}."
+fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
