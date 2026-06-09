@@ -33,15 +33,18 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
-from personas import assign_astartes_persona, persona_to_profile
+from personas import (
+    BACKUP_ASTARTES,
+    PRIMARY_ASTARTES,
+    assign_astartes_persona,
+    persona_to_profile,
+    voice_settings_for_tts_voice,
+)
 from shared import (
     DB_PATH,
     DESKTOP_CONFIG,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
-    PERSONA_PROFILES,
-    PROFILES,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     ULTIMATE_FALLBACK,
@@ -622,11 +625,9 @@ async def dispatch_notify(
                 tts = False
             elif row and row["tts_voice"]:
                 wsl_voice = row["tts_voice"]
-                for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
-                    if p["wsl_voice"] == wsl_voice:
-                        voice = p.get("mac_voice", "Daniel")
-                        wsl_rate = p.get("wsl_rate", 0)
-                        break
+                settings = voice_settings_for_tts_voice(wsl_voice)
+                voice = settings["mac_voice"]
+                wsl_rate = settings["wsl_rate"]
         except Exception as e:
             logger.warning(f"notify: voice profile lookup failed for {instance_id}: {e}")
 
@@ -930,16 +931,12 @@ async def tts_queue_worker():
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
                 if tts_current.message:
-                    # Look up profile by WSL voice (DB tts_voice stores WSL voice name)
-                    # to get mac_voice fallback and wsl_rate
+                    # Resolve persona playback settings by WSL voice
+                    # (DB tts_voice stores the Windows voice name).
                     wsl_voice = tts_current.voice
-                    mac_voice = "Daniel"  # default fallback
-                    wsl_rate = 0
-                    for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
-                        if p["wsl_voice"] == wsl_voice:
-                            mac_voice = p.get("mac_voice", "Daniel")
-                            wsl_rate = p.get("wsl_rate", 0)
-                            break
+                    settings = voice_settings_for_tts_voice(wsl_voice)
+                    mac_voice = settings["mac_voice"]
+                    wsl_rate = settings["wsl_rate"]
 
                     # Speak the message (run in executor to allow skip API to interrupt)
                     # Queue items use file-based playback for transport controls (pause/resume/speed)
@@ -1177,8 +1174,8 @@ def get_tts_queue_status() -> dict:
         "satellite_available": TTS_BACKEND["satellite_available"],
         "global_mode": TTS_GLOBAL_MODE["mode"],
         "voice_pool": {
-            "total": len(PROFILES),
-            "fallback_count": len(FALLBACK_VOICES),
+            "total": len(PRIMARY_ASTARTES),
+            "fallback_count": len(BACKUP_ASTARTES),
         },
     }
 

@@ -15,7 +15,7 @@ import aiosqlite
 
 from cron_engine import CronEngine
 from instance_registry import INSTANCE_COLUMNS, legacy_row_to_instance_values, slug_from_legacy
-from personas import ensure_personas_table, persona_id_for_slug
+from personas import ensure_personas_table, persona_id_for_slug, repair_legacy_instance_personas
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
@@ -495,6 +495,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
         drop_targets = dead_columns & columns
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
+
+        repaired_personas = await repair_legacy_instance_personas(db)
+        if repaired_personas:
+            print(f"Repaired {repaired_personas} legacy active persona assignments")
 
         await _ensure_instances_v2(db)
 

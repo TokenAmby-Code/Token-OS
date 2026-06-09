@@ -514,3 +514,207 @@ ALL_COMPAT_PROFILES = [
     *PERSONA_COMPAT_PROFILES,
 ]
 PROFILE_BY_SLUG = {p["name"]: p for p in ALL_COMPAT_PROFILES}
+
+
+def profile_by_tts_voice(tts_voice: str | None, *, default_rank: str | None = None) -> dict | None:
+    """Resolve a seeded persona compatibility profile by its Windows TTS voice.
+
+    ``tts_voice`` is not globally unique forever (the Deathwatch overflow uses
+    the same emergency voice as a backup chapter), so results are ordered the
+    same way assignment is ordered: primary Astartes, backup Astartes, overflow,
+    then singleton/Primarch compatibility profiles.
+    """
+    if not tts_voice:
+        return None
+    for profile in ALL_COMPAT_PROFILES:
+        if profile.get("wsl_voice") != tts_voice:
+            continue
+        if default_rank and profile.get("default_rank") != default_rank:
+            continue
+        return profile
+    return None
+
+
+def voice_settings_for_tts_voice(tts_voice: str | None) -> dict:
+    """Return TTS playback settings for a seeded persona voice.
+
+    Unknown voices keep the historical safe defaults so direct notification
+    overrides still work, but normal queued/runtime instance voices resolve
+    through the persona registry projection instead of hand-iterating pools.
+    """
+    profile = profile_by_tts_voice(tts_voice)
+    return {
+        "wsl_voice": tts_voice,
+        "mac_voice": (profile or {}).get("mac_voice") or "Daniel",
+        "wsl_rate": (profile or {}).get("wsl_rate") or 0,
+        "profile": profile,
+    }
+
+
+async def astartes_persona_by_tts_voice(db: aiosqlite.Connection, tts_voice: str) -> dict | None:
+    """Resolve a selectable Astartes persona row for a requested TTS voice."""
+    cursor = await db.execute(
+        """
+        SELECT *
+        FROM personas
+        WHERE default_rank = 'astartes'
+          AND assignment_pool IN ('primary', 'backup')
+          AND tts_voice = ?
+        ORDER BY CASE assignment_pool WHEN 'primary' THEN 0 WHEN 'backup' THEN 1 ELSE 2 END,
+                 assignment_order IS NULL,
+                 assignment_order,
+                 slug
+        LIMIT 1
+        """,
+        (tts_voice,),
+    )
+    return _row_to_dict(await cursor.fetchone())
+
+
+async def selectable_astartes_personas(db: aiosqlite.Connection) -> list[dict]:
+    """Return seeded Astartes rows available for manual voice selection."""
+    cursor = await db.execute(
+        """
+        SELECT *
+        FROM personas
+        WHERE default_rank = 'astartes'
+          AND assignment_pool IN ('primary', 'backup')
+          AND tts_voice IS NOT NULL
+        ORDER BY CASE assignment_pool WHEN 'primary' THEN 0 WHEN 'backup' THEN 1 ELSE 2 END,
+                 assignment_order IS NULL,
+                 assignment_order,
+                 slug
+        """
+    )
+    return [_row_to_dict(row) for row in await cursor.fetchall()]
+
+
+def _normalize_slug(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def singleton_persona_slug_for_runtime(
+    *, legion: str | None = None, primarch: str | None = None
+) -> str | None:
+    """Map runtime legion/primarch markers to non-Astartes seeded persona slugs."""
+    primarch_slug = _normalize_slug(primarch)
+    if primarch_slug in SEED_BY_SLUG and SEED_BY_SLUG[primarch_slug].default_rank != "astartes":
+        return primarch_slug
+
+    legion_slug = _normalize_slug(legion)
+    return {
+        "custodes": "custodes",
+        "fabricator": "fabricator-general",
+        "fabricator-general": "fabricator-general",
+        "administratum": "administratum",
+        "inquisitor": "inquisitor",
+    }.get(legion_slug)
+
+
+async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
+    """Repair active instance rows left from the pre-persona voice profile era.
+
+    This is a cutover migration for the compatibility column
+    ``claude_instances.profile_name``. It only touches active non-subagent rows:
+    singleton/Primarch panes are rewritten to their seeded persona identity, and
+    active Astartes rows with missing/unknown legacy profile names receive the
+    first currently-unlocked seeded Astartes persona.
+    """
+    cols = await _table_columns(db, "claude_instances")
+    required = {"id", "profile_name", "tts_voice", "notification_sound", "status"}
+    if not required.issubset(cols):
+        return 0
+
+    select_cols = [
+        "id",
+        "profile_name",
+        "tts_voice",
+        "notification_sound",
+        "status",
+    ]
+    for optional in ("legion", "primarch", "is_subagent", "registered_at", "last_activity"):
+        if optional in cols:
+            select_cols.append(optional)
+
+    subagent_clause = "AND COALESCE(is_subagent, 0) = 0" if "is_subagent" in cols else ""
+    order_terms = [col for col in ("registered_at", "last_activity", "id") if col in cols]
+    order_sql = ", ".join(order_terms or ["id"])
+    cursor = await db.execute(
+        f"""
+        SELECT {", ".join(select_cols)}
+        FROM claude_instances
+        WHERE status IN ('processing', 'idle')
+          {subagent_clause}
+        ORDER BY {order_sql}
+        """
+    )
+    rows = [_row_to_dict_with_names(row, select_cols) for row in await cursor.fetchall()]
+
+    changed = 0
+    locked_ids = await active_non_retired_persona_ids(db)
+    for row in rows:
+        singleton_slug = singleton_persona_slug_for_runtime(
+            legion=row.get("legion"), primarch=row.get("primarch")
+        )
+        if singleton_slug:
+            persona = await resolve_persona(db, singleton_slug)
+            if not persona:
+                continue
+            profile = persona_to_profile(persona)
+            updates = {
+                "profile_name": profile["name"],
+                "tts_voice": profile["wsl_voice"],
+                "notification_sound": profile["notification_sound"],
+            }
+            if any(row.get(key) != value for key, value in updates.items()):
+                await db.execute(
+                    """
+                    UPDATE claude_instances
+                    SET profile_name = ?, tts_voice = ?, notification_sound = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updates["profile_name"],
+                        updates["tts_voice"],
+                        updates["notification_sound"],
+                        row["id"],
+                    ),
+                )
+                changed += 1
+            # Singleton repairs may release a formerly valid Astartes slug.
+            locked_ids = await active_non_retired_persona_ids(db)
+            continue
+
+        current = await resolve_persona(db, row.get("profile_name") or "")
+        if current and current.get("default_rank") == "astartes":
+            continue
+
+        assigned, _ = await assign_astartes_persona(db, active_ids=locked_ids)
+        profile = persona_to_profile(assigned)
+        await db.execute(
+            """
+            UPDATE claude_instances
+            SET profile_name = ?, tts_voice = ?, notification_sound = ?
+            WHERE id = ?
+            """,
+            (
+                profile["name"],
+                profile["wsl_voice"],
+                profile["notification_sound"],
+                row["id"],
+            ),
+        )
+        locked_ids.add(assigned["id"])
+        changed += 1
+
+    return changed
+
+
+def _row_to_dict_with_names(row, names: Sequence[str]) -> dict:
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    if hasattr(row, "keys"):
+        return {key: row[key] for key in row.keys()}
+    return dict(zip(names, row, strict=False))

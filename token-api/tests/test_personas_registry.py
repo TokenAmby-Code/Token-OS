@@ -176,3 +176,45 @@ async def test_future_instances_rank_retired_does_not_lock_persona(app_env):
         assert personas.persona_id_for_slug("ultramarines") in locked
         assigned, _ = await personas.assign_astartes_persona(db)
         assert assigned["slug"] == "blood-angels"
+
+
+@pytest.mark.asyncio
+async def test_repair_legacy_active_persona_assignments(app_env):
+    import personas
+
+    async with aiosqlite.connect(app_env.db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO claude_instances
+              (id, session_id, origin_type, device_id, legion, primarch, profile_name,
+               tts_voice, notification_sound, status)
+            VALUES
+              ('legacy-custodes', 'legacy-custodes-s', 'local', 'Mac-Mini',
+               'custodes', 'custodes', NULL, NULL, NULL, 'idle'),
+              ('legacy-fg', 'legacy-fg-s', 'local', 'Mac-Mini',
+               'fabricator', 'fabricator-general', 'profile_1', 'Microsoft George', 'chimes.wav', 'idle'),
+              ('legacy-worker', 'legacy-worker-s', 'local', 'Mac-Mini',
+               'astartes', NULL, 'emperors-children', 'Microsoft Heera', 'chimes.wav', 'idle')
+            """
+        )
+        await db.commit()
+
+        repaired = await personas.repair_legacy_instance_personas(db)
+        await db.commit()
+        assert repaired == 3
+
+        cursor = await db.execute(
+            """
+            SELECT id, profile_name, tts_voice, notification_sound
+            FROM claude_instances
+            WHERE id IN ('legacy-custodes', 'legacy-fg', 'legacy-worker')
+            ORDER BY id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    assert rows == [
+        ("legacy-custodes", "custodes", "Microsoft George", "chimes.wav"),
+        ("legacy-fg", "fabricator-general", None, None),
+        ("legacy-worker", "blood-angels", "Microsoft Ravi", "notify.wav"),
+    ]
