@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+from pathlib import Path
 import time
 from dataclasses import replace
 
@@ -58,161 +59,167 @@ class RestartExecutor:
 
         holding_session = "_stash"
         self._create_holding_session(holding_session)
-        for attachment in plan.client_attachments:
-            if attachment.attachment_class in {
-                AttachmentClass.REMOTE_LEADER,
-                AttachmentClass.REMOTE_GROUPED,
-            }:
-                self.adapter.run("detach-client", "-t", attachment.client_tty, allow_failure=True)
-                detached += 1
-            else:
-                self._switch_client(attachment.client_tty, holding_session)
-                parked += 1
-
-        grouped_sessions = [
-            s for s in plan.grouped_sessions if s.session_name != s.leader_session_name
-        ]
-        for grouped in grouped_sessions:
-            self.adapter.run("kill-session", "-t", grouped.session_name, allow_failure=True)
-        self.adapter.run("kill-session", "-t", plan.session_name, allow_failure=True)
-
-        build_workspace(self.adapter, plan.session_name)
-        time.sleep(0.5)
-
-        rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
-        for window in rebuilt.windows:
-            try:
-                normalize_window(self.adapter, plan.session_name, window.window_index)
-            except Exception:
-                continue
-        self._clear_transient_windows(plan.session_name)
-        time.sleep(0.2)
-        rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
-        pane_by_label = {
-            pane.pane_role: pane.pane_id for pane in rebuilt.iter_panes() if pane.pane_role
-        }
-
-        for resume in plan.resumes:
-            target_pane_id = resume.target_pane_id or pane_by_label.get(resume.pane_label, "")
-            if not target_pane_id:
-                resume_results.append(
-                    ResumeResult(
-                        instance_id=resume.instance_id,
-                        pane_label=resume.pane_label,
-                        target_pane_id="",
-                        disposition=resume.disposition,
-                        success=False,
-                        message="target pane missing after rebuild",
+        try:
+            for attachment in plan.client_attachments:
+                if attachment.attachment_class in {
+                    AttachmentClass.REMOTE_LEADER,
+                    AttachmentClass.REMOTE_GROUPED,
+                }:
+                    self.adapter.run(
+                        "detach-client", "-t", attachment.client_tty, allow_failure=True
                     )
-                )
-                continue
+                    detached += 1
+                else:
+                    self._switch_client(attachment.client_tty, holding_session)
+                    parked += 1
 
-            if resume.tombstone_role and resume.tombstone_role != resume.pane_label:
-                source_pane_id = pane_by_label.get(resume.tombstone_role, "")
-                if source_pane_id and source_pane_id != target_pane_id:
-                    self._install_tombstone(source_pane_id, resume.tombstone_role, target_pane_id)
+            grouped_sessions = [
+                s for s in plan.grouped_sessions if s.session_name != s.leader_session_name
+            ]
+            for grouped in grouped_sessions:
+                self.adapter.run("kill-session", "-t", grouped.session_name, allow_failure=True)
+            self.adapter.run("kill-session", "-t", plan.session_name, allow_failure=True)
 
-            command = self.adapter.run(
-                "display-message",
-                "-t",
-                target_pane_id,
-                "-p",
-                "#{pane_current_command}",
-                allow_failure=True,
-            ).strip()
-            if "claude" in command:
-                resume_results.append(
-                    ResumeResult(
-                        instance_id=resume.instance_id,
-                        pane_label=resume.pane_label,
-                        target_pane_id=target_pane_id,
-                        disposition=resume.disposition,
-                        success=False,
-                        message="target pane already busy",
+            build_workspace(self.adapter, plan.session_name)
+            time.sleep(0.5)
+
+            rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
+            for window in rebuilt.windows:
+                try:
+                    normalize_window(self.adapter, plan.session_name, window.window_index)
+                except Exception:
+                    continue
+            self._clear_transient_windows(plan.session_name)
+            time.sleep(0.2)
+            rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
+            pane_by_label = {
+                pane.pane_role: pane.pane_id for pane in rebuilt.iter_panes() if pane.pane_role
+            }
+
+            for resume in plan.resumes:
+                target_pane_id = resume.target_pane_id or pane_by_label.get(resume.pane_label, "")
+                if not target_pane_id:
+                    resume_results.append(
+                        ResumeResult(
+                            instance_id=resume.instance_id,
+                            pane_label=resume.pane_label,
+                            target_pane_id="",
+                            disposition=resume.disposition,
+                            success=False,
+                            message="target pane missing after rebuild",
+                        )
                     )
-                )
-                continue
+                    continue
 
-            localized_dir = self._localize_path(resume.working_dir)
-            self.adapter.send_keys(
-                target_pane_id,
-                f"cd {shlex.quote(localized_dir or '$HOME')} && dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(target_pane_id)}",
-                "Enter",
-            )
-            time.sleep(1.5)
-            pane_output = self.adapter.capture_pane(target_pane_id, lines=8).lower()
-            if any(pattern in pane_output for pattern in RESUME_FAILURE_PATTERNS):
-                self.adapter.send_keys(target_pane_id, "C-c")
-                time.sleep(0.2)
-                self.adapter.send_keys(target_pane_id, "C-c")
-                resume_results.append(
-                    ResumeResult(
-                        instance_id=resume.instance_id,
-                        pane_label=resume.pane_label,
-                        target_pane_id=target_pane_id,
-                        disposition=resume.disposition,
-                        success=False,
-                        message="resume validation failed",
-                    )
-                )
-                continue
+                if resume.tombstone_role and resume.tombstone_role != resume.pane_label:
+                    source_pane_id = pane_by_label.get(resume.tombstone_role, "")
+                    if source_pane_id and source_pane_id != target_pane_id:
+                        self._install_tombstone(
+                            source_pane_id, resume.tombstone_role, target_pane_id
+                        )
 
-            if resume.disposition.value == "resume_and_continue":
-                time.sleep(2.0)
-                self.adapter.send_text_then_submit(target_pane_id, CONTINUATION_PROMPT)
-            resume_results.append(
-                ResumeResult(
-                    instance_id=resume.instance_id,
-                    pane_label=resume.pane_label,
-                    target_pane_id=target_pane_id,
-                    disposition=resume.disposition,
-                    success=True,
-                    message="resumed",
-                )
-            )
-
-        persistent_violations = self._assert_persistent_runtime_panes(plan.session_name)
-
-        for grouped in grouped_sessions:
-            self.adapter.run(
-                "new-session",
-                "-d",
-                "-t",
-                plan.session_name,
-                "-s",
-                grouped.session_name,
-                allow_failure=True,
-            )
-            if grouped.selected_window_name:
-                self._run_focus_restore(
-                    "select-window",
+                command = self.adapter.run(
+                    "display-message",
                     "-t",
-                    f"{grouped.session_name}:{grouped.selected_window_name}",
+                    target_pane_id,
+                    "-p",
+                    "#{pane_current_command}",
+                    allow_failure=True,
+                ).strip()
+                if "claude" in command:
+                    resume_results.append(
+                        ResumeResult(
+                            instance_id=resume.instance_id,
+                            pane_label=resume.pane_label,
+                            target_pane_id=target_pane_id,
+                            disposition=resume.disposition,
+                            success=False,
+                            message="target pane already busy",
+                        )
+                    )
+                    continue
+
+                localized_dir = self._localize_path(resume.working_dir)
+                self.adapter.send_keys(
+                    target_pane_id,
+                    f"cd {shlex.quote(localized_dir or '$HOME')} && dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(target_pane_id)}",
+                    "Enter",
+                )
+                time.sleep(1.5)
+                pane_output = self.adapter.capture_pane(target_pane_id, lines=8).lower()
+                if any(pattern in pane_output for pattern in RESUME_FAILURE_PATTERNS):
+                    self.adapter.send_keys(target_pane_id, "C-c")
+                    time.sleep(0.2)
+                    self.adapter.send_keys(target_pane_id, "C-c")
+                    resume_results.append(
+                        ResumeResult(
+                            instance_id=resume.instance_id,
+                            pane_label=resume.pane_label,
+                            target_pane_id=target_pane_id,
+                            disposition=resume.disposition,
+                            success=False,
+                            message="resume validation failed",
+                        )
+                    )
+                    continue
+
+                if resume.disposition.value == "resume_and_continue":
+                    time.sleep(2.0)
+                    self.adapter.send_text_then_submit(target_pane_id, CONTINUATION_PROMPT)
+                resume_results.append(
+                    ResumeResult(
+                        instance_id=resume.instance_id,
+                        pane_label=resume.pane_label,
+                        target_pane_id=target_pane_id,
+                        disposition=resume.disposition,
+                        success=True,
+                        message="resumed",
+                    )
+                )
+
+            persistent_violations = self._assert_persistent_runtime_panes(plan.session_name)
+
+            for grouped in grouped_sessions:
+                self.adapter.run(
+                    "new-session",
+                    "-d",
+                    "-t",
+                    plan.session_name,
+                    "-s",
+                    grouped.session_name,
                     allow_failure=True,
                 )
-            recreated += 1
+                if grouped.selected_window_name:
+                    self._run_focus_restore(
+                        "select-window",
+                        "-t",
+                        f"{grouped.session_name}:{grouped.selected_window_name}",
+                        allow_failure=True,
+                    )
+                recreated += 1
 
-        for attachment in plan.client_attachments:
-            target_session = attachment.session_name
-            self._switch_client(attachment.client_tty, target_session)
-            restored += 1
+            for attachment in plan.client_attachments:
+                target_session = attachment.session_name
+                self._switch_client(attachment.client_tty, target_session)
+                restored += 1
 
-        self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
+            verification = persistent_violations + self._verify(plan, rebuilt, resume_results)
+            return RestartExecutionResult(
+                session_name=plan.session_name,
+                phase=RestartPhase.COMPLETE if not verification else RestartPhase.VERIFY,
+                plan=replace(plan, phase=RestartPhase.COMPLETE),
+                actions=tuple(actions),
+                resume_results=tuple(resume_results),
+                coherence_issues=plan.coherence_issues,
+                postcondition_violations=tuple(verification),
+                clients_parked=parked,
+                clients_detached=detached,
+                clients_restored=restored,
+                grouped_sessions_recreated=recreated,
+            )
 
-        verification = persistent_violations + self._verify(plan, rebuilt, resume_results)
-        return RestartExecutionResult(
-            session_name=plan.session_name,
-            phase=RestartPhase.COMPLETE if not verification else RestartPhase.VERIFY,
-            plan=replace(plan, phase=RestartPhase.COMPLETE),
-            actions=tuple(actions),
-            resume_results=tuple(resume_results),
-            coherence_issues=plan.coherence_issues,
-            postcondition_violations=tuple(verification),
-            clients_parked=parked,
-            clients_detached=detached,
-            clients_restored=restored,
-            grouped_sessions_recreated=recreated,
-        )
+        finally:
+            self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
 
     def _run_focus_restore(self, *args: str, allow_failure: bool = False) -> str:
         previous = os.environ.get("IMPERIUM_TMUX_FOCUS_RESTORE")
@@ -252,8 +259,9 @@ class RestartExecutor:
             "-y",
             "30",
             self._holding_shell_command(),
-            allow_failure=True,
         )
+        if not self.adapter.has_session(holding_session):
+            raise RuntimeError(f"failed to create holding session {holding_session}")
         self.adapter.run(
             "set-option",
             "-t",
@@ -378,9 +386,9 @@ done
         if any(agent in command for agent in ("claude", "codex", "node")):
             return ""
 
-        civic_dir = os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")
-        if not os.path.isdir(civic_dir):
-            civic_dir = os.path.expanduser("~")
+        civic_dir = Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic"))
+        if not civic_dir.is_dir():
+            civic_dir = Path.home()
         prompt = (
             "Stand by as the civic reservist runtime. Do not start new work. "
             "Wait for civic-thread fallthrough or operator instructions."
@@ -395,7 +403,7 @@ done
                 "--pane",
                 pane_id,
                 "--dir",
-                civic_dir,
+                str(civic_dir),
                 "--instance-type",
                 "hook_driven",
                 "--no-gt",
@@ -423,7 +431,7 @@ done
             .strip()
             .lower()
         )
-        if not any(agent in command for agent in ("claude", "codex", "node", "bash")):
+        if not any(agent in command for agent in ("claude", "codex", "node")):
             return "civic reservist launch did not appear to start"
         return ""
 
@@ -444,8 +452,6 @@ done
         ).stdout.strip()
         if candidate:
             return candidate
-        from pathlib import Path
-
         return str(Path(__file__).resolve().parents[2] / "bin" / "dispatch")
 
     def _localize_path(self, path: str) -> str:
