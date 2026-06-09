@@ -14,6 +14,7 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
+from personas import ensure_personas_table
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
@@ -26,6 +27,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
+        await ensure_personas_table(db)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS claude_instances (

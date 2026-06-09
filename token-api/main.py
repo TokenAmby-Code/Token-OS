@@ -1835,7 +1835,8 @@ async def register_instance(request: InstanceRegisterRequest):
             "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff"),
-            "cc_color": profile.get("cc_color", "default"),
+            "chip_color": profile.get("chip_color"),
+            "pane_tint": profile.get("pane_tint"),
         },
     )
 
@@ -10361,15 +10362,15 @@ async def list_instances(
                         "active": True,
                         "started_at": datetime.now().isoformat(),
                     }
-            # Resolve cc_color from profile name
+            # Resolve display/chip/tint from persona/profile slug. Pane tint is
+            # tmux style only; Claude slash-color is no longer generated or surfaced.
             pn = inst.get("profile_name")
-            if pn:
-                for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                    if p["name"] == pn:
-                        inst["color"] = p.get("color", "#0099ff")
-                        inst["cc_color"] = p.get("cc_color", "default")
-                        inst["chapter"] = p.get("chapter")
-                        break
+            prof = profile_by_name(pn)
+            if prof:
+                inst["color"] = prof.get("chip_color") or prof.get("color")
+                inst["chip_color"] = prof.get("chip_color") or prof.get("color")
+                inst["pane_tint"] = prof.get("pane_tint")
+                inst["chapter"] = prof.get("chapter")
             # Golden Throne: enrich with pending timer state
             gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
             inst["gt_next_fire"] = (
@@ -10455,15 +10456,14 @@ async def get_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         instance = dict(row)
-        # Resolve color from profile name
+        # Resolve display/chip/tint from persona/profile slug.
         profile_name = instance.get("profile_name")
-        if profile_name:
-            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                if p["name"] == profile_name:
-                    instance["color"] = p.get("color", "#0099ff")
-                    instance["cc_color"] = p.get("cc_color", "default")
-                    instance["chapter"] = p.get("chapter")
-                    break
+        prof = profile_by_name(profile_name)
+        if prof:
+            instance["color"] = prof.get("chip_color") or prof.get("color")
+            instance["chip_color"] = prof.get("chip_color") or prof.get("color")
+            instance["pane_tint"] = prof.get("pane_tint")
+            instance["chapter"] = prof.get("chapter")
         return instance
 
 
@@ -17135,12 +17135,12 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "session_id": inst.get("session_id"),
                 "display_name": _ops_display_name(inst),
                 "tab_name": inst.get("tab_name"),
-                # Chapter (40k voice/persona identity), resolved at read-time from
-                # profile_name — same pattern as color/cc_color. chapter_color is the
-                # hex shade for the cockpit chip; cc_color is the named tmux colour.
+                # Persona/chapter display identity, resolved at read-time from
+                # profile_name until instances.persona_id lands. chapter_color is
+                # the cockpit chip; pane_tint is the tmux pane background style.
                 "chapter": _prof.get("chapter") if _prof else None,
-                "chapter_color": _prof.get("color") if _prof else None,
-                "cc_color": _prof.get("cc_color") if _prof else None,
+                "chapter_color": (_prof.get("chip_color") or _prof.get("color")) if _prof else None,
+                "pane_tint": _prof.get("pane_tint") if _prof else None,
                 "status": status,
                 "engine": engine,
                 "device_id": inst.get("device_id"),

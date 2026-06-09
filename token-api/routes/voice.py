@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
+from personas import assign_astartes_persona, persona_to_profile
 from shared import (
     CUSTODES_PROFILE,
     DB_PATH,
@@ -241,7 +242,13 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
+            """
+            SELECT ci.id, ci.tts_voice, ci.notification_sound, ci.tts_mode, ci.profile_name,
+                   p.default_rank
+            FROM claude_instances ci
+            LEFT JOIN personas p ON p.slug = ci.profile_name
+            WHERE ci.id = ?
+            """,
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -262,18 +269,19 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
                 write_source="api",
                 actor="tts-mode",
             )
-        elif mode in ("verbose", "voice-chat") and not old_voice:
+        elif (
+            mode in ("verbose", "voice-chat")
+            and not old_voice
+            and (row["default_rank"] == "astartes" or row["profile_name"] is None)
+        ):
             # Re-assign voice from pool
-            cursor2 = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
-            )
-            rows = await cursor2.fetchall()
-            used_voices = {r[0] for r in rows}
-            profile, _ = get_next_available_profile(used_voices)
+            persona, _ = await assign_astartes_persona(db)
+            profile = persona_to_profile(persona)
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
                 updates={
+                    "profile_name": profile["name"],
                     "tts_mode": mode,
                     "tts_voice": profile["wsl_voice"],
                     "notification_sound": profile["notification_sound"],
