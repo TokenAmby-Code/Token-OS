@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+# pending-ui-flush - guarded drain of the pane-branding queue (~/.claude/pending-ui-cmds)
+# TAGS: tmux, guard, branding, pending-ui
+# AUDIENCE: agent
+"""Origin-side guard for the instance-branding (auto-rename) queue.
+
+Branding is deferred to ``~/.claude/pending-ui-cmds/<N>`` (filename ``N`` is a
+tmux pane number) so a ``/rename`` slash-command fires on the next
+prompt submit instead of mid-stream. The 2026-06-09 P0 showed the drain path had
+no guards: it send-keys'd into whatever now lived at pane ``%N`` regardless of a
+human typing there, the queue was append-only (58 files, entries back to April),
+and a recycled pane id replayed a prior occupant's stale branding command.
+
+This tool is the single, testable owner of that queue. Three subcommands:
+
+  * ``enqueue`` — append a branding command, tagged with the enqueuing session
+    (the pane *epoch*) and a timestamp. Used by the writers (instance-name,
+    SessionStart hook) in place of a bare ``echo >>``.
+  * ``flush``   — drain one pane's queue safely: purge stale/foreign/dead-pane
+    entries, HOLD (never drop, never race) while the target pane has active human
+    typing or a live client viewing it, then send surviving commands through the
+    gated ``claude-cmd`` path and remove them on success.
+  * ``sweep``   — prune the whole queue dir of legacy/expired/dead-pane files so
+    depth stays bounded at the origin (called from SessionStart).
+
+Every guard fails *open* on an infrastructure read error (a transient tmux fault
+never bricks branding) but fails *closed* on a positive signal (typing / attached
+/ stale), mirroring the universal send gate's contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---- configuration (env-overridable; CLI flags win) ----------------------- #
+
+_DEFAULT_TTL_SECONDS = 300  # short TTL: stale branding never replays into a recycled pane
+_DEFAULT_TYPING_WINDOW = 10  # seconds since last keystroke that still count as "typing"
+_DEFAULT_HOLD_SECONDS = 8.0  # max time a single flush will HOLD waiting for the pane to idle
+_DEFAULT_POLL_SECONDS = 0.25  # re-check cadence while holding
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _queue_dir() -> Path:
+    return Path(
+        os.environ.get("PENDING_UI_DIR", str(Path.home() / ".claude" / "pending-ui-cmds"))
+    )
+
+
+def _pane_safe(pane: str) -> str:
+    return pane.lstrip("%")
+
+
+# ---- tmux + claude-cmd resolution (PATH is stripped under Claude hooks) ---- #
+
+
+def _resolve_tmux() -> str:
+    override = os.environ.get("PENDING_UI_TMUX")
+    if override:
+        return override
+    found = shutil.which("tmux")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if os.access(cand, os.X_OK):
+            return cand
+    return "tmux"
+
+
+def _resolve_claude_cmd() -> str:
+    override = os.environ.get("PENDING_UI_CLAUDE_CMD")
+    if override:
+        return override
+    sibling = Path(__file__).resolve().parent / "claude-cmd"
+    if sibling.exists():
+        return str(sibling)
+    for cand in (
+        "/Volumes/Imperium/Token-OS/cli-tools/bin/claude-cmd",
+        "/mnt/imperium/Token-OS/cli-tools/bin/claude-cmd",
+    ):
+        if os.access(cand, os.X_OK):
+            return cand
+    return "claude-cmd"
+
+
+def _tmux(*args: str) -> tuple[int, str]:
+    """Run a tmux read/command. Returns (rc, stdout). Never raises."""
+    try:
+        proc = subprocess.run(
+            [_resolve_tmux(), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+        )
+        return proc.returncode, proc.stdout
+    except Exception:
+        return 1, ""
+
+
+# ---- guard predicates ----------------------------------------------------- #
+
+
+def _alive_panes() -> set[str] | None:
+    """Set of live pane ids, or None if tmux could not be read (fail-open)."""
+    rc, out = _tmux("list-panes", "-a", "-F", "#{pane_id}")
+    if rc != 0 or not out.strip():
+        return None
+    return {ln.strip() for ln in out.splitlines() if ln.strip()}
+
+
+def _typing_active(window_seconds: int) -> bool:
+    """True iff a human typed within the window. Mirrors send_gate.typing_guard_active.
+
+    Reads tmux ``#{client_activity}`` (bumped on client input). Fail-open: an
+    unreadable tmux returns False (allow), never a spurious hold.
+    """
+    rc, out = _tmux("display-message", "-p", "#{client_activity}")
+    if rc != 0:
+        return False
+    raw = out.strip()
+    if not raw:
+        return False
+    try:
+        activity = int(raw)
+    except ValueError:
+        return False
+    age = int(time.time()) - activity
+    return 0 <= age <= max(1, window_seconds)
+
+
+def _pane_attended(pane: str) -> bool:
+    """True iff a live client is currently *viewing* this pane.
+
+    A human is on the pane when it is the active pane of the active window of a
+    session that has at least one attached client. Fail-open: unreadable tmux
+    yields False.
+    """
+    rc, out = _tmux("display-message", "-p", "-t", pane, "#{?pane_active,1,0}#{?window_active,1,0}")
+    if rc != 0 or out.strip() != "11":
+        return False
+    rc2, out2 = _tmux("list-clients", "-t", pane, "-F", "x")
+    if rc2 != 0:
+        return False
+    return any(ln.strip() for ln in out2.splitlines())
+
+
+def _unsafe(pane: str, window_seconds: int) -> bool:
+    """The pane must not be written to right now (human typing OR viewing it)."""
+    return _typing_active(window_seconds) or _pane_attended(pane)
+
+
+# ---- send path (reuses the gated claude-cmd / send-gate pipeline) --------- #
+
+
+def _send(pane: str, cmd: str) -> bool:
+    """Send one slash-command to a pane via the gated claude-cmd path."""
+    try:
+        proc = subprocess.run(
+            [_resolve_claude_cmd(), "--pane", pane, cmd],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _send_clear(pane: str) -> None:
+    """Clear any residual prompt-line text after a branding burst (best-effort).
+
+    Only ever reached once the pane has been confirmed idle+unattended, so this
+    cannot land mid-keystroke — the gap the original raw ``send-keys C-u`` left.
+    """
+    _tmux("send-keys", "-t", pane, "C-u")
+
+
+# ---- queue entry model ---------------------------------------------------- #
+
+
+class Entry:
+    __slots__ = ("ts", "session", "pane", "cmd", "raw")
+
+    def __init__(self, ts: int, session: str, pane: str, cmd: str, raw: str):
+        self.ts = ts
+        self.session = session
+        self.pane = pane
+        self.cmd = cmd
+        self.raw = raw
+
+
+def _parse(line: str) -> Entry | None:
+    """Parse a v2 queue line ``<ts> <session|-> %<pane> <slash-command>``.
+
+    Returns None for anything malformed — including the legacy pre-fix format
+    ``%<pane> <cmd>`` (no timestamp/epoch), which is treated as expired so the
+    April backlog drains without ever firing.
+    """
+    parts = line.split(None, 3)
+    if len(parts) != 4:
+        return None
+    ts_raw, session, pane, cmd = parts
+    if not ts_raw.isdigit() or not pane.startswith("%") or not cmd:
+        return None
+    return Entry(int(ts_raw), session, pane, cmd, line)
+
+
+def _is_fresh(entry: Entry, *, current_session: str, ttl: int, alive: set[str] | None) -> bool:
+    """A still-deliverable entry: within TTL, same epoch, target pane alive."""
+    if int(time.time()) - entry.ts > ttl:
+        return False
+    if entry.session not in ("", "-") and current_session not in ("", "-"):
+        if entry.session != current_session:
+            return False
+    if alive is not None and entry.pane not in alive:
+        return False
+    return True
+
+
+def _format_line(ts: int, session: str, pane: str, cmd: str) -> str:
+    return f"{ts} {session or '-'} {pane} {cmd}"
+
+
+# ---- subcommands ---------------------------------------------------------- #
+
+
+def cmd_enqueue(args: argparse.Namespace) -> int:
+    qdir = _queue_dir()
+    qdir.mkdir(parents=True, exist_ok=True)
+    ts = args.ts if args.ts is not None else int(time.time())
+    session = args.session or "-"
+    pane = args.pane
+    lines: list[str] = []
+    if args.rename:
+        lines.append(_format_line(ts, session, pane, f"/rename {args.rename}"))
+    if not lines:
+        print(json.dumps({"enqueued": 0}))
+        return 0
+    target = qdir / _pane_safe(pane)
+    with target.open("a", encoding="utf-8") as fh:
+        for ln in lines:
+            fh.write(ln + "\n")
+    print(json.dumps({"enqueued": len(lines), "pane": pane}))
+    return 0
+
+
+def cmd_flush(args: argparse.Namespace) -> int:
+    qdir = _queue_dir()
+    pane = args.pane
+    session = args.session or "-"
+    ttl = args.ttl if args.ttl is not None else _int_env("PENDING_UI_TTL_SECONDS", _DEFAULT_TTL_SECONDS)
+    window = _int_env("PENDING_UI_TYPING_WINDOW", _int_env("TMUX_TYPING_GUARD_WINDOW", _DEFAULT_TYPING_WINDOW))
+    hold = args.hold if args.hold is not None else _float_env("PENDING_UI_HOLD_SECONDS", _DEFAULT_HOLD_SECONDS)
+    poll = _float_env("PENDING_UI_POLL_SECONDS", _DEFAULT_POLL_SECONDS)
+
+    qfile = qdir / _pane_safe(pane)
+    summary = {"pane": pane, "sent": 0, "purged": 0, "held": 0, "failed": 0}
+    if not qfile.exists():
+        print(json.dumps(summary))
+        return 0
+
+    # Atomically claim the file so a concurrent submit doesn't double-drain it.
+    drain = qdir / f"{_pane_safe(pane)}.drain.{os.getpid()}"
+    try:
+        os.replace(qfile, drain)
+    except OSError:
+        print(json.dumps(summary))
+        return 0
+
+    raw_lines = [ln for ln in drain.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    alive = _alive_panes()
+    fresh: list[Entry] = []
+    for ln in raw_lines:
+        entry = _parse(ln)
+        if entry is None or not _is_fresh(entry, current_session=session, ttl=ttl, alive=alive):
+            summary["purged"] += 1
+            continue
+        fresh.append(entry)
+
+    kept: list[str] = []
+    if fresh:
+        # HOLD: never write while the human is typing in / viewing this pane.
+        deadline = time.monotonic() + max(0.0, hold)
+        while _unsafe(pane, window) and time.monotonic() < deadline:
+            time.sleep(poll)
+
+        if _unsafe(pane, window):
+            # Still unsafe after the hold budget — keep every fresh entry for the
+            # next submit. Never dropped, never raced.
+            kept = [e.raw for e in fresh]
+            summary["held"] = len(fresh)
+        else:
+            for entry in fresh:
+                if _send(entry.pane, entry.cmd):
+                    summary["sent"] += 1
+                else:
+                    summary["failed"] += 1
+                    kept.append(entry.raw)
+            if summary["sent"] > 0 and not _unsafe(pane, window):
+                _send_clear(pane)
+
+    # Re-queue kept lines (append so a concurrently-written entry survives), then
+    # drop the drain temp.
+    if kept:
+        with qfile.open("a", encoding="utf-8") as fh:
+            for ln in kept:
+                fh.write(ln + "\n")
+    try:
+        drain.unlink()
+    except OSError:
+        pass
+
+    print(json.dumps(summary))
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    qdir = _queue_dir()
+    ttl = args.ttl if args.ttl is not None else _int_env("PENDING_UI_TTL_SECONDS", _DEFAULT_TTL_SECONDS)
+    summary = {"removed": 0, "trimmed": 0, "kept": 0}
+    if not qdir.is_dir():
+        print(json.dumps(summary))
+        return 0
+    alive = _alive_panes()
+    for path in qdir.iterdir():
+        if not path.is_file() or ".drain." in path.name:
+            continue
+        try:
+            raw_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except OSError:
+            continue
+        survivors: list[str] = []
+        for ln in raw_lines:
+            entry = _parse(ln)
+            # sweep is epoch-agnostic: it only prunes universally-dead entries
+            # (malformed/legacy, past TTL, or targeting a vanished pane). Epoch
+            # mismatch is the flush's job, against the live pane occupant.
+            if entry is None:
+                continue
+            if int(time.time()) - entry.ts > ttl:
+                continue
+            if alive is not None and entry.pane not in alive:
+                continue
+            survivors.append(entry.raw)
+        if not survivors:
+            try:
+                path.unlink()
+                summary["removed"] += 1
+            except OSError:
+                pass
+        elif len(survivors) != len(raw_lines):
+            path.write_text("\n".join(survivors) + "\n", encoding="utf-8")
+            summary["trimmed"] += 1
+            summary["kept"] += 1
+        else:
+            summary["kept"] += 1
+    print(json.dumps(summary))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pending-ui-flush", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_enq = sub.add_parser("enqueue", help="append a branding command to a pane's queue")
+    p_enq.add_argument("--pane", required=True)
+    p_enq.add_argument("--session", default="")
+    p_enq.add_argument("--ts", type=int, default=None)
+    p_enq.add_argument("--rename", default="")
+    p_enq.set_defaults(func=cmd_enqueue)
+
+    p_flush = sub.add_parser("flush", help="safely drain one pane's queue")
+    p_flush.add_argument("--pane", required=True)
+    p_flush.add_argument("--session", default="")
+    p_flush.add_argument("--ttl", type=int, default=None)
+    p_flush.add_argument("--hold", type=float, default=None)
+    p_flush.set_defaults(func=cmd_flush)
+
+    p_sweep = sub.add_parser("sweep", help="prune legacy/expired/dead-pane queue files")
+    p_sweep.add_argument("--ttl", type=int, default=None)
+    p_sweep.set_defaults(func=cmd_sweep)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except Exception as exc:  # never break a writer or a hook
+        sys.stderr.write(f"pending-ui-flush: {exc}\n")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

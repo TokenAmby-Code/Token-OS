@@ -94,6 +94,7 @@ from pane_surface import (
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
+from personas import assign_astartes_persona, persona_to_profile
 from phone_service import (
     _send_to_phone,
     load_zap_count_from_daily_note,
@@ -159,25 +160,20 @@ from shared import (
     DESKTOP_STATE,
     DICTATION_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PEDAL_BUFFER_MS,
     PEDAL_BYPASS_MS,
     PEDAL_DOUBLE_TAP_MS,
     PEDAL_STATE,
-    PERSONA_PROFILES,
     PHONE_CONFIG,
     PHONE_HEARTBEAT,
     PHONE_STATE,
-    PROFILES,
     SERVER_PORT,
     STASH_DIR,
     STASH_MAX_AGE_HOURS,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
-    ULTIMATE_FALLBACK,
-    get_next_available_profile,
     is_local_device,
     is_pid_claude,
     log_event,
@@ -1773,15 +1769,8 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get WSL voices held by active instances only (stopped instances release their voice)
-        cursor = await db.execute(
-            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        rows = await cursor.fetchall()
-        used_wsl_voices = {row[0] for row in rows if row[0]}
-
-        # Assign profile via linear probe
-        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
+        persona, pool_exhausted = await assign_astartes_persona(db)
+        profile = persona_to_profile(persona)
 
         # Insert into the legacy compatibility table, then mirror to the canonical
         # tmux-free v2 registry. The mirror deliberately drops pane ids/position
@@ -1839,7 +1828,8 @@ async def register_instance(request: InstanceRegisterRequest):
             "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff"),
-            "cc_color": profile.get("cc_color", "default"),
+            "chip_color": profile.get("chip_color"),
+            "pane_tint": profile.get("pane_tint"),
         },
     )
 
@@ -10235,10 +10225,11 @@ async def list_instances(
                 SELECT i.*,
                        p.slug AS persona_slug,
                        p.display_name AS persona_display_name,
-                       p.pane_color AS persona_pane_color,
+                       p.pane_tint AS persona_pane_tint,
+                       p.chip_color AS persona_chip_color,
                        p.tts_voice AS persona_tts_voice,
-                       p.notification_sound AS persona_notification_sound,
-                       p.singleton AS persona_singleton
+                       p.tts_rate AS persona_tts_rate,
+                       p.notification_sound AS persona_notification_sound
                   FROM instances i
                   LEFT JOIN personas p ON p.id = i.persona_id
             """
@@ -10256,10 +10247,11 @@ async def list_instances(
                 "id": row.get("persona_id"),
                 "slug": row.pop("persona_slug", None),
                 "display_name": row.pop("persona_display_name", None),
-                "pane_color": row.pop("persona_pane_color", None),
+                "pane_tint": row.pop("persona_pane_tint", None),
+                "chip_color": row.pop("persona_chip_color", None),
                 "tts_voice": row.pop("persona_tts_voice", None),
+                "tts_rate": row.pop("persona_tts_rate", None),
                 "notification_sound": row.pop("persona_notification_sound", None),
-                "singleton": row.pop("persona_singleton", None),
             }
             # Compatibility aliases for older tmux-facing callers while storage
             # remains the final v2 shape.
@@ -10267,6 +10259,9 @@ async def list_instances(
             row["profile_name"] = row["persona"].get("slug")
             row["tts_voice"] = row["persona"].get("tts_voice")
             row["notification_sound"] = row["persona"].get("notification_sound")
+            row["color"] = row["persona"].get("chip_color")
+            row["chip_color"] = row["persona"].get("chip_color")
+            row["pane_tint"] = row["persona"].get("pane_tint")
             row["cockpit_label"] = derived_cockpit_label(row)
             row["voice_chat"] = row.get("interaction_mode") == "voice_chat"
             if row["voice_chat"]:
@@ -10359,15 +10354,14 @@ async def get_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         instance = dict(row)
-        # Resolve color from profile name
+        # Resolve display/chip/tint from persona/profile slug.
         profile_name = instance.get("profile_name")
-        if profile_name:
-            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                if p["name"] == profile_name:
-                    instance["color"] = p.get("color", "#0099ff")
-                    instance["cc_color"] = p.get("cc_color", "default")
-                    instance["chapter"] = p.get("chapter")
-                    break
+        prof = profile_by_name(profile_name)
+        if prof:
+            instance["color"] = prof.get("chip_color") or prof.get("color")
+            instance["chip_color"] = prof.get("chip_color") or prof.get("color")
+            instance["pane_tint"] = prof.get("pane_tint")
+            instance["chapter"] = prof.get("chapter")
         return instance
 
 
@@ -17039,12 +17033,12 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "session_id": inst.get("session_id"),
                 "display_name": _ops_display_name(inst),
                 "tab_name": inst.get("tab_name"),
-                # Chapter (40k voice/persona identity), resolved at read-time from
-                # profile_name — same pattern as color/cc_color. chapter_color is the
-                # hex shade for the cockpit chip; cc_color is the named tmux colour.
+                # Persona/chapter display identity, resolved at read-time from
+                # profile_name until instances.persona_id lands. chapter_color is
+                # the cockpit chip; pane_tint is the tmux pane background style.
                 "chapter": _prof.get("chapter") if _prof else None,
-                "chapter_color": _prof.get("color") if _prof else None,
-                "cc_color": _prof.get("cc_color") if _prof else None,
+                "chapter_color": (_prof.get("chip_color") or _prof.get("color")) if _prof else None,
+                "pane_tint": _prof.get("pane_tint") if _prof else None,
                 "status": status,
                 "engine": engine,
                 "device_id": inst.get("device_id"),

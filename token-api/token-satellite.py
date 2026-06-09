@@ -1559,7 +1559,7 @@ class AhkRequest(BaseModel):
 
 class TmuxSendKeysRequest(BaseModel):
     pane: str  # tmux pane ID (e.g., "%5")
-    command: str  # slash command or text to send (e.g., "/color cyan")
+    command: str  # slash command or text to send
     no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
 
 

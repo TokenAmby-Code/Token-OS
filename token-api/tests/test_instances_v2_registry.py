@@ -345,7 +345,7 @@ def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
     row = conn.execute(
         """SELECT i.commander_type, p.slug AS commander_slug
              FROM instances i
-             LEFT JOIN personas p ON CAST(p.id AS TEXT) = i.commander_id
+             LEFT JOIN personas p ON p.id = i.commander_id
             WHERE i.id = 'legion-target-worker'"""
     ).fetchone()
     conn.close()

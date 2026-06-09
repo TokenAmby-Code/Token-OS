@@ -14,13 +14,8 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
-from instance_registry import (
-    INSTANCE_COLUMNS,
-    PERSONA_SEEDS,
-    legacy_row_to_instance_values,
-    metadata_json,
-    slug_from_legacy,
-)
+from instance_registry import INSTANCE_COLUMNS, legacy_row_to_instance_values, slug_from_legacy
+from personas import ensure_personas_table, persona_id_for_slug
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
@@ -38,44 +33,7 @@ async def _table_exists(db, table: str) -> bool:
     return await cursor.fetchone() is not None
 
 
-async def _seed_personas(db) -> None:
-    for (
-        slug,
-        display_name,
-        default_rank,
-        pane_color,
-        tts_voice,
-        sound,
-        singleton,
-        metadata,
-    ) in PERSONA_SEEDS:
-        await db.execute(
-            """INSERT INTO personas
-               (slug, display_name, default_rank, pane_color, tts_voice, notification_sound, singleton, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(slug) DO UPDATE SET
-                   display_name = excluded.display_name,
-                   default_rank = excluded.default_rank,
-                   pane_color = excluded.pane_color,
-                   tts_voice = excluded.tts_voice,
-                   notification_sound = excluded.notification_sound,
-                   singleton = excluded.singleton,
-                   metadata_json = excluded.metadata_json
-            """,
-            (
-                slug,
-                display_name,
-                default_rank,
-                pane_color,
-                tts_voice,
-                sound,
-                singleton,
-                metadata_json(metadata),
-            ),
-        )
-
-
-async def _persona_id_for_legacy_row(db, row: dict) -> int | None:
+async def _persona_id_for_legacy_row(db, row: dict) -> str | None:
     slug = slug_from_legacy(row)
     if not slug:
         return None
@@ -83,17 +41,16 @@ async def _persona_id_for_legacy_row(db, row: dict) -> int | None:
     found = await cursor.fetchone()
     if found:
         return found[0]
+    persona_id = persona_id_for_slug(slug)
     display = slug.replace("-", " ").title()
     await db.execute(
         """INSERT INTO personas
-           (slug, display_name, default_rank, pane_color, singleton, metadata_json)
-           VALUES (?, ?, 'astartes', 'default', 0, '{}')
-           ON CONFLICT(slug) DO NOTHING""",
-        (slug, display),
+           (id, slug, display_name, default_rank, pane_tint)
+           VALUES (?, ?, ?, 'astartes', 'default')
+           ON CONFLICT(id) DO NOTHING""",
+        (persona_id, slug, display),
     )
-    cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
-    found = await cursor.fetchone()
-    return found[0] if found else None
+    return persona_id
 
 
 async def _create_instances_table(db) -> None:
@@ -115,7 +72,7 @@ async def _create_instances_table(db) -> None:
             last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             stopped_at TIMESTAMP,
             archived_at TIMESTAMP,
-            persona_id INTEGER REFERENCES personas(id),
+            persona_id TEXT REFERENCES personas(id),
             rank TEXT NOT NULL DEFAULT 'astartes'
                 CHECK(rank IN ('astartes','overseer','primarch','retired') OR rank GLOB 'aspirant:*'),
             session_doc_id INTEGER,
@@ -136,20 +93,7 @@ async def _create_instances_table(db) -> None:
 
 async def _ensure_instances_v2(db) -> None:
     await db.execute("PRAGMA foreign_keys=ON")
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS personas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT NOT NULL UNIQUE,
-            display_name TEXT NOT NULL,
-            default_rank TEXT NOT NULL DEFAULT 'astartes',
-            pane_color TEXT,
-            tts_voice TEXT,
-            notification_sound TEXT,
-            singleton INTEGER NOT NULL DEFAULT 0 CHECK(singleton IN (0,1)),
-            metadata_json TEXT NOT NULL DEFAULT '{}'
-        )
-    """)
-    await _seed_personas(db)
+    await ensure_personas_table(db)
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS golden_throne (
@@ -259,7 +203,7 @@ async def _ensure_instances_v2(db) -> None:
         WHEN NEW.commander_type = 'persona'
         BEGIN
             SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM personas WHERE CAST(id AS TEXT) = NEW.commander_id
+                SELECT 1 FROM personas WHERE id = NEW.commander_id
             ) THEN RAISE(ABORT, 'persona commander_id must reference personas.id') END;
         END
     """)
@@ -270,7 +214,7 @@ async def _ensure_instances_v2(db) -> None:
         WHEN NEW.commander_type = 'persona'
         BEGIN
             SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM personas WHERE CAST(id AS TEXT) = NEW.commander_id
+                SELECT 1 FROM personas WHERE id = NEW.commander_id
             ) THEN RAISE(ABORT, 'persona commander_id must reference personas.id') END;
         END
     """)
@@ -342,7 +286,7 @@ async def _ensure_instances_v2(db) -> None:
         CREATE TRIGGER trg_instances_singleton_guard
         BEFORE INSERT ON instances
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
-             AND (SELECT singleton FROM personas WHERE id = NEW.persona_id) = 1
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
         BEGIN
             UPDATE instances
                SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
@@ -354,7 +298,7 @@ async def _ensure_instances_v2(db) -> None:
         CREATE TRIGGER trg_instances_singleton_guard_update
         BEFORE UPDATE OF persona_id, rank, commander_type ON instances
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
-             AND (SELECT singleton FROM personas WHERE id = NEW.persona_id) = 1
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
         BEGIN
             UPDATE instances
                SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
@@ -371,6 +315,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
+        await ensure_personas_table(db)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS claude_instances (
