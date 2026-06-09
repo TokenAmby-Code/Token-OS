@@ -68,6 +68,7 @@ def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monke
         tmux_pane="%10",
         working_dir=str(tmp_path),
         prompt="line one\nline two",
+        prompt_summary="GT kreig north needs tests passing",
         engine="codex",
     )
     result = asyncio.run(satellite.golden_throne_followup(req))
@@ -76,7 +77,7 @@ def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monke
     assert sent == [
         (
             "%10",
-            "Golden Throne follow-up. Run: cat /tmp/golden-throne-sop-abcdef12.md — then execute that SOP.",
+            "GT kreig north needs tests passing. Run: cat /tmp/golden-throne-sop-abcdef12.md, then address those criteria.",
             True,
         )
     ]

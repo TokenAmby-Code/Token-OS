@@ -6561,6 +6561,55 @@ def _golden_throne_banner_text_for_rubric(human_pane_surface: str, status: Rubri
     return f"GT {human_pane_surface}: missing {head}"
 
 
+def _golden_throne_inline_rubric_summary(
+    human_pane_surface: str,
+    status: RubricStatus | None,
+) -> str | None:
+    """One-line, criteria-specific GT summary for live pane injection.
+
+    The full accountability prompt often has to go through a temp file because
+    multi-line send-keys payloads are unreliable. The visible injection line
+    must still name the triggering criterion; otherwise the agent sees only a
+    generic "execute this SOP" nudge while the Emperor hears specific TTS.
+    """
+    if status is None or not status.missing:
+        return None
+    head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+    remaining = len(status.missing) - 3
+    suffix = f" (+{remaining} more)" if remaining > 0 else ""
+    return f"GT {human_pane_surface} needs {head}{suffix}"
+
+
+def _clip_one_line(text: str, max_len: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(compact) <= max_len:
+        return compact
+    if max_len == 1:
+        return "…"
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _golden_throne_file_bridge_prompt(
+    sop_file: str,
+    *,
+    rubric_summary: str | None = None,
+    max_len: int = 200,
+) -> str:
+    """Short live-agent prompt that points to the full temp-file instruction.
+
+    For rubric-driven fires, keep the line criteria-specific. Legacy/custom
+    long prompts still use a generic bridge because no structured criterion is
+    available.
+    """
+    if rubric_summary:
+        tail = f". Run: cat {sop_file}, then address those criteria."
+        return f"{_clip_one_line(rubric_summary, max_len - len(tail))}{tail}"
+    text = f"Golden Throne follow-up. Run: cat {sop_file}, then resume this thread."
+    return _clip_one_line(text, max_len)
+
+
 def _golden_throne_ready_for_ack_tts(human_pane_surface: str) -> str:
     """Notify-only TTS when rubric just went complete."""
     return f"{human_pane_surface} ready for ack"
@@ -7112,6 +7161,7 @@ async def golden_throne_followup(session_id: str):
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     doc_path = doc_meta.get("file_path")
+    rubric_prompt_active = False
     if custom_sop_path:
         # Explicit per-instance override wins over the rubric-derived prompt.
         expanded = Path(custom_sop_path).expanduser()
@@ -7127,6 +7177,7 @@ async def golden_throne_followup(session_id: str):
         sop_prompt = _golden_throne_accountability_prompt(
             rubric_status, doc_path, doc_meta.get("frontmatter")
         )
+        rubric_prompt_active = True
         logger.info(
             f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
             f"(missing: {rubric_status.missing})"
@@ -7148,6 +7199,11 @@ async def golden_throne_followup(session_id: str):
         tmux_pane, pane_label = await _resolve_remote_instance_pane(session_id, device_id)
     pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
     human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    rubric_injection_summary = (
+        _golden_throne_inline_rubric_summary(human_pane_surface, rubric_status)
+        if rubric_prompt_active
+        else None
+    )
     instance["tmux_pane"] = tmux_pane
     instance["pane_label"] = pane_label
     instance["pane_surface"] = pane_surface
@@ -7244,8 +7300,10 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                inject_prompt = (
-                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                inject_prompt = _golden_throne_file_bridge_prompt(
+                    sop_file,
+                    rubric_summary=rubric_injection_summary,
+                    max_len=MAX_SENDKEYS_LEN,
                 )
             try:
                 queued = await enqueue_pane_write(
@@ -7377,6 +7435,7 @@ async def golden_throne_followup(session_id: str):
                         "tmux_pane": tmux_pane,
                         "working_dir": working_dir,
                         "prompt": sop_prompt,
+                        "prompt_summary": rubric_injection_summary,
                         "engine": engine,
                     },
                 )
