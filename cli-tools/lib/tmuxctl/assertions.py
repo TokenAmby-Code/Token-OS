@@ -18,7 +18,7 @@ from .api import (
     stop_instance,
     update_instance_activity,
 )
-from .custodes import _pane_pid, pane_has_active_claude
+from .custodes import _pane_pid, pane_has_active_agent
 from .enums import InstanceStatus
 from .resolver import resolve_pane
 from .tmux_adapter import TmuxAdapter
@@ -89,7 +89,7 @@ def _registry_entries(pane_id: str, pane_label: str, *, include_stopped: bool = 
 
 
 def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
-    return pane_has_active_claude(_pane_pid(adapter, pane_id))
+    return pane_has_active_agent(_pane_pid(adapter, pane_id))
 
 
 def _dispatch_args(

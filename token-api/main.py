@@ -2934,7 +2934,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": new_status, "last_activity": now},
+            updates={"status": new_status, "last_activity": now, "stopped_at": None},
             mutation_type="status_changed",
             write_source="api",
             actor=f"activity-{request.action}",
