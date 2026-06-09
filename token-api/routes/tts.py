@@ -45,7 +45,6 @@ from shared import (
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     ULTIMATE_FALLBACK,
-    get_next_available_profile,
     get_quiet_hours_status,
     is_phone_reachable,
     is_satellite_tts_available,

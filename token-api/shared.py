@@ -341,20 +341,6 @@ def profile_by_name(profile_name: str | None) -> dict | None:
     return PROFILE_BY_SLUG.get(profile_name)
 
 
-def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:
-    """Legacy voice-lock assignment shim.
-
-    New runtime assignment should use ``personas.assign_astartes_persona`` so the
-    lock source is DB persona occupancy, not voice names.
-    """
-    for profile in PROFILES:
-        if profile["wsl_voice"] not in used_wsl_voices:
-            return profile, False
-    for profile in FALLBACK_VOICES:
-        if profile["wsl_voice"] not in used_wsl_voices:
-            return profile, True
-    return ULTIMATE_FALLBACK, True
-
 
 # ============ TTS State ============
 

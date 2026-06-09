@@ -92,6 +92,7 @@ from pane_surface import (
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
+from personas import assign_astartes_persona, persona_to_profile
 from phone_service import (
     _send_to_phone,
     load_zap_count_from_daily_note,
@@ -157,26 +158,21 @@ from shared import (
     DESKTOP_STATE,
     DICTATION_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PEDAL_BUFFER_MS,
     PEDAL_BYPASS_MS,
     PEDAL_DOUBLE_TAP_MS,
     PEDAL_STATE,
-    PERSONA_PROFILES,
     PHONE_CONFIG,
     PHONE_HEARTBEAT,
     PHONE_STATE,
-    PROFILES,
     SERVER_PORT,
     STASH_DIR,
     STASH_MAX_AGE_HOURS,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
-    ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
-    get_next_available_profile,
     is_local_device,
     is_pid_claude,
     log_event,
@@ -1772,15 +1768,8 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get WSL voices held by active instances only (stopped instances release their voice)
-        cursor = await db.execute(
-            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        rows = await cursor.fetchall()
-        used_wsl_voices = {row[0] for row in rows if row[0]}
-
-        # Assign profile via linear probe
-        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
+        persona, pool_exhausted = await assign_astartes_persona(db)
+        profile = persona_to_profile(persona)
 
         # Insert instance
         now = datetime.now().isoformat()

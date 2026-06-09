@@ -38,6 +38,7 @@ from instance_mutation import (
     sanctioned_update_instance,
 )
 from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
+from personas import assign_astartes_persona, persona_to_profile
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
@@ -53,15 +54,10 @@ from shared import (
     DB_PATH,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
     MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
-    PERSONA_PROFILES,
-    PROFILES,
-    ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
     append_workflow_event,
-    get_next_available_profile,
     is_subagent_pid,
     log_event,
     profile_by_name,
@@ -2437,15 +2433,8 @@ async def handle_session_start(payload: dict) -> dict:
             profile = {"name": None, "wsl_voice": None, "notification_sound": None}
             pool_exhausted = False
         else:
-            # Get WSL voices held by active instances
-            cursor = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-            )
-            rows = await cursor.fetchall()
-            used_wsl_voices = {row[0] for row in rows if row[0]}
-
-            # Assign profile via linear probe
-            profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
+            persona, pool_exhausted = await assign_astartes_persona(db)
+            profile = persona_to_profile(persona)
 
         # Preserve discord settings from prior registration (--resume re-registers with same id)
         _prior_discord_hosted = 0

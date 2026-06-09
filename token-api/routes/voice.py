@@ -33,7 +33,6 @@ from shared import (
     PEDAL_STATE,
     PROFILES,
     VOICE_CHAT_SESSIONS,
-    get_next_available_profile,
     log_event,
 )
 

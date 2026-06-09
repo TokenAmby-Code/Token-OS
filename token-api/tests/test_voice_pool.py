@@ -2,6 +2,7 @@
 
 import uuid
 
+import aiosqlite
 import pytest
 from fastapi.testclient import TestClient
 
@@ -30,17 +31,19 @@ def test_legacy_profile_by_name_resolves_persona_projection(app_env):
     assert app_env.shared.profile_by_name("profile_3") is None
 
 
-def test_legacy_get_next_available_profile_primary_then_backup(app_env):
-    used = set()
-    for _ in range(len(app_env.shared.PROFILES)):
-        profile, exhausted = app_env.shared.get_next_available_profile(used)
-        assert profile in app_env.shared.PROFILES
-        assert exhausted is False
-        used.add(profile["wsl_voice"])
+@pytest.mark.asyncio
+async def test_persona_assignment_primary_then_backup(app_env):
+    import personas
 
-    profile, exhausted = app_env.shared.get_next_available_profile(used)
-    assert profile in app_env.shared.FALLBACK_VOICES
-    assert exhausted is True
+    async with aiosqlite.connect(app_env.db_path) as db:
+        first, exhausted = await personas.assign_astartes_persona(db, active_ids=set())
+        assert first["slug"] == app_env.shared.PROFILES[0]["name"]
+        assert exhausted is False
+
+        primary_ids = {personas.persona_id_for_slug(p["name"]) for p in app_env.shared.PROFILES}
+        backup, exhausted = await personas.assign_astartes_persona(db, active_ids=primary_ids)
+        assert backup["slug"] == app_env.shared.FALLBACK_VOICES[0]["name"]
+        assert exhausted is True
 
 
 def test_custodes_voice_reserved_from_astartes_assignment(app_env):
