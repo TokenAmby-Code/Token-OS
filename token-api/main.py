@@ -82,14 +82,13 @@ from instance_mutation import (
 from instance_registry import derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
-    DEFAULT_TAB_NAME_RX,
-    PLACEHOLDER_TAB_NAME_RX,
-)
-from pane_surface import (
     human_pane_surface as _format_human_pane_surface,
 )
 from pane_surface import (
     is_meaningful_tab_name as _is_meaningful_surface_name,
+)
+from pane_surface import (
+    is_placeholder_tab_name as _is_placeholder_tab_name,
 )
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
@@ -144,7 +143,6 @@ from session_doc_helpers import (
     mark_rubric_acknowledged,
     mark_rubric_notified,
     read_frontmatter,
-    read_rubric,
     reconcile_coderabbit_comments,
     serialize_frontmatter,
     unique_human_path,
@@ -1606,15 +1604,24 @@ async def _has_pending_naming_nudge(db, instance_id: str) -> bool:
     return bool(await cursor.fetchone())
 
 
-def _build_naming_nudge_message(slug: str | None) -> str:
-    derived = (slug or "").strip()
-    hint = f" Current rough doc slug is `{derived}`." if derived else ""
+def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
+    # Doc-bound instances name themselves by naming their session doc
+    # (_apply_session_doc_instance_name mirrors the doc title onto the tab).
+    if has_session_doc:
+        derived = (slug or "").strip()
+        hint = f" Current rough doc slug is `{derived}`." if derived else ""
+        return (
+            "Your session document still needs a descriptive name. "
+            "Choose a 3-6 word title that describes the work, then run "
+            '`session-doc-name "Your Descriptive Title"`. '
+            "Do not use dates, timestamps, UUIDs, pane IDs, model names, or generic project roots."
+            f"{hint}"
+        )
+    # Doc-less interactive instances name the pane directly via instance-name.
     return (
-        "Your session document still needs a descriptive name. "
-        "Choose a 3-6 word title that describes the work, then run "
-        '`session-doc-name "Your Descriptive Title"`. '
-        "Do not use dates, timestamps, UUIDs, pane IDs, model names, or generic project roots."
-        f"{hint}"
+        "This pane isn't named yet. Choose a 3-6 word kebab title for what "
+        'you\'re working on and run `instance-name "your-title"`. '
+        "No dates/UUIDs/pane-ids/model-names/generic roots."
     )
 
 
@@ -1622,12 +1629,23 @@ def _build_naming_nudge_message(slug: str | None) -> str:
 async def orchestrator_naming_nudge(request: NamingNudgeRequest):
     """Nudge a stopped pane that still has a placeholder tab name.
 
-    This endpoint is intentionally idempotent for renamed panes and capped to
-    three nudges per instance. Durable writes go through sanctioned mutation
-    helpers; the nudge count is derived from the append-only events table.
+    Thin HTTP wrapper (keybind + Claude's naming-nudge.sh Stop shim) around
+    ``_maybe_naming_nudge``. The shared core is idempotent for renamed panes
+    and capped to three nudges per instance.
     """
+    return await _maybe_naming_nudge(request.instance_id or request.session_id)
 
-    instance_id = request.instance_id or request.session_id
+
+async def _maybe_naming_nudge(instance_id: str | None) -> dict:
+    """Interview an unnamed pane: ask the agent to self-name. No synthesis.
+
+    Idempotent for renamed panes (no-op via ``_is_placeholder_tab_name``),
+    guarded against duplicate pending nudges, and capped to three nudges per
+    instance. Engine-agnostic: invoked both by the HTTP wrapper above and
+    server-side on the Stop hook so Codex panes (which have no naming-nudge.sh)
+    get interviewed too. Durable writes go through sanctioned mutation helpers;
+    the nudge count is derived from the append-only events table.
+    """
     if not instance_id:
         return {"success": False, "action": "missing_instance_id"}
 
@@ -1714,7 +1732,8 @@ async def orchestrator_naming_nudge(request: NamingNudgeRequest):
 
     session_doc_path = instance.get("session_doc_path") or instance.get("dispatch_session_doc_path")
     slug = _derive_session_doc_slug(session_doc_path)
-    message = _build_naming_nudge_message(slug)
+    has_session_doc = bool(instance.get("session_doc_id") or session_doc_path)
+    message = _build_naming_nudge_message(slug, has_session_doc)
     queued = await enqueue_pane_write(
         instance_id=instance_id,
         tmux_pane=tmux_pane,
@@ -9594,7 +9613,16 @@ async def _victory_ack_core(
         rubric_status: RubricStatus | None = None
         if doc_path and doc_path.exists():
             try:
-                rubric_status = await asyncio.to_thread(read_rubric, doc_path)
+                fm, _body = await asyncio.to_thread(read_frontmatter, doc_path)
+                # Enrich the surface so the derived `instance_named` criterion
+                # sees the live tab name(s) of the linked instance(s). An empty
+                # list (no linked instance) derives True — never a false block.
+                names_cursor = await db.execute(
+                    "SELECT tab_name FROM claude_instances WHERE session_doc_id = ?",
+                    (doc_id,),
+                )
+                fm["_instance_tab_names"] = [r["tab_name"] for r in await names_cursor.fetchall()]
+                rubric_status = evaluate_rubric(fm)
             except Exception as exc:
                 logger.warning(f"victory-ack: rubric read failed for {doc_path}: {exc}")
 
@@ -18674,17 +18702,6 @@ def _reconcile_eligible(row: dict, now: datetime) -> bool:
     return age >= RECONCILE_IDLE_THRESHOLD_SECONDS
 
 
-def _is_placeholder_tab_name(tab_name: str | None) -> bool:
-    if not tab_name:
-        return False
-    cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
-    if not cleaned:
-        return False
-    if PLACEHOLDER_TAB_NAME_RX.match(cleaned):
-        return True
-    return bool(DEFAULT_TAB_NAME_RX.match(cleaned))
-
-
 def _clean_tab_name(tab_name: str | None) -> str:
     if not tab_name:
         return ""
@@ -25107,6 +25124,7 @@ hooks_init_deps(
     timer_log_shift=shared.timer_log_shift,
     run_stop_evaluators=_run_stop_evaluators,
     auto_name_instance=_auto_name_instance,
+    maybe_naming_nudge=_maybe_naming_nudge,
     work_action_callback=hook_work_action_callback,
     schedule_golden_throne_callback=schedule_golden_throne_followup,
     golden_throne_activity_callback=golden_throne_user_activity,

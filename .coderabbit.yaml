@@ -12,7 +12,7 @@
 
 language: en-US
 early_access: false
-enable_free_tier: false
+enable_free_tier: true
 
 reviews:
   profile: assertive

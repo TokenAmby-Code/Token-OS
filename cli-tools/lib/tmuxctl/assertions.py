@@ -210,6 +210,7 @@ def _observed_row_hash(row, spec: PersonaSpec) -> str:
         "legion": getattr(row, "legion", "") if row is not None else "",
         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
         "instance_type": getattr(row, "instance_type", "") if row is not None else "",
+        "primarch": (getattr(row, "primarch", "") or "") if row is not None else "",
     }
     return hashlib.sha1(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
@@ -308,6 +309,67 @@ def _guarded_send_persona_command(
     return sent, reason, ("persona_correction_sent" if sent else "persona_correction_failed")
 
 
+def _guarded_note_unregistered(
+    adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec
+) -> tuple[bool, str, str]:
+    """Surface a live persona pane that has NO registry row at all — without spamming.
+
+    Injecting ``/persona`` here is a proven no-op: for a singleton pane the persona
+    skill verifies-and-reports rather than self-PATCHing (by design — registration
+    is an infrastructure invariant, not the agent's job). The only component that
+    can correctly create the row is the agent's own SessionStart, which holds the
+    session_id and the full identity derivation and fires on (re)start;
+    ``instances-clear`` now preserves persona rows so the watchdog reactivates them
+    in place thereafter. So we do NOT inject — re-injecting ``/persona`` every tick
+    only burned the persona's model (Opus, on the Administratum pane) forever
+    without ever creating the row. Instead emit a distinct, actionable diagnostic
+    once per backoff window and let the operator / a restart register the row.
+
+    Returns ``(False, reason, action)`` — never "sent"; the action is
+    ``persona_unregistered_noted`` (fresh) or ``persona_unregistered_suppressed``
+    (within backoff).
+    """
+    row_hash = _observed_row_hash(None, spec)
+    guard = _read_persona_guard(adapter, pane_id)
+    now = time.time()
+    same_input = guard.get("persona") == spec.persona and guard.get("row_hash") == row_hash
+
+    if same_input and (now - float(guard.get("ts", 0) or 0)) < PERSONA_GUARD_BACKOFF_SECONDS:
+        attempts = int(guard.get("attempts", 1) or 1) + 1
+        guard["attempts"] = attempts
+        _write_persona_guard(adapter, pane_id, guard)
+        return (
+            False,
+            f"persona_unregistered_suppressed attempts={attempts}",
+            "persona_unregistered_suppressed",
+        )
+
+    log_event(
+        "persona_unregistered_live_runtime",
+        details={
+            "pane": pane_id,
+            "pane_label": spec.pane_label,
+            "expected_persona": spec.persona,
+            "remedy": (
+                f"restart this pane so SessionStart registers the row "
+                f"(primarch={spec.persona}); /persona is a no-op for singleton panes "
+                f"and instances-clear now preserves the row for reactivation"
+            ),
+        },
+    )
+    _write_persona_guard(
+        adapter,
+        pane_id,
+        {
+            "persona": spec.persona,
+            "row_hash": row_hash,
+            "ts": now,
+            "attempts": (int(guard.get("attempts", 0) or 0) + 1) if same_input else 1,
+        },
+    )
+    return False, "persona_unregistered_live_runtime", "persona_unregistered_noted"
+
+
 def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
     for row in rows:
         try:
@@ -387,9 +449,21 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
         return row.pane_label == spec.pane_label and (
             row.legion == "fabricator" or spec.persona in tab
         )
-    # Personas without a dedicated legion/primarch row (e.g. administratum)
-    # currently register as a shared legion; their stable pane_label plus the
-    # persona-derived tab name is the only available identity.
+    if spec.persona == "administratum":
+        # Administratum shares the `mechanicus` legion with worker panes, so legion
+        # cannot identify it — its load-bearing key is `primarch='administratum'`
+        # (the same column the token-api `_resolve_administratum_instance`
+        # dispatcher resolves on). Keying on primarch decouples the match from the
+        # agent self-naming: a freshly SessionStart-registered row has
+        # tab_name='needs-name' yet IS the recorder, so requiring the persona
+        # substring in tab_name re-armed the correction loop until the agent ran
+        # `instance-name`. tab_name stays a fallback for rows predating the
+        # primarch column.
+        return row.pane_label == spec.pane_label and (
+            getattr(row, "primarch", "") == "administratum" or spec.persona in tab
+        )
+    # Fallback for any other persona pane: stable pane_label plus persona-derived
+    # tab name.
     return row.pane_label == spec.pane_label and spec.persona in tab
 
 
@@ -519,18 +593,21 @@ def _assert_instance_impl(
                             "error": str(exc),
                         },
                     )
-            sent, reason, action = _guarded_send_persona_command(adapter, pane_id, spec, None)
-            log_event(
-                "assert_instance_mismatch",
-                details={
-                    "pane": pane_id,
-                    "pane_label": pane_label,
-                    "expected_persona": spec.persona,
-                    "actual_legion": "",
-                    "action": action,
-                    "reason": "live_runtime_missing_registry",
-                },
-            )
+                    result.update(
+                        {
+                            "ok": False,
+                            "instance_id": stopped_match.instance_id,
+                            "action": "registry_reactivation_failed",
+                            "reason": "reactivate_stopped_registry_failed",
+                        }
+                    )
+                    return finish(result, clear_failed=False)
+            # Live runtime, no registry row at all (not even a stopped one to
+            # reactivate). Do NOT inject `/persona` — it is a no-op for singleton
+            # panes and re-firing it every tick burned the persona's model forever.
+            # Surface the anomaly loudly + back off; SessionStart on restart creates
+            # the row, and instances-clear now preserves it for later reactivation.
+            noted, reason, action = _guarded_note_unregistered(adapter, pane_id, spec)
             result.update({"ok": False, "action": action, "reason": reason})
             return finish(result, clear_failed=False)
         _assert_persona_color(adapter, pane_id, spec)
