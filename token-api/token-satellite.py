@@ -856,15 +856,17 @@ class DeskFlowWatchdog:
             self.next_recovery_at = time.time() + DESKFLOW_BACKOFF_SECONDS[0]
 
         # Edge loop: block on the follower's edge queue — indefinitely unless a
-        # recovery retry is scheduled. On timeout, run the idle tick (a bounded
-        # recovery retry while un-connected). A ``None`` edge is the stop sentinel.
+        # recovery retry or hold expiry is scheduled. On timeout, run the idle
+        # tick. A ``None`` edge is the stop sentinel; a real edge queued ahead of
+        # the sentinel must not dispatch once shutdown has started.
         while not self._stop_event.is_set():
             try:
                 edge = self._edge_queue.get(timeout=self._edge_loop_timeout())
             except queue.Empty:
-                self._on_idle_tick()
+                if not self._stop_event.is_set():
+                    self._on_idle_tick()
                 continue
-            if edge is None:
+            if edge is None or self._stop_event.is_set():
                 continue
             try:
                 self._dispatch_edge(edge)
@@ -874,28 +876,48 @@ class DeskFlowWatchdog:
     def _edge_loop_timeout(self) -> float | None:
         """Edge-queue blocking timeout.
 
-        While actively un-connected (``waiting``/``backoff``) the loop must wake
-        promptly to drive the next recovery retry — return a ``next_recovery_at``-
-        aware timeout floored at 1.0s. In every other state (``running``/``held``/
-        ``ceased``/``stopped``) there is nothing timed to do: block until an edge
-        or the stop sentinel arrives (no periodic liveness poll, by decree).
+        Two timed obligations exist: the next recovery retry while actively
+        un-connected (``waiting``/``backoff``, at ``next_recovery_at``) and the
+        hold expiry while ``held`` (at ``hold_until``). Wake for those, floored
+        at 1.0s. In every other state (``running``/``ceased``/``stopped``) there
+        is nothing timed to do: block until an edge or the stop sentinel arrives
+        (no periodic liveness poll, by decree).
         """
         if self.state in ("waiting", "backoff"):
             return max(1.0, self.next_recovery_at - time.time())
+        if self.state == "held" and self.hold_until:
+            return max(1.0, self.hold_until - time.time())
         return None
 
     def _on_idle_tick(self) -> None:
-        """Idle-tick body: a bounded recovery retry while actively un-connected.
+        """Idle-tick body: hold expiry + a bounded recovery retry.
 
-        Only reachable in ``waiting``/``backoff`` — every other state blocks on
-        the edge queue without a timeout. Re-drives the recovery ladder at the
-        scheduled retry time so a wedged ``waiting``/``backoff`` (boot invite or
-        a prior rung that never connected the Mac, with no further edge arriving)
-        heals without an external trigger. ``ceased`` is excluded by design (it
-        waits for an UP edge to resurrect); ``running``/``held`` never retry.
-        ``_recovery_lock`` guards re-entrancy; backoff escalation to ``ceased``
-        after DESKFLOW_MAX_RECOVERY_ATTEMPTS still bounds it.
+        Only reachable in ``waiting``/``backoff``/``held`` — every other state
+        blocks on the edge queue without a timeout.
+
+        ``held``: resume when the hold expires — connected holds settle straight
+        to ``running``; un-connected holds drop to ``waiting`` with an immediate
+        retry armed (a DROP swallowed during the hold produces no further edge,
+        so the resume itself must re-drive recovery).
+
+        ``waiting``/``backoff``: re-drive the recovery ladder at the scheduled
+        retry time so a wedged state (boot invite or a prior rung that never
+        connected the Mac, with no further edge arriving) heals without an
+        external trigger. ``ceased`` is excluded by design (it waits for an UP
+        edge to resurrect); ``running`` never retries. ``_recovery_lock`` guards
+        re-entrancy; backoff escalation to ``ceased`` after
+        DESKFLOW_MAX_RECOVERY_ATTEMPTS still bounds it.
         """
+        if self.state == "held":
+            if self.hold_until and time.time() > self.hold_until:
+                logger.info("KVM watchdog: Hold expired, resuming")
+                if self._follower_connected():
+                    self._mark_connected()
+                else:
+                    self.state = "waiting"
+                    self.last_state_change = time.time()
+                    self.next_recovery_at = time.time()
+            return
         if (
             self.state in ("waiting", "backoff")
             and not self._follower.connected

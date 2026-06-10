@@ -275,14 +275,54 @@ def test_recovery_lock_skips_overlapping_recovery() -> None:
 # ── Idle-tick recovery driver (the recovery-wedge fix) ──
 
 
-def test_edge_loop_timeout_blocks_indefinitely_unless_recovering() -> None:
-    # No periodic liveness poll: every settled state blocks until an edge
+def test_edge_loop_timeout_blocks_indefinitely_unless_timed_work() -> None:
+    # No periodic liveness poll: settled states block until an edge
     # (or the stop sentinel) arrives.
     module = load_satellite_module()
     wd = make_watchdog(module)
-    for state in ("running", "held", "ceased", "stopped", "starting"):
+    for state in ("running", "ceased", "stopped", "starting"):
         wd.state = state
         assert wd._edge_loop_timeout() is None
+
+
+def test_edge_loop_timeout_held_wakes_at_hold_expiry() -> None:
+    module = load_satellite_module()
+    wd = make_watchdog(module)
+    wd.state = "held"
+    wd.hold_until = time.time() + 5
+    t = wd._edge_loop_timeout()
+    assert 1.0 <= t <= 6.0
+    # Expired hold clamps to the floor so the resume runs promptly.
+    wd.hold_until = time.time() - 10
+    assert wd._edge_loop_timeout() == 1.0
+
+
+def test_idle_tick_resumes_expired_hold() -> None:
+    module = load_satellite_module()
+    # Connected at expiry → settle straight to running.
+    wd = make_watchdog(module, follower_connected=True, record_recover=True)
+    wd.state = "held"
+    wd.hold_until = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert wd.state == "running"
+    # Un-connected at expiry → waiting with an immediate retry armed (a DROP
+    # swallowed during the hold produces no further edge).
+    wd2 = make_watchdog(module, record_recover=True)
+    wd2.state = "held"
+    wd2.hold_until = time.time() - 1
+    module.DeskFlowWatchdog._on_idle_tick(wd2)
+    assert wd2.state == "waiting"
+    assert wd2.next_recovery_at <= time.time()
+
+
+def test_idle_tick_keeps_unexpired_hold() -> None:
+    module = load_satellite_module()
+    wd = make_watchdog(module, record_recover=True)
+    wd.state = "held"
+    wd.hold_until = time.time() + 60
+    module.DeskFlowWatchdog._on_idle_tick(wd)
+    assert wd.state == "held"
+    assert not any(isinstance(a, tuple) and a[0] == "recover" for a in wd.actions)
 
 
 def test_edge_loop_timeout_short_while_waiting_respects_next_recovery_at() -> None:
@@ -390,6 +430,28 @@ def test_stop_unblocks_edge_loop_with_sentinel() -> None:
     module.DeskFlowWatchdog.stop(wd)
     assert wd._stop_event.is_set()
     assert wd._edge_queue.get_nowait() is None
+
+
+def test_edge_dequeued_after_stop_is_not_dispatched() -> None:
+    # A real edge queued ahead of the stop sentinel must not trigger invites/
+    # recovery once shutdown has started — the loop re-checks the stop event
+    # after every wake-up. Simulate stop firing mid-iteration: the timeout hook
+    # runs right before the dequeue, so setting stop there lands in the window
+    # between the loop-condition check and the dispatch guard.
+    module = load_satellite_module()
+    wd = make_watchdog(module, follower_connected=True)
+    wd._wait_for_tailscale = lambda: True
+    dispatched = []
+    wd._dispatch_edge = lambda edge: dispatched.append(edge)
+    wd._follower.feed(LINE_DROP)  # real edge queued before stop
+
+    def _timeout_then_stop() -> float:
+        wd._stop_event.set()
+        return 0.05
+
+    wd._edge_loop_timeout = _timeout_then_stop
+    module.DeskFlowWatchdog._run(wd)
+    assert dispatched == []
 
 
 # ── Follower tail mechanics ──
