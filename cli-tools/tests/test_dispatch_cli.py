@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "cli-tools" / "bin" / "dispatch"
 
@@ -480,6 +482,7 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
       d --direct "direct work"
       cdc {ROOT} --direct "direct cdc"
       d --resume resume-session-id
+      d --target legion:new "new pane"
     """
     env = os.environ.copy()
     env.update(
@@ -490,6 +493,7 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
             "TOKEN_OS": str(ROOT),
             "IMPERIUM": str(ROOT.parent),
             "TERM": "xterm",
+            "TMUX_PANE": "%42",
         }
     )
     result = subprocess.run(
@@ -503,11 +507,41 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
 
     assert result.returncode == 0, result.stderr
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "d|--interactive do more"
-    assert lines[1] == f"cdc|--interactive --dir {ROOT} do cdc"
-    assert lines[2] == "d|--interactive --direct direct work"
-    assert lines[3] == f"cdc|--interactive --dir {ROOT} --direct direct cdc"
-    assert lines[4] == "d|--interactive --resume resume-session-id"
+    assert lines[0] == "d|--interactive --pane self do more"
+    assert lines[1] == f"cdc|--interactive --pane self --dir {ROOT} do cdc"
+    assert lines[2] == "d|--interactive --pane self --direct direct work"
+    assert lines[3] == f"cdc|--interactive --pane self --dir {ROOT} --direct direct cdc"
+    assert lines[4] == "d|--interactive --pane self --resume resume-session-id"
+    assert lines[5] == "d|--interactive --target legion:new new pane"
+
+
+def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_MENU_CONSUMED", "1")
+    monkeypatch.setenv("TMUX_PANE", "%42")
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "launch in place",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "target:          self" in result.stdout
+    assert "TOKEN_API_DISPATCH_TARGET=self" in result.stdout
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=<tmux-pane>" in result.stdout
+    assert "TMUX_PANE=<tmux-pane>" in result.stdout
+    assert "--target self" in result.stdout
 
 
 def test_dispatch_human_origin_forces_interactive_even_with_direct(monkeypatch):
@@ -776,6 +810,56 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "Aspirant Session Startup" in staged
     assert "## Implantation" in staged
     assert "## Trials" in staged
+
+
+def test_dispatch_human_aspirant_launch_defaults_to_self_pane(tmp_path) -> None:
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    codex_log = tmp_path / "codex.log"
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$CODEX_LOG"\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+
+    env = os.environ.copy()
+    env["IMPERIUM"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DISPATCH_ORIGIN"] = "d"
+    env["TOKEN_API_DISPATCH_MENU_CONSUMED"] = "1"
+    env["TMUX_PANE"] = "%55"
+    env["CODEX_LOG"] = str(codex_log)
+    env["CODEX_BIN"] = str(fake_codex)
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--aspirant",
+            "--aspirant-kind",
+            "dispatch",
+            "--engine",
+            "codex",
+            "--dir",
+            str(ROOT),
+            "--victory-condition",
+            "Tests pass",
+            "Launch in this pane",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "launch_action: dispatch --direct --engine codex" in result.stdout
+    assert "--target self" in result.stdout
+    assert "--target legion:new" not in result.stdout
+    assert codex_log.exists()
 
 
 def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_prompt(

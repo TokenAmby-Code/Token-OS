@@ -6,6 +6,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
+import pytest
 from tmuxctl.stack import (
     STACK_COLLAPSED_HEIGHT,
     add_stack_pane,
@@ -108,6 +109,26 @@ class FakeLegionAdapter:
             pane = args[args.index("-t") + 1]
             self.rows = [row for row in self.rows if not row.startswith(f"{pane}\t")]
         return ""
+
+
+def test_add_stack_pane_kills_new_worker_when_layout_fails(monkeypatch):
+    import tmuxctl._stack_core as stack_core
+
+    rows = [
+        "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+    ]
+    adapter = FakeLegionAdapter(rows=rows)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(stack_core, "enforce_stack_layout", _boom)
+
+    with pytest.raises(OSError):
+        stack_core.add_orchestrator_stack_pane(adapter, "main", "legion", cwd="/tmp", focus=False)
+
+    assert any(command[0] == "kill-pane" and "%N" in command for command in adapter.commands)
+    assert not any(row.startswith("%N\t") for row in adapter.rows or [])
 
 
 def test_selecting_custodes_does_not_resize_legion():

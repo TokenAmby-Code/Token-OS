@@ -329,6 +329,24 @@ _dispatch_kind_is_aspirant() {
     return 1
 }
 
+_dispatch_has_target_spec() {
+    local first=true
+    local arg
+    for arg in "$@"; do
+        if $first; then
+            case "$arg" in
+                legion|mechanicus|civic) return 0 ;;
+            esac
+        fi
+        first=false
+        case "$arg" in
+            --target|--pane|--target=*|--pane=*) return 0 ;;
+            --) break ;;
+        esac
+    done
+    return 1
+}
+
 _dispatch_human_surface() {
     local origin="$1"
     local do_clear="$2"
@@ -348,6 +366,9 @@ _dispatch_human_surface() {
     # Human launcher surfaces are canonical dispatch entrypoints. Always enter the
     # dispatch selector by default. Aspirant intake is explicit-only for now
     # because the Aspirant pipeline is not reliable enough to be the default.
+    if ! _dispatch_has_target_spec "${args[@]}" && [[ -n "${TMUX_PANE:-${TMUX:-}}" ]]; then
+        args=(--pane self "${args[@]}")
+    fi
     if [[ -z "${TOKEN_API_DISPATCH_MENU_CONSUMED:-${DISPATCH_MENU_CONSUMED:-}}" ]] \
         && ! _dispatch_has_flag --interactive "${args[@]}"; then
         args=(--interactive "${args[@]}")

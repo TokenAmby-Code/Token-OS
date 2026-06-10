@@ -43,6 +43,39 @@ def captured_subprocess(monkeypatch):
     return calls
 
 
+def test_run_allow_failure_uses_single_output_pipe(monkeypatch):
+    calls = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append((cmd, kwargs))
+        proc = _FakeCompleted()
+        proc.stdout = "%9\n"
+        return proc
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    assert adapter.run("list-panes", "-t", "legion", allow_failure=True) == "%9\n"
+
+    assert calls
+    assert calls[0][1]["stdout"] is tmux_adapter.subprocess.PIPE
+    assert calls[0][1]["stderr"] is tmux_adapter.subprocess.DEVNULL
+
+
+def test_run_reports_emfile_as_tmux_error(monkeypatch):
+    def _fake_run(cmd, *args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    with pytest.raises(tmux_adapter.TmuxError) as excinfo:
+        adapter.run("list-panes", "-t", "legion", allow_failure=True)
+
+    assert "too many open files" in str(excinfo.value)
+    assert "list-panes" in str(excinfo.value)
+
+
 @pytest.fixture
 def recorded_suppressions(monkeypatch):
     records: list[dict] = []

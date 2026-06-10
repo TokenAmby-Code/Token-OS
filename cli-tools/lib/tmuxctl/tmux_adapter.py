@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -146,6 +147,15 @@ def _has_flag(args: list[str], flag: str) -> bool:
     return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
 
 
+def _tmux_stderr_target(*, allow_failure: bool):
+    # allow_failure callers intentionally tolerate tmux errors and almost never
+    # consume stderr. Do not spend a second pipe for stderr; the live legion:new
+    # failure hit EMFILE while creating an unnecessary err pipe. Discard tolerated
+    # stderr instead of merging it into stdout, because structured tmux stdout is
+    # parsed by list_clients/list_sessions/list_panes callers.
+    return subprocess.DEVNULL if allow_failure else subprocess.PIPE
+
+
 class TmuxAdapter:
     """Small wrapper around raw tmux commands.
 
@@ -285,12 +295,21 @@ class TmuxAdapter:
         # (a blocked send writes nothing to the pane) and before the keys land, so
         # the marker is committed before the agent's hooks can fire. Never raises.
         send_gate.register_automated_send(resolved_args, source=self._send_gate_source())
-        proc = subprocess.run(
-            [self.tmux_binary, *resolved_args],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                [self.tmux_binary, *resolved_args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=_tmux_stderr_target(allow_failure=allow_failure),
+                check=False,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EMFILE:
+                raise TmuxError(
+                    "tmux subprocess failed: too many open files while running "
+                    f"tmux {' '.join(resolved_args)}"
+                ) from exc
+            raise
         if proc.returncode != 0 and not allow_failure:
             stderr = proc.stderr.strip()
             raise TmuxError(stderr or f"tmux {' '.join(resolved_args)} failed")

@@ -789,18 +789,26 @@ def add_orchestrator_stack_pane(
     finally:
         _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "false")
 
-    _tag_worker(
-        adapter,
-        pane,
-        spec,
-        _lowest_available_worker_ordinal(workers, spec),
-        reason="worker_birth",
-    )
-    _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
-    adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
-    focus_new_worker = focus and not (base == "mechanicus" and not _mechanicus_focus_allowed())
-    enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus_new_worker)
-    return pane
+    try:
+        _tag_worker(
+            adapter,
+            pane,
+            spec,
+            _lowest_available_worker_ordinal(workers, spec),
+            reason="worker_birth",
+        )
+        _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
+        adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
+        focus_new_worker = focus and not (base == "mechanicus" and not _mechanicus_focus_allowed())
+        enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus_new_worker)
+        return pane
+    except Exception:
+        # If post-split normalization fails, do not leave a blank pending worker
+        # pane behind. This was the visible failure mode of legion:new dispatch:
+        # an empty stack pane opened, then no agent ever started.
+        if pane:
+            adapter.run("kill-pane", "-t", pane, allow_failure=True)
+        raise
 
 
 def add_stack_worker_pane(
