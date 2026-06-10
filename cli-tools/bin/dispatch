@@ -62,6 +62,7 @@ Usage:
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
+  --model <model>              Claude model alias/name for Claude launches
   --repo <name>                Branch from a known project's checkout by name,
                                resolving ~/.config/worktrees/<name>.conf
                                (case-insensitive); avoids passing a full --dir
@@ -139,6 +140,7 @@ WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
 CODEX_PROFILE="${TOKEN_API_CODEX_PROFILE:-}"
+CLAUDE_MODEL="${TOKEN_API_CLAUDE_MODEL:-}"
 DISCORD_CHANNEL=""
 NO_WORKTREE=false
 WORKTREE_BRANCH=""
@@ -160,6 +162,7 @@ esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine) ENGINE="${2:-}"; ENGINE_EXPLICIT=true; shift 2 ;;
+    --model) CLAUDE_MODEL="${2:-}"; shift 2 ;;
     --repo) REPO="${2:-}"; shift 2 ;;
     --id|--resume|-r)
       if [[ $# -lt 2 || "${2:-}" == --* ]]; then
@@ -1379,6 +1382,7 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
   "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
 )
+[[ -n "$CLAUDE_MODEL" ]] && COMMON_ENV+=("TOKEN_API_CLAUDE_MODEL=${CLAUDE_MODEL}")
 [[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PRIMARCH=${PERSONA}")
 if [[ -n "$DISCORD_CHANNEL" ]]; then
   COMMON_ENV+=(
@@ -1603,7 +1607,9 @@ build_agent_command() {
     if [[ "$ENGINE" == "codex" ]]; then
       cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "$RESUME_ID" "${PROMPT:-}")
     else
-      cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions --resume "$RESUME_ID")
+      cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+      [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
+      cmd+=(--resume "$RESUME_ID")
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
       # Forward an initial prompt into the resumed interactive session (e.g. a
       # Golden Throne follow-up SOP). Codex resume already forwards PROMPT above;
@@ -1614,6 +1620,7 @@ build_agent_command() {
     cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "" "${PROMPT:-}")
   else
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+    [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
     if [[ -n "$PERSONA" ]]; then
       local persona_prompt profile_dir line
       persona_prompt="$(build_claude_persona_system_prompt "$PERSONA")"
@@ -1696,6 +1703,7 @@ build_dispatch_command() {
     args=(dispatch --engine "$ENGINE" --dir "$WORK_DIR")
   fi
   [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
+  [[ -n "$CLAUDE_MODEL" ]] && args+=(--model "$CLAUDE_MODEL")
   if [[ -z "$RESUME_ID" ]]; then
     [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
     [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
@@ -1735,6 +1743,7 @@ dispatch dry-run
   instance_type:   $INSTANCE_TYPE
   zealotry:        $ZEALOTRY
   sync:            $SYNC
+  claude_model:    ${CLAUDE_MODEL:-default}
   session_doc:     ${SESSION_DOC:-new session doc}
   system_prompt:   $([[ -n "$SYSTEM_PROMPT" ]] && echo provided || echo none)
   mcp:             $MCP_DECISION

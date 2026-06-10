@@ -36,6 +36,7 @@ class PersonaSpec:
     session_doc: str
     engine: str = "claude"
     sync: bool = False
+    model: str = ""
 
 
 def _vault_root() -> Path:
@@ -64,7 +65,7 @@ def persona_spec(label: str) -> PersonaSpec:
             str(_vault_root() / "Mars" / "Sessions" / "fabricator-general.md"),
         )
     if label == "mechanicus:admin":
-        return PersonaSpec(label, "administratum", "hook_driven", _admin_log())
+        return PersonaSpec(label, "administratum", "hook_driven", _admin_log(), model="sonnet")
     raise ValueError(f"unknown persona pane: {label}")
 
 
@@ -101,6 +102,8 @@ def _dispatch_args(
         args += ["--persona", str(persona)]
     if session_doc := upsert.get("session_doc"):
         args += ["--session-doc", str(session_doc)]
+    if model := upsert.get("model"):
+        args += ["--model", str(model)]
     if work_dir := upsert.get("dir") or upsert.get("working_dir"):
         args += ["--dir", str(work_dir)]
     if upsert.get("instance_type"):
@@ -450,6 +453,7 @@ def _assert_instance_impl(
                 "instance_type": spec.instance_type,
                 "session_doc": spec.session_doc,
                 "sync": spec.sync,
+                "model": spec.model,
                 "no_gt": not spec.sync,
             }
             ok, reason = _launch(pane_id, launch_upsert, str((upsert or {}).get("prompt") or ""))

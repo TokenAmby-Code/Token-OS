@@ -83,6 +83,29 @@ def test_dispatch_unicode_prompt_no_illegal_byte_sequence_under_c_locale(tmp_pat
     assert "RE error" not in result.stderr
 
 
+def test_dispatch_claude_model_dry_run_forwards_to_wrapper():
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--model",
+            "sonnet",
+            "stand by",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "claude_model:    sonnet" in result.stdout
+    assert "--model sonnet" in result.stdout
+
+
 def test_dispatch_legion_shorthand_maps_to_target(tmp_path):
     for keyword in ("legion", "mechanicus", "civic"):
         result = subprocess.run(
