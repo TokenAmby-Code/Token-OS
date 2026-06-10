@@ -20,6 +20,8 @@ from typing import Any
 
 import yaml
 
+from pane_surface import is_placeholder_tab_name
+
 logger = logging.getLogger(__name__)
 
 _VAULT_ROOT = Path(os.environ.get("IMPERIUM_ENV", "")) if os.environ.get("IMPERIUM_ENV") else None
@@ -328,6 +330,10 @@ DEFAULT_SESSION_DOC_RUBRIC: dict[str, bool] = {
     "sanguinius_satisfied": False,
     # Derived in evaluate_rubric from fm['commentary']: True iff commentary is None.
     "commentary_resolved": True,
+    # Derived in evaluate_rubric from fm['_instance_tab_names'] (injected by the
+    # victory-ack caller): True iff a linked instance has a non-placeholder name.
+    # A stale `needs-name` blocks victory; absent surface => non-blocking True.
+    "instance_named": False,
 }
 
 
@@ -561,6 +567,25 @@ def evaluate_rubric(fm: dict, rubric_key: str | None = None) -> RubricStatus:
                 rubric_value = dict(rubric_value)
                 derived_dirty = True
             rubric_value[dkey] = compute(fm)
+
+    # `instance_named`: True iff at least one linked instance carries a real
+    # (non-placeholder) tab name. The live name(s) are injected by the evaluator
+    # caller as fm['_instance_tab_names'] (e.g. the victory-ack chokepoint).
+    # When that surface is absent — a legacy/un-enriched read, or a doc with no
+    # linked instance — this derives True so it never falsely blocks; the gate
+    # only bites where the caller enriches the surface.
+    if "instance_named" in rubric_value:
+        if not derived_dirty:
+            rubric_value = dict(rubric_value)
+            derived_dirty = True
+        names = fm.get("_instance_tab_names")
+        # `n and ...`: a None/empty name is *absence of a name*, not a real one —
+        # is_placeholder_tab_name(None) is False, so without the truthy guard a
+        # NULL tab_name would wrongly satisfy the criterion (and mask a sibling
+        # placeholder). Require a truthy, non-placeholder name.
+        rubric_value["instance_named"] = (not names) or any(
+            n and not is_placeholder_tab_name(n) for n in names
+        )
 
     skip_set = set(skip)
     missing = [k for k, v in rubric_value.items() if not bool(v) and k not in skip_set]

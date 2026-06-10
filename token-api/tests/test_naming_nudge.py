@@ -194,6 +194,47 @@ async def test_naming_nudge_sends_for_numbered_placeholder(app_env, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
+    app_env, monkeypatch
+) -> None:
+    """A placeholder-named instance with NO session doc must be told to run
+    `instance-name` (it owns its pane name directly), not `session-doc-name`."""
+    _insert_instance(app_env.db_path, tab_name="needs-name", session_doc_id=None)
+    enqueued = []
+
+    async def fake_enqueue(**kwargs):
+        enqueued.append(kwargs)
+        return {"id": "queue-1", **kwargs, "status": "pending"}
+
+    async def fake_process(queue_id):
+        return [{"queue_id": queue_id, "status": "sent"}]
+
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fake_enqueue)
+    monkeypatch.setattr(app_env.main, "process_pane_write_queue_once", fake_process)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(session_id="inst-naming")
+    )
+
+    assert result["action"] == "nudge_sent"
+    payload = enqueued[0]["payload"]
+    assert 'instance-name "your-title"' in payload
+    assert "session-doc-name" not in payload
+
+    row = _fetchone(
+        app_env.db_path,
+        "SELECT workflow_blocked_reason FROM claude_instances WHERE id = 'inst-naming'",
+    )
+    assert row["workflow_blocked_reason"] == "tab_name_placeholder"
+
+    event = _fetchone(
+        app_env.db_path,
+        "SELECT event_type FROM events WHERE instance_id = 'inst-naming' AND event_type = 'naming_nudge_sent'",
+    )
+    assert event["event_type"] == "naming_nudge_sent"
+
+
+@pytest.mark.asyncio
 async def test_naming_nudge_noops_for_null_doc_instance(app_env, monkeypatch):
     """An automated launch left with NULL session_doc_id and no placeholder tab
     name must not be infinitely nudged — the gate keys on tab_name."""

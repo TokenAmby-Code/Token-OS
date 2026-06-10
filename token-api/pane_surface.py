@@ -29,6 +29,26 @@ def is_meaningful_tab_name(tab_name: str | None) -> bool:
     return human_tab_name(tab_name) is not None
 
 
+def is_placeholder_tab_name(tab_name: str | None) -> bool:
+    """True when ``tab_name`` is a launch/placeholder stub, not an agent name.
+
+    Canonical predicate shared by the naming-nudge gate (main) and the
+    ``instance_named`` victory criterion (session_doc_helpers). Catches the
+    ``needs-name``/``session``/``unnamed-session`` placeholder stems (with an
+    optional numeric suffix) and the ``Claude HH:MM`` launch stamp. A blank
+    name is *not* a placeholder (callers gate naming on a real placeholder, not
+    on absence), matching the historical behavior.
+    """
+    if not tab_name:
+        return False
+    cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
+    if not cleaned:
+        return False
+    if PLACEHOLDER_TAB_NAME_RX.match(cleaned):
+        return True
+    return bool(DEFAULT_TAB_NAME_RX.match(cleaned))
+
+
 def human_tab_name(tab_name: str | None) -> str | None:
     """Return the cleaned human name, or None for placeholders/blank names."""
     if not tab_name:
