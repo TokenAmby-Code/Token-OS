@@ -95,7 +95,9 @@ def _mkfakes(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _run(args: list[str], *, qdir: Path, fakes: dict, extra_env: dict | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: list[str], *, qdir: Path, fakes: dict, extra_env: dict | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "PENDING_UI_DIR": str(qdir),
@@ -110,7 +112,9 @@ def _run(args: list[str], *, qdir: Path, fakes: dict, extra_env: dict | None = N
         "PENDING_UI_TYPING_WINDOW": "10",
         **(extra_env or {}),
     }
-    proc = subprocess.run([sys.executable, str(TOOL), *args], text=True, capture_output=True, check=False, env=env)
+    proc = subprocess.run(
+        [sys.executable, str(TOOL), *args], text=True, capture_output=True, check=False, env=env
+    )
     return proc
 
 
