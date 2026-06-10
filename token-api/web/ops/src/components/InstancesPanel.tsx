@@ -1,9 +1,17 @@
 // Active fleet. Table on desktop, card stack on mobile (same data, one source).
+//
+// Selection: double-clicking a row selects + expands that instance (feature A);
+// the currently-talking instance is auto-selected (feature B). Both feed the
+// SAME selection state (owned by App) and render the SAME <ExpandedInstance>
+// card — one "select + expand" mechanism, not two. Manual selection also POSTs
+// /api/instances/{id}/focus-pane so the tmux pane is focused + marked.
 
-import type { OpsInstance } from '../types';
+import type { OpsInstance, TtsCurrent } from '../types';
 import { statusTone, zealotryTone } from '../modes';
 import { formatAge, formatTime, compactPath } from '../format';
 import { openSessionDoc } from '../api';
+
+export type Selection = { id: string; source: 'manual' | 'talking' };
 
 function Zealotry({ value }: { value: number }) {
   const tone = zealotryTone(value);
@@ -93,12 +101,125 @@ function PrBadge({ inst }: { inst: OpsInstance }) {
   return <span className={cls}>{label}</span>;
 }
 
-export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
+// Live state of the expanded instance: talking right now vs. just selected. Driven
+// by whether it is the current speaker (not by how it was selected), so the tag
+// stays truthful if a talking-selected instance falls silent.
+function SourceTag({ isTalking }: { isTalking: boolean }) {
+  return (
+    <span className={`xi__src xi__src--${isTalking ? 'talking' : 'manual'}`}>
+      {isTalking ? '🔊 talking' : '◆ selected'}
+    </span>
+  );
+}
+
+// The expanded instance view — shared by feature A (manual) and feature B
+// (talking). One card, regardless of how the instance became selected.
+function ExpandedInstance({
+  inst,
+  isTalking,
+  current,
+  focusNote,
+  onClear,
+}: {
+  inst: OpsInstance;
+  isTalking: boolean;
+  current: TtsCurrent | null;
+  focusNote: string | null;
+  onClear: () => void;
+}) {
+  return (
+    <article className={`xi ${isTalking ? 'xi--talking' : ''}`}>
+      <header className="xi__head">
+        <div className="xi__id">
+          <strong>{inst.display_name}</strong>
+          <PrBadge inst={inst} />
+          <ChapterChip inst={inst} />
+          <StatusPill status={inst.status} />
+          <SourceTag isTalking={isTalking} />
+        </div>
+        <button type="button" className="xi__close" onClick={onClear} title="collapse">
+          ✕
+        </button>
+      </header>
+
+      <span className="subline">
+        {inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}
+        {inst.is_subagent ? ' · subagent' : ''}
+      </span>
+
+      {isTalking && current ? (
+        <div className="xi__speaking">
+          <span className="xi__speaking-led" aria-hidden />
+          <span className="xi__speaking-msg" title={current.message}>{current.message}</span>
+          <span className="xi__speaking-meta">
+            {current.voice ?? '—'}
+            {current.backend ? ` · ${current.backend}` : ''}
+          </span>
+        </div>
+      ) : null}
+
+      <div className="xi__grid">
+        <div><span className="k">fervor</span><Zealotry value={inst.zealotry} /></div>
+        <div>
+          <span className="k">age</span>
+          {formatAge(inst.age_seconds)}
+          {inst.stale.is_stale ? <span className="tag tag--stale">stale</span> : null}
+        </div>
+        <div><span className="k">pane</span>{inst.pane_label ?? inst.tmux_pane ?? '—'}</div>
+        <div><span className="k">Golden Throne</span><GtCell inst={inst} /></div>
+        <div className="xi__wide"><span className="k">working dir</span><code>{inst.working_dir ?? '—'}</code></div>
+        <div className="xi__wide"><span className="k">session doc</span><SessionDocCell inst={inst} /></div>
+        <div className="xi__wide"><span className="k">next action</span>{inst.next_required_action ?? inst.workflow_state ?? '—'}</div>
+      </div>
+
+      {focusNote ? <p className="xi__note">{focusNote}</p> : null}
+    </article>
+  );
+}
+
+export function InstancesPanel({
+  instances,
+  selection,
+  talkingId,
+  current,
+  focusNote,
+  onSelect,
+  onClear,
+}: {
+  instances: OpsInstance[];
+  selection: Selection | null;
+  talkingId: string | null;
+  current: TtsCurrent | null;
+  focusNote: string | null;
+  onSelect: (id: string) => void;
+  onClear: () => void;
+}) {
   if (instances.length === 0) {
     return <p className="empty">No active instances reported. The fleet is dormant.</p>;
   }
+
+  const selectedInst = selection ? instances.find((i) => i.id === selection.id) ?? null : null;
+
+  function marks(inst: OpsInstance): string {
+    const cls: string[] = [];
+    if (inst.stale.is_stale) cls.push('isStale');
+    if (selection?.id === inst.id) cls.push('is-selected');
+    if (talkingId === inst.id) cls.push('is-talking');
+    return cls.join(' ');
+  }
+
   return (
     <>
+      {selectedInst && selection ? (
+        <ExpandedInstance
+          inst={selectedInst}
+          isTalking={talkingId === selectedInst.id}
+          current={current}
+          focusNote={focusNote}
+          onClear={onClear}
+        />
+      ) : null}
+
       {/* Desktop table */}
       <div className="tableWrap only-wide">
         <table className="fleet">
@@ -117,7 +238,12 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
           </thead>
           <tbody>
             {instances.map((inst) => (
-              <tr key={inst.id} className={inst.stale.is_stale ? 'isStale' : ''}>
+              <tr
+                key={inst.id}
+                className={marks(inst)}
+                onDoubleClick={() => onSelect(inst.id)}
+                title="double-click to select + expand"
+              >
                 <td>
                   <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
                   <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
@@ -145,7 +271,11 @@ export function InstancesPanel({ instances }: { instances: OpsInstance[] }) {
       {/* Mobile cards */}
       <div className="fleet-cards only-narrow">
         {instances.map((inst) => (
-          <article key={inst.id} className={`fcard ${inst.stale.is_stale ? 'isStale' : ''}`}>
+          <article
+            key={inst.id}
+            className={`fcard ${marks(inst)}`}
+            onDoubleClick={() => onSelect(inst.id)}
+          >
             <header className="fcard__head">
               <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
               <StatusPill status={inst.status} />
