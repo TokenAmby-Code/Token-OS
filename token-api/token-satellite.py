@@ -31,6 +31,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2208,8 +2209,18 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
         return (None, None)
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
+        # sys.executable, not bare "python3" (the uv shim re-syncs the venv on every
+        # spawn and fails closed on a corrupt venv). tmuxctl's CLI is stdlib-only.
         proc = subprocess.run(
-            ["python3", "-m", "tmuxctl.cli", "resolve-instance", session_id, "--format", "json"],
+            [
+                sys.executable,
+                "-m",
+                "tmuxctl.cli",
+                "resolve-instance",
+                session_id,
+                "--format",
+                "json",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
