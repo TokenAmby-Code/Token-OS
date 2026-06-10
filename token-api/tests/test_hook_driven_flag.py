@@ -94,7 +94,7 @@ def test_session_end_clears_input_lock(app_env, monkeypatch):
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
             "UPDATE claude_instances SET input_lock = ? WHERE id = ?",
-            ("claude-cmd", "locked-1"),
+            ("agent-cmd", "locked-1"),
         )
         conn.commit()
     monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)

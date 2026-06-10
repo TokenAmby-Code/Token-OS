@@ -422,10 +422,10 @@ do_complete() {
         log_success "Work loop complete. Exiting."
         echo ""
         if ! $dry_run; then
-            # Send /exit to self via claude-cmd
+            # Send /exit to self via agent-cmd
             # This gracefully exits the Claude instance
-            if command -v claude-cmd &>/dev/null; then
-                claude-cmd --self --detach "/exit"
+            if command -v agent-cmd &>/dev/null; then
+                agent-cmd --self --detach "/exit"
             fi
         else
             log_dry "Would send /exit to self"

@@ -3706,14 +3706,14 @@ async def handle_stop(payload: dict) -> dict:
                     notice = MORNING_EXPIRY_NOTICE.format(hours=MORNING_MAX_DURATION_HOURS)
                     try:
                         proc = await _run_subprocess_offloop(
-                            ("claude-cmd", "--pane", tmux_pane, notice),
+                            ("agent-cmd", "--pane", tmux_pane, notice),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                             timeout=10,
                         )
                         if proc.returncode != 0:
                             logger.warning(
-                                f"Hook: Stop {session_id[:12]}... morning expiry notice claude-cmd failed: "
+                                f"Hook: Stop {session_id[:12]}... morning expiry notice agent-cmd failed: "
                                 f"{proc.stderr.decode()[:200]}"
                             )
                     except Exception as e:
@@ -3736,14 +3736,14 @@ async def handle_stop(payload: dict) -> dict:
 
         try:
             proc = await _run_subprocess_offloop(
-                ("claude-cmd", "--pane", tmux_pane, keepalive_prompt),
+                ("agent-cmd", "--pane", tmux_pane, keepalive_prompt),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 timeout=10,
             )
             if proc.returncode != 0:
                 logger.warning(
-                    f"Hook: Stop {session_id[:12]}... sync keepalive claude-cmd failed: "
+                    f"Hook: Stop {session_id[:12]}... sync keepalive agent-cmd failed: "
                     f"{proc.stderr.decode()[:200]}"
                 )
         except Exception as e:
@@ -4147,7 +4147,7 @@ async def _askq_ladder_run(instance_id: str, question_text: str) -> None:
 
 
 async def _askq_send_bust_prompt(instance_id: str, state: dict) -> None:
-    """Deliver the autonomous-fallback prompt to the asking instance via claude-cmd."""
+    """Deliver the autonomous-fallback prompt to the asking instance via agent-cmd."""
     tmux_pane = state.get("tmux_pane")
     if not tmux_pane:
         # Re-fetch from DB in case state didn't capture it
@@ -4169,14 +4169,14 @@ async def _askq_send_bust_prompt(instance_id: str, state: dict) -> None:
 
     try:
         proc = await _run_subprocess_offloop(
-            ("claude-cmd", "--pane", tmux_pane, ASKQ_BUST_PROMPT),
+            ("agent-cmd", "--pane", tmux_pane, ASKQ_BUST_PROMPT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             timeout=10,
         )
         if proc.returncode != 0:
             logger.warning(
-                f"AskQ ladder: claude-cmd bust failed for {instance_id[:12]}: "
+                f"AskQ ladder: agent-cmd bust failed for {instance_id[:12]}: "
                 f"{proc.stderr.decode()[:200]}"
             )
     except Exception as e:
