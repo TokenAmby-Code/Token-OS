@@ -139,13 +139,16 @@ ensure_workspace_before_attach() {
         return 0
     fi
 
+    # A self-heal must NEVER destroy live work. This previously auto-ran a full
+    # `restart --execute` (kill-session + rebuild) whenever the layout drifted —
+    # e.g. after a botched `prefix d` demote — silently wiping every pane and
+    # agent instance on the *next attach*. Any benign attach (a CI/CD step, a
+    # phone reconnect, anything that runs `tx`/`tx start`) would therefore nuke
+    # the whole session without a prompt. Detect drift and WARN only; a real
+    # rebuild must be the operator's deliberate, guarded `tx restart`.
     if workspace_needs_repair "$session"; then
-        log_warn "Session '${session}' is not the managed full layout; rebuilding it."
-        if ! run_tmuxctl restart --execute --session "$session"; then
-            log_warn "Managed restart failed; replacing malformed session '${session}'."
-            tmux kill-session -t "$session" 2>/dev/null || true
-            run_tmuxctl create --session "$session"
-        fi
+        log_warn "Session '${session}' layout looks malformed (pane counts/tags drifted)."
+        log_warn "Attaching AS-IS — nothing wiped. Run 'tx restart' deliberately to rebuild."
     fi
 }
 
