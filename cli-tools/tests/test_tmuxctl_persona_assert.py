@@ -14,12 +14,14 @@ from tmuxctl.assertions import (
     PERSONA_GUARD_OPTION,
     PersonaSpec,
     _clear_pane_overlay,
+    _guarded_note_unregistered,
     _guarded_send_persona_command,
     _observed_row_hash,
     _row_matches_persona,
 )
 
 FG_LABEL = "mechanicus:fabricator-general"
+ADMIN_LABEL = "mechanicus:admin"
 
 
 def _fg_spec() -> PersonaSpec:
@@ -28,6 +30,23 @@ def _fg_spec() -> PersonaSpec:
 
 def _custodes_spec() -> PersonaSpec:
     return PersonaSpec("legion:custodes", "custodes", "hook_driven", "/tmp/c.md", sync=True)
+
+
+def _admin_spec() -> PersonaSpec:
+    return PersonaSpec(ADMIN_LABEL, "administratum", "hook_driven", "/tmp/admin.md")
+
+
+def _admin_row(**kw):
+    base = dict(
+        instance_id="i-admin",
+        pane_label=ADMIN_LABEL,
+        legion="mechanicus",
+        tab_name="needs-name",
+        instance_type="hook_driven",
+        primarch="administratum",
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
 
 
 def _row(**kw):
@@ -98,6 +117,40 @@ def test_custodes_predicate_unchanged():
     assert _row_matches_persona(_row(legion="astartes", instance_type="sync"), spec) is False
 
 
+def test_admin_matches_on_primarch_with_fresh_tab_name():
+    # The bug: a freshly SessionStart-registered recorder has tab_name='needs-name'
+    # (no 'administratum' substring) yet IS the recorder — keying on primarch must
+    # match it so the correction loop never arms before the agent self-names.
+    spec = _admin_spec()
+    assert _row_matches_persona(_admin_row(tab_name="needs-name"), spec) is True
+
+
+def test_admin_matches_on_tab_fallback_when_primarch_missing():
+    # Rows predating the primarch column still match via the tab-name fallback.
+    spec = _admin_spec()
+    row = _admin_row(primarch="", tab_name="administratum-state-watch")
+    assert _row_matches_persona(row, spec) is True
+
+
+def test_admin_fails_when_neither_primarch_nor_tab_identify():
+    spec = _admin_spec()
+    assert _row_matches_persona(_admin_row(primarch="", tab_name="needs-name"), spec) is False
+
+
+def test_admin_fails_on_pane_label_mismatch_even_with_right_primarch():
+    spec = _admin_spec()
+    row = _admin_row(pane_label="mechanicus:2", primarch="administratum")
+    assert _row_matches_persona(row, spec) is False
+
+
+def test_admin_hash_busts_on_primarch_change():
+    # The guard must notice a primarch flip so a stuck backoff can re-evaluate.
+    spec = _admin_spec()
+    h_missing = _observed_row_hash(_admin_row(primarch=""), spec)
+    h_set = _observed_row_hash(_admin_row(primarch="administratum"), spec)
+    assert h_missing != h_set
+
+
 # ── guardrail ────────────────────────────────────────────────────────────────
 
 
@@ -147,6 +200,41 @@ def test_guard_records_distinct_hash_per_observed_row():
     h2 = _observed_row_hash(_row(tab_name="b"), spec)
     assert h1 != h2
     assert _observed_row_hash(None, spec) == _observed_row_hash(None, spec)
+
+
+def test_unregistered_note_does_not_inject_persona():
+    # The core spam fix: a live persona pane with NO row must NOT inject `/persona`
+    # (a no-op for singletons) — it notes the anomaly loudly instead.
+    adapter = FakeAdapter()
+    spec = _admin_spec()
+    with (
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
+        patch.object(assertions, "log_event") as log,
+    ):
+        noted, _, action = _guarded_note_unregistered(adapter, "%11", spec)
+
+    assert (noted, action) == (False, "persona_unregistered_noted")
+    send.assert_not_called()  # never injects — that was the Opus-burning bug
+    events = [c.args[0] for c in log.call_args_list if c.args]
+    assert "persona_unregistered_live_runtime" in events
+
+
+def test_unregistered_note_suppresses_within_backoff():
+    adapter = FakeAdapter()
+    spec = _admin_spec()
+    with (
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
+        patch.object(assertions, "log_event") as log,
+    ):
+        _, _, action1 = _guarded_note_unregistered(adapter, "%11", spec)
+        _, _, action2 = _guarded_note_unregistered(adapter, "%11", spec)
+
+    assert action1 == "persona_unregistered_noted"
+    assert action2 == "persona_unregistered_suppressed"
+    send.assert_not_called()
+    # The loud diagnostic fires once, then backs off — no per-tick event spam.
+    emitted = [c.args[0] for c in log.call_args_list if c.args]
+    assert emitted.count("persona_unregistered_live_runtime") == 1
 
 
 def test_guard_state_persists_in_pane_option():
