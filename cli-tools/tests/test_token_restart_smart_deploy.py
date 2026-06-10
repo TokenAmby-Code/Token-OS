@@ -49,14 +49,14 @@ def _stub_env(
     logfile = tmp_path / "calls.log"
     logfile.touch()
 
-    # The live checkout the fake sync "advances". We point token-restart at it
-    # via CD_LIVE_CHECKOUT (its explicit override seam) — NOT via IMPERIUM, which
-    # nas-path.sh unconditionally re-derives from the machine config (so on a
-    # Linux CI runner TOKEN_OS would be /mnt/imperium/Token-OS, which doesn't
-    # exist, and resolve_live_checkout would abort → full-restart fallback). The
-    # override must point at a real dir, so create it.
-    repo = tmp_path / "Token-OS"
+    # The deploy-owned runtime checkout the fake sync "advances". CD_LIVE_CHECKOUT
+    # is the backward-compatible override seam; TOKEN_OS_BARE_REPO points at a
+    # fake bare skeleton. Both need to exist for the new protected-main topology.
+    repo = tmp_path / "runtime"
     repo.mkdir(exist_ok=True)
+    (repo / ".git").mkdir(exist_ok=True)
+    bare = tmp_path / "token-os.git"
+    bare.mkdir(exist_ok=True)
 
     # Simple logging stubs (log "<name> <args>", exit 0).
     for name in ["launchctl", "sleep", "ssh", "osascript", "uv", "pgrep", "push-mobile"]:
@@ -85,10 +85,13 @@ def _stub_env(
     git.write_text(
         r"""#!/usr/bin/env bash
 if [[ "$1" == "-C" ]]; then shift 2; fi
+if [[ "$1" == --git-dir=* ]]; then shift; fi
+if [[ "$1" == "--git-dir" ]]; then shift 2; fi
 sub="$1"; shift || true
 case "$sub" in
-  fetch|stash) exit 0 ;;
-  merge)
+  fetch|stash|update-ref|checkout|cat-file) exit 0 ;;
+  status) exit 0 ;;
+  merge-base)
     if [[ "${MERGE_FAIL_TIMES:-0}" != "0" ]]; then
       count=0
       [[ -f "$MERGE_COUNTER" ]] && count="$(cat "$MERGE_COUNTER")"
@@ -102,11 +105,15 @@ case "$sub" in
     exit 0
     ;;
   rev-parse)
-    case "$1" in
-      --show-toplevel) echo "$STUB_REPO" ;;
-      FETCH_HEAD)      echo "NEW111" ;;
-      HEAD)            if [[ "${STUB_NO_ADVANCE:-}" == "1" ]]; then echo "NEW111"; else echo "OLD000"; fi ;;
-      *)               echo "OLD000" ;;
+    args="$*"
+    case "$args" in
+      *--show-toplevel*) echo "$STUB_REPO" ;;
+      *--is-bare-repository*) echo "true" ;;
+      *FETCH_HEAD*) echo "NEW111" ;;
+      *refs/heads/main*) if [[ "${STUB_BARE_OLD:-}" == "1" ]]; then echo "OLD000"; else echo "NEW111"; fi ;;
+      *\^\{commit\}*) echo "NEW111" ;;
+      *HEAD*)            if [[ "${STUB_NO_ADVANCE:-}" == "1" ]]; then echo "NEW111"; else echo "OLD000"; fi ;;
+      *)                 echo "OLD000" ;;
     esac
     ;;
   diff)
@@ -130,6 +137,7 @@ esac
         "PATH": f"{stub_bin}:{os.environ['PATH']}",
         "IMPERIUM_MACHINE": "mac",
         "CD_LIVE_CHECKOUT": str(repo),
+        "TOKEN_OS_BARE_REPO": str(bare),
         "STUB_REPO": str(repo),
         "STUB_CHANGED_PATHS": changed_paths,
         "MERGE_FAIL_TIMES": str(fail_times),
@@ -235,48 +243,42 @@ def test_no_advance_falls_back_to_full_restart(tmp_path: Path) -> None:
 # ── SMB-busy ff-merge resilience (the silent-stale-deploy fix) ────────
 
 
-def test_transient_smb_lock_retries_then_syncs(tmp_path: Path) -> None:
-    # First ff-merge hits a transient SMB EBUSY unlink lock and exits 1; the retry
-    # helper backs off and the second merge succeeds. The sync must ADVANCE — i.e.
-    # selectively restart only token-api — NOT silently degrade to a stale full
-    # restart (the bug: stderr was discarded and EBUSY misread as "not a ff").
-    env, logfile = _stub_env(
-        tmp_path,
-        "token-api/main.py",
-        merge_fail_times=1,
-        merge_fail_msg=(
-            "error: unable to unlink old 'cli-tools/bin/tmux-pane-label': Resource busy"
-        ),
-    )
-    proc = _run(env)
-    assert proc.returncode == 0, proc.stderr
-    calls = logfile.read_text()
-    # FF succeeded (success marker present, abort marker absent) → SYNC advanced.
-    assert "CD-sync: fast-forwarded" in proc.stdout
-    assert "ABORTING sync" not in proc.stdout
-    # The retry actually fired on the transient lock.
-    assert "transient SMB lock" in proc.stdout
-    # Selective restart: only token-api bounced. A degraded full restart would also
-    # bounce discord, so its absence proves we did NOT degrade to a stale no-advance.
-    assert KICK_TOKENAPI in calls
-    assert KICK_DISCORD not in calls
-
-
-def test_genuine_non_ff_degrades_and_surfaces_error(tmp_path: Path) -> None:
-    # A real non-fast-forward (not a transient lock): the helper must NOT retry it
-    # away. The sync aborts, degrades to a full restart of the standard set, AND the
-    # real git error is surfaced — closing the silent-stale-deploy hole.
+def test_bare_main_non_ff_aborts_without_restart(tmp_path: Path) -> None:
     env, logfile = _stub_env(
         tmp_path,
         "discord-daemon/daemon.js",
         merge_fail_genuine=True,
         merge_fail_msg="fatal: Not possible to fast-forward, aborting.",
     )
+    env["STUB_BARE_OLD"] = "1"
     proc = _run(env)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode != 0
+    assert "bare main is not a fast-forward" in proc.stdout
     calls = logfile.read_text()
-    # No advance → fallback to the full standard-set restart (token-api + discord).
-    assert KICK_TOKENAPI in calls
-    assert KICK_DISCORD in calls
-    # The failure is no longer silent: the real git stderr is echoed to the log.
-    assert "Not possible to fast-forward" in proc.stdout
+    assert KICK_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
+
+
+def test_dirty_runtime_checkout_aborts_without_restart(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/main.py")
+    env["STUB_DIRTY_RUNTIME"] = "1"
+    # Replace git stub with a small wrapper that reports dirty status, delegating
+    # all other commands to the generated stub body is overkill; status alone is
+    # enough to force the hard-fail path before checkout/restarts.
+    git_path = Path(env["PATH"].split(":", 1)[0]) / "git"
+    old = git_path.read_text()
+    git_path.write_text(
+        old.replace(
+            'sub="$1"; shift || true\ncase "$sub" in',
+            'sub="$1"; shift || true\n'
+            'if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then '
+            'echo " M token-api/main.py"; exit 0; fi\n'
+            'case "$sub" in',
+        )
+    )
+    proc = _run(env)
+    assert proc.returncode != 0
+    assert "runtime checkout is dirty" in proc.stdout
+    calls = logfile.read_text()
+    assert KICK_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
