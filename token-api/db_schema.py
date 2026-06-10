@@ -341,6 +341,13 @@ async def _ensure_instances_v2(db) -> None:
     # singletons (FG, Administratum, Custodes, Inquisitor) and Primarchs are never
     # rewritten — the FG is not its own commander. B is naturally scoped (only the
     # mechanicus-worker persona trips it). Retired rows (historical) are left alone.
+    #
+    # Both personas are re-seeded on every startup before these triggers exist, but
+    # each WHEN also guards on the TARGET persona ``EXISTS`` so a missing seed can
+    # never make a force-UPDATE write the slug subquery's NULL into the row — A
+    # would otherwise null out persona_id, and B would null commander_id and abort
+    # the parent write on the commander_type/commander_id CHECK. With the guard a
+    # missing persona simply means the trigger no-ops and the read-time guard flags it.
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_mech_commander_to_persona")
     await db.execute("""
         CREATE TRIGGER trg_instances_mech_commander_to_persona
@@ -348,6 +355,7 @@ async def _ensure_instances_v2(db) -> None:
         WHEN NEW.commander_type = 'persona'
              AND NEW.commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general')
              AND NEW.rank != 'retired'
+             AND EXISTS (SELECT 1 FROM personas WHERE slug = 'mechanicus-worker')
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') = 'astartes'
              AND (NEW.persona_id IS NOT (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
                   OR NEW.automated != 1)
@@ -365,6 +373,7 @@ async def _ensure_instances_v2(db) -> None:
         WHEN NEW.commander_type = 'persona'
              AND NEW.commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general')
              AND NEW.rank != 'retired'
+             AND EXISTS (SELECT 1 FROM personas WHERE slug = 'mechanicus-worker')
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') = 'astartes'
              AND (NEW.persona_id IS NOT (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
                   OR NEW.automated != 1)
@@ -381,6 +390,7 @@ async def _ensure_instances_v2(db) -> None:
         AFTER INSERT ON instances
         WHEN NEW.persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
              AND NEW.rank != 'retired'
+             AND EXISTS (SELECT 1 FROM personas WHERE slug = 'fabricator-general')
              AND (NEW.commander_type != 'persona'
                   OR NEW.commander_id IS NOT (SELECT id FROM personas WHERE slug = 'fabricator-general')
                   OR NEW.automated != 1)
@@ -398,6 +408,7 @@ async def _ensure_instances_v2(db) -> None:
         AFTER UPDATE OF commander_type, commander_id, persona_id, automated, rank ON instances
         WHEN NEW.persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
              AND NEW.rank != 'retired'
+             AND EXISTS (SELECT 1 FROM personas WHERE slug = 'fabricator-general')
              AND (NEW.commander_type != 'persona'
                   OR NEW.commander_id IS NOT (SELECT id FROM personas WHERE slug = 'fabricator-general')
                   OR NEW.automated != 1)
