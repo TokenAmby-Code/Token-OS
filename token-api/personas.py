@@ -44,7 +44,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         10,
-        "default",
+        "#300808",
         "#b1191e",
         "Microsoft Ravi",
         "1",
@@ -56,7 +56,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         20,
-        "default",
+        "#081c30",
         "#1f4e9b",
         "Microsoft Susan",
         "1",
@@ -68,7 +68,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         30,
-        "default",
+        "#082810",
         "#1b7a3d",
         "Microsoft Sean",
         "0",
@@ -80,7 +80,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         40,
-        "default",
+        "#302800",
         "#e6b800",
         "Microsoft Catherine",
         "1",
@@ -92,7 +92,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         50,
-        "default",
+        "#101010",
         "#2b2b2b",
         "Microsoft Heera",
         "1",
@@ -371,6 +371,53 @@ async def resolve_persona(db: aiosqlite.Connection, persona_id_or_slug: str) -> 
         "SELECT * FROM personas WHERE id = ? OR slug = ?", (persona_id_or_slug, persona_id_or_slug)
     )
     return _row_to_dict(await cursor.fetchone())
+
+
+async def persona_tint_for_instance(
+    db: aiosqlite.Connection, instance_id: str | None, *, default: str = "default"
+) -> str:
+    """Resolve tmux pane tint from canonical ``instances.persona_id``.
+
+    Legacy ``legion`` and ``profile_name`` are deliberately not consulted here.
+    Unassigned/civic rows with no canonical persona resolve to tmux default.
+    """
+    if not instance_id:
+        return default
+    cursor = await db.execute(
+        """
+        SELECT p.pane_tint
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return default
+    tint = row[0]
+    return tint if tint else default
+
+
+def persona_tint_for_instance_sync(
+    conn: sqlite3.Connection, instance_id: str | None, *, default: str = "default"
+) -> str:
+    """Synchronous variant of :func:`persona_tint_for_instance`."""
+    if not instance_id:
+        return default
+    row = conn.execute(
+        """
+        SELECT p.pane_tint
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    ).fetchone()
+    if not row:
+        return default
+    tint = row[0]
+    return tint if tint else default
 
 
 def assignment_exhausted(persona: dict) -> bool:

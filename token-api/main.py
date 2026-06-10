@@ -77,6 +77,7 @@ from instance_mutation import (
     get_instance_mutations,
     reconcile_instance,
     sanctioned_insert_instance,
+    sanctioned_update_canonical_instance,
     sanctioned_update_instance,
 )
 from instance_registry import derived_cockpit_label
@@ -93,7 +94,7 @@ from pane_surface import (
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
-from personas import assign_astartes_persona, persona_to_profile
+from personas import assign_astartes_persona, persona_to_profile, resolve_persona
 from phone_service import (
     _send_to_phone,
     load_zap_count_from_daily_note,
@@ -417,10 +418,10 @@ sys.excepthook = _global_exception_handler
 # [MOVED to shared.py] — DEVICE_IPS, LOCAL_DEVICES, resolve_device_from_ip, is_local_device
 
 
-# Legion pane tint is event-driven: shared.apply_pane_tint / clear_pane_tint,
-# keyed to shared.LEGION_PANE_COLORS (the single colour map, kept in sync with
-# tmuxctl's _assert_persona_color). Fired on persona register/change, pane
-# vacate, and close — there is no polling recolor worker.
+# Pane tint is event-driven: shared.apply_instance_pane_tint / clear_pane_tint,
+# keyed to canonical instances.persona_id → personas.pane_tint. Fired on
+# persona register/change, pane vacate, and close — there is no polling recolor
+# worker.
 
 
 # Scheduler instance. Jobs stay in memory; restart recovery is driven from the
@@ -1500,8 +1501,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Mac-side Deskflow lifecycle is event-driven: the WSL satellite invites this
     # Mac via POST /api/kvm/start when its log follower sees the server come up.
     # No Mac-side probe/supervisor (it spammed the server with secure-socket errors).
-    # Legion pane tint is event-driven (shared.apply_pane_tint / clear_pane_tint),
-    # fired on persona register/change, pane vacate, and close — no polling worker.
+    # Persona pane tint is event-driven (shared.apply_instance_pane_tint /
+    # clear_pane_tint), fired on persona register/change, pane vacate, and close
+    # — no polling worker.
     # Start pane state worker (@CC_STATE)
     asyncio.create_task(pane_state_worker())
     print("Pane state worker started")
@@ -1948,7 +1950,7 @@ async def stop_instance(instance_id: str):
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
 
-    # Event-driven tint: the persona vacated this pane — clear its legion tint
+    # Event-driven tint: the persona vacated this pane — clear its persona tint
     # back to default. No queue, no poll.
     if stopped_pane:
         await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
@@ -8101,8 +8103,8 @@ async def _find_custodes_tmux_pane() -> str | None:
 
     Uses the `@PANE_ID = legion:custodes` tmux pane option as the identity signal
     — set by `_create_custodes_legion_pane` at pane creation. Pane background
-    color is an OUTPUT of legion designation (applied by shared.apply_pane_tint),
-    never an input — keying recovery on color creates a circular SoT dependency
+    color is an OUTPUT of canonical persona assignment, never an input — keying
+    recovery on color creates a circular SoT dependency
     where a missed recolor makes Custodes "disappear" to the dispatcher.
     """
     try:
@@ -9360,6 +9362,10 @@ async def set_zealotry(instance_id: str, request: Request):
 
 ALLOWED_LEGIONS = {"astartes", "mechanicus", "custodes", "civic", "fabricator"}
 SINGLETON_LEGIONS = {"custodes", "fabricator"}
+LEGION_PERSONA_SLUGS = {
+    "custodes": "custodes",
+    "fabricator": "fabricator-general",
+}
 
 
 @app.patch("/api/instances/{instance_id}/legion")
@@ -9377,20 +9383,44 @@ async def set_instance_legion(instance_id: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+        updates = {"legion": legion}
+        persona_slug = LEGION_PERSONA_SLUGS.get(legion)
+        if persona_slug:
+            persona = await resolve_persona(db, persona_slug)
+            if persona:
+                profile = persona_to_profile(persona)
+                updates.update(
+                    {
+                        "profile_name": profile["name"],
+                        "tts_voice": profile["wsl_voice"],
+                        "notification_sound": profile["notification_sound"],
+                    }
+                )
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"legion": legion},
+            updates=updates,
             mutation_type="instance_updated",
             write_source="api",
             actor="set-legion",
         )
+        if legion == "civic":
+            await sanctioned_update_canonical_instance(
+                db,
+                instance_id=instance_id,
+                updates={"persona_id": None},
+                mutation_type="persona_unassigned",
+                write_source="api",
+                actor="set-legion",
+            )
         await db.commit()
 
-    # Event-driven tint: resolve live pane through tmuxctl, never from DB.
+    # Event-driven tint: resolve live pane through tmuxctl and paint from
+    # canonical instances.persona_id → personas.pane_tint, never from legion.
     tmux_pane, _pane_role = await shared.resolve_instance_pane(instance_id)
     if tmux_pane:
-        await asyncio.to_thread(shared.apply_pane_tint, tmux_pane, legion, source="set-legion")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await shared.apply_instance_pane_tint(db, instance_id, tmux_pane, source="set-legion")
 
     logger.info(f"Legion: {instance_id[:12]} → {legion}")
     return {"instance_id": instance_id, "legion": legion}

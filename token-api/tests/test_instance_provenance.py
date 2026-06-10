@@ -270,14 +270,14 @@ class TestReconciliation:
         self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Supplant paints panes via the event-driven tint path (no recolor queue):
-        the new pane is painted for the preserved legion and the vacated pane cleared."""
+        the new pane is painted from canonical persona tint and the vacated pane cleared."""
         import shared
 
         tint_calls = []
         monkeypatch.setattr(
             shared,
             "apply_pane_tint",
-            lambda pane, legion, **kw: tint_calls.append(("apply", pane, legion)),
+            lambda pane, pane_tint, **kw: tint_calls.append(("apply", pane, pane_tint)),
         )
         monkeypatch.setattr(
             shared,
@@ -313,8 +313,8 @@ class TestReconciliation:
         assert resp.status_code == 200, resp.text
         assert resp.json()["action"] == "supplanted"
 
-        # New pane painted for the preserved legion; vacated pane cleared.
-        assert ("apply", "%new", "custodes") in tint_calls
+        # New pane painted from the preserved canonical persona; vacated pane cleared.
+        assert ("apply", "%new", "#302800") in tint_calls
         assert ("clear", "%old") in tint_calls
 
     def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env):

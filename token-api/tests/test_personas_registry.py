@@ -50,7 +50,28 @@ async def test_resolver_silent_and_voiced_personas(app_env):
     assert chapter["display_name"] == "Blood Angels"
     assert chapter["assignment_pool"] == "primary"
     assert chapter["tts_voice"] == "Microsoft Ravi"
+    assert chapter["chip_color"] == "#b1191e"
+    assert chapter["pane_tint"] == "#300808"
     assert chapter["notification_sound"] == "notify.wav"
+
+
+@pytest.mark.asyncio
+async def test_group_a_astartes_seed_preferred_voices_and_dark_tints(app_env):
+    import personas
+
+    expected = {
+        "blood-angels": ("Microsoft Ravi", "#b1191e", "#300808"),
+        "ultramarines": ("Microsoft Susan", "#1f4e9b", "#081c30"),
+        "salamanders": ("Microsoft Sean", "#1b7a3d", "#082810"),
+        "imperial-fists": ("Microsoft Catherine", "#e6b800", "#302800"),
+        "raven-guard": ("Microsoft Heera", "#2b2b2b", "#101010"),
+    }
+    async with aiosqlite.connect(app_env.db_path) as db:
+        for slug, (voice, chip, tint) in expected.items():
+            row = await personas.resolve_persona(db, slug)
+            assert row["tts_voice"] == voice
+            assert row["chip_color"] == chip
+            assert row["pane_tint"] == tint
 
 
 @pytest.mark.asyncio
@@ -132,6 +153,7 @@ def test_recoloring_has_no_slash_color_path():
 
     shared = (root / "token-api" / "shared.py").read_text(encoding="utf-8")
     assert '"select-pane", "-t", tmux_pane, "-P", f"bg={bg}"' in shared
+    assert "LEGION_PANE_COLORS" not in shared
 
 
 @pytest.mark.asyncio
@@ -176,6 +198,42 @@ async def test_future_instances_rank_retired_does_not_lock_persona(app_env):
         assert personas.persona_id_for_slug("ultramarines") in locked
         assigned, _ = await personas.assign_astartes_persona(db)
         assert assigned["slug"] == "blood-angels"
+
+
+@pytest.mark.asyncio
+async def test_persona_tint_for_instance_uses_canonical_persona_id(app_env):
+    import personas
+
+    async with aiosqlite.connect(app_env.db_path) as db:
+        await db.execute(
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('chapter', 'chapter', 'Mac-Mini', 'emperor', 'idle', ?, 'astartes')""",
+            (personas.persona_id_for_slug("ultramarines"),),
+        )
+        await db.execute(
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('civic', 'civic', 'Mac-Mini', 'emperor', 'idle', NULL, 'astartes')"""
+        )
+        await db.execute(
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('custodes', 'custodes', 'Mac-Mini', 'emperor', 'idle', ?, 'overseer')""",
+            (personas.persona_id_for_slug("custodes"),),
+        )
+        await db.execute(
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('fg', 'fg', 'Mac-Mini', 'emperor', 'idle', ?, 'overseer')""",
+            (personas.persona_id_for_slug("fabricator-general"),),
+        )
+        await db.commit()
+
+        assert await personas.persona_tint_for_instance(db, "chapter") == "#081c30"
+        assert await personas.persona_tint_for_instance(db, "civic") == "default"
+        assert await personas.persona_tint_for_instance(db, "custodes") == "#302800"
+        assert await personas.persona_tint_for_instance(db, "fg") == "#300808"
 
 
 @pytest.mark.asyncio

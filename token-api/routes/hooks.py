@@ -2189,26 +2189,18 @@ async def handle_session_start(payload: dict) -> dict:
                     await db.commit()
 
                 # Event-driven tint: the persona moved panes. Clear the vacated
-                # pane and paint the new one for its legion (no recolor queue).
-                _transplant_legion = (
-                    existing_row["legion"]
-                    if hasattr(existing_row, "__getitem__") and existing_row["legion"]
-                    else "astartes"
-                )
+                # pane and paint the new one from canonical instances.persona_id
+                # → personas.pane_tint (no recolor queue).
                 # Tint is cosmetic — best-effort, never fail registration on it.
                 try:
-                    if _transplant_legion != "astartes":
-                        if old_tmux_pane and old_tmux_pane != tmux_pane:
-                            await asyncio.to_thread(
-                                shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
-                            )
-                        if tmux_pane:
-                            await asyncio.to_thread(
-                                shared.apply_pane_tint,
-                                tmux_pane,
-                                _transplant_legion,
-                                source="transplant",
-                            )
+                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
+                        )
+                    if tmux_pane:
+                        await shared.apply_instance_pane_tint(
+                            db, session_id, tmux_pane, source="transplant"
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Hook: SessionStart transplant tint repaint failed for %s: %s",
@@ -2351,6 +2343,28 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
+                try:
+                    target_pane = tmux_pane or existing_row["tmux_pane"]
+                    if (
+                        tmux_pane
+                        and existing_row["tmux_pane"]
+                        and tmux_pane != existing_row["tmux_pane"]
+                    ):
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint,
+                            existing_row["tmux_pane"],
+                            source="reregister-vacate",
+                        )
+                    if target_pane:
+                        await shared.apply_instance_pane_tint(
+                            db, session_id, target_pane, source="reregister"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Hook: SessionStart reregister tint repaint failed for %s: %s",
+                        session_id[:12],
+                        exc,
+                    )
                 await log_event(
                     "instance_reregistered",
                     instance_id=session_id,
@@ -2542,22 +2556,18 @@ async def handle_session_start(payload: dict) -> dict:
                     await db.commit()
 
                 # Event-driven tint: the persona moved panes. Clear the vacated
-                # pane and paint the new one for its legion (no recolor queue).
-                _supplant_legion = old_inst["legion"] if old_inst["legion"] else "astartes"
+                # pane and paint the new one from canonical instances.persona_id
+                # → personas.pane_tint (no recolor queue).
                 # Tint is cosmetic — best-effort, never fail registration on it.
                 try:
-                    if _supplant_legion != "astartes":
-                        if old_tmux_pane and old_tmux_pane != tmux_pane:
-                            await asyncio.to_thread(
-                                shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
-                            )
-                        if tmux_pane:
-                            await asyncio.to_thread(
-                                shared.apply_pane_tint,
-                                tmux_pane,
-                                _supplant_legion,
-                                source="supplant",
-                            )
+                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
+                        )
+                    if tmux_pane:
+                        await shared.apply_instance_pane_tint(
+                            db, session_id, tmux_pane, source="supplant"
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Hook: SessionStart supplant tint repaint failed for %s: %s",
@@ -2873,6 +2883,19 @@ async def handle_session_start(payload: dict) -> dict:
                 actor="SessionStart",
                 wrapper_launch_id=wrapper_launch_id,
             )
+            if auto_legion == "civic":
+                # Civic/Pax launches have no persona tint authority. Keep legacy
+                # legion for routing, but clear canonical persona assignment so
+                # tint resolution falls through to tmux default instead of an old
+                # civic-green or arbitrary chapter colour.
+                await sanctioned_update_canonical_instance(
+                    db,
+                    instance_id=session_id,
+                    updates={"persona_id": None},
+                    mutation_type="persona_unassigned",
+                    write_source="hooks",
+                    actor="SessionStart",
+                )
         elif _prior_legion and _prior_legion != "astartes":
             await sanctioned_update_instance(
                 db,
@@ -2926,6 +2949,18 @@ async def handle_session_start(payload: dict) -> dict:
             mechanicus_subscription.get("created") or mechanicus_subscription.get("existing")
         ):
             await db.commit()
+
+        try:
+            if tmux_pane:
+                await shared.apply_instance_pane_tint(
+                    db, session_id, tmux_pane, source="SessionStart"
+                )
+        except Exception as exc:
+            logger.warning(
+                "Hook: SessionStart tint repaint failed for %s: %s",
+                session_id[:12],
+                exc,
+            )
 
     logger.info(
         f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})"
@@ -3084,6 +3119,16 @@ async def handle_session_end(payload: dict) -> dict:
         )
 
         await db.commit()
+
+        try:
+            if _stop_pane:
+                await asyncio.to_thread(shared.clear_pane_tint, _stop_pane, source="SessionEnd")
+        except Exception as exc:
+            logger.warning(
+                "Hook: SessionEnd tint clear failed for %s: %s",
+                session_id[:12],
+                exc,
+            )
 
         # Close-time pane cleanup is centralized through tmuxctl assertion:
         # persona panes self-heal/recolor, dead stack workers prune, and failed

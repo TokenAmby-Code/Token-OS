@@ -25,7 +25,7 @@ def test_legacy_profile_by_name_resolves_persona_projection(app_env):
     blood = app_env.shared.profile_by_name("blood-angels")
     assert blood["chapter"] == "Blood Angels"
     assert blood["chip_color"] == "#b1191e"
-    assert blood["pane_tint"] == "default"
+    assert blood["pane_tint"] == "#300808"
     assert app_env.shared.profile_by_name("profile_3") is None
 
 
