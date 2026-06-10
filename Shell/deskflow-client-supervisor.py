@@ -28,6 +28,12 @@ is the source of truth; token-api syncs it to
 blocks NAS executables).
 """
 
+# Defer annotation evaluation (PEP 563). The supervisor runs under the system
+# /usr/bin/python3 (3.9 on current macOS), where PEP 604 unions like
+# `float | None` raise TypeError if evaluated at definition time. Lazy
+# annotations keep the type hints as strings, so they never execute at runtime.
+from __future__ import annotations
+
 import argparse
 import os
 import select

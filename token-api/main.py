@@ -15976,8 +15976,14 @@ def _ensure_deskflow_client_agent():
 def _start_mac_deskflow_client(reason: str):
     _ensure_deskflow_client_agent()
     _ensure_mac_deskflow_keymap(f"{reason}_pre_start")
-    # The legacy GUI supervises its own core and would fight the headless job.
-    subprocess.run(["killall", "Deskflow"], capture_output=True, text=True)
+    # Sweep both the legacy GUI and any stray core before converging. Killing
+    # the GUI does NOT take its core down — macOS reparents the child
+    # deskflow-core to launchd (PPID 1), and that orphan keeps the server
+    # socket, so the headless supervisor's fresh core would lose the
+    # duplicate-instance race (exit 5). kickstart -k below reaps a healthy
+    # supervisor's own core via its SIGTERM handler, so this sweep only ever
+    # removes unowned orphans; the converge then spawns one clean core.
+    subprocess.run(["killall", "Deskflow", "deskflow-core"], capture_output=True, text=True)
     target = _deskflow_client_agent_target()
     # kickstart -k = atomic converge (kills a wedged supervisor, starts fresh).
     # Fall back to bootstrap for an unloaded job (e.g. after Mac reboot —

@@ -112,3 +112,16 @@ class TestMarkerDisambiguation:
         sup = make_supervisor(module, start_time=100.0)
         assert sup.timeout(110.0) == 10.0
         assert sup.timeout(125.0) == 0.0  # past deadline clamps, never negative
+
+
+class TestPy39Runtime:
+    def test_pep604_annotations_stay_lazy_strings(self) -> None:
+        # The supervisor runs under the system /usr/bin/python3 (3.9 on current
+        # macOS), where a PEP 604 union like `float | None` raises TypeError if
+        # evaluated at definition time. `from __future__ import annotations`
+        # keeps annotations as strings so they never execute. CI runs 3.11
+        # (where the union is legal), so this string check is the only guard
+        # that the __future__ import is still present — drop it and the live
+        # supervisor crashes on import.
+        module = load_supervisor_module()
+        assert module.Supervisor.timeout.__annotations__["return"] == "float | None"
