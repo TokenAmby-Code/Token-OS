@@ -124,13 +124,16 @@ def find_live_custodes() -> dict | None:
     """Return the live Custodes singleton row, or None if no custodes is alive.
 
     Identity is **persona + rank**, not sync mode: a live row whose
-    ``persona.slug == 'custodes'`` with a non-``retired`` rank and an active
-    status (the canonical ``instances`` table normalizes ``processing``→``working``
-    and never exposes ``legion``/``instance_type``/``synced`` on ``/api/instances``,
-    so the old sync-shaped predicate matched nothing here). Custodes is a singleton
-    (the rank-stamp + singleton-guard triggers collapse duplicates to one), so at
-    most one such row exists. Reads the same ``/api/instances`` surface the Custodes
-    prompt and supervisor use, so all three agree.
+    ``persona.slug == 'custodes'`` with a non-``retired`` rank, a non-``chapter``
+    ``commander_type``, and an active status (the canonical ``instances`` table
+    normalizes ``processing``→``working`` and never exposes
+    ``legion``/``instance_type``/``synced`` on ``/api/instances``, so the old
+    sync-shaped predicate matched nothing here). The ``commander_type != 'chapter'``
+    filter matches ``personas.resolve_live_persona_instance`` so a custodes chapter
+    child (a subagent sharing the persona_id) cannot shadow the overseer. Custodes
+    is a singleton (the rank-stamp + singleton-guard triggers collapse duplicates to
+    one), so at most one such row exists. Reads the same ``/api/instances`` surface
+    the Custodes prompt and supervisor use, so all three agree.
 
     This finds the custodes regardless of sync MODE — injecting the morning prompt
     into an already-running (resting) custodes pane is the expected path, so the
@@ -148,6 +151,7 @@ def find_live_custodes() -> dict | None:
         if (
             persona.get("slug") == "custodes"
             and inst.get("rank") != "retired"
+            and inst.get("commander_type") != "chapter"
             and inst.get("status") not in ("stopped", "archived")
         ):
             return inst

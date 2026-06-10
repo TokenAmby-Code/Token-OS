@@ -346,10 +346,13 @@ async def _ensure_instances_v2(db) -> None:
     # One-time reconciliation of rows that predate the stamp trigger. The bulk
     # claude_instances→instances rebuild (above) inserts with triggers dropped, so
     # historical Custodes rows can sit at rank='astartes' (live data had three).
-    # Stamp the most-recently-active non-retired row per non-Astartes persona to
-    # its default_rank; that UPDATE fires the singleton-guard-update, retiring the
-    # rest. Idempotent: once collapsed, the surviving row is already at default
-    # (WHEN false) and no other non-retired rows remain to retire.
+    # Stamp the most-recently-active *live* (non-retired, non-stopped/archived)
+    # row per non-Astartes persona to its default_rank; that UPDATE fires the
+    # singleton-guard-update, retiring the rest. Excluding stopped/archived rows
+    # here mirrors the resolver (resolve_live_persona_instance) so a stale stopped
+    # row can never be stamped as the overseer and retire the actually-live one.
+    # Idempotent: once collapsed, the surviving row is already at default
+    # (WHEN false) and no other live non-retired rows remain to retire.
     await db.execute("""
         UPDATE instances
            SET rank = (SELECT default_rank FROM personas p WHERE p.id = instances.persona_id)
@@ -358,12 +361,14 @@ async def _ensure_instances_v2(db) -> None:
               WHERE p.default_rank != 'astartes'
                 AND i.rank != 'retired'
                 AND i.commander_type != 'chapter'
+                AND i.status NOT IN ('stopped', 'archived')
                 AND i.id = (
                     SELECT i2.id FROM instances i2
                      WHERE i2.persona_id = i.persona_id
                        AND i2.rank != 'retired'
                        AND i2.commander_type != 'chapter'
-                     ORDER BY i2.last_activity DESC LIMIT 1
+                       AND i2.status NOT IN ('stopped', 'archived')
+                     ORDER BY i2.last_activity DESC, i2.created_at DESC, i2.id DESC LIMIT 1
                 )
          )
     """)

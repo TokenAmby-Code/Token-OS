@@ -459,6 +459,53 @@ def test_resolve_live_persona_instance_finds_synced_less_custodes(app_env):
     assert resolved["status"] == "working"
 
 
+def test_resolve_live_persona_instance_excludes_chapter_children(app_env):
+    """Regression: a custodes *chapter* child (subagent sharing the persona_id),
+    even one that is more recently active and stamped overseer, must NOT shadow the
+    overseer singleton. The resolver's ``commander_type != 'chapter'`` filter is the
+    objective-critical guard (live archive.db had four custodes chapter children
+    under the overseer)."""
+    import asyncio
+
+    import aiosqlite
+
+    import personas
+
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    # The overseer singleton, active but with an OLDER last_activity.
+    _insert_instance(
+        conn,
+        id="live-cust",
+        persona_id=custodes,
+        rank="overseer",
+        status="working",
+        last_activity="2025-01-01T00:00:00",
+    )
+    # A chapter child commanded by the overseer, more recently active and even
+    # stamped overseer — it would win on both rank and recency if not excluded.
+    _insert_instance(
+        conn,
+        id="chapter-cust",
+        persona_id=custodes,
+        commander_type="chapter",
+        commander_id="live-cust",
+        rank="overseer",
+        status="working",
+        last_activity="2025-12-31T00:00:00",
+    )
+    conn.commit()
+    conn.close()
+
+    async def run():
+        async with aiosqlite.connect(app_env.db_path) as db:
+            return await personas.resolve_live_persona_instance(db, "custodes")
+
+    resolved = asyncio.run(run())
+    assert resolved is not None
+    assert resolved["id"] == "live-cust"
+
+
 def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
     import asyncio
     import sys

@@ -380,7 +380,9 @@ async def resolve_live_persona_instance(db: aiosqlite.Connection, slug: str) -> 
     ``personas.slug`` + a non-``retired`` ``instances.rank`` — never by sync mode.
     ``synced``/``instance_type``/``golden_throne='sync'`` are runtime *modes*, not
     identity (see ``instance_registry.golden_throne_binding``). Returns the
-    most-recently-active non-retired, non-stopped/archived row for the persona, or
+    highest-rank, then most-recently-active non-retired, non-stopped/archived row
+    for the persona (rank is the primary sort so a correctly-stamped overseer wins
+    over a stale ``astartes`` row even if the latter is more recently active), or
     ``None`` when no such instance is alive.
 
     Note: the ``instances`` table normalizes ``processing``→``working`` (see
@@ -406,7 +408,16 @@ async def resolve_live_persona_instance(db: aiosqlite.Connection, slug: str) -> 
           AND i.rank != 'retired'
           AND i.commander_type != 'chapter'
           AND i.status NOT IN ('stopped', 'archived')
-        ORDER BY i.last_activity DESC
+        ORDER BY
+          CASE i.rank
+            WHEN 'primarch' THEN 3
+            WHEN 'overseer' THEN 2
+            WHEN 'astartes' THEN 1
+            ELSE 0
+          END DESC,
+          i.last_activity DESC,
+          i.created_at DESC,
+          i.id DESC
         LIMIT 1
         """,
         (slug,),

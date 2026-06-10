@@ -9566,7 +9566,7 @@ async def get_synced_session(legion: str):
         return {
             "legion": legion,
             "synced_session": {
-                "id": row["id"],
+                "id": row.get("id"),
                 "device_id": row.get("device_id"),
                 "status": row.get("status"),
                 "rank": row.get("rank"),

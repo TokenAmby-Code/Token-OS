@@ -80,16 +80,19 @@ curl -s "$TOKEN_API_URL/api/instances/resolve?source_ip=127.0.0.1&status=process
 ### Step 3.5: Verify before patching (persona panes are already registered)
 
 Read the current row, its persona/rank, and its pane label first:
+
 ```bash
 curl -s "$TOKEN_API_URL/api/instances" \
   | jq --arg id "$INSTANCE_ID" '.[] | select(.id==$id) | {persona: .persona.slug, rank, status, primarch, pane_label}'
 ```
 
 - If `pane_label` is one of `legion:custodes` / `mechanicus:fabricator-general` / `mechanicus:admin`, this is a **singleton persona pane**. `SessionStart` already set its identity (persona + rank). **Verify it matches the expected identity and stop — do not PATCH.** For custodes specifically, the canonical check is exactly one non-retired row with `persona.slug == "custodes"` at `rank == "overseer"`:
+
   ```bash
   curl -s "$TOKEN_API_URL/api/instances" \
     | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status}}'
   ```
+
   If that is wrong (no row, wrong rank, or more than one), report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH. Sync mode (`synced`/`instance_type=sync`) is NOT part of this check — it is a morning-session mode, not identity.
 - Otherwise (ad-hoc persona in a non-persona pane), continue to Step 4 and PATCH.
 
