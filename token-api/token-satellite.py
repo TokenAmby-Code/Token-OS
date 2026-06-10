@@ -592,6 +592,9 @@ DESKFLOW_SERVER_CONFIG_WIN = "C:/ProgramData/Deskflow/deskflow-server.conf"
 DESKFLOW_SERVER_CONFIG_WSL = Path("/mnt/c/ProgramData/Deskflow/deskflow-server.conf")
 DESKFLOW_GUI_CONFIG_WSL = Path("/mnt/c/Users/colby/AppData/Roaming/Deskflow/Deskflow.conf")
 DESKFLOW_CORE_LOG = Path("/tmp/deskflow-core.log")
+# Transient systemd user unit the server runs in — its own cgroup, so satellite
+# restarts (every deploy) can't take the live KVM session down with them.
+DESKFLOW_SERVER_UNIT = "deskflow-core-server"
 DESKFLOW_SERVER_CONFIG_BACKUPS = [
     REPO_ROOT / "config" / "deskflow" / "wsl-server.conf",
 ]
@@ -1173,20 +1176,60 @@ class DeskFlowWatchdog:
 
     def _start_deskflow_server(self) -> bool:
         """Start deskflow-core if not running. Returns True iff a fresh process was
-        launched (→ a SERVER_UP log edge will follow); False if already running."""
+        launched (→ a SERVER_UP log edge will follow); False if already running.
+
+        The server is spawned into its own transient systemd unit
+        (``DESKFLOW_SERVER_UNIT``), NOT as a child of this process. The satellite
+        restarts on every deploy, and a direct child dies with the satellite's
+        cgroup (KillMode=control-group) — which dropped the live KVM session on
+        every merge-to-main. The server stays up permanently by design; its
+        lifetime must not be coupled to the satellite's.
+        """
         if self._check_deskflow_running():
             logger.info("KVM watchdog: DeskFlow already running, skipping start")
             return False
         logger.info("KVM watchdog: Starting DeskFlow server")
         try:
             self._ensure_deskflow_config()
-            log_file = DESKFLOW_CORE_LOG.open("a")
-            subprocess.Popen(
-                [DESKFLOW_CORE_EXE_WSL, "server"],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
+            # Clear any stale failed instance of the transient unit (e.g. after a
+            # taskkill of the Windows process) so systemd-run can reuse the name.
+            subprocess.run(
+                ["systemctl", "--user", "reset-failed", DESKFLOW_SERVER_UNIT],
+                capture_output=True,
+                timeout=10,
             )
+            result = subprocess.run(
+                [
+                    "systemd-run",
+                    "--user",
+                    "--collect",
+                    f"--unit={DESKFLOW_SERVER_UNIT}",
+                    f"--property=StandardOutput=append:{DESKFLOW_CORE_LOG}",
+                    f"--property=StandardError=append:{DESKFLOW_CORE_LOG}",
+                    DESKFLOW_CORE_EXE_WSL,
+                    "server",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                # Fall back to a direct child so the KVM still heals — but that
+                # re-couples the server to the satellite's lifetime, so shout.
+                logger.error(
+                    "KVM watchdog: systemd-run launch failed (rc=%s, stderr=%r) — "
+                    "falling back to direct child; server will die with the "
+                    "satellite cgroup on the next restart",
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                log_file = DESKFLOW_CORE_LOG.open("a")
+                subprocess.Popen(
+                    [DESKFLOW_CORE_EXE_WSL, "server"],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
             return True
         except Exception as e:
             logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
