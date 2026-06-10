@@ -45,6 +45,11 @@ class SubprocessRecorder:
             if argv[: len(prefix)] == prefix:
                 self._fail_once.remove(prefix)
                 return FakeProcess(returncode=1)
+        # pgrep returns non-zero when no process matches — the start path's
+        # "wait until the core is gone" loop reads that as gone, so default to
+        # gone (rc=1) and keep the loop from spinning to its timeout.
+        if argv[:1] == ["pgrep"]:
+            return FakeProcess(returncode=1)
         return FakeProcess(returncode=0)
 
     def popen(self, argv: Sequence[Any], **kwargs: Any) -> FakeProcess:
@@ -111,13 +116,19 @@ class TestStart:
         kvm_env.main._start_mac_deskflow_client("test")
 
         calls = kvm_env.recorder.run_calls
-        # Legacy GUI + any orphaned core swept before converging: killing the
-        # GUI reparents its core to launchd, and kickstart -k SIGKILLs our own
-        # supervisor (no reap) — either way a stray core would lose the
-        # duplicate-instance race, so the sweep must precede the kickstart.
-        legacy_kill = calls.index(["killall", "Deskflow", "deskflow-core"])
+        # Legacy GUI + any orphaned core SIGKILL'd before converging (-9 because
+        # deskflow-core ignores SIGTERM): killing the GUI reparents its core to
+        # launchd, and kickstart -k SIGKILLs our own supervisor (no reap) —
+        # either way a stray core would lose the duplicate-instance race, so the
+        # sweep must precede the kickstart.
+        legacy_kill = calls.index(["killall", "-9", "Deskflow", "deskflow-core"])
         kickstart = calls.index(["launchctl", "kickstart", "-k", kvm_env.target])
         assert legacy_kill < kickstart
+
+        # Wait until the swept core is actually gone (pgrep), between the
+        # SIGKILL and the kickstart, so the fresh core never races a survivor.
+        pgrep = calls.index(["pgrep", "-x", "deskflow-core"])
+        assert legacy_kill < pgrep < kickstart
 
         # Keymap guard pre and post around the kickstart.
         guard_calls = [i for i, c in enumerate(calls) if "deskflow-keymap-guard.sh" in c[0]]

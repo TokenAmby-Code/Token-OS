@@ -15976,14 +15976,21 @@ def _ensure_deskflow_client_agent():
 def _start_mac_deskflow_client(reason: str):
     _ensure_deskflow_client_agent()
     _ensure_mac_deskflow_keymap(f"{reason}_pre_start")
-    # Sweep both the legacy GUI and any stray core before converging. Killing
-    # the GUI does NOT take its core down — macOS reparents the child
-    # deskflow-core to launchd (PPID 1), and that orphan keeps the server
-    # socket, so the headless supervisor's fresh core would lose the
-    # duplicate-instance race (exit 5). kickstart -k below reaps a healthy
-    # supervisor's own core via its SIGTERM handler, so this sweep only ever
-    # removes unowned orphans; the converge then spawns one clean core.
-    subprocess.run(["killall", "Deskflow", "deskflow-core"], capture_output=True, text=True)
+    # Sweep both the legacy GUI and any stray core before converging, with
+    # SIGKILL — deskflow-core ignores SIGTERM (verified: an orphan survived
+    # `kill -TERM` indefinitely), so plain `killall` can never clear it.
+    # The sweep is mandatory because every existing core would block the
+    # fresh one (duplicate-instance → exit 5): killing the GUI reparents its
+    # child core to launchd (PPID 1) rather than ending it, and `kickstart -k`
+    # SIGKILLs our own supervisor so it cannot reap its core either. Then wait
+    # until the core is actually gone — SIGKILL is near-instant but the
+    # kickstart→supervisor→spawn path could otherwise still race a not-yet-
+    # reaped core.
+    subprocess.run(["killall", "-9", "Deskflow", "deskflow-core"], capture_output=True, text=True)
+    for _ in range(30):  # up to ~3s
+        if subprocess.run(["pgrep", "-x", "deskflow-core"], capture_output=True).returncode != 0:
+            break
+        time.sleep(0.1)
     target = _deskflow_client_agent_target()
     # kickstart -k = atomic converge (kills a wedged supervisor, starts fresh).
     # Fall back to bootstrap for an unloaded job (e.g. after Mac reboot —
