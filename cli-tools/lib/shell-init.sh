@@ -13,8 +13,8 @@
 #   fi
 #
 # Usage in ~/.zshenv (Mac):
-#   if [[ -r /Volumes/Imperium/Token-OS/cli-tools/lib/shell-init.sh ]]; then
-#       source /Volumes/Imperium/Token-OS/cli-tools/lib/shell-init.sh
+#   if [[ -r /Volumes/Imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh ]]; then
+#       source /Volumes/Imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh
 #   elif [[ -f ~/.imperium-shell-cache ]]; then
 #       source ~/.imperium-shell-cache
 #   fi
