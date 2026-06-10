@@ -25,7 +25,12 @@ from .tmux_adapter import TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
 CLAUDE_CMD_BIN = "claude-cmd"
-PERSONA_LABELS = {"legion:custodes", "mechanicus:fabricator-general", "mechanicus:admin"}
+PERSONA_LABELS = {
+    "legion:custodes",
+    "legion:malcador",
+    "mechanicus:fabricator-general",
+    "mechanicus:admin",
+}
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,17 @@ def _admin_log() -> str:
 
 def persona_spec(label: str) -> PersonaSpec:
     if label == "legion:custodes":
-        return PersonaSpec(label, "custodes", "hook_driven", _today_daily_note(), sync=True)
+        return PersonaSpec(
+            label, "custodes", "hook_driven", _today_daily_note(), sync=True, model="opus"
+        )
+    if label == "legion:malcador":
+        return PersonaSpec(
+            label,
+            "malcador",
+            "hook_driven",
+            str(_vault_root() / "Terra" / "Sessions" / "malcador.md"),
+            model="fable",
+        )
     if label == "mechanicus:fabricator-general":
         return PersonaSpec(
             label,
