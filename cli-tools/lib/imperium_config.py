@@ -92,7 +92,7 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
-TOKEN_OS = os.environ.get("TOKEN_OS") or f"{IMPERIUM}/Token-OS"
+TOKEN_OS = os.environ.get("TOKEN_OS") or f"{IMPERIUM}/runtimes/token-os/live"
 CLI_TOOLS = os.environ.get("CLI_TOOLS") or f"{TOKEN_OS}/cli-tools"
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
 

@@ -5,7 +5,7 @@
 #   IMPERIUM_MACHINE — Machine identifier: mac, wsl, phone
 #   IMPERIUM         — Root of the Imperium NAS share
 #   CIVIC            — Root of the Civic NAS share
-#   TOKEN_OS         — Token-OS directory ($IMPERIUM/Token-OS)
+#   TOKEN_OS         — Token-OS runtime checkout ($IMPERIUM/runtimes/token-os/live)
 #   CLI_TOOLS        — CLI tools directory ($TOKEN_OS/cli-tools)
 #   TOKEN_API_URL    — Token-API base URL (localhost on mac, tailscale elsewhere)
 #
@@ -25,7 +25,10 @@
 # Skip if already fully resolved (idempotent sourcing)
 # Check for the function, not just the env var — .zshenv may set IMPERIUM_MACHINE
 # without defining imperium_cfg.
-if [[ -n "${IMPERIUM_MACHINE:-}" ]] && type imperium_cfg &>/dev/null; then
+# Also require CLI_TOOLS to point at a real dir: a shell carrying a stale path
+# (e.g. the archived legacy checkout) must NOT short-circuit — it has to re-derive
+# so it self-heals instead of propagating the dead path into the offline cache.
+if [[ -n "${IMPERIUM_MACHINE:-}" ]] && type imperium_cfg &>/dev/null && [[ -d "${CLI_TOOLS:-/nonexistent}" ]]; then
     return 0 2>/dev/null || true
 fi
 
@@ -113,6 +116,11 @@ imperium_cfg() {
 # ============================================================
 export IMPERIUM="$(imperium_cfg nas_imperium)"
 export CIVIC="$(imperium_cfg nas_civic)"
-export TOKEN_OS="$IMPERIUM/Token-OS"
+# Token-OS now runs from the deploy-owned runtime checkout (protected-main/local-CD,
+# 2026-06-10). The old working checkout $IMPERIUM/Token-OS is archived. Agents edit
+# branch worktrees under ~/worktrees/Token-OS/wt-<branch>, never these paths.
+# Unconditional (not ${TOKEN_OS:-...}): long-lived tmux/launchd parents may export a
+# stale legacy TOKEN_OS, and this is the one canonical derivation — it must override.
+export TOKEN_OS="$IMPERIUM/runtimes/token-os/live"
 export CLI_TOOLS="$TOKEN_OS/cli-tools"
 export TOKEN_API_URL="${TOKEN_API_URL:-$(imperium_cfg token_api_url)}"
