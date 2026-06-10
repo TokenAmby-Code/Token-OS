@@ -141,7 +141,7 @@ Launch contract:
 - Suppress duplicate launches when the note already has `aspirant_launch_id` and status `launching` or `launched`.
 - On failure, mark the note `aspirant_session_status: failed` and record `aspirant_launch_error`.
 
-Related CLI behavior is documented in `/Volumes/Imperium/Scripts/cli-tools/docs/aspirant-dispatch.md`.
+Related CLI behavior is documented in `/Volumes/Imperium/runtimes/token-os/live/cli-tools/docs/aspirant-dispatch.md`.
 
 ### Instance Management
 ```

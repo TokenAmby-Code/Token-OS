@@ -114,7 +114,7 @@ Build output lands in `token-api/ui/ops`.
 Backend verification:
 
 ```bash
-cd /Volumes/Imperium/Token-OS/token-api
+cd /Volumes/Imperium/runtimes/token-os/live/token-api
 .venv/bin/python -m py_compile main.py
 .venv/bin/pytest -q tests/test_ops_ui.py
 curl -sf http://localhost:7777/api/ui/ops/state | jq .surface
@@ -124,7 +124,7 @@ curl -sf 'http://localhost:7777/api/ui/ops/timer/history?window=15m&bucket=60s' 
 Restart the live service after changing backend or committed frontend build assets:
 
 ```bash
-token-restart --from /Volumes/Imperium/Token-OS/token-api
+token-restart --from /Volumes/Imperium/runtimes/token-os/live/token-api
 open http://localhost:7777/ui/ops
 ```
 

@@ -110,11 +110,11 @@ A config file maps directory patterns to relevant tag sets:
 # cli-tools/directory-tags.yaml
 ~/ProcAgentDir:
   tags: [deploy, db, pr, git, instance, workflow]
-/Volumes/Imperium/Scripts/token-api:
+/Volumes/Imperium/runtimes/token-os/live/token-api:
   tags: [token-api, deploy]
-/Volumes/Imperium/Scripts/mobile:
+/Volumes/Imperium/runtimes/token-os/live/mobile:
   tags: [mobile, macrodroid]
-/Volumes/Imperium/Scripts/cli-tools:
+/Volumes/Imperium/runtimes/token-os/live/cli-tools:
   tags: [all]
 ```
 

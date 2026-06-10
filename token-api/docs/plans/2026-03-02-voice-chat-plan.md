@@ -14,18 +14,18 @@
 
 ### Existing Infrastructure
 - **TTS**: Token-API on Mac (`100.95.109.23:7777`). WSL satellite SAPI voices (primary) with Mac `say` fallback. Queue-based, 9 accent profiles assigned per instance.
-- **Dictation**: Wispr Flow on Windows, activated via `Ctrl+Win+Space`. Bluetooth ring right button toggles it. Left double-tap sends Enter. See `/Volumes/Imperium/Scripts/ahk/ring-remap.ahk`.
+- **Dictation**: Wispr Flow on Windows, activated via `Ctrl+Win+Space`. Bluetooth ring right button toggles it. Left double-tap sends Enter. See `/Volumes/Imperium/runtimes/token-os/live/ahk/ring-remap.ahk`.
 - **Hooks**: All hooks dispatch through `~/.claude/hooks/generic-hook.sh` → `POST http://100.95.109.23:7777/api/hooks/{ActionType}`. PreToolUse is synchronous; all others fire-and-forget.
 - **Stop hook TTS**: Already extracts transcript tail and speaks a summary via TTS on turn end.
 - **Satellite**: `token-satellite.py` on WSL port 7777. Already executes Windows commands via `CMD_EXE` and `POWERSHELL_EXE` subprocess calls. Pattern for AHK execution is identical.
-- **AHK v2.0**: Installed at `/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe`. Scripts at `/Volumes/Imperium/Scripts/ahk/`.
+- **AHK v2.0**: Installed at `/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe`. Scripts at `/Volumes/Imperium/runtimes/token-os/live/ahk/`.
 
 ### Key Files
 - `~/.claude/settings.json` — Hook configuration (lines 15-129)
 - `~/.claude/hooks/generic-hook.sh` — Unified hook dispatcher
-- `/Volumes/Imperium/Scripts/ahk/ring-remap.ahk` — Ring button handlers + Wispr integration (791 lines)
-- `/Volumes/Imperium/Scripts/token-api/main.py` — Token-API server (~5000 lines)
-- `/Volumes/Imperium/Scripts/token-api/token-satellite.py` — WSL satellite server (~800 lines)
+- `/Volumes/Imperium/runtimes/token-os/live/ahk/ring-remap.ahk` — Ring button handlers + Wispr integration (791 lines)
+- `/Volumes/Imperium/runtimes/token-os/live/token-api/main.py` — Token-API server (~5000 lines)
+- `/Volumes/Imperium/runtimes/token-os/live/token-api/token-satellite.py` — WSL satellite server (~800 lines)
 - `~/.claude/skills/` — Skills directory
 
 ### Execution Chain (Actual — Implemented 2026-03-03)
@@ -55,12 +55,12 @@ No fallback needed — AskUserQuestion DOES trigger PreToolUse hooks (confirmed)
 > **Not needed.** The `local_exec` pattern eliminated the satellite proxy entirely. Token-API returns the AHK command in the PreToolUse response, and `generic-hook.sh` runs it directly on WSL.
 
 **Files:**
-- Modify: `/Volumes/Imperium/Scripts/token-api/token-satellite.py`
-- Create: `/Volumes/Imperium/Scripts/ahk/voice-select-other.ahk`
+- Modify: `/Volumes/Imperium/runtimes/token-os/live/token-api/token-satellite.py`
+- Create: `/Volumes/Imperium/runtimes/token-os/live/ahk/voice-select-other.ahk`
 
 **Step 1: Create the one-shot AHK script**
 
-Create `/Volumes/Imperium/Scripts/ahk/voice-select-other.ahk` — a minimal AHK v2 script that sends keystrokes to select "Other" in AskUserQuestion and exits:
+Create `/Volumes/Imperium/runtimes/token-os/live/ahk/voice-select-other.ahk` — a minimal AHK v2 script that sends keystrokes to select "Other" in AskUserQuestion and exits:
 
 ```ahk
 #Requires AutoHotkey v2.0
@@ -142,7 +142,7 @@ git commit -m "feat: add /ahk/execute satellite endpoint + voice-select-other sc
 > **Divergence:** No satellite proxy. Handler does two things: (1) extracts question text → `queue_tts()`, (2) returns `local_exec` with AHK command. See `main.py` around line 7996.
 
 **Files:**
-- Modify: `/Volumes/Imperium/Scripts/token-api/main.py` (hook handler + voice chat state)
+- Modify: `/Volumes/Imperium/runtimes/token-os/live/token-api/main.py` (hook handler + voice chat state)
 
 **Step 1: Add voice chat state tracking**
 
@@ -214,7 +214,7 @@ curl -X POST http://localhost:7777/api/hooks/PreToolUse \
 **Step 5: Commit**
 
 ```bash
-cd /Volumes/Imperium/Scripts/token-api
+cd /Volumes/Imperium/runtimes/token-os/live/token-api
 git add main.py
 git commit -m "feat: voice chat state + AskUserQuestion hook → satellite AHK dispatch"
 ```
@@ -375,7 +375,7 @@ git commit -m "feat: add AskUserQuestion PreToolUse hook matcher for voice chat"
 > **Divergence:** Done automatically. `queue_tts(session_id, text)` already looks up the instance's `tts_voice` column. No endpoint changes needed.
 
 **Files:**
-- Modify: `/Volumes/Imperium/Scripts/token-api/main.py` (TTS endpoint)
+- Modify: `/Volumes/Imperium/runtimes/token-os/live/token-api/main.py` (TTS endpoint)
 
 **Step 1: Read existing TTS endpoint**
 
