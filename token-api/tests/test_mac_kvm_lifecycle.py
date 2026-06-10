@@ -111,8 +111,11 @@ class TestStart:
         kvm_env.main._start_mac_deskflow_client("test")
 
         calls = kvm_env.recorder.run_calls
-        # Legacy GUI killed (its own core supervisor would fight the headless job).
-        legacy_kill = calls.index(["killall", "Deskflow"])
+        # Legacy GUI + any orphaned core swept before converging: killing the
+        # GUI reparents its core to launchd, and kickstart -k SIGKILLs our own
+        # supervisor (no reap) — either way a stray core would lose the
+        # duplicate-instance race, so the sweep must precede the kickstart.
+        legacy_kill = calls.index(["killall", "Deskflow", "deskflow-core"])
         kickstart = calls.index(["launchctl", "kickstart", "-k", kvm_env.target])
         assert legacy_kill < kickstart
 
