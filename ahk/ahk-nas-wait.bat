@@ -1,14 +1,14 @@
 @echo off
 :: Generic NAS-wait launcher for AHK scripts.
 :: Usage: ahk-nas-wait.bat <script>
-::   script-compiler       -> \\Token-NAS\Imperium\Token-OS\ahk\script-compiler.ahk
-::   ring-remap            -> \\Token-NAS\Imperium\Token-OS\ahk\ring-remap.ahk
+::   script-compiler       -> \\Token-NAS\Imperium\runtimes\token-os\live\ahk\script-compiler.ahk
+::   ring-remap            -> \\Token-NAS\Imperium\runtimes\token-os\live\ahk\ring-remap.ahk
 ::   Civic\foo.ahk         -> \\Token-NAS\Civic\foo.ahk
 ::   \\full\path\bar.ahk   -> used as-is
 
 set "AHK=C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
 set "NAS=\\Token-NAS"
-set "AHK_DIR=%NAS%\Imperium\Token-OS\ahk"
+set "AHK_DIR=%NAS%\Imperium\runtimes\token-os\live\ahk"
 set "RETRIES=15"
 set "DELAY=3"
 set "INPUT=%~1"

@@ -24,59 +24,13 @@ LaunchLocalPowerShell(scriptName, arguments := "") {
     return true
 }
 
-LaunchMonitorWindow() {
-    SetTitleMatchMode 2  ; Partial title match
-
-    ; Launch Windows Terminal minimized to avoid flash on the main monitor.
-    ; IMPERIUM_NO_TMUX=1 exported before sourcing .bashrc prevents auto-attach.
-    Run('wt.exe --title "token-monitor" -p "Ubuntu" -- wsl.exe -d Ubuntu -e env IMPERIUM_NO_TMUX=1 bash -lic monitor', , "Min")
-
-    hwnd := 0
-    Loop 3 {
-        if !WinWait("token-monitor ahk_exe WindowsTerminal.exe",, 15) {
-            TrayTip "Startup Bootstrap", "Monitor window did not appear within 15s", 3
-            Sleep 2000
-            return false
-        }
-
-        hwnd := WinExist()
-        Sleep 1000
-
-        ; Windows Terminal may recycle the hwnd during startup.
-        try {
-            WinGetTitle("ahk_id " hwnd)
-            break
-        } catch {
-            hwnd := 0
-            continue
-        }
-    }
-
-    if (!hwnd) {
-        TrayTip "Startup Bootstrap", "Monitor window handle kept going stale", 3
-        Sleep 2000
-        return false
-    }
-
-    leftMon := 1
-    leftX := 99999
-    Loop MonitorGetCount() {
-        MonitorGetWorkArea(A_Index, &l)
-        if (l < leftX) {
-            leftX := l
-            leftMon := A_Index
-        }
-    }
-
-    try {
-        MonitorGetWorkArea(leftMon, &mL, &mT, &mR, &mB)
-        WinRestore("ahk_id " hwnd)
-        Sleep 50
-        WinMove(mL, mT, mR - mL, mB - mT, "ahk_id " hwnd)
-        Sleep 50
-        WinMaximize("ahk_id " hwnd)
-    }
-
+BootWslHeadless() {
+    ; Kick WSL awake headlessly so systemd boots and starts token-satellite.
+    ; The deprecated `wt.exe ... monitor` TUI surface is gone; booting WSL was
+    ; the only function it served. `-e true` runs a trivial command purely to
+    ; trigger distro boot. Invoke-DeskflowBoot.ps1 (below) absorbs systemd
+    ; warm-up via its 20s delay / 180s health-timeout before kicking the Mac.
+    Run('wsl.exe -d Ubuntu -e true', , "Hide")
     return true
 }
 
@@ -86,8 +40,8 @@ ExitStartup() {
     ExitApp
 }
 
-; 1. Start the WSL monitor surface immediately.
-LaunchMonitorWindow()
+; 1. Boot WSL headlessly so systemd brings up token-satellite.
+BootWslHeadless()
 
 ; 2. Kick the Deskflow phased restart through token-satellite once WSL is up.
 LaunchLocalPowerShell("Invoke-DeskflowBoot.ps1", "-DelaySeconds 20 -HealthTimeoutSeconds 180")
