@@ -284,16 +284,13 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
       -H "Content-Type: application/json" \
       -d @- 2>/dev/null) || true
 
-  # Defer auto-color + auto-rename to next UserPromptSubmit via pending-ui-cmds
-  # Ensures inline display stays in sync after re-registration, plan mode, resume, etc.
-  COLOR=$(echo "$RESPONSE" | jq -r '.cc_color // empty' 2>/dev/null)
+  # Defer auto-rename to next UserPromptSubmit via pending-ui-cmds. Pane tint is
+  # DB/persona-resolved and applied by tmux style only; no slash color path.
   TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null)
   PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
-  if [[ -n "$PANE" && ( -n "$COLOR" || -n "$TAB_NAME" ) ]]; then
+  if [[ -n "$PANE" && -n "$TAB_NAME" ]]; then
     SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
-    ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID")
-    [[ -n "$TAB_NAME" ]] && ENQ_ARGS+=(--rename "$TAB_NAME")
-    [[ -n "$COLOR" ]] && ENQ_ARGS+=(--color "$COLOR")
+    ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID" --rename "$TAB_NAME")
     "$PENDING_UI_FLUSH" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
   fi
   # Prune legacy/expired/dead-pane queue files every relaunch so the queue never

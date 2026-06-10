@@ -2,14 +2,14 @@
 # pending-ui-flush - guarded drain of the pane-branding queue (~/.claude/pending-ui-cmds)
 # TAGS: tmux, guard, branding, pending-ui
 # AUDIENCE: agent
-"""Origin-side guard for the instance-branding (auto-rename / auto-color) queue.
+"""Origin-side guard for the instance-branding (auto-rename) queue.
 
 Branding is deferred to ``~/.claude/pending-ui-cmds/<N>`` (filename ``N`` is a
-tmux pane number) so a ``/rename`` / ``/color`` slash-command fires on the next
+tmux pane number) so a ``/rename`` slash-command fires on the next
 prompt submit instead of mid-stream. The 2026-06-09 P0 showed the drain path had
 no guards: it send-keys'd into whatever now lived at pane ``%N`` regardless of a
 human typing there, the queue was append-only (58 files, entries back to April),
-and a recycled pane id replayed a prior occupant's stale ``/color default``.
+and a recycled pane id replayed a prior occupant's stale branding command.
 
 This tool is the single, testable owner of that queue. Three subcommands:
 
@@ -313,8 +313,6 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     lines: list[str] = []
     if args.rename:
         lines.append(_format_line(ts, session, pane, f"/rename {args.rename}"))
-    if args.color:
-        lines.append(_format_line(ts, session, pane, f"/color {args.color}"))
     if not lines:
         print(json.dumps({"enqueued": 0}))
         return 0
@@ -472,7 +470,6 @@ def main(argv: list[str]) -> int:
     p_enq.add_argument("--session", default="")
     p_enq.add_argument("--ts", type=int, default=None)
     p_enq.add_argument("--rename", default="")
-    p_enq.add_argument("--color", default="")
     p_enq.set_defaults(func=cmd_enqueue)
 
     p_flush = sub.add_parser("flush", help="safely drain one pane's queue")

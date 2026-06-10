@@ -142,19 +142,18 @@ def test_enqueue_writes_epoch_and_timestamp(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     proc = _run(
-        ["enqueue", "--pane", "%41", "--session", SID, "--rename", "foo", "--color", "blue"],
+        ["enqueue", "--pane", "%41", "--session", SID, "--rename", "foo"],
         qdir=qdir,
         fakes=fakes,
     )
     assert proc.returncode == 0, proc.stderr
     lines = _qfile(qdir, "%41").read_text().splitlines()
-    assert len(lines) == 2
+    assert len(lines) == 1
     ts, sid, pane, cmd = lines[0].split(None, 3)
     assert int(ts) > 0 and abs(int(ts) - int(time.time())) < 30
     assert sid == SID
     assert pane == "%41"
     assert cmd == "/rename foo"
-    assert lines[1].split(None, 3)[3] == "/color blue"
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +165,7 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
-    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /color blue\n")
+    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /rename held\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
         qdir=qdir,
@@ -178,7 +177,7 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path: Path) -> None:
     # Zero keystrokes injected, and the command is NOT dropped — it stays queued.
     assert _sends(fakes) == ""
     assert _qfile(qdir, "%41").exists()
-    assert "/color blue" in _qfile(qdir, "%41").read_text()
+    assert "/rename held" in _qfile(qdir, "%41").read_text()
     assert _summary(proc).get("sent", 0) == 0
     assert _summary(proc).get("held", 0) >= 1
 
@@ -188,7 +187,7 @@ def test_flush_sends_and_drains_when_idle(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     _qfile(qdir, "%41").write_text(
-        f"{int(time.time())} {SID} %41 /rename foo\n{int(time.time())} {SID} %41 /color blue\n"
+        f"{int(time.time())} {SID} %41 /rename foo\n{int(time.time())} {SID} %41 /rename held\n"
     )
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
@@ -204,7 +203,7 @@ def test_flush_sends_and_drains_when_idle(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     sends = _sends(fakes)
-    assert "/rename foo" in sends and "/color blue" in sends
+    assert "/rename foo" in sends and "/rename held" in sends
     assert "%41" in sends
     # Drained on success — file gone (or empty).
     qf = _qfile(qdir, "%41")
@@ -222,7 +221,7 @@ def test_flush_purges_entry_older_than_ttl(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     old = int(time.time()) - 4000  # well past the 300s TTL
-    _qfile(qdir, "%41").write_text(f"{old} {SID} %41 /color red\n")
+    _qfile(qdir, "%41").write_text(f"{old} {SID} %41 /rename stale\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
         qdir=qdir,
@@ -241,7 +240,7 @@ def test_flush_purges_legacy_untagged_line(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     # Pre-fix format: "%<pane> <cmd>" with no timestamp/epoch — the April backlog.
-    _qfile(qdir, "%41").write_text("%41 /color default\n")
+    _qfile(qdir, "%41").write_text("%41 /rename legacy\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
         qdir=qdir,
@@ -249,7 +248,7 @@ def test_flush_purges_legacy_untagged_line(tmp_path: Path) -> None:
         extra_env={"FAKE_ALIVE": "%41", "FAKE_ACTIVITY": "1"},
     )
     assert proc.returncode == 0, proc.stderr
-    assert _sends(fakes) == ""  # legacy /color default never fires
+    assert _sends(fakes) == ""  # legacy rename never fires
     assert _summary(proc).get("purged", 0) >= 1
 
 
@@ -257,7 +256,7 @@ def test_flush_purges_entry_for_dead_pane(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
-    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /color blue\n")
+    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /rename held\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
         qdir=qdir,
@@ -280,7 +279,7 @@ def test_flush_purges_entry_from_foreign_session_epoch(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     # Entry enqueued by a PRIOR occupant of %41 (different session epoch).
-    _qfile(qdir, "%41").write_text(f"{int(time.time())} {OTHER_SID} %41 /color red\n")
+    _qfile(qdir, "%41").write_text(f"{int(time.time())} {OTHER_SID} %41 /rename stale\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],  # current occupant is SID
         qdir=qdir,
@@ -301,7 +300,7 @@ def test_flush_holds_when_pane_has_live_client_attached(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
-    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /color blue\n")
+    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /rename held\n")
     proc = _run(
         ["flush", "--pane", "%41", "--session", SID],
         qdir=qdir,
@@ -330,10 +329,10 @@ def test_sweep_removes_stale_keeps_fresh_alive(tmp_path: Path) -> None:
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
     now = int(time.time())
-    _qfile(qdir, "%38").write_text("%38 /color red\n")  # legacy
+    _qfile(qdir, "%38").write_text("%38 /rename stale\n")  # legacy
     _qfile(qdir, "%99").write_text(f"{now} {SID} %99 /rename keep\n")  # fresh+alive
-    _qfile(qdir, "%50").write_text(f"{now - 9999} {SID} %50 /color y\n")  # expired
-    _qfile(qdir, "%77").write_text(f"{now} {SID} %77 /color z\n")  # dead pane
+    _qfile(qdir, "%50").write_text(f"{now - 9999} {SID} %50 /rename expired\n")  # expired
+    _qfile(qdir, "%77").write_text(f"{now} {SID} %77 /rename dead\n")  # dead pane
     proc = _run(
         ["sweep"],
         qdir=qdir,
