@@ -79,19 +79,30 @@ if command -v tmux >/dev/null 2>&1; then
 fi
 
 DB_PATH="${TOKEN_API_DB:-${HOME}/.claude/agents.db}"
-RESUME_ID="$INSTANCE_ID"
-for candidate in "$TOKEN_SESSION_ID" "$BRIDGE_ID" "$SESSION_ID"; do
-    [[ -n "$RESUME_ID" ]] && break
-    RESUME_ID="$(_lookup_instance_by_token "$candidate" "$DB_PATH")"
-done
-if [[ -z "$RESUME_ID" ]]; then
-    RESUME_ID="$(_lookup_instance_by_pane "$PANE" "$PANE_LABEL" "$DB_PATH")"
+RESUME_ID=""
+if [[ -r "$DB_PATH" ]]; then
+    for candidate in "$INSTANCE_ID" "$TOKEN_SESSION_ID" "$BRIDGE_ID" "$SESSION_ID"; do
+        [[ -n "$RESUME_ID" ]] && break
+        RESUME_ID="$(_lookup_instance_by_token "$candidate" "$DB_PATH")"
+    done
+    if [[ -z "$RESUME_ID" ]]; then
+        RESUME_ID="$(_lookup_instance_by_pane "$PANE" "$PANE_LABEL" "$DB_PATH")"
+    fi
+else
+    # Last-ditch fallback for machines without the Token-API DB mounted. Normal
+    # managed panes must validate through the DB so stale @INSTANCE_ID cannot win.
+    RESUME_ID="$INSTANCE_ID"
 fi
 
 RESUME_CMD=""
 if [[ -n "$RESUME_ID" ]]; then
     printf -v RESUME_CMD 'dispatch --id %q --pane self' "$RESUME_ID"
 fi
+{
+    printf '[%s] agent=%s pane=%s label=%s instance_opt=%s token_session=%s bridge=%s hook_session=%s db=%s resume_id=%s cmd=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$AGENT" "$PANE" "$PANE_LABEL" "$INSTANCE_ID" \
+        "$TOKEN_SESSION_ID" "$BRIDGE_ID" "$SESSION_ID" "$DB_PATH" "$RESUME_ID" "$RESUME_CMD"
+} >> /tmp/agent-session-end-resume.log 2>/dev/null || true
 
 SENTINEL="/tmp/agent-resume-${PANE}"
 TMP="${SENTINEL}.tmp.$$"
