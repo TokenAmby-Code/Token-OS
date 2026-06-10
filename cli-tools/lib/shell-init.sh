@@ -6,8 +6,8 @@
 # It handles all NAS-hosted tooling setup so machine profiles stay minimal.
 #
 # Usage in ~/.bashrc (WSL):
-#   if [[ -r /mnt/imperium/Token-OS/cli-tools/lib/shell-init.sh ]]; then
-#       source /mnt/imperium/Token-OS/cli-tools/lib/shell-init.sh
+#   if [[ -r /mnt/imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh ]]; then
+#       source /mnt/imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh
 #   elif [[ -f ~/.imperium-shell-cache ]]; then
 #       source ~/.imperium-shell-cache
 #   fi
