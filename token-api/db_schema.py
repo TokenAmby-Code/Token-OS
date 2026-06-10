@@ -30,6 +30,7 @@ from personas import (
     persona_to_profile,
     resolve_persona,
     singleton_persona_slug_for_runtime,
+    validate_mechanicus_invariant,
 )
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
@@ -815,6 +816,105 @@ def restore_claude_instances_from_archive(db_path: Path | None = None) -> int:
     finally:
         conn.close()
 
+    # ── Mechanicus-worker biconditional (Terra/Ultramar/Mechanicus Worker Persona) ──
+    # THE keystone, self-enforcing invariant: an instance whose commander resolves
+    # to the Fabricator-General persona singleton is persona ``mechanicus-worker``,
+    # and vice-versa. Dispatch only has to set ``commander = FG``; these triggers
+    # assign the (voiceless, shared) coat — there is no separate assignment logic.
+    #
+    #   A. commander -> FG   =>  persona = mechanicus-worker, automated = 1
+    #   B. persona = mechanicus-worker  =>  commander -> FG, automated = 1
+    #
+    # "Commander resolves to FG" is keyed on the FG PERSONA id (resolved by slug,
+    # restart-stable: ``commander_type='persona' AND commander_id=<fg persona>``),
+    # never a volatile commander instance_id — instance ids churn every tmux
+    # restart. The persona ids are resolved by slug subquery so nothing hardcodes a
+    # UUID. The secondary invariant (mechanicus-worker => automated) is folded in.
+    #
+    # SQLite BEFORE triggers cannot mutate NEW.*, so the "force" is an AFTER
+    # INSERT/UPDATE corrective UPDATE (same pattern as the persona-rank stamp in
+    # custodes-sync-decouple-rank / PR #162; coexists with it — different trigger
+    # names, additive). Each WHEN is a FIXED POINT: once the corrective UPDATE
+    # lands (persona=mechanicus + automated=1 / commander=FG + automated=1) the
+    # WHEN is false, so it converges in one step under recursive_triggers ON or OFF
+    # (SQLite default here is OFF; verified) and cannot loop. A's corrective UPDATE
+    # touching persona only ever leaves commander=FG/automated=1, so B stays
+    # satisfied (and vice-versa) — the two never ping-pong.
+    #
+    # EXEMPTION: the worker tier only. A only fires when the row's CURRENT persona
+    # is Astartes-default or NULL (``default_rank='astartes'``), so the overseer
+    # singletons (FG, Administratum, Custodes, Inquisitor) and Primarchs are never
+    # rewritten — the FG is not its own commander. B is naturally scoped (only the
+    # mechanicus-worker persona trips it). Retired rows (historical) are left alone.
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_mech_commander_to_persona")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_mech_commander_to_persona
+        AFTER INSERT ON instances
+        WHEN NEW.commander_type = 'persona'
+             AND NEW.commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general')
+             AND NEW.rank != 'retired'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') = 'astartes'
+             AND (NEW.persona_id IS NOT (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
+                  OR NEW.automated != 1)
+        BEGIN
+            UPDATE instances
+               SET persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker'),
+                   automated = 1
+             WHERE id = NEW.id;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_mech_commander_to_persona_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_mech_commander_to_persona_update
+        AFTER UPDATE OF commander_type, commander_id, persona_id, automated, rank ON instances
+        WHEN NEW.commander_type = 'persona'
+             AND NEW.commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general')
+             AND NEW.rank != 'retired'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') = 'astartes'
+             AND (NEW.persona_id IS NOT (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
+                  OR NEW.automated != 1)
+        BEGIN
+            UPDATE instances
+               SET persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker'),
+                   automated = 1
+             WHERE id = NEW.id;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_mech_persona_to_commander")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_mech_persona_to_commander
+        AFTER INSERT ON instances
+        WHEN NEW.persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
+             AND NEW.rank != 'retired'
+             AND (NEW.commander_type != 'persona'
+                  OR NEW.commander_id IS NOT (SELECT id FROM personas WHERE slug = 'fabricator-general')
+                  OR NEW.automated != 1)
+        BEGIN
+            UPDATE instances
+               SET commander_type = 'persona',
+                   commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general'),
+                   automated = 1
+             WHERE id = NEW.id;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_mech_persona_to_commander_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_mech_persona_to_commander_update
+        AFTER UPDATE OF commander_type, commander_id, persona_id, automated, rank ON instances
+        WHEN NEW.persona_id = (SELECT id FROM personas WHERE slug = 'mechanicus-worker')
+             AND NEW.rank != 'retired'
+             AND (NEW.commander_type != 'persona'
+                  OR NEW.commander_id IS NOT (SELECT id FROM personas WHERE slug = 'fabricator-general')
+                  OR NEW.automated != 1)
+        BEGIN
+            UPDATE instances
+               SET commander_type = 'persona',
+                   commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general'),
+                   automated = 1
+             WHERE id = NEW.id;
+        END
+    """)
+
 
 async def init_database_async(db_path: Path | None = None) -> None:
     """Initialize the SQLite database with the managed schema and migrations."""
@@ -837,6 +937,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
 
         await _ensure_instances(db)
         await _extract_claude_instances(db, db_path)
+
+        # Read-time half of the mechanicus-worker belt-and-suspenders: the write
+        # triggers keep this empty in steady state, so a non-empty result at init
+        # is a real anomaly (e.g. a hand-edited row) worth surfacing, not a fatal.
+        mech_violations = await validate_mechanicus_invariant(db)
+        if mech_violations:
+            print(
+                f"WARNING: {len(mech_violations)} mechanicus-worker invariant "
+                f"violation(s) at init: {mech_violations}"
+            )
 
         # Annex-era indexes on the surviving predicates (golden_throne marker
         # replaced legion/synced; discord routing reads the annex columns).
