@@ -1701,17 +1701,36 @@ def _dispatch_deferred(pane: str, reason: str = "dispatch_deferred") -> dict:
     }
 
 
+def _looks_like_codex_skill_invocation(text: str) -> bool:
+    # Keep this local: token-satellite is deployed as a standalone WSL service
+    # and should not import tmuxctl internals from the Mac-side CLI package.
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("$"):
+        return False
+    parts = stripped[1:].split(None, 1)
+    if not parts:
+        return False
+    head = parts[0]
+    return bool(head) and all(ch.isalnum() or ch in {"-", "_"} for ch in head)
+
+
 def _tmux_send_payload_then_submit(
     pane: str,
     payload: str,
     *,
     clear_prompt: bool = False,
+    enable_skill_sink: bool = False,
 ) -> None:
     """Send text and submit as separate tmux operations."""
     if clear_prompt:
         subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], check=True, timeout=5)
         time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", pane, "-l", payload], check=True, timeout=5)
+    if enable_skill_sink and _looks_like_codex_skill_invocation(payload):
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Tab"], check=True, timeout=5)
+        time.sleep(0.3)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
+        time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
 
 
@@ -2276,7 +2295,12 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                         sop_file,
                         prompt_summary=req.prompt_summary,
                     )
-                _tmux_send_payload_then_submit(pane, inject_prompt, clear_prompt=True)
+                _tmux_send_payload_then_submit(
+                    pane,
+                    inject_prompt,
+                    clear_prompt=True,
+                    enable_skill_sink=(engine == "codex"),
+                )
                 transport = "send-keys"
                 logger.info(
                     f"Golden Throne: sent SOP to {pane} via send-keys (session {req.session_id[:12]})"

@@ -6,6 +6,8 @@ import time
 from .api import fetch_instance_registry
 from .tmux_adapter import TmuxAdapter
 
+SkillSinkKeys = tuple[str, ...]
+
 
 def normalize_agent(value: str | None) -> str:
     raw = (value or "").strip().lower()
@@ -40,6 +42,28 @@ def skill_invocation_text(
     prefix = f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)}"
     args = (arguments or "").strip()
     return f"{prefix} {args}" if args else f"{prefix} "
+
+
+def codex_skill_sink_keys(agent: str | None) -> SkillSinkKeys:
+    """Keys needed after typing a skill invocation but before submit.
+
+    Codex accepts literal ``$skill`` text, but it does not reliably materialize
+    the skill chip until Tab/Enter. Tab is lower risk than Enter because it sinks
+    the skill without submitting arbitrary prompt text. Claude slash commands do
+    not need this and must not receive it.
+    """
+    return ("Tab",) if normalize_agent(agent) == "codex" else ()
+
+
+def looks_like_codex_skill_invocation(text: str) -> bool:
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("$"):
+        return False
+    parts = stripped[1:].split(None, 1)
+    if not parts:
+        return False
+    head = parts[0]
+    return bool(head) and all(ch.isalnum() or ch in {"-", "_"} for ch in head)
 
 
 def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
@@ -126,7 +150,12 @@ def resolve_agent_for_pane(
 
 
 def insert_at_prompt_start(
-    adapter: TmuxAdapter, pane: str, text: str, *, settle_seconds: float = 0.05
+    adapter: TmuxAdapter,
+    pane: str,
+    text: str,
+    *,
+    settle_seconds: float = 0.05,
+    sink_keys: SkillSinkKeys = (),
 ) -> None:
     for _ in range(50):
         adapter.send_keys(pane, "PgUp")
@@ -134,6 +163,8 @@ def insert_at_prompt_start(
     if settle_seconds > 0:
         time.sleep(settle_seconds)
     adapter.run("send-keys", "-t", pane, "-l", text)
+    for key in sink_keys:
+        adapter.send_keys(pane, key)
     if settle_seconds > 0:
         time.sleep(settle_seconds)
     for _ in range(50):
@@ -152,7 +183,13 @@ def invoke_skill_in_pane(
 ) -> str:
     resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
     text = skill_invocation_text(skill, resolved_agent, arguments)
-    insert_at_prompt_start(adapter, pane, text, settle_seconds=settle_seconds)
+    insert_at_prompt_start(
+        adapter,
+        pane,
+        text,
+        settle_seconds=settle_seconds,
+        sink_keys=codex_skill_sink_keys(resolved_agent),
+    )
     return text
 
 
@@ -173,5 +210,10 @@ def send_skill_invocation_to_pane(
     """
     resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
     text = skill_invocation_text(skill, resolved_agent, arguments)
-    adapter.send_text_then_submit(pane, text, clear_prompt=clear_prompt)
+    adapter.send_text_then_submit(
+        pane,
+        text,
+        clear_prompt=clear_prompt,
+        pre_submit_keys=codex_skill_sink_keys(resolved_agent),
+    )
     return text

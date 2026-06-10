@@ -258,6 +258,7 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
+from tmuxctl.skill_invoke import looks_like_codex_skill_invocation as _looks_like_codex_skill
 from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
@@ -4756,6 +4757,7 @@ async def _tmux_send_payload_then_submit(
     payload: str,
     *,
     clear_prompt: bool = False,
+    enable_skill_sink: bool = False,
 ) -> dict:
     """Send text and submit through tmuxctl's pane-write primitive."""
     from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
@@ -4768,6 +4770,9 @@ async def _tmux_send_payload_then_submit(
                 tmux_pane,
                 payload,
                 clear_prompt=clear_prompt,
+                pre_submit_keys=("Tab",)
+                if enable_skill_sink and _looks_like_codex_skill(payload)
+                else (),
             ),
             timeout=10,
         )
@@ -4836,6 +4841,16 @@ async def _tmux_send_payload_then_submit(
     }
 
 
+async def _pane_write_instance_engine(instance_id: str) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT engine FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+    return ((row[0] if row else "") or "").strip().lower()
+
+
 async def process_pane_write_queue_once(
     queue_id: str | None = None, *, limit: int = 10
 ) -> list[dict]:
@@ -4891,6 +4906,9 @@ async def process_pane_write_queue_once(
             results.append(result)
             continue
         is_brief = item["source"] == "brief"
+        enable_skill_sink = False
+        if item["source"] == "golden_throne" and _looks_like_codex_skill(item["payload"]):
+            enable_skill_sink = await _pane_write_instance_engine(instance_id) == "codex"
         try:
             # brief clears/replaces a stale composer rather than deferring on it
             # forever. Its live symptom: a leftover draft in the target composer
@@ -4912,6 +4930,12 @@ async def process_pane_write_queue_once(
             if is_brief:
                 send_result = await _tmux_send_payload_then_submit(
                     pane, item["payload"], clear_prompt=True
+                )
+            elif enable_skill_sink:
+                send_result = await _tmux_send_payload_then_submit(
+                    pane,
+                    item["payload"],
+                    enable_skill_sink=True,
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
@@ -7013,6 +7037,12 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
                 "synced": 0,
                 "input_lock": None,
                 "stopped_at": now,
+                # The GT sweep uses stopped_at/last_activity as the quiet edge
+                # and gt_last_resume_at as the "already handled this quiet edge"
+                # sentinel. Without stamping it here, a missing-pane row is
+                # rediscovered every sweep, re-armed, and fires forever against
+                # a ghost instance.
+                "gt_last_resume_at": now,
             },
             mutation_type="instance_stopped",
             write_source="golden_throne",
@@ -7090,6 +7120,13 @@ async def golden_throne_followup(session_id: str):
     # Skip if victory was declared
     if instance.get("victory_at"):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
+        return
+
+    if instance.get("instance_type") != "golden_throne" or int(instance.get("zealotry") or 0) < 4:
+        logger.info(
+            f"Golden Throne: {session_id[:12]} disabled before fire "
+            f"(type={instance.get('instance_type')} zealotry={instance.get('zealotry')}), skipping"
+        )
         return
 
     # Read the linked session doc rubric and classify the fire state. This is
