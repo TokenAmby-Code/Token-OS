@@ -599,7 +599,6 @@ DESKFLOW_SERVER_UNIT = "deskflow-core-server"
 DESKFLOW_SERVER_CONFIG_BACKUPS = [
     REPO_ROOT / "config" / "deskflow" / "wsl-server.conf",
 ]
-DESKFLOW_PROCESS_CHECK_INTERVAL = 300  # verify DeskFlow process every 5 min (process liveness only)
 DESKFLOW_RECONNECT_WAIT = 5  # seconds to allow opportunistic reconnect between recovery tiers
 DESKFLOW_OPP_GRACE = 3  # seconds to watch the follower for self-heal before each escalation rung
 DESKFLOW_BACKOFF_SECONDS = [30, 60, 120, 300, 900]
@@ -747,8 +746,12 @@ class DeskFlowWatchdog:
     event-driven: a ``DeskflowLogFollower`` tails deskflow-core's own log and
     pushes connection edges onto ``self._edge_queue``; the watchdog consumes
     them on its own thread (so all recovery stays under ``_recovery_lock`` and
-    never blinds the follower). The only surviving timer is a low-frequency
-    process-liveness check.
+    never blinds the follower). There is NO periodic liveness poll: a server
+    death that writes no log line is caught at the next satellite boot (every
+    deploy restarts the satellite, whose boot path starts the server if absent)
+    or by manual ``/kvm/control start`` — a KVM drop is immediately user-visible,
+    so a background check adds latency-bounded noise, not safety. The only timed
+    wake-ups are the bounded recovery retries while actively un-connected.
 
     States:
         starting  — boot: waiting for Tailscale + DeskFlow startup
@@ -763,7 +766,6 @@ class DeskFlowWatchdog:
 
     def __init__(self):
         self.state = "starting"
-        self.last_process_check = 0.0
         self.hold_until: float | None = None
         self.last_state_change = time.time()
         self.recovery_attempts = 0
@@ -787,6 +789,9 @@ class DeskFlowWatchdog:
 
     def stop(self) -> None:
         self._stop_event.set()
+        # Sentinel unblocks the edge loop, which may be parked on a timeout-less
+        # queue.get (no periodic wake-up exists in connected/held/ceased states).
+        self._edge_queue.put(None)
         if self._thread:
             self._thread.join(timeout=10)
         if self._follower:
@@ -851,54 +856,69 @@ class DeskFlowWatchdog:
             # ladder at next_recovery_at. _mark_connected() resets this to 0.0.
             self.next_recovery_at = time.time() + DESKFLOW_BACKOFF_SECONDS[0]
 
-        # Edge loop: block on the follower's edge queue. On timeout, run the idle
-        # tick (process liveness + a bounded recovery retry while un-connected).
+        # Edge loop: block on the follower's edge queue — indefinitely unless a
+        # recovery retry or hold expiry is scheduled. On timeout, run the idle
+        # tick. A ``None`` edge is the stop sentinel; a real edge queued ahead of
+        # the sentinel must not dispatch once shutdown has started.
         while not self._stop_event.is_set():
             try:
                 edge = self._edge_queue.get(timeout=self._edge_loop_timeout())
             except queue.Empty:
-                self._on_idle_tick()
+                if not self._stop_event.is_set():
+                    self._on_idle_tick()
+                continue
+            if edge is None or self._stop_event.is_set():
                 continue
             try:
                 self._dispatch_edge(edge)
             except Exception as e:
                 logger.error(f"KVM watchdog: edge dispatch error ({edge}): {e}")
 
-    def _edge_loop_timeout(self) -> float:
+    def _edge_loop_timeout(self) -> float | None:
         """Edge-queue blocking timeout.
 
-        While actively un-connected (``waiting``/``backoff``) the loop must wake
-        promptly to drive the next recovery retry — return a ``next_recovery_at``-
-        aware timeout clamped into ``[1.0, DESKFLOW_PROCESS_CHECK_INTERVAL]``. In
-        every other state (``running``/``held``/``ceased``/``stopped``) only the
-        slow process-liveness cadence matters.
+        Two timed obligations exist: the next recovery retry while actively
+        un-connected (``waiting``/``backoff``, at ``next_recovery_at``) and the
+        hold expiry while ``held`` (at ``hold_until``). Wake for those, floored
+        at 1.0s. In every other state (``running``/``ceased``/``stopped``) there
+        is nothing timed to do: block until an edge or the stop sentinel arrives
+        (no periodic liveness poll, by decree).
         """
         if self.state in ("waiting", "backoff"):
-            remaining = self.next_recovery_at - time.time()
-            return max(1.0, min(remaining, float(DESKFLOW_PROCESS_CHECK_INTERVAL)))
-        return float(DESKFLOW_PROCESS_CHECK_INTERVAL)
+            return max(1.0, self.next_recovery_at - time.time())
+        if self.state == "held" and self.hold_until:
+            return max(1.0, self.hold_until - time.time())
+        return None
 
     def _on_idle_tick(self) -> None:
-        """Idle-tick body: process liveness + a bounded recovery retry.
+        """Idle-tick body: hold expiry + a bounded recovery retry.
 
-        Runs when the edge queue times out with no edge. Keeps the server process
-        alive, and — while actively un-connected — re-drives the recovery ladder at
-        the scheduled retry time so a wedged ``waiting``/``backoff`` (boot invite or
-        a prior rung that never connected the Mac, with no further edge arriving)
-        heals without an external trigger.
+        Only reachable in ``waiting``/``backoff``/``held`` — every other state
+        blocks on the edge queue without a timeout.
+
+        ``held``: resume when the hold expires — connected holds settle straight
+        to ``running``; un-connected holds drop to ``waiting`` with an immediate
+        retry armed (a DROP swallowed during the hold produces no further edge,
+        so the resume itself must re-drive recovery).
+
+        ``waiting``/``backoff``: re-drive the recovery ladder at the scheduled
+        retry time so a wedged state (boot invite or a prior rung that never
+        connected the Mac, with no further edge arriving) heals without an
+        external trigger. ``ceased`` is excluded by design (it waits for an UP
+        edge to resurrect); ``running`` never retries. ``_recovery_lock`` guards
+        re-entrancy; backoff escalation to ``ceased`` after
+        DESKFLOW_MAX_RECOVERY_ATTEMPTS still bounds it.
         """
-        # force_stop means leave the server down — don't auto-restart it.
-        if self.state == "stopped":
+        if self.state == "held":
+            if self.hold_until and time.time() > self.hold_until:
+                logger.info("KVM watchdog: Hold expired, resuming")
+                if self._follower_connected():
+                    self._mark_connected()
+                else:
+                    self.state = "waiting"
+                    self.last_state_change = time.time()
+                    self.next_recovery_at = time.time()
             return
-        try:
-            self._ensure_server_alive()
-        except Exception as e:
-            logger.error(f"KVM watchdog: liveness check error: {e}")
-
-        # Bounded recovery retry: only while actively un-connected. ``ceased`` is
-        # excluded by design (it waits for an UP edge to resurrect); ``running``/
-        # ``held`` never retry. ``_recovery_lock`` guards re-entrancy; backoff
-        # escalation to ``ceased`` after DESKFLOW_MAX_RECOVERY_ATTEMPTS still bounds it.
         if (
             self.state in ("waiting", "backoff")
             and not self._follower.connected
@@ -993,20 +1013,6 @@ class DeskFlowWatchdog:
                 return True
             self._stop_event.wait(0.2)
         return self._follower_connected()
-
-    def _ensure_server_alive(self):
-        """Restart the local DeskFlow server if it died or stopped listening."""
-        now = time.time()
-        if now - self.last_process_check < DESKFLOW_PROCESS_CHECK_INTERVAL:
-            return
-        self.last_process_check = now
-        if not self._check_deskflow_running():
-            logger.warning("KVM watchdog: DeskFlow server died, restarting")
-            self._start_deskflow_server()
-            return
-        if not self._check_deskflow_listening():
-            logger.warning("KVM watchdog: DeskFlow process exists but port 24800 is not listening")
-            self._reload_deskflow_server()
 
     # ── Reachability ──
 
@@ -1376,7 +1382,6 @@ class DeskFlowWatchdog:
         self.next_recovery_at = 0.0
         self.last_recovery_action = None
         self.last_state_change = time.time()
-        self.last_process_check = time.time()
 
     def _schedule_backoff(self):
         self.recovery_attempts += 1
