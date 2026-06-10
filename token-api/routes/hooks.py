@@ -895,6 +895,7 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
     resolved = await talk_service.resolve_pane(raw) or raw
     instance_id = await shared.instance_id_for_pane(resolved)
     db.row_factory = aiosqlite.Row
+    row = None
     if instance_id:
         cursor = await db.execute(
             """SELECT id, tab_name, engine, status, last_activity
@@ -905,9 +906,11 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
                LIMIT 1""",
             (instance_id,),
         )
-    else:
+        row = await cursor.fetchone()
+    if not row:
         # Compatibility fallback for legacy rows/tests that predate @INSTANCE_ID
-        # stamps. This is read-only; canonical instances still never stores panes.
+        # stamps, and isolation fallback for test/temp DBs when the live tmux pane
+        # carries an @INSTANCE_ID from a different Token-API database.
         cursor = await db.execute(
             """SELECT id, tab_name, engine, status, last_activity
                FROM claude_instances
@@ -917,7 +920,7 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
                LIMIT 1""",
             (resolved,),
         )
-    row = await cursor.fetchone()
+        row = await cursor.fetchone()
     if not row:
         return {"id": instance_id, "tmux_pane": resolved}
     result = dict(row)

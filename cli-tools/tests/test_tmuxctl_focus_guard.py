@@ -3,6 +3,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
@@ -55,3 +57,21 @@ def test_preserve_focus_restores_window_and_pane_after_automation_snap():
     assert adapter.current_pane == "%1"
     assert ("select-window", "-t", "main:1") in adapter.commands
     assert ("select-pane", "-t", "%1") in adapter.commands
+
+
+def test_preserve_focus_restore_failure_does_not_mask_body_exception():
+    class FailingRestoreAdapter(FakeFocusAdapter):
+        fail_restore = False
+
+        def run(self, *args: str, allow_failure: bool = False) -> str:
+            if self.fail_restore and args[0] == "display-message":
+                raise OSError(24, "Too many open files")
+            return super().run(*args, allow_failure=allow_failure)
+
+    adapter = FailingRestoreAdapter()
+
+    with pytest.raises(RuntimeError, match="real failure"):
+        with preserve_focus(adapter, source="test", attempted_target="%2"):
+            adapter.run("select-window", "-t", "main:2")
+            adapter.fail_restore = True
+            raise RuntimeError("real failure")

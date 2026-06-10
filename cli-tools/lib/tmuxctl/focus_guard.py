@@ -162,13 +162,28 @@ def preserve_focus(
         yield snapshot
     finally:
         if enabled:
-            restore_focus(
-                adapter,
-                snapshot,
-                source=source,
-                attempted_target=attempted_target,
-                previous=snapshot,
-            )
+            try:
+                restore_focus(
+                    adapter,
+                    snapshot,
+                    source=source,
+                    attempted_target=attempted_target,
+                    previous=snapshot,
+                )
+            except Exception as exc:
+                # Focus restore is best-effort automation hygiene. It must never
+                # mask the real stack/dispatch failure (notably EMFILE from tmux
+                # subprocess creation), or the operator loses the actionable root
+                # cause behind a second restore traceback.
+                _log(
+                    "restore-error",
+                    action="restore_error",
+                    command_surface=source,
+                    attempted_target=attempted_target,
+                    previous_window=snapshot.window,
+                    previous_pane=snapshot.pane,
+                    error=str(exc),
+                )
 
 
 def show_global_option(adapter: TmuxAdapter, option: str) -> str:

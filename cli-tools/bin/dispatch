@@ -725,6 +725,17 @@ if $INTERACTIVE && [[ -z "$RESUME_ID" ]]; then
   export DISPATCH_MENU_CONSUMED=1
 fi
 
+default_human_surface_target() {
+  # A typed `d`/`cdc` dispatch from inside tmux should occupy the invoking pane by
+  # default. Prefix+Space remains the explicit new-legion-pane launcher because it
+  # passes --target legion:new.
+  [[ -z "$TARGET" ]] || return 0
+  dispatch_origin_is_human_surface || return 0
+  [[ -n "$(dispatch_tmux_pane)" ]] || return 0
+  TARGET="self"
+}
+default_human_surface_target
+
 if $KIND_ALIAS_USED && ! $ASPIRANT; then
   err "--kind is only valid as an alias for --aspirant-kind when --aspirant is set"
   exit 64
@@ -1041,11 +1052,12 @@ launch_dispatch_aspirant_session() {
     mode_flag="--no-gt"
   fi
 
+  local launch_target="${TARGET:-legion:new}"
   launch_args=(
     --direct
     --engine "$ENGINE"
     --dir "$vault"
-    --target legion:new
+    --target "$launch_target"
     --session-doc "$session_doc_abs"
     --prompt-file "$prompt_file"
     "$mode_flag"
@@ -1200,7 +1212,19 @@ DISPATCH_SLOT=""
 RESOLVED_TARGET="$TARGET"
 LAUNCH_MODE="direct"
 if [[ -n "$TARGET" ]]; then
-  if [[ "$TARGET" == *:* ]]; then
+  if [[ "$TARGET" == "self" || "$TARGET" == "current" ]]; then
+    DISPATCH_SELF_PANE="$(dispatch_tmux_pane)"
+    if [[ -z "$DISPATCH_SELF_PANE" ]]; then
+      err "--pane $TARGET requires a tmux pane"
+      exit 69
+    fi
+    LAUNCH_MODE="direct"
+    RESOLVED_TARGET="$DISPATCH_SELF_PANE"
+    RESOLVED_PHYSICAL_TARGET="$DISPATCH_SELF_PANE"
+  elif [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
+    LAUNCH_MODE="direct"
+    RESOLVED_PHYSICAL_TARGET="$TMUX_PANE"
+  elif [[ "$TARGET" == *:* ]]; then
     DISPATCH_WINDOW="${TARGET%%:*}"
     DISPATCH_SLOT="${TARGET#*:}"
     DISPATCH_MODE="$DISPATCH_SLOT"
@@ -1225,12 +1249,14 @@ if [[ -n "$RESUME_ID" ]]; then
   [[ -n "$RESUME_LAUNCH_MODE" ]] && LAUNCH_MODE="$RESUME_LAUNCH_MODE"
   if [[ -n "$TARGET" ]]; then
     if [[ "$TARGET" == "self" || "$TARGET" == "current" ]]; then
-      if [[ -z "${TMUX_PANE:-}" ]]; then
-        err "--pane $TARGET requires TMUX_PANE"
+      DISPATCH_SELF_PANE="$(dispatch_tmux_pane)"
+      if [[ -z "$DISPATCH_SELF_PANE" ]]; then
+        err "--pane $TARGET requires a tmux pane"
         exit 69
       fi
       LAUNCH_MODE="direct"
-      RESOLVED_PHYSICAL_TARGET="$TMUX_PANE"
+      RESOLVED_TARGET="$DISPATCH_SELF_PANE"
+      RESOLVED_PHYSICAL_TARGET="$DISPATCH_SELF_PANE"
     elif [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
       LAUNCH_MODE="direct"
     elif [[ "$TARGET" == *:new ]]; then
