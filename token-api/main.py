@@ -1382,6 +1382,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         pass
 
+    # Fail closed (P0 2026-06-09): a worktree dev server must never write the live
+    # ~/.claude/agents.db. If this code is running from under a worktrees/ tree but
+    # DB_PATH still resolves to the live DB, refuse to start instead of racing the
+    # production :7777 writer (timer/enforcement corruption, phantom shocks).
+    _live_db = (Path.home() / ".claude" / "agents.db").resolve()
+    _run_roots = (Path(__file__).resolve(), Path.cwd().resolve())
+    if any("worktrees" in p.parts for p in _run_roots) and DB_PATH.resolve() == _live_db:
+        raise SystemExit(
+            "REFUSING TO START: running from a worktree but TOKEN_API_DB resolves to "
+            f"the live {_live_db}. Set TOKEN_API_DB in .worktree.env to an isolated "
+            "copy (worktree-setup does this automatically)."
+        )
+
     # Startup
     await init_database_async(DB_PATH)
     await load_tasks_from_db()
