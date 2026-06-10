@@ -723,6 +723,7 @@ def add_orchestrator_stack_pane(
     base: str,
     *,
     cwd: str | None = None,
+    focus: bool = True,
 ) -> str:
     spec = STACK_PAGE_SPECS.get(base)
     if spec is None:
@@ -770,12 +771,12 @@ def add_orchestrator_stack_pane(
         else:
             worker_ids = {worker.pane_id for worker in workers}
             stored_focus = _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION)
-            focus = stored_focus if stored_focus in worker_ids else workers[0].pane_id
+            split_target = stored_focus if stored_focus in worker_ids else workers[0].pane_id
             pane = adapter.run(
                 "split-window",
                 "-v",
                 "-t",
-                focus,
+                split_target,
                 "-d",
                 "-P",
                 "-F",
@@ -797,7 +798,7 @@ def add_orchestrator_stack_pane(
     )
     _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
     adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
-    focus_new_worker = not (base == "mechanicus" and not _mechanicus_focus_allowed())
+    focus_new_worker = focus and not (base == "mechanicus" and not _mechanicus_focus_allowed())
     enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus_new_worker)
     return pane
 
@@ -808,5 +809,6 @@ def add_stack_worker_pane(
     *,
     cwd: str | None = None,
     window: str = "legion",
+    focus: bool = True,
 ) -> str:
-    return add_orchestrator_stack_pane(adapter, session, window, cwd=cwd)
+    return add_orchestrator_stack_pane(adapter, session, window, cwd=cwd, focus=focus)

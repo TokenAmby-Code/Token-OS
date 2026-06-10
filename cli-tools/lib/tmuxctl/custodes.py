@@ -32,6 +32,7 @@ DISPATCH_BIN = "dispatch"
 CLAUDE_CMD_BIN = "claude-cmd"
 
 CLAUDE_PROCESS_NEEDLES = ("claude",)
+AGENT_PROCESS_NEEDLES = ("claude", "codex")
 
 
 def _ensure_custodes_pane(adapter: TmuxAdapter, session: str) -> str:
@@ -90,13 +91,8 @@ def _process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
     return children, commands
 
 
-def pane_has_active_claude(pane_pid: int | None) -> bool:
-    """True if any descendant of pane_pid is a live claude process.
-
-    tmux's ``#{pane_current_command}`` returns the foreground process group
-    leader at the TTY — for panes launched via ``claude-wrapper.sh`` that is
-    bash, not claude. Walking the process tree is the canonical signal.
-    """
+def _pane_has_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> bool:
+    """True if any descendant of pane_pid command contains one of needles."""
     if not pane_pid:
         return False
     children, commands = _process_tree()
@@ -110,10 +106,30 @@ def pane_has_active_claude(pane_pid: int | None) -> bool:
             continue
         seen.add(pid)
         command = commands.get(pid, "")
-        if any(needle in command for needle in CLAUDE_PROCESS_NEEDLES):
+        if any(needle in command for needle in needles):
             return True
         stack.extend(children.get(pid, []))
     return False
+
+
+def pane_has_active_claude(pane_pid: int | None) -> bool:
+    """True if any descendant of pane_pid is a live claude process.
+
+    tmux's ``#{pane_current_command}`` returns the foreground process group
+    leader at the TTY — for panes launched via ``claude-wrapper.sh`` that is
+    bash, not claude. Walking the process tree is the canonical signal.
+    """
+    return _pane_has_active_process(pane_pid, CLAUDE_PROCESS_NEEDLES)
+
+
+def pane_has_active_agent(pane_pid: int | None) -> bool:
+    """True if any descendant of pane_pid is a live Claude or Codex process.
+
+    ``assert-instance`` is engine-neutral: a live Codex pane is a valid managed
+    runtime and must not be pruned/stopped just because the detector was written
+    originally for Claude-only persona panes.
+    """
+    return _pane_has_active_process(pane_pid, AGENT_PROCESS_NEEDLES)
 
 
 def _upsert_via_claude_cmd(pane_id: str, prompt: str) -> tuple[bool, str]:

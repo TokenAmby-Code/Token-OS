@@ -6,6 +6,8 @@ import time
 from .api import fetch_instance_registry
 from .tmux_adapter import TmuxAdapter
 
+SkillSinkKeys = tuple[str, ...]
+
 
 def normalize_agent(value: str | None) -> str:
     raw = (value or "").strip().lower()
@@ -32,8 +34,36 @@ def normalize_skill_name(skill: str) -> str:
     return name
 
 
-def skill_invocation_text(skill: str, agent: str | None) -> str:
-    return f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)} "
+def skill_invocation_text(
+    skill: str,
+    agent: str | None,
+    arguments: str | None = None,
+) -> str:
+    prefix = f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)}"
+    args = (arguments or "").strip()
+    return f"{prefix} {args}" if args else f"{prefix} "
+
+
+def codex_skill_sink_keys(agent: str | None) -> SkillSinkKeys:
+    """Keys needed after typing a skill invocation but before submit.
+
+    Codex accepts literal ``$skill`` text, but it does not reliably materialize
+    the skill chip until Tab/Enter. Tab is lower risk than Enter because it sinks
+    the skill without submitting arbitrary prompt text. Claude slash commands do
+    not need this and must not receive it.
+    """
+    return ("Tab",) if normalize_agent(agent) == "codex" else ()
+
+
+def looks_like_codex_skill_invocation(text: str) -> bool:
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("$"):
+        return False
+    parts = stripped[1:].split(None, 1)
+    if not parts:
+        return False
+    head = parts[0]
+    return bool(head) and all(ch.isalnum() or ch in {"-", "_"} for ch in head)
 
 
 def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
@@ -65,7 +95,17 @@ def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
     return "auto"
 
 
-def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "auto") -> str:
+def resolve_agent_for_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    requested: str = "auto",
+    *,
+    default: str = "claude",
+) -> str:
+    normalized_default = normalize_agent(default)
+    if normalized_default == "auto" and (default or "").strip().lower() != "auto":
+        raise ValueError("default must be one of: claude, codex, or auto")
+
     explicit = normalize_agent(requested)
     if explicit != "auto":
         return explicit
@@ -106,11 +146,16 @@ def resolve_agent_for_pane(adapter: TmuxAdapter, pane: str, requested: str = "au
     hinted_agent = normalize_agent(hinted)
     if hinted_agent != "auto":
         return hinted_agent
-    return "claude"
+    return normalized_default
 
 
 def insert_at_prompt_start(
-    adapter: TmuxAdapter, pane: str, text: str, *, settle_seconds: float = 0.05
+    adapter: TmuxAdapter,
+    pane: str,
+    text: str,
+    *,
+    settle_seconds: float = 0.05,
+    sink_keys: SkillSinkKeys = (),
 ) -> None:
     for _ in range(50):
         adapter.send_keys(pane, "PgUp")
@@ -118,6 +163,8 @@ def insert_at_prompt_start(
     if settle_seconds > 0:
         time.sleep(settle_seconds)
     adapter.run("send-keys", "-t", pane, "-l", text)
+    for key in sink_keys:
+        adapter.send_keys(pane, key)
     if settle_seconds > 0:
         time.sleep(settle_seconds)
     for _ in range(50):
@@ -131,9 +178,42 @@ def invoke_skill_in_pane(
     skill: str,
     *,
     agent: str = "auto",
+    arguments: str | None = None,
     settle_seconds: float = 0.05,
 ) -> str:
     resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
-    text = skill_invocation_text(skill, resolved_agent)
-    insert_at_prompt_start(adapter, pane, text, settle_seconds=settle_seconds)
+    text = skill_invocation_text(skill, resolved_agent, arguments)
+    insert_at_prompt_start(
+        adapter,
+        pane,
+        text,
+        settle_seconds=settle_seconds,
+        sink_keys=codex_skill_sink_keys(resolved_agent),
+    )
+    return text
+
+
+def send_skill_invocation_to_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    skill: str,
+    *,
+    agent: str = "auto",
+    arguments: str | None = None,
+    clear_prompt: bool = False,
+) -> str:
+    """Build a harness-correct skill invocation, send it, and submit it.
+
+    This is the generic automation primitive for systems that need to wake an
+    agent with a skill rather than prose instructions. Target resolution and the
+    universal send gate stay inside ``TmuxAdapter.send_text_then_submit``.
+    """
+    resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
+    text = skill_invocation_text(skill, resolved_agent, arguments)
+    adapter.send_text_then_submit(
+        pane,
+        text,
+        clear_prompt=clear_prompt,
+        pre_submit_keys=codex_skill_sink_keys(resolved_agent),
+    )
     return text

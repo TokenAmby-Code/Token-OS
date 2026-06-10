@@ -5,7 +5,15 @@
 """Compact timer status formatted for tmux status bar.
 
 Outputs a single segment with tmux color syntax (#[fg=...]).
-Designed for use in ~/.tmux.conf status-right/status-left.
+
+NOTE (2026-06, Phase 2-A1): this is no longer the LIVE status source. The status
+bar used to fork this script every status-interval (a blocking GET /api/timer over
+SMB on each render); Token-API's timer worker now pushes the same pre-formatted
+segment to the global tmux option @TIMER_SEG, which the bar reads in-format with
+zero fork. The formatting here is mirrored byte-for-byte by
+`_format_timer_status_segment()` in token-api/main.py (a test cross-checks both).
+This script is retained as a `--plain` debug/inspection tool and as the reference
+for that formatting — keep the two in sync if you change either.
 
 Usage:
     tmux-status              # Timer mode icon + balance, tmux-colored

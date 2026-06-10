@@ -77,6 +77,15 @@ def _rows_at_pane(db_path, pane):
     return rows
 
 
+def _row_by_id(db_path, instance_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT id, primarch FROM claude_instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
 # ── R-H1: persona pane-label singleton supplant ────────────────────────────────
 
 
@@ -100,6 +109,11 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+
+    async def live_instance_for_pane(pane):
+        return "stale-fg" if pane == "%fg" else None
+
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", live_instance_for_pane)
 
     async def run():
         return await hooks.handle_session_start(
@@ -155,9 +169,10 @@ def test_non_persona_pane_is_not_supplanted(app_env, monkeypatch):
 
     ids = {r[0] for r in _rows_at_pane(app_env.db_path, "%wk")}
     # No supplant: the stale non-persona row survives untouched and the new session
-    # registers as its own distinct row.
+    # registers as its own distinct row. New registrations no longer persist tmux_pane,
+    # so verify the new row by id rather than by pane.
     assert "stale-worker" in ids, "non-persona row must not be supplanted/migrated"
-    assert "new-worker" in ids, "new session must register as its own row"
+    assert _row_by_id(app_env.db_path, "new-worker") is not None, "new session must register"
 
 
 # ── R-H2: subscriber flag resolves the live pane over a dead id ─────────────────
@@ -176,6 +191,11 @@ def test_subscriber_flag_resolves_live_pane_over_dead_id(app_env, monkeypatch):
         return {"status": "sent", "operation": "fake"}
 
     monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    async def live_instance_for_pane(pane):
+        return "live-sub" if pane == "%sub" else None
+
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", live_instance_for_pane)
 
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
@@ -240,21 +260,23 @@ def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
     assert tts_voice == CUSTODES_PROFILE["wsl_voice"] == "Microsoft George"
     assert notification_sound == CUSTODES_PROFILE["notification_sound"]
 
-    # The SessionStart response drives the queued /color command (generic-hook.sh
-    # reads .cc_color). Custodes is a persona pane — its whole background is gold-
-    # tinted by tmux — so it takes cc_color=default (no foreground /color), not the
-    # random chapter colour it was assigned a moment before it was recognised.
+    # The SessionStart response carries display/chip/tint data only. Pane colour
+    # is applied by tmux style; no Claude slash-color command is emitted.
     assert result["profile"] == "custodes"
-    assert result["cc_color"] == CUSTODES_PROFILE["cc_color"] == "default"
+    assert "cc_color" not in result
     assert result["color"] == CUSTODES_PROFILE["color"]
+    assert result["chip_color"] == CUSTODES_PROFILE["chip_color"]
+    assert result["pane_tint"] == CUSTODES_PROFILE["pane_tint"]
 
 
 def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
     # FG (and every persona except Custodes) must register with NO voice — it never
-    # TTSes and never consumes a chapter voice slot — and take cc_color=default so
-    # its tmux-painted background carries its identity instead of a /color.
+    # TTSes and never consumes a chapter voice slot. Its tmux-painted background
+    # carries its identity; no Claude slash-color command is emitted.
     hooks = sys.modules["routes.hooks"]
-    from shared import FABRICATOR_PROFILE
+    from shared import profile_by_name
+
+    FABRICATOR_PROFILE = profile_by_name("fabricator-general")
 
     async def fg_label(_pane):
         return hooks.MECHANICUS_FG_LABEL  # "mechanicus:fabricator-general"
@@ -285,6 +307,7 @@ def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
     assert profile_name == FABRICATOR_PROFILE["name"] == "fabricator-general"
     assert tts_voice is None, "FG must hold no voice (frees a chapter voice slot)"
 
-    # Persona pane → no foreground /color; the response carries cc_color=default.
+    # Persona pane → no foreground slash-color; response carries tint data.
     assert result["profile"] == "fabricator-general"
-    assert result["cc_color"] == "default"
+    assert "cc_color" not in result
+    assert result["pane_tint"] == FABRICATOR_PROFILE["pane_tint"]

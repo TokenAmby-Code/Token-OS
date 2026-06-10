@@ -37,6 +37,10 @@ export function parseTmuxFields(line) {
   return String(line || '').split(TMUX_FIELD_SEP);
 }
 
+function normalizeBotName(botName) {
+  return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');
+}
+
 export function createVoiceManager(botClients, config, logger) {
   const guildId = config.guild_id;
   const operatorUserId = config.operator_user_id;
@@ -179,6 +183,7 @@ export function createVoiceManager(botClients, config, logger) {
   let onAudioFrame = null;
   let onAudioEnd = null;
   let onAudioCommit = null;
+  let onVoiceLeave = null;
   const SILENCE_PCM_20MS = Buffer.alloc(48000 / 50 * 2);
 
   function getBotState(botName) {
@@ -233,8 +238,11 @@ export function createVoiceManager(botClients, config, logger) {
         throw new Error(`Channel ${voiceChannelId} is not a voice channel`);
       }
 
-      // Destroy existing connection if any
-      if (state.connection) {
+      // Destroy existing connection if any through the same leave cleanup path
+      // used by auto-leave, VC hops, and manual disconnects.
+      if (connectionUsable(state)) {
+        await leaveChannel(botName, 'rejoin');
+      } else if (state.connection) {
         try { state.connection.destroy(); } catch {}
         state.connection = null;
       }
@@ -290,6 +298,7 @@ export function createVoiceManager(botClients, config, logger) {
   // Explicit commit after Discord silence. Audio itself is streamed live to
   // OpenAI Realtime; no local PCM chunk files are created.
   const SILENCE_COMMIT_MS = config.voice_silence_commit_ms ?? 700; // Wait after Discord silence before committing a turn.
+  const MIN_LOCAL_COMMIT_AUDIO_MS = config.voice_min_commit_audio_ms ?? 100;
 
   function subscribeToUser(botName, userId) {
     const state = getBotState(botName);
@@ -329,6 +338,21 @@ export function createVoiceManager(botClients, config, logger) {
     let bytesSinceCommit = 0;
     let silenceTimer = null;
     let lockedTmuxPane = null;
+    let suppressEndClose = false;
+
+    function currentRouteMeta(extra = {}) {
+      return {
+        routeEpoch: state.routeEpoch,
+        channelId: state.channelId,
+        lockedTmuxPane,
+        ...extra,
+      };
+    }
+
+    function downsampledDurationMs(bytes48kMonoS16) {
+      const downsampledBytes = Math.floor(Number(bytes48kMonoS16 || 0) / 2);
+      return (downsampledBytes / (24000 * 2)) * 1000;
+    }
 
     function commitPending(reason, extra = {}) {
       if (silenceTimer) {
@@ -336,14 +360,36 @@ export function createVoiceManager(botClients, config, logger) {
         silenceTimer = null;
       }
       if (!hasAudioSinceCommit) return false;
+      const audioMs = downsampledDurationMs(bytesSinceCommit);
+      if (audioMs < MIN_LOCAL_COMMIT_AUDIO_MS) {
+        logger.debug?.(
+          `Voice [${botName}]: skipping tiny realtime audio commit from ${userId} ` +
+          `(${Math.round(audioMs)}ms, ${bytesSinceCommit} bytes, reason=${reason})`
+        );
+        hasAudioSinceCommit = false;
+        bytesSinceCommit = 0;
+        lockedTmuxPane = null;
+        return false;
+      }
       logger.info(`Voice [${botName}]: committing realtime audio from ${userId} (${bytesSinceCommit} bytes, reason=${reason})`);
       if (onAudioCommit) {
-        try { onAudioCommit(userId, botName, { reason, lockedTmuxPane, ...extra }); } catch {}
+        try { onAudioCommit(userId, botName, currentRouteMeta({ reason, audioMs, ...extra })); } catch {}
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;
       lockedTmuxPane = null;
       return true;
+    }
+
+    function discardPending() {
+      suppressEndClose = true;
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+      hasAudioSinceCommit = false;
+      bytesSinceCommit = 0;
+      lockedTmuxPane = null;
     }
 
     function startSilenceTimer() {
@@ -363,18 +409,24 @@ export function createVoiceManager(botClients, config, logger) {
     });
 
     decoder.on('data', (chunk) => {
-      // First real audio frame of a local utterance: lock the active pane now.
+      // First real audio frame of a local utterance: only Cadia/Imperial Guard
+      // owns active-pane locks. Static persona bots must never receive or fall
+      // back to this Cadia pane.
       if (!hasAudioSinceCommit) {
-        lockedTmuxPane = resolveSelectedTmuxPane();
-        if (lockedTmuxPane) {
-          logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
+        if (normalizeBotName(botName) === 'imperial_guard') {
+          lockedTmuxPane = resolveSelectedTmuxPane();
+          if (lockedTmuxPane) {
+            logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
+          } else {
+            logger.warn(`Voice [${botName}]: no selected tmux pane lock for user ${userId}`);
+          }
         } else {
-          logger.warn(`Voice [${botName}]: no selected tmux pane lock for user ${userId}`);
+          lockedTmuxPane = null;
         }
       }
 
       if (onAudioFrame) {
-        try { onAudioFrame(userId, chunk, botName, { silence: false, lockedTmuxPane }); } catch {}
+        try { onAudioFrame(userId, chunk, botName, currentRouteMeta({ silence: false })); } catch {}
       }
       // Real audio arrived — cancel any pending silence commit.
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
@@ -390,7 +442,7 @@ export function createVoiceManager(botClients, config, logger) {
       if (silenceTimer) clearTimeout(silenceTimer);
       state.activeSubscriptions.delete(userId);
       commitPending('stream-end');
-      if (onAudioEnd) {
+      if (!suppressEndClose && onAudioEnd) {
         try { onAudioEnd(userId, botName); } catch {}
       }
     });
@@ -399,7 +451,7 @@ export function createVoiceManager(botClients, config, logger) {
       if (silenceTimer) clearTimeout(silenceTimer);
       logger.error(`Voice [${botName}]: decoder error for ${userId}: ${err.message}`);
       state.activeSubscriptions.delete(userId);
-      if (onAudioEnd) {
+      if (!suppressEndClose && onAudioEnd) {
         try { onAudioEnd(userId, botName); } catch {}
       }
     });
@@ -408,36 +460,55 @@ export function createVoiceManager(botClients, config, logger) {
       if (silenceTimer) clearTimeout(silenceTimer);
       logger.error(`Voice [${botName}]: stream error for ${userId}: ${err.message}`);
       state.activeSubscriptions.delete(userId);
-      if (onAudioEnd) {
+      if (!suppressEndClose && onAudioEnd) {
         try { onAudioEnd(userId, botName); } catch {}
       }
     });
 
-    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, commit: commitPending });
+    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, commit: commitPending, discard: discardPending });
   }
 
-  async function leaveChannel(botName = 'mechanicus') {
-    const state = getBotState(botName);
-    if (!connectionUsable(state)) return { left: false, reason: 'not connected' };
+  async function runVoiceLeaveCleanup(botName, meta = {}) {
+    if (!onVoiceLeave) return;
+    try {
+      await onVoiceLeave(botName, meta);
+    } catch (err) {
+      logger.warn(`Voice [${botName}]: leave cleanup failed: ${err.message}`);
+    }
+  }
 
-    // Commit any pending realtime audio before destroying subscriptions.
+  function cleanupActiveSubscriptions(state, botName, reason, { commit = true } = {}) {
+    // Normal stop may commit pending audio. VC leave/hop discards it: the
+    // operator has moved away, and stale transcripts must not land afterward.
     for (const [userId, sub] of state.activeSubscriptions) {
-      if (sub.commit) {
-        try { sub.commit('leave'); } catch {}
+      if (commit && sub.commit) {
+        try { sub.commit(reason); } catch {}
+      } else if (sub.discard) {
+        try { sub.discard(); } catch {}
       }
       try { sub.stream.destroy(); } catch {}
       try { sub.decoder.destroy(); } catch {}
     }
     state.activeSubscriptions.clear();
+  }
+
+  async function leaveChannel(botName = 'mechanicus', reason = 'manual') {
+    const state = getBotState(botName);
+    const leftChannel = state.channelId;
+    if (!connectionUsable(state)) {
+      return { left: false, reason: 'not connected', channelId: leftChannel, botName };
+    }
+
+    cleanupActiveSubscriptions(state, botName, reason, { commit: false });
 
     try { state.connection.destroy(); } catch (err) { logger.warn(`Voice [${botName}]: destroy during leave ignored: ${err.message}`); }
     state.connection = null;
     state.listening = false;
-    const leftChannel = state.channelId;
     state.channelId = null;
 
-    logger.info(`Voice [${botName}]: left channel ${leftChannel}`);
-    return { left: true, channelId: leftChannel, botName };
+    logger.info(`Voice [${botName}]: left channel ${leftChannel} (${reason})`);
+    await runVoiceLeaveCleanup(botName, { channelId: leftChannel, reason, left: true, botName });
+    return { left: true, channelId: leftChannel, botName, reason };
   }
 
   function startListening(botName = 'mechanicus') {
@@ -475,6 +546,7 @@ export function createVoiceManager(botClients, config, logger) {
         listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
         connectionState: state.connection?.state?.status || 'disconnected',
+        routeEpoch: state.routeEpoch,
       };
     }
     // Return all bots' status
@@ -490,6 +562,7 @@ export function createVoiceManager(botClients, config, logger) {
         listening: state.listening,
         activeListeners: state.activeSubscriptions.size,
         connectionState: state.connection?.state?.status || 'disconnected',
+        routeEpoch: state.routeEpoch,
       };
     }
     // Include configured but not-yet-connected bots
@@ -501,6 +574,7 @@ export function createVoiceManager(botClients, config, logger) {
           listening: false,
           activeListeners: 0,
           connectionState: 'disconnected',
+          routeEpoch: 0,
           assignedChannel: voiceChannels[name],
         };
       }
@@ -577,7 +651,15 @@ export function createVoiceManager(botClients, config, logger) {
           `Voice auto-join [${botName}]: stale join completed for ${channelId}; ` +
           `operator now in ${operatorVoiceChannelId || 'none'}, leaving immediately`
         );
-        await leaveChannel(botName);
+        const left = await leaveChannel(botName, 'stale-join');
+        if (!left.left) {
+          await runVoiceLeaveCleanup(botName, {
+            channelId,
+            reason: 'stale-join-invalidation',
+            left: false,
+            botName,
+          });
+        }
         return;
       }
       startListening(botName);
@@ -587,7 +669,7 @@ export function createVoiceManager(botClients, config, logger) {
     }
   }
 
-  async function leaveBotNow(botName, reason) {
+  async function leaveBotNow(botName, reason, expectedChannelId = null) {
     const state = getBotState(botName);
     state.routeEpoch += 1;
     if (state.leaveTimer) {
@@ -598,11 +680,19 @@ export function createVoiceManager(botClients, config, logger) {
       if (state.joining) {
         logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
       }
+      logger.info(`Voice auto-join [${botName}]: running leave cleanup without live connection (${reason})`);
+      await runVoiceLeaveCleanup(botName, {
+        channelId: state.channelId || expectedChannelId,
+        reason,
+        left: false,
+        invalidatedJoin: true,
+        botName,
+      });
       return;
     }
     logger.info(`Voice auto-join [${botName}]: leaving immediately (${reason})`);
     try {
-      await leaveChannel(botName);
+      await leaveChannel(botName, reason);
     } catch (err) {
       logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
     }
@@ -611,8 +701,23 @@ export function createVoiceManager(botClients, config, logger) {
   function scheduleBotLeave(botName, channelId, reason) {
     const state = getBotState(botName);
     state.routeEpoch += 1;
+    const invalidatedEpoch = state.routeEpoch;
     const graceMs = Number(config.voice_auto_leave_grace_ms ?? 5000);
     if (state.leaveTimer) clearTimeout(state.leaveTimer);
+
+    // Leave intent cleanup is immediate. The Discord connection may stay alive
+    // for grace, but drafts, overlays, Realtime sessions, and pending audio are stale now.
+    cleanupActiveSubscriptions(state, botName, reason, { commit: false });
+    state.listening = false;
+    void runVoiceLeaveCleanup(botName, {
+      channelId,
+      reason,
+      left: false,
+      intent: 'leave',
+      routeEpoch: invalidatedEpoch,
+      botName,
+    });
+
     if (!connectionUsable(state)) {
       if (state.joining) {
         logger.info(`Voice auto-join [${botName}]: invalidated in-flight join (${reason})`);
@@ -624,7 +729,7 @@ export function createVoiceManager(botClients, config, logger) {
       state.leaveTimer = null;
       if (!connectionUsable(state)) return;
       try {
-        await leaveChannel(botName);
+        await leaveChannel(botName, reason);
       } catch (err) {
         logger.error(`Voice auto-join [${botName}]: failed to leave: ${err.message}`);
       }
@@ -634,40 +739,51 @@ export function createVoiceManager(botClients, config, logger) {
   async function syncAutoJoinForOperatorChannel(trigger, { immediateLeave = false } = {}) {
     const desiredBotName = botNameForChannel(operatorVoiceChannelId);
 
+    // Invalidate/cleanup non-current bots before starting any new join. This
+    // makes VC hops deterministic even if Discord omits oldState.channelId or
+    // voice_channels object order has the new bot first.
     for (const [botName, channelId] of Object.entries(voiceChannels)) {
-      const state = getBotState(botName);
       const desired = desiredBotName === botName;
-
-      if (desired) {
-        if (state.leaveTimer) {
-          clearTimeout(state.leaveTimer);
-          state.leaveTimer = null;
-        }
-        if (connectionUsable(state) && state.channelId === channelId) {
-          logger.debug(`Voice auto-join [${botName}]: already connected to current channel (${trigger})`);
-          continue;
-        }
-        if (state.joining) {
-          logger.debug(`Voice auto-join [${botName}]: already joining current channel (${trigger})`);
-          continue;
-        }
-        state.routeEpoch += 1;
-        const routeEpoch = state.routeEpoch;
-        logger.info(`Voice auto-join [${botName}]: operator joined ${channelId}, following... (${trigger})`);
-        void joinAndListenIfCurrent(botName, channelId, routeEpoch);
-        continue;
-      }
-
+      if (desired) continue;
+      const state = getBotState(botName);
       const connectedElsewhere = connectionUsable(state);
       const joiningElsewhere = state.joining;
       if (!connectedElsewhere && !joiningElsewhere) continue;
 
       if (immediateLeave || operatorVoiceChannelId) {
-        void leaveBotNow(botName, `operator in ${operatorVoiceChannelId || 'no assigned channel'} via ${trigger}`);
+        await leaveBotNow(botName, `operator in ${operatorVoiceChannelId || 'no assigned channel'} via ${trigger}`);
       } else {
         scheduleBotLeave(botName, channelId, trigger);
       }
     }
+
+    if (!desiredBotName) return;
+
+    const channelId = voiceChannels[desiredBotName];
+    const state = getBotState(desiredBotName);
+    if (state.leaveTimer) {
+      clearTimeout(state.leaveTimer);
+      state.leaveTimer = null;
+    }
+    if (connectionUsable(state) && state.channelId === channelId) {
+      logger.debug(`Voice auto-join [${desiredBotName}]: already connected to current channel (${trigger})`);
+      return;
+    }
+    if (state.joining) {
+      logger.debug(`Voice auto-join [${desiredBotName}]: already joining current channel (${trigger})`);
+      return;
+    }
+    state.routeEpoch += 1;
+    const routeEpoch = state.routeEpoch;
+    logger.info(`Voice auto-join [${desiredBotName}]: operator joined ${channelId}, following... (${trigger})`);
+    void joinAndListenIfCurrent(desiredBotName, channelId, routeEpoch);
+  }
+
+  async function leaveBotForChannel(channelId, reason) {
+    const botName = botNameForChannel(channelId);
+    if (!botName) return false;
+    await leaveBotNow(botName, reason, channelId);
+    return true;
   }
 
   /**
@@ -701,6 +817,7 @@ export function createVoiceManager(botClients, config, logger) {
       const joinedChannel = newState.channelId;
       const leftChannel = oldState.channelId;
       const previousChannel = operatorVoiceChannelId;
+      const explicitChannelSwitch = Boolean(leftChannel && joinedChannel && leftChannel !== joinedChannel);
 
       // Treat "joined a different VC" as a hop even when Discord did not give
       // the expected oldState channel. This covers hot swaps and cache misses.
@@ -720,6 +837,10 @@ export function createVoiceManager(botClients, config, logger) {
         `Voice auto-join: operator voice update left=${leftChannel || 'none'} ` +
         `joined=${joinedChannel || 'none'} previous=${previousChannel || 'none'} hop=${isHop}`
       );
+
+      if (explicitChannelSwitch) {
+        await leaveBotForChannel(leftChannel, `explicit-vc-hop ${leftChannel}->${joinedChannel}`);
+      }
 
       await syncAutoJoinForOperatorChannel(isHop ? 'vc-hop' : 'voice-state-update', {
         immediateLeave: isHop || Boolean(joinedChannel),
@@ -929,6 +1050,7 @@ export function createVoiceManager(botClients, config, logger) {
     setAudioFrameCallback(cb) { onAudioFrame = cb; },
     setAudioEndCallback(cb) { onAudioEnd = cb; },
     setAudioCommitCallback(cb) { onAudioCommit = cb; },
+    setVoiceLeaveCallback(cb) { onVoiceLeave = cb; },
     reconcileOperatorVoiceState,
   };
 }

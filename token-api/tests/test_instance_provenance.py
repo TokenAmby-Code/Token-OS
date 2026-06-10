@@ -152,6 +152,29 @@ class TestProvenance:
         assert latest["write_source"] == "api"
         assert latest["actor"] == "assign-doc"
 
+    def test_activity_reactivation_clears_stopped_at(self, client: Any, app_env: Any) -> None:
+        instance_id = _session_start(client)
+        conn = _db(app_env)
+        conn.execute(
+            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            ("2026-06-09T10:00:00", instance_id),
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.post(
+            f"/api/instances/{instance_id}/activity", json={"action": "prompt_submit"}
+        )
+        assert resp.status_code == 200, resp.text
+
+        conn = _db(app_env)
+        row = conn.execute(
+            "SELECT status, stopped_at FROM claude_instances WHERE id = ?", (instance_id,)
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "processing"
+        assert row["stopped_at"] is None
+
 
 class TestReconciliation:
     def test_clean_instance_returns_clean(self, client):

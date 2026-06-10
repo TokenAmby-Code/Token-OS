@@ -217,7 +217,7 @@ Local verification completed:
 
 Residual issue:
 
-- `tests/test_voice_pool.py` pure unit section passes through the linear-probe tests
+- `tests/test_voice_pool.py` pure unit section covers persona assignment ordering
 - its API integration section hangs in the registration flow under test harness execution
 - this appears separate from schema parity and should be checked independently
 

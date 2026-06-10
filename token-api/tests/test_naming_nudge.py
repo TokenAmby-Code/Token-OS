@@ -194,7 +194,7 @@ async def test_naming_nudge_sends_for_numbered_placeholder(app_env, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_naming_nudge_doc_less_instance_uses_instance_name_message(app_env, monkeypatch):
+async def test_naming_nudge_doc_less_instance_uses_instance_name_message(app_env, monkeypatch) -> None:
     """A placeholder-named instance with NO session doc must be told to run
     `instance-name` (it owns its pane name directly), not `session-doc-name`."""
     _insert_instance(app_env.db_path, tab_name="needs-name", session_doc_id=None)
@@ -227,7 +227,7 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(app_env
 
     event = _fetchone(
         app_env.db_path,
-        "SELECT event_type FROM events WHERE instance_id = 'inst-naming'",
+        "SELECT event_type FROM events WHERE instance_id = 'inst-naming' AND event_type = 'naming_nudge_sent'",
     )
     assert event["event_type"] == "naming_nudge_sent"
 

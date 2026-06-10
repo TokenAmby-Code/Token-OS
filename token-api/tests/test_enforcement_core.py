@@ -980,6 +980,96 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     assert details["tmux_pane"] == "%132"
 
 
+@pytest.mark.asyncio
+async def test_golden_throne_instance_gone_marks_quiet_edge_handled(app_env, monkeypatch):
+    scheduled = []
+
+    async def fake_schedule(instance, reason="stop_hook"):
+        scheduled.append((instance["id"], reason))
+        return {"scheduled": True, "reason": reason}
+
+    monkeypatch.setattr(app_env.main, "schedule_golden_throne_followup", fake_schedule)
+
+    now = datetime.now() - timedelta(minutes=5)
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO claude_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status,
+            instance_type, engine, zealotry, tmux_pane, stopped_at, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "gt-instance-gone",
+            "gt-instance-gone",
+            "GT Instance Gone",
+            "/tmp",
+            "local",
+            "Mac-Mini",
+            "stopped",
+            "golden_throne",
+            "codex",
+            10,
+            "%404",
+            now.isoformat(),
+            now.isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    await app_env.main._golden_throne_handle_instance_gone("gt-instance-gone", "codex")
+
+    row = _rows(
+        app_env.db_path,
+        "SELECT stopped_at, gt_last_resume_at FROM claude_instances WHERE id = ?",
+        ("gt-instance-gone",),
+    )[0]
+    assert row["gt_last_resume_at"] == row["stopped_at"]
+
+    recovered = await app_env.main.recover_recent_stopped_golden_throne_timers(
+        lookback_minutes=30,
+    )
+
+    assert scheduled == []
+    assert recovered == []
+
+
+@pytest.mark.asyncio
+async def test_golden_throne_followup_skips_disabled_row_before_rubric(app_env, monkeypatch):
+    async def fail_if_rubric_read(instance):
+        raise AssertionError("disabled GT rows must not read rubric or dispatch")
+
+    monkeypatch.setattr(app_env.main, "_read_instance_session_doc_rubric", fail_if_rubric_read)
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO claude_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status,
+            instance_type, engine, zealotry, tmux_pane, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "gt-disabled-before-fire",
+            "gt-disabled-before-fire",
+            "GT Disabled",
+            "/tmp",
+            "local",
+            "Mac-Mini",
+            "stopped",
+            "one_off",
+            "codex",
+            0,
+            "%405",
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    await app_env.main.golden_throne_followup("gt-disabled-before-fire")
+
+    events = _rows(app_env.db_path, "SELECT event_type FROM events ORDER BY id")
+    assert [row["event_type"] for row in events] == []
+
+
 def test_pavlok_guardrails_drop_cap_cooldown_keep_quiet_and_contexts(app_env):
     """Cap + cooldown removed per Enforcement Dedup Removal; context guards kept."""
     fixed = datetime(2026, 5, 1, 14, 0, 0)

@@ -8,6 +8,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.stack import (
     STACK_COLLAPSED_HEIGHT,
+    add_stack_pane,
     dispatch_stack_command,
     enforce_stack_layout,
     focus_selected,
@@ -276,6 +277,30 @@ def test_stack_dispatch_reuses_lowest_available_worker_id():
     )
 
     assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
+
+
+def test_stack_add_no_focus_allocates_worker_without_selecting_it():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+
+    pane = add_stack_pane(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "legion",
+        cwd="/tmp",
+        focus=False,
+    )
+
+    assert pane == "%N"
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_TYPE", "stack-worker") in adapter.commands
+    assert not any(
+        command[0] == "select-pane" and "-T" not in command for command in adapter.commands
+    )
+    assert "@STACK_FOCUSED_PANE" not in adapter.window_options
 
 
 def test_mechanicus_stack_dispatch_no_focus_does_not_select_worker():

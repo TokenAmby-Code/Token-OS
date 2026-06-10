@@ -66,10 +66,19 @@ agents-db --json instances       # JSON output
 
 ## Key Tables
 
-### claude_instances
-Core instance registry. This remains the source of truth for live instance state,
-but sanctioned writes now flow through the `instance_mutation.py` helper so
-provenance and reconciliation can reason about drift. Key columns:
+### instances
+Canonical instance registry v2. This is the replacement registry for new/updated
+rows and deliberately stores **no tmux runtime identity**: no raw `tmux_pane`, no
+`pane_label`/`@PANE_ID`, and no dispatch window/slot/target coordinates. Token-API
+asks tmuxctl (`resolve-instance` / live pane stamps) whenever it needs runtime pane
+resolution. Do not add tmux IDs back to this table.
+
+### claude_instances (deprecated compatibility)
+Legacy compatibility table while call sites are retired. It is no longer the source
+of truth for tmux pane binding, and sanctioned writes strip tmux runtime fields
+before persisting. Non-runtime instance state is mirrored into `instances` by
+`instance_mutation.py`. Historical stale tmux columns may exist only as migration
+debt. Key legacy columns:
 - `id` - Instance UUID
 - `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
 - `working_dir` - Instance working directory
@@ -77,12 +86,11 @@ provenance and reconciliation can reason about drift. Key columns:
 - `last_activity` - heartbeat timestamp used for stale detection and reconciliation ordering
 - `device_id` - runtime host identity, e.g. `Mac-Mini`, `Token-S24`
 - `is_subagent` - 1 if spawned headlessly or as a background worker
-- `tmux_pane` - pane projection target for `@CC_STATE` and legion tint
 - `legion` / `synced` / `input_lock` - high-frequency control-plane fields now covered by provenance
 - `tts_mode` / `tts_voice` / `notification_sound` - per-instance voice and mute state
 - `session_doc_id` / `session_doc_policy` / `continuity_binding_source` - active continuity binding
 - `workflow_state` / `workflow_updated_at` / `stop_allowed` / `next_required_action` - coarse workflow state
-- `dispatch_target` / `dispatch_window` / `dispatch_mode` / `dispatch_slot` - dispatch identity
+- `dispatch_mode` - dispatch launch mode; target/window/slot coordinates are deprecated runtime fields
 - `instance_type` / `follow_up_sop` / `zealotry` / `victory_at` / `victory_reason` - lifecycle + follow-up controls
 - `discord_hosted` / `discord_channel` / `transplant_target_session` - operator linkage and transplant handoff state
 - `wrapper_launch_id` - wrapper ingress correlation key when present
@@ -423,28 +431,22 @@ token-ping notify/test           # or: curl -s http://localhost:7777/api/notify/
 
 **Testing TTS:** After running a TTS test, sleep for ~10 seconds before continuing so the user can confirm whether they heard sound and/or speech.
 
-## Profile System
+## Persona Registry
 
-### Voice Pool (9 foreign accents + 3 fallback)
+The `personas` SQLite table is the runtime authority for display identity,
+chip color, pane tint, TTS voice/rate, notification sound, and assignment
+order. Astartes instances receive the first unlocked seeded Astartes persona
+in assignment order; active `processing`/`idle` rows lock their persona, and
+stopped rows release it. `claude_instances.profile_name` temporarily stores the
+persona slug until the instances-table refactor adds first-class `persona_id`.
 
-Voices assigned via **random-start linear probe** (open addressing): one random call per slot, increment on collision. Only active instances (`processing`/`idle`) hold a voice — stopped instances release theirs.
+Manual `/api/instances/{id}/voice` changes are persona changes: the requested
+voice must map to a seeded Astartes persona, `profile_name` and TTS fields are
+updated together, and another active instance is never bumped by voice.
 
-**Primary pool** (foreign accents, distinct and identifiable):
-
-| Profile | WSL Voice | Mac Fallback | Region | Sound |
-|---------|-----------|-------------|--------|-------|
-| profile_1 | Microsoft George | Daniel | UK M | chimes.wav |
-| profile_2 | Microsoft Susan | Karen | UK F | notify.wav |
-| profile_3 | Microsoft Catherine | Karen | AU F | ding.wav |
-| profile_4 | Microsoft James | Daniel | AU M | tada.wav |
-| profile_5 | Microsoft Sean | Moira | IE M | chord.wav |
-| profile_6 | Microsoft Hazel | Moira | IE F | recycle.wav |
-| profile_7 | Microsoft Heera | Rishi | IN F | chimes.wav |
-| profile_8 | Microsoft Ravi | Rishi | IN M | notify.wav |
-| profile_9 | Microsoft Linda | Karen | CA F | ding.wav |
-
-**Fallback pool** (US English, used when primary is exhausted):
-- David, Zira, Mark → less distinct, but functional
+Custodes is a singleton persona with reserved George TTS. Fabricator-General,
+Administratum, Inquisitor, and Primarch personas are silent (`tts_voice NULL`)
+unless explicitly changed in the seeded registry.
 
 ## Provenance And Reconciliation
 

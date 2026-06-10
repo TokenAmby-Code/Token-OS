@@ -16,6 +16,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
   const language = config.realtime_language || config.language || 'en';
   const prompt = config.realtime_prompt || config.prompt || '';
   const vad = config.realtime_vad || {};
+  const minCommitAudioMs = config.realtime_min_commit_audio_ms ?? config.voice_min_commit_audio_ms ?? 100;
   const sessions = new Map();
 
   function keyFor(botName, userId) {
@@ -51,6 +52,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       pendingCommitMeta: null,
       lastCommitMeta: null,
       lockedTmuxPane: null,
+      routeEpoch: null,
+      channelId: null,
       committed: false,
       cleanupTimer: null,
     };
@@ -87,6 +90,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     });
 
     ws.on('message', (raw) => {
+      if (session.closed) return;
       let event;
       try {
         event = JSON.parse(raw.toString());
@@ -186,6 +190,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           firstDeltaAt: session.lastDeltaAt,
           commitMeta: session.lastCommitMeta || null,
           lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || session.lockedTmuxPane || null,
+          routeEpoch: session.lastCommitMeta?.routeEpoch ?? session.routeEpoch ?? null,
+          channelId: session.lastCommitMeta?.channelId ?? session.channelId ?? null,
         });
         scheduleCleanup(session, 1000, 'completed');
       }
@@ -269,6 +275,8 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     const session = getSession(botName, userId);
     if (!session || session.closed) return;
     if (meta?.lockedTmuxPane) session.lockedTmuxPane = meta.lockedTmuxPane;
+    if (meta?.routeEpoch !== undefined) session.routeEpoch = meta.routeEpoch;
+    if (meta?.channelId !== undefined) session.channelId = meta.channelId;
     const audio = downsample48kTo24k(session, pcmChunk);
     if (!audio || audio.length === 0) return;
     if (!session.ready) {
@@ -279,9 +287,31 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     appendAudio(session, audio);
   }
 
+  function audioMsForBytes(bytes) {
+    return (Number(bytes || 0) / (24000 * 2)) * 1000;
+  }
+
+  function pendingAudioBytes(session) {
+    return session.pendingAudio.reduce((total, chunk) => total + chunk.length, 0);
+  }
+
+  function totalBufferedAudioMs(session) {
+    return audioMsForBytes(session.appendedBytes + pendingAudioBytes(session));
+  }
+
   function commitUser(userId, botName, meta = {}) {
     const session = sessions.get(keyFor(botName, userId));
     if (!session || session.closed) return false;
+    if (session.committed) return false;
+    const bufferedMs = totalBufferedAudioMs(session);
+    if (bufferedMs < minCommitAudioMs) {
+      logger.debug?.(
+        `Realtime [${botName}]: skipping tiny commit for user ${userId} ` +
+        `(${Math.round(bufferedMs)}ms, reason=${meta.reason || 'manual'})`
+      );
+      cleanupSession(session);
+      return false;
+    }
     if (!session.ready) {
       if (session.pendingAudio.length > 0 || session.appendedFrames > 0) {
         session.pendingCommitMeta = meta;
@@ -294,11 +324,13 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       return false;
     }
     if (session.appendedFrames === 0) return false;
-    session.lastCommitMeta = meta || {};
+    session.lastCommitMeta = { ...(meta || {}) };
+    if (session.lastCommitMeta.routeEpoch === undefined && session.routeEpoch !== null) session.lastCommitMeta.routeEpoch = session.routeEpoch;
+    if (session.lastCommitMeta.channelId === undefined && session.channelId !== null) session.lastCommitMeta.channelId = session.channelId;
     session.committed = true;
     logger.info(
       `Realtime [${botName}]: committing audio for user ${userId} ` +
-      `(${session.appendedFrames} frames, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
+      `(${session.appendedFrames} frames, ${Math.round(bufferedMs)}ms, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
     );
     return send(session, { type: 'input_audio_buffer.commit' });
   }
@@ -331,11 +363,24 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     for (const key of sessions.keys()) cleanupSession(key);
   }
 
+  function dropBot(botName) {
+    let dropped = 0;
+    for (const [key, session] of [...sessions.entries()]) {
+      if (session.botName !== botName) continue;
+      cleanupSession(session);
+      dropped += 1;
+      logger.info(`Realtime [${botName}]: dropped session for user ${session.userId}`);
+      if (sessions.has(key)) sessions.delete(key);
+    }
+    return dropped;
+  }
+
   return {
     appendPCM,
     commitUser,
     closeUser,
     closeAll,
+    dropBot,
     getStatus() {
       const out = {};
       for (const [key, session] of sessions) {

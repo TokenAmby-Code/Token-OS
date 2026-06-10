@@ -288,6 +288,22 @@ async function main() {
   voiceManager.setAudioCommitCallback((userId, botName, meta) => {
     return transcriber.commitUser?.(userId, botName, meta);
   });
+  voiceManager.setVoiceLeaveCallback(async (botName, meta = {}) => {
+    const droppedSessions = transcriber.dropBot?.(botName) || 0;
+    if (droppedSessions) {
+      logger.info(
+        `Voice [${botName}]: dropped ${droppedSessions} realtime session(s) on leave ` +
+        `(${meta.reason || 'unknown'})`
+      );
+    }
+    const cleared = await voiceTranscriptRouter.clear({ bot: botName });
+    if (cleared.length) {
+      logger.info(
+        `Voice [${botName}]: cleared ${cleared.length} transcript draft(s) on leave ` +
+        `(${meta.reason || 'unknown'})`
+      );
+    }
+  });
 
   // Route voice transcripts directly to tmux. Persona panes have stable
   // @PANE_ID roles and Cadia/Imperial Guard already carries a locked live pane,
@@ -304,7 +320,7 @@ async function main() {
         botLabel,
       });
       logger.info(`Transcription [${botLabel}]: tmux route ${JSON.stringify(routed)}`);
-      if (routed && routed.routed === false && routed.reason) {
+      if (routed && routed.routed === false && routed.reason && !routed.ignored) {
         try {
           await voiceManager.playTTS(`Voice route failed: ${routed.reason}`, botLabel);
         } catch {}
