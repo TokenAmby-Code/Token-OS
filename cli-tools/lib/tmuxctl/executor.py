@@ -431,7 +431,7 @@ done
     def _token_os_dir(self) -> Path:
         imperium = os.environ.get("IMPERIUM")
         if imperium:
-            return Path(imperium) / "Token-OS"
+            return Path(imperium) / "runtimes" / "token-os" / "live"
         return Path(__file__).resolve().parents[3]
 
     def _resolve_optional_pane(self, target: str) -> str:

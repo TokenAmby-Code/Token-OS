@@ -46,7 +46,7 @@ _PROMPTS_DIR = str(Path.home() / ".claude" / "prompts")
 # claude, openclaw, and homebrew tools are reachable.
 _HOME = str(Path.home())
 _EXTRA_PATHS = [
-    f"{_HOME}/Token-OS/cli-tools/bin",
+    "/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin",
     f"{_HOME}/.local/bin",
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",

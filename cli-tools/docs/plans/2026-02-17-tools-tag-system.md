@@ -577,13 +577,13 @@ git commit -m "feat(tools): grouped display with tag filtering and name search"
 ~/ProcAgentDir:
   tags: [deploy, db, git, pr, worktree, instance, workflow, system]
 
-/Volumes/Imperium/Scripts/token-api:
+/Volumes/Imperium/runtimes/token-os/live/token-api:
   tags: [token-api, deploy, instance]
 
-/Volumes/Imperium/Scripts/mobile:
+/Volumes/Imperium/runtimes/token-os/live/mobile:
   tags: [mobile, macrodroid]
 
-/Volumes/Imperium/Scripts/cli-tools:
+/Volumes/Imperium/runtimes/token-os/live/cli-tools:
   tags: [all]
 
 ~/Scripts:
@@ -686,12 +686,12 @@ Note: Since this uses `local` inside the main script body, the `--dir` block sho
 **Step 2: Verify**
 
 ```bash
-bin/tools --agent --dir /Volumes/Imperium/Scripts/token-api
+bin/tools --agent --dir /Volumes/Imperium/runtimes/token-os/live/token-api
 ```
 Expected: tools tagged `token-api`, `deploy`, `instance` — no human-only tools.
 
 ```bash
-bin/tools --human --dir /Volumes/Imperium/Scripts/cli-tools
+bin/tools --human --dir /Volumes/Imperium/runtimes/token-os/live/cli-tools
 ```
 Expected: all tools (the `all` tag).
 
@@ -801,8 +801,8 @@ bin/tools timer
 
 # Directory mode
 bin/tools --agent --dir ~/ProcAgentDir
-bin/tools --agent --dir /Volumes/Imperium/Scripts/token-api
-bin/tools --agent --dir /Volumes/Imperium/Scripts/mobile
+bin/tools --agent --dir /Volumes/Imperium/runtimes/token-os/live/token-api
+bin/tools --agent --dir /Volumes/Imperium/runtimes/token-os/live/mobile
 
 # Help
 bin/tools --help

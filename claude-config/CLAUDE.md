@@ -8,10 +8,10 @@ All source code, vaults, and project data live on the NAS (`Token-NAS`, `192.168
 
 | Volume | Mac Mount | WSL Mount | Encryption | Contents |
 |--------|-----------|-----------|-----------|----------|
-| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Imperium-ENV vault, Scripts/, CLI tools, Plans |
+| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Imperium-ENV vault, Token-OS runtime, CLI tools, Plans |
 | **Civic** | `/Volumes/Civic` | `/mnt/civic` | AES-256 | Pax-ENV vault, ProcurementAgentAI, Civic work projects |
 
-Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `Scripts/cli-tools/lib/nas-path.sh`.
+Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `$IMPERIUM/runtimes/token-os/live/cli-tools/lib/nas-path.sh`.
 
 **Naming:** Civic Initiatives (company) > askCivic (AI service) > Pax (AI agent). Volumes are named after the org.
 
@@ -19,7 +19,7 @@ Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `Scrip
 
 **Before NAS-dependent work**, verify mounts are live:
 ```bash
-ls "$IMPERIUM/Token-OS/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED"
+ls "$IMPERIUM/runtimes/token-os/live/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED"
 ls "$CIVIC/" > /dev/null 2>&1 && echo "ok" || echo "NOT MOUNTED or LOCKED"
 ```
 If a mount is down, inform the user — do not attempt to remount (requires sudo).
@@ -86,7 +86,7 @@ confirm behavior is preserved. Don't mark a task complete without verification.
 
 Use tasks for anything with 3+ steps or that involves multiple files.
 
-## CLI Tools (`$IMPERIUM/Token-OS/cli-tools/bin/`)
+## CLI Tools (`$IMPERIUM/runtimes/token-os/live/cli-tools/bin/`)
 
 | Command | Purpose |
 |---------|---------|
@@ -197,7 +197,7 @@ Projects have their own CLAUDE.md files with project-specific guidance. Claude l
 
 Key projects:
 - `$CIVIC/ProcurementAgentAI/CLAUDE.md` - Main project (architecture + CLI tool docs)
-- `$IMPERIUM/Token-OS/token-api/CLAUDE.md` - Token-API server
-- `$IMPERIUM/Token-OS/mobile/CLAUDE.md` - Mobile/MacroDroid tools
+- `$IMPERIUM/runtimes/token-os/live/token-api/CLAUDE.md` - Token-API server
+- `$IMPERIUM/runtimes/token-os/live/mobile/CLAUDE.md` - Mobile/MacroDroid tools
 - `$IMPERIUM/Imperium-ENV/CLAUDE.md` - Primary Obsidian vault (Imperium)
 - `$CIVIC/Pax-ENV/CLAUDE.md` - Work Obsidian vault (obsidian-cli docs live here)

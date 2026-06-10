@@ -3,7 +3,7 @@
 **Location**: `/Volumes/Imperium/runtimes/token-os/live/` (deploy-owned runtime checkout — read-only for agents)
 **Purpose**: Generic utility scripts, tools, and services
 **Last Updated**: 2026-06-10
-**Status**: Protected-main/local-CD topology (2026-06-10). Main syncs ff-only via the bare skeleton `/Volumes/Imperium/token-os.git`; services run from the detached runtime checkout above. **All agent work happens in branch worktrees under `~/worktrees/Token-OS/wt-<branch>`** (use `worktree-setup <branch> --project Token-OS` or `dispatch --worktree <branch>`). Never edit the runtime checkout — a dirty runtime aborts deploys. The old working checkout `/Volumes/Imperium/Token-OS` is archived; do not resurrect or push from it.
+**Status**: Protected-main/local-CD topology (2026-06-10). Main syncs ff-only via the bare skeleton `/Volumes/Imperium/token-os.git`; services run from the detached runtime checkout above. **All agent work happens in branch worktrees under `~/worktrees/Token-OS/wt-<branch>`** (use `worktree-setup <branch> --project Token-OS` or `dispatch --worktree <branch>`). Never edit the runtime checkout — a dirty runtime aborts deploys. The old working checkout (the pre-cutover `Token-OS` tree) is archived as `Token-OS.legacy-20260610`; do not resurrect or push from it.
 
 ## Structure
 
@@ -79,7 +79,7 @@ Standalone Discord WebSocket daemon (discord.js v14) replacing OpenClaw's Discor
 ## Verification After Move
 
 **Completed 2026-02-15**:
-- [x] Scripts exist at /Volumes/Imperium/Scripts
+- [x] Scripts exist at /Volumes/Imperium/runtimes/token-os/live
 - [x] Executable permissions preserved
 - [x] Token API running from new location (port 7777)
 - [x] Cron jobs updated with new paths

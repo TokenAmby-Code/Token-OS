@@ -23,7 +23,7 @@ class TestClassifyByPath:
         assert classify_work_class(wd) == WorkClass.BILLABLE
 
     def test_imperium_is_personal(self):
-        assert classify_work_class("/Volumes/Imperium/Token-OS") == WorkClass.PERSONAL
+        assert classify_work_class("/Volumes/Imperium/runtimes/token-os/live") == WorkClass.PERSONAL
         assert classify_work_class("/Volumes/Imperium/Imperium-ENV") == WorkClass.PERSONAL
 
     def test_home_root_is_personal(self):
@@ -54,7 +54,10 @@ class TestClassifyByLegion:
 
     def test_civic_legion_beats_personal_path(self):
         # Explicit civic legion on an Imperium checkout still reads on-the-clock.
-        assert classify_work_class("/Volumes/Imperium/Token-OS", "civic") == WorkClass.BILLABLE
+        assert (
+            classify_work_class("/Volumes/Imperium/runtimes/token-os/live", "civic")
+            == WorkClass.BILLABLE
+        )
 
     def test_billable_path_beats_personal_legion(self):
         # Physically in the Civic repo wins even if mislabeled personal.

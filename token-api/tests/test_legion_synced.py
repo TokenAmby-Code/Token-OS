@@ -673,7 +673,7 @@ class TestWorkflowState:
                     "TOKEN_API_DISPATCH_WINDOW": "legion",
                     "TOKEN_API_DISPATCH_MODE": "stack_new",
                     "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
-                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/runtimes/token-os/live",
                     "TOKEN_API_LAUNCH_MODE": "vault_then_transplant",
                     "TOKEN_API_TRANSPLANT_EXPECTED": "true",
                 },
@@ -706,7 +706,7 @@ class TestWorkflowState:
             "/api/hooks/SessionStart",
             json={
                 "session_id": sid,
-                "cwd": "/Volumes/Imperium/Token-OS",
+                "cwd": "/Volumes/Imperium/runtimes/token-os/live",
                 "pid": 22222,
                 "env": {
                     "TOKEN_API_ENGINE": "codex",
@@ -716,7 +716,7 @@ class TestWorkflowState:
                     "TOKEN_API_DISPATCH_MODE": "named_slot",
                     "TOKEN_API_DISPATCH_SLOT": "SW",
                     "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),
-                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/Token-OS",
+                    "TOKEN_API_TARGET_WORKING_DIR": "/Volumes/Imperium/runtimes/token-os/live",
                     "TOKEN_API_LAUNCH_MODE": "direct_target",
                     "TOKEN_API_TRANSPLANT_EXPECTED": "false",
                 },

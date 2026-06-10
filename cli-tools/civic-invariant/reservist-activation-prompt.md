@@ -66,7 +66,7 @@ in **both** locations (they must stay byte-identical):
 - Runtime copy actually injected by `civic-thread`:
   `~/.civic-invariant/reservist-activation-prompt.md`
 - Repo source-of-truth (now in `main`):
-  `/Volumes/Imperium/Token-OS/cli-tools/civic-invariant/reservist-activation-prompt.md`
+  `/Volumes/Imperium/runtimes/token-os/live/cli-tools/civic-invariant/reservist-activation-prompt.md`
   — change it on a small Token-OS branch and open a PR (`pr-create`), since it
   lives in `main`.
 
@@ -74,7 +74,7 @@ After both are updated, verify they match:
 
 ```bash
 diff ~/.civic-invariant/reservist-activation-prompt.md \
-     /Volumes/Imperium/Token-OS/cli-tools/civic-invariant/reservist-activation-prompt.md
+     /Volumes/Imperium/runtimes/token-os/live/cli-tools/civic-invariant/reservist-activation-prompt.md
 ```
 
 ## 5. Until your prompt is patched — hold the invariant

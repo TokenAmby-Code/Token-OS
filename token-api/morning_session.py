@@ -426,7 +426,7 @@ fresh:
   `/api/timer/state`, `/api/instances?sort=recent_activity`,
   `/api/fleet/state`, `/api/habits/today` directly.
 - Worktrees: `git -C ~/AskCivic/askcivic worktree list`,
-  `git -C ~/Token-OS/cli-tools/token-api worktree list`.
+  `git -C /Volumes/Imperium/runtimes/token-os/live worktree list`.
 
 ## Mandate
 

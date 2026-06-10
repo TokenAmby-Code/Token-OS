@@ -242,7 +242,7 @@ GET    /api/vault/*                # Vault queries
 ## Project Structure
 
 ```
-/mnt/imperium/Token-OS/token-api/
+/mnt/imperium/runtimes/token-os/live/token-api/
 ├── main.py                 # FastAPI app entry point
 ├── config.py               # Configuration & device definitions
 ├── models/

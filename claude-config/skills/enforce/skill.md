@@ -139,18 +139,18 @@ When `/enforce --build` is invoked, read these files before starting implementat
 
    ```bash
    # Read key sections
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '275,300p'   # models
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '4055,4130p' # pavlok
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '4805,4960p' # enforcement
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '8742,8820p' # notify
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '9610,9730p' # stop hook
-   cat -n /Volumes/Imperium/Token-OS/token-api/main.py | sed -n '9768,9855p' # pretooluse
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '275,300p'   # models
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '4055,4130p' # pavlok
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '4805,4960p' # enforcement
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '8742,8820p' # notify
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '9610,9730p' # stop hook
+   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '9768,9855p' # pretooluse
    ```
 
 2. **Phone-side macros:**
-   - `/Volumes/Imperium/Token-OS/mobile/macros/v2-enforce-cascade.yaml` — MacroDroid enforce spec
-   - `/Volumes/Imperium/Token-OS/mobile/macros/MACRODROID.md` — full macro inventory
-   - MDR export: `macrodroid-read /Volumes/Imperium/Token-OS/mobile/macros/EXPORT.mdr --macro "Enforce" --detail`
+   - `/Volumes/Imperium/runtimes/token-os/live/mobile/macros/v2-enforce-cascade.yaml` — MacroDroid enforce spec
+   - `/Volumes/Imperium/runtimes/token-os/live/mobile/macros/MACRODROID.md` — full macro inventory
+   - MDR export: `macrodroid-read /Volumes/Imperium/runtimes/token-os/live/mobile/macros/EXPORT.mdr --macro "Enforce" --detail`
    - Fresh pull (if phone reachable): `macrodroid-read --refresh --detail`
 
 3. **Phone config & connectivity:**
@@ -161,10 +161,10 @@ When `/enforce --build` is invoked, read these files before starting implementat
 ### Architecture Docs
 4. **Vault notes:**
    - `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Phone Enforcement Architecture.md`
-   - `/Volumes/Imperium/Token-OS/mobile/AGENTS.md` — mobile dev tools, macro spec format, CLI tools
+   - `/Volumes/Imperium/runtimes/token-os/live/mobile/AGENTS.md` — mobile dev tools, macro spec format, CLI tools
 
 ### Mobile CLI Tools
-5. **CLI tools** (all in `/Volumes/Imperium/Token-OS/cli-tools/bin/`):
+5. **CLI tools** (all in `/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/`):
    - `macrodroid-read` — parse .mdr backups
    - `macrodroid-gen` — generate .macro from YAML
    - `macrodroid-push` — push .macro to phone
@@ -173,7 +173,7 @@ When `/enforce --build` is invoked, read these files before starting implementat
    - `notify` — desktop notification CLI
 
 ### Phone Directory
-6. **`/Volumes/Imperium/Token-OS/mobile/`** — templates, macro specs, tasker scripts
+6. **`/Volumes/Imperium/runtimes/token-os/live/mobile/`** — templates, macro specs, tasker scripts
    - `macros/` — YAML specs, MDR exports, archive
    - `tasker-scripts/` — Termux:Tasker integration (pavlok.sh etc.)
    - `termux-*` — shell/tmux config templates

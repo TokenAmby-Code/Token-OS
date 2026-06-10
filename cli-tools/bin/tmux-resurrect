@@ -250,7 +250,7 @@ for inst in json.loads(sys.stdin.read()):
         local launch_cmd
         if [[ "$engine" == "codex" ]]; then
             local dispatch_bin
-            dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM}/Token-OS/cli-tools/bin/dispatch")"
+            dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM}/runtimes/token-os/live/cli-tools/bin/dispatch")"
             printf -v launch_cmd 'cd %q && %q --direct --engine codex --resume %q --pane %q --dir %q --prompt %q' \
                 "$working_dir" "$dispatch_bin" "$session_id" "$target" "$working_dir" "Resume after tmux restart. Read your session doc and continue only if clear."
         else
@@ -357,7 +357,7 @@ for inst in json.load(open('$SNAPSHOT_FILE')):
         local launch_cmd
         if [[ "$engine" == "codex" ]]; then
             local dispatch_bin
-            dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM}/Token-OS/cli-tools/bin/dispatch")"
+            dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM}/runtimes/token-os/live/cli-tools/bin/dispatch")"
             printf -v launch_cmd 'cd %q && %q --direct --engine codex --resume %q --pane %q --dir %q --prompt %q' \
                 "$working_dir" "$dispatch_bin" "$session_id" "$target" "$working_dir" "Resume after tmux restart. Read your session doc and continue only if clear."
         else
