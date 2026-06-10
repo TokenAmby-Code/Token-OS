@@ -290,6 +290,10 @@ def slug_from_legacy(row: dict | None) -> str | None:
 
 
 def golden_throne_binding(row: dict) -> str | None:
+    # 'sync' here is a runtime MODE value for the golden_throne column, never an
+    # identity source. Custodes (and other singletons) are resolved by persona +
+    # rank via personas.resolve_live_persona_instance — nothing finds the Custodes
+    # by golden_throne='sync'/synced/instance_type after the sync-decouple change.
     instance_type = (row.get("instance_type") or "").strip().lower()
     if instance_type == "sync" or row.get("synced") == 1:
         return "sync"

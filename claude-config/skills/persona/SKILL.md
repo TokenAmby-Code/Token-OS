@@ -10,7 +10,7 @@ user_invocable: true
 
 When an instance loads a persona via `@Personas/<name>.md` **in an arbitrary pane**, the DB doesn't know about it — the instance shows as `legion: astartes, instance_type: one_off`. This skill bridges the gap: read the persona file, extract identity fields, and PATCH the instance's DB row via Token-API.
 
-**Singleton persona panes auto-register — do not PATCH them.** The custodes, Fabricator-General, and Administratum panes carry a stable `@PANE_ID` (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`) stamped by tmuxctl. `SessionStart` derives the row identity (legion + primarch + instance_type) from that pane label — it is an infrastructure invariant, not the agent's job. **Note for custodes:** `synced` is **NOT** derived at startup — its correct default is `synced=0`. The morning session flips it to `synced=1`; do not treat `synced=0` at registration time as a defect. If you are one of these personas, your row is **already correct on startup**. Run the verify step below and **report** if it is wrong (that means the harness is broken) — never self-PATCH. Patching is only for ad-hoc personas loaded into a non-persona pane.
+**Singleton persona panes auto-register — do not PATCH them.** The custodes, Fabricator-General, and Administratum panes carry a stable `@PANE_ID` (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`) stamped by tmuxctl. `SessionStart` derives the row identity (persona + rank, plus legion/primarch) from that pane label — it is an infrastructure invariant, not the agent's job. **Custodes identity is persona + rank** (`persona.slug=custodes`, `rank=overseer`), resolved on the canonical `instances` table — **never** by sync. `synced`/`instance_type=sync` are a runtime MODE the morning session sets while live (default `synced=0`); do not treat `synced=0` at registration time as a defect. If you are one of these personas, your row is **already correct on startup**. Run the verify step below and **report** if it is wrong (that means the harness is broken) — never self-PATCH. Patching is only for ad-hoc personas loaded into a non-persona pane.
 
 ## Usage
 
@@ -79,14 +79,18 @@ curl -s "$TOKEN_API_URL/api/instances/resolve?source_ip=127.0.0.1&status=process
 
 ### Step 3.5: Verify before patching (persona panes are already registered)
 
-Read the current row and its pane label first:
+Read the current row, its persona/rank, and its pane label first:
 ```bash
 curl -s "$TOKEN_API_URL/api/instances" \
-  | jq --arg id "$INSTANCE_ID" '.[] | select(.id==$id) | {legion, instance_type, synced, primarch, pane_label}'
+  | jq --arg id "$INSTANCE_ID" '.[] | select(.id==$id) | {persona: .persona.slug, rank, status, primarch, pane_label}'
 ```
 
-- If `pane_label` is one of `legion:custodes` / `mechanicus:fabricator-general` / `mechanicus:admin`, this is a **singleton persona pane**. `SessionStart` already set its identity (legion + primarch + instance_type). **Verify those match the expected identity and stop — do not PATCH.** If they do not match, report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH.
-  - **`synced` is exempt from this check for custodes.** Its correct startup default is `synced=0`; the morning session flips it to `1`. Do **not** report `synced=0` as a mismatch and do **not** self-PATCH it at registration time.
+- If `pane_label` is one of `legion:custodes` / `mechanicus:fabricator-general` / `mechanicus:admin`, this is a **singleton persona pane**. `SessionStart` already set its identity (persona + rank). **Verify it matches the expected identity and stop — do not PATCH.** For custodes specifically, the canonical check is exactly one non-retired row with `persona.slug == "custodes"` at `rank == "overseer"`:
+  ```bash
+  curl -s "$TOKEN_API_URL/api/instances" \
+    | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status}}'
+  ```
+  If that is wrong (no row, wrong rank, or more than one), report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH. Sync mode (`synced`/`instance_type=sync`) is NOT part of this check — it is a morning-session mode, not identity.
 - Otherwise (ad-hoc persona in a non-persona pane), continue to Step 4 and PATCH.
 
 ### Step 4: PATCH the instance (ad-hoc panes only)
@@ -103,18 +107,7 @@ curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/rename" \
   -d "{\"tab_name\": \"$PERSONA_TITLE\"}"
 ```
 
-**Custodes-only: also flip synced + instance_type.** Custodes is the synced singleton — the state-hook dispatcher requires `synced=1 AND instance_type='sync'` to find the live instance. Skip this for any other persona.
-
-```bash
-if [ "$LEGION" = "custodes" ]; then
-  curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/synced" \
-    -H "Content-Type: application/json" -d '{"synced": true}'
-  curl -s -X PATCH "$TOKEN_API_URL/api/instances/$INSTANCE_ID/type" \
-    -H "Content-Type: application/json" -d '{"instance_type": "sync"}'
-fi
-```
-
-Without this, `_dispatch_custodes_intervention` in `main.py` cannot see the instance, falls through to `_launch_custodes_for_intervention`, and spams `cd /Volumes/Imperium/Imperium-ENV && primarch custodes …` into the pane every time a state hook fires. (See `Mars/Tasks/Custodes Single Source of Truth.md`.)
+**No sync flip.** The state-hook dispatcher (`_dispatch_custodes_intervention` in `main.py`) resolves the Custodes by **persona + rank** (`resolve_live_persona_instance`), not by `synced`/`instance_type=sync`, so registering a custodes does NOT require flipping sync. Sync is a runtime mode the morning session owns. (An ad-hoc custodes in a non-persona pane is unusual; setting `legion: custodes` above is enough for the dispatcher to find it by identity.)
 
 ### Step 5: Confirm
 

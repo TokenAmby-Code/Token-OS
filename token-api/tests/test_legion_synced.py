@@ -234,15 +234,18 @@ class TestSetLegion:
 
 
 class TestSetSynced:
+    # The /synced endpoint is a generic per-legion mode-conflict guard (Mechanicus
+    # path); it is NOT how the Custodes singleton is identified anymore (that is
+    # persona + rank), so these exercise it on mechanicus rather than custodes.
     def test_set_synced_true(self, client):
-        iid = _insert_instance(legion="custodes")
+        iid = _insert_instance(legion="mechanicus")
         resp = client.patch(f"/api/instances/{iid}/synced", json={"synced": True})
         assert resp.status_code == 200
         assert resp.json()["synced"] is True
         assert _get_instance(iid)["synced"] == 1
 
     def test_set_synced_false(self, client):
-        iid = _insert_instance(legion="custodes", synced=1)
+        iid = _insert_instance(legion="mechanicus", synced=1)
         resp = client.patch(f"/api/instances/{iid}/synced", json={"synced": False})
         assert resp.status_code == 200
         assert resp.json()["synced"] is False
@@ -250,8 +253,8 @@ class TestSetSynced:
 
     def test_synced_one_per_legion(self, client):
         """Second synced=true in same legion should 409."""
-        iid1 = _insert_instance(legion="custodes")
-        iid2 = _insert_instance(legion="custodes")
+        iid1 = _insert_instance(legion="mechanicus")
+        iid2 = _insert_instance(legion="mechanicus")
 
         resp1 = client.patch(f"/api/instances/{iid1}/synced", json={"synced": True})
         assert resp1.status_code == 200
@@ -261,7 +264,7 @@ class TestSetSynced:
 
     def test_synced_different_legions(self, client):
         """Different legions can each have a synced session."""
-        iid1 = _insert_instance(legion="custodes")
+        iid1 = _insert_instance(legion="astartes")
         iid2 = _insert_instance(legion="mechanicus")
 
         resp1 = client.patch(f"/api/instances/{iid1}/synced", json={"synced": True})
@@ -272,8 +275,8 @@ class TestSetSynced:
 
     def test_synced_stopped_no_conflict(self, client):
         """Stopped instance with synced=1 shouldn't block new synced."""
-        iid1 = _insert_instance(legion="custodes", synced=1, status="stopped")
-        iid2 = _insert_instance(legion="custodes")
+        iid1 = _insert_instance(legion="mechanicus", synced=1, status="stopped")
+        iid2 = _insert_instance(legion="mechanicus")
 
         resp = client.patch(f"/api/instances/{iid2}/synced", json={"synced": True})
         assert resp.status_code == 200
@@ -286,25 +289,62 @@ class TestSetSynced:
 # ── 4. GET /api/legion/{legion}/synced-session ───────────────
 
 
+def _insert_canonical_custodes(*, rank="overseer", status="working", db_path=None):
+    """Insert a canonical instances row for the custodes persona (no sync mode).
+
+    get_synced_session('custodes') resolves by persona + rank on the instances
+    table now, so the synced-session lookup must find THIS row, not a
+    claude_instances.synced flag.
+    """
+    iid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(db_path or _TEST_DB_PATH)
+    persona_id = conn.execute("SELECT id FROM personas WHERE slug='custodes'").fetchone()[0]
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, engine, working_dir, device_id, origin_type, commander_type,
+            status, created_at, last_activity, persona_id, rank, automated,
+            notification_mode, interaction_mode)
+           VALUES (?, ?, 'claude', '/tmp', 'Mac-Mini', 'local', 'emperor',
+                   ?, ?, ?, ?, ?, 0, 'verbose', 'text')""",
+        (iid, f"Custodes-{iid[:6]}", status, now, now, persona_id, rank),
+    )
+    conn.commit()
+    conn.close()
+    return iid
+
+
 class TestSyncedSessionLookup:
-    def test_synced_session_found(self, client):
-        iid = _insert_instance(legion="custodes", synced=1, tmux_pane="%5")
+    def test_custodes_session_found_by_persona_rank(self, client):
+        """Custodes resolves by persona + rank on instances — NO sync marker needed."""
+        iid = _insert_canonical_custodes(rank="overseer", status="working")
         resp = client.get("/api/legion/custodes/synced-session")
         assert resp.status_code == 200
         data = resp.json()
         assert data["synced_session"] is not None
         assert data["synced_session"]["id"] == iid
+        assert data["synced_session"]["rank"] == "overseer"
 
-    def test_synced_session_none(self, client):
+    def test_custodes_session_none_when_no_live_custodes(self, client):
         resp = client.get("/api/legion/custodes/synced-session")
         assert resp.status_code == 200
         assert resp.json()["synced_session"] is None
 
-    def test_synced_session_stopped_excluded(self, client):
-        _insert_instance(legion="custodes", synced=1, status="stopped")
+    def test_custodes_session_retired_excluded(self, client):
+        """A retired (superseded) custodes is not the live singleton."""
+        _insert_canonical_custodes(rank="retired", status="stopped")
         resp = client.get("/api/legion/custodes/synced-session")
         assert resp.status_code == 200
         assert resp.json()["synced_session"] is None
+
+    def test_mechanicus_session_uses_legacy_synced(self, client):
+        """Non-custodes legions keep the legacy claude_instances.synced lookup."""
+        iid = _insert_instance(legion="mechanicus", synced=1, tmux_pane="%5")
+        resp = client.get("/api/legion/mechanicus/synced-session")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["synced_session"] is not None
+        assert data["synced_session"]["id"] == iid
 
     def test_synced_session_invalid_legion(self, client):
         resp = client.get("/api/legion/invalid/synced-session")
@@ -501,13 +541,26 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "legion:custodes", "%32")
         assert row["legion"] == "custodes"
         assert row["primarch"] == "custodes"
-        assert row["instance_type"] == "sync"
-        # synced is NOT set at registration (#67): custodes resolves via the
-        # pane marker; the morning session flips synced to 1 while live.
+        # Custodes resting identity is persona + rank, NOT sync. The pane registers
+        # it at the FG/Admin default (hook_driven); the morning session sets sync
+        # MODE while live. synced default stays 0.
+        assert row["instance_type"] == "hook_driven"
         assert row["synced"] == 0
         # Custodes is the one persona that speaks: reserved George voice.
         assert row["profile_name"] == "custodes"
         assert row["tts_voice"] == "Microsoft George"
+        # The canonical identity that actually resolves the singleton: persona +
+        # overseer rank on the instances table (stamped by the rank-stamp trigger).
+        conn = sqlite3.connect(_TEST_DB_PATH)
+        ident = conn.execute(
+            """SELECT p.slug, i.rank FROM instances i
+               JOIN personas p ON p.id = i.persona_id WHERE i.id = ?""",
+            (row["id"],),
+        ).fetchone()
+        conn.close()
+        assert ident is not None
+        assert ident[0] == "custodes"
+        assert ident[1] == "overseer"
 
     def test_fabricator_general_pane(self, client):
         # FG owns the dedicated singleton legion "fabricator" (not "mechanicus" —

@@ -305,6 +305,68 @@ async def _ensure_instances_v2(db) -> None:
              WHERE id != NEW.id AND persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
         END
     """)
+    # Stamp a singleton persona's row back to its registry default_rank. The
+    # claude_instances→instances mirror has no `rank` column, so every Custodes
+    # (FG/Admin/...) mutation arrives carrying the column default 'astartes' and
+    # would otherwise clobber the identity rank. SQLite BEFORE triggers cannot
+    # mutate NEW.*, so the rank is restored by an AFTER INSERT/UPDATE follow-up
+    # UPDATE. The WHEN guard fires only for non-Astartes-default personas (so
+    # Astartes/aspirant rows are never touched) and only when the row's rank
+    # actually diverges from its default — so the re-stamp is a fixed point
+    # (NEW.rank == default → WHEN false → no-op) and converges under
+    # recursive_triggers ON or OFF (SQLite default is OFF here; verified). The
+    # paired BEFORE-INSERT/UPDATE singleton guards above then collapse any
+    # duplicate non-retired rows to exactly one.
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_stamp_persona_rank")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_stamp_persona_rank
+        AFTER INSERT ON instances
+        WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
+             AND NEW.rank != COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes')
+        BEGIN
+            UPDATE instances
+               SET rank = (SELECT default_rank FROM personas WHERE id = NEW.persona_id)
+             WHERE id = NEW.id;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_stamp_persona_rank_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_stamp_persona_rank_update
+        AFTER UPDATE OF persona_id, rank ON instances
+        WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
+             AND NEW.rank != COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes')
+        BEGIN
+            UPDATE instances
+               SET rank = (SELECT default_rank FROM personas WHERE id = NEW.persona_id)
+             WHERE id = NEW.id;
+        END
+    """)
+    # One-time reconciliation of rows that predate the stamp trigger. The bulk
+    # claude_instances→instances rebuild (above) inserts with triggers dropped, so
+    # historical Custodes rows can sit at rank='astartes' (live data had three).
+    # Stamp the most-recently-active non-retired row per non-Astartes persona to
+    # its default_rank; that UPDATE fires the singleton-guard-update, retiring the
+    # rest. Idempotent: once collapsed, the surviving row is already at default
+    # (WHEN false) and no other non-retired rows remain to retire.
+    await db.execute("""
+        UPDATE instances
+           SET rank = (SELECT default_rank FROM personas p WHERE p.id = instances.persona_id)
+         WHERE id IN (
+             SELECT i.id FROM instances i JOIN personas p ON p.id = i.persona_id
+              WHERE p.default_rank != 'astartes'
+                AND i.rank != 'retired'
+                AND i.commander_type != 'chapter'
+                AND i.id = (
+                    SELECT i2.id FROM instances i2
+                     WHERE i2.persona_id = i.persona_id
+                       AND i2.rank != 'retired'
+                       AND i2.commander_type != 'chapter'
+                     ORDER BY i2.last_activity DESC LIMIT 1
+                )
+         )
+    """)
 
 
 async def init_database_async(db_path: Path | None = None) -> None:

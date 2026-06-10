@@ -374,30 +374,31 @@ def test_run_morning_session_proceeds_with_real_alarm_ack(isolated_morning_dir):
     assert result["instance_id"] == "cafe1234"
 
 
-# ── find_live_custodes + reconcile: desynced-row upsert ───────
+# ── find_live_custodes + reconcile: persona + rank identity ───
 
 
-def test_find_live_custodes_matches_desynced_hook_driven():
-    """A resting/desynced custodes (hook_driven, synced=0) is still THE custodes.
+def test_find_live_custodes_matches_by_persona_and_rank():
+    """The custodes is found by persona.slug + non-retired rank, NOT by sync.
 
-    Injecting the morning prompt into an already-running custodes pane is the
-    expected path, so the locator must FIND that row in order to reconcile it —
-    not miss it (the old sync-only match) and declare the morning a failure.
+    The canonical /api/instances surface exposes persona.slug + rank + normalized
+    status and carries NO legion/instance_type/synced, so the locator resolves on
+    identity. A resting custodes with no sync marker is still THE custodes.
     """
     instances = [
+        # Retired (superseded) custodes — must be skipped.
         {
             "id": "dead1",
-            "legion": "custodes",
-            "instance_type": "hook_driven",
-            "stopped_at": "2026-06-06T01:00:00",
+            "persona": {"slug": "custodes"},
+            "rank": "retired",
+            "status": "stopped",
         },
+        # Live custodes, no sync marker anywhere — found by identity alone.
         {
             "id": "live1",
-            "legion": "custodes",
-            "instance_type": "hook_driven",
-            "synced": 0,
-            "tmux_pane": "%9",
-            "stopped_at": None,
+            "persona": {"slug": "custodes"},
+            "rank": "overseer",
+            "status": "working",
+            "runtime": {"tmux_pane": "%9"},
         },
     ]
     with patch("morning_session._get", lambda path: instances):
@@ -407,34 +408,32 @@ def test_find_live_custodes_matches_desynced_hook_driven():
 
 
 def test_find_live_custodes_none_when_no_custodes_alive():
-    """No live custodes of any type → None (the one genuine launch failure)."""
+    """No live custodes persona → None (the one genuine launch failure)."""
     instances = [
-        {"id": "x", "legion": "mechanicus", "instance_type": "sync", "stopped_at": None},
+        # Another persona, even if sync-shaped, is not the custodes.
         {
-            "id": "y",
-            "legion": "custodes",
-            "instance_type": "sync",
-            "stopped_at": "2026-06-06T01:00:00",
+            "id": "x",
+            "persona": {"slug": "fabricator-general"},
+            "rank": "primarch",
+            "status": "working",
         },
+        # A custodes row that is retired/stopped does not count as alive.
+        {"id": "y", "persona": {"slug": "custodes"}, "rank": "retired", "status": "stopped"},
+        {"id": "z", "persona": {"slug": "custodes"}, "rank": "overseer", "status": "archived"},
     ]
     with patch("morning_session._get", lambda path: instances):
         assert morning_session.find_live_custodes() is None
 
 
-def test_reconcile_custodes_active_upserts_desynced_row():
-    """A desynced custodes (hook_driven/synced=0) is PATCHed to sync + synced=1."""
+def test_reconcile_custodes_active_sets_sync_mode():
+    """Reconcile sets sync MODE (best-effort) on the resolved custodes row."""
     sent: dict = {}
 
     def fake_patch(path, data=None):
         sent[path] = data
         return {"ok": True}
 
-    inst = {
-        "id": "abc123def456",
-        "legion": "custodes",
-        "instance_type": "hook_driven",
-        "synced": 0,
-    }
+    inst = {"id": "abc123def456", "persona": {"slug": "custodes"}, "rank": "overseer"}
     with patch("morning_session._patch", side_effect=fake_patch):
         result = morning_session.reconcile_custodes_active(inst)
     assert result["reconciled"] is True
@@ -442,26 +441,29 @@ def test_reconcile_custodes_active_upserts_desynced_row():
     assert sent["/api/instances/abc123def456/synced"] == {"synced": True}
 
 
-def test_reconcile_custodes_active_noop_when_already_active():
-    """Already sync+synced → idempotent no-op, zero PATCH calls."""
+def test_reconcile_custodes_active_no_instance_id():
+    """A row without an id cannot be reconciled — no PATCH calls."""
     calls: list = []
-    inst = {"id": "abc", "legion": "custodes", "instance_type": "sync", "synced": 1}
+    inst = {"persona": {"slug": "custodes"}, "rank": "overseer"}
     with patch("morning_session._patch", side_effect=lambda *a, **k: calls.append(a)):
         result = morning_session.reconcile_custodes_active(inst)
     assert result["reconciled"] is False
-    assert result["reason"] == "already_active"
+    assert result["reason"] == "no_instance_id"
     assert calls == []
 
 
-def test_confirm_custodes_registered_reconciles_desynced():
-    """confirm finds a desynced custodes, reconciles it, returns live + reconciled."""
+def test_confirm_custodes_registered_finds_by_identity():
+    """confirm finds the custodes by identity, sets sync mode, returns live.
+
+    The live pane comes from runtime.tmux_pane (pane identity is never durably
+    stored on the canonical row).
+    """
     inst = {
         "id": "live9",
-        "legion": "custodes",
-        "instance_type": "hook_driven",
-        "synced": 0,
-        "tmux_pane": "%9",
-        "stopped_at": None,
+        "persona": {"slug": "custodes"},
+        "rank": "overseer",
+        "status": "working",
+        "runtime": {"tmux_pane": "%9"},
     }
     with (
         patch("morning_session._get", lambda path: [inst]),
