@@ -567,11 +567,16 @@ def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(
     assert "--target self" in result.stdout
 
 
-def test_dispatch_human_origin_forces_interactive_even_with_direct(monkeypatch):
+def test_dispatch_human_origin_uses_codex_harness_state_for_astartes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "dispatch-harness"
+    state_file.write_text("codex\n", encoding="utf-8")
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
     monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
     monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
-    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__sisters_of_battle__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__astartes__")
     monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
     result = subprocess.run(
         [str(DISPATCH), "--dry-run", "--direct", "launch directly"],
@@ -585,17 +590,99 @@ def test_dispatch_human_origin_forces_interactive_even_with_direct(monkeypatch):
     assert "dispatch dry-run" in result.stdout
     assert "dispatch aspirant dry-run" not in result.stdout
     assert "engine:          codex" in result.stdout
+    assert "persona:         Astartes — Codex" in result.stdout
     assert "instance_type:   one_off" in result.stdout
     assert "dispatch_codex_launch_inline" in result.stdout
     assert "codex-dispatch" not in result.stdout
+    assert "sisters-of-battle" not in result.stdout
+    assert "Sisters" not in result.stdout
 
 
-def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
+def test_dispatch_human_origin_missing_or_invalid_harness_state_defaults_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
-    monkeypatch.setenv("TOKEN_API_DISPATCH_MENU_CONSUMED", "1")
     monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
     monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
-    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__sisters_of_battle__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__astartes__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+
+    for contents in (None, "garbage\n"):
+        state_file = tmp_path / f"dispatch-harness-{contents is not None}"
+        if contents is not None:
+            state_file.write_text(contents, encoding="utf-8")
+        monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
+        result = subprocess.run(
+            [str(DISPATCH), "--dry-run", "--direct", "launch directly"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "engine:          claude" in result.stdout
+        assert "persona:         Astartes — Claude" in result.stdout
+        assert "Sisters" not in result.stdout
+
+
+def test_dispatch_noninteractive_ignores_harness_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "dispatch-harness"
+    state_file.write_text("codex\n", encoding="utf-8")
+    monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "launch directly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "engine:          claude" in result.stdout
+    assert "persona:         Astartes — Claude" in result.stdout
+
+
+def test_dispatch_internal_interactive_ignores_harness_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "dispatch-harness"
+    state_file.write_text("codex\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("TOKEN_API_INTERNAL_DISPATCH", "1")
+    monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__astartes__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--interactive", "--direct", "launch directly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "engine:          claude" in result.stdout
+    assert "persona:         Astartes — Claude" in result.stdout
+
+
+def test_dispatch_menu_consumed_prevents_second_interactive_menu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "dispatch-harness"
+    state_file.write_text("codex\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("TOKEN_API_DISPATCH_MENU_CONSUMED", "1")
+    monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__astartes__")
     monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
     result = subprocess.run(
         [
@@ -618,6 +705,32 @@ def test_dispatch_menu_consumed_prevents_second_interactive_menu(monkeypatch):
     assert "dispatch dry-run" in result.stdout
     assert "engine:          claude" in result.stdout
     assert "instance_type:   one_off" in result.stdout
+
+
+def test_dispatch_interactive_vulkan_uses_current_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_DIR", str(ROOT))
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "vulkan")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+
+    for harness in ("codex", "claude"):
+        state_file = tmp_path / f"dispatch-harness-{harness}"
+        state_file.write_text(f"{harness}\n", encoding="utf-8")
+        monkeypatch.setenv("DISPATCH_HARNESS_STATE_FILE", str(state_file))
+        result = subprocess.run(
+            [str(DISPATCH), "--dry-run", "--direct", "vulkan work"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert f"engine:          {harness}" in result.stdout
+        assert "TOKEN_API_PRIMARCH=vulkan" in result.stdout
 
 
 def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
@@ -667,7 +780,8 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     )
     assert inquisitor.returncode == 0, inquisitor.stderr
     assert "engine:          codex" in inquisitor.stdout
-    assert "TOKEN_API_CODEX_PROFILE=inquisitor" in inquisitor.stdout
+    assert "TOKEN_API_CODEX_PROFILE=inquisitor" not in inquisitor.stdout
+    assert "TOKEN_API_CODEX_PROFILE=sisters-of-battle" not in inquisitor.stdout
     assert "TOKEN_API_PRIMARCH=inquisitor" in inquisitor.stdout
     assert "dispatch_codex_launch_inline" in inquisitor.stdout
 
@@ -694,6 +808,33 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert "engine:          codex" in vulkan.stdout
     assert "TOKEN_API_PRIMARCH=vulkan" in vulkan.stdout
     assert "primarch vulkan" not in vulkan.stdout
+    assert "TOKEN_API_CODEX_PROFILE=sisters-of-battle" not in vulkan.stdout
+
+
+def test_dispatch_codex_profile_is_explicit_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKEN_API_CODEX_PROFILE", "custom-profile")
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--no-worktree",
+            "--engine",
+            "codex",
+            "--dir",
+            str(ROOT),
+            "codex work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_CODEX_PROFILE=custom-profile" in result.stdout
 
 
 def test_dispatch_rejects_deprecated_primarch_flag() -> None:

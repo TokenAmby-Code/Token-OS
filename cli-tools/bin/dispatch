@@ -107,6 +107,7 @@ quote() { printf '%q' "$1"; }
 
 ENGINE="claude"
 ENGINE_EXPLICIT=false
+DISPATCH_MENU_HARNESS="$ENGINE"
 RESUME_ID=""
 RESUME_INSTANCE_ID=""
 RESUME_REQUESTED=false
@@ -362,14 +363,7 @@ normalize_persona_key() {
 persona_engine_binding() {
   case "$(normalize_persona_key "$1")" in
     custodes) printf 'claude' ;;
-    inquisitor|inquisition|sisters|sisters-of-battle) printf 'codex' ;;
-  esac
-}
-
-persona_codex_profile() {
-  case "$(normalize_persona_key "$1")" in
-    inquisitor|inquisition) printf 'inquisitor' ;;
-    sisters|sisters-of-battle) printf 'sisters-of-battle' ;;
+    inquisitor|inquisition) printf 'codex' ;;
   esac
 }
 
@@ -382,9 +376,8 @@ apply_persona_engine_binding() {
 }
 
 apply_codex_profile_default() {
-  [[ "$ENGINE" == "codex" ]] || return 0
-  [[ -z "$CODEX_PROFILE" && -n "$PERSONA" ]] && CODEX_PROFILE="$(persona_codex_profile "$PERSONA")"
-  [[ -z "$CODEX_PROFILE" && -z "$PERSONA" ]] && CODEX_PROFILE="sisters-of-battle"
+  # dispatch never derives a Codex CLI profile from persona/harness choice.
+  # TOKEN_API_CODEX_PROFILE is passthrough-only when the caller supplied it.
   return 0
 }
 
@@ -578,16 +571,55 @@ resume_session_candidates() {
   done
 }
 
-persona_candidates() {
-  if [[ -n "$PERSONA" ]]; then
-    printf '%s\tcurrent persona: %s\n' "$PERSONA" "$PERSONA"
-  elif [[ "$ENGINE" == "codex" ]]; then
-    printf '__sisters_of_battle__\tSisters of Battle — Codex\n'
-    printf '__astartes__\tAstartes — Claude\n'
-  else
-    printf '__astartes__\tAstartes — Claude\n'
-    printf '__sisters_of_battle__\tSisters of Battle — Codex\n'
-  fi
+normalize_harness() {
+  case "$1" in
+    claude|codex) printf '%s' "$1" ;;
+    *) printf 'claude' ;;
+  esac
+}
+
+dispatch_harness_state_file() {
+  expand_path "${DISPATCH_HARNESS_STATE_FILE:-$HOME/.config/imperium/dispatch-harness}"
+}
+
+dispatch_harness_state_allowed() {
+  dispatch_origin_is_human_surface || return 1
+  [[ -z "${TOKEN_API_INTERNAL_DISPATCH:-}" ]] || return 1
+  return 0
+}
+
+read_dispatch_harness_state() {
+  local state_file value
+  dispatch_harness_state_allowed || { printf 'claude'; return 0; }
+  state_file="$(dispatch_harness_state_file)"
+  value="$(cat "$state_file" 2>/dev/null || true)"
+  normalize_harness "$value"
+}
+
+write_dispatch_harness_state() {
+  local value="$1" state_file dir
+  dispatch_harness_state_allowed || return 0
+  value="$(normalize_harness "$value")"
+  state_file="$(dispatch_harness_state_file)"
+  dir="$(dirname "$state_file")"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$value" >"$state_file" 2>/dev/null || true
+}
+
+persona_harness_label() {
+  case "$(normalize_harness "$1")" in
+    codex) printf 'Codex' ;;
+    *) printf 'Claude' ;;
+  esac
+}
+
+persona_candidate_default() {
+  local harness="$1"
+  printf '__astartes__\tAstartes — %s\n' "$(persona_harness_label "$harness")"
+}
+
+persona_candidate_rows() {
+  local name title group rank
 
   sqlite_query "
     SELECT name, COALESCE(title, ''), COALESCE(launcher_group, ''), COALESCE(launcher_rank, 100)
@@ -599,6 +631,12 @@ persona_candidates() {
     [[ -n "$name" ]] || continue
     printf '%s\t%s%s\n' "$name" "$name" "${title:+ — $title}"
   done
+}
+
+persona_candidates() {
+  local harness="${1:-$ENGINE}"
+  persona_candidate_default "$harness"
+  persona_candidate_rows
 }
 
 mode_candidates() {
@@ -657,8 +695,54 @@ pick_fzf_value() {
   printf '%s' "${selection%%$'\t'*}"
 }
 
+pick_persona_value() {
+  local default_value="$1" current_harness="$2" selection override tmp_harness tmp_rows state_file toggle_cmd reload_cmd
+  override="$(interactive_override_for persona)"
+  if [[ -n "$override" ]]; then
+    case "$override" in none|NONE|__none__) printf '__none__';; *) printf '%s' "$override";; esac
+    return 0
+  fi
+
+  if [[ ! -t 2 || ! -r /dev/tty ]]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+
+  command -v fzf >/dev/null 2>&1 || { err "fzf is required for --interactive"; exit 69; }
+  tmp_harness="$(mktemp -t dispatch-harness.XXXXXX)"
+  tmp_rows="$(mktemp -t dispatch-personas.XXXXXX)"
+  printf '%s\n' "$(normalize_harness "$current_harness")" >"$tmp_harness"
+  persona_candidate_rows >"$tmp_rows"
+  state_file=""
+  dispatch_harness_state_allowed && state_file="$(dispatch_harness_state_file)"
+
+  reload_cmd='h="$(cat "$1" 2>/dev/null || printf claude)"; case "$h" in codex) label=Codex ;; *) h=claude; label=Claude ;; esac; printf "__astartes__\tAstartes — %s\n" "$label"; cat "$2"'
+  toggle_cmd='h="$(cat "$1" 2>/dev/null || printf claude)"; case "$h" in codex) n=claude ;; *) n=codex ;; esac; printf "%s\n" "$n" > "$1"; if [[ -n "${2:-}" ]]; then mkdir -p "$(dirname "$2")" 2>/dev/null || true; printf "%s\n" "$n" > "$2" 2>/dev/null || true; fi'
+  selection="$(
+    bash -c "$reload_cmd" dispatch-personas "$tmp_harness" "$tmp_rows" |
+      fzf --height=40% --reverse --cycle \
+        --bind="tab:execute-silent(bash -c $(printf '%q' "$toggle_cmd") dispatch-toggle $(printf '%q' "$tmp_harness") $(printf '%q' "$state_file"))+reload(bash -c $(printf '%q' "$reload_cmd") dispatch-personas $(printf '%q' "$tmp_harness") $(printf '%q' "$tmp_rows"))" \
+        --bind='btab:up' \
+        --delimiter=$'\t' --with-nth=2.. --prompt='persona> ' || true
+  )"
+  DISPATCH_MENU_HARNESS="$(normalize_harness "$(cat "$tmp_harness" 2>/dev/null || true)")"
+  rm -f "$tmp_harness" "$tmp_rows"
+  [[ -n "$selection" ]] || { err "interactive selection cancelled"; exit 130; }
+  printf '%s' "${selection%%$'\t'*}"
+}
+
 run_interactive_selection() {
   local selected default_mode
+
+  DISPATCH_MENU_HARNESS="$(normalize_harness "$ENGINE")"
+  if dispatch_harness_state_allowed; then
+    if $ENGINE_EXPLICIT; then
+      DISPATCH_MENU_HARNESS="$(normalize_harness "$ENGINE")"
+    else
+      DISPATCH_MENU_HARNESS="$(read_dispatch_harness_state)"
+      ENGINE="$DISPATCH_MENU_HARNESS"
+    fi
+  fi
 
   WORK_DIR="$(expand_path "$WORK_DIR")"
   if ! $WORK_DIR_EXPLICIT; then
@@ -687,26 +771,21 @@ run_interactive_selection() {
   local default_persona
   if [[ -n "$PERSONA" ]]; then
     default_persona="$PERSONA"
-  elif [[ "$ENGINE" == "codex" ]]; then
-    default_persona="__sisters_of_battle__"
   else
     default_persona="__astartes__"
   fi
-  selected="$(persona_candidates | dedupe_tsv | pick_fzf_value persona 'persona> ' "$default_persona")"
+  selected="$(pick_persona_value "$default_persona" "$DISPATCH_MENU_HARNESS")"
   case "$selected" in
     __astartes__|astartes)
       PERSONA=""
-      ENGINE="claude"
-      ;;
-    __sisters_of_battle__|sisters|sisters-of-battle|sisters_of_battle)
-      PERSONA=""
-      ENGINE="codex"
+      ENGINE="$(normalize_harness "$DISPATCH_MENU_HARNESS")"
       ;;
     __none__|none)
       PERSONA=""
       ;;
     *)
       PERSONA="$selected"
+      ENGINE="$(normalize_harness "$DISPATCH_MENU_HARNESS")"
       ;;
   esac
 
@@ -1076,11 +1155,14 @@ launch_dispatch_aspirant_session() {
   local arg
   for arg in "${launch_args[@]}"; do printf ' %q' "$arg"; done
   printf '\n'
-  TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
-  TOKEN_API_INTERNAL_DISPATCH=1 \
-  TOKEN_API_PRIMARCH="${PERSONA:-${TOKEN_API_PRIMARCH:-}}" \
-  TOKEN_API_CODEX_PROFILE="$CODEX_PROFILE" \
-  "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
+  local -a recursive_env
+  recursive_env=(
+    "TOKEN_API_DISPATCH_MENU_CONSUMED=1"
+    "TOKEN_API_INTERNAL_DISPATCH=1"
+  )
+  [[ -n "${PERSONA:-${TOKEN_API_PRIMARCH:-}}" ]] && recursive_env+=("TOKEN_API_PRIMARCH=${PERSONA:-${TOKEN_API_PRIMARCH:-}}")
+  [[ -n "$CODEX_PROFILE" ]] && recursive_env+=("TOKEN_API_CODEX_PROFILE=$CODEX_PROFILE")
+  env "${recursive_env[@]}" "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
 }
 
 aspirant_persona_prompt_path() {
@@ -1406,8 +1488,8 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_WITH_BROWSER=${WITH_BROWSER}"
   "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
   "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
-  "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
 )
+[[ -n "$CODEX_PROFILE" ]] && COMMON_ENV+=("TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}")
 [[ -n "$CLAUDE_MODEL" ]] && COMMON_ENV+=("TOKEN_API_CLAUDE_MODEL=${CLAUDE_MODEL}")
 [[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PRIMARCH=${PERSONA}")
 if [[ -n "$DISCORD_CHANNEL" ]]; then
@@ -1594,7 +1676,6 @@ dispatch_codex_launch_inline() {
     "TOKEN_API_TRANSPLANT_EXPECTED=${TOKEN_API_TRANSPLANT_EXPECTED:-false}"
     "TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_tmux_pane}"
     "TMUX_PANE=${resolved_tmux_pane}"
-    "TOKEN_API_CODEX_PROFILE=${codex_profile}"
     "TOKEN_API_INSTANCE_TYPE=${instance_type}"
     "TOKEN_API_ZEALOTRY=${zealotry}"
     "TOKEN_API_DISPATCH_MCP=${TOKEN_API_DISPATCH_MCP:-}"
@@ -1605,6 +1686,7 @@ dispatch_codex_launch_inline() {
     "TOKEN_API_DISCORD_CHANNEL=${TOKEN_API_DISCORD_CHANNEL:-}"
     "TOKEN_API_DISCORD_BOT=${TOKEN_API_DISCORD_BOT:-}"
   )
+  [[ -n "$codex_profile" ]] && codex_env+=("TOKEN_API_CODEX_PROFILE=${codex_profile}")
   codex_profile_args=()
   [[ -n "$codex_profile" ]] && codex_profile_args=(--profile "$codex_profile")
 
@@ -1748,11 +1830,7 @@ build_dispatch_command() {
 RESOLVED_DISPATCH_COMMAND="$(LC_ALL=C; build_dispatch_command)"
 PERSONA_DISPLAY="$PERSONA"
 if [[ -z "$PERSONA_DISPLAY" ]]; then
-  if [[ "$ENGINE" == "codex" ]]; then
-    PERSONA_DISPLAY="Sisters of Battle"
-  else
-    PERSONA_DISPLAY="astartes"
-  fi
+  PERSONA_DISPLAY="Astartes — $(persona_harness_label "$ENGINE")"
 fi
 
 if $DRY_RUN; then
