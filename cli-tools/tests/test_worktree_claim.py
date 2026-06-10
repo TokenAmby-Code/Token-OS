@@ -159,3 +159,16 @@ def test_concurrent_create_race_serializes_mkdir_fallback(project: Project) -> N
     even on a flock-equipped CI runner.
     """
     _assert_race_serializes(project, "race-mkdir", {"WORKTREE_CLAIM_NO_FLOCK": "1"})
+
+
+def test_main_master_refused_by_default(project: Project) -> None:
+    for branch in ("main", "master"):
+        res = project.run(branch)
+        assert res.returncode == 64
+        assert "main/master are protected" in res.stderr
+
+
+def test_main_allowed_only_with_admin_flag(project: Project) -> None:
+    res = project.run("main", "--allow-protected-branch", "--existing")
+    assert res.returncode == 0, res.stderr
+    assert (project.parent / "wt-main" / ".git").exists()

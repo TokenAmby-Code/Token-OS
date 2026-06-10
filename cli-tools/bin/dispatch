@@ -521,8 +521,11 @@ directory_candidates() {
   for path in \
     "/Volumes/Imperium/Imperium-ENV" \
     "/Volumes/Civic/Pax-ENV" \
+    "${TOKEN_OS_RUNTIME_CHECKOUT:-/Volumes/Imperium/runtimes/token-os/live}" \
     "/Volumes/Imperium/Token-OS" \
+    "$HOME/worktrees/Token-OS" \
     "$HOME/worktrees/askCivic" \
+    "${TERMINUS_RUNTIME_CHECKOUT:-$HOME/runtimes/askCivic/terminus-preview}" \
     "/Volumes/Civic/askcivic.git"
   do
     [[ -d "$path" ]] || continue
@@ -930,13 +933,15 @@ if [[ -n "$REPO" ]]; then
     done
   fi
   [[ -n "$REPO_CONF" ]] || { err "--repo '$REPO': no config at ~/.config/worktrees/${REPO}.conf"; exit 66; }
-  REPO_SECRETS="$( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""
+  REPO_ROOT="$( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; PROTECTED_ROOT=""; RUNTIME_CHECKOUT=""; SYNC_SUBDIR=""
     # shellcheck disable=SC1090
     source "$REPO_CONF" 2>/dev/null || true
-    eval "printf '%s' \"\${SECRETS_DIR:-}\"" )"
-  [[ -n "$REPO_SECRETS" ]] || { err "--repo '$REPO': config has no SECRETS_DIR ($REPO_CONF)"; exit 66; }
+    if [[ -n "$PROTECTED_ROOT" ]]; then printf '%s' "$PROTECTED_ROOT";
+    elif [[ -n "$SECRETS_DIR" ]]; then printf '%s' "$SECRETS_DIR";
+    else printf '%s' "$BARE_REPO"; fi )"
+  [[ -n "$REPO_ROOT" ]] || { err "--repo '$REPO': config has no PROTECTED_ROOT, SECRETS_DIR, or BARE_REPO ($REPO_CONF)"; exit 66; }
   if ! $WORK_DIR_EXPLICIT; then
-    WORK_DIR="$REPO_SECRETS"
+    WORK_DIR="$REPO_ROOT"
     WORK_DIR_EXPLICIT=true
   fi
 fi
@@ -1148,7 +1153,7 @@ slugify_branch() {
 }
 
 enter_worktree_for_project() {
-  local proj="$1" parent="$2" secrets="$3" branch=""
+  local proj="$1" parent="$2" root="$3" branch=""
   branch="$WORKTREE_BRANCH"
   [[ -z "$branch" && -n "$SESSION_DOC" ]] && branch="$(slugify_branch "$(basename "${SESSION_DOC%.*}")")"
   [[ -z "$branch" && -n "$TITLE" && "$TITLE" != "Dispatch aspirant" ]] && branch="$(slugify_branch "$TITLE")"
@@ -1163,7 +1168,7 @@ enter_worktree_for_project() {
     exit 64
   fi
   # Preserve any nested cwd under the shared checkout (repo/subdir → wt/subdir).
-  local rel="${WORK_DIR#"$secrets"}"; rel="${rel#/}"
+  local rel="${WORK_DIR#"$root"}"; rel="${rel#/}"
   local wt_path="$parent/wt-$branch"
   local dest="$wt_path"; [[ -n "$rel" ]] && dest="$wt_path/$rel"
   if $DRY_RUN; then
@@ -1185,25 +1190,34 @@ enter_worktree_for_project() {
 }
 
 maybe_enter_worktree() {
-  $NO_WORKTREE && { WORKTREE_DECISION="opt-out (--no-worktree)"; return 0; }
   $ASPIRANT && { WORKTREE_DECISION="n/a (aspirant)"; return 0; }
   [[ -n "$RESUME_ID" ]] && { WORKTREE_DECISION="n/a (resume reuses existing dir)"; return 0; }
 
-  local conf proj parent secrets
+  local conf proj parent secrets protected runtime root
   for conf in "$HOME"/.config/worktrees/*.conf; do
     [[ -f "$conf" ]] || continue
     proj="$(basename "$conf" .conf)"
     parent="$(dispatch_conf_var "$conf" WORKTREE_PARENT)"
     secrets="$(dispatch_conf_var "$conf" SECRETS_DIR)"
+    protected="$(dispatch_conf_var "$conf" PROTECTED_ROOT)"
+    runtime="$(dispatch_conf_var "$conf" RUNTIME_CHECKOUT)"
     if [[ -n "$parent" && ( "$WORK_DIR" == "$parent" || "$WORK_DIR" == "$parent"/* ) ]]; then
       WORKTREE_DECISION="n/a (already isolated worktree)"
       return 0
     fi
-    if [[ -n "$secrets" && ( "$WORK_DIR" == "$secrets" || "$WORK_DIR" == "$secrets"/* ) ]]; then
-      enter_worktree_for_project "$proj" "$parent" "$secrets"
+    for root in "$protected" "$runtime" "$secrets"; do
+      [[ -n "$root" ]] || continue
+      [[ "$WORK_DIR" == "$root" || "$WORK_DIR" == "$root"/* ]] || continue
+      if $NO_WORKTREE; then
+        err "refusing to dispatch into protected/runtime root with --no-worktree: $WORK_DIR"
+        err "use --worktree <branch> (preferred) or choose an existing branch worktree under $parent"
+        exit 64
+      fi
+      enter_worktree_for_project "$proj" "$parent" "$root"
       return 0
-    fi
+    done
   done
+  $NO_WORKTREE && { WORKTREE_DECISION="opt-out (--no-worktree)"; return 0; }
   return 0
 }
 
