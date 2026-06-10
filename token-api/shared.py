@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -444,7 +445,7 @@ async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         proc = await _run_subprocess_offloop(
-            ("python3", "-m", "tmuxctl.cli", "resolve-pane", tmux_pane),
+            (sys.executable, "-m", "tmuxctl.cli", "resolve-pane", tmux_pane),
             env={
                 **os.environ,
                 "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
@@ -553,8 +554,20 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
         return (None, None)
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
+        # sys.executable, never bare "python3": on the live host "python3" resolves
+        # to the uv shim, which re-syncs token-api's venv on every spawn and fails
+        # closed (no stdout) on a corrupt venv — null panes for every row. tmuxctl's
+        # CLI is stdlib-only, so the running interpreter runs it directly via PYTHONPATH.
         proc = await _run_subprocess_offloop(
-            ("python3", "-m", "tmuxctl.cli", "resolve-instance", instance_id, "--format", "json"),
+            (
+                sys.executable,
+                "-m",
+                "tmuxctl.cli",
+                "resolve-instance",
+                instance_id,
+                "--format",
+                "json",
+            ),
             env={
                 **os.environ,
                 "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
