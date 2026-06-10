@@ -11,7 +11,7 @@
 # Usage:
 #   tx                    # Show session status (or start if not in tmux)
 #   tx start              # Create/attach to main workspace session
-#   tx restart [-r]       # Kill session and recreate workspace
+#   tx restart [-r]       # Kill session and recreate workspace (asks to confirm; -y/--force skips)
 #   tx restart-pane       # Reset active pane to default state
 #   tx restart-page       # Reset current window/page to default layout
 #   tx exit               # Detach from tmux
@@ -41,6 +41,8 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 # shellcheck source=../lib/pane-id.sh
 source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
+# shellcheck source=../lib/origin.sh
+source "${_LIB_DIR}/origin.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -57,6 +59,36 @@ log_warn()    { echo -e "${YELLOW}▸${RESET} $*" >&2; }
 log_error()   { echo -e "${RED}✗${RESET} $*" >&2; }
 
 SESSION_NAME="main"
+
+# --- Invocation attribution log ----------------------------------------------
+# The destructive subcommands (`tx start` / `tx restart`) have wiped the whole
+# workspace unbidden — three times in one day. The caller is dynamic (a live
+# agent's Bash tool that believes it is running a benign attach), so no static
+# grep over scripts/cron/launchd/CI can find it. Record WHO invokes each
+# destructive entry point, red-handed: timestamp, subcommand, outcome, the
+# resolved origin record (machine/device/pane/instance/geofence/transport, from
+# origin.sh), TTY state, and the parent process (the agent's shell / Bash-tool
+# wrapper). This is a flat, append-only log — deliberately NOT the live
+# agents.db or any token-api hot path, so it stays inert and outside the failure
+# modes that caused the wipes. Best-effort: it must NEVER block or fail `tx`.
+TX_INVOCATION_LOG="${TX_INVOCATION_LOG:-${HOME}/.claude/tx-invocations.log}"
+
+_tx_log_invocation() {
+    local subcmd="${1:-?}" outcome="${2:-?}"
+    {
+        local ts origin parent in_tty out_tty
+        ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')
+        origin=$(origin_record 2>/dev/null || echo '{}')
+        in_tty=0; [[ -t 0 ]] && in_tty=1
+        out_tty=0; [[ -t 1 ]] && out_tty=1
+        # Parent process = the agent shell / Bash-tool wrapper that ran us.
+        parent=$(ps -o ppid=,command= -p "$PPID" 2>/dev/null | tr '\n\t' '  ')
+        mkdir -p "$(dirname "$TX_INVOCATION_LOG")" 2>/dev/null || true
+        printf '%s\tsubcmd=%s\toutcome=%s\ttty=-t0:%s,-t1:%s\torigin=%s\tparent=%s\n' \
+            "$ts" "$subcmd" "$outcome" "$in_tty" "$out_tty" "$origin" "$parent" \
+            >> "$TX_INVOCATION_LOG" 2>/dev/null
+    } 2>/dev/null || true
+}
 
 # --- Workspace flag detection ---
 # Legacy workspace flags (now mapped to tx subcommands or removed).
@@ -139,13 +171,20 @@ ensure_workspace_before_attach() {
         return 0
     fi
 
+    # A self-heal must NEVER destroy live work. This previously auto-ran a full
+    # `restart --execute` (kill-session + rebuild) whenever the layout drifted —
+    # e.g. after a botched `prefix d` demote — silently wiping every pane and
+    # agent instance on the *next attach*. Any benign attach (a CI/CD step, a
+    # phone reconnect, anything that runs `tx`/`tx start`) would therefore nuke
+    # the whole session without a prompt. Detect drift and WARN only; a real
+    # rebuild must be the operator's deliberate, guarded `tx restart`.
     if workspace_needs_repair "$session"; then
-        log_warn "Session '${session}' is not the managed full layout; rebuilding it."
-        if ! run_tmuxctl restart --execute --session "$session"; then
-            log_warn "Managed restart failed; replacing malformed session '${session}'."
-            tmux kill-session -t "$session" 2>/dev/null || true
-            run_tmuxctl create --session "$session"
-        fi
+        # This is the exact line that previously triggered the silent wipe.
+        # Log it (with origin) so we see every benign attach that hit a
+        # malformed layout, and from where.
+        _tx_log_invocation "start" "selfheal-warned" || true
+        log_warn "Session '${session}' layout looks malformed (pane counts/tags drifted)."
+        log_warn "Attaching AS-IS — nothing wiped. Run 'tx restart' deliberately to rebuild."
     fi
 }
 
@@ -163,7 +202,7 @@ tx — tmux wrapper
 SESSION
   tx              status / start
   tx start        create + attach
-  tx restart (-r) kill + recreate
+  tx restart (-r) kill + recreate (confirms; -y skips)
   tx restart-pane   reset pane
   tx restart-page   reset page
   tx exit         detach
@@ -220,7 +259,7 @@ tx — Imperium tmux wrapper
 Session:
   tx                  status, or start if no tmux
   tx start            create + attach workspace
-  tx restart, tx -r   kill + recreate session
+  tx restart, tx -r   kill + recreate session (asks to confirm; -y/--force skips)
   tx restart-pane     reset active pane to default state
   tx restart-page     reset current window/page to default layout
   tx exit             detach (session stays alive)
@@ -279,10 +318,12 @@ cmd_start() {
 
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         ensure_workspace_before_attach "$SESSION_NAME"
+        _tx_log_invocation "start" "attached" || true
         log_info "Attaching to existing session '${SESSION_NAME}'"
         exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
     fi
 
+    _tx_log_invocation "start" "attached" || true
     log_info "Creating workspace session '${SESSION_NAME}'"
     run_tmuxctl create --session "$SESSION_NAME"
     exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
@@ -318,6 +359,43 @@ cmd_restart_page() {
 
 cmd_restart() {
     local session="$SESSION_NAME"
+
+    # --- Destructive-action guard -------------------------------------------
+    # `tx restart` tears down and rebuilds the ENTIRE workspace — every pane and
+    # every agent instance. It must never fire flippantly, and never from an
+    # agent / hook / cron, which have repeatedly wiped live work unbidden.
+    # Require an explicit interactive confirmation; FAIL CLOSED when there is no
+    # controlling TTY (a tool-invoked Bash, a hook, a background job all lack
+    # one). `--force`/`-y` is the deliberate escape hatch for scripted callers.
+    local force=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes|--force) force=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$force" ]]; then
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            _tx_log_invocation "restart" "refused-no-tty" || true
+            log_error "tx restart wipes & rebuilds the whole '${session}' workspace (all panes/instances)."
+            log_error "Refusing: no interactive terminal to confirm. Re-run with --force if you really mean it."
+            return 1
+        fi
+        log_warn "tx restart will KILL and rebuild the entire '${session}' session — every pane and agent instance."
+        printf "Type 'restart' to confirm: " >&2
+        local reply=""
+        read -r reply || true
+        if [[ "$reply" != "restart" ]]; then
+            _tx_log_invocation "restart" "aborted" || true
+            log_info "Aborted — nothing was restarted."
+            return 1
+        fi
+        _tx_log_invocation "restart" "confirmed" || true
+    else
+        _tx_log_invocation "restart --force" "confirmed" || true
+    fi
+    # ------------------------------------------------------------------------
 
     # Snapshot active instances for resurrection. The Python executor handles
     # client park/detach/restore + teardown + rebuild + resume internally.
