@@ -576,7 +576,9 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
    an instance; the row is marked and the <ExpandedInstance> card renders above
    the table. Manual selection also focuses + @OPS_SELECTED-marks the tmux pane. */
 
-.fleet tbody tr { cursor: default; }
+/* double-click selects an instance, so suppress the native text-highlight the
+   double-click gesture would otherwise leave on the row */
+.fleet tbody tr, .fcard { cursor: default; user-select: none; }
 .fleet tbody tr.is-selected { background: color-mix(in srgb, var(--sel) 12%, transparent); box-shadow: inset 3px 0 0 var(--sel); }
 .fleet tbody tr.is-selected:hover { background: color-mix(in srgb, var(--sel) 18%, transparent); }
 .fleet tbody tr.is-talking { box-shadow: inset 3px 0 0 var(--phosphor); }

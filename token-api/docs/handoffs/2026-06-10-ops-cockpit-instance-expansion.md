@@ -103,3 +103,18 @@ without that blast radius:
 Operator follow-up (needs a real talking fleet + live tmux): on the live cockpit, double-
 click a local instance and confirm its tmux pane focuses/zooms and shows `◆ SEL`; confirm
 a speaking instance auto-expands and its pane gets the badge.
+
+### Self-review fixes (CodeRabbit was rate-limited / out of org credits)
+
+A `/code-review` pass (CodeRabbit couldn't run) surfaced and fixed:
+- **`prevTalking` was reset to null whenever TTS fell silent** → a same-speaker
+  pause/resume (gap between queued utterances) counted as a *new* talker and clobbered a
+  manual pin. Fixed: `prevTalking` only advances on a real distinct talker, never resets
+  on silence. New E2E assertion pins this (17/17).
+- **Ghost selection** when the selected instance leaves `instances.active`: added a prune
+  effect (`useInstanceSelection(current, activeIds)`) that clears the dangling selection
+  (and forgets the talker so it re-expands on return).
+- **Native text-highlight on double-click**: `user-select: none` on fleet rows / cards.
+Intentional (not changed): clearing a talking card via ✕ is a dismissal — the same
+speaker won't auto-re-expand until a different instance talks; double-click the row to
+bring it back.
