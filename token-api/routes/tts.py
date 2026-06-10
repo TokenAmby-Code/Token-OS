@@ -941,7 +941,7 @@ async def select_instance_pane(instance_id: str) -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT device_id, tmux_pane FROM claude_instances WHERE id = ?",
+                "SELECT device_id, tmux_pane FROM instances WHERE id = ?",
                 (instance_id,),
             )
             row = await cursor.fetchone()
