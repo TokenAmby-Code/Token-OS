@@ -59,7 +59,7 @@ def test_run_allow_failure_uses_single_output_pipe(monkeypatch):
 
     assert calls
     assert calls[0][1]["stdout"] is tmux_adapter.subprocess.PIPE
-    assert calls[0][1]["stderr"] is tmux_adapter.subprocess.STDOUT
+    assert calls[0][1]["stderr"] is tmux_adapter.subprocess.DEVNULL
 
 
 def test_run_reports_emfile_as_tmux_error(monkeypatch):

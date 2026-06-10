@@ -907,10 +907,13 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
             (instance_id,),
         )
         row = await cursor.fetchone()
-    if not row:
+    allow_stamped_pane_fallback = (
+        os.environ.get("TOKEN_API_TEST_ALLOW_STAMPED_PANE_FALLBACK") == "1"
+    )
+    if not row and (not instance_id or allow_stamped_pane_fallback):
         # Compatibility fallback for legacy rows/tests that predate @INSTANCE_ID
-        # stamps, and isolation fallback for test/temp DBs when the live tmux pane
-        # carries an @INSTANCE_ID from a different Token-API database.
+        # stamps. Tests may opt into stamped fallback when the live tmux server
+        # carries an @INSTANCE_ID from a different temporary Token-API database.
         cursor = await db.execute(
             """SELECT id, tab_name, engine, status, last_activity
                FROM claude_instances

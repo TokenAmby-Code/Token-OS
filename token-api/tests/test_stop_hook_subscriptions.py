@@ -695,9 +695,10 @@ def test_prune_endpoint_dry_run_default(app_env):
     assert len(_active_subscription_ids(app_env.db_path)) == 1
 
 
-def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env):
+def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypatch):
     from fastapi.testclient import TestClient
 
+    monkeypatch.setenv("TOKEN_API_TEST_ALLOW_STAMPED_PANE_FALLBACK", "1")
     _insert_instance(app_env.db_path, "planner-1", pane="%91", engine="codex")
     client = TestClient(app_env.main.app)
 

@@ -150,9 +150,10 @@ def _has_flag(args: list[str], flag: str) -> bool:
 def _tmux_stderr_target(*, allow_failure: bool):
     # allow_failure callers intentionally tolerate tmux errors and almost never
     # consume stderr. Do not spend a second pipe for stderr; the live legion:new
-    # failure hit EMFILE while creating that unnecessary err pipe. Keep stderr
-    # merged into stdout for best-effort diagnostics without extra FD pressure.
-    return subprocess.STDOUT if allow_failure else subprocess.PIPE
+    # failure hit EMFILE while creating an unnecessary err pipe. Discard tolerated
+    # stderr instead of merging it into stdout, because structured tmux stdout is
+    # parsed by list_clients/list_sessions/list_panes callers.
+    return subprocess.DEVNULL if allow_failure else subprocess.PIPE
 
 
 class TmuxAdapter:

@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "cli-tools" / "bin" / "dispatch"
 
@@ -513,7 +515,9 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
     assert lines[5] == "d|--interactive --target legion:new new pane"
 
 
-def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(monkeypatch):
+def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     monkeypatch.setenv("TOKEN_API_DISPATCH_MENU_CONSUMED", "1")
     monkeypatch.setenv("TMUX_PANE", "%42")
