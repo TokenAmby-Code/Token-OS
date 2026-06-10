@@ -821,6 +821,46 @@ async def _focus_and_zoom_pane(pane_id: str) -> dict:
     return {"focused": True, "actions": actions}
 
 
+# ============ Selected-instance marker ============
+# The Ops Cockpit "select + expand an instance" primitive (feature A: manual
+# double-click selection; feature B: talking-instance overlay) shares ONE tmux
+# realization — `_focus_zoom_and_mark`: focus + zoom the pane, then stamp
+# @OPS_SELECTED on it so the selection is visible on the pane border too. Only
+# one pane is ever selected; stamping a new one clears the marker from any other
+# pane. The border render lives in cli-tools/tmux/tmux-base.conf (the @TTS_STATE
+# idiom). Fire-and-forget: the marker is cosmetic and never blocks focus.
+
+
+def _set_ops_selected(pane_id: str | None) -> None:
+    """Stamp @OPS_SELECTED=1 on `pane_id`, clearing it from every other pane.
+
+    Routed through `_tmux` (so it never raises and stays monkeypatchable). Exactly
+    one pane carries the marker after this returns. Synchronous; async callers on
+    the event loop wrap it in asyncio.to_thread.
+    """
+    listed = _tmux(["list-panes", "-a", "-F", "#{pane_id} #{@OPS_SELECTED}"])
+    if listed is not None and getattr(listed, "returncode", 1) == 0:
+        for line in (listed.stdout or "").splitlines():
+            parts = line.split()
+            # Clear the marker anywhere it lingers except the pane we're selecting.
+            if len(parts) >= 2 and parts[1] and parts[0] != pane_id:
+                _tmux(["set-option", "-p", "-u", "-t", parts[0], "@OPS_SELECTED"])
+    if pane_id:
+        _tmux(["set-option", "-p", "-t", pane_id, "@OPS_SELECTED", "1"])
+
+
+async def _focus_zoom_and_mark(pane_id: str) -> dict:
+    """The shared 'select + expand a pane' primitive for both cockpit features.
+
+    Focus + zoom the pane, then mark it @OPS_SELECTED. The talking auto-snap
+    (feature B) and the manual focus-pane endpoint (feature A) both funnel
+    through here, so there is exactly one expand mechanism — not two forks.
+    """
+    result = await _focus_and_zoom_pane(pane_id)
+    await asyncio.to_thread(_set_ops_selected, pane_id)
+    return result
+
+
 async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
     """Snap tmux focus + zoom to the pane that originated this TTS item.
 
@@ -875,12 +915,71 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
         if not pane_id:
             return {"snapped": False, "reason": "pane_dead"}
 
-        result = await _focus_and_zoom_pane(pane_id)
+        result = await _focus_zoom_and_mark(pane_id)
         logger.info(f"TTS focus snap -> {pane_id} ({result.get('actions')})")
         return {"snapped": True, "pane_id": pane_id, **result}
     except Exception as e:
         logger.warning(f"TTS focus snap failed (non-fatal): {e}")
         return {"snapped": False, "reason": "error", "error": str(e)}
+
+
+async def select_instance_pane(instance_id: str) -> dict:
+    """Manual 'select + expand' of an instance's pane (Ops Cockpit feature A).
+
+    The operator double-clicked a fleet row; reflect that selection in tmux by
+    running the SAME focus+zoom+mark primitive the talking auto-snap uses. Local
+    machine ownership and a live pane are hard gates (you cannot focus a remote
+    or dead pane). Unlike the talking snap, a manual selection deliberately
+    bypasses the voice-chat / discord-backend gates — the operator explicitly
+    asked for this pane. Never raises; returns {snapped, reason, ...}.
+    """
+    try:
+        if not instance_id:
+            return {"snapped": False, "reason": "no_instance"}
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT device_id, tmux_pane FROM claude_instances WHERE id = ?",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
+
+        if not row:
+            return {"snapped": False, "reason": "instance_gone"}
+
+        device_id = row["device_id"]
+        tmux_pane = row["tmux_pane"]
+
+        # Local-only: only the machine that owns the pane can focus it.
+        local = _local_device_name()
+        if not local or device_id != local:
+            return {"snapped": False, "reason": "remote_pane", "device_id": device_id}
+
+        if not tmux_pane:
+            return {"snapped": False, "reason": "no_pane"}
+
+        pane_id = await resolve_tmux_pane_id(tmux_pane)
+        if not pane_id:
+            return {"snapped": False, "reason": "pane_dead"}
+
+        result = await _focus_zoom_and_mark(pane_id)
+        logger.info(f"Ops manual focus -> {pane_id} ({result.get('actions')})")
+        return {"snapped": True, "reason": None, "pane_id": pane_id, **result}
+    except Exception as e:
+        logger.warning(f"Ops manual focus failed (non-fatal): {e}")
+        return {"snapped": False, "reason": "error", "error": str(e)}
+
+
+@router.post("/api/instances/{instance_id}/focus-pane")
+async def focus_instance_pane(instance_id: str) -> dict:
+    """Human-initiated tmux focus for the Ops Cockpit fleet table.
+
+    Selects + zooms + marks the instance's pane (server-resolved by id; raw %pane
+    ids never reach the browser). Mirrors the talking auto-snap onto an explicit
+    operator action. Returns FocusResult {snapped, reason} (web/ops/src/api.ts).
+    """
+    return await select_instance_pane(instance_id)
 
 
 async def tts_queue_worker():

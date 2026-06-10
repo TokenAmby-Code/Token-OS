@@ -34,6 +34,7 @@
   --phosphor-dim: #5e8a39;
   --hazard: #ff5b3d;
   --hazard-deep: #b8341d;
+  --sel: #c77dff; /* ops instance-selection accent (matches the tmux ◆ SEL badge) */
 
   /* timer mode palette */
   --m-working: #93d94f;
@@ -569,6 +570,66 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
 .fcard__grid > div { font-size: 13px; }
 .fcard__wide { grid-column: 1 / -1; }
 .fcard .k { display: block; color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 2px; }
+
+/* ── instance selection + expanded view (A: double-click · B: talking) ─── */
+/* One mechanism: a double-click (manual) or the current talker (auto) selects
+   an instance; the row is marked and the <ExpandedInstance> card renders above
+   the table. Manual selection also focuses + @OPS_SELECTED-marks the tmux pane. */
+
+.fleet tbody tr { cursor: default; }
+.fleet tbody tr.is-selected { background: color-mix(in srgb, var(--sel) 12%, transparent); box-shadow: inset 3px 0 0 var(--sel); }
+.fleet tbody tr.is-selected:hover { background: color-mix(in srgb, var(--sel) 18%, transparent); }
+.fleet tbody tr.is-talking { box-shadow: inset 3px 0 0 var(--phosphor); }
+.fleet tbody tr.is-selected.is-talking { box-shadow: inset 3px 0 0 var(--phosphor), inset 6px 0 0 var(--sel); }
+
+.fcard.is-selected { border-left-color: var(--sel); background: color-mix(in srgb, var(--sel) 8%, var(--surface-2)); }
+.fcard.is-talking { border-left-color: var(--phosphor); }
+
+.xi {
+  position: relative;
+  margin-bottom: 14px;
+  padding: 13px 15px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--sel) 10%, var(--surface-2)), var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--sel) 40%, var(--line-bright));
+  border-left: 3px solid var(--sel);
+  border-radius: var(--radius-sm);
+}
+.xi--talking { --sel: var(--phosphor); }
+
+.xi__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.xi__id { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.xi__id strong { font-size: 16px; }
+.xi__close {
+  flex: none; cursor: pointer; background: transparent; border: 1px solid var(--line-bright);
+  color: var(--muted); border-radius: 5px; width: 24px; height: 24px; line-height: 1; font-size: 13px;
+}
+.xi__close:hover { color: var(--text); border-color: var(--sel); }
+
+.xi__src { font-size: 10px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap; }
+.xi__src--manual { color: var(--sel); border: 1px solid color-mix(in srgb, var(--sel) 50%, transparent); background: color-mix(in srgb, var(--sel) 12%, transparent); }
+.xi__src--talking { color: var(--phosphor); border: 1px solid var(--phosphor-dim); background: rgba(147, 217, 79, 0.1); }
+
+.xi__speaking {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  padding: 8px 11px; border-radius: 5px;
+  background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--phosphor);
+  font-size: 13px;
+}
+.xi__speaking-led { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--phosphor); box-shadow: 0 0 8px var(--phosphor); animation: pulse 1.8s ease-in-out infinite; }
+.xi__speaking-msg { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.xi__speaking-meta { flex: none; color: var(--faint); font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; white-space: nowrap; }
+
+.xi__grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 16px; margin-top: 12px; }
+.xi__grid > div { font-size: 13px; min-width: 0; }
+.xi__grid .k { display: block; color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 3px; }
+.xi__wide { grid-column: span 2; }
+.xi__grid code { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--muted); word-break: break-all; }
+.xi__note { margin: 10px 0 0; font-size: 11.5px; color: var(--brass-bright); }
+
+@media (max-width: 720px) {
+  .xi__grid { grid-template-columns: 1fr 1fr; }
+  .xi__wide { grid-column: 1 / -1; }
+}
 
 /* ── facts / attention ──────────────────────────────────────────────── */
 

@@ -1,9 +1,10 @@
-import { useEffect, useRef } from 'react';
-import { useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { focusPane, useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
+import type { TtsCurrent } from './types';
 import { formatClock } from './format';
 import { HudRings } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
-import { InstancesPanel } from './components/InstancesPanel';
+import { InstancesPanel, type Selection } from './components/InstancesPanel';
 import { AssertionsPanel, AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
 import { VoiceQueuePanel } from './components/VoiceQueuePanel';
 import { TtsStrip } from './components/TtsStrip';
@@ -32,6 +33,58 @@ function Panel({
   );
 }
 
+// One "select + expand an instance" mechanism for both cockpit features:
+//   A) a manual double-click in the fleet table, and
+//   B) the currently-talking instance (auto).
+// Both set the same selection and render the same expanded card. A manual
+// selection also reflects into tmux via /api/instances/{id}/focus-pane
+// (focus + zoom + @OPS_SELECTED mark); the talking case is already mirrored in
+// tmux by the backend TTS focus-snap, so we don't double-fire it from here.
+function useInstanceSelection(current: TtsCurrent | null) {
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [focusNote, setFocusNote] = useState<string | null>(null);
+  const selectionRef = useRef<Selection | null>(null);
+  selectionRef.current = selection;
+  const prevTalking = useRef<string | null>(null);
+
+  // Feature B: talking drives selection — but only on a *distinct* speaker
+  // change, so a manual selection sticks until the next new talker
+  // (last-writer-wins on real events, not on every 2s poll).
+  const talkingId = current?.instance_id ?? null;
+  useEffect(() => {
+    if (talkingId && talkingId !== prevTalking.current) {
+      setSelection({ id: talkingId, source: 'talking' });
+      setFocusNote(null);
+    }
+    prevTalking.current = talkingId;
+  }, [talkingId]);
+
+  // Feature A: manual double-click. Re-selecting the manually-selected row
+  // collapses it.
+  const select = useCallback((id: string) => {
+    const prev = selectionRef.current;
+    if (prev && prev.id === id && prev.source === 'manual') {
+      setSelection(null);
+      setFocusNote(null);
+      return;
+    }
+    setSelection({ id, source: 'manual' });
+    setFocusNote(null);
+    focusPane(id)
+      .then((r) => {
+        if (!r.snapped) setFocusNote(`tmux pane not focused: ${r.reason ?? 'unknown'}`);
+      })
+      .catch((e) => setFocusNote(`tmux focus failed: ${e instanceof Error ? e.message : String(e)}`));
+  }, []);
+
+  const clear = useCallback(() => {
+    setSelection(null);
+    setFocusNote(null);
+  }, []);
+
+  return { selection, talkingId, focusNote, select, clear };
+}
+
 export function App() {
   const ops = useOpsState();
   const timer = useTimerHistory();
@@ -39,6 +92,7 @@ export function App() {
   const docs = useSessionDocs();
 
   const state = ops.data;
+  const selection = useInstanceSelection(state?.tts.current ?? null);
   const initialBuildId = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
@@ -144,7 +198,15 @@ export function App() {
               </div>
             }
           >
-            <InstancesPanel instances={state.instances.active} />
+            <InstancesPanel
+              instances={state.instances.active}
+              selection={selection.selection}
+              talkingId={selection.talkingId}
+              current={state.tts.current}
+              focusNote={selection.focusNote}
+              onSelect={selection.select}
+              onClear={selection.clear}
+            />
           </Panel>
 
           <Panel
