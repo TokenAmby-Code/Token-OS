@@ -35,7 +35,7 @@ def env(tmp_path: Path) -> Env:
     parent = home / "worktrees" / "clmtest"
     parent.mkdir(parents=True)
     (home / ".config" / "worktrees" / "clmtest.conf").write_text(
-        f"BARE_REPO={tmp_path / 'proj.git'}\nWORKTREE_PARENT={parent}\nSECRETS_DIR={prod}\n",
+        f"BARE_REPO={tmp_path / 'proj.git'}\nWORKTREE_PARENT={parent}\nSECRETS_DIR={prod / 'secrets'}\nPROTECTED_ROOT={prod}\nRUNTIME_CHECKOUT={tmp_path / 'runtime'}\nLOCAL_BARE_MAIN_SYNC=true\n",
         encoding="utf-8",
     )
     base = dict(os.environ)
@@ -58,7 +58,9 @@ def _worktree_line(stdout: str) -> str:
 
 
 def test_no_worktree_opt_out(env: Env) -> None:
-    res = _run(env, "--no-worktree", "--dir", str(env.prod), "do the thing")
+    other = env.prod.parent / "nonproject"
+    other.mkdir()
+    res = _run(env, "--no-worktree", "--dir", str(other), "do the thing")
     assert res.returncode == 0, res.stderr
     assert "worktree:" in res.stdout
     assert "opt-out" in _worktree_line(res.stdout).lower()
@@ -133,3 +135,17 @@ def test_explicit_dir_wins_over_repo(env: Env) -> None:
     res = _run(env, "--repo", "clmtest", "--dir", str(other), "do it")
     assert res.returncode == 0, res.stderr
     assert f"dir:             {other}" in res.stdout
+
+
+def test_no_worktree_refuses_protected_root(env: Env) -> None:
+    res = _run(env, "--no-worktree", "--dir", str(env.prod), "do the thing")
+    assert res.returncode == 64
+    assert "refusing to dispatch into protected/runtime root" in res.stderr
+
+
+def test_runtime_root_also_forces_worktree(env: Env) -> None:
+    runtime = env.prod.parent / "runtime"
+    runtime.mkdir()
+    res = _run(env, "--dir", str(runtime), "--worktree", "runtime-fix", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "wt-runtime-fix" in _worktree_line(res.stdout)

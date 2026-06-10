@@ -49,6 +49,7 @@ SKIP_SYNC=false
 NO_TRANSPLANT=false
 REQUIRE_FREE=false
 FORCE=false
+ALLOW_PROTECTED_BRANCH=false
 PROJECT="$(detect_default_project)"
 INIT_MODE=false
 SESSION_DOC_ID=""
@@ -71,6 +72,9 @@ Options:
   --no-transplant       Skip session transplant (for subagents or non-interactive use)
   --require-free        Claim the branch atomically; refuse if a live worktree
                         already holds it (1 branch = 1 worktree = 1 PR)
+  --allow-protected-branch
+                        Admin escape hatch: allow creating main/master worktrees.
+                        Normal agents must not use main/master as work targets.
   -f, --force           Override an existing claim / reuse an existing branch
   --session-doc <id>    Register this worktree (active) in the session doc's
                         frontmatter worktrees: list. Supplied by the parent
@@ -84,6 +88,10 @@ Config:
     BARE_REPO         Path to bare git repo on NAS
     WORKTREE_PARENT   Local directory for worktrees
     SECRETS_DIR       NAS directory with env files and credentials
+    PROTECTED_ROOT    Optional protected checkout/root agents must not edit
+    RUNTIME_CHECKOUT  Optional deploy-owned runtime checkout (not a work target)
+    LOCAL_BARE_MAIN_SYNC
+                      true when local CD owns bare main synchronization
 
 Examples:
   worktree-setup feature-auth              # New branch in askCivic
@@ -203,6 +211,9 @@ print_init_template() {
 BARE_REPO=/mnt/civic/${project}.git
 WORKTREE_PARENT=\$HOME/worktrees/${project}
 SECRETS_DIR=/mnt/civic/${project}.secrets
+PROTECTED_ROOT=
+RUNTIME_CHECKOUT=
+LOCAL_BARE_MAIN_SYNC=false
 
 # Optional: subdirectory containing pyproject.toml (for monorepos)
 # SYNC_SUBDIR=subdir
@@ -254,6 +265,10 @@ while [[ $# -gt 0 ]]; do
             REQUIRE_FREE=true
             shift
             ;;
+        --allow-protected-branch|--allow-main-worktree|--admin-readonly-main)
+            ALLOW_PROTECTED_BRANCH=true
+            shift
+            ;;
         --session-doc)
             if [[ $# -lt 2 ]]; then
                 log_error "--session-doc requires a doc id"
@@ -298,6 +313,15 @@ fi
 
 # Load project config (validates NAS mounts, bare repo, etc.)
 load_config "$PROJECT"
+
+if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" ]]; then
+    if [[ "$ALLOW_PROTECTED_BRANCH" != "true" ]]; then
+        log_error "Refusing to create a '$BRANCH_NAME' worktree: main/master are protected skeleton branches, not agent work targets"
+        log_error "Use a feature branch. Admin/read-only exception: --allow-protected-branch"
+        exit 64
+    fi
+    log_warn "Admin exception: creating protected branch worktree '$BRANCH_NAME'"
+fi
 
 WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
@@ -447,11 +471,11 @@ fi
 
 # Execute
 log_info "Creating worktree..."
-# --force for main/master: allows both WSL and Mac to have wt-main simultaneously.
-# Explicit --force (Gap 1 claim override) also maps through, and prunes any stale
+# Explicit --force (Gap 1 claim override) maps through, and prunes any stale
 # worktree registration left by a removed-but-unpruned dir so the re-add succeeds.
+# main/master are refused above unless --allow-protected-branch is passed.
 FORCE_FLAG=""
-if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" || "$FORCE" == "true" ]]; then
+if [[ "$FORCE" == "true" ]]; then
     FORCE_FLAG="--force"
 fi
 if [[ "$FORCE" == "true" ]]; then

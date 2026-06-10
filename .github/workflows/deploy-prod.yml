@@ -3,13 +3,15 @@ name: Deploy (prod)
 # Triggers ONLY on merge to main. Per-worktree local dev URLs are untouched —
 # there is no "merge to deploy dev" path. Merge means ship.
 #
-# Token-OS is personal software on a local Mac — "deploy to prod" == sync the live
-# checkout and restart the right local services. This pipeline is intentionally
+# Token-OS is personal software on a local Mac — "deploy to prod" == sync the local
+# bare skeleton, update the deploy-owned runtime checkout, and restart the right
+# local services. This pipeline is intentionally
 # DUMB: it does NOT figure out what changed. A GH-hosted runner cannot reach the
 # Mac directly, so it joins the Emperor's tailnet (ephemeral node) and POSTs to
 # token-api's /api/cd/restart webhook. The webhook spawns a single git-aware
-# `token-restart --sync`, which ff-only pulls the live checkout to origin/main and
-# restarts ONLY the services whose files the merge changed (see
+# `token-restart --sync`, which ff-only syncs /Volumes/Imperium/token-os.git main,
+# checks out the requested SHA detached in the runtime checkout, and restarts ONLY
+# the services whose files the merge changed (see
 # map_changed_to_services in cli-tools/bin/token-restart). All the "what changed →
 # what restarts" intelligence lives there, in one git-aware place — not split
 # across this workflow and the webhook. The endpoint is ACK-FIRST: it returns 200
@@ -92,7 +94,7 @@ jobs:
             --arg sha "$SHA" \
             --arg pr_url "$PR_URL" \
             '{sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
-          echo "Posting restart for merge $SHA (token-restart decides what ships)"
+          echo "Posting runtime deploy for merge $SHA (local bare sync + detached runtime checkout)"
           # The endpoint acks immediately then restarts detached; a short timeout is
           # fine. A timeout here almost always means the tailnet ACL blocks :7777.
           code=$(curl -sS -o /tmp/cd_resp.json -w '%{http_code}' \

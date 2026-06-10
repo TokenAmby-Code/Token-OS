@@ -15765,8 +15765,9 @@ async def cd_restart(request: Request):
     """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
 
     Body: {"sha": "...", "pr_url": "..."}. The merge to main is shipped by a single
-    detached, git-aware `token-restart --sync`: it ff-only pulls the live checkout
-    to origin/main and then restarts ONLY the services whose files the merge
+    detached, git-aware `token-restart --sync`: it fast-forwards the local bare
+    skeleton from GitHub main, updates the deploy-owned runtime checkout detached,
+    and then restarts ONLY the services whose files the deploy
     changed (see map_changed_to_services in cli-tools/bin/token-restart). The CD
     pipeline no longer routes services — it just hits this endpoint. Any legacy
     `services` field is accepted but informational (logged, not acted on).
@@ -15827,8 +15828,11 @@ async def cd_restart(request: Request):
         except Exception as e:
             logger.warning("CD: save_restart_state failed (continuing): %s", e)
         token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
+        target_env = ""
+        if isinstance(sha, str) and sha.strip():
+            target_env = f"TOKEN_RESTART_TARGET_SHA={shlex.quote(sha.strip())} "
         _cd_spawn_detached(
-            ["bash", "-c", f"sleep 2; exec {shlex.quote(token_restart)} --sync"],
+            ["bash", "-c", f"sleep 2; exec {target_env}{shlex.quote(token_restart)} --sync"],
             log_name="self-restart",
         )
         _cd_last_restart_spawn = now
