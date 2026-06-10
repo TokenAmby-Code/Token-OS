@@ -11,7 +11,7 @@
 # Usage:
 #   tx                    # Show session status (or start if not in tmux)
 #   tx start              # Create/attach to main workspace session
-#   tx restart [-r]       # Kill session and recreate workspace
+#   tx restart [-r]       # Kill session and recreate workspace (asks to confirm; -y/--force skips)
 #   tx restart-pane       # Reset active pane to default state
 #   tx restart-page       # Reset current window/page to default layout
 #   tx exit               # Detach from tmux
@@ -163,7 +163,7 @@ tx — tmux wrapper
 SESSION
   tx              status / start
   tx start        create + attach
-  tx restart (-r) kill + recreate
+  tx restart (-r) kill + recreate (confirms; -y skips)
   tx restart-pane   reset pane
   tx restart-page   reset page
   tx exit         detach
@@ -220,7 +220,7 @@ tx — Imperium tmux wrapper
 Session:
   tx                  status, or start if no tmux
   tx start            create + attach workspace
-  tx restart, tx -r   kill + recreate session
+  tx restart, tx -r   kill + recreate session (asks to confirm; -y/--force skips)
   tx restart-pane     reset active pane to default state
   tx restart-page     reset current window/page to default layout
   tx exit             detach (session stays alive)
@@ -318,6 +318,38 @@ cmd_restart_page() {
 
 cmd_restart() {
     local session="$SESSION_NAME"
+
+    # --- Destructive-action guard -------------------------------------------
+    # `tx restart` tears down and rebuilds the ENTIRE workspace — every pane and
+    # every agent instance. It must never fire flippantly, and never from an
+    # agent / hook / cron, which have repeatedly wiped live work unbidden.
+    # Require an explicit interactive confirmation; FAIL CLOSED when there is no
+    # controlling TTY (a tool-invoked Bash, a hook, a background job all lack
+    # one). `--force`/`-y` is the deliberate escape hatch for scripted callers.
+    local force=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes|--force) force=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$force" ]]; then
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            log_error "tx restart wipes & rebuilds the whole '${session}' workspace (all panes/instances)."
+            log_error "Refusing: no interactive terminal to confirm. Re-run with --force if you really mean it."
+            return 1
+        fi
+        log_warn "tx restart will KILL and rebuild the entire '${session}' session — every pane and agent instance."
+        printf "Type 'restart' to confirm: " >&2
+        local reply=""
+        read -r reply || true
+        if [[ "$reply" != "restart" ]]; then
+            log_info "Aborted — nothing was restarted."
+            return 1
+        fi
+    fi
+    # ------------------------------------------------------------------------
 
     # Snapshot active instances for resurrection. The Python executor handles
     # client park/detach/restore + teardown + rebuild + resume internally.
