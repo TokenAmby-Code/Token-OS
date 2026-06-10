@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .builder import build_workspace
+from .custodes import _pane_pid, pane_has_active_agent
 from .enums import AttachmentClass, RestartPhase
 from .models import (
     RestartAction,
@@ -356,43 +357,42 @@ done
         except Exception as exc:
             violations.append(f"persistent persona assertion unavailable: {exc}")
 
-        try:
-            civic_violation = self._ensure_civic_reservist_runtime()
-            if civic_violation:
-                violations.append(civic_violation)
-        except Exception as exc:
-            violations.append(f"civic reservist assertion failed: {exc}")
+        for label, target, cwd, prompt in (
+            (
+                "civic reservist",
+                "reservists:civic",
+                Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")),
+                "Stand by as the civic reservist runtime. Do not start new work. "
+                "Wait for civic-thread fallthrough or operator instructions.",
+            ),
+            (
+                "Token-OS reservist",
+                "reservists:slot",
+                self._token_os_dir(),
+                "Stand by as the Token-OS reservist runtime. Do not start new work. "
+                "Wait for operator or orchestration instructions.",
+            ),
+        ):
+            try:
+                violation = self._ensure_reservist_runtime(label, target, cwd, prompt)
+                if violation:
+                    violations.append(violation)
+            except Exception as exc:
+                violations.append(f"{label} assertion failed: {exc}")
 
         return violations
 
-    def _ensure_civic_reservist_runtime(self) -> str:
-        target = "reservists:civic"
+    def _ensure_reservist_runtime(
+        self, label: str, target: str, working_dir: Path, prompt: str
+    ) -> str:
         pane_id = self._resolve_optional_pane(target)
         if not pane_id:
-            return "civic reservist pane missing after rebuild"
-
-        command = (
-            self.adapter.run(
-                "display-message",
-                "-t",
-                pane_id,
-                "-p",
-                "#{pane_current_command}",
-                allow_failure=True,
-            )
-            .strip()
-            .lower()
-        )
-        if any(agent in command for agent in ("claude", "codex", "node")):
+            return f"{label} pane missing after rebuild"
+        if self._pane_has_agent_runtime(pane_id):
             return ""
 
-        civic_dir = Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic"))
-        if not civic_dir.is_dir():
-            civic_dir = Path.home()
-        prompt = (
-            "Stand by as the civic reservist runtime. Do not start new work. "
-            "Wait for civic-thread fallthrough or operator instructions."
-        )
+        if not working_dir.is_dir():
+            working_dir = Path.home()
         dispatch_bin = self._dispatch_binary()
         proc = subprocess.run(
             [
@@ -400,10 +400,12 @@ done
                 "--direct",
                 "--engine",
                 "claude",
+                "--model",
+                "sonnet",
                 "--pane",
                 pane_id,
                 "--dir",
-                str(civic_dir),
+                str(working_dir),
                 "--instance-type",
                 "hook_driven",
                 "--no-gt",
@@ -417,23 +419,20 @@ done
         )
         if proc.returncode != 0:
             stderr = proc.stderr.strip()[:160]
-            return f"civic reservist dispatch failed rc={proc.returncode}: {stderr}"
+            return f"{label} dispatch failed rc={proc.returncode}: {stderr}"
         time.sleep(1.0)
-        command = (
-            self.adapter.run(
-                "display-message",
-                "-t",
-                pane_id,
-                "-p",
-                "#{pane_current_command}",
-                allow_failure=True,
-            )
-            .strip()
-            .lower()
-        )
-        if not any(agent in command for agent in ("claude", "codex", "node")):
-            return "civic reservist launch did not appear to start"
+        if not self._pane_has_agent_runtime(pane_id):
+            return f"{label} launch did not appear to start"
         return ""
+
+    def _pane_has_agent_runtime(self, pane_id: str) -> bool:
+        return pane_has_active_agent(_pane_pid(self.adapter, pane_id))
+
+    def _token_os_dir(self) -> Path:
+        imperium = os.environ.get("IMPERIUM")
+        if imperium:
+            return Path(imperium) / "Token-OS"
+        return Path(__file__).resolve().parents[3]
 
     def _resolve_optional_pane(self, target: str) -> str:
         try:

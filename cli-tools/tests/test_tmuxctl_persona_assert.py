@@ -14,10 +14,12 @@ from tmuxctl.assertions import (
     PERSONA_GUARD_OPTION,
     PersonaSpec,
     _clear_pane_overlay,
+    _dispatch_args,
     _guarded_note_unregistered,
     _guarded_send_persona_command,
     _observed_row_hash,
     _row_matches_persona,
+    persona_spec,
 )
 
 FG_LABEL = "mechanicus:fabricator-general"
@@ -81,6 +83,28 @@ class FakeAdapter:
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
         return self.options.get(option, "")
+
+
+def test_persona_specs_pin_model_defaults():
+    assert persona_spec("legion:custodes").model == ""
+    assert persona_spec("mechanicus:fabricator-general").model == ""
+    assert persona_spec("mechanicus:admin").model == "sonnet"
+
+
+def test_dispatch_args_include_model_when_present():
+    args = _dispatch_args(
+        "%99",
+        {
+            "engine": "claude",
+            "persona": "administratum",
+            "model": "sonnet",
+            "session_doc": "/tmp/admin.md",
+            "instance_type": "hook_driven",
+        },
+    )
+
+    assert "--model" in args
+    assert args[args.index("--model") + 1] == "sonnet"
 
 
 # ── _row_matches_persona ─────────────────────────────────────────────────────
