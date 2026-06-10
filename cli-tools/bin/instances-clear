@@ -48,7 +48,7 @@ def _is_persona_row(inst: dict) -> bool:
         or (inst.get("pane_label") or "") in PERSONA_PANE_LABELS
     )
 
-def get_instances(include_active: bool = False):
+def get_instances(include_active: bool = False) -> tuple[list[dict[str, object]], int]:
     """Get instances from the database (excluding persona singleton rows)."""
     if not DB_PATH.exists():
         return [], 0

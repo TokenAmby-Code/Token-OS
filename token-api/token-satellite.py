@@ -1559,7 +1559,7 @@ class AhkRequest(BaseModel):
 
 class TmuxSendKeysRequest(BaseModel):
     pane: str  # tmux pane ID (e.g., "%5")
-    command: str  # slash command or text to send (e.g., "/color cyan")
+    command: str  # slash command or text to send
     no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
 
 
@@ -1568,6 +1568,7 @@ class GoldenThroneFollowupRequest(BaseModel):
     tmux_pane: str | None = None
     working_dir: str = "~"
     prompt: str
+    prompt_summary: str | None = None
     engine: str = "claude"
 
 
@@ -1700,17 +1701,36 @@ def _dispatch_deferred(pane: str, reason: str = "dispatch_deferred") -> dict:
     }
 
 
+def _looks_like_codex_skill_invocation(text: str) -> bool:
+    # Keep this local: token-satellite is deployed as a standalone WSL service
+    # and should not import tmuxctl internals from the Mac-side CLI package.
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("$"):
+        return False
+    parts = stripped[1:].split(None, 1)
+    if not parts:
+        return False
+    head = parts[0]
+    return bool(head) and all(ch.isalnum() or ch in {"-", "_"} for ch in head)
+
+
 def _tmux_send_payload_then_submit(
     pane: str,
     payload: str,
     *,
     clear_prompt: bool = False,
+    enable_skill_sink: bool = False,
 ) -> None:
     """Send text and submit as separate tmux operations."""
     if clear_prompt:
         subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], check=True, timeout=5)
         time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", pane, "-l", payload], check=True, timeout=5)
+    if enable_skill_sink and _looks_like_codex_skill_invocation(payload):
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Tab"], check=True, timeout=5)
+        time.sleep(0.3)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
+        time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
 
 
@@ -2170,6 +2190,36 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
     return (pane_id, role)
 
 
+def _clip_one_line(text: str, max_len: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(compact) <= max_len:
+        return compact
+    if max_len == 1:
+        return "…"
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _golden_throne_file_bridge_prompt(
+    sop_file: str,
+    *,
+    prompt_summary: str | None = None,
+    max_len: int = 200,
+) -> str:
+    """Short live-agent prompt for long/multi-line Golden Throne payloads.
+
+    Mac token-api already generated the full prompt. For rubric-driven fires it
+    also sends a one-line summary naming the missing criterion so the remote
+    pane does not receive a generic "execute this SOP" injection.
+    """
+    if prompt_summary:
+        tail = f". Run: cat {sop_file}, then address those criteria."
+        return f"{_clip_one_line(prompt_summary, max_len - len(tail))}{tail}"
+    text = f"Golden Throne follow-up. Run: cat {sop_file}, then resume this thread."
+    return _clip_one_line(text, max_len)
+
+
 @app.get("/tmux/resolve-instance")
 async def tmux_resolve_instance(session_id: str):
     """Resolve a Claude instance UUID to its live pane on this satellite's host.
@@ -2241,10 +2291,16 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 else:
                     sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
                     Path(sop_file).write_text(req.prompt)
-                    inject_prompt = (
-                        f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                    inject_prompt = _golden_throne_file_bridge_prompt(
+                        sop_file,
+                        prompt_summary=req.prompt_summary,
                     )
-                _tmux_send_payload_then_submit(pane, inject_prompt, clear_prompt=True)
+                _tmux_send_payload_then_submit(
+                    pane,
+                    inject_prompt,
+                    clear_prompt=True,
+                    enable_skill_sink=(engine == "codex"),
+                )
                 transport = "send-keys"
                 logger.info(
                     f"Golden Throne: sent SOP to {pane} via send-keys (session {req.session_id[:12]})"

@@ -53,6 +53,15 @@ def _hook_driven(db_path, instance_id) -> int:
     return row[0] if row else None
 
 
+def _input_lock(db_path, instance_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 # ── Stop / SessionEnd clear the flag ───────────────────────────────────────────
 
 
@@ -77,6 +86,25 @@ def test_session_end_clears_hook_driven(app_env):
 
     asyncio.run(run())
     assert _hook_driven(app_env.db_path, "flagged-2") == 0
+
+
+def test_session_end_clears_input_lock(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "locked-1", pane="%44")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "UPDATE claude_instances SET input_lock = ? WHERE id = ?",
+            ("claude-cmd", "locked-1"),
+        )
+        conn.commit()
+    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
+    monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
+
+    async def run():
+        await hooks.handle_session_end({"session_id": "locked-1"})
+
+    asyncio.run(run())
+    assert _input_lock(app_env.db_path, "locked-1") is None
 
 
 # ── Agent-lifecycle hooks no longer flip global productivity ────────────────────

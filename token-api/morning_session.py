@@ -452,7 +452,7 @@ You spawned in the custodes orchestrator pane, so `SessionStart` already
 registered your row from the pane identity:
 - **legion=custodes** (triggers singleton enforcement — any prior custodes are demoted)
 - **instance_type=sync**
-- **synced=1** (kept for state-hook/color predicates)
+- **synced=1** (kept for state-hook identity predicates)
 
 You do **not** self-register — identity is owned by the harness. Just verify
 and report:

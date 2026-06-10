@@ -53,6 +53,7 @@ def mark_cron_instance_stopped(instance_id: str):
                 updates={
                     "status": "stopped",
                     "synced": 0,
+                    "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
                 },
                 mutation_type="instance_stopped",

@@ -25,7 +25,7 @@ from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
 from .resolver import resolve_instance, resolve_pane, resolve_to_physical, resolve_to_public
-from .skill_invoke import invoke_skill_in_pane
+from .skill_invoke import invoke_skill_in_pane, send_skill_invocation_to_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
 from .tombstone import install_tombstone, jump_tombstone
@@ -149,8 +149,33 @@ class TmuxControlPlane:
         pane_label = self.cardinal_pane_label(target)
         return fetch_session_doc_for_pane_label(pane_label)
 
-    def invoke_skill(self, target: str, skill: str, *, agent: str = "auto") -> str:
-        return invoke_skill_in_pane(self.adapter, target, skill, agent=agent)
+    def invoke_skill(
+        self,
+        target: str,
+        skill: str,
+        *,
+        agent: str = "auto",
+        arguments: str | None = None,
+    ) -> str:
+        return invoke_skill_in_pane(self.adapter, target, skill, agent=agent, arguments=arguments)
+
+    def send_skill(
+        self,
+        target: str,
+        skill: str,
+        *,
+        agent: str = "auto",
+        arguments: str | None = None,
+        clear_prompt: bool = False,
+    ) -> str:
+        return send_skill_invocation_to_pane(
+            self.adapter,
+            target,
+            skill,
+            agent=agent,
+            arguments=arguments,
+            clear_prompt=clear_prompt,
+        )
 
     def audience_toggle(self, target: str, *, client: str = "") -> str:
         return audience_toggle(self.adapter, target, client=client)

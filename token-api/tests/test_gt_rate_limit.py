@@ -59,7 +59,7 @@ def _insert_instance(db_path: Path, instance_id: str | None = None) -> str:
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, instance_type, zealotry, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'one_off', 4, ?, ?)""",
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'golden_throne', 4, ?, ?)""",
         (iid, str(uuid.uuid4()), f"gt-{iid[:8]}", "/tmp", now, now),
     )
     conn.commit()

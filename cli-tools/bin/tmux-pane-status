@@ -154,7 +154,8 @@ def build_pane_info():
             "context_size": state.get("context_window_size") if state else None,
             "cost_usd": state.get("cost_usd") if state else None,
             "session_doc": inst.get("session_doc_id") if inst else None,
-            "cc_color": inst.get("cc_color", "default") if inst else "default",
+            "chip_color": (inst.get("chip_color") or inst.get("chapter_color")) if inst else None,
+            "pane_tint": inst.get("pane_tint") if inst else None,
             "state_age_s": staleness,
             "device": inst.get("device_id", "?") if inst else "?",
         }

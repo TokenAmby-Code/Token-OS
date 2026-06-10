@@ -93,6 +93,120 @@ async def test_send_payload_success_is_unverified_not_sent(app_env: Any, monkeyp
     assert not result.get("gated")
 
 
+async def test_send_payload_tabs_codex_skill_before_submit(app_env: Any, monkeypatch: Any) -> None:
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    seen: dict[str, Any] = {}
+
+    def _ok(self, target, text, **kwargs):
+        seen["target"] = target
+        seen["text"] = text
+        seen["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
+
+    result = await main._tmux_send_payload_then_submit(
+        "%9",
+        '$golden-throne-sop victory condition "needs tests passing" is unmet',
+        enable_skill_sink=True,
+    )
+
+    assert result["returncode"] == 0
+    assert seen["kwargs"]["pre_submit_keys"] == ("Tab",)
+
+
+async def test_send_payload_does_not_tab_dollar_text_without_skill_sink(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    seen: dict[str, Any] = {}
+
+    def _ok(self, target, text, **kwargs):
+        seen["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
+
+    result = await main._tmux_send_payload_then_submit("%9", "$HOME is not a skill")
+
+    assert result["returncode"] == 0
+    assert seen["kwargs"]["pre_submit_keys"] == ()
+
+
+async def test_send_payload_does_not_tab_claude_skill(app_env: Any, monkeypatch: Any) -> None:
+    main = app_env.main
+    import tmuxctl.tmux_adapter as ta
+
+    seen: dict[str, Any] = {}
+
+    def _ok(self, target, text, **kwargs):
+        seen["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
+
+    result = await main._tmux_send_payload_then_submit("%9", "/golden-throne-sop needs x")
+
+    assert result["returncode"] == 0
+    assert seen["kwargs"]["pre_submit_keys"] == ()
+
+
+async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypatch: Any) -> None:
+    main = app_env.main
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+    seen: dict[str, Any] = {}
+
+    async def _ok(pane, payload, **kwargs):
+        seen["pane"] = pane
+        seen["payload"] = payload
+        seen["kwargs"] = kwargs
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "unverified",
+            "verified_by": None,
+        }
+
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, instance_type, engine, tmux_pane)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "gt-codex-skill",
+                "gt-codex-skill",
+                "GT Codex Skill",
+                "/tmp",
+                "local",
+                "Mac-Mini",
+                "idle",
+                "golden_throne",
+                "codex",
+                "%9",
+            ),
+        )
+
+    queued = await main.enqueue_pane_write(
+        instance_id="gt-codex-skill",
+        tmux_pane="%9",
+        source="golden_throne",
+        purpose="followup",
+        payload='$golden-throne-sop victory condition "needs tests passing" is unmet',
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert results[0]["status"] == main.PANE_WRITE_SENT
+    assert seen["kwargs"]["enable_skill_sink"] is True
+
+
 # ---- queue handling: gated stays pending, success goes sent -----------------
 
 

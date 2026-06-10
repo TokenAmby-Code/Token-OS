@@ -59,8 +59,10 @@ Behavior is type-bound:
 
 - Persona panes (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`):
   - blank/no live runtime: launch the configured persona in the same pane;
-  - live runtime but no coherent registry identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
-  - live runtime with wrong identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
+  - live runtime with a stopped coherent registry row: reactivate the row and return `ok=true`, `action=registry_reactivated`;
+  - live runtime but no registry row at all: do not inject `/persona`; log the anomaly and return `ok=false`, `action=persona_unregistered_noted` (or `persona_unregistered_suppressed` during backoff);
+  - live runtime with a registry row for the wrong identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
+  - stopped-row reactivation failure: return `ok=false`, `action=registry_reactivation_failed`;
   - live and coherent: return `ok=true`.
 - Stack workers (`@PANE_TYPE=stack-worker`):
   - no live runtime: mark stale Token-API rows stopped, clear stale pane identity, and prune the pane;
@@ -69,9 +71,9 @@ Behavior is type-bound:
   - assertion is truth-only; no launch/restart;
   - stale Token-API rows may be marked stopped as coherence cleanup.
 
-`send-text` runs this assertion opportunistically before injecting payloads. If assertion sends persona correction, `send-text` refuses the real payload; callers must settle and retry assertion before delivery.
+`send-text` runs this assertion opportunistically before injecting payloads. If assertion returns any `ok=false` persona action, `send-text` refuses the real payload; callers must settle and retry assertion before delivery.
 
-Operational note: after plan-mode or any mode transition that can drop persona registration, run `tmuxctl assert-instance --pane <persona-pane>`. A duplicate `/persona` line means the first correction had not yet produced a coherent registry row when the retry ran; this is safe but should be treated as a settle/retry tuning issue, not as permission to manually spawn the persona.
+Operational note: after plan-mode or any mode transition that can drop persona registration, run `tmuxctl assert-instance --pane <persona-pane>`. `persona_unregistered_noted` means the pane is live but has no registry row to reactivate; restart that persona pane so SessionStart can create the row. `persona_unregistered_suppressed` means the same condition is still in its diagnostic backoff window.
 
 ## Current entry points
 

@@ -106,6 +106,7 @@ def add_stack_pane(
     base: str,
     *,
     cwd: str | None = None,
+    focus: bool = True,
 ) -> str:
     """Add a new worker pane to the named stack, spilling if the canonical window is full.
 
@@ -118,7 +119,7 @@ def add_stack_pane(
     if base in {"legion", "mechanicus"}:
         from .stack import add_orchestrator_stack_pane
 
-        return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd)
+        return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd, focus=focus)
 
     existing = _list_spill_windows(adapter, session, base)
     if not existing:
@@ -168,7 +169,7 @@ def dispatch_stack_command(
         attempted_target=f"{session}:{base}",
         enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
     ):
-        pane = add_stack_pane(adapter, session, base, cwd=cwd)
+        pane = add_stack_pane(adapter, session, base, cwd=cwd, focus=focus)
         if focus:
             window_target = adapter.run(
                 "display-message",

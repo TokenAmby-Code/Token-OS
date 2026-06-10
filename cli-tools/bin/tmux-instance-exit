@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# tmux-instance-exit — Gracefully exit an interactive agent and stage resume command
+# TAGS: tmux, agent, claude, codex, exit, resume, keybind
+# AUDIENCE: human
+#
+# Sends Ctrl+C x3 to kill the current agent session, then captures
+# the native resume session id from agent exit output, stages a
+# generic dispatch resume command in shell
+# history, and clears the terminal.
+#
+# Usage:
+#     tmux-instance-exit              # Current pane
+#     tmux-instance-exit --pane self  # Target the invoking pane for resume
+
+set -euo pipefail
+
+PANE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Resolve target pane — run-shell doesn't set $TMUX_PANE but does set
+# the target for display-message. Prefix with % since display-message
+# inside run-shell strips the % from #{pane_id}.
+if [[ -z "$PANE" ]]; then
+    _id=$(tmux display-message -p '#{pane_id}' 2>/dev/null) || true
+    if [[ -n "$_id" && "$_id" != %* ]]; then
+        PANE="%${_id}"
+    elif [[ -n "$_id" ]]; then
+        PANE="$_id"
+    fi
+fi
+
+# Helper: run tmux command with -t pane targeting after the subcommand
+# e.g. _tmux send-keys C-c → tmux send-keys -t %3 C-c
+_tmux() {
+    local subcmd="$1"; shift
+    if [[ -n "$PANE" ]]; then
+        tmux "$subcmd" -t "$PANE" "$@"
+    else
+        tmux "$subcmd" "$@"
+    fi
+}
+
+_is_static_persona_pane() {
+    [[ -n "$PANE" ]] || return 1
+    local role
+    role="$(tmux show-options -pv -t "$PANE" @PANE_ID 2>/dev/null || true)"
+    case "$role" in
+        legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+_deexpand_if_zoomed() {
+    [[ -n "$PANE" ]] || return 0
+    local zoomed
+    zoomed="$(tmux display-message -p -t "$PANE" '#{window_zoomed_flag}' 2>/dev/null || true)"
+    if [[ "$zoomed" == "1" ]]; then
+        tmux resize-pane -Z -t "$PANE" 2>/dev/null || true
+    fi
+}
+
+_clear_closeout_chrome() {
+    [[ -n "$PANE" ]] || return 0
+    local static_persona=false
+    if _is_static_persona_pane; then
+        static_persona=true
+    fi
+    tmux select-pane -t "$PANE" -T "" 2>/dev/null || true
+    tmux select-pane -t "$PANE" -P "bg=default" 2>/dev/null || true
+    tmux set-option -p -t "$PANE" @PANE_TITLE_SUPPRESS true 2>/dev/null || true
+    local opt
+    for opt in \
+        @INSTANCE_ID \
+        @PANE_LABEL \
+        @CC_STATE \
+        @TTS_STATE \
+        @CONTEXT_INFO \
+        @STACK_PENDING \
+        @ACTIVE_TITLE \
+        @PROGRESS_TITLE \
+        @PANE_PROGRESS \
+        @GT_FIRE \
+        @PLANNING_STATE \
+        @PLANNING_AGENT \
+        @DISCORD_VOICE_LOCK
+    do
+        tmux set-option -pu -t "$PANE" "$opt" 2>/dev/null || true
+    done
+    if [[ "$static_persona" != "true" ]]; then
+        tmux set-option -pu -t "$PANE" @PERSONA_ASSERT_GUARD 2>/dev/null || true
+    fi
+}
+
+_pane_stack_close_target() {
+    [[ -n "$PANE" ]] || return 1
+    local meta session_window window_name window_base pane_role pane_type
+    meta="$(tmux display-message -p -t "$PANE" '#{session_name}:#{window_index}	#{window_name}	#{@PANE_ID}	#{@PANE_TYPE}' 2>/dev/null || true)"
+    [[ -n "$meta" ]] || return 1
+    IFS=$'\t' read -r session_window window_name pane_role pane_type <<< "$meta"
+    window_base="${window_name%%(*}"
+    window_base="${window_base%%-*}"
+
+    case "$pane_role" in
+        legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+            return 1
+            ;;
+    esac
+
+    if [[ "$pane_type" == "stack-worker" ]]; then
+        printf '%s\n' "$session_window"
+        return 0
+    fi
+
+    case "$window_base:$pane_role" in
+        legion:legion:worker|legion:legion:regiment|mechanicus:mechanicus:worker)
+            printf '%s\n' "$session_window"
+            return 0
+            ;;
+        legion:legion:[1-9]*|mechanicus:mechanicus:[1-9]*)
+            printf '%s\n' "$session_window"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+_enforce_stack_window() {
+    local window_target="$1"
+    [[ -n "$window_target" ]] || return 0
+    if command -v tmux-run >/dev/null 2>&1; then
+        tmux-run tmuxctl stack enforce --window "$window_target" --kill-pending-clear >/dev/null 2>&1 || true
+    elif command -v tmuxctl >/dev/null 2>&1; then
+        IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack enforce --window "$window_target" --kill-pending-clear >/dev/null 2>&1 || true
+    fi
+}
+
+
+_clear_resume_sentinels() {
+    [[ -n "$PANE" ]] || return 0
+    rm -f "/tmp/agent-resume-${PANE}" "/tmp/claude-resume-${PANE}" 2>/dev/null || true
+}
+
+_focus_stack_orchestrator() {
+    local window_target="$1"
+    [[ -n "$window_target" ]] || return 0
+    local window_name window_base role target
+    window_name="$(tmux display-message -p -t "$window_target" '#{window_name}' 2>/dev/null || true)"
+    window_base="${window_name%%(*}"
+    window_base="${window_base%%-*}"
+    case "$window_base" in
+        legion) role="legion:custodes" ;;
+        mechanicus) role="mechanicus:fabricator-general" ;;
+        *) return 0 ;;
+    esac
+    target="$(tmux list-panes -t "$window_target" -F '#{pane_id}	#{@PANE_ID}' 2>/dev/null \
+        | awk -F '\t' -v role="$role" '$2 == role { print $1; exit }')"
+    [[ -n "$target" ]] && tmux select-pane -t "$target" 2>/dev/null || true
+}
+
+INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
+STACK_WINDOW="$(_pane_stack_close_target || true)"
+_deexpand_if_zoomed
+
+# Send Ctrl+C three times with small delays
+for i in 1 2 3; do
+    _tmux send-keys C-c
+    sleep 0.2
+done
+
+# Wait for the process to accept the exits and return to shell. Prefer the
+# pane's live @INSTANCE_ID over scraping agent-specific resume blurbs: dispatch
+# resolves both Claude and Codex rows by id/session and owns engine routing.
+sleep 1
+_clear_resume_sentinels
+
+if [[ -n "$STACK_WINDOW" ]]; then
+    _clear_closeout_chrome
+    _enforce_stack_window "$STACK_WINDOW"
+    _focus_stack_orchestrator "$STACK_WINDOW"
+    exit 0
+fi
+
+RESUME_ID="$INSTANCE_ID"
+if [[ -z "$RESUME_ID" ]]; then
+    # Compatibility fallback for unstamped legacy panes. This path is best-effort
+    # only; normal managed panes are resumed via @INSTANCE_ID above.
+    RESUME_ID=$(tmux capture-pane -p -t "$PANE" -S -20 2>/dev/null | python3 -c '
+import sys, re
+
+lines = sys.stdin.read().split("\n")
+box_chars = set("│╭╮╰╯┌┐└┘├┤┬┴┼─╭╮╯╰")
+patterns = [
+    re.compile(r"claude\s+--resume\s+(.*)$"),
+    re.compile(r"codex\s+resume(?:\s+\S+)*\s+([A-Za-z0-9._:-]+)(?:\s|$)"),
+]
+
+for i in range(len(lines) - 1, -1, -1):
+    line = lines[i]
+    if any(c in box_chars for c in line):
+        continue
+    for rx in patterns:
+        m = rx.search(line)
+        if not m:
+            continue
+        arg = m.group(1).strip()
+        needs_next = False
+        if arg.startswith(chr(34)) and not arg.endswith(chr(34)):
+            needs_next = True
+        elif re.match(r"^[a-f0-9-]+$", arg) and len(arg) < 36:
+            needs_next = True
+        if needs_next and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and not any(c in box_chars for c in nxt) and not re.match(r"^(tokenclaw|\$|%)", nxt):
+                arg = arg + nxt
+        print(arg.strip(chr(34) + chr(39)))
+        sys.exit(0)
+' 2>/dev/null)
+fi
+
+RESUME_CMD=""
+if [[ -n "$RESUME_ID" ]]; then
+    RESUME_CMD="dispatch --id $(printf '%q' "$RESUME_ID") --pane self"
+fi
+HISTORY_CMD="$RESUME_CMD"
+
+# Move the visible shell home, clear, then stage a resume command. Dispatch
+# resolves the instance working directory from Token-API on --id resume; do not
+# bake stale cwd state into shell history.
+PANE_SHELL=$(_tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo "")
+_clear_closeout_chrome
+if [[ -z "$HISTORY_CMD" ]]; then
+    _tmux send-keys "cd ~ && clear" Enter
+else
+    case "$PANE_SHELL" in
+        *zsh*)  _tmux send-keys "cd ~ && clear && print -s $(printf '%q' "$HISTORY_CMD")" Enter ;;
+        *)      _tmux send-keys "cd ~ && clear && history -s $(printf '%q' "$HISTORY_CMD")" Enter ;;
+    esac
+fi
