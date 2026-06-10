@@ -84,7 +84,7 @@ class Supervisor:
     def expired(self, now: float) -> bool:
         return self.deadline is not None and now >= self.deadline
 
-    def timeout(self, now: float):
+    def timeout(self, now: float) -> float | None:
         """select() timeout until the armed deadline; None = block forever."""
         if self.deadline is None:
             return None

@@ -32,7 +32,7 @@ def make_supervisor(module: Any, start_time: float = 100.0) -> Any:
 
 
 class TestConnectWindow:
-    def test_armed_from_birth(self):
+    def test_armed_from_birth(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         assert sup.deadline == 120.0
@@ -40,7 +40,7 @@ class TestConnectWindow:
         assert sup.expired(120.0)
         assert sup.window_name == "connect"
 
-    def test_connect_clears_deadline(self):
+    def test_connect_clears_deadline(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(CONNECTED_LINE, 105.0)
@@ -50,7 +50,7 @@ class TestConnectWindow:
         assert sup.timeout(105.0) is None
         assert not sup.expired(10_000.0)
 
-    def test_noise_lines_do_not_disarm(self):
+    def test_noise_lines_do_not_disarm(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(NOISE_LINE, 105.0)
@@ -59,7 +59,7 @@ class TestConnectWindow:
 
 
 class TestReconnectWindow:
-    def test_disconnect_arms_reconnect_window(self):
+    def test_disconnect_arms_reconnect_window(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(CONNECTED_LINE, 105.0)
@@ -68,7 +68,7 @@ class TestReconnectWindow:
         assert not sup.connected
         assert sup.window_name == "reconnect"
 
-    def test_reconnect_within_window_clears(self):
+    def test_reconnect_within_window_clears(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(CONNECTED_LINE, 105.0)
@@ -78,7 +78,7 @@ class TestReconnectWindow:
         assert sup.connected
         assert not sup.expired(10_000.0)
 
-    def test_reconnect_window_expiry_kills(self):
+    def test_reconnect_window_expiry_kills(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(CONNECTED_LINE, 105.0)
@@ -86,7 +86,7 @@ class TestReconnectWindow:
         assert not sup.expired(214.9)
         assert sup.expired(215.0)
 
-    def test_repeated_drops_rearm_from_latest(self):
+    def test_repeated_drops_rearm_from_latest(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         sup.handle_line(CONNECTED_LINE, 105.0)
@@ -97,7 +97,7 @@ class TestReconnectWindow:
 
 
 class TestMarkerDisambiguation:
-    def test_disconnected_line_is_not_a_connect(self):
+    def test_disconnected_line_is_not_a_connect(self) -> None:
         # "disconnected from server" must never read as a connect — substring
         # matching is only safe because the connect marker is "connected to
         # server", which the disconnect line does not contain.
@@ -107,7 +107,7 @@ class TestMarkerDisambiguation:
         assert not sup.connected
         assert sup.deadline == 120.0  # reconnect window from now
 
-    def test_timeout_tracks_deadline(self):
+    def test_timeout_tracks_deadline(self) -> None:
         module = load_supervisor_module()
         sup = make_supervisor(module, start_time=100.0)
         assert sup.timeout(110.0) == 10.0

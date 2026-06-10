@@ -12,13 +12,16 @@ the module boundary and assert the launchctl choreography:
 """
 
 import os
+from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 
 class FakeProcess:
-    def __init__(self, returncode=0, stdout="", stderr=""):
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -27,15 +30,15 @@ class FakeProcess:
 class SubprocessRecorder:
     """Records every subprocess.run/Popen argv; per-prefix exit-code overrides."""
 
-    def __init__(self):
-        self.run_calls = []
-        self.popen_calls = []
-        self._fail_once = []
+    def __init__(self) -> None:
+        self.run_calls: list[list[str]] = []
+        self.popen_calls: list[list[str]] = []
+        self._fail_once: list[list[str]] = []
 
-    def fail_once(self, *argv_prefix):
+    def fail_once(self, *argv_prefix: str) -> None:
         self._fail_once.append(list(argv_prefix))
 
-    def run(self, argv, **kwargs):
+    def run(self, argv: Sequence[Any], **kwargs: Any) -> FakeProcess:
         argv = [str(a) for a in argv]
         self.run_calls.append(argv)
         for prefix in list(self._fail_once):
@@ -44,16 +47,16 @@ class SubprocessRecorder:
                 return FakeProcess(returncode=1)
         return FakeProcess(returncode=0)
 
-    def popen(self, argv, **kwargs):
+    def popen(self, argv: Sequence[Any], **kwargs: Any) -> FakeProcess:
         self.popen_calls.append([str(a) for a in argv])
         return FakeProcess(returncode=0)
 
-    def run_argvs_with(self, *words):
+    def run_argvs_with(self, *words: str) -> list[list[str]]:
         return [c for c in self.run_calls if all(w in c for w in words)]
 
 
 @pytest.fixture
-def kvm_env(app_env, tmp_path, monkeypatch):
+def kvm_env(app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     main = app_env.main
     recorder = SubprocessRecorder()
     monkeypatch.setattr(main.subprocess, "run", recorder.run)
@@ -70,7 +73,7 @@ def kvm_env(app_env, tmp_path, monkeypatch):
 
 
 class TestEnsureAgent:
-    def test_first_sync_installs_and_bootstraps(self, kvm_env):
+    def test_first_sync_installs_and_bootstraps(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._ensure_deskflow_client_agent()
 
         supervisor = kvm_env.helper_dir / "deskflow-client-supervisor.py"
@@ -85,14 +88,14 @@ class TestEnsureAgent:
         assert kvm_env.recorder.run_argvs_with("launchctl", "bootout", kvm_env.target)
         assert kvm_env.recorder.run_argvs_with("launchctl", "bootstrap", str(plist))
 
-    def test_unchanged_content_is_a_noop(self, kvm_env):
+    def test_unchanged_content_is_a_noop(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._ensure_deskflow_client_agent()
         kvm_env.recorder.run_calls.clear()
 
         kvm_env.main._ensure_deskflow_client_agent()
         assert not kvm_env.recorder.run_calls  # no bootout/bootstrap churn
 
-    def test_plist_change_rebootstraps(self, kvm_env):
+    def test_plist_change_rebootstraps(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._ensure_deskflow_client_agent()
         plist = kvm_env.helper_dir / "com.imperium.deskflow-client.plist"
         plist.write_text("stale")
@@ -104,7 +107,7 @@ class TestEnsureAgent:
 
 
 class TestStart:
-    def test_start_choreography(self, kvm_env):
+    def test_start_choreography(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._start_mac_deskflow_client("test")
 
         calls = kvm_env.recorder.run_calls
@@ -124,7 +127,9 @@ class TestStart:
         assert not kvm_env.recorder.run_argvs_with("open")
         assert all(c[0] != "open" for c in kvm_env.recorder.popen_calls)
 
-    def test_start_falls_back_to_bootstrap_when_job_unloaded(self, kvm_env):
+    def test_start_falls_back_to_bootstrap_when_job_unloaded(
+        self, kvm_env: SimpleNamespace
+    ) -> None:
         # First kickstart fails (job not loaded, e.g. after Mac reboot).
         kvm_env.main._ensure_deskflow_client_agent()
         kvm_env.recorder.run_calls.clear()
@@ -137,7 +142,7 @@ class TestStart:
         assert len(kickstarts) == 2  # failed attempt + retry after bootstrap
         assert len(bootstraps) == 1
 
-    def test_start_skips_bootstrap_when_kickstart_succeeds(self, kvm_env):
+    def test_start_skips_bootstrap_when_kickstart_succeeds(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._ensure_deskflow_client_agent()
         kvm_env.recorder.run_calls.clear()
 
@@ -148,7 +153,7 @@ class TestStart:
 
 
 class TestStop:
-    def test_stop_choreography(self, kvm_env):
+    def test_stop_choreography(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._stop_mac_deskflow_client("test")
 
         calls = kvm_env.recorder.run_calls
@@ -160,7 +165,7 @@ class TestStop:
 
 
 class TestReload:
-    def test_reload_never_bounces_a_live_session(self, kvm_env):
+    def test_reload_never_bounces_a_live_session(self, kvm_env: SimpleNamespace) -> None:
         kvm_env.main._reload_mac_deskflow_client("test")
 
         gentle = kvm_env.recorder.run_argvs_with("launchctl", "kickstart")
