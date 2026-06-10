@@ -1323,11 +1323,13 @@ class DeskFlowWatchdog:
     def _restart_mac_client(self):
         """Force-kill and restart the Mac DeskFlow client via SSH.
 
-        The API-based stop (pkill) is too gentle — the GUI can respawn
-        the core before the start call, leaving a stuck socket. SSH with
-        kill -9 + fresh open is reliable.
+        Bypasses a wedged Mac token-api entirely. The client is headless now
+        (deskflow-core under the com.imperium.deskflow-client launchd job), so
+        the hard path is kill -9 + `launchctl kickstart -k` of that job — never
+        `open -a Deskflow`, which would resurrect the GUI and its own core
+        supervisor.
         """
-        logger.info("KVM watchdog: Restarting Mac client via SSH (kill → wake → open)")
+        logger.info("KVM watchdog: Restarting Mac client via SSH (kill → kickstart → wake)")
         try:
             result = subprocess.run(
                 [
@@ -1338,7 +1340,8 @@ class DeskFlowWatchdog:
                     "BatchMode=yes",
                     "mini",
                     "killall -9 Deskflow deskflow-core 2>/dev/null; "
-                    "sleep 2; caffeinate -u -t 5 & open -a Deskflow",
+                    "launchctl kickstart -k gui/501/com.imperium.deskflow-client; "
+                    "caffeinate -u -t 5 &",
                 ],
                 capture_output=True,
                 text=True,

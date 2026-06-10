@@ -203,6 +203,18 @@ from timer_telemetry import (
 DESKFLOW_CLIENT_CONFIG_PATH = Path.home() / "Library" / "Deskflow" / "Deskflow.conf"
 DESKFLOW_KEYMAP_GUARD = SCRIPTS_DIR / "Shell" / "deskflow-keymap-guard.sh"
 
+# Headless Deskflow client: deskflow-core runs under its own launchd job
+# (never a token-api child — token-api's job has no AbandonProcessGroup, so
+# children die on every deploy restart; Mac analog of the WSL transient-unit
+# fix, PR #148), supervised by a bounded-retry wrapper. Repo copies are the
+# source of truth; _ensure_deskflow_client_agent() syncs them to local disk
+# (launchd needs local exec — TCC blocks NAS executables, same precedent as
+# the keymap guard's helper binary).
+DESKFLOW_CLIENT_AGENT_LABEL = "com.imperium.deskflow-client"
+DESKFLOW_SUPERVISOR_SRC = SCRIPTS_DIR / "Shell" / "deskflow-client-supervisor.py"
+DESKFLOW_CLIENT_PLIST_SRC = SCRIPTS_DIR / "Shell" / "com.imperium.deskflow-client.plist"
+DESKFLOW_HELPER_DIR = Path.home() / "Library" / "Application Support" / "Imperium"
+
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
 logger.setLevel(logging.INFO)
@@ -15914,46 +15926,123 @@ def _ensure_mac_deskflow_keymap(reason: str):
         )
 
 
+def _deskflow_client_agent_target() -> str:
+    return f"gui/{os.getuid()}/{DESKFLOW_CLIENT_AGENT_LABEL}"
+
+
+def _deskflow_client_plist_dest() -> Path:
+    return DESKFLOW_HELPER_DIR / f"{DESKFLOW_CLIENT_AGENT_LABEL}.plist"
+
+
+def _ensure_deskflow_client_agent():
+    """Sync the headless-client supervisor + launchd plist to local disk.
+
+    Called lazily from start/reload so deploys carry supervisor updates
+    automatically while the NAS repo stays single-source. On plist change the
+    job is bootout'd + re-bootstrapped (launchd only reads plists at load).
+    """
+    DESKFLOW_HELPER_DIR.mkdir(parents=True, exist_ok=True)
+
+    supervisor_src = DESKFLOW_SUPERVISOR_SRC.read_text()
+    supervisor_dest = DESKFLOW_HELPER_DIR / "deskflow-client-supervisor.py"
+    if not supervisor_dest.exists() or supervisor_dest.read_text() != supervisor_src:
+        supervisor_dest.write_text(supervisor_src)
+        supervisor_dest.chmod(0o755)
+        logger.info(f"KVM: Synced deskflow client supervisor to {supervisor_dest}")
+
+    plist_text = DESKFLOW_CLIENT_PLIST_SRC.read_text().replace("__HOME__", str(Path.home()))
+    plist_dest = _deskflow_client_plist_dest()
+    if not plist_dest.exists() or plist_dest.read_text() != plist_text:
+        plist_dest.write_text(plist_text)
+        subprocess.run(
+            ["launchctl", "bootout", _deskflow_client_agent_target()],
+            capture_output=True,
+            text=True,
+        )
+        result = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_dest)],
+            capture_output=True,
+            text=True,
+        )
+        logger.info(
+            f"KVM: (Re)bootstrapped {DESKFLOW_CLIENT_AGENT_LABEL} (exit={result.returncode})"
+        )
+
+
 def _start_mac_deskflow_client(reason: str):
+    _ensure_deskflow_client_agent()
     _ensure_mac_deskflow_keymap(f"{reason}_pre_start")
-    subprocess.Popen(["open", "/Applications/Deskflow.app"])
+    # The legacy GUI supervises its own core and would fight the headless job.
+    subprocess.run(["killall", "Deskflow"], capture_output=True, text=True)
+    target = _deskflow_client_agent_target()
+    # kickstart -k = atomic converge (kills a wedged supervisor, starts fresh).
+    # Fall back to bootstrap for an unloaded job (e.g. after Mac reboot —
+    # the plist lives outside ~/Library/LaunchAgents), mirroring
+    # token-restart's restart_mac().
+    result = subprocess.run(
+        ["launchctl", "kickstart", "-k", target], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(_deskflow_client_plist_dest())],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(["launchctl", "kickstart", "-k", target], capture_output=True, text=True)
     subprocess.Popen(["caffeinate", "-u", "-t", "5"])
     _ensure_mac_deskflow_keymap(f"{reason}_post_start")
-    logger.info(f"KVM: Started Deskflow client ({reason})")
+    logger.info(f"KVM: Started headless Deskflow client ({reason})")
 
 
 def _reload_mac_deskflow_client(reason: str):
+    _ensure_deskflow_client_agent()
     _ensure_mac_deskflow_keymap(f"{reason}_pre_reload")
-    subprocess.run(["open", "-a", "Deskflow"], capture_output=True, text=True, timeout=5)
+    # kickstart WITHOUT -k: start only if dead — never bounces a live session.
+    subprocess.run(
+        ["launchctl", "kickstart", _deskflow_client_agent_target()],
+        capture_output=True,
+        text=True,
+    )
     subprocess.Popen(["caffeinate", "-u", "-t", "5"])
     _ensure_mac_deskflow_keymap(f"{reason}_post_reload")
-    logger.info(f"KVM: Reloaded Deskflow client ({reason})")
+    logger.info(f"KVM: Reloaded headless Deskflow client ({reason})")
 
 
 def _stop_mac_deskflow_client(reason: str):
+    # Graceful: the supervisor forwards SIGTERM to the core and reaps it. The
+    # job stays loaded; KeepAlive=false means nothing respawns.
     result = subprocess.run(
+        ["launchctl", "kill", "SIGTERM", _deskflow_client_agent_target()],
+        capture_output=True,
+        text=True,
+    )
+    # Fallback sweep: unloaded job, orphaned core, or lingering legacy GUI.
+    subprocess.run(
         ["killall", "-9", "Deskflow", "deskflow-core"],
         capture_output=True,
         text=True,
     )
-    logger.info(f"KVM: Stopped Deskflow client ({reason}, exit={result.returncode})")
+    logger.info(f"KVM: Stopped Deskflow client ({reason}, launchctl_exit={result.returncode})")
 
 
 @app.post("/api/kvm/start")
 async def kvm_start() -> dict[str, object]:
-    """Start (or re-converge) the Deskflow client on this Mac.
+    """Start (or re-converge) the headless Deskflow client on this Mac.
 
-    This is the satellite's invitation receiver. With Deskflow's native auto-retry
-    disabled, a client that is *running but disconnected* (stale socket) will not
-    re-dial on its own, so "already running" must NOT no-op — that would leave a
-    dead client wedged. We stop+start to converge a known-good client. The keymap
+    This is the satellite's invitation receiver. The client runs headless
+    (deskflow-core under com.imperium.deskflow-client) behind a supervisor
+    that bounds Deskflow's hardcoded re-dial loop: no connect within the
+    connect window, or no recovery within the reconnect window after a drop,
+    and the client goes quiet until the next invite. Auto-retry past those
+    windows is therefore actually disabled — supervisor-enforced.
+
+    `launchctl kickstart -k` is the atomic converge: a client that is
+    *running but disconnected* (stale socket, expired supervisor) is killed
+    and restarted in one step, so "already running" never wedges. The keymap
     guard runs pre/post inside _start_mac_deskflow_client.
     """
     try:
         was_running = _mac_deskflow_running()
-        if was_running:
-            _stop_mac_deskflow_client("api_start_restart")
-            await asyncio.sleep(1)  # let killall -9 tear down before reopening
         _start_mac_deskflow_client("api_start")
         return {
             "success": True,
@@ -15997,13 +16086,23 @@ async def kvm_status() -> dict[str, object]:
 
     Lifecycle now lives on the WSL satellite's event-driven watchdog; the Mac
     only reports process liveness. The satellite's _get_mac_kvm_status reads
-    only ``running``, so dropping the old ``supervisor`` block is safe.
+    only ``running``; ``supervisor_loaded`` (is the launchd job bootstrapped,
+    regardless of whether it is currently running) is informational.
     """
     pids = _mac_deskflow_pids()
     running = bool(pids)
+    supervisor_loaded = (
+        subprocess.run(
+            ["launchctl", "print", _deskflow_client_agent_target()],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
     return {
         "running": running,
         "pids": pids,
+        "supervisor_loaded": supervisor_loaded,
     }
 
 
