@@ -241,7 +241,7 @@ class CronEngine:
             "description": "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. I am Alpharius.",
             "enabled": True,
             "schedule": {"type": "cron", "value": "*/30 * * * *", "tz": "America/Phoenix"},
-            "command": f"cd {os.environ.get('TOKEN_OS', '/mnt/imperium/Token-OS')}/token-api && python3 alpharius_heartbeat.py",
+            "command": f"cd {os.environ.get('TOKEN_OS', '/mnt/imperium/runtimes/token-os/live')}/token-api && python3 alpharius_heartbeat.py",
             "timeout_seconds": 60,
         },
     ]
