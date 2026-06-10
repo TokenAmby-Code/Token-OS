@@ -66,10 +66,19 @@ agents-db --json instances       # JSON output
 
 ## Key Tables
 
-### claude_instances
-Core instance registry. This remains the source of truth for live instance state,
-but sanctioned writes now flow through the `instance_mutation.py` helper so
-provenance and reconciliation can reason about drift. Key columns:
+### instances
+Canonical instance registry v2. This is the replacement registry for new/updated
+rows and deliberately stores **no tmux runtime identity**: no raw `tmux_pane`, no
+`pane_label`/`@PANE_ID`, and no dispatch window/slot/target coordinates. Token-API
+asks tmuxctl (`resolve-instance` / live pane stamps) whenever it needs runtime pane
+resolution. Do not add tmux IDs back to this table.
+
+### claude_instances (deprecated compatibility)
+Legacy compatibility table while call sites are retired. It is no longer the source
+of truth for tmux pane binding, and sanctioned writes strip tmux runtime fields
+before persisting. Non-runtime instance state is mirrored into `instances` by
+`instance_mutation.py`. Historical stale tmux columns may exist only as migration
+debt. Key legacy columns:
 - `id` - Instance UUID
 - `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
 - `working_dir` - Instance working directory
@@ -77,12 +86,11 @@ provenance and reconciliation can reason about drift. Key columns:
 - `last_activity` - heartbeat timestamp used for stale detection and reconciliation ordering
 - `device_id` - runtime host identity, e.g. `Mac-Mini`, `Token-S24`
 - `is_subagent` - 1 if spawned headlessly or as a background worker
-- `tmux_pane` - pane projection target for `@CC_STATE` and legion tint
 - `legion` / `synced` / `input_lock` - high-frequency control-plane fields now covered by provenance
 - `tts_mode` / `tts_voice` / `notification_sound` - per-instance voice and mute state
 - `session_doc_id` / `session_doc_policy` / `continuity_binding_source` - active continuity binding
 - `workflow_state` / `workflow_updated_at` / `stop_allowed` / `next_required_action` - coarse workflow state
-- `dispatch_target` / `dispatch_window` / `dispatch_mode` / `dispatch_slot` - dispatch identity
+- `dispatch_mode` - dispatch launch mode; target/window/slot coordinates are deprecated runtime fields
 - `instance_type` / `follow_up_sop` / `zealotry` / `victory_at` / `victory_reason` - lifecycle + follow-up controls
 - `discord_hosted` / `discord_channel` / `transplant_target_session` - operator linkage and transplant handoff state
 - `wrapper_launch_id` - wrapper ingress correlation key when present

@@ -35,7 +35,9 @@ from instance_mutation import (
     _fetch_instance_row,
     sanctioned_delete_instance,
     sanctioned_insert_instance,
+    sanctioned_update_canonical_instance,
     sanctioned_update_instance,
+    sanctioned_update_legacy_runtime_fields,
 )
 from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
 from personas import assign_astartes_persona, persona_to_profile
@@ -427,6 +429,101 @@ async def _stamp_instance_id(
         logger.debug(f"Hook: @PANE_LABEL stamp errored for {tmux_pane}: {exc}")
 
 
+async def _persona_id_by_slug(db, slug: str) -> str | None:
+    cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
+    row = await cursor.fetchone()
+    return str(row[0]) if row else None
+
+
+async def _apply_canonical_commander_binding(
+    db,
+    *,
+    instance_id: str,
+    dispatch_target: str | None,
+    parent_instance_id: str | None,
+    dispatch_mode: str | None = None,
+) -> None:
+    """Set final v2 commander semantics from SessionStart context.
+
+    Runtime dispatch target/window/slot are not stored in ``instances``; this is
+    the one-time translation from launch context into durable commander routing.
+    """
+    if parent_instance_id:
+        return
+    mode = (_normalize_text(dispatch_mode) or "").lower()
+    if mode in {"silent", "breakoff", "break-off", "break_off"}:
+        await sanctioned_update_canonical_instance(
+            db,
+            instance_id=instance_id,
+            updates={"commander_type": "emperor", "commander_id": None},
+            mutation_type="commander_binding_changed",
+            write_source="hooks",
+            actor="SessionStart",
+        )
+        return
+    target = (_normalize_text(dispatch_target) or "").lower()
+    commander_slug = None
+    if target == "legion:new":
+        commander_slug = "custodes"
+    elif target == "mechanicus:new":
+        commander_slug = "fabricator-general"
+    if not commander_slug:
+        return
+    commander_persona_id = await _persona_id_by_slug(db, commander_slug)
+    if commander_persona_id is None:
+        return
+    await sanctioned_update_canonical_instance(
+        db,
+        instance_id=instance_id,
+        updates={
+            "commander_type": "persona",
+            "commander_id": str(commander_persona_id),
+        },
+        mutation_type="commander_binding_changed",
+        write_source="hooks",
+        actor="SessionStart",
+    )
+
+
+async def _persist_legacy_runtime_fields(
+    db,
+    *,
+    instance_id: str,
+    tmux_pane: str | None = None,
+    pane_label: str | None = None,
+    dispatch_target: str | None = None,
+    dispatch_window: str | None = None,
+    dispatch_slot: str | None = None,
+) -> None:
+    """Compatibility write for claude_instances only.
+
+    Canonical ``instances`` never stores these runtime fields. Legacy hook/routing
+    code still reads claude_instances until retired, so keep the compatibility row
+    usable without mirroring these fields into v2 storage/provenance.
+    """
+    updates = {}
+    if tmux_pane is not None:
+        updates["tmux_pane"] = tmux_pane
+    if pane_label is not None:
+        updates["pane_label"] = pane_label
+    if dispatch_target is not None:
+        updates["dispatch_target"] = dispatch_target
+    if dispatch_window is not None:
+        updates["dispatch_window"] = dispatch_window
+    if dispatch_slot is not None:
+        updates["dispatch_slot"] = dispatch_slot
+    if not updates:
+        return
+    await sanctioned_update_legacy_runtime_fields(
+        db,
+        instance_id=instance_id,
+        updates=updates,
+        mutation_type="runtime_binding_changed",
+        write_source="hooks",
+        actor="SessionStart-runtime-compat",
+    )
+
+
 async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
     """Clear ``@INSTANCE_ID`` on a pane an instance is moving *off* of.
 
@@ -796,18 +893,36 @@ async def _resolve_instance_for_pane(db, pane: str | None) -> dict | None:
     if not raw:
         return None
     resolved = await talk_service.resolve_pane(raw) or raw
+    instance_id = await shared.instance_id_for_pane(resolved)
     db.row_factory = aiosqlite.Row
-    cursor = await db.execute(
-        """SELECT id, tmux_pane, tab_name, engine, status, last_activity
-           FROM claude_instances
-           WHERE tmux_pane = ?
-           ORDER BY CASE WHEN status = 'stopped' THEN 1 ELSE 0 END,
-                    last_activity DESC
-           LIMIT 1""",
-        (resolved,),
-    )
+    if instance_id:
+        cursor = await db.execute(
+            """SELECT id, tab_name, engine, status, last_activity
+               FROM claude_instances
+               WHERE id = ?
+               ORDER BY CASE WHEN status = 'stopped' THEN 1 ELSE 0 END,
+                        last_activity DESC
+               LIMIT 1""",
+            (instance_id,),
+        )
+    else:
+        # Compatibility fallback for legacy rows/tests that predate @INSTANCE_ID
+        # stamps. This is read-only; canonical instances still never stores panes.
+        cursor = await db.execute(
+            """SELECT id, tab_name, engine, status, last_activity
+               FROM claude_instances
+               WHERE tmux_pane = ?
+               ORDER BY CASE WHEN status = 'stopped' THEN 1 ELSE 0 END,
+                        last_activity DESC
+               LIMIT 1""",
+            (resolved,),
+        )
     row = await cursor.fetchone()
-    return dict(row) if row else {"tmux_pane": resolved}
+    if not row:
+        return {"id": instance_id, "tmux_pane": resolved}
+    result = dict(row)
+    result["tmux_pane"] = resolved
+    return result
 
 
 async def _resolve_instance_by_id(db, instance_id: str | None) -> dict | None:
@@ -1314,19 +1429,7 @@ async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
     target_id = None
     try:
         if pane:
-            prev_factory = getattr(db, "row_factory", None)
-            db.row_factory = aiosqlite.Row
-            try:
-                cur = await db.execute(
-                    "SELECT id FROM claude_instances WHERE tmux_pane = ? "
-                    "AND status != 'stopped' ORDER BY last_activity DESC LIMIT 1",
-                    (pane,),
-                )
-                row = await cur.fetchone()
-            finally:
-                db.row_factory = prev_factory
-            if row:
-                target_id = row["id"]
+            target_id = await shared.instance_id_for_pane(pane)
         # Fall back to the recorded subscriber id only when the pane has no live row.
         if not target_id:
             target_id = declared_id
@@ -1880,24 +1983,25 @@ async def handle_session_start(payload: dict) -> dict:
         # already occupying this pane, keyed off ITS persisted primarch rather than the
         # (possibly-unresolved) new registration's label.
         if not supplant_id and tmux_pane:
-            # Gate strictly to the KNOWN persona primarchs (from PERSONA_PANE_IDENTITY).
-            # `primarch` can be set on non-persona rows too, so matching any non-empty
-            # primarch would let a recycled non-persona pane inherit a stale row's
-            # identity/session metadata instead of registering clean. (CodeRabbit #83.)
+            # Gate strictly to the KNOWN persona primarchs (from PERSONA_PANE_IDENTITY),
+            # resolving pane occupancy from tmuxctl's live @INSTANCE_ID stamp instead
+            # of the deprecated stored tmux_pane column.
             persona_primarchs = sorted(
                 {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
             )
-            placeholders = ",".join("?" for _ in persona_primarchs)
-            cursor = await db.execute(
-                f"""SELECT id FROM claude_instances
-                    WHERE tmux_pane = ? AND id != ?
-                      AND TRIM(primarch) IN ({placeholders})
-                    ORDER BY registered_at DESC LIMIT 1""",
-                (tmux_pane, session_id, *persona_primarchs),
-            )
-            row = await cursor.fetchone()
-            if row:
-                supplant_id = row["id"]
+            live_pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+            if live_pane_instance_id and live_pane_instance_id != session_id:
+                placeholders = ",".join("?" for _ in persona_primarchs)
+                cursor = await db.execute(
+                    f"""SELECT id FROM claude_instances
+                        WHERE id = ?
+                          AND TRIM(primarch) IN ({placeholders})
+                        ORDER BY registered_at DESC LIMIT 1""",
+                    (live_pane_instance_id, *persona_primarchs),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    supplant_id = row["id"]
 
         # 4. PID+pane match (covers plan-mode context-clear: Claude Code emits a fresh
         # session_id but the underlying process keeps the same PID and tmux pane).
@@ -1906,13 +2010,24 @@ async def handle_session_start(payload: dict) -> dict:
         if not supplant_id:
             payload_pid = payload.get("pid")
             if payload_pid and tmux_pane:
-                cursor = await db.execute(
-                    """SELECT id FROM claude_instances
-                       WHERE pid = ? AND tmux_pane = ?
-                         AND status IN ('processing', 'idle')
-                       ORDER BY registered_at DESC LIMIT 1""",
-                    (payload_pid, tmux_pane),
-                )
+                live_pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+                if live_pane_instance_id:
+                    cursor = await db.execute(
+                        """SELECT id FROM claude_instances
+                           WHERE id = ? AND pid = ?
+                             AND status IN ('processing', 'idle')
+                           ORDER BY registered_at DESC LIMIT 1""",
+                        (live_pane_instance_id, payload_pid),
+                    )
+                else:
+                    # Legacy fallback for rows created before @INSTANCE_ID stamps.
+                    cursor = await db.execute(
+                        """SELECT id FROM claude_instances
+                           WHERE pid = ? AND tmux_pane = ?
+                             AND status IN ('processing', 'idle')
+                           ORDER BY registered_at DESC LIMIT 1""",
+                        (payload_pid, tmux_pane),
+                    )
                 row = await cursor.fetchone()
                 if row:
                     supplant_id = row["id"]
@@ -1966,8 +2081,6 @@ async def handle_session_start(payload: dict) -> dict:
                         "pid": payload.get("pid"),
                         "device_id": device_id,
                         "status": "idle",
-                        "tmux_pane": tmux_pane,
-                        "pane_label": pane_label or existing_row["pane_label"],
                         "last_activity": now,
                         "stopped_at": None,
                         "victory_at": None,
@@ -1988,10 +2101,7 @@ async def handle_session_start(payload: dict) -> dict:
                         "wrapper_launch_id": wrapper_launch_id or existing_row["wrapper_launch_id"],
                         "launcher": launcher or existing_row["launcher"],
                         "engine": engine or existing_row["engine"],
-                        "dispatch_target": dispatch_target or existing_row["dispatch_target"],
-                        "dispatch_window": dispatch_window or existing_row["dispatch_window"],
                         "dispatch_mode": dispatch_mode or existing_row["dispatch_mode"],
-                        "dispatch_slot": dispatch_slot or existing_row["dispatch_slot"],
                         "dispatch_session_doc_path": dispatch_session_doc_path
                         or existing_row["dispatch_session_doc_path"],
                         "target_working_dir": target_working_dir
@@ -2011,6 +2121,22 @@ async def handle_session_start(payload: dict) -> dict:
                     write_source="hooks",
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                )
+                await _persist_legacy_runtime_fields(
+                    db,
+                    instance_id=session_id,
+                    tmux_pane=tmux_pane,
+                    pane_label=pane_label or existing_row["pane_label"],
+                    dispatch_target=dispatch_target,
+                    dispatch_window=dispatch_window,
+                    dispatch_slot=dispatch_slot,
+                )
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(
                     tmux_pane, session_id, display_name=existing_row["tab_name"]
@@ -2077,6 +2203,13 @@ async def handle_session_start(payload: dict) -> dict:
                         session_id[:12],
                         exc,
                     )
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
+                )
                 await db.commit()
 
                 cursor = await db.execute(
@@ -2111,8 +2244,6 @@ async def handle_session_start(payload: dict) -> dict:
                     "pid": payload.get("pid") or existing_row["pid"],
                     "device_id": device_id,
                     "status": "idle",
-                    "tmux_pane": tmux_pane or existing_row["tmux_pane"],
-                    "pane_label": pane_label or existing_row["pane_label"],
                     "last_activity": now,
                     "stopped_at": None,
                     "victory_at": None,
@@ -2126,10 +2257,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "wrapper_launch_id": wrapper_launch_id or existing_row["wrapper_launch_id"],
                     "launcher": launcher or existing_row["launcher"],
                     "engine": engine or existing_row["engine"],
-                    "dispatch_target": dispatch_target or existing_row["dispatch_target"],
-                    "dispatch_window": dispatch_window or existing_row["dispatch_window"],
                     "dispatch_mode": dispatch_mode or existing_row["dispatch_mode"],
-                    "dispatch_slot": dispatch_slot or existing_row["dispatch_slot"],
                     "dispatch_session_doc_path": dispatch_session_doc_path
                     or existing_row["dispatch_session_doc_path"],
                     "target_working_dir": target_working_dir or existing_row["target_working_dir"],
@@ -2152,6 +2280,22 @@ async def handle_session_start(payload: dict) -> dict:
                     write_source="hooks",
                     actor="SessionStart",
                     wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                )
+                await _persist_legacy_runtime_fields(
+                    db,
+                    instance_id=session_id,
+                    tmux_pane=tmux_pane or existing_row["tmux_pane"],
+                    pane_label=pane_label or existing_row["pane_label"],
+                    dispatch_target=dispatch_target,
+                    dispatch_window=dispatch_window,
+                    dispatch_slot=dispatch_slot,
+                )
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(
                     tmux_pane or existing_row["tmux_pane"],
@@ -2187,6 +2331,14 @@ async def handle_session_start(payload: dict) -> dict:
                     or mechanicus_subscription.get("existing")
                 ):
                     await db.commit()
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or existing_row["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
+                )
+                await db.commit()
                 await log_event(
                     "instance_reregistered",
                     instance_id=session_id,
@@ -2194,8 +2346,6 @@ async def handle_session_start(payload: dict) -> dict:
                     details={
                         "source": "hook",
                         "engine": engine or existing_row["engine"],
-                        "tmux_pane": tmux_pane or existing_row["tmux_pane"],
-                        "pane_label": pane_label or existing_row["pane_label"],
                         "was_status": existing_row["status"],
                     },
                 )
@@ -2203,7 +2353,6 @@ async def handle_session_start(payload: dict) -> dict:
                     "success": True,
                     "action": "reregistered",
                     "instance_id": session_id,
-                    "pane_label": pane_label or existing_row["pane_label"],
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
                 }
@@ -2259,8 +2408,6 @@ async def handle_session_start(payload: dict) -> dict:
                         "working_dir": working_dir,
                         "pid": payload.get("pid"),
                         "status": "idle",
-                        "tmux_pane": tmux_pane,
-                        "pane_label": pane_label or old_inst["pane_label"],
                         "device_id": device_id,
                         "registered_at": now,
                         "last_activity": now,
@@ -2278,10 +2425,7 @@ async def handle_session_start(payload: dict) -> dict:
                         "wrapper_launch_id": wrapper_launch_id or old_inst["wrapper_launch_id"],
                         "launcher": launcher or old_inst["launcher"],
                         "engine": engine or old_inst["engine"],
-                        "dispatch_target": dispatch_target or old_inst["dispatch_target"],
-                        "dispatch_window": dispatch_window or old_inst["dispatch_window"],
                         "dispatch_mode": dispatch_mode or old_inst["dispatch_mode"],
-                        "dispatch_slot": dispatch_slot or old_inst["dispatch_slot"],
                         "dispatch_session_doc_path": dispatch_session_doc_path
                         or old_inst["dispatch_session_doc_path"],
                         "target_working_dir": target_working_dir or old_inst["target_working_dir"],
@@ -2301,8 +2445,31 @@ async def handle_session_start(payload: dict) -> dict:
                     where_clause="id = ?",
                     where_params=(supplant_id,),
                 )
+                await _persist_legacy_runtime_fields(
+                    db,
+                    instance_id=session_id,
+                    tmux_pane=tmux_pane,
+                    pane_label=pane_label or old_inst["pane_label"],
+                    dispatch_target=dispatch_target,
+                    dispatch_window=dispatch_window,
+                    dispatch_slot=dispatch_slot,
+                )
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or old_inst["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
+                )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["tab_name"])
 
+                await _apply_canonical_commander_binding(
+                    db,
+                    instance_id=session_id,
+                    dispatch_target=dispatch_target,
+                    parent_instance_id=parent_instance_id or old_inst["parent_instance_id"],
+                    dispatch_mode=dispatch_mode,
+                )
                 # Auto-link primarch session doc if applicable
                 session_doc_id = resolved_session_doc_id or old_inst["session_doc_id"]
                 if primarch_name and not session_doc_id:
@@ -2544,16 +2711,11 @@ async def handle_session_start(payload: dict) -> dict:
                 "synced": 1 if persona_synced else 0,
                 "input_lock": None,
                 "is_subagent": is_subagent,
-                "tmux_pane": tmux_pane,
-                "pane_label": pane_label,
                 "primarch": primarch_name or None,
                 "wrapper_launch_id": wrapper_launch_id,
                 "launcher": launcher,
                 "engine": engine,
-                "dispatch_target": dispatch_target,
-                "dispatch_window": dispatch_window,
                 "dispatch_mode": dispatch_mode,
-                "dispatch_slot": dispatch_slot,
                 "dispatch_session_doc_path": dispatch_session_doc_path,
                 "target_working_dir": target_working_dir,
                 "launch_mode": launch_mode,
@@ -2572,6 +2734,22 @@ async def handle_session_start(payload: dict) -> dict:
             write_source="hooks",
             actor="SessionStart",
             wrapper_launch_id=wrapper_launch_id,
+        )
+        await _persist_legacy_runtime_fields(
+            db,
+            instance_id=session_id,
+            tmux_pane=tmux_pane,
+            pane_label=pane_label,
+            dispatch_target=dispatch_target,
+            dispatch_window=dispatch_window,
+            dispatch_slot=dispatch_slot,
+        )
+        await _apply_canonical_commander_binding(
+            db,
+            instance_id=session_id,
+            dispatch_target=dispatch_target,
+            parent_instance_id=parent_instance_id,
+            dispatch_mode=dispatch_mode,
         )
         await _stamp_instance_id(tmux_pane, session_id, display_name=tab_name)
         # Auto-link primarch instance to its active session doc
@@ -2596,7 +2774,6 @@ async def handle_session_start(payload: dict) -> dict:
                 device_id=device_id,
                 details={
                     "launcher": launcher,
-                    "dispatch_target": dispatch_target,
                     "legion": dispatch_legion,
                     "primarch": primarch_name,
                     "origin_type": origin_type,
@@ -2695,6 +2872,13 @@ async def handle_session_start(payload: dict) -> dict:
                 wrapper_launch_id=wrapper_launch_id,
             )
 
+        await _apply_canonical_commander_binding(
+            db,
+            instance_id=session_id,
+            dispatch_target=dispatch_target,
+            parent_instance_id=parent_instance_id,
+            dispatch_mode=dispatch_mode,
+        )
         await db.commit()
 
         # Update frontmatter if we linked a session doc

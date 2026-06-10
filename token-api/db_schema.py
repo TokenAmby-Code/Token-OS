@@ -14,9 +14,297 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
-from personas import ensure_personas_table, repair_legacy_instance_personas
+from instance_registry import INSTANCE_COLUMNS, legacy_row_to_instance_values, slug_from_legacy
+from personas import ensure_personas_table, persona_id_for_slug, repair_legacy_instance_personas
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+
+
+async def _table_columns(db, table: str) -> set[str]:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    return {col[1] for col in await cursor.fetchall()}
+
+
+async def _table_exists(db, table: str) -> bool:
+    cursor = await db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    )
+    return await cursor.fetchone() is not None
+
+
+async def _persona_id_for_legacy_row(db, row: dict) -> str | None:
+    slug = slug_from_legacy(row)
+    if not slug:
+        return None
+    cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
+    found = await cursor.fetchone()
+    if found:
+        return found[0]
+    persona_id = persona_id_for_slug(slug)
+    display = slug.replace("-", " ").title()
+    await db.execute(
+        """INSERT INTO personas
+           (id, slug, display_name, default_rank, pane_tint)
+           VALUES (?, ?, ?, 'astartes', 'default')
+           ON CONFLICT(id) DO NOTHING""",
+        (persona_id, slug, display),
+    )
+    return persona_id
+
+
+async def _create_instances_table(db) -> None:
+    await db.execute("""
+        CREATE TABLE instances (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            engine TEXT,
+            working_dir TEXT,
+            device_id TEXT NOT NULL,
+            origin_type TEXT NOT NULL DEFAULT 'local'
+                CHECK(origin_type IN ('local','ssh','cron','dispatch','api','perpetual')),
+            commander_type TEXT NOT NULL DEFAULT 'emperor'
+                CHECK(commander_type IN ('emperor','persona','chapter')),
+            commander_id TEXT,
+            status TEXT NOT NULL DEFAULT 'idle'
+                CHECK(status IN ('idle','working','questioning','preplanning','planning','compacting','reviewing','victorious','stopped','archived')),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            stopped_at TIMESTAMP,
+            archived_at TIMESTAMP,
+            persona_id TEXT REFERENCES personas(id),
+            rank TEXT NOT NULL DEFAULT 'astartes'
+                CHECK(rank IN ('astartes','overseer','primarch','retired') OR rank GLOB 'aspirant:*'),
+            session_doc_id INTEGER,
+            continuity_binding_source TEXT,
+            wrapper_launch_id TEXT,
+            automated INTEGER NOT NULL DEFAULT 0 CHECK(automated IN (0,1)),
+            notification_mode TEXT NOT NULL DEFAULT 'verbose'
+                CHECK(notification_mode IN ('verbose','muted','silent')),
+            interaction_mode TEXT NOT NULL DEFAULT 'text'
+                CHECK(interaction_mode IN ('text','voice_chat')),
+            golden_throne TEXT,
+            CHECK((commander_type = 'emperor' AND commander_id IS NULL) OR
+                  (commander_type IN ('persona','chapter') AND commander_id IS NOT NULL)),
+            CHECK(status != 'archived' OR rank = 'retired')
+        )
+    """)
+
+
+async def _ensure_instances_v2(db) -> None:
+    await db.execute("PRAGMA foreign_keys=ON")
+    await ensure_personas_table(db)
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS golden_throne (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zealotry INTEGER NOT NULL DEFAULT 4,
+            resume_count INTEGER NOT NULL DEFAULT 0,
+            resume_window_started_at TIMESTAMP,
+            last_resume_at TIMESTAMP,
+            follow_up_sop TEXT,
+            stop_allowed INTEGER NOT NULL DEFAULT 1 CHECK(stop_allowed IN (0,1)),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS aspirants (
+            id TEXT PRIMARY KEY,
+            source_note_path TEXT,
+            prompt_path TEXT,
+            system_prompt_path TEXT,
+            status TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            promoted_instance_id TEXT,
+            retired_instance_id TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+
+    needs_rebuild = True
+    old_rows: list[dict] = []
+    if await _table_exists(db, "instances"):
+        cols = await _table_columns(db, "instances")
+        needs_rebuild = cols != set(INSTANCE_COLUMNS)
+        if needs_rebuild:
+            db.row_factory = aiosqlite.Row
+            try:
+                cursor = await db.execute("SELECT * FROM instances")
+                old_rows = [dict(row) for row in await cursor.fetchall()]
+            finally:
+                db.row_factory = None
+            await db.execute("DROP TABLE instances")
+    if needs_rebuild:
+        await _create_instances_table(db)
+        source_rows = old_rows
+        if await _table_exists(db, "claude_instances"):
+            db.row_factory = aiosqlite.Row
+            try:
+                cursor = await db.execute("SELECT * FROM claude_instances")
+                source_rows = [dict(row) for row in await cursor.fetchall()] or source_rows
+            finally:
+                db.row_factory = None
+        for row in source_rows:
+            if set(INSTANCE_COLUMNS).issubset(row.keys()):
+                values = {column: row.get(column) for column in INSTANCE_COLUMNS}
+            else:
+                values = legacy_row_to_instance_values(
+                    row, await _persona_id_for_legacy_row(db, row)
+                )
+            if not values.get("id"):
+                continue
+            columns = [column for column in INSTANCE_COLUMNS if column in values]
+            await db.execute(
+                f"INSERT OR REPLACE INTO instances ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                [values[column] for column in columns],
+            )
+
+    columns = await _table_columns(db, "instances")
+    if columns != set(INSTANCE_COLUMNS):
+        raise RuntimeError(
+            f"instances table schema mismatch: expected {INSTANCE_COLUMNS}, got {sorted(columns)}"
+        )
+
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_v2_status ON instances(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_v2_device ON instances(device_id)")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_instances_v2_persona_active ON instances(persona_id, rank)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_instances_v2_commander ON instances(commander_type, commander_id)"
+    )
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_fk_guard")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_fk_guard
+        BEFORE INSERT ON instances
+        WHEN NEW.persona_id IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM personas WHERE id = NEW.persona_id
+            ) THEN RAISE(ABORT, 'persona_id must reference personas.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_fk_guard_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_fk_guard_update
+        BEFORE UPDATE OF persona_id ON instances
+        WHEN NEW.persona_id IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM personas WHERE id = NEW.persona_id
+            ) THEN RAISE(ABORT, 'persona_id must reference personas.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_commander_guard")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_commander_guard
+        BEFORE INSERT ON instances
+        WHEN NEW.commander_type = 'persona'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM personas WHERE id = NEW.commander_id
+            ) THEN RAISE(ABORT, 'persona commander_id must reference personas.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_commander_guard_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_commander_guard_update
+        BEFORE UPDATE OF commander_type, commander_id ON instances
+        WHEN NEW.commander_type = 'persona'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM personas WHERE id = NEW.commander_id
+            ) THEN RAISE(ABORT, 'persona commander_id must reference personas.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_golden_throne_guard")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_golden_throne_guard
+        BEFORE INSERT ON instances
+        WHEN NEW.golden_throne IS NOT NULL AND NEW.golden_throne != 'sync'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM golden_throne WHERE CAST(id AS TEXT) = NEW.golden_throne
+            ) THEN RAISE(ABORT, 'golden_throne must be NULL, sync, or golden_throne.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_golden_throne_guard_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_golden_throne_guard_update
+        BEFORE UPDATE OF golden_throne ON instances
+        WHEN NEW.golden_throne IS NOT NULL AND NEW.golden_throne != 'sync'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM golden_throne WHERE CAST(id AS TEXT) = NEW.golden_throne
+            ) THEN RAISE(ABORT, 'golden_throne must be NULL, sync, or golden_throne.id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_chapter_persona_guard")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_chapter_persona_guard
+        BEFORE INSERT ON instances
+        WHEN NEW.commander_type = 'chapter'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM instances commander
+                WHERE commander.id = NEW.commander_id
+                  AND commander.rank != 'retired'
+                  AND commander.status != 'archived'
+                  AND (commander.persona_id IS NEW.persona_id)
+            ) THEN RAISE(ABORT, 'chapter commander must be active and share persona_id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_chapter_persona_guard_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_chapter_persona_guard_update
+        BEFORE UPDATE OF commander_type, commander_id, persona_id ON instances
+        WHEN NEW.commander_type = 'chapter'
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM instances commander
+                WHERE commander.id = NEW.commander_id
+                  AND commander.rank != 'retired'
+                  AND commander.status != 'archived'
+                  AND (commander.persona_id IS NEW.persona_id)
+            ) THEN RAISE(ABORT, 'chapter commander must be active and share persona_id') END;
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_retire_children")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_retire_children
+        AFTER UPDATE OF rank ON instances
+        WHEN NEW.rank = 'retired' AND OLD.rank != 'retired'
+        BEGIN
+            UPDATE instances
+               SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
+             WHERE commander_type = 'chapter' AND commander_id = NEW.id AND rank != 'retired';
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_singleton_guard")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_singleton_guard
+        BEFORE INSERT ON instances
+        WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
+        BEGIN
+            UPDATE instances
+               SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
+             WHERE persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
+        END
+    """)
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_singleton_guard_update")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_singleton_guard_update
+        BEFORE UPDATE OF persona_id, rank, commander_type ON instances
+        WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
+             AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
+        BEGIN
+            UPDATE instances
+               SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
+             WHERE id != NEW.id AND persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
+        END
+    """)
 
 
 async def init_database_async(db_path: Path | None = None) -> None:
@@ -207,6 +495,12 @@ async def init_database_async(db_path: Path | None = None) -> None:
         drop_targets = dead_columns & columns
         for col in drop_targets:
             await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
+
+        repaired_personas = await repair_legacy_instance_personas(db)
+        if repaired_personas:
+            print(f"Repaired {repaired_personas} legacy active persona assignments")
+
+        await _ensure_instances_v2(db)
 
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)"
@@ -1183,10 +1477,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             """,
                 habit,
             )
-
-        repaired_personas = await repair_legacy_instance_personas(db)
-        if repaired_personas:
-            print(f"Repaired {repaired_personas} legacy active persona assignments")
 
         await db.commit()
         print(f"Database initialized at {db_path}")

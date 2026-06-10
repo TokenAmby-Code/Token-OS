@@ -77,6 +77,15 @@ def _rows_at_pane(db_path, pane):
     return rows
 
 
+def _row_by_id(db_path, instance_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT id, primarch FROM claude_instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
 # ── R-H1: persona pane-label singleton supplant ────────────────────────────────
 
 
@@ -100,6 +109,11 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+
+    async def live_instance_for_pane(pane):
+        return "stale-fg" if pane == "%fg" else None
+
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", live_instance_for_pane)
 
     async def run():
         return await hooks.handle_session_start(
@@ -155,9 +169,10 @@ def test_non_persona_pane_is_not_supplanted(app_env, monkeypatch):
 
     ids = {r[0] for r in _rows_at_pane(app_env.db_path, "%wk")}
     # No supplant: the stale non-persona row survives untouched and the new session
-    # registers as its own distinct row.
+    # registers as its own distinct row. New registrations no longer persist tmux_pane,
+    # so verify the new row by id rather than by pane.
     assert "stale-worker" in ids, "non-persona row must not be supplanted/migrated"
-    assert "new-worker" in ids, "new session must register as its own row"
+    assert _row_by_id(app_env.db_path, "new-worker") is not None, "new session must register"
 
 
 # ── R-H2: subscriber flag resolves the live pane over a dead id ─────────────────
@@ -176,6 +191,11 @@ def test_subscriber_flag_resolves_live_pane_over_dead_id(app_env, monkeypatch):
         return {"status": "sent", "operation": "fake"}
 
     monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    async def live_instance_for_pane(pane):
+        return "live-sub" if pane == "%sub" else None
+
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", live_instance_for_pane)
 
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(

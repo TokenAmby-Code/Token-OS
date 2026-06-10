@@ -158,21 +158,15 @@ async def test_future_instances_rank_retired_does_not_lock_persona(app_env):
 
     async with aiosqlite.connect(app_env.db_path) as db:
         await db.execute(
-            """
-            CREATE TABLE instances (
-                id TEXT PRIMARY KEY,
-                persona_id TEXT,
-                rank TEXT,
-                status TEXT
-            )
-            """
-        )
-        await db.execute(
-            "INSERT INTO instances (id, persona_id, rank, status) VALUES ('retired', ?, 'retired', 'active')",
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('retired', 'retired', 'Mac-Mini', 'emperor', 'idle', ?, 'retired')""",
             (personas.persona_id_for_slug("blood-angels"),),
         )
         await db.execute(
-            "INSERT INTO instances (id, persona_id, rank, status) VALUES ('active', ?, 'astartes', 'active')",
+            """INSERT INTO instances
+               (id, name, device_id, commander_type, status, persona_id, rank)
+               VALUES ('active', 'active', 'Mac-Mini', 'emperor', 'idle', ?, 'astartes')""",
             (personas.persona_id_for_slug("ultramarines"),),
         )
         await db.commit()

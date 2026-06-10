@@ -161,8 +161,10 @@ def fetch_instance_rows_raw() -> list[dict]:
 
 
 def rebind_instance_pane(instance_id: str, pane_id: str) -> None:
-    """Repoint a drifted instance row's ``tmux_pane`` to a concrete pane id."""
-    patch_instance(instance_id, "tmux-pane", {"tmux_pane": pane_id})
+    """Retired: Token-API no longer exposes pane rebinding as a DB/API mutation."""
+    raise RegistryError(
+        "rebind_instance_pane is retired; use tmuxctl/live @INSTANCE_ID stamps, not Token-API"
+    )
 
 
 def fetch_session_doc_for_pane_label(pane_label: str) -> dict:

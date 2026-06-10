@@ -402,10 +402,11 @@ async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
 async def active_non_retired_persona_ids(db: aiosqlite.Connection) -> set[str]:
     """Return DB-locked personas for active, non-retired instances.
 
-    Future schema path: ``instances.persona_id`` + ``instances.rank``.
-    Current compatibility path: ``claude_instances.profile_name`` is treated as
-    the persona slug while ``rank`` is absent; stopped rows do not lock.
+    Prefer canonical ``instances.persona_id``/``rank`` when present, but also
+    union legacy ``claude_instances.profile_name`` locks during the transition so
+    direct legacy inserts and existing rows continue to reserve voices.
     """
+    locked: set[str] = set()
     instance_cols = await _table_columns(db, "instances")
     if {"persona_id", "rank"}.issubset(instance_cols):
         cursor = await db.execute(
@@ -417,21 +418,22 @@ async def active_non_retired_persona_ids(db: aiosqlite.Connection) -> set[str]:
               AND COALESCE(status, 'active') NOT IN ('stopped', 'closed')
             """
         )
-        return {row[0] for row in await cursor.fetchall() if row[0]}
+        locked.update(row[0] for row in await cursor.fetchall() if row[0])
 
     legacy_cols = await _table_columns(db, "claude_instances")
-    if "profile_name" not in legacy_cols:
-        return set()
-    cursor = await db.execute(
-        """
-        SELECT DISTINCT p.id
-        FROM claude_instances ci
-        JOIN personas p ON p.slug = ci.profile_name
-        WHERE ci.status IN ('processing', 'idle')
-          AND p.default_rank = 'astartes'
-        """
-    )
-    return {row[0] for row in await cursor.fetchall() if row[0]}
+    if "profile_name" in legacy_cols:
+        cursor = await db.execute(
+            """
+            SELECT DISTINCT p.id
+            FROM claude_instances ci
+            JOIN personas p ON p.slug = ci.profile_name
+            WHERE ci.status IN ('processing', 'idle')
+              AND p.default_rank = 'astartes'
+            """
+        )
+        locked.update(row[0] for row in await cursor.fetchall() if row[0])
+
+    return locked
 
 
 async def assign_astartes_persona(
