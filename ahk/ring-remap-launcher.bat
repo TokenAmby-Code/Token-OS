@@ -5,7 +5,7 @@
 :: not the NAS copy, so it can always be found on startup.
 
 set "AHK_EXE=C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
-set "SCRIPT_PATH=\\Token-NAS\Imperium\Scripts\ahk\ring-remap.ahk"
+set "SCRIPT_PATH=\\Token-NAS\Imperium\runtimes\token-os\live\ahk\ring-remap.ahk"
 set "RETRY_SECONDS=5"
 set "MAX_RETRIES=60"
 
