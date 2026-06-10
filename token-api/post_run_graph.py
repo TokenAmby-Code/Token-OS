@@ -262,7 +262,7 @@ def _subprocess_env() -> dict:
 
     env = dict(os.environ)
     extra = [
-        f"{_HOME}/Token-OS/cli-tools/bin",
+        "/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin",
         f"{_HOME}/.local/bin",
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",

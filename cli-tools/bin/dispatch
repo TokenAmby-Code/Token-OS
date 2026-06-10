@@ -522,7 +522,6 @@ directory_candidates() {
     "/Volumes/Imperium/Imperium-ENV" \
     "/Volumes/Civic/Pax-ENV" \
     "${TOKEN_OS_RUNTIME_CHECKOUT:-/Volumes/Imperium/runtimes/token-os/live}" \
-    "/Volumes/Imperium/Token-OS" \
     "$HOME/worktrees/Token-OS" \
     "$HOME/worktrees/askCivic" \
     "${TERMINUS_RUNTIME_CHECKOUT:-$HOME/runtimes/askCivic/terminus-preview}" \
@@ -1073,7 +1072,7 @@ launch_dispatch_aspirant_session() {
   )
   [[ -n "$PERSONA" ]] && launch_args+=(--persona "$PERSONA")
   if [[ "$ENGINE" == "claude" ]]; then
-    persona_prompt="$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-/Volumes/Imperium/Scripts}/cli-tools/prompts/aspirant-persona.md")"
+    persona_prompt="$(aspirant_persona_prompt_path 2>/dev/null || printf '%s' "${TOKEN_OS_ROOT:-$TOKEN_OS}/cli-tools/prompts/aspirant-persona.md")"
     launch_args+=(--system-prompt-file "$persona_prompt")
   fi
 

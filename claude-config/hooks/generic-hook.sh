@@ -46,7 +46,7 @@ _resolve_token_os_bin() {
   fi
   for root in "${IMPERIUM:-}" "${CIVIC:-}"; do
     [[ -n "$root" ]] || continue
-    cand="${root%/}/Token-OS/cli-tools/bin/${tool}"
+    cand="${root%/}/runtimes/token-os/live/cli-tools/bin/${tool}"
     if _mount_live "$root" && [[ -x "$cand" ]]; then
       printf '%s\n' "$cand"
       return 0

@@ -87,7 +87,7 @@ export function createVoiceManager(botClients, config, logger) {
     if (!info) return false;
     if (info.sessionName === 'discord-daemon') return false;
     if (info.sessionName?.startsWith?.('tx_test_')) return false;
-    if ((info.currentPath || '').endsWith('/Token-OS/discord-daemon')) return false;
+    if ((info.currentPath || '').endsWith('/runtimes/token-os/live/discord-daemon')) return false;
     return true;
   }
 

@@ -34,7 +34,7 @@ end
 local function imperiumConfigValue(name)
     local cmd = [[/usr/bin/python3 - <<'PY'
 import sys
-sys.path.insert(0, "/Volumes/Imperium/Token-OS/cli-tools/lib")
+sys.path.insert(0, "/Volumes/Imperium/runtimes/token-os/live/cli-tools/lib")
 try:
     import imperium_config
     print(getattr(imperium_config, "]] .. name .. [[", ""))

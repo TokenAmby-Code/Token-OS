@@ -4,7 +4,7 @@
 # Creates symlinks from ~/.claude/ and ~/CLAUDE.md to the canonical config
 # on the NAS. settings.json is copied (not symlinked) since Claude Code writes to it.
 #
-# Usage: bash $IMPERIUM/Scripts/claude-config/setup.sh
+# Usage: bash $IMPERIUM/runtimes/token-os/live/claude-config/setup.sh
 #
 # Safe to re-run — backs up existing files before replacing.
 

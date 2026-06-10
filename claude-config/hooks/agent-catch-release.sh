@@ -49,9 +49,9 @@ fi
 log "CATCH ${SUBAGENT_TYPE} agent: ${AGENT_DESC}"
 
 # --- Resolve environment ---
-source "$(dirname "$(readlink -f "$0")")/../../Token-OS/cli-tools/lib/nas-path.sh" 2>/dev/null || true
+source "$(dirname "$(readlink -f "$0")")/../../cli-tools/lib/nas-path.sh" 2>/dev/null || true
 VAULT_DIR="${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV"
-DISPATCH_BIN="${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/dispatch"
+DISPATCH_BIN="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/bin/dispatch"
 
 # Resolve parent's working directory from the hook's CWD
 PARENT_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)

@@ -570,7 +570,7 @@ ai_fallback() {
             echo ""
             read -rp "Do you want to create this tool? Describe it (or 'no' to cancel): " response
             if [[ "$response" != "no" && "$response" != "n" && -n "$response" ]]; then
-                (cd "/mnt/imperium/Scripts/cli-tools" && unset CLAUDECODE && claude "$response")
+                (cd "$CLI_TOOLS_DIR" && unset CLAUDECODE && claude "$response")
             fi
         fi
     fi

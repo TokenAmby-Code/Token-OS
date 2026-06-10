@@ -7,7 +7,7 @@ set -euo pipefail
 
 DB_PATH="${QUIET_BUSTER_RESUME_DB:-$HOME/.claude/agents.db}"
 THREAD_ID="${QUIET_BUSTER_RESUME_THREAD_ID:-}"
-WORKDIR="${QUIET_BUSTER_RESUME_WORKDIR:-/Volumes/Imperium/Token-OS/token-api}"
+WORKDIR="${QUIET_BUSTER_RESUME_WORKDIR:-/Volumes/Imperium/runtimes/token-os/live/token-api}"
 CHECK_AFTER="${QUIET_BUSTER_RESUME_CHECK_AFTER:-}"
 CHECK_UNTIL="${QUIET_BUSTER_RESUME_CHECK_UNTIL:-}"
 FLAG_PATH="${QUIET_BUSTER_RESUME_FLAG:-$HOME/.claude/quiet-buster-resume-fired.flag}"
@@ -89,7 +89,7 @@ printf -v workdir_q '%q' "$WORKDIR"
 printf -v thread_q '%q' "$THREAD_ID"
 printf -v prompt_q '%q' "$prompt"
 
-dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM:-/Volumes/Imperium}/Token-OS/cli-tools/bin/dispatch")"
+dispatch_bin="$(command -v dispatch 2>/dev/null || echo "${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/bin/dispatch")"
 printf -v dispatch_q '%q' "$dispatch_bin"
 printf -v pane_q '%q' "$pane_id"
 cmd="cd ${workdir_q} && ${dispatch_q} --direct --engine codex --resume ${thread_q} --pane ${pane_q} --dir ${workdir_q} --prompt ${prompt_q}"
