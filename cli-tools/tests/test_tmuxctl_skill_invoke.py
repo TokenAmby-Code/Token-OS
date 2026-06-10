@@ -13,8 +13,11 @@ import tmuxctl.skill_invoke as skill_invoke
 from tmuxctl.enums import InstanceStatus
 from tmuxctl.models import InstanceRegistryEntry, InstanceRegistrySnapshot
 from tmuxctl.skill_invoke import (
+    codex_skill_sink_keys,
     invoke_skill_in_pane,
+    looks_like_codex_skill_invocation,
     normalize_skill_name,
+    send_skill_invocation_to_pane,
     skill_invocation_text,
 )
 from tmuxctl.tmux_adapter import TmuxAdapter
@@ -48,6 +51,31 @@ def test_skill_invocation_text_uses_claude_slash():
     assert skill_invocation_text("preplan", "auto") == "/preplan "
 
 
+def test_skill_invocation_text_appends_arguments_without_trailing_padding():
+    assert (
+        skill_invocation_text(
+            "golden-throne-sop",
+            "codex",
+            'victory condition "needs tests passing" is unmet',
+        )
+        == '$golden-throne-sop victory condition "needs tests passing" is unmet'
+    )
+
+
+def test_codex_skill_sink_keys_only_for_codex():
+    assert codex_skill_sink_keys("codex") == ("Tab",)
+    assert codex_skill_sink_keys("openai") == ("Tab",)
+    assert codex_skill_sink_keys("claude") == ()
+
+
+def test_looks_like_codex_skill_invocation():
+    assert looks_like_codex_skill_invocation("$golden-throne-sop victory condition x")
+    assert not looks_like_codex_skill_invocation("/golden-throne-sop victory condition x")
+    assert not looks_like_codex_skill_invocation("plain $golden-throne-sop")
+    assert not looks_like_codex_skill_invocation("$")
+    assert not looks_like_codex_skill_invocation("$   ")
+
+
 def test_normalize_skill_name_rejects_empty_or_spaced():
     with pytest.raises(ValueError):
         normalize_skill_name("/$")
@@ -66,7 +94,49 @@ def test_invoke_skill_in_pane_inserts_at_prompt_start_with_harness_prefix(monkey
         ("send-keys", "-t", "%42", "Home")
     ]
     assert ("send-keys", "-t", "%42", "-l", "$preplan ") in adapter.calls
+    assert ("send-keys", "-t", "%42", "Tab") in adapter.calls
     assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
+
+
+def test_invoke_skill_in_pane_does_not_tab_sink_claude(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    text = invoke_skill_in_pane(adapter, "%42", "preplan", agent="claude")
+
+    assert text == "/preplan "
+    assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls
+
+
+def test_send_skill_invocation_to_pane_submits_through_gated_adapter(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    text = send_skill_invocation_to_pane(
+        adapter,
+        "%42",
+        "golden-throne-sop",
+        agent="codex",
+        arguments='victory condition "needs tests passing" is unmet',
+    )
+
+    assert text == '$golden-throne-sop victory condition "needs tests passing" is unmet'
+    assert ("send-keys", "-t", "%42", "-l", text) in adapter.calls
+    assert adapter.calls[-3:] == [
+        ("send-keys", "-t", "%42", "Tab"),
+        ("send-keys", "-t", "%42", "C-m"),
+        ("send-keys", "-t", "%42", "C-m"),
+    ]
+
+
+def test_send_skill_invocation_to_pane_does_not_tab_sink_claude(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    text = send_skill_invocation_to_pane(adapter, "%42", "preplan", agent="claude")
+
+    assert text == "/preplan "
+    assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls
 
 
 def test_resolve_agent_for_pane_uses_registry_engine(monkeypatch):
@@ -127,3 +197,30 @@ def test_resolve_agent_for_pane_falls_back_to_pane_hint(monkeypatch):
     )
 
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "codex"
+
+
+def test_resolve_agent_for_pane_default_when_inconclusive(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(
+        skill_invoke, "fetch_instance_registry", lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+
+    def fake_run(cmd, **kwargs):
+        # Pane process is a plain shell — no claude/codex marker to detect.
+        return subprocess.CompletedProcess(cmd, 0, "bash -l\n", "")
+
+    monkeypatch.setattr(skill_invoke.subprocess, "run", fake_run)
+
+    # No registry, no harness in the pane process, no @PLANNING_AGENT hint: the
+    # default decides. tmux-plan-menu passes default="auto" so preplan fails
+    # closed instead of inserting a guessed leader.
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "claude"
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42", default="auto") == "auto"
+
+
+def test_resolve_agent_for_pane_rejects_invalid_default():
+    # default must stay inside the claude|codex|auto contract — an arbitrary
+    # value must never escape as the resolved harness.
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError):
+        skill_invoke.resolve_agent_for_pane(adapter, "%42", default="bogus")

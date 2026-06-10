@@ -10,8 +10,10 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import assertions
 from tmuxctl.assertions import (
+    PANE_CLOSE_TRANSIENT_OPTIONS,
     PERSONA_GUARD_OPTION,
     PersonaSpec,
+    _clear_pane_overlay,
     _guarded_send_persona_command,
     _observed_row_hash,
     _row_matches_persona,
@@ -157,3 +159,43 @@ def test_guard_state_persists_in_pane_option():
     ):
         _guarded_send_persona_command(adapter, "%27", spec, row)
     assert PERSONA_GUARD_OPTION in adapter.options
+
+
+def test_clear_pane_overlay_removes_close_time_state_but_keeps_identity():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": "palace:N",
+            "@PANE_TYPE": "palace",
+            "@PANE_LABEL": "needs-name",
+            "@INSTANCE_ID": "inst-1",
+            "@DISCORD_VOICE_LOCK": "1",
+            PERSONA_GUARD_OPTION: "{}",
+        }
+    )
+
+    _clear_pane_overlay(adapter, "%27")
+
+    for option in PANE_CLOSE_TRANSIENT_OPTIONS:
+        assert option not in adapter.options
+    assert PERSONA_GUARD_OPTION not in adapter.options
+    assert adapter.options["@PANE_ID"] == "palace:N"
+    assert adapter.options["@PANE_TYPE"] == "palace"
+    assert adapter.options["@PANE_TITLE_SUPPRESS"] == "true"
+
+
+def test_clear_pane_overlay_preserves_static_persona_guard():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": "legion:custodes",
+            "@PANE_TYPE": "legion",
+            "@PANE_LABEL": "custodes",
+            PERSONA_GUARD_OPTION: "{}",
+        }
+    )
+
+    _clear_pane_overlay(adapter, "%27")
+
+    assert adapter.options[PERSONA_GUARD_OPTION] == "{}"
+    assert "@PANE_LABEL" not in adapter.options

@@ -87,20 +87,45 @@ def _resolve_tmux() -> str:
     return "tmux"
 
 
+def _mount_live(root: str) -> bool:
+    if not root:
+        return False
+    path = Path(root)
+    if not path.is_dir():
+        return False
+    try:
+        next(path.iterdir(), None)
+    except OSError:
+        return False
+    return True
+
+
+def _env_token_os_candidates(tool: str) -> list[Path]:
+    roots = [os.environ.get("IMPERIUM", ""), os.environ.get("CIVIC", "")]
+    return [Path(root) / "Token-OS" / "cli-tools" / "bin" / tool for root in roots if _mount_live(root)]
+
+
 def _resolve_claude_cmd() -> str:
     override = os.environ.get("PENDING_UI_CLAUDE_CMD")
     if override:
         return override
     sibling = Path(__file__).resolve().parent / "claude-cmd"
+    if os.access(sibling, os.X_OK):
+        return str(sibling)
+    for cand in _env_token_os_candidates("claude-cmd"):
+        if os.access(cand, os.X_OK):
+            return str(cand)
+    return "claude-cmd"
+
+
+def _resolve_guard_script() -> str | None:
+    sibling = Path(__file__).resolve().parents[1] / "lib" / "tmux-guard.sh"
     if sibling.exists():
         return str(sibling)
-    for cand in (
-        "/Volumes/Imperium/Token-OS/cli-tools/bin/claude-cmd",
-        "/mnt/imperium/Token-OS/cli-tools/bin/claude-cmd",
-    ):
-        if os.access(cand, os.X_OK):
-            return cand
-    return "claude-cmd"
+    for cand in _env_token_os_candidates("../lib/tmux-guard.sh"):
+        if cand.exists():
+            return str(cand.resolve())
+    return None
 
 
 def _tmux(*args: str) -> tuple[int, str]:
@@ -136,17 +161,26 @@ def _typing_active(window_seconds: int) -> bool:
     Reads tmux ``#{client_activity}`` (bumped on client input). Fail-open: an
     unreadable tmux returns False (allow), never a spurious hold.
     """
-    rc, out = _tmux("display-message", "-p", "#{client_activity}")
+    rc, out = _tmux("display-message", "-p", "#{client_activity} #{client_last_key}")
     if rc != 0:
         return False
     raw = out.strip()
     if not raw:
         return False
+    parts = raw.split(maxsplit=1)
     try:
-        activity = int(raw)
-    except ValueError:
+        activity = int(parts[0])
+    except (IndexError, ValueError):
         return False
     age = int(time.time()) - activity
+    last_key = parts[1].strip() if len(parts) > 1 else ""
+    if last_key in {"Enter", "Return", "C-m", "\r", "\n"}:
+        return False
+    # The hook submit itself can bump client_activity immediately before this
+    # flush runs. Treat sub-second/in-same-second bumps as machine submit noise,
+    # not human typing, while preserving the normal typing guard window.
+    if age < 1:
+        return False
     return 0 <= age <= max(1, window_seconds)
 
 
@@ -190,12 +224,35 @@ def _send(pane: str, cmd: str) -> bool:
 
 
 def _send_clear(pane: str) -> None:
-    """Clear any residual prompt-line text after a branding burst (best-effort).
-
-    Only ever reached once the pane has been confirmed idle+unattended, so this
-    cannot land mid-keystroke — the gap the original raw ``send-keys C-u`` left.
-    """
-    _tmux("send-keys", "-t", pane, "C-u")
+    """Clear residual prompt-line text through the guarded send-keys path."""
+    guard = _resolve_guard_script()
+    if not guard:
+        return
+    env = {
+        **os.environ,
+        "TMUX_GUARD_REAL_TMUX": _resolve_tmux(),
+        "TMUX_GUARD_TIMEOUT": "0",
+    }
+    try:
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; tmux_send_guarded "$@"',
+                "pending-ui-flush",
+                guard,
+                "-t",
+                pane,
+                "C-u",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=2.0,
+        )
+    except Exception:
+        return
 
 
 # ---- queue entry model ---------------------------------------------------- #
@@ -347,13 +404,23 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print(json.dumps(summary))
         return 0
     alive = _alive_panes()
-    for path in qdir.iterdir():
-        if not path.is_file() or ".drain." in path.name:
+    for path in list(qdir.iterdir()):
+        if not path.is_file() or ".drain." in path.name or ".sweep." in path.name:
             continue
+        claim = qdir / f"{path.name}.sweep.{os.getpid()}"
         try:
-            raw_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            os.replace(path, claim)
         except OSError:
             continue
+        try:
+            raw_lines = [ln for ln in claim.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except OSError:
+            try:
+                claim.unlink()
+            except OSError:
+                pass
+            continue
+
         survivors: list[str] = []
         for ln in raw_lines:
             entry = _parse(ln)
@@ -367,18 +434,31 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             if alive is not None and entry.pane not in alive:
                 continue
             survivors.append(entry.raw)
-        if not survivors:
+
+        # Preserve any entries appended after the claim. If a writer recreated
+        # `path`, append survivors to it; otherwise rewrite only the survivors.
+        new_lines: list[str] = []
+        if path.exists():
             try:
-                path.unlink()
-                summary["removed"] += 1
+                new_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
             except OSError:
-                pass
-        elif len(survivors) != len(raw_lines):
-            path.write_text("\n".join(survivors) + "\n", encoding="utf-8")
-            summary["trimmed"] += 1
+                new_lines = []
+        final_lines = new_lines + survivors
+        if final_lines:
+            mode = "a" if path.exists() else "w"
+            with path.open(mode, encoding="utf-8") as fh:
+                lines_to_write = survivors if mode == "a" else final_lines
+                for ln in lines_to_write:
+                    fh.write(ln + "\n")
+            if len(survivors) != len(raw_lines):
+                summary["trimmed"] += 1
             summary["kept"] += 1
         else:
-            summary["kept"] += 1
+            summary["removed"] += 1
+        try:
+            claim.unlink()
+        except OSError:
+            pass
     print(json.dumps(summary))
     return 0
 

@@ -76,8 +76,10 @@ from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     get_instance_mutations,
     reconcile_instance,
+    sanctioned_insert_instance,
     sanctioned_update_instance,
 )
+from instance_registry import derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     DEFAULT_TAB_NAME_RX,
@@ -92,6 +94,7 @@ from pane_surface import (
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
+from personas import assign_astartes_persona, persona_to_profile
 from phone_service import (
     _send_to_phone,
     load_zap_count_from_daily_note,
@@ -134,7 +137,9 @@ from session_doc_helpers import (
     _update_doc_agents_list,
     bump_session_doc_up_to_date,
     create_session_doc_file,
+    describe_rubric,
     evaluate_rubric,
+    explain_unmet,
     human_filename_stem,
     mark_rubric_acknowledged,
     mark_rubric_notified,
@@ -155,26 +160,20 @@ from shared import (
     DESKTOP_STATE,
     DICTATION_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PEDAL_BUFFER_MS,
     PEDAL_BYPASS_MS,
     PEDAL_DOUBLE_TAP_MS,
     PEDAL_STATE,
-    PERSONA_PROFILES,
     PHONE_CONFIG,
     PHONE_HEARTBEAT,
     PHONE_STATE,
-    PROFILES,
     SERVER_PORT,
     STASH_DIR,
     STASH_MAX_AGE_HOURS,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
-    ULTIMATE_FALLBACK,
-    VOICE_CHAT_SESSIONS,
-    get_next_available_profile,
     is_local_device,
     is_pid_claude,
     log_event,
@@ -259,6 +258,8 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
+from tmuxctl.skill_invoke import looks_like_codex_skill_invocation as _looks_like_codex_skill
+from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
@@ -1100,6 +1101,7 @@ async def cleanup_stale_instances() -> dict:
                 updates={
                     "status": "stopped",
                     "synced": 0,
+                    "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
                 },
                 mutation_type="instance_stopped",
@@ -1448,6 +1450,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     recovered_gt = await recover_recent_stopped_golden_throne_timers()
     if recovered_gt:
         print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
+    # Safety net: re-run GT recovery on an interval so a timer the in-memory
+    # scheduler loses *after* startup (restart mid-wait, transient stale-pane
+    # skip) self-heals instead of stranding the session until the next restart.
+    scheduler.add_job(
+        _golden_throne_sweep_sync,
+        IntervalTrigger(seconds=GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS),
+        id="golden_throne_timer_sweep",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     # Re-arm the morning supervisor poller if we restarted inside today's
     # supervision window (the relative poller lives in the in-memory jobstore
     # and is otherwise lost across a restart; the 04:00 cron only re-arms daily).
@@ -1757,39 +1770,35 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get WSL voices held by active instances only (stopped instances release their voice)
-        cursor = await db.execute(
-            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        rows = await cursor.fetchall()
-        used_wsl_voices = {row[0] for row in rows if row[0]}
+        persona, pool_exhausted = await assign_astartes_persona(db)
+        profile = persona_to_profile(persona)
 
-        # Assign profile via linear probe
-        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
-
-        # Insert instance
+        # Insert into the legacy compatibility table, then mirror to the canonical
+        # tmux-free v2 registry. The mirror deliberately drops pane ids/position
+        # fields; tmuxctl remains the runtime resolution oracle.
         now = datetime.now().isoformat()
-        await db.execute(
-            """INSERT INTO claude_instances
-               (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
-                profile_name, tts_voice, notification_sound, pid, status,
-                registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)""",
-            (
-                request.instance_id,
-                session_id,
-                request.tab_name,
-                request.working_dir,
-                request.origin_type,
-                request.source_ip,
-                device_id,
-                profile["name"],
-                profile["wsl_voice"],
-                profile["notification_sound"],
-                request.pid,
-                now,
-                now,
-            ),
+        instance_values = {
+            "id": request.instance_id,
+            "session_id": session_id,
+            "tab_name": request.tab_name,
+            "working_dir": request.working_dir,
+            "origin_type": request.origin_type,
+            "source_ip": request.source_ip,
+            "device_id": device_id,
+            "profile_name": profile["name"],
+            "tts_voice": profile["wsl_voice"],
+            "notification_sound": profile["notification_sound"],
+            "pid": request.pid,
+            "status": "idle",
+            "registered_at": now,
+            "last_activity": now,
+        }
+        await sanctioned_insert_instance(
+            db,
+            values=instance_values,
+            mutation_type="instance_registered",
+            write_source="api",
+            actor="register-instance",
         )
         await db.commit()
 
@@ -1820,7 +1829,8 @@ async def register_instance(request: InstanceRegisterRequest):
             "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff"),
-            "cc_color": profile.get("cc_color", "default"),
+            "chip_color": profile.get("chip_color"),
+            "pane_tint": profile.get("pane_tint"),
         },
     )
 
@@ -1893,7 +1903,12 @@ async def stop_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="stop-instance",
@@ -2021,7 +2036,12 @@ async def kill_instance(instance_id: str):
                     await sanctioned_update_instance(
                         db,
                         instance_id=instance_id,
-                        updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                        updates={
+                            "status": "stopped",
+                            "synced": 0,
+                            "input_lock": None,
+                            "stopped_at": now,
+                        },
                         mutation_type="instance_stopped",
                         write_source="api",
                         actor="kill-instance",
@@ -2043,7 +2063,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2069,7 +2094,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2094,7 +2124,12 @@ async def kill_instance(instance_id: str):
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"status": "stopped", "synced": 0, "stopped_at": now},
+                    updates={
+                        "status": "stopped",
+                        "synced": 0,
+                        "input_lock": None,
+                        "stopped_at": now,
+                    },
                     mutation_type="instance_stopped",
                     write_source="api",
                     actor="kill-instance",
@@ -2188,7 +2223,12 @@ async def kill_instance(instance_id: str):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="api",
             actor="kill-instance",
@@ -2889,39 +2929,13 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        tmux_pane = row["tmux_pane"]
-        device_id = row["device_id"]
-        if device_id == LOCAL_DEVICE_NAME and tmux_pane and not await _tmux_pane_exists(tmux_pane):
-            await sanctioned_update_instance(
-                db,
-                instance_id=instance_id,
-                updates={
-                    "status": "stopped",
-                    "synced": 0,
-                    "stopped_at": now,
-                },
-                mutation_type="instance_stopped",
-                write_source="api",
-                actor=f"activity-{request.action}-dead-pane",
-            )
-            await db.commit()
-            await log_event(
-                "activity_ignored_dead_pane",
-                instance_id=instance_id,
-                details={"action": request.action, "tmux_pane": tmux_pane},
-            )
-            return {
-                "status": "ignored_dead_pane",
-                "instance_id": instance_id,
-                "action": request.action,
-                "new_status": "stopped",
-                "acknowledged_expected_acks": 0,
-            }
+        # Do not consult stored tmux pane columns here. Runtime liveness belongs
+        # to tmuxctl; if a caller needs pane truth it must resolve it live.
 
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"status": new_status, "last_activity": now},
+            updates={"status": new_status, "last_activity": now, "stopped_at": None},
             mutation_type="status_changed",
             write_source="api",
             actor=f"activity-{request.action}",
@@ -3008,6 +3022,16 @@ ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 60}
 GT_ENFORCEMENT_RESUME_THRESHOLD = 2
 GT_RESUME_WINDOW = timedelta(hours=24)
 GOLDEN_THRONE_QUIET_HOURS_BUFFER = timedelta(minutes=5)
+# Safety-net cadence for re-arming GT timers the in-memory scheduler lost. The
+# scheduler has no persistent jobstore (by design — see the morning-supervisor
+# recovery note), so a token-api restart mid-wait drops every pending GT
+# date-job, and the one-shot startup recovery runs only once. Without a periodic
+# re-run, a dropped timer (or one skipped by a transient stale-pane check)
+# strands the session until the next restart or a human intervenes — the >12h
+# stall seen in the GT proof. This interval bounds that stranding. Env-tunable.
+GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS = int(
+    os.environ.get("TOKEN_API_GT_SWEEP_INTERVAL_SECONDS", "120")
+)
 
 EXPECTED_ACK_PENDING = "pending"
 EXPECTED_ACK_TERMINAL_STATUSES = {
@@ -3460,6 +3484,97 @@ async def _gt_clear_fire(instance_id: str) -> None:
         logger.debug(f"GT: @GT_FIRE clear failed for {instance_id[:12]} ({pane}): {exc}")
 
 
+# --- Timer status segment push (@TIMER_SEG) ----------------------------------
+#
+# status-right used to fork `#(tmux-status)` every status-interval — a blocking
+# urllib GET /api/timer to an SMB-resident Python script on EVERY render. Instead
+# the timer worker pushes a pre-formatted segment to the GLOBAL tmux option
+# @TIMER_SEG; the bar reads `#{@TIMER_SEG}` in-format with ZERO fork. Formatting
+# is ported byte-for-byte from cli-tools/bin/tmux-status (kept as a `--plain`
+# debug tool) so the rendered bar is identical — the test cross-checks both.
+
+# Icon glyphs match cli-tools/bin/tmux-status byte-for-byte — verified by the
+# cross-check test, which diffs this against the legacy script's own output.
+# Note "distracted" carries the U+FE0F emoji variation selector after U+26A0.
+_TIMER_MODE_ICONS = {
+    "working": "\U0001f4bc",  # 💼
+    "multitasking": "⚡",  # ⚡
+    "idle": "⏸",  # ⏸
+    "distracted": "⚠️",  # ⚠️
+    "break": "☕",  # ☕
+    "sleeping": "\U0001f319",  # 🌙
+}
+
+# Modes where showing the break balance is meaningful (ported from tmux-status).
+_TIMER_BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+
+
+def _fmt_timer_balance_compact(seconds: int) -> str:
+    """Compact balance string: +14m, -2m, +2h3m, +45s.
+
+    Ported byte-for-byte from cli-tools/bin/tmux-status.fmt_balance_compact.
+    """
+    sign = "+" if seconds >= 0 else "-"
+    abs_s = abs(int(seconds))
+    if abs_s < 60:
+        return f"{sign}{abs_s}s"
+    elif abs_s < 3600:
+        return f"{sign}{abs_s // 60}m"
+    else:
+        h = abs_s // 3600
+        m = (abs_s % 3600) // 60
+        if m == 0:
+            return f"{sign}{h}h"
+        return f"{sign}{h}h{m:02d}m"
+
+
+def _format_timer_status_segment(mode: str | None, break_balance_ms: int) -> str:
+    """Build the tmux-colored timer segment (icon + signed balance).
+
+    Mirrors the default (no-flag) output of cli-tools/bin/tmux-status exactly,
+    deriving from the live engine the same fields /api/timer exposes to the script:
+      is_in_backlog             = break_balance_ms < 0
+      break_backlog_ms          = abs(min(0, break_balance_ms))
+      accumulated_break_seconds = round(max(0, break_balance_ms) / 1000)
+    Returns e.g. "💼 #[fg=green]+14m#[default]" or "🌙" (no balance for that mode).
+    """
+    mode = (mode or "").lower()
+    icon = _TIMER_MODE_ICONS.get(mode, "?")
+    parts = [icon]
+    if mode in _TIMER_BALANCE_MODES:
+        if break_balance_ms < 0:
+            bal_s = -round(abs(min(0, break_balance_ms)) / 1000)
+        else:
+            bal_s = round(max(0, break_balance_ms) / 1000)
+        bal_str = _fmt_timer_balance_compact(bal_s)
+        if bal_s > 1800:
+            fg = "green"
+        elif bal_s > 0:
+            fg = "yellow"
+        else:
+            fg = "red"
+        parts.append(f"#[fg={fg}]{bal_str}#[default]")
+    return " ".join(parts)
+
+
+async def _timer_push_segment(segment: str) -> None:
+    """Push the pre-formatted timer segment to the GLOBAL @TIMER_SEG tmux option.
+
+    The bar renders `#{@TIMER_SEG}` in-format (zero fork) instead of forking
+    `#(tmux-status)` every status-interval. Global (-g), not pane-scoped: the timer
+    is a singleton. Best-effort, never raises — no tmux server just no-ops.
+    """
+    try:
+        await _run_subprocess_offloop(
+            ("tmux", "set-option", "-g", "@TIMER_SEG", segment),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception as exc:
+        logger.debug(f"TIMER: @TIMER_SEG push failed: {exc}")
+
+
 # --- CodeRabbit review sync (poller -> reconciler -> rubric) ------------------
 #
 # A dedicated APScheduler interval job per open-PR instance polls CodeRabbit's
@@ -3850,6 +3965,27 @@ async def recover_coderabbit_sync_jobs() -> list[str]:
     return armed
 
 
+def _zealotry_delay_seconds(zealotry: int) -> int:
+    """Map a zealotry level to its GT re-poke delay, clamped to the table.
+
+    ZEALOTRY_DELAY_MAP is keyed 4..10 (4 = loosest 1800s, 10 = tightest 60s). The
+    old `.get(zealotry, MAP[4])` silently resolved ANY out-of-range value to the
+    LOOSEST delay — so a >10 zealotry (which should be the *tightest* leash) would
+    quietly become 1800s. Ingress is guarded (PATCH + launch parse reject >10),
+    but guard the read too: clamp to the nearest valid level and log loudly, so a
+    bad value can never silently loosen the leash.
+    """
+    lo, hi = min(ZEALOTRY_DELAY_MAP), max(ZEALOTRY_DELAY_MAP)
+    if zealotry not in ZEALOTRY_DELAY_MAP:
+        clamped = max(lo, min(zealotry, hi))
+        logger.warning(
+            f"Golden Throne: zealotry={zealotry} out of range {lo}-{hi}; "
+            f"clamping to {clamped} (never silent-loosest)"
+        )
+        zealotry = clamped
+    return ZEALOTRY_DELAY_MAP[zealotry]
+
+
 async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_hook") -> dict:
     """Arm the one-shot Golden Throne follow-up timer for an idle instance.
 
@@ -3886,7 +4022,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
 
-    delay_seconds = ZEALOTRY_DELAY_MAP.get(zealotry, ZEALOTRY_DELAY_MAP[4])
+    delay_seconds = _zealotry_delay_seconds(zealotry)
     original_fire_at = datetime.now() + timedelta(seconds=delay_seconds)
     fire_at = original_fire_at
     quiet_hours = shared.get_quiet_hours_status()
@@ -4006,6 +4142,29 @@ async def recover_recent_stopped_golden_throne_timers(
         )
         logger.info(f"Golden Throne: recovered {len(recovered)} stopped GT timer(s)")
     return recovered
+
+
+def _golden_throne_sweep_sync() -> dict:
+    """Interval-job entry: periodically re-run GT timer recovery.
+
+    The one-shot startup recovery cannot heal a timer dropped *after* startup (a
+    restart mid-wait, or a session whose pane was transiently stale at startup).
+    Running the same idempotent recovery on an interval lets such timers
+    self-heal within GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS instead of stranding
+    the session. Bridges to the loop like _golden_throne_followup_sync.
+    """
+    try:
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                recover_recent_stopped_golden_throne_timers(), APP_LOOP
+            )
+            recovered = future.result(timeout=120)
+        else:
+            recovered = asyncio.run(recover_recent_stopped_golden_throne_timers())
+        return {"success": True, "recovered": len(recovered)}
+    except Exception as exc:
+        logger.exception("Golden Throne: periodic timer sweep failed")
+        return {"success": False, "error": str(exc)}
 
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
@@ -4598,6 +4757,7 @@ async def _tmux_send_payload_then_submit(
     payload: str,
     *,
     clear_prompt: bool = False,
+    enable_skill_sink: bool = False,
 ) -> dict:
     """Send text and submit through tmuxctl's pane-write primitive."""
     from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
@@ -4610,6 +4770,9 @@ async def _tmux_send_payload_then_submit(
                 tmux_pane,
                 payload,
                 clear_prompt=clear_prompt,
+                pre_submit_keys=("Tab",)
+                if enable_skill_sink and _looks_like_codex_skill(payload)
+                else (),
             ),
             timeout=10,
         )
@@ -4678,6 +4841,16 @@ async def _tmux_send_payload_then_submit(
     }
 
 
+async def _pane_write_instance_engine(instance_id: str) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT engine FROM claude_instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+    return ((row[0] if row else "") or "").strip().lower()
+
+
 async def process_pane_write_queue_once(
     queue_id: str | None = None, *, limit: int = 10
 ) -> list[dict]:
@@ -4733,6 +4906,9 @@ async def process_pane_write_queue_once(
             results.append(result)
             continue
         is_brief = item["source"] == "brief"
+        enable_skill_sink = False
+        if item["source"] == "golden_throne" and _looks_like_codex_skill(item["payload"]):
+            enable_skill_sink = await _pane_write_instance_engine(instance_id) == "codex"
         try:
             # brief clears/replaces a stale composer rather than deferring on it
             # forever. Its live symptom: a leftover draft in the target composer
@@ -4754,6 +4930,12 @@ async def process_pane_write_queue_once(
             if is_brief:
                 send_result = await _tmux_send_payload_then_submit(
                     pane, item["payload"], clear_prompt=True
+                )
+            elif enable_skill_sink:
+                send_result = await _tmux_send_payload_then_submit(
+                    pane,
+                    item["payload"],
+                    enable_skill_sink=True,
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
@@ -6296,51 +6478,13 @@ _PANE_LABEL_REPAIR_MIN_INTERVAL_SECONDS = 30.0
 
 
 def _schedule_pane_label_repair(candidates: list[dict]) -> None:
-    """Best-effort pane-label repair outside high-traffic read requests.
-
-    `/api/instances` used to run tmux subprocesses and DB writes while its
-    aiosqlite connection was open. Under polling load that amplified lock waits
-    and subprocess thread growth. Keep the read endpoint pure; repair labels in a
-    debounced background task.
-    """
-    global _PANE_LABEL_REPAIR_TASK, _PANE_LABEL_REPAIR_LAST_MONOTONIC
-
-    candidates = [
-        {"id": c.get("id"), "tmux_pane": c.get("tmux_pane")}
-        for c in candidates
-        if c.get("id") and c.get("tmux_pane")
-    ][:20]
-    if not candidates:
-        return
-    if _PANE_LABEL_REPAIR_TASK and not _PANE_LABEL_REPAIR_TASK.done():
-        return
-    now = time.monotonic()
-    if now - _PANE_LABEL_REPAIR_LAST_MONOTONIC < _PANE_LABEL_REPAIR_MIN_INTERVAL_SECONDS:
-        return
-    _PANE_LABEL_REPAIR_LAST_MONOTONIC = now
-    _PANE_LABEL_REPAIR_TASK = asyncio.create_task(_repair_missing_pane_labels(candidates))
+    # Retired with instances v2. Pane labels are tmuxctl runtime state, not DB state.
+    return
 
 
 async def _repair_missing_pane_labels(candidates: list[dict]) -> None:
-    for candidate in candidates:
-        instance_id = candidate["id"]
-        tmux_pane = candidate["tmux_pane"]
-        try:
-            pane_label = await _tmux_pane_label(tmux_pane)
-            if not pane_label:
-                continue
-            async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
-                    db,
-                    instance_id=instance_id,
-                    updates={"pane_label": pane_label},
-                    mutation_type="instance_updated",
-                    write_source="api",
-                    actor="background-pane-label-repair",
-                )
-                await db.commit()
-        except Exception as exc:
-            logger.debug(f"Pane label background repair failed for {tmux_pane}: {exc}")
+    # Retired with instances v2. Kept only so stale imports/tests fail benignly.
+    return
 
 
 def _golden_throne_surface(tab_name: str, tmux_pane: str | None, pane_label: str | None) -> str:
@@ -6401,6 +6545,77 @@ def _golden_throne_banner_text_for_rubric(human_pane_surface: str, status: Rubri
         return f"GT {human_pane_surface}"
     head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
     return f"GT {human_pane_surface}: missing {head}"
+
+
+def _golden_throne_inline_rubric_summary(
+    human_pane_surface: str,
+    status: RubricStatus | None,
+) -> str | None:
+    """One-line, criteria-specific GT summary for live pane injection.
+
+    The full accountability prompt often has to go through a temp file because
+    multi-line send-keys payloads are unreliable. The visible injection line
+    must still name the triggering criterion; otherwise the agent sees only a
+    generic "execute this SOP" nudge while the Emperor hears specific TTS.
+    """
+    if status is None or not status.missing:
+        return None
+    head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+    remaining = len(status.missing) - 3
+    suffix = f" (+{remaining} more)" if remaining > 0 else ""
+    return f"GT {human_pane_surface} needs {head}{suffix}"
+
+
+def _quote_skill_argument(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _golden_throne_skill_invocation_prompt(
+    status: RubricStatus,
+    *,
+    engine: str,
+) -> str:
+    """Harness-correct explicit skill wake for incomplete rubric fires."""
+    if status.missing:
+        head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
+        remaining = len(status.missing) - 3
+        if remaining > 0:
+            head = f"{head} (+{remaining} more)"
+    else:
+        head = "session rubric"
+    arguments = f"victory condition {_quote_skill_argument(f'needs {head}')} is unmet"
+    return _tmuxctl_skill_invocation_text("golden-throne-sop", engine, arguments)
+
+
+def _clip_one_line(text: str, max_len: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(compact) <= max_len:
+        return compact
+    if max_len == 1:
+        return "…"
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _golden_throne_file_bridge_prompt(
+    sop_file: str,
+    *,
+    rubric_summary: str | None = None,
+    max_len: int = 200,
+) -> str:
+    """Short live-agent prompt that points to the full temp-file instruction.
+
+    For rubric-driven fires, keep the line criteria-specific. Legacy/custom
+    long prompts still use a generic bridge because no structured criterion is
+    available.
+    """
+    if rubric_summary:
+        tail = f". Run: cat {sop_file}, then address those criteria."
+        return f"{_clip_one_line(rubric_summary, max_len - len(tail))}{tail}"
+    text = f"Golden Throne follow-up. Run: cat {sop_file}, then resume this thread."
+    return _clip_one_line(text, max_len)
 
 
 def _golden_throne_ready_for_ack_tts(human_pane_surface: str) -> str:
@@ -6492,6 +6707,15 @@ def _coderabbit_hold_prompt(status: RubricStatus, doc_path: Path | None, review_
     )
 
 
+def _golden_throne_is_coderabbit_hold(status: RubricStatus, fm: dict | None = None) -> bool:
+    review_state = (fm or {}).get(CODERABBIT_REVIEW_STATE_FIELD)
+    return status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
+        "pending",
+        "reviewing",
+        "absent",
+    )
+
+
 def _golden_throne_accountability_prompt(
     status: RubricStatus, doc_path: Path | None, fm: dict | None = None
 ) -> str:
@@ -6507,11 +6731,7 @@ def _golden_throne_accountability_prompt(
     """
     fm = fm or {}
     review_state = fm.get(CODERABBIT_REVIEW_STATE_FIELD)
-    if status.missing == [CODERABBIT_PASSED_KEY] and review_state in (
-        "pending",
-        "reviewing",
-        "absent",
-    ):
+    if _golden_throne_is_coderabbit_hold(status, fm):
         return _coderabbit_hold_prompt(status, doc_path, review_state)
 
     rendered = [_render_missing_condition(m, fm) for m in status.missing]
@@ -6812,7 +7032,18 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates={"status": "stopped", "synced": 0, "stopped_at": now},
+            updates={
+                "status": "stopped",
+                "synced": 0,
+                "input_lock": None,
+                "stopped_at": now,
+                # The GT sweep uses stopped_at/last_activity as the quiet edge
+                # and gt_last_resume_at as the "already handled this quiet edge"
+                # sentinel. Without stamping it here, a missing-pane row is
+                # rediscovered every sweep, re-armed, and fires forever against
+                # a ghost instance.
+                "gt_last_resume_at": now,
+            },
             mutation_type="instance_stopped",
             write_source="golden_throne",
             actor="golden-throne-instance-gone",
@@ -6891,6 +7122,13 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} already declared victory, skipping")
         return
 
+    if instance.get("instance_type") != "golden_throne" or int(instance.get("zealotry") or 0) < 4:
+        logger.info(
+            f"Golden Throne: {session_id[:12]} disabled before fire "
+            f"(type={instance.get('instance_type')} zealotry={instance.get('zealotry')}), skipping"
+        )
+        return
+
     # Read the linked session doc rubric and classify the fire state. This is
     # the one genuinely new line of data flow: the fire path now sees the
     # rubric and can name the specific unmet condition instead of a flat SOP.
@@ -6954,6 +7192,8 @@ async def golden_throne_followup(session_id: str):
     instance_type = instance.get("instance_type", "one_off")
     custom_sop_path = instance.get("follow_up_sop")
     doc_path = doc_meta.get("file_path")
+    engine = _agent_engine(instance)
+    rubric_prompt_active = False
     if custom_sop_path:
         # Explicit per-instance override wins over the rubric-derived prompt.
         expanded = Path(custom_sop_path).expanduser()
@@ -6964,20 +7204,27 @@ async def golden_throne_followup(session_id: str):
             logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
             sop_prompt = _load_golden_throne_sop()
     elif rubric_state == "incomplete":
-        # The Voice: name the specific unmet rubric conditions instead of the
-        # flat SOP. Falls back to legacy SOP for any non-incomplete state.
-        sop_prompt = _golden_throne_accountability_prompt(
-            rubric_status, doc_path, doc_meta.get("frontmatter")
-        )
-        logger.info(
-            f"Golden Throne: using rubric accountability prompt for {session_id[:12]} "
-            f"(missing: {rubric_status.missing})"
-        )
+        fm = doc_meta.get("frontmatter")
+        if _golden_throne_is_coderabbit_hold(rubric_status, fm):
+            # A pending CodeRabbit review is not agent work. Preserve the benign
+            # hold prompt rather than invoking a work SOP and creating a loop.
+            sop_prompt = _golden_throne_accountability_prompt(rubric_status, doc_path, fm)
+            logger.info(f"Golden Throne: using CodeRabbit hold prompt for {session_id[:12]}")
+        else:
+            # The Voice: wake the agent through the explicit Golden Throne skill
+            # so the injected turn is first-class procedure, not prose saying
+            # "execute this SOP". The skill then reads the session doc and acts
+            # on the named rubric condition.
+            sop_prompt = _golden_throne_skill_invocation_prompt(rubric_status, engine=engine)
+            rubric_prompt_active = True
+            logger.info(
+                f"Golden Throne: using rubric skill invocation for {session_id[:12]} "
+                f"(missing: {rubric_status.missing})"
+            )
     else:
         sop_prompt = _load_golden_throne_sop()
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", "session")
-    engine = _agent_engine(instance)
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
     # perspective, so a stale stored %N can no longer drive a send or speak a
@@ -6990,6 +7237,11 @@ async def golden_throne_followup(session_id: str):
         tmux_pane, pane_label = await _resolve_remote_instance_pane(session_id, device_id)
     pane_surface = _golden_throne_surface(tab_name, tmux_pane, pane_label)
     human_pane_surface = _golden_throne_human_surface(tab_name, tmux_pane, pane_label)
+    rubric_injection_summary = (
+        _golden_throne_inline_rubric_summary(human_pane_surface, rubric_status)
+        if rubric_prompt_active
+        else None
+    )
     instance["tmux_pane"] = tmux_pane
     instance["pane_label"] = pane_label
     instance["pane_surface"] = pane_surface
@@ -7086,8 +7338,10 @@ async def golden_throne_followup(session_id: str):
             else:
                 sop_file = f"/tmp/golden-throne-sop-{session_id[:8]}.md"
                 Path(sop_file).write_text(sop_prompt)
-                inject_prompt = (
-                    f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                inject_prompt = _golden_throne_file_bridge_prompt(
+                    sop_file,
+                    rubric_summary=rubric_injection_summary,
+                    max_len=MAX_SENDKEYS_LEN,
                 )
             try:
                 queued = await enqueue_pane_write(
@@ -7219,6 +7473,7 @@ async def golden_throne_followup(session_id: str):
                         "tmux_pane": tmux_pane,
                         "working_dir": working_dir,
                         "prompt": sop_prompt,
+                        "prompt_summary": rubric_injection_summary,
                         "engine": engine,
                     },
                 )
@@ -9099,13 +9354,10 @@ async def set_instance_legion(instance_id: str, request: Request):
         )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
-        )
+        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        tmux_pane = row[0]
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
@@ -9116,8 +9368,8 @@ async def set_instance_legion(instance_id: str, request: Request):
         )
         await db.commit()
 
-    # Event-driven tint: this instance just (re)registered its persona — paint
-    # its pane for the new legion. No queue, no poll.
+    # Event-driven tint: resolve live pane through tmuxctl, never from DB.
+    tmux_pane, _pane_role = await shared.resolve_instance_pane(instance_id)
     if tmux_pane:
         await asyncio.to_thread(shared.apply_pane_tint, tmux_pane, legion, source="set-legion")
 
@@ -9125,51 +9377,9 @@ async def set_instance_legion(instance_id: str, request: Request):
     return {"instance_id": instance_id, "legion": legion}
 
 
-@app.patch("/api/instances/{instance_id}/tmux-pane")
-async def rebind_instance_tmux_pane(instance_id: str, request: Request):
-    """Repoint a drifted instance row's tmux_pane to a concrete tmux pane id.
-
-    Self-heal surface for the dispatch pane-registry wedge: a `:new` stack launch
-    could register the allocation token (e.g. `mechanicus:new`) as tmux_pane,
-    leaving the row unresolvable by pane_truth / assert-instance / agent-cmd. The
-    stack sweep correlates such a row to its live pane (by pid) and rebinds it
-    here. Only concrete `%NN` pane ids are accepted — never another token.
-    """
-    body = await request.json()
-    tmux_pane = (body.get("tmux_pane") or "").strip()
-    if not (tmux_pane.startswith("%") and tmux_pane[1:].isdigit()):
-        raise HTTPException(
-            status_code=400,
-            detail="tmux_pane must be a concrete tmux pane id (e.g. %16)",
-        )
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT legion FROM claude_instances WHERE id = ?", (instance_id,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        legion = row[0]
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates={"tmux_pane": tmux_pane},
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="rebind-tmux-pane",
-        )
-        await db.commit()
-
-    # Event-driven tint: the instance's pane moved — repaint the new pane for its
-    # legion (closes the old trg_tmux_pane_recolor order-of-operations gap).
-    if legion:
-        await asyncio.to_thread(
-            shared.apply_pane_tint, tmux_pane, legion, source="rebind-tmux-pane"
-        )
-
-    logger.info(f"Tmux pane: {instance_id[:12]} → {tmux_pane}")
-    return {"instance_id": instance_id, "tmux_pane": tmux_pane}
+# /api/instances/{instance_id}/tmux-pane intentionally removed. Token-API must
+# never accept a request whose purpose is to persist/rebind tmux runtime identity;
+# pane ownership is live tmuxctl state via @INSTANCE_ID stamps.
 
 
 @app.patch("/api/instances/{instance_id}/synced")
@@ -9397,6 +9607,26 @@ async def _victory_ack_core(
             and not rubric_status.legacy_string
         ):
             if not rubric_status.complete:
+                # Explain each unmet condition. Derived fields (e.g.
+                # sanguinius_satisfied ← beautifier <persona>_is state) report
+                # their source so an operator does not mistake the derivation for
+                # a stale/cached file read and waste time touching the literal.
+                try:
+                    fm_now, _ = await asyncio.to_thread(read_frontmatter, doc_path)
+                    unmet = explain_unmet(fm_now, rubric_status.missing, rubric_status.rubric_key)
+                except Exception as exc:
+                    logger.warning(f"victory-ack: unmet-explain failed for {doc_path}: {exc}")
+                    unmet = [
+                        {"field": m, "derived": False, "detail": None}
+                        for m in rubric_status.missing
+                    ]
+                derived_unmet = [u for u in unmet if u.get("derived") and u.get("detail")]
+                derived_note = (
+                    " Note — these are DERIVED, not literal fields: "
+                    + "; ".join(f"{u['field']} {u['detail']}" for u in derived_unmet)
+                    if derived_unmet
+                    else ""
+                )
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -9404,23 +9634,27 @@ async def _victory_ack_core(
                         "doc_id": doc_id,
                         "missing": rubric_status.missing,
                         "skipped": rubric_status.skipped,
+                        "unmet": unmet,
                         "message": (
                             "Cannot ack victory — these conditions are unmet: "
                             + ", ".join(rubric_status.missing)
                             + ". Address them, mark inapplicable ones in "
-                            f"{rubric_status.rubric_key}_skip, or pass force=true."
+                            f"{rubric_status.rubric_key}_skip, or pass force=true." + derived_note
                         ),
                     },
                 )
 
-        # Stamp rubric ack on the session-doc frontmatter (modern path).
+        # Stamp rubric ack on the session-doc frontmatter (modern path) and
+        # mirror the archive status onto the file. Without the status write the
+        # file frontmatter keeps `status: active` while the DB row below flips to
+        # `archived` — the DB↔file divergence observed during the GT proof.
         if doc_path and doc_path.exists():
             try:
                 await asyncio.to_thread(mark_rubric_acknowledged, doc_path, reason)
+                file_updates = {"status": "archived"}
                 if deliverables:
-                    await asyncio.to_thread(
-                        update_frontmatter, doc_path, {"deliverables": deliverables}
-                    )
+                    file_updates["deliverables"] = deliverables
+                await asyncio.to_thread(update_frontmatter, doc_path, file_updates)
             except Exception as exc:
                 logger.warning(f"victory-ack: frontmatter ack failed for {doc_path}: {exc}")
 
@@ -9985,7 +10219,7 @@ async def pedal_left():
         return {"action": "waiting", "reason": "first_tap"}
 
 
-_INSTANCES_READ_CACHE: dict[tuple[str, str, int], tuple[float, list[dict]]] = {}
+_INSTANCES_READ_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
 _INSTANCES_READ_CACHE_LOCK = asyncio.Lock()
 _INSTANCES_READ_CACHE_TTL_SECONDS = 0.5
 
@@ -9995,17 +10229,22 @@ async def list_instances(
     status: str | None = None,
     sort: str | None = None,
     limit: int = 300,
+    include_runtime: bool = True,
 ):
-    """List instances, optionally filtered by status and sorted."""
+    """List canonical instance registry rows.
+
+    Durable storage comes from ``instances``. Tmux pane identity is not stored;
+    when requested, live runtime fields are resolved transiently from tmuxctl.
+    """
     order_clauses = {
-        "status": "status ASC, last_activity DESC",
-        "recent_activity": "last_activity DESC",
-        "recent_stopped": "stopped_at DESC NULLS LAST, last_activity DESC",
-        "created": "registered_at DESC",
+        "status": "i.status ASC, i.last_activity DESC",
+        "recent_activity": "i.last_activity DESC",
+        "recent_stopped": "i.stopped_at DESC NULLS LAST, i.last_activity DESC",
+        "created": "i.created_at DESC",
     }
-    order_by = order_clauses.get(sort, "registered_at DESC")
+    order_by = order_clauses.get(sort, "i.created_at DESC")
     limit = max(1, min(int(limit or 300), 1000))
-    cache_key = (status or "", sort or "", limit)
+    cache_key = (status or "", sort or "", limit, bool(include_runtime))
     cache_hit = _INSTANCES_READ_CACHE.get(cache_key)
     now_mono = time.monotonic()
     if cache_hit and now_mono - cache_hit[0] <= _INSTANCES_READ_CACHE_TTL_SECONDS:
@@ -10019,62 +10258,72 @@ async def list_instances(
 
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-
+            base_sql = """
+                SELECT i.*,
+                       p.slug AS persona_slug,
+                       p.display_name AS persona_display_name,
+                       p.pane_tint AS persona_pane_tint,
+                       p.chip_color AS persona_chip_color,
+                       p.tts_voice AS persona_tts_voice,
+                       p.tts_rate AS persona_tts_rate,
+                       p.notification_sound AS persona_notification_sound
+                  FROM instances i
+                  LEFT JOIN personas p ON p.id = i.persona_id
+            """
             if status:
                 cursor = await db.execute(
-                    f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by} LIMIT ?",
+                    f"{base_sql} WHERE i.status = ? ORDER BY {order_by} LIMIT ?",
                     (status, limit),
                 )
             else:
-                cursor = await db.execute(
-                    f"SELECT * FROM claude_instances ORDER BY {order_by} LIMIT ?",
-                    (limit,),
-                )
+                cursor = await db.execute(f"{base_sql} ORDER BY {order_by} LIMIT ?", (limit,))
+            rows = [dict(row) for row in await cursor.fetchall()]
 
-            rows = await cursor.fetchall()
-
-        instances = []
-        pane_label_repair_candidates = []
-        for row in rows:
-            inst = dict(row)
-            # voice_chat derived from tts_mode column (DB-authoritative)
-            is_vc = (inst.get("tts_mode") == "voice-chat") or (inst["id"] in VOICE_CHAT_SESSIONS)
-            if is_vc:
-                inst["voice_chat"] = True
-                inst["listening"] = DICTATION_STATE["active"]
-                # Ensure in-memory session exists if DB says voice-chat
-                if inst["id"] not in VOICE_CHAT_SESSIONS:
-                    VOICE_CHAT_SESSIONS[inst["id"]] = {
-                        "active": True,
-                        "started_at": datetime.now().isoformat(),
-                    }
-            # Resolve cc_color from profile name
-            pn = inst.get("profile_name")
-            if pn:
-                for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                    if p["name"] == pn:
-                        inst["color"] = p.get("color", "#0099ff")
-                        inst["cc_color"] = p.get("cc_color", "default")
-                        inst["chapter"] = p.get("chapter")
-                        break
-            # Golden Throne: enrich with pending timer state
-            gt_job = scheduler.get_job(f"golden-throne-{inst['id']}")
-            inst["gt_next_fire"] = (
+        async def enrich(row: dict) -> dict:
+            row["persona"] = {
+                "id": row.get("persona_id"),
+                "slug": row.pop("persona_slug", None),
+                "display_name": row.pop("persona_display_name", None),
+                "pane_tint": row.pop("persona_pane_tint", None),
+                "chip_color": row.pop("persona_chip_color", None),
+                "tts_voice": row.pop("persona_tts_voice", None),
+                "tts_rate": row.pop("persona_tts_rate", None),
+                "notification_sound": row.pop("persona_notification_sound", None),
+            }
+            # Compatibility aliases for older tmux-facing callers while storage
+            # remains the final v2 shape.
+            row["tab_name"] = row.get("name")
+            row["profile_name"] = row["persona"].get("slug")
+            row["tts_voice"] = row["persona"].get("tts_voice")
+            row["notification_sound"] = row["persona"].get("notification_sound")
+            row["color"] = row["persona"].get("chip_color")
+            row["chip_color"] = row["persona"].get("chip_color")
+            row["pane_tint"] = row["persona"].get("pane_tint")
+            row["cockpit_label"] = derived_cockpit_label(row)
+            row["voice_chat"] = row.get("interaction_mode") == "voice_chat"
+            if row["voice_chat"]:
+                row["listening"] = DICTATION_STATE["active"]
+            gt_job = scheduler.get_job(f"golden-throne-{row['id']}")
+            row["gt_next_fire"] = (
                 gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
             )
-            if (
-                not inst.get("pane_label")
-                and inst.get("status") != "stopped"
-                and inst.get("device_id") == LOCAL_DEVICE_NAME
-                and inst.get("tmux_pane")
-            ):
-                pane_label_repair_candidates.append(
-                    {"id": inst["id"], "tmux_pane": inst.get("tmux_pane")}
-                )
+            if include_runtime:
+                if row.get("device_id") != LOCAL_DEVICE_NAME or row.get("status") in {
+                    "stopped",
+                    "archived",
+                }:
+                    row["runtime"] = {"live_pane": False, "source": "tmuxctl"}
+                else:
+                    pane, role = await shared.resolve_instance_pane(row.get("id"))
+                    row["runtime"] = {
+                        "live_pane": bool(pane),
+                        "tmux_pane": pane,
+                        "pane_label": role,
+                        "source": "tmuxctl",
+                    }
+            return row
 
-            instances.append(inst)
-
-        _schedule_pane_label_repair(pane_label_repair_candidates)
+        instances = await asyncio.gather(*(enrich(row) for row in rows))
         _INSTANCES_READ_CACHE[cache_key] = (time.monotonic(), instances)
         return instances
 
@@ -10142,15 +10391,14 @@ async def get_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         instance = dict(row)
-        # Resolve color from profile name
+        # Resolve display/chip/tint from persona/profile slug.
         profile_name = instance.get("profile_name")
-        if profile_name:
-            for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                if p["name"] == profile_name:
-                    instance["color"] = p.get("color", "#0099ff")
-                    instance["cc_color"] = p.get("cc_color", "default")
-                    instance["chapter"] = p.get("chapter")
-                    break
+        prof = profile_by_name(profile_name)
+        if prof:
+            instance["color"] = prof.get("chip_color") or prof.get("color")
+            instance["chip_color"] = prof.get("chip_color") or prof.get("color")
+            instance["pane_tint"] = prof.get("pane_tint")
+            instance["chapter"] = prof.get("chapter")
         return instance
 
 
@@ -16822,12 +17070,12 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "session_id": inst.get("session_id"),
                 "display_name": _ops_display_name(inst),
                 "tab_name": inst.get("tab_name"),
-                # Chapter (40k voice/persona identity), resolved at read-time from
-                # profile_name — same pattern as color/cc_color. chapter_color is the
-                # hex shade for the cockpit chip; cc_color is the named tmux colour.
+                # Persona/chapter display identity, resolved at read-time from
+                # profile_name until instances.persona_id lands. chapter_color is
+                # the cockpit chip; pane_tint is the tmux pane background style.
                 "chapter": _prof.get("chapter") if _prof else None,
-                "chapter_color": _prof.get("color") if _prof else None,
-                "cc_color": _prof.get("cc_color") if _prof else None,
+                "chapter_color": (_prof.get("chip_color") or _prof.get("color")) if _prof else None,
+                "pane_tint": _prof.get("pane_tint") if _prof else None,
                 "status": status,
                 "engine": engine,
                 "device_id": inst.get("device_id"),
@@ -17848,11 +18096,20 @@ async def timer_worker():
     last_db_save = 0.0
     last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
+    last_pushed_seg: str | None = None
     today = datetime.now().strftime("%Y-%m-%d")
 
     # Start initial session
     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
     _session_start_ms = int(time.monotonic() * 1000)
+
+    # Hydrate @TIMER_SEG immediately so a freshly (re)started server populates the
+    # status bar at once, instead of leaving the last (now-stale) value or a blank
+    # until the first tick lands.
+    last_pushed_seg = _format_timer_status_segment(
+        timer_engine.current_mode.value, timer_engine.break_balance_ms
+    )
+    await _timer_push_segment(last_pushed_seg)
 
     while True:
         try:
@@ -18127,6 +18384,18 @@ async def timer_worker():
             if now - last_db_save >= 10:
                 await timer_save_to_db()
                 last_db_save = now
+
+            # Push the pre-formatted timer segment to @TIMER_SEG when it changes,
+            # so the status bar reads it in-format with zero per-render fork (the
+            # #(tmux-status) HTTP-poll shell-out is gone). The segment changes only
+            # on a mode flip (icon) or a minute/threshold rollover of the balance —
+            # ~1 push/min plus instant mode transitions, not once per tick.
+            seg = _format_timer_status_segment(
+                timer_engine.current_mode.value, timer_engine.break_balance_ms
+            )
+            if seg != last_pushed_seg:
+                await _timer_push_segment(seg)
+                last_pushed_seg = seg
 
         except asyncio.CancelledError:
             # Save state on shutdown
@@ -18788,6 +19057,7 @@ async def clear_stale_processing_flags():
                             updates={
                                 "status": "stopped",
                                 "synced": 0,
+                                "input_lock": None,
                                 "stopped_at": datetime.now().isoformat(),
                             },
                             mutation_type="instance_stopped",
@@ -23412,6 +23682,140 @@ async def get_session_doc_content(doc_id: int):
         raise HTTPException(status_code=404, detail=f"File not found: {fp}")
 
     return {"id": doc_id, "title": row[1], "file_path": str(fp), "content": fp.read_text()}
+
+
+@app.get("/api/session-docs/{doc_id}/rubric")
+async def get_session_doc_rubric(doc_id: int):
+    """Diagnostic: surface exactly what victory-ack sees for a doc's rubric.
+
+    Resolves the rubric the same way victory-ack does (fresh disk read +
+    evaluate_rubric) and reports per-field provenance — crucially, which
+    subconditions are DERIVED (e.g. `sanguinius_satisfied` is computed from the
+    beautifier `<persona>_is` state, not a literal field; `commentary_resolved`
+    from `commentary` being empty). Also surfaces DB↔file `status` divergence and
+    the file mtime so a "stale read?" hunch can be confirmed or dismissed at a
+    glance. Read-only; never mutates.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, file_path, title, status FROM session_documents WHERE id = ?",
+            (doc_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+    doc_path = Path(row["file_path"]) if row["file_path"] else None
+    db_status = row["status"]
+
+    file_exists = bool(doc_path and doc_path.exists())
+    file_status = None
+    file_mtime = None
+    rubric_diag = None
+    read_error = None
+    if file_exists:
+        try:
+            fm, _ = await asyncio.to_thread(read_frontmatter, doc_path)
+            file_status = fm.get("status")
+            rubric_diag = describe_rubric(fm)
+            stat = await asyncio.to_thread(doc_path.stat)
+            file_mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        except Exception as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "doc_id": doc_id,
+        "title": row["title"],
+        "file_path": str(doc_path) if doc_path else None,
+        "file_exists": file_exists,
+        "file_mtime": file_mtime,
+        "db_status": db_status,
+        "file_status": file_status,
+        "status_divergent": file_status is not None and db_status != file_status,
+        "ackable_without_force": bool(rubric_diag and rubric_diag["complete"]),
+        "rubric": rubric_diag,
+        "read_error": read_error,
+    }
+
+
+@app.get("/api/golden-throne/timers")
+async def get_golden_throne_timers():
+    """Diagnostic: GT timer liveness for every live (pre-ack) Golden Throne
+    instance — is a follow-up job armed, when does it next fire, and is it
+    overdue?
+
+    The driven agent has no in-thread signal distinguishing "leash loosened"
+    (longer zealotry delay) from "timer stalled" (job lost on a restart). This
+    surfaces the actual scheduler state — armed/next_fire/overdue — so liveness
+    is auditable from outside the thread. `unarmed`/`overdue` counts > 0 mean the
+    next sweep (every sweep_interval_seconds) should re-arm them. Read-only.
+    """
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.id, ci.tab_name, ci.status, ci.zealotry, ci.device_id,
+                   ci.session_doc_id, sd.status AS doc_status
+            FROM claude_instances ci
+            LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
+            WHERE ci.instance_type = 'golden_throne'
+              AND ci.status IN ('idle', 'stopped')
+              AND COALESCE(ci.zealotry, 4) >= 4
+              AND (sd.status IS NULL OR sd.status != 'archived')
+            ORDER BY ci.last_activity DESC
+            """,
+        )
+        rows = await cursor.fetchall()
+
+    timers = []
+    unarmed = 0
+    overdue_count = 0
+    for row in rows:
+        iid = row["id"]
+        zealotry = int(row["zealotry"] or 4)
+        job = scheduler.get_job(f"golden-throne-{iid}")
+        armed = job is not None
+        next_fire = None
+        seconds_until = None
+        # A pending job on a not-yet-started scheduler carries the `undefined`
+        # sentinel rather than a datetime — guard so this never 500s.
+        nrt = getattr(job, "next_run_time", None) if job is not None else None
+        if isinstance(nrt, datetime):
+            next_fire = nrt.isoformat()
+            seconds_until = nrt.timestamp() - now.timestamp()
+        overdue = (not armed) or (
+            seconds_until is not None and seconds_until < -ENFORCEMENT_JOB_MISFIRE_GRACE_SECONDS
+        )
+        if not armed:
+            unarmed += 1
+        if overdue:
+            overdue_count += 1
+        timers.append(
+            {
+                "instance_id": iid,
+                "tab_name": row["tab_name"],
+                "status": row["status"],
+                "zealotry": zealotry,
+                "expected_delay_seconds": _zealotry_delay_seconds(zealotry),
+                "device_id": row["device_id"],
+                "doc_id": row["session_doc_id"],
+                "armed": armed,
+                "next_fire": next_fire,
+                "seconds_until_fire": seconds_until,
+                "overdue": overdue,
+            }
+        )
+
+    return {
+        "now": now.isoformat(),
+        "sweep_interval_seconds": GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS,
+        "count": len(timers),
+        "unarmed": unarmed,
+        "overdue": overdue_count,
+        "timers": timers,
+    }
 
 
 @app.patch("/api/session-docs/{doc_id}")

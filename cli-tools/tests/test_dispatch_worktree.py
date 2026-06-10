@@ -97,19 +97,18 @@ def _instance_type_line(stdout: str) -> str:
     return next(ln for ln in stdout.splitlines() if "instance_type:" in ln)
 
 
-def test_worktree_defaults_to_golden_throne(env: Env) -> None:
-    # Custodes directive: a --worktree worker keeps the Golden Throne lane by
-    # default (alive until session-doc victory criteria are expended). one_off is
-    # an explicit opt-in only — never the default.
+def test_worktree_defaults_to_one_off(env: Env) -> None:
+    # Temporary default while Golden Throne is not reliable enough for general
+    # dispatch. Golden Throne remains available through explicit --gt.
     res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "do it")
     assert res.returncode == 0, res.stderr
-    assert "golden_throne" in _instance_type_line(res.stdout)
-
-
-def test_worktree_one_off_is_explicit_opt_in(env: Env) -> None:
-    res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "--no-gt", "do it")
-    assert res.returncode == 0, res.stderr
     assert "one_off" in _instance_type_line(res.stdout)
+
+
+def test_worktree_golden_throne_is_explicit_opt_in(env: Env) -> None:
+    res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "--gt", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "golden_throne" in _instance_type_line(res.stdout)
 
 
 def test_repo_resolves_secrets_dir_case_insensitively(env: Env) -> None:

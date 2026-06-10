@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -54,7 +55,7 @@ case "$1" in
     if printf '%s' "$args" | grep -q ' -t '; then
       printf '%s\n' "${FAKE_ATTEND:-00}"
     else
-      printf '%s\n' "${FAKE_ACTIVITY:-0}"
+      printf '%s %s\n' "${FAKE_ACTIVITY:-0}" "${FAKE_LAST_KEY:-}"
     fi
     ;;
   list-clients)
@@ -94,7 +95,7 @@ def _mkfakes(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _run(args, *, qdir: Path, fakes: dict, extra_env: dict | None = None):
+def _run(args: list[str], *, qdir: Path, fakes: dict, extra_env: dict | None = None) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "PENDING_UI_DIR": str(qdir),
@@ -109,17 +110,17 @@ def _run(args, *, qdir: Path, fakes: dict, extra_env: dict | None = None):
         "PENDING_UI_TYPING_WINDOW": "10",
         **(extra_env or {}),
     }
-    proc = subprocess.run([str(TOOL), *args], text=True, capture_output=True, check=False, env=env)
+    proc = subprocess.run([sys.executable, str(TOOL), *args], text=True, capture_output=True, check=False, env=env)
     return proc
 
 
-def _summary(proc) -> dict:
+def _summary(proc: subprocess.CompletedProcess[str]) -> dict:
     # Tool prints a one-line JSON summary on stdout.
     line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "{}"
     return json.loads(line)
 
 
-def _sends(fakes) -> str:
+def _sends(fakes: dict) -> str:
     return fakes["send_log"].read_text() if fakes["send_log"].exists() else ""
 
 
@@ -132,7 +133,7 @@ def _qfile(qdir: Path, pane: str) -> Path:
 # --------------------------------------------------------------------------- #
 
 
-def test_enqueue_writes_epoch_and_timestamp(tmp_path):
+def test_enqueue_writes_epoch_and_timestamp(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -157,7 +158,7 @@ def test_enqueue_writes_epoch_and_timestamp(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path):
+def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -167,7 +168,7 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path):
         qdir=qdir,
         fakes=fakes,
         # Human typed "just now" -> typing guard active. Pane alive.
-        extra_env={"FAKE_ALIVE": "%41", "FAKE_ACTIVITY": str(int(time.time()))},
+        extra_env={"FAKE_ALIVE": "%41", "FAKE_ACTIVITY": str(int(time.time()) - 2)},
     )
     assert proc.returncode == 0, proc.stderr
     # Zero keystrokes injected, and the command is NOT dropped — it stays queued.
@@ -178,7 +179,7 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path):
     assert _summary(proc).get("held", 0) >= 1
 
 
-def test_flush_sends_and_drains_when_idle(tmp_path):
+def test_flush_sends_and_drains_when_idle(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -212,7 +213,7 @@ def test_flush_sends_and_drains_when_idle(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_flush_purges_entry_older_than_ttl(tmp_path):
+def test_flush_purges_entry_older_than_ttl(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -231,7 +232,7 @@ def test_flush_purges_entry_older_than_ttl(tmp_path):
     assert _summary(proc).get("purged", 0) >= 1
 
 
-def test_flush_purges_legacy_untagged_line(tmp_path):
+def test_flush_purges_legacy_untagged_line(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -248,7 +249,7 @@ def test_flush_purges_legacy_untagged_line(tmp_path):
     assert _summary(proc).get("purged", 0) >= 1
 
 
-def test_flush_purges_entry_for_dead_pane(tmp_path):
+def test_flush_purges_entry_for_dead_pane(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -270,7 +271,7 @@ def test_flush_purges_entry_for_dead_pane(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_flush_purges_entry_from_foreign_session_epoch(tmp_path):
+def test_flush_purges_entry_from_foreign_session_epoch(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -292,7 +293,7 @@ def test_flush_purges_entry_from_foreign_session_epoch(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_flush_holds_when_pane_has_live_client_attached(tmp_path):
+def test_flush_holds_when_pane_has_live_client_attached(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)
@@ -320,7 +321,7 @@ def test_flush_holds_when_pane_has_live_client_attached(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_sweep_removes_stale_keeps_fresh_alive(tmp_path):
+def test_sweep_removes_stale_keeps_fresh_alive(tmp_path: Path) -> None:
     qdir = tmp_path / "q"
     qdir.mkdir()
     fakes = _mkfakes(tmp_path)

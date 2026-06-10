@@ -43,21 +43,6 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# Map a profile's named cc_color (the same palette tmux uses on the pane border)
-# to an ANSI escape for the Claude Code status line. default/unknown -> no tint.
-CC_ANSI = {
-    "red": RED,
-    "green": GREEN,
-    "yellow": YELLOW,
-    "cyan": CYAN,
-    "blue": "\033[34m",
-    "purple": "\033[35m",
-    "orange": "\033[38;5;208m",
-    "pink": "\033[38;5;213m",
-    "default": "",
-}
-
-
 def tmux_pane_has_input(pane_id):
     """Check if a pane has pending user input. Returns True if user is typing."""
     import re
@@ -247,7 +232,8 @@ def write_state(pane_id, data, pct, model_name, session_id, instance):
         state["session_doc_id"] = instance.get("session_doc_id")
         state["tab_name"] = instance.get("tab_name")
         state["instance_id"] = instance.get("id")
-        state["cc_color"] = instance.get("cc_color")
+        state["chip_color"] = instance.get("chip_color") or instance.get("chapter_color")
+        state["pane_tint"] = instance.get("pane_tint")
     try:
         with open(state_file, "w") as f:
             json.dump(state, f)
@@ -319,11 +305,10 @@ def main():
 
     # Fetch instance data and TTS state from Token-API
     instance = get_instance_by_pane(pane_id)
-    # Chapter is the operator-facing identity (40k chapter / persona). Since
-    # chapter<->voice is 1:1, the chapter name implies the voice — we surface the
-    # chapter (coloured by its cc_color) instead of the raw TTS voice short-name.
+    # Chapter/persona is the operator-facing identity. The chip colour is a hex
+    # display colour; pane background tint is owned by Token-API/tmux style.
     chapter = instance.get("chapter") if instance else ""
-    cc = instance.get("cc_color") if instance else ""
+    chip_color = (instance.get("chip_color") or instance.get("chapter_color")) if instance else ""
     # Use resolved title if available, fall back to short_session_doc on raw ID
     session_doc = ""
     if instance:
@@ -344,11 +329,9 @@ def main():
         f"{model_name} {pct_str} {used_str}/{total_str}",
     ]
     if chapter:
-        # tmux interprets #[...] styles in pane-border-format (see tmux-base.conf);
-        # tint via the named cc_color. default/empty -> no tint (persona panes carry
-        # their identity in the themed pane background already).
+        # tmux interprets #[...] styles in pane-border-format (see tmux-base.conf).
         border_parts.append(
-            f"#[fg={cc}]{chapter}#[default]" if cc and cc != "default" else chapter
+            f"#[fg={chip_color}]{chapter}#[default]" if chip_color else chapter
         )
     if session_doc:
         border_parts.append(session_doc)

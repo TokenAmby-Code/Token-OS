@@ -35,6 +35,66 @@ def test_satellite_tmux_send_payload_then_submit_separates_enter(monkeypatch):
     ]
 
 
+def test_satellite_tmux_send_payload_tabs_codex_skill_before_enter(monkeypatch):
+    satellite = _load_satellite_module()
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(satellite.subprocess, "run", fake_run)
+
+    satellite._tmux_send_payload_then_submit(
+        "%10",
+        '$golden-throne-sop victory condition "needs tests passing" is unmet',
+        clear_prompt=True,
+        enable_skill_sink=True,
+    )
+
+    assert [call[0] for call in calls] == [
+        ["tmux", "send-keys", "-t", "%10", "C-u"],
+        [
+            "tmux",
+            "send-keys",
+            "-t",
+            "%10",
+            "-l",
+            '$golden-throne-sop victory condition "needs tests passing" is unmet',
+        ],
+        ["tmux", "send-keys", "-t", "%10", "Tab"],
+        ["tmux", "send-keys", "-t", "%10", "C-m"],
+        ["tmux", "send-keys", "-t", "%10", "C-m"],
+    ]
+
+
+def test_satellite_tmux_send_payload_does_not_tab_claude_skill(monkeypatch):
+    satellite = _load_satellite_module()
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(satellite.subprocess, "run", fake_run)
+
+    satellite._tmux_send_payload_then_submit("%10", "/golden-throne-sop needs x", clear_prompt=True)
+
+    assert [call[0] for call in calls] == [
+        ["tmux", "send-keys", "-t", "%10", "C-u"],
+        ["tmux", "send-keys", "-t", "%10", "-l", "/golden-throne-sop needs x"],
+        ["tmux", "send-keys", "-t", "%10", "C-m"],
+    ]
+
+
 def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monkeypatch, tmp_path):
     satellite = _load_satellite_module()
     sent = []
@@ -58,7 +118,9 @@ def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monke
     monkeypatch.setattr(
         satellite,
         "_tmux_send_payload_then_submit",
-        lambda pane, payload, clear_prompt=False: sent.append((pane, payload, clear_prompt)),
+        lambda pane, payload, clear_prompt=False, enable_skill_sink=False: sent.append(
+            (pane, payload, clear_prompt, enable_skill_sink)
+        ),
     )
 
     import asyncio
@@ -68,6 +130,7 @@ def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monke
         tmux_pane="%10",
         working_dir=str(tmp_path),
         prompt="line one\nline two",
+        prompt_summary="GT kreig north needs tests passing",
         engine="codex",
     )
     result = asyncio.run(satellite.golden_throne_followup(req))
@@ -76,7 +139,8 @@ def test_satellite_golden_throne_live_agent_uses_file_for_multiline_prompt(monke
     assert sent == [
         (
             "%10",
-            "Golden Throne follow-up. Run: cat /tmp/golden-throne-sop-abcdef12.md — then execute that SOP.",
+            "GT kreig north needs tests passing. Run: cat /tmp/golden-throne-sop-abcdef12.md, then address those criteria.",
+            True,
             True,
         )
     ]

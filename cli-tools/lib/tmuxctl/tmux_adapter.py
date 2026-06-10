@@ -443,6 +443,7 @@ class TmuxAdapter:
         text: str,
         *,
         clear_prompt: bool = False,
+        pre_submit_keys: tuple[str, ...] = (),
         submit_settle_seconds: float = DEFAULT_SUBMIT_SETTLE_SECONDS,
     ) -> None:
         """Inject literal text and submit robustly.
@@ -471,6 +472,10 @@ class TmuxAdapter:
         if gate and gate.get("suppressed"):
             raise TmuxSendGated(gate)
         if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
+        for key in pre_submit_keys:
+            self.send_keys(target, key)
+        if pre_submit_keys and submit_settle_seconds > 0:
             time.sleep(submit_settle_seconds)
         self.send_keys(target, "C-m")
         if submit_settle_seconds > 0:

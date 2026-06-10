@@ -191,15 +191,19 @@ if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
 
             _BIN_DIR="$(dirname "$(readlink -f "$0")")"
             CLAUDE_PID=$(_find_claude_pid || true)
-            SESSION_ID=""
+            CLAUDE_EPOCH=""
             if [[ -n "$CLAUDE_PID" && -f "${HOME}/.claude/session-pids/${CLAUDE_PID}" ]]; then
-                SESSION_ID=$(cat "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true)
+                CLAUDE_EPOCH=$(cat "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true)
             fi
 
-            ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID" --rename "$NAME")
-            [[ -n "$COLOR" ]] && ENQ_ARGS+=(--color "$COLOR")
-            "${_BIN_DIR}/pending-ui-flush" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
-            echo "Queued: /rename $NAME + /color $COLOR (fires on next prompt submit)"
+            if [[ -n "$CLAUDE_EPOCH" && "$CLAUDE_EPOCH" != "-" ]]; then
+                ENQ_ARGS=(enqueue --pane "$PANE" --session "$CLAUDE_EPOCH" --rename "$NAME")
+                [[ -n "$COLOR" ]] && ENQ_ARGS+=(--color "$COLOR")
+                "${_BIN_DIR}/pending-ui-flush" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
+                echo "Queued: /rename $NAME + /color $COLOR (fires on next prompt submit)"
+            else
+                echo "Skipped UI queue: no Claude session epoch for $PANE" >&2
+            fi
         fi
     fi
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 _MODULES_TO_RELOAD = [
+    "personas",
     "shared",
     "db_schema",
     "phone_service",

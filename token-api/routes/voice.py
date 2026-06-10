@@ -3,7 +3,7 @@ Voice management route module — extracted from main.py.
 
 Owns:
 - Voice profile listing and assignment (/api/voices)
-- Instance voice change with collision handling (/api/instances/{id}/voice)
+- Instance voice/persona change (/api/instances/{id}/voice)
 - TTS mode switching (/api/instances/{id}/tts-mode)
 - Voice chat session toggling (/api/instances/{id}/voice-chat)
 - Dictation state management (/api/dictation)
@@ -14,7 +14,6 @@ Does NOT own:
 """
 
 import logging
-import random
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
@@ -23,16 +22,19 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
+from personas import (
+    assign_astartes_persona,
+    astartes_persona_by_tts_voice,
+    persona_to_profile,
+    selectable_astartes_personas,
+)
 from shared import (
     CUSTODES_PROFILE,
     DB_PATH,
     DICTATION_STATE,
-    FALLBACK_VOICES,
     PEDAL_BUFFER_MS,
     PEDAL_STATE,
-    PROFILES,
     VOICE_CHAT_SESSIONS,
-    get_next_available_profile,
     log_event,
 )
 
@@ -72,57 +74,35 @@ class VoiceChangeRequest(BaseModel):
     voice: str
 
 
-# ============ Voice Profile Helpers ============
-
-
-def find_voice_linear_probe(used_voices: set) -> str | None:
-    """Find an available WSL voice using random offset + linear probe.
-
-    Picks a random starting index in PROFILES (foreign accents), then iterates
-    circularly until finding a voice not in used_voices. Falls back to
-    FALLBACK_VOICES, then returns None if everything is taken.
-    """
-    n = len(PROFILES)
-    if n > 0:
-        start = random.randint(0, n - 1)
-        for i in range(n):
-            idx = (start + i) % n
-            voice = PROFILES[idx]["wsl_voice"]
-            if voice not in used_voices:
-                return voice
-
-    # Try fallback voices
-    for fb in FALLBACK_VOICES:
-        if fb["wsl_voice"] not in used_voices:
-            return fb["wsl_voice"]
-
-    return None
-
-
 # ============ Voice Management Endpoints ============
 
 
 @router.get("/api/voices")
 async def list_voices():
-    """List all available TTS voices from the profile pool."""
-    all_profiles = PROFILES + FALLBACK_VOICES
+    """List manually selectable persona-backed Astartes voices."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        personas = await selectable_astartes_personas(db)
+
     voices = []
-    for profile in all_profiles:
+    for persona in personas:
+        profile = persona_to_profile(persona)
         wsl_voice = profile["wsl_voice"]
         short_name = wsl_voice.replace("Microsoft ", "")
-        is_fallback = profile in FALLBACK_VOICES
         voices.append(
             {
                 "voice": wsl_voice,
                 "mac_voice": profile["mac_voice"],
                 "short_name": short_name,
                 "profile_name": profile["name"],
-                "fallback": is_fallback,
+                "display_name": profile["display_name"],
+                "chip_color": profile["chip_color"],
+                "pane_tint": profile["pane_tint"],
+                "fallback": profile["assignment_pool"] == "backup",
             }
         )
-    # Surface the reserved Custodes voice (George) for display only. It lives
-    # outside PROFILES/FALLBACK_VOICES, so it never enters rotation or the
-    # PATCH .../voice validation set — workers can never be assigned it.
+    # Surface the reserved Custodes voice (George) for display only. It is not
+    # an Astartes persona, so PATCH .../voice cannot assign it to workers.
     voices.append(
         {
             "voice": CUSTODES_PROFILE["wsl_voice"],
@@ -138,89 +118,111 @@ async def list_voices():
 
 @router.patch("/api/instances/{instance_id}/voice")
 async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
-    """Change an instance's TTS voice with collision handling.
+    """Change an instance's Astartes persona by selecting its seeded voice.
 
-    If the target voice is already in use by another instance, that instance
-    gets bumped using random offset + linear probe to find an open slot.
-    No cascade - bumped instance just finds the next available voice.
+    Manual voice changes are persona changes: the requested voice must map to a
+    selectable seeded Astartes persona, and profile_name/tts fields are updated
+    together. Collisions are rejected; this route never moves another instance.
     """
-    all_voices = {p["wsl_voice"] for p in PROFILES + FALLBACK_VOICES}
-    if request.voice not in all_voices:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
-        )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get all instances and their voices
-        cursor = await db.execute("SELECT id, tts_voice, tab_name FROM claude_instances")
-        rows = await cursor.fetchall()
+        db.row_factory = aiosqlite.Row
+        target_persona = await astartes_persona_by_tts_voice(db, request.voice)
+        selectable = await selectable_astartes_personas(db)
+        all_voices = sorted({row["tts_voice"] for row in selectable if row.get("tts_voice")})
+        if not target_persona:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid Astartes persona voice. Available: {', '.join(all_voices)}",
+            )
 
-        instance_to_voice = {row[0]: row[1] for row in rows}
-        instance_to_name = {row[0]: row[2] for row in rows}
-        voice_to_instance = {row[1]: row[0] for row in rows if row[1]}
-
-        if instance_id not in instance_to_voice:
+        cursor = await db.execute(
+            """
+            SELECT ci.id, ci.tts_voice, ci.notification_sound, ci.profile_name, ci.tab_name,
+                   COALESCE(p.default_rank, 'astartes') AS current_rank
+            FROM claude_instances ci
+            LEFT JOIN personas p ON p.slug = ci.profile_name
+            WHERE ci.id = ?
+            """,
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        original_voice = instance_to_voice[instance_id]
-        if original_voice == request.voice:
-            return {"status": "no_change", "instance_id": instance_id, "voice": request.voice}
-
-        # Changes to apply: [(instance_id, old_voice, new_voice), ...]
-        changes = [(instance_id, original_voice, request.voice)]
-
-        # Check for collision
-        holder = voice_to_instance.get(request.voice)
-        if holder and holder != instance_id:
-            # Collision! Bump the holder to a new voice
-            holder_old_voice = instance_to_voice[holder]
-
-            # Build set of voices that will be in use after our change
-            # (exclude original_voice since we're freeing it, include request.voice since we're taking it)
-            used_after = set(voice_to_instance.keys())
-            used_after.discard(original_voice)  # We're freeing this
-            used_after.add(request.voice)  # We're taking this
-
-            # Find new voice for bumped instance via linear probe
-            new_voice_for_holder = find_voice_linear_probe(used_after)
-            if not new_voice_for_holder:
-                # All voices in use, give them the voice we just freed
-                new_voice_for_holder = original_voice
-
-            changes.append((holder, holder_old_voice, new_voice_for_holder))
-
-        # Apply all changes to database
-        for iid, _, new_voice in changes:
-            await sanctioned_update_instance(
-                db,
-                instance_id=iid,
-                updates={"tts_voice": new_voice},
-                mutation_type="instance_updated",
-                write_source="api",
-                actor="voice-assignment",
+        if row["current_rank"] != "astartes":
+            raise HTTPException(
+                status_code=400,
+                detail="Manual voice changes are only valid for Astartes instances",
             )
+
+        holder_cursor = await db.execute(
+            """
+            SELECT id, tab_name
+            FROM claude_instances
+            WHERE id != ?
+              AND tts_voice = ?
+              AND status IN ('processing', 'idle')
+            LIMIT 1
+            """,
+            (instance_id, request.voice),
+        )
+        holder = await holder_cursor.fetchone()
+        if holder:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "voice_in_use",
+                    "voice": request.voice,
+                    "holder_instance_id": holder["id"],
+                    "holder_name": holder["tab_name"] or holder["id"][:8],
+                },
+            )
+
+        old_voice = row["tts_voice"]
+        old_profile = row["profile_name"]
+        profile = persona_to_profile(target_persona)
+        if old_voice == request.voice and old_profile == profile["name"]:
+            return {
+                "status": "no_change",
+                "instance_id": instance_id,
+                "voice": request.voice,
+                "profile_name": profile["name"],
+                "profile": profile,
+            }
+
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "profile_name": profile["name"],
+                "tts_voice": profile["wsl_voice"],
+                "notification_sound": profile["notification_sound"],
+            },
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="voice-assignment",
+        )
         await db.commit()
 
-    # Log events for each change
-    for iid, old_v, new_v in changes:
-        name = instance_to_name.get(iid, iid[:8])
-        await log_event(
-            "instance_voice_changed",
-            instance_id=iid,
-            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id},
-        )
-
-    # Build response
-    bumps = [
-        {"instance_id": iid, "name": instance_to_name.get(iid, iid[:8]), "old": old_v, "new": new_v}
-        for iid, old_v, new_v in changes
-    ]
+    await log_event(
+        "instance_voice_changed",
+        instance_id=instance_id,
+        details={
+            "old_voice": old_voice,
+            "new_voice": request.voice,
+            "old_profile": old_profile,
+            "new_profile": profile["name"],
+            "bumped": False,
+        },
+    )
 
     return {
         "status": "voice_changed",
         "instance_id": instance_id,
         "voice": request.voice,
-        "changes": bumps,
+        "profile_name": profile["name"],
+        "profile": profile,
     }
 
 
@@ -241,7 +243,13 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
+            """
+            SELECT ci.id, ci.tts_voice, ci.notification_sound, ci.tts_mode, ci.profile_name,
+                   p.default_rank
+            FROM claude_instances ci
+            LEFT JOIN personas p ON p.slug = ci.profile_name
+            WHERE ci.id = ?
+            """,
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -262,18 +270,19 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
                 write_source="api",
                 actor="tts-mode",
             )
-        elif mode in ("verbose", "voice-chat") and not old_voice:
+        elif (
+            mode in ("verbose", "voice-chat")
+            and not old_voice
+            and (row["default_rank"] == "astartes" or row["profile_name"] is None)
+        ):
             # Re-assign voice from pool
-            cursor2 = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
-            )
-            rows = await cursor2.fetchall()
-            used_voices = {r[0] for r in rows}
-            profile, _ = get_next_available_profile(used_voices)
+            persona, _ = await assign_astartes_persona(db)
+            profile = persona_to_profile(persona)
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
                 updates={
+                    "profile_name": profile["name"],
                     "tts_mode": mode,
                     "tts_voice": profile["wsl_voice"],
                     "notification_sound": profile["notification_sound"],

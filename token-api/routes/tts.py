@@ -33,18 +33,21 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
+from personas import (
+    BACKUP_ASTARTES,
+    PRIMARY_ASTARTES,
+    assign_astartes_persona,
+    persona_to_profile,
+    voice_settings_for_tts_voice,
+)
 from shared import (
     DB_PATH,
     DESKTOP_CONFIG,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
-    PERSONA_PROFILES,
-    PROFILES,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     ULTIMATE_FALLBACK,
-    get_next_available_profile,
     get_quiet_hours_status,
     is_phone_reachable,
     is_satellite_tts_available,
@@ -618,13 +621,13 @@ async def dispatch_notify(
                     "SELECT tts_voice FROM claude_instances WHERE id = ?", (instance_id,)
                 )
                 row = await cursor.fetchone()
-            if row and row["tts_voice"]:
+            if row and row["tts_voice"] is None:
+                tts = False
+            elif row and row["tts_voice"]:
                 wsl_voice = row["tts_voice"]
-                for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
-                    if p["wsl_voice"] == wsl_voice:
-                        voice = p.get("mac_voice", "Daniel")
-                        wsl_rate = p.get("wsl_rate", 0)
-                        break
+                settings = voice_settings_for_tts_voice(wsl_voice)
+                voice = settings["mac_voice"]
+                wsl_rate = settings["wsl_rate"]
         except Exception as e:
             logger.warning(f"notify: voice profile lookup failed for {instance_id}: {e}")
 
@@ -928,16 +931,12 @@ async def tts_queue_worker():
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
                 if tts_current.message:
-                    # Look up profile by WSL voice (DB tts_voice stores WSL voice name)
-                    # to get mac_voice fallback and wsl_rate
+                    # Resolve persona playback settings by WSL voice
+                    # (DB tts_voice stores the Windows voice name).
                     wsl_voice = tts_current.voice
-                    mac_voice = "Daniel"  # default fallback
-                    wsl_rate = 0
-                    for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
-                        if p["wsl_voice"] == wsl_voice:
-                            mac_voice = p.get("mac_voice", "Daniel")
-                            wsl_rate = p.get("wsl_rate", 0)
-                            break
+                    settings = voice_settings_for_tts_voice(wsl_voice)
+                    mac_voice = settings["mac_voice"]
+                    wsl_rate = settings["wsl_rate"]
 
                     # Speak the message (run in executor to allow skip API to interrupt)
                     # Queue items use file-based playback for transport controls (pause/resume/speed)
@@ -1050,8 +1049,11 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     if not row:
         return {"success": False, "error": f"Instance {instance_id} not found"}
 
-    voice = row["tts_voice"] or "Microsoft David"
-    sound = row["notification_sound"] or "chimes.wav"
+    if row["tts_voice"] is None:
+        return {"success": True, "queued": False, "reason": "persona_silent"}
+
+    voice = row["tts_voice"]
+    sound = row["notification_sound"]
     tab_name = row["tab_name"] or instance_id
     tmux_pane = row["tmux_pane"] if "tmux_pane" in row.keys() else None
 
@@ -1172,8 +1174,8 @@ def get_tts_queue_status() -> dict:
         "satellite_available": TTS_BACKEND["satellite_available"],
         "global_mode": TTS_GLOBAL_MODE["mode"],
         "voice_pool": {
-            "total": len(PROFILES),
-            "fallback_count": len(FALLBACK_VOICES),
+            "total": len(PRIMARY_ASTARTES),
+            "fallback_count": len(BACKUP_ASTARTES),
         },
     }
 
@@ -1464,16 +1466,25 @@ async def set_global_tts_mode(request: Request):
         elif mode == "verbose" and old_mode == "silent":
             # Re-assign voices to all active instances that lost theirs
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NULL AND is_subagent = 0"
+                """
+                SELECT ci.id
+                FROM claude_instances ci
+                LEFT JOIN personas p ON p.slug = ci.profile_name
+                WHERE ci.status IN ('processing', 'idle')
+                  AND ci.tts_voice IS NULL
+                  AND ci.is_subagent = 0
+                  AND (p.default_rank = 'astartes' OR ci.profile_name IS NULL)
+                """
             )
             rows = await cursor.fetchall()
-            used_voices = set()
             for row in rows:
-                profile, _ = get_next_available_profile(used_voices)
+                persona, _ = await assign_astartes_persona(db)
+                profile = persona_to_profile(persona)
                 await sanctioned_update_instance(
                     db,
                     instance_id=row[0],
                     updates={
+                        "profile_name": profile["name"],
                         "tts_mode": mode,
                         "tts_voice": profile["wsl_voice"],
                         "notification_sound": profile["notification_sound"],
@@ -1482,7 +1493,6 @@ async def set_global_tts_mode(request: Request):
                     write_source="api",
                     actor="tts-global-mode",
                 )
-                used_voices.add(profile["wsl_voice"])
         else:
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"

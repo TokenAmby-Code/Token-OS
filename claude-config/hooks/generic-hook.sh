@@ -29,25 +29,39 @@ ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
 # Resolve token-api URL from environment (set in nas-path.sh)
 API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 
-# Resolve claude-cmd with fallback to known NAS paths
-# Claude Code strips PATH during hook execution, so `command -v` may fail
-CLAUDE_CMD=$(command -v claude-cmd 2>/dev/null) || true
-if [[ -z "$CLAUDE_CMD" ]]; then
-  for _p in /Volumes/Imperium/Token-OS/cli-tools/bin/claude-cmd /mnt/imperium/Token-OS/cli-tools/bin/claude-cmd; do
-    if [[ -x "$_p" ]]; then CLAUDE_CMD="$_p"; break; fi
+# Claude Code strips PATH during hook execution, so `command -v` may fail.
+# Use environment-configured roots only; do not hardcode NAS paths.
+_mount_live() {
+  local root="$1"
+  [[ -n "$root" && -d "$root" ]] || return 1
+  ls "$root" >/dev/null 2>&1
+}
+
+_resolve_token_os_bin() {
+  local tool="$1" found root cand
+  found=$(command -v "$tool" 2>/dev/null) || true
+  if [[ -n "$found" && -x "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  for root in "${IMPERIUM:-}" "${CIVIC:-}"; do
+    [[ -n "$root" ]] || continue
+    cand="${root%/}/Token-OS/cli-tools/bin/${tool}"
+    if _mount_live "$root" && [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
   done
-fi
+  return 1
+}
+
+CLAUDE_CMD=$(_resolve_token_os_bin claude-cmd) || true
 # Fallback to no-op if claude-cmd is not found anywhere
 : "${CLAUDE_CMD:=false}"
 
-# Resolve pending-ui-flush the same way (sibling of claude-cmd) — it owns the
-# guarded drain/enqueue/sweep of the pane-branding queue.
-PENDING_UI_FLUSH=$(command -v pending-ui-flush 2>/dev/null) || true
-if [[ -z "$PENDING_UI_FLUSH" ]]; then
-  for _p in /Volumes/Imperium/Token-OS/cli-tools/bin/pending-ui-flush /mnt/imperium/Token-OS/cli-tools/bin/pending-ui-flush; do
-    if [[ -x "$_p" ]]; then PENDING_UI_FLUSH="$_p"; break; fi
-  done
-fi
+# Resolve pending-ui-flush the same way — it owns the guarded
+# drain/enqueue/sweep of the pane-branding queue.
+PENDING_UI_FLUSH=$(_resolve_token_os_bin pending-ui-flush) || true
 : "${PENDING_UI_FLUSH:=false}"
 
 # Inject shell environment variables for device detection, primarch identity,
