@@ -1199,16 +1199,14 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
 
-        # ── Legion Pane Recolor System (retired) ─────────────────────
-        # The queue table + DB triggers + 1s polling worker are gone. Pane tint is
-        # now applied event-driven at the lifecycle moments that actually change it
-        # (persona register/change, pane rebind, vacate, close) via
-        # shared.apply_pane_tint / clear_pane_tint. Drop the legacy objects so
-        # existing DBs converge too — no writer remains, so leaving them would only
-        # let the table grow unread.
+        # ── Legacy Pane Recolor System (retired) ─────────────────────
+        # The DB triggers + 1s polling worker are gone. Pane tint is now applied
+        # event-driven at lifecycle moments that actually change it (persona
+        # register/change, pane rebind, vacate, close) from canonical
+        # instances.persona_id → personas.pane_tint. Disable the old writers but
+        # do not drop the historical queue table/rows.
         await db.execute("DROP TRIGGER IF EXISTS trg_legion_recolor")
         await db.execute("DROP TRIGGER IF EXISTS trg_tmux_pane_recolor")
-        await db.execute("DROP TABLE IF EXISTS pane_recolor_queue")
 
         # ── Pane State Queue (@CC_STATE) ──
         # Trigger-driven pane variable updates. Any status change on claude_instances

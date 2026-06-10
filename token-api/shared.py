@@ -472,32 +472,24 @@ async def tmux_pane_exists(tmux_pane: str | None) -> bool:
 
 
 # ── Persona pane tint (event-driven) ────────────────────────────────────────
-# Pane background colour is resolved from persona pane_tint where available and
-# applied only with `tmux select-pane -P bg=...`. Claude slash-color is not used.
-LEGION_PANE_COLORS = {
-    "custodes": PROFILE_BY_SLUG["custodes"]["pane_tint"],
-    "mechanicus": PROFILE_BY_SLUG["mechanicus"]["pane_tint"],
-    "fabricator": PROFILE_BY_SLUG["fabricator-general"]["pane_tint"],
-    "fabricator-general": PROFILE_BY_SLUG["fabricator-general"]["pane_tint"],
-    "administratum": PROFILE_BY_SLUG["administratum"]["pane_tint"],
-    "civic": "#083010",  # dark green
-    "astartes": "default",  # no tint (default legion)
-}
+# Pane background colour is resolved from canonical instances.persona_id →
+# personas.pane_tint and applied only with `tmux select-pane -P bg=...`.
+# Claude slash-color is not used.
 
 
 def apply_pane_tint(
-    tmux_pane: str | None, legion: str | None, *, source: str = "pane-tint"
+    tmux_pane: str | None, pane_tint: str | None, *, source: str = "pane-tint"
 ) -> None:
-    """Paint a pane's background for its legion. Event-driven — call this when an
-    instance registers or changes its persona (apply the colour) or vacates a
-    pane (pass legion=None/'astartes' to clear). Focus-preserving: it never moves
-    the operator's camera, and `select-pane -P` sets pane style only, so it can
-    neither change the active pane nor collapse a native zoom. Synchronous (runs
-    a tmux subprocess); async callers should wrap it in asyncio.to_thread.
+    """Paint a pane's background with an already-resolved persona tint.
+
+    Event-driven — call this when an instance registers or changes persona
+    (apply the colour) or vacates a pane (pass ``default`` to clear).
+    Synchronous (runs a tmux subprocess); async callers should wrap it in
+    asyncio.to_thread.
     """
     if not tmux_pane:
         return
-    bg = LEGION_PANE_COLORS.get(legion or "astartes", "default")
+    bg = pane_tint or "default"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         import sys
@@ -524,13 +516,28 @@ def apply_pane_tint(
         with preserve_focus(adapter, source=source, attempted_target=tmux_pane):
             adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
     except Exception as exc:
-        logger.warning("pane tint failed for %s (legion=%s): %s", tmux_pane, legion, exc)
+        logger.warning("pane tint failed for %s (bg=%s): %s", tmux_pane, bg, exc)
 
 
 def clear_pane_tint(tmux_pane: str | None, *, source: str = "pane-tint-clear") -> None:
-    """Clear a pane's legion tint back to default. Event-driven — call on close or
-    when a persona vacates a pane. Thin wrapper over apply_pane_tint(astartes)."""
-    apply_pane_tint(tmux_pane, "astartes", source=source)
+    """Clear a pane's persona tint back to tmux default."""
+    apply_pane_tint(tmux_pane, "default", source=source)
+
+
+async def apply_instance_pane_tint(
+    db,
+    instance_id: str | None,
+    tmux_pane: str | None,
+    *,
+    source: str = "pane-tint",
+) -> str:
+    """Resolve and apply pane tint from canonical ``instances.persona_id``."""
+    from personas import persona_tint_for_instance
+
+    bg = await persona_tint_for_instance(db, instance_id)
+    if tmux_pane:
+        await asyncio.to_thread(apply_pane_tint, tmux_pane, bg, source=source)
+    return bg
 
 
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:

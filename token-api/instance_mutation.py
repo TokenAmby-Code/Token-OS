@@ -15,6 +15,7 @@ from instance_registry import (
     legacy_row_to_instance_values,
     slug_from_legacy,
 )
+from personas import persona_tint_for_instance
 
 logger = logging.getLogger("token_api")
 
@@ -80,13 +81,6 @@ INSTANCE_MUTATION_FIELDS = {
     "pr_url",
     "pr_state",
     "hook_driven",
-}
-
-LEGION_PANE_COLORS = {
-    "custodes": "#302800",
-    "mechanicus": "#300808",
-    "civic": "#083010",
-    "astartes": "default",
 }
 
 # Canonical v2 registry columns. These deliberately exclude every raw tmux pane
@@ -883,7 +877,7 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
     pending_projection = await _get_pending_projection(db, instance_id)
     observed_projection = _read_tmux_projection(row.get("tmux_pane"))
     expected_cc_state = row.get("status")
-    expected_pane_bg = LEGION_PANE_COLORS.get(row.get("legion") or "astartes", "default")
+    expected_pane_bg = await persona_tint_for_instance(db, instance_id)
     projection_findings = []
 
     if row.get("tmux_pane"):
@@ -912,8 +906,8 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
                 projection_findings.append(
                     {
                         "category": "projection_drift",
-                        "message": "pane legion tint does not match instance legion",
-                        "fields": ["legion"],
+                        "message": "pane persona tint does not match instance persona",
+                        "fields": ["persona_id"],
                         "expected": expected_pane_bg,
                         "observed": current_bg,
                     }

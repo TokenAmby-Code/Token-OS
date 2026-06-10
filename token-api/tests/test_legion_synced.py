@@ -162,6 +162,64 @@ class TestSetLegion:
             assert resp.json()["legion"] == legion
             assert _get_instance(iid)["legion"] == legion
 
+    def test_set_legion_singleton_updates_canonical_persona_tint(
+        self, client, app_env, monkeypatch
+    ):
+        import personas
+
+        tint_calls = []
+
+        async def _pane(_instance_id):
+            return ("%cust", "main")
+
+        monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _pane)
+        monkeypatch.setattr(
+            app_env.main.shared,
+            "apply_pane_tint",
+            lambda pane, pane_tint, **kw: tint_calls.append((pane, pane_tint)),
+        )
+
+        iid = _insert_instance()
+        resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": "custodes"})
+        assert resp.status_code == 200
+
+        row = _get_instance(iid)
+        assert row["profile_name"] == "custodes"
+        assert row["tts_voice"] == "Microsoft George"
+        assert ("%cust", "#302800") in tint_calls
+
+        conn = sqlite3.connect(app_env.db_path)
+        persona_id = conn.execute(
+            "SELECT persona_id FROM instances WHERE id = ?", (iid,)
+        ).fetchone()[0]
+        conn.close()
+        assert persona_id == personas.persona_id_for_slug("custodes")
+
+    def test_set_legion_civic_clears_canonical_persona_tint(self, client, app_env, monkeypatch):
+        tint_calls = []
+
+        async def _pane(_instance_id):
+            return ("%pax", "main")
+
+        monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _pane)
+        monkeypatch.setattr(
+            app_env.main.shared,
+            "apply_pane_tint",
+            lambda pane, pane_tint, **kw: tint_calls.append((pane, pane_tint)),
+        )
+
+        iid = _insert_instance()
+        resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": "civic"})
+        assert resp.status_code == 200
+        assert ("%pax", "default") in tint_calls
+
+        conn = sqlite3.connect(app_env.db_path)
+        persona_id = conn.execute(
+            "SELECT persona_id FROM instances WHERE id = ?", (iid,)
+        ).fetchone()[0]
+        conn.close()
+        assert persona_id is None
+
     def test_set_legion_invalid(self, client):
         iid = _insert_instance()
         resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": "unknown"})
@@ -332,6 +390,31 @@ class TestCivicAutoDetect:
         assert row is not None
         assert row["legion"] == "civic"
 
+    def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
+        import shared
+
+        tint_calls = []
+        monkeypatch.setattr(
+            shared,
+            "apply_pane_tint",
+            lambda pane, pane_tint, **kw: tint_calls.append((pane, pane_tint)),
+        )
+
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Pax-ENV",
+                "env": {},
+                "pid": 99999,
+                "tmux_pane": "%pax",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert ("%pax", "default") in tint_calls
+        assert ("%pax", "#083010") not in tint_calls
+
     def test_civic_autodetect_pax_path(self, client):
         sid = str(uuid.uuid4())
         self._register_via_hook(client, working_dir="/mnt/imperium/pax/project", session_id=sid)
@@ -347,6 +430,30 @@ class TestCivicAutoDetect:
         row = _get_instance(sid)
         assert row is not None
         assert row["legion"] == "astartes"
+
+    def test_normal_session_start_applies_chapter_persona_tint(self, client, monkeypatch):
+        import shared
+
+        tint_calls = []
+        monkeypatch.setattr(
+            shared,
+            "apply_pane_tint",
+            lambda pane, pane_tint, **kw: tint_calls.append((pane, pane_tint)),
+        )
+
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "env": {},
+                "pid": 99999,
+                "tmux_pane": "%chapter",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert ("%chapter", "#300808") in tint_calls
 
     def test_cron_autodetect_mechanicus(self, client):
         """Cron origin should auto-detect as mechanicus."""
