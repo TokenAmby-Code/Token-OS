@@ -50,7 +50,15 @@ if [[ -z "$DEV_CMD" ]]; then
             echo "post-push: run worktree-setup's DB seed or add TOKEN_API_DB=$WORKTREE_ROOT/token-api/.dev-agents.db"
             exit 0
         fi
-        if [[ "$(cd "$(dirname "$TOKEN_API_DB")" 2>/dev/null && pwd)/$(basename "$TOKEN_API_DB")" == "$LIVE_DB" ]]; then
+        # Canonicalize both sides (symlinks/aliases must not defeat the guard).
+        # BSD readlink -f errors on not-yet-existing paths (fresh .dev-agents.db),
+        # so fall back to python realpath, then to the literal path.
+        _resolve() {
+            readlink -f "$1" 2>/dev/null \
+                || python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$1" 2>/dev/null \
+                || echo "$1"
+        }
+        if [[ "$(_resolve "$TOKEN_API_DB")" == "$(_resolve "$LIVE_DB")" ]]; then
             echo "post-push: REFUSING to start token-api — TOKEN_API_DB resolves to the live $LIVE_DB"
             exit 0
         fi
