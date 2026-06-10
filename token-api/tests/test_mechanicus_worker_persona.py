@@ -334,6 +334,36 @@ async def test_query_guard_async_matches_sync(app_env):
     assert violations == [], "forced to the coat on insert => guard is clean"
 
 
+def test_force_no_ops_and_never_corrupts_when_target_persona_missing(app_env):
+    # Defensive: if a required persona is somehow absent, a force trigger must
+    # no-op (EXISTS guard) rather than write the slug subquery's NULL into the row
+    # (A nulling persona_id) or abort the parent write (B nulling commander_id,
+    # which would fail the commander_type/commander_id CHECK).
+    conn = _conn(app_env.db_path)
+    fg = _persona(conn, "fabricator-general")
+    ultra = _persona(conn, "ultramarines")
+    # Remove the unreferenced mechanicus-worker seed to simulate the missing state.
+    conn.execute("DELETE FROM personas WHERE slug='mechanicus-worker'")
+    conn.commit()
+    # A: an FG-commanded row keeps its (non-mech) persona; persona_id is NOT nulled.
+    a = _insert_instance(conn, commander_type="persona", commander_id=fg, persona_id=ultra)
+    ct, ci, pid, _, _ = _row(conn, a)
+    assert (ct, ci, pid) == ("persona", fg, ultra)
+
+    # B: with FG absent and mechanicus-worker present, inserting the coat must
+    # no-op (not abort on the commander CHECK by nulling commander_id).
+    conn.execute("DELETE FROM personas WHERE slug='fabricator-general'")
+    conn.execute(
+        "INSERT INTO personas (id, slug, display_name, default_rank, tts_voice) "
+        "VALUES ('mech-x', 'mechanicus-worker', 'Mechanicus Worker', 'astartes', NULL)"
+    )
+    conn.commit()
+    b = _insert_instance(conn, persona_id="mech-x")
+    ct, ci, pid, _, _ = _row(conn, b)
+    assert (ct, ci, pid) == ("emperor", None, "mech-x"), "B no-ops when FG missing"
+    conn.close()
+
+
 @pytest.mark.parametrize("slug", ["fabricator-general", "mechanicus-worker"])
 def test_required_personas_present(app_env, slug):
     conn = _conn(app_env.db_path)
