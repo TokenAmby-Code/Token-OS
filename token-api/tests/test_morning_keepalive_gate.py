@@ -96,7 +96,7 @@ def test_sync_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkeypatc
 
     result = asyncio.run(run())
     assert result["action"] == "stop_processed_sync_idle:no_session"
-    assert calls == []  # no keepalive claude-cmd delivery
+    assert calls == []  # no keepalive agent-cmd delivery
 
 
 def test_sync_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
@@ -136,7 +136,7 @@ def test_sync_active_morning_reinjects_keepalive(app_env, monkeypatch):
     assert result["action"] == "stop_processed_sync"
     assert len(calls) == 1
     cmd = calls[0]
-    assert cmd[0] == "claude-cmd" and cmd[1] == "--pane" and cmd[2] == "%42"
+    assert cmd[0] == "agent-cmd" and cmd[1] == "--pane" and cmd[2] == "%42"
     assert "morning session is still active" in cmd[3]
 
 
@@ -163,7 +163,7 @@ def test_sync_expired_morning_autoends_and_sends_one_notice(app_env, monkeypatch
     # ONE final notice — the expiry notice, NOT the keepalive.
     assert len(calls) == 1
     cmd = calls[0]
-    assert cmd[0] == "claude-cmd" and cmd[2] == "%42"
+    assert cmd[0] == "agent-cmd" and cmd[2] == "%42"
     assert "automatically ended" in cmd[3]
     assert "morning session is still active" not in cmd[3]
 
@@ -189,7 +189,7 @@ def test_non_sync_instance_never_reaches_keepalive(app_env, monkeypatch):
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
     assert result["action"] != "stop_processed_sync"
-    assert all(c[0] != "claude-cmd" for c in calls)
+    assert all(c[0] != "agent-cmd" for c in calls)
 
 
 def test_morning_end_writes_status_ended_to_state_file(app_env):

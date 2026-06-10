@@ -55,8 +55,8 @@ _resolve_token_os_bin() {
   return 1
 }
 
-CLAUDE_CMD=$(_resolve_token_os_bin claude-cmd) || true
-# Fallback to no-op if claude-cmd is not found anywhere
+CLAUDE_CMD=$(_resolve_token_os_bin agent-cmd) || true
+# Fallback to no-op if agent-cmd is not found anywhere
 : "${CLAUDE_CMD:=false}"
 
 # Resolve pending-ui-flush the same way — it owns the guarded

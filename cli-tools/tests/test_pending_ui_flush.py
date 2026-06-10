@@ -15,7 +15,7 @@ guards, one test each:
   4. Never brand a human-attended pane — a pane a live client is viewing is held,
      not written.
 
-The tool's tmux + claude-cmd dependencies are injected via env-pointed fakes
+The tool's tmux + agent-cmd dependencies are injected via env-pointed fakes
 (PENDING_UI_TMUX / PENDING_UI_CLAUDE_CMD), so every case is deterministic.
 """
 
@@ -36,7 +36,7 @@ OTHER_SID = "99999999-8888-7777-6666-555555555555"
 
 
 # --------------------------------------------------------------------------- #
-# Fakes: a tmux that answers reads from env, and a claude-cmd that logs sends. #
+# Fakes: a tmux that answers reads from env, and a agent-cmd that logs sends. #
 # --------------------------------------------------------------------------- #
 
 _FAKE_TMUX = r"""#!/usr/bin/env bash
@@ -84,7 +84,7 @@ def _mkfakes(tmp_path: Path) -> dict[str, Path]:
     tmux = binp / "tmux"
     tmux.write_text(_FAKE_TMUX, encoding="utf-8")
     tmux.chmod(0o755)
-    cc = binp / "claude-cmd"
+    cc = binp / "agent-cmd"
     cc.write_text(_FAKE_CLAUDE_CMD, encoding="utf-8")
     cc.chmod(0o755)
     return {

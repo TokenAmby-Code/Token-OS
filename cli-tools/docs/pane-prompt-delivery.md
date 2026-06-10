@@ -12,9 +12,9 @@ agent-cmd --instance <instance-id> "////resume"
 tmux select-pane -P bg=#ff9900
 ```
 
-`claude-cmd` is retained as a compatibility wrapper and delegates directly to `agent-cmd`.
+`agent-cmd` is retained as a compatibility wrapper and delegates directly to `agent-cmd`.
 
-Supported target/options mirror the old `claude-cmd` interface:
+Supported target/options mirror the old `agent-cmd` interface:
 
 - `--self`
 - `--pane <pane-id>`
@@ -44,7 +44,7 @@ The second delayed submit is intentional. In live Codex/Claude repros, immediate
 ## Current routed entry points
 
 - `agent-cmd` direct use
-- `claude-cmd` compatibility wrapper
+- `agent-cmd` compatibility wrapper
 - `tmuxctl send-text`
 - Python callers using `TmuxAdapter.send_text_then_submit`
 - Token-API pane-write queue / local pane-write path

@@ -422,6 +422,7 @@ def test_hook_gc_cli_calls_prune_api(monkeypatch, capsys):
 
 
 def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_env, monkeypatch):
+    monkeypatch.setenv("TOKEN_API_TEST_ALLOW_STAMPED_PANE_FALLBACK", "1")
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "self-plan", pane="%90")
     sent = []

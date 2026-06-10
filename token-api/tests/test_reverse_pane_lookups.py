@@ -128,48 +128,6 @@ async def test_instance_id_for_pane_blank_pane_is_none(app_env: Any) -> None:
 
 
 # ============================================================================
-# Site: rename_instance_by_pane  (/api/instance/rename)
-# ============================================================================
-
-
-async def test_rename_by_pane_resolves_via_stamp(app_env: Any, monkeypatch: Any) -> None:
-    main = app_env.main
-    # Stored pane intentionally != the live pane the agent reports.
-    _insert_instance(app_env.db_path, "inst-A", tmux_pane="%STALE", tab_name="Old")
-
-    async def _stamp(pane):
-        return "inst-A" if pane == "%LIVE" else None
-
-    monkeypatch.setattr(main.shared, "instance_id_for_pane", _stamp)
-
-    result = await main.rename_instance_by_pane(
-        main.PaneRenameRequest(tmux_pane="%LIVE", tab_name="Fresh Name")
-    )
-
-    assert result["status"] == "renamed"
-    assert result["instance_id"] == "inst-A"
-    assert _fetch(app_env.db_path, "inst-A", "tab_name") == "Fresh Name"
-
-
-async def test_rename_by_pane_404_when_pane_unstamped(app_env: Any, monkeypatch: Any) -> None:
-    main = app_env.main
-    _insert_instance(app_env.db_path, "inst-A", tmux_pane="%LIVE", tab_name="Old")
-
-    async def _no_stamp(_pane):
-        return None
-
-    monkeypatch.setattr(main.shared, "instance_id_for_pane", _no_stamp)
-
-    with pytest.raises(main.HTTPException) as exc:
-        await main.rename_instance_by_pane(
-            main.PaneRenameRequest(tmux_pane="%LIVE", tab_name="Fresh")
-        )
-    assert exc.value.status_code == 404
-    # Stored column must not be consulted as a fallback.
-    assert _fetch(app_env.db_path, "inst-A", "tab_name") == "Old"
-
-
-# ============================================================================
 # Site: _flag_hook_driven  (pane fallback)
 # ============================================================================
 

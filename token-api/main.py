@@ -1698,9 +1698,10 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
                 "nudges": NAMING_NUDGE_MAX_PER_INSTANCE,
             }
 
-        tmux_pane = (instance.get("tmux_pane") or "").strip()
+        tmux_pane, _pane_role = await shared.resolve_instance_pane(instance_id)
+        tmux_pane = (tmux_pane or "").strip()
         if not tmux_pane:
-            return {"success": False, "action": "missing_tmux_pane", "instance_id": instance_id}
+            return {"success": False, "action": "missing_live_pane", "instance_id": instance_id}
 
         nudge_count = await _count_naming_nudges(db, instance_id)
         if nudge_count >= NAMING_NUDGE_MAX_PER_INSTANCE:
@@ -2668,11 +2669,6 @@ class RenameInstanceRequest(BaseModel):
     tab_name: str
 
 
-class PaneRenameRequest(BaseModel):
-    tmux_pane: str
-    tab_name: str
-
-
 INSTANCE_NAME_MAX_CHARS = 40
 INSTANCE_NAME_SPINNER_PREFIXES = "✳⠐⠸ "
 INSTANCE_NAME_PLACEHOLDER_RX = re.compile(r"^Claude \d{2}:\d{2}$")
@@ -2773,70 +2769,6 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
 
 
-@app.post("/api/instance/rename")
-async def rename_instance_by_pane(request: PaneRenameRequest):
-    """Rename the active instance attached to a tmux pane.
-
-    Used by the `instance-name` CLI from inside an agent pane. This route is
-    intentionally pane-scoped so agents do not need to know their instance id.
-    """
-    tmux_pane = (request.tmux_pane or "").strip()
-    if not tmux_pane:
-        raise HTTPException(status_code=400, detail="tmux_pane is required")
-    tab_name = _validate_instance_name_slug(request.tab_name)
-
-    # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp rather
-    # than querying the stored tmux_pane column. The CLI passes the agent's own live
-    # $TMUX_PANE, so the stamp is authoritative and current.
-    pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
-    if not pane_instance_id:
-        raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT id, tab_name
-               FROM claude_instances
-               WHERE id = ?
-                 AND COALESCE(status, '') != 'stopped'
-               LIMIT 1""",
-            (pane_instance_id,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
-
-        old_name = row["tab_name"]
-        instance_id = row["id"]
-        result = await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates={"tab_name": tab_name},
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="instance-name-cli",
-        )
-        await db.commit()
-
-    await log_event(
-        "instance_renamed",
-        instance_id=instance_id,
-        details={
-            "old_name": old_name,
-            "new_name": tab_name,
-            "tmux_pane": tmux_pane,
-            "source": "instance-name-cli",
-        },
-    )
-    return {
-        "status": "renamed",
-        "instance_id": instance_id,
-        "tmux_pane": tmux_pane,
-        "tab_name": tab_name,
-        "changed_fields": result.get("changed_fields", []),
-    }
-
-
 @app.patch("/api/instances/{instance_id}/transplant-pending")
 async def mark_transplant_pending(instance_id: str, target_session: str):
     """Mark an instance as about to be transplanted to a new session ID.
@@ -2869,7 +2801,7 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
 
 
 @app.post("/api/instances/{instance_id}/input-lock")
-async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
+async def acquire_input_lock(instance_id: str, locker: str = "agent-cmd"):
     """Acquire input lock for an instance's tmux pane.
 
     Prevents concurrent tmux send-keys from interleaving in the PTY buffer.
@@ -2898,7 +2830,7 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
 
 
 @app.delete("/api/instances/{instance_id}/input-lock")
-async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
+async def release_input_lock(instance_id: str, locker: str = "agent-cmd"):
     """Release input lock for an instance's tmux pane."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -7698,10 +7630,10 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     # Deliver prompt: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
-        # Local delivery via claude-cmd
+        # Local delivery via agent-cmd
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude-cmd",
+                "agent-cmd",
                 "--pane",
                 tmux_pane,
                 prompt,
@@ -7711,13 +7643,13 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
                 logger.info(
-                    f"Nudge: delivered to {instance_id[:12]} via claude-cmd pane={tmux_pane}"
+                    f"Nudge: delivered to {instance_id[:12]} via agent-cmd pane={tmux_pane}"
                 )
             else:
                 logger.error(
-                    f"Nudge: claude-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}"
+                    f"Nudge: agent-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}"
                 )
-                return {"nudged": False, "reason": f"claude-cmd failed: rc={proc.returncode}"}
+                return {"nudged": False, "reason": f"agent-cmd failed: rc={proc.returncode}"}
         except Exception as e:
             logger.error(f"Nudge: local delivery failed for {instance_id[:12]}: {e}")
             return {"nudged": False, "reason": f"local_failed: {e}"}
@@ -8001,7 +7933,7 @@ async def _custodes_intervention_negative_edge_cancel_result(
     }
 
 
-# Signatures the Custodes injection subprocess (`claude-cmd` → `agent-cmd` →
+# Signatures the Custodes injection subprocess (`agent-cmd` → `agent-cmd` →
 # `tmuxctl send-text`) surfaces in stderr. The universal send gate raises
 # `TmuxSendGated` ("send suppressed by gate: <reason>"); agent-cmd's own
 # typing-guard wait aborts with "user input not cleared". Both mean NO bytes
@@ -8050,7 +7982,7 @@ async def _inject_custodes_prompt_to_pane(
     # reaches this helper.
     await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor="state-hook-fanout")
     try:
-        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
+        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "agent-cmd"
         proc = await asyncio.create_subprocess_exec(
             str(claude_cmd),
             "--pane",
@@ -8075,7 +8007,7 @@ async def _inject_custodes_prompt_to_pane(
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace")
             category, gate_reason = _classify_pane_inject_failure(stderr_text)
-            reason = f"claude-cmd failed: rc={proc.returncode}"
+            reason = f"agent-cmd failed: rc={proc.returncode}"
             logger.warning(f"Custodes state hook: {reason} [{category}]: {stderr_text[:200]}")
             result = {
                 "dispatched": False,
