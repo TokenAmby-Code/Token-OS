@@ -28,7 +28,7 @@ registry dashboard. The name helps identify what you're working on.
 
 Options:
   --id <id>          Explicit instance ID (for ambiguous cases)
-  --no-ui            Skip queued Claude Code /rename (for headless/cron)
+  --no-ui            Skip Claude Code /rename (for headless/cron)
   --session          Create a session doc named after the instance and assign it
   --session <title>  Find existing session doc by title (fuzzy) and assign it
   --session-id <N>   Assign to existing session doc by ID
@@ -188,14 +188,18 @@ if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
         if [[ -n "$PANE" ]]; then
             _BIN_DIR="$(dirname "$(readlink -f "$0")")"
             CLAUDE_PID=$(_find_claude_pid || true)
-            SESSION_ID=""
+            CLAUDE_EPOCH=""
             if [[ -n "$CLAUDE_PID" && -f "${HOME}/.claude/session-pids/${CLAUDE_PID}" ]]; then
-                SESSION_ID=$(cat "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true)
+                CLAUDE_EPOCH=$(cat "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true)
             fi
 
-            ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID" --rename "$NAME")
-            "${_BIN_DIR}/pending-ui-flush" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
-            echo "Queued: /rename $NAME (fires on next prompt submit)"
+            if [[ -n "$CLAUDE_EPOCH" && "$CLAUDE_EPOCH" != "-" ]]; then
+                ENQ_ARGS=(enqueue --pane "$PANE" --session "$CLAUDE_EPOCH" --rename "$NAME")
+                "${_BIN_DIR}/pending-ui-flush" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
+                echo "Queued: /rename $NAME (fires on next prompt submit)"
+            else
+                echo "Skipped UI queue: no Claude session epoch for $PANE" >&2
+            fi
         fi
     fi
 
