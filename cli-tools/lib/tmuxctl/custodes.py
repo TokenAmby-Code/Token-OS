@@ -6,7 +6,7 @@ should only know "I want to deliver this prompt to Custodes." This module
 decides:
 
 - If the legion:custodes pane has a live `claude` process → upsert the prompt
-  via `claude-cmd --pane`.
+  via `agent-cmd --pane`.
 - Otherwise (shell, empty, dead) → fresh launch via `dispatch --persona
   custodes --pane <id> --prompt-file <path> --sync` (the non-deprecated
   replacement for `primarch custodes`).
@@ -29,7 +29,7 @@ from .stack import CUSTODES_ROLE, add_orchestrator_stack_pane
 from .tmux_adapter import TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
-CLAUDE_CMD_BIN = "claude-cmd"
+CLAUDE_CMD_BIN = "agent-cmd"
 
 CLAUDE_PROCESS_NEEDLES = ("claude",)
 AGENT_PROCESS_NEEDLES = ("claude", "codex")
@@ -142,11 +142,11 @@ def _upsert_via_claude_cmd(pane_id: str, prompt: str) -> tuple[bool, str]:
             check=False,
         )
     except FileNotFoundError as exc:
-        return False, f"claude-cmd not found: {exc}"
+        return False, f"agent-cmd not found: {exc}"
     except subprocess.TimeoutExpired:
-        return False, "claude-cmd timed out"
+        return False, "agent-cmd timed out"
     if proc.returncode != 0:
-        return False, f"claude-cmd rc={proc.returncode}: {proc.stderr.strip()[:200]}"
+        return False, f"agent-cmd rc={proc.returncode}: {proc.stderr.strip()[:200]}"
     return True, "ok"
 
 

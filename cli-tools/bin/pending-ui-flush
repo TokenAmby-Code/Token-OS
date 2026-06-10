@@ -19,7 +19,7 @@ This tool is the single, testable owner of that queue. Three subcommands:
   * ``flush``   — drain one pane's queue safely: purge stale/foreign/dead-pane
     entries, HOLD (never drop, never race) while the target pane has active human
     typing or a live client viewing it, then send surviving commands through the
-    gated ``claude-cmd`` path and remove them on success.
+    gated ``agent-cmd`` path and remove them on success.
   * ``sweep``   — prune the whole queue dir of legacy/expired/dead-pane files so
     depth stays bounded at the origin (called from SessionStart).
 
@@ -71,7 +71,7 @@ def _pane_safe(pane: str) -> str:
     return pane.lstrip("%")
 
 
-# ---- tmux + claude-cmd resolution (PATH is stripped under Claude hooks) ---- #
+# ---- tmux + agent-cmd resolution (PATH is stripped under Claude hooks) ---- #
 
 
 def _resolve_tmux() -> str:
@@ -109,13 +109,13 @@ def _resolve_claude_cmd() -> str:
     override = os.environ.get("PENDING_UI_CLAUDE_CMD")
     if override:
         return override
-    sibling = Path(__file__).resolve().parent / "claude-cmd"
+    sibling = Path(__file__).resolve().parent / "agent-cmd"
     if os.access(sibling, os.X_OK):
         return str(sibling)
-    for cand in _env_token_os_candidates("claude-cmd"):
+    for cand in _env_token_os_candidates("agent-cmd"):
         if os.access(cand, os.X_OK):
             return str(cand)
-    return "claude-cmd"
+    return "agent-cmd"
 
 
 def _resolve_guard_script() -> str | None:
@@ -205,11 +205,11 @@ def _unsafe(pane: str, window_seconds: int) -> bool:
     return _typing_active(window_seconds) or _pane_attended(pane)
 
 
-# ---- send path (reuses the gated claude-cmd / send-gate pipeline) --------- #
+# ---- send path (reuses the gated agent-cmd / send-gate pipeline) --------- #
 
 
 def _send(pane: str, cmd: str) -> bool:
-    """Send one slash-command to a pane via the gated claude-cmd path."""
+    """Send one slash-command to a pane via the gated agent-cmd path."""
     try:
         proc = subprocess.run(
             [_resolve_claude_cmd(), "--pane", pane, cmd],

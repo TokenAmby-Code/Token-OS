@@ -27,7 +27,7 @@ def test_codex_tui_text_then_submit_dispatches() -> None:
     is env-gated because it requires Codex auth/network and consumes a small
     model turn. The pre-2026-05-10 helper sent text and C-m back-to-back; on the
     live regression panes that left prompts queued. The fixed helper waits before
-    C-m, matching claude-cmd's proven path.
+    C-m, matching agent-cmd's proven path.
     """
 
     if shutil.which("codex") is None:

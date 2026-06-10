@@ -14,12 +14,14 @@ DETACH=false
 RESOLVE_ONLY=false
 NO_ESCAPE=false
 COMMAND=""
+SKILL=""
+SKILL_ARGUMENTS=""
 
 usage() {
     cat <<'USAGE'
 agent-cmd - Send a prompt/command to a live Claude or Codex pane
 
-Usage: agent-cmd [--self|--pane PANE|--instance ID] [--detach] [--resolve-only] [--no-escape] <prompt>
+Usage: agent-cmd [--self|--pane PANE|--instance ID] [--detach] [--resolve-only] [--no-escape] [--skill NAME [--arguments TEXT]|<prompt>]
 USAGE
 }
 
@@ -64,10 +66,9 @@ find_tmux_pane() {
     done | head -1
 }
 
-resolve_instance_id() {
-    local pid="$1"
-    local cache_file="${HOME}/.claude/session-pids/${pid}"
-    [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null || true
+pane_instance_id() {
+    local pane="$1"
+    tmux show-options -pv -t "$pane" @INSTANCE_ID 2>/dev/null | head -1
 }
 
 resolve_pane() {
@@ -85,13 +86,20 @@ while [[ $# -gt 0 ]]; do
         --instance) TARGET_MODE="instance"; TARGET_VALUE="$2"; shift 2 ;;
         --detach) DETACH=true; shift ;;
         --resolve-only) RESOLVE_ONLY=true; shift ;;
-        --no-escape) NO_ESCAPE=true; shift ;;  # accepted for claude-cmd compatibility
+        --no-escape) NO_ESCAPE=true; shift ;;  # accepted for old caller compatibility
+        --skill) SKILL="${2:-}"; shift 2 ;;
+        --arguments) SKILL_ARGUMENTS="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) COMMAND="$1"; shift ;;
     esac
 done
 
-if [[ "$RESOLVE_ONLY" != true && -z "$COMMAND" ]]; then
+if [[ -n "$SKILL" && -n "$COMMAND" ]]; then
+    echo "Error: use either --skill or a literal prompt, not both." >&2
+    usage >&2
+    exit 1
+fi
+if [[ "$RESOLVE_ONLY" != true && -z "$COMMAND" && -z "$SKILL" ]]; then
     echo "Error: No command specified." >&2
     usage >&2
     exit 1
@@ -104,17 +112,15 @@ case "$TARGET_MODE" in
         AGENT_PID=$(find_agent_pid || true)
         [[ -z "$AGENT_PID" ]] && { echo "Error: Could not find agent ancestor process." >&2; exit 1; }
         PANE=$(find_tmux_pane "$AGENT_PID")
-        INSTANCE_ID=$(resolve_instance_id "$AGENT_PID")
+        [[ -z "$PANE" ]] && { echo "Error: Could not find tmux pane for agent process." >&2; exit 1; }
+        INSTANCE_ID=$(pane_instance_id "$PANE" || true)
         ;;
     pane)
         PANE="$TARGET_VALUE"
         ;;
     instance)
         INSTANCE_ID="$TARGET_VALUE"
-        INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$TARGET_VALUE" 2>/dev/null || true)
-        PANE=$(echo "$INSTANCE_DATA" | jq -r '.tmux_pane // empty' 2>/dev/null || true)
-        INSTANCE_PID=$(echo "$INSTANCE_DATA" | jq -r '.pid // empty' 2>/dev/null || true)
-        [[ -z "$PANE" && -n "$INSTANCE_PID" ]] && PANE=$(find_tmux_pane "$INSTANCE_PID" || true)
+        PANE=$("${_BIN_DIR}/tmuxctl" resolve-instance --format physical "$TARGET_VALUE" 2>/dev/null || true)
         [[ -z "$PANE" ]] && { echo "Error: Could not find pane for instance '$TARGET_VALUE'." >&2; exit 1; }
         ;;
 esac
@@ -122,6 +128,25 @@ esac
 [[ -n "$PANE" ]] && PANE=$(resolve_pane "$PANE")
 if [[ "$RESOLVE_ONLY" == true ]]; then
     echo "$PANE"
+    exit 0
+fi
+
+send_skill() {
+    local pane="$1" skill="$2" args="$3" out
+    out=$("${_BIN_DIR}/tmuxctl" invoke-skill "$skill" --pane "$pane" --arguments "$args" --submit 2>&1) || {
+        echo "$out" >&2
+        return 1
+    }
+    printf '%s' "$out"
+}
+
+if [[ -n "$SKILL" ]]; then
+    if [[ "$DETACH" == true ]]; then
+        (send_skill "$PANE" "$SKILL" "$SKILL_ARGUMENTS" >/dev/null 2>&1) &
+        disown 2>/dev/null || true
+    else
+        send_skill "$PANE" "$SKILL" "$SKILL_ARGUMENTS"
+    fi
     exit 0
 fi
 

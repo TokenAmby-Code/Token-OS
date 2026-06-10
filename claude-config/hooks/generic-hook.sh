@@ -55,9 +55,9 @@ _resolve_token_os_bin() {
   return 1
 }
 
-CLAUDE_CMD=$(_resolve_token_os_bin claude-cmd) || true
-# Fallback to no-op if claude-cmd is not found anywhere
-: "${CLAUDE_CMD:=false}"
+AGENT_CMD=$(_resolve_token_os_bin agent-cmd) || true
+# Fallback to no-op if agent-cmd is not found anywhere
+: "${AGENT_CMD:=false}"
 
 # Resolve pending-ui-flush the same way — it owns the guarded
 # drain/enqueue/sweep of the pane-branding queue.
@@ -147,7 +147,7 @@ fi
 # Resolve tmux pane via PID walk when env var is stripped (Claude Code strips $TMUX_PANE)
 # Inject into payload so Token-API can store it for cross-machine dispatch
 if [[ -z "$TMUX_PANE" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
-  RESOLVED_PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
+  RESOLVED_PANE=$($AGENT_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$RESOLVED_PANE" ]]; then
     HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg p "$RESOLVED_PANE" '.tmux_pane = $p') || true
     # Also resolve @PANE_ID (human-readable label like "palace:TR") for DB-driven resurrection
@@ -184,7 +184,7 @@ fi
 if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   TRANSPLANT_PANE=""
   if [[ -n "$CLAUDE_PID" ]]; then
-    TRANSPLANT_PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
+    TRANSPLANT_PANE=$($AGENT_CMD --self --resolve-only 2>/dev/null || true)
   fi
 
   if [[ -n "$TRANSPLANT_PANE" ]]; then
@@ -236,7 +236,7 @@ fi
 # It never injects while the target pane is being typed in or actively viewed,
 # never replays a stale or foreign-epoch entry, and never drops a held command.
 if [[ "$ACTION_TYPE" == "UserPromptSubmit" ]]; then
-  PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
+  PANE=$($AGENT_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" ]]; then
     SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
     (
@@ -287,7 +287,7 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   # Defer auto-rename to next UserPromptSubmit via pending-ui-cmds. Pane tint is
   # DB/persona-resolved and applied by tmux style only; no slash color path.
   TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null)
-  PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
+  PANE=$($AGENT_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" && -n "$TAB_NAME" ]]; then
     SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
     ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID" --rename "$TAB_NAME")

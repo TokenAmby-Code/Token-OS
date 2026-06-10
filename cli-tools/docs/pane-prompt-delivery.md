@@ -9,18 +9,18 @@ This exists because raw `tmux send-keys ... Enter` can leave text queued in live
 ```bash
 agent-cmd --pane %123 "run the tests"
 agent-cmd --instance <instance-id> "////resume"
+agent-cmd --skill preplan --arguments "current task" --pane %123
 tmux select-pane -P bg=#ff9900
 ```
 
-`claude-cmd` is retained as a compatibility wrapper and delegates directly to `agent-cmd`.
-
-Supported target/options mirror the old `claude-cmd` interface:
+Supported target/options:
 
 - `--self`
 - `--pane <pane-id>`
 - `--instance <instance-id>`
 - `--detach`
 - `--resolve-only`
+- `--skill <name>` with optional `--arguments <text>`
 - `--no-escape` currently accepted for caller compatibility
 
 ## Delivery invariant
@@ -44,7 +44,6 @@ The second delayed submit is intentional. In live Codex/Claude repros, immediate
 ## Current routed entry points
 
 - `agent-cmd` direct use
-- `claude-cmd` compatibility wrapper
 - `tmuxctl send-text`
 - Python callers using `TmuxAdapter.send_text_then_submit`
 - Token-API pane-write queue / local pane-write path

@@ -145,8 +145,8 @@ _find_claude_pid() {
     return 1
 }
 
-# Resolve and rename. Default path is pane-scoped via $TMUX_PANE so the agent
-# does not need to know its instance id. Explicit legacy mode remains.
+# Resolve and rename. The default path reads this pane's live @INSTANCE_ID
+# stamp from tmux and uses the instance-id API; tmux is the runtime authority.
 if [[ -n "$EXPLICIT_ID" ]]; then
     INSTANCE_ID="$EXPLICIT_ID"
 else
@@ -155,25 +155,17 @@ else
         echo "Error: TMUX_PANE is not set; run this inside an active tmux pane" >&2
         exit 2
     fi
-    RESPONSE=$(jq -n --arg tmux_pane "$TMUX_PANE_ID" --arg tab_name "$NAME" \
-        '{tmux_pane: $tmux_pane, tab_name: $tab_name}' \
-        | curl -s -X POST "$API_URL/api/instance/rename" \
-            -H "Content-Type: application/json" \
-            --data-binary @- 2>/dev/null || true)
-    INSTANCE_ID=$(echo "$RESPONSE" | jq -r '.instance_id // empty' 2>/dev/null || true)
-fi
-
-if [[ -n "$EXPLICIT_ID" ]]; then
+    INSTANCE_ID=$(tmux show-options -pv -t "$TMUX_PANE_ID" @INSTANCE_ID 2>/dev/null | head -1 || true)
     if [[ -z "$INSTANCE_ID" ]]; then
-        echo "Error: No active instance found. Use --id to specify explicitly." >&2
+        echo "Error: pane $TMUX_PANE_ID has no @INSTANCE_ID" >&2
         exit 1
     fi
-
-    RESPONSE=$(jq -n --arg tab_name "$NAME" '{tab_name: $tab_name}' \
-        | curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
-            -H "Content-Type: application/json" \
-            --data-binary @- 2>/dev/null || true)
 fi
+
+RESPONSE=$(jq -n --arg tab_name "$NAME" '{tab_name: $tab_name}' \
+    | curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
+        -H "Content-Type: application/json" \
+        --data-binary @- 2>/dev/null || true)
 
 if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
     echo "Renamed to: $NAME"
@@ -183,22 +175,22 @@ if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
     # recycled pane never inherits it, it expires if never drained, and the drain
     # holds while the pane is being typed in — see cli-tools/bin/pending-ui-flush.
     if [[ "$NO_UI" != "1" ]]; then
-        PANE=$(claude-cmd --self --resolve-only 2>/dev/null || true)
+        PANE=$(agent-cmd --self --resolve-only 2>/dev/null || true)
 
         if [[ -n "$PANE" ]]; then
             _BIN_DIR="$(dirname "$(readlink -f "$0")")"
-            CLAUDE_PID=$(_find_claude_pid || true)
-            CLAUDE_EPOCH=""
-            if [[ -n "$CLAUDE_PID" && -f "${HOME}/.claude/session-pids/${CLAUDE_PID}" ]]; then
-                CLAUDE_EPOCH=$(cat "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true)
+            AGENT_PID=$(_find_claude_pid || true)
+            AGENT_EPOCH=""
+            if [[ -n "$AGENT_PID" && -f "${HOME}/.claude/session-pids/${AGENT_PID}" ]]; then
+                AGENT_EPOCH=$(cat "${HOME}/.claude/session-pids/${AGENT_PID}" 2>/dev/null || true)
             fi
 
-            if [[ -n "$CLAUDE_EPOCH" && "$CLAUDE_EPOCH" != "-" ]]; then
-                ENQ_ARGS=(enqueue --pane "$PANE" --session "$CLAUDE_EPOCH" --rename "$NAME")
+            if [[ -n "$AGENT_EPOCH" && "$AGENT_EPOCH" != "-" ]]; then
+                ENQ_ARGS=(enqueue --pane "$PANE" --session "$AGENT_EPOCH" --rename "$NAME")
                 "${_BIN_DIR}/pending-ui-flush" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
                 echo "Queued: /rename $NAME (fires on next prompt submit)"
             else
-                echo "Skipped UI queue: no Claude session epoch for $PANE" >&2
+                echo "Skipped UI queue: no agent session epoch for $PANE" >&2
             fi
         fi
     fi

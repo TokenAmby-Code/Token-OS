@@ -97,7 +97,7 @@ New:
 **Status:** done (63c251a) — tools file via index update (CIFS ghost)
 
 New:
-- `cli-tools/bin/claude-cmd`
+- `cli-tools/bin/agent-cmd`
 - `cli-tools/bin/enforce`
 - `cli-tools/bin/mewgenics-capture`
 - `cli-tools/bin/mewgenics-dedup`

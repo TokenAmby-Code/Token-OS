@@ -2095,7 +2095,7 @@ async def read_file(path: str):
 async def tmux_send_keys(req: TmuxSendKeysRequest):
     """Send a command to a Claude Code instance's tmux pane.
 
-    Used by Mac Token-API / claude-cmd for cross-machine dispatch.
+    Used by Mac Token-API / agent-cmd for cross-machine dispatch.
     Input locking is handled by the caller (Mac-side DB lock), not here.
     """
     pane = req.pane
