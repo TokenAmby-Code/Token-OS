@@ -65,7 +65,7 @@ These are the least vibeslop parts of the stack:
 - `cli-tools/bin/transplant`
   - more sophisticated and safety-conscious than expected
   - real process migration logic, not just a wrapper
-- `cli-tools/bin/claude-cmd`
+- `cli-tools/bin/agent-cmd`
   - input-locking plus local/remote pane dispatch is a legitimate systems solution
 
 ## Critical Execution Paths

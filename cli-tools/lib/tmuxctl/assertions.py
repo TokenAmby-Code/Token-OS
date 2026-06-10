@@ -24,7 +24,7 @@ from .resolver import resolve_pane
 from .tmux_adapter import TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
-CLAUDE_CMD_BIN = "claude-cmd"
+CLAUDE_CMD_BIN = "agent-cmd"
 PERSONA_LABELS = {"legion:custodes", "mechanicus:fabricator-general", "mechanicus:admin"}
 
 
@@ -156,7 +156,7 @@ def _upsert_prompt(pane_id: str, prompt: str) -> tuple[bool, str]:
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     if proc.returncode != 0:
-        return False, f"claude-cmd rc={proc.returncode}: {proc.stderr.strip()[:200]}"
+        return False, f"agent-cmd rc={proc.returncode}: {proc.stderr.strip()[:200]}"
     return True, "upserted_existing_pane"
 
 

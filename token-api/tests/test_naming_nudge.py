@@ -4,6 +4,19 @@ import sqlite3
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _live_pane_resolver(app_env, monkeypatch):
+    async def _resolve(instance_id):
+        with sqlite3.connect(app_env.db_path) as conn:
+            row = conn.execute(
+                "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+        return ((row[0], "") if row and row[0] else (None, ""))
+
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve)
+
+
 def _insert_instance(
     db_path,
     *,
@@ -94,6 +107,35 @@ async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monk
     )
     assert event["event_type"] == "naming_nudge_sent"
     assert json.loads(event["details"])["nudge_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_naming_nudge_uses_live_resolved_pane_not_stored_db_pane(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, tmux_pane="%STALE")
+    enqueued = []
+
+    async def resolve_live(instance_id):
+        assert instance_id == "inst-naming"
+        return ("%LIVE", "legion:NW")
+
+    async def fake_enqueue(**kwargs):
+        enqueued.append(kwargs)
+        return {"id": "queue-1", **kwargs, "status": "pending"}
+
+    async def fake_process(queue_id):
+        return [{"queue_id": queue_id, "status": "sent"}]
+
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", resolve_live)
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fake_enqueue)
+    monkeypatch.setattr(app_env.main, "process_pane_write_queue_once", fake_process)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(instance_id="inst-naming")
+    )
+
+    assert result["action"] == "nudge_sent"
+    assert result["tmux_pane"] == "%LIVE"
+    assert enqueued[0]["tmux_pane"] == "%LIVE"
 
 
 @pytest.mark.asyncio

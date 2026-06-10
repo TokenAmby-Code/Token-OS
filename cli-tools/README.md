@@ -56,7 +56,7 @@ skills-sync --check --json
 
 ### Live agent pane prompt delivery (`agent-cmd`)
 
-`agent-cmd` is the canonical command for submitting text into an existing Claude/Codex prompt pane. It normalizes payloads and uses the hardened literal-send + delayed double-submit sequence through `tmuxctl`; `claude-cmd` remains as a compatibility wrapper. Use this for live prompt injection instead of raw `tmux send-keys ... Enter`. See `cli-tools/docs/pane-prompt-delivery.md`.
+`agent-cmd` is the canonical command for submitting text into an existing Claude/Codex prompt pane. It normalizes payloads and uses the hardened literal-send + delayed double-submit sequence through `tmuxctl`; Use this for live prompt injection instead of raw `tmux send-keys ... Enter`. See `cli-tools/docs/pane-prompt-delivery.md`.
 
 ### Managed tmux stack dispatch (`tmuxctl stack`)
 
