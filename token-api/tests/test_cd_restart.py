@@ -107,12 +107,14 @@ def test_merge_spawns_one_git_aware_token_restart(client, spawned):
     body = resp.json()
     assert body["ok"] is True
     assert "scheduled" in body["restart"]
-    # Exactly ONE detached spawn: token-restart, WITH --sync (so the merge is
-    # ff-pulled into the live checkout before the git-aware selective restart).
+    # Exactly ONE detached spawn: token-restart, WITH --sync and the target SHA
+    # exported so local CD syncs bare main then checks out the requested runtime SHA.
     restarts = _self_restarts(spawned)
     assert len(restarts) == 1
     assert any("token-restart" in part for part in restarts[0]), restarts[0]
-    assert restarts[0][-1].rstrip().endswith("--sync")
+    shell = restarts[0][-1]
+    assert shell.rstrip().endswith("--sync")
+    assert "TOKEN_RESTART_TARGET_SHA=deadbeef" in shell
     # No per-service side-spawns anymore (no discord kickstart / push-mobile / curl).
     assert len(spawned) == 1
 
