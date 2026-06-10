@@ -125,6 +125,44 @@ def test_stop_evaluator_parse_allows_real_block(app_env):
     assert "run the tests itself" in finding
 
 
+def test_action_validator_prompt_human_only_is_just_tx_restart(app_env):
+    """Only `tx restart` (full live-session wipe) is human-only — the action_validator
+    must NOT nudge an agent to self-run it. Everything else (commit/push/PR/merge/
+    live-test, INCLUDING `token-restart`) the agent SHOULD do autonomously: per the
+    Emperor's "Astartes know no fear" doctrine, `tx restart` is the only workspace
+    exception. Guard BOTH halves so a regression can neither re-broaden the human-only
+    set nor re-flag `token-restart` (which would re-introduce pussyfooting).
+    """
+    system = app_env.main.STOP_EVALUATORS["action_validator"]["system"]
+    lowered = system.lower()
+
+    # The session-wipe command (and its alias/executor) is named as human-only.
+    for cmd in ("tx restart", "tx -r", "tmuxctl restart"):
+        assert cmd in system, f"action_validator prompt must name {cmd!r} as human-only"
+    assert "human-only" in lowered
+    assert "must not self-execute" in lowered
+
+    # token-restart is the OPPOSITE — agents SHOULD self-run it; never flag it.
+    assert "including `token-restart`" in lowered
+
+
+def test_action_validator_parse_still_blocks_ordinary_manual_action(app_env):
+    """The destructive-command carve-out must NOT soften ordinary manual-action
+    blocks — telling the user to run the test suite is still a real BLOCK.
+    """
+    text = (
+        "VERDICT: BLOCK The agent should run `pytest` itself instead of telling the user to run it"
+    )
+
+    should_nudge, finding, needs_jury = app_env.main._parse_evaluator_result(
+        "action_validator",
+        text,
+    )
+
+    assert should_nudge is True
+    assert needs_jury is False
+
+
 def test_stop_evaluator_parse_suppresses_placeholder_plan_noise(app_env):
     text = (
         'VERDICT: BLOCK The Plan section currently shows "No plan defined yet." '
