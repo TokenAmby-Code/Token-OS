@@ -26,8 +26,12 @@ if [[ ! -f "$ENV_FILE" ]]; then
     exit 0
 fi
 
+# Export everything from .worktree.env (PORT, TOKEN_API_DB, DEV_CMD, …) so the
+# dev-server child actually inherits it — a plain `source` sets shell vars only.
+set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+set +a
 
 if [[ -z "${PORT:-}" ]]; then
     echo "post-push: PORT not set in $ENV_FILE — skipping"
@@ -38,6 +42,26 @@ fi
 DEV_CMD="${DEV_CMD:-}"
 if [[ -z "$DEV_CMD" ]]; then
     if [[ -f "$WORKTREE_ROOT/token-api/main.py" ]]; then
+        # Fail closed (P0 2026-06-09): never launch a worktree token-api against
+        # the live agents.db. TOKEN_API_DB must be set and must not resolve to it.
+        LIVE_DB="$HOME/.claude/agents.db"
+        if [[ -z "${TOKEN_API_DB:-}" ]]; then
+            echo "post-push: REFUSING to start token-api — TOKEN_API_DB not set in $ENV_FILE (would write live agents.db)"
+            echo "post-push: run worktree-setup's DB seed or add TOKEN_API_DB=$WORKTREE_ROOT/token-api/.dev-agents.db"
+            exit 0
+        fi
+        # Canonicalize both sides (symlinks/aliases must not defeat the guard).
+        # BSD readlink -f errors on not-yet-existing paths (fresh .dev-agents.db),
+        # so fall back to python realpath, then to the literal path.
+        _resolve() {
+            readlink -f "$1" 2>/dev/null \
+                || python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$1" 2>/dev/null \
+                || echo "$1"
+        }
+        if [[ "$(_resolve "$TOKEN_API_DB")" == "$(_resolve "$LIVE_DB")" ]]; then
+            echo "post-push: REFUSING to start token-api — TOKEN_API_DB resolves to the live $LIVE_DB"
+            exit 0
+        fi
         DEV_CMD="cd token-api && uv run uvicorn main:app --host 127.0.0.1 --port \$PORT --reload"
     elif [[ -f "$WORKTREE_ROOT/package.json" ]]; then
         DEV_CMD="npm run dev -- --port \$PORT"

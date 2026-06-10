@@ -22,6 +22,9 @@ mesh-pipe/config.json
 *state*.json
 session_registry.json
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 
@@ -77,6 +80,10 @@ yarn-error.log*
 .claude-deploy.log
 .claude-deploy-signal
 .claude-local-server-state.json
+
+# Per-worktree dev server artifacts (.worktree-dev.log is covered by *.log;
+# the pid file was untracked and tripped pr-create's clean-tree guard)
+.worktree-dev.pid
 
 # ====================================================
 # COMPILED / BINARY
