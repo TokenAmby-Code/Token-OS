@@ -290,6 +290,7 @@ def test_clear_pane_overlay_removes_close_time_state_but_keeps_identity():
             "@PANE_LABEL": "needs-name",
             "@INSTANCE_ID": "inst-1",
             "@DISCORD_VOICE_LOCK": "1",
+            "@DISCORD_VOICE_PROCESSING": "1",
             PERSONA_GUARD_OPTION: "{}",
         }
     )

@@ -337,14 +337,10 @@ export function createVoiceTranscriptRouter({
   async function applyStateLockOverlay(state) {
     if (!state?.lockOverlay) return;
     await writePaneOption(state.target, VOICE_LOCK_OPTION, '1');
+    // Cosmetic init of the processing flag — best-effort, must not fail acquire.
     try {
       await writePaneOption(state.target, VOICE_PROCESSING_OPTION, '0');
-    } catch (err) {
-      try {
-        await writePaneOption(state.target, VOICE_LOCK_OPTION, '0');
-      } catch {}
-      throw err;
-    }
+    } catch {}
   }
 
   async function restoreStateLockOverlay(state) {
@@ -408,7 +404,9 @@ export function createVoiceTranscriptRouter({
     // Discord voice is explicit Emperor/user dictation into the locked pane.
     // It pierces the universal recent-typing gate as direct input, while still
     // being audited via TMUX_SEND_GATE_ALLOW.
-    await setStateProcessing(state, true);
+    // The processing flag is operator-visible status only — a flaky option
+    // write must never block transcript delivery, so both edges are best-effort.
+    try { await setStateProcessing(state, true); } catch {}
     try {
       await writeText(state.target, segment, { bypassGuard: true });
     } finally {

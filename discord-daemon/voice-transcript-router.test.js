@@ -153,6 +153,33 @@ test('Imperial Guard cleanup clears voice lock even if processing clear fails', 
   ]);
 });
 
+test('a flaky processing-flag write never blocks transcript delivery', async () => {
+  const typed = [];
+  const router = createVoiceTranscriptRouter({
+    logger: { warn() {}, info() {} },
+    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
+    displayValue() { return 'old-title'; },
+    async setPaneTitle() {},
+    async setPaneOption(_target, option) {
+      // Lock acquire works; only the cosmetic processing edges flake.
+      if (option === '@DISCORD_VOICE_PROCESSING') throw new Error('set-option flaked');
+    },
+    async typeIntoTarget(target, text) { typed.push([target, text]); },
+    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+  });
+
+  const result = await router.route({
+    botName: 'imperial_guard',
+    userId: 'u1',
+    text: 'must still land',
+    lockedTmuxPane: '%42',
+  });
+
+  assert.equal(result.routed, true);
+  assert.deepEqual(typed, [['%42', 'must still land']]);
+  assert.equal(router.listDrafts().length, 1);
+});
+
 test('voice processing flag is cleared even when typing into the pane fails', async () => {
   const ops = [];
   const router = createVoiceTranscriptRouter({
