@@ -92,49 +92,89 @@ local function sendTmuxPrefix()
     hs.eventtap.keyStroke({"ctrl"}, "space")
 end
 
--- ===== Dial scroll: unified curve (event-driven, zero timers) =====
--- twin: ahk/dial-scroll.ahk — same algorithm + constants drive Windows directly.
+-- ===== Dial scroll: unified curve + momentum coast =====
+-- twin: ahk/dial-scroll.ahk — same algorithm + constants.
+--
+-- NOTE: this path is normally DORMANT. The dial is plugged into Windows, and
+-- deskflow ignores the dial software's injected F13/F14 while forwarding the
+-- AHK twin's injected wheel events — so the Mac usually feels the AHK engine.
+-- This twin exists as the fallback for the dial talking to the Mac directly
+-- (verified 2026-06-11: dialEvents stayed 0 across real dial use via deskflow).
 --
 -- One scroll event per dial tick, scaled by a multiplier that ramps while ticks
 -- arrive faster than FAST_WINDOW_MS and resets to base on any slow tick.
--- Output happens only inside the tick handler — releasing the dial is a dead stop.
--- Brake: a reverse tick while ripping (multiplier ramped AND last tick within
--- BRAKE_WINDOW_MS) is swallowed — freezes output instead of scrolling backward.
--- The next reverse tick, now at rest, scrolls normally.
+-- A ripped dial (multiplier past COAST_MIN_MULT) coasts after release: a pulse
+-- timer keeps emitting decaying scroll until the multiplier runs out.
+-- Brake: a reverse tick while ripping OR coasting is swallowed — freezes output
+-- instead of scrolling backward. The next reverse tick, at rest, scrolls normally.
 --
 -- Shared constants (keep in sync with twin):
 --   BASE_LINES=1  FAST_WINDOW_MS=120  ACCEL_RATE=1.2  ACCEL_MAX=12.0  BRAKE_WINDOW_MS=300
+--   COAST_DECAY=0.85  COAST_TICK_MS=30  COAST_MIN_MULT=3.0  RELEASE_MS=60
 --   MIN_INPUT_GAP_MS=3 is AHK-only (BT phantom guard); the deskflow path doesn't need it.
 local DIAL_BASE_LINES      = 1     -- scroll lines for a single deliberate tick
 local DIAL_FAST_WINDOW_MS  = 120   -- gaps below this ramp acceleration
 local DIAL_ACCEL_RATE      = 1.2   -- multiplier growth per fast tick
 local DIAL_ACCEL_MAX       = 12.0  -- cap on the multiplier
 local DIAL_BRAKE_WINDOW_MS = 300   -- reversal within this of last tick while ramped = brake
+local DIAL_COAST_DECAY     = 0.85  -- multiplier decay per coast pulse
+local DIAL_COAST_TICK_MS   = 30    -- coast pulse interval
+local DIAL_COAST_MIN_MULT  = 3.0   -- only rips coast; gentle ticking still stops dead
+local DIAL_RELEASE_MS      = 60    -- no tick for this long = dial released, coast may pulse
 
 local dialLastTickMs = 0
 local dialLastDir    = 0
 local dialMult       = 1.0
+local dialCoastTimer = nil
+-- Telemetry rings (read via ImperiumHammerspoonStatus): last 16 tick gaps + lines
+local dialGapRing    = {}
+local dialLineRing   = {}
+local dialRingIdx    = 0
 
--- Called from the eventtap callback — must stay pure arithmetic + one post();
--- slow callbacks get the tap disabled by macOS.
+-- Coast pulse: runs on the main run loop (not the eventtap callback). While the
+-- dial is still actively ticking it no-ops; once released it pays out decaying
+-- momentum until the multiplier runs dry.
+local function dialCoastPulse()
+    local sinceLast = hs.timer.absoluteTime() / 1e6 - dialLastTickMs
+    if sinceLast < DIAL_RELEASE_MS then
+        return
+    end
+    dialMult = dialMult * DIAL_COAST_DECAY
+    local lines = math.floor(DIAL_BASE_LINES * dialMult + 0.5)
+    if lines < 1 then
+        dialCoastTimer:stop()
+        dialMult = 1.0
+        return
+    end
+    hs.eventtap.event.newScrollEvent({0, dialLastDir * lines}, {}, "line"):post()
+end
+
+dialCoastTimer = hs.timer.new(DIAL_COAST_TICK_MS / 1000, dialCoastPulse)
+
+-- Called from the eventtap callback — must stay cheap (arithmetic, one post(),
+-- timer start/stop); slow callbacks get the tap disabled by macOS.
 local function postDialScroll(dir)
     dialEvents = dialEvents + 1
     local nowMs = hs.timer.absoluteTime() / 1e6
     local gap = nowMs - dialLastTickMs
     dialLastTickMs = nowMs
+    local coasting = dialCoastTimer:running()
 
     if dir ~= dialLastDir and dialLastDir ~= 0 then
-        local wasRipping = (dialMult > 1.0 and gap < DIAL_BRAKE_WINDOW_MS)
+        local wasMoving = coasting or (dialMult > 1.0 and gap < DIAL_BRAKE_WINDOW_MS)
+        dialCoastTimer:stop()
         dialMult = 1.0
         dialLastDir = dir
-        if wasRipping then
+        if wasMoving then
             return -- BRAKE: swallow the stop-tick, scroll nothing
         end
         -- slow-gap reversal = deliberate turnaround → fall through, scroll at base
     end
     dialLastDir = dir
 
-    if gap < DIAL_FAST_WINDOW_MS then
+    -- A same-direction tick during coast re-engages the flywheel: keep the
+    -- decayed multiplier and ramp from there instead of resetting to base.
+    if gap < DIAL_FAST_WINDOW_MS or coasting then
         dialMult = math.min(dialMult * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
     else
         dialMult = 1.0
@@ -142,6 +182,14 @@ local function postDialScroll(dir)
 
     local lines = math.max(1, math.floor(DIAL_BASE_LINES * dialMult + 0.5))
     hs.eventtap.event.newScrollEvent({0, dir * lines}, {}, "line"):post()
+
+    dialRingIdx = (dialRingIdx % 16) + 1
+    dialGapRing[dialRingIdx] = math.floor(gap)
+    dialLineRing[dialRingIdx] = lines
+
+    if dialMult >= DIAL_COAST_MIN_MULT and not dialCoastTimer:running() then
+        dialCoastTimer:start()
+    end
 end
 
 local function cancelHoldTimer()
@@ -372,11 +420,22 @@ volumeWatcher:start()
 require("hs.ipc")
 
 function _G.ImperiumHammerspoonStatus()
+    -- Serialize the dial telemetry rings oldest→newest as "gap:lines" pairs.
+    local ticks = {}
+    for i = 1, 16 do
+        local idx = ((dialRingIdx + i - 1) % 16) + 1
+        if dialGapRing[idx] then
+            table.insert(ticks, dialGapRing[idx] .. ":" .. dialLineRing[idx])
+        end
+    end
     return {
         inputTapEnabled = inputTap and inputTap:isEnabled() or false,
         dictationActive = dictationActive,
         enterQueued = enterQueued,
         dialEvents = dialEvents,
+        dialMult = dialMult,
+        dialCoasting = dialCoastTimer and dialCoastTimer:running() or false,
+        dialTicks = table.concat(ticks, " "),
         tapRestarts = tapRestarts,
         tokenApiUrl = TOKEN_API_URL,
         discordDaemonUrl = DISCORD_DAEMON_URL,
