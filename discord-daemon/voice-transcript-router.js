@@ -69,6 +69,23 @@ function tmuxEnv(extra = {}) {
   };
 }
 
+// Read-only tmux state lookups (pane existence, the static-target list-panes,
+// title reads) must resolve to the LOCAL tmux binary, never the NAS-hosted
+// cli-tools/bin/tmux guard wrapper. That wrapper lives on the SMB mount; when
+// the mount stalls, spawning it times out (spawnSync tmux ETIMEDOUT) and a live
+// voice transcript is silently dropped as "no target pane" — observed dropping
+// both a Custodes static-target route and a Cadia locked-pane route. The guard
+// wrapper exists for interactive typing/focus safety, which read lookups never
+// need, so prefer the local binary here. Writes keep tmuxEnv()'s wrapper path
+// (they rely on its TMUX_SEND_GATE_ALLOW handling).
+function tmuxReadEnv(extra = {}) {
+  return {
+    ...process.env,
+    PATH: ['/opt/homebrew/bin', '/usr/local/bin', CLI_DIR, process.env.PATH || ''].join(':'),
+    ...extra,
+  };
+}
+
 function normalizeBot(botName) {
   return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');
 }
@@ -116,7 +133,7 @@ function paneExists(pane, execSync = execFileSync) {
     const out = execSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     }).trim();
     return out === pane || out.startsWith('%');
   } catch {
@@ -156,7 +173,7 @@ export function resolveStaticVoiceTargetToPane(target, {
     ], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     });
     const marked = [];
     const fallback = [];
@@ -234,7 +251,7 @@ function displayValue(target, format) {
     return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     }).replace(/\n$/, '');
   } catch {
     return '';
