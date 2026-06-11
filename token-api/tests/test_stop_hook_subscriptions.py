@@ -151,7 +151,7 @@ def test_explicit_subscribe_unsubscribe(app_env):
     asyncio.run(run())
 
 
-def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch):
+def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch) -> None:
     # The live preplan subscribe sends target_pane == subscriber_pane == the same
     # %id. _resolve_instance_for_pane is the expensive leg (tmux show-options + a
     # SQLite lookup); it must run ONCE for the shared pane, not twice. Force the
@@ -190,7 +190,7 @@ def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch):
     assert calls["n"] == 1  # resolved once for the shared pane, not twice
 
 
-def test_distinct_pane_subscribe_resolves_each_pane(app_env, monkeypatch):
+def test_distinct_pane_subscribe_resolves_each_pane(app_env, monkeypatch) -> None:
     # When the two roles are different panes, each is still resolved (the cache
     # must not collapse distinct panes to one resolution).
     hooks = sys.modules["routes.hooks"]

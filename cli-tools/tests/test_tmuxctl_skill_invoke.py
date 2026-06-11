@@ -161,7 +161,7 @@ def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatc
     assert tab_index < prompt_end_index
 
 
-def test_move_to_prompt_start_emits_single_batched_pgup_then_home():
+def test_move_to_prompt_start_emits_single_batched_pgup_then_home() -> None:
     # One send-keys subprocess carries all 50 PgUp plus the Home terminator.
     adapter = RecordingAdapter()
     move_to_prompt_start(adapter, "%42")
@@ -187,7 +187,7 @@ def test_insert_text_emits_buffer_separated_send():
     ]
 
 
-def test_move_to_prompt_end_emits_single_batched_pgdn_then_end():
+def test_move_to_prompt_end_emits_single_batched_pgdn_then_end() -> None:
     # One send-keys subprocess carries all 50 PgDn plus the End terminator.
     adapter = RecordingAdapter()
     move_to_prompt_end(adapter, "%42")
