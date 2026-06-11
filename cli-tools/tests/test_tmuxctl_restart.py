@@ -31,7 +31,12 @@ from tmuxctl.planner import build_restart_plan
 
 
 def _pane(
-    pane_id: str, role: str, *, command: str = "zsh", window: str = "somnium"
+    pane_id: str,
+    role: str,
+    *,
+    command: str = "zsh",
+    window: str = "somnium",
+    stamp_instance_id: str = "",
 ) -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
@@ -48,6 +53,7 @@ def _pane(
         pane_kind=PaneKind.UNKNOWN,
         reserved=False,
         active=False,
+        instance_id=stamp_instance_id,
     )
 
 
@@ -261,6 +267,52 @@ def test_palace_happy_path_resumes_grid_and_side_labels():
     resumed = {resume.instance_id: resume.target_pane_id for resume in plan.resumes}
     assert resumed == {"alpha": "%2", "beta": "%6"}
     assert all(not resume.target_hidden_until_rebuild for resume in plan.resumes)
+
+
+def test_restart_plan_backfills_pane_label_from_live_instance_stamp():
+    # Cutover Slice B (#84) retired pane_label/tmux_pane from /api/instances, so
+    # the registry now arrives with an empty pane_label. The live @INSTANCE_ID
+    # pane stamp is the reverse-lookup source of truth and must rehydrate the
+    # resume target; otherwise _is_candidate drops every instance and nothing
+    # resumes across a tx restart.
+    workspace = _workspace(
+        _pane("%1", "palace:W", window="palace", stamp_instance_id="ghost"),
+        _pane("%2", "palace:N", window="palace"),
+        window="palace",
+        archetype=WindowArchetype.PALACE,
+    )
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("ghost", "", tmux_pane=""),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
+        ("ghost", "palace:W", "%1")
+    ]
+
+
+def test_restart_plan_prefers_registry_pane_label_over_stamp():
+    # When the registry still carries a pane_label it wins, so a future registry
+    # that resumes serving labels keeps working and a stale stamp cannot hijack
+    # the resume target.
+    workspace = _workspace(
+        _pane("%1", "palace:W", window="palace", stamp_instance_id="abc"),
+        _pane("%2", "palace:N", window="palace"),
+        window="palace",
+        archetype=WindowArchetype.PALACE,
+    )
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("abc", "palace:N", tmux_pane="%2"),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
+        ("abc", "palace:N", "%2")
+    ]
 
 
 def test_build_client_attachments_classifies_local_remote_and_grouped():
