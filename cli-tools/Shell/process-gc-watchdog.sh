@@ -103,18 +103,36 @@ etime_to_secs() {
 emit_event() {
   [[ "$GC_EMIT_EVENTS" == "1" ]] || return 0
   local pid="$1" cpu="$2" etime="$3" cmd="$4" rule="$5" payload
-  payload=$(printf '{"event_type":"process_gc_reap","details":{"pid":%s,"cpu":"%s","etime":"%s","cmd":"%s","rule":"%s","source":"process-gc-watchdog"}}' \
-    "$pid" "$cpu" "$etime" "$cmd" "$rule")
+  payload="$(printf '{"event_type":"process_gc_reap","details":{"pid":%s,"cpu":"%s","etime":"%s","cmd":"%s","rule":"%s","source":"process-gc-watchdog"}}' \
+    "$pid" "$cpu" "$etime" "$cmd" "$rule")"
   curl -fsS -m 2 -X POST -H 'Content-Type: application/json' \
     -d "$payload" "http://localhost:7777/api/events/log" >/dev/null 2>&1 || true
 }
 
+# PID-reuse guard: confirm the PID still looks like the process we classified
+# from the ps snapshot — same allowlisted basename AND an elapsed time
+# consistent with the rule that matched. A recycled PID is at most seconds old
+# and cannot pass the rule's etime floor, so snapshot-to-kill races cannot hit
+# an unrelated process. Called immediately before TERM and again before KILL.
+still_same_process() {
+  local pid="$1" base="$2" min_secs="$3" cur cur_etime cur_comm
+  cur="$(ps -p "$pid" -o etime=,comm= 2>/dev/null)" || return 1
+  [[ -n "$cur" ]] || return 1
+  read -r cur_etime cur_comm <<< "$cur"
+  [[ "${cur_comm##*/}" == "$base" ]] || return 1
+  (( $(etime_to_secs "$cur_etime") > min_secs )) || return 1
+}
+
 reap() {
-  local pid="$1" cpu="$2" etime="$3" base="$4" rule="$5"
+  local pid="$1" cpu="$2" etime="$3" base="$4" rule="$5" min_secs="${6:-0}"
+  if ! still_same_process "$pid" "$base" "$min_secs"; then
+    log "SKIP rule=$rule pid=$pid cmd=$base — gone or identity changed since scan (pid-reuse guard)"
+    return 0
+  fi
   log "REAP rule=$rule pid=$pid cpu=$cpu etime=$etime cmd=$base"
   kill -TERM "$pid" 2>/dev/null || true
   sleep 2
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$pid" 2>/dev/null && still_same_process "$pid" "$base" "$min_secs"; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
   reaped=$((reaped + 1))
@@ -137,7 +155,7 @@ while read -r pid ppid cpu etime tty comm; do
 
   # Rule A: orphan (ppid==1), high CPU, long-lived.
   if [[ "$ppid" == "1" ]] && (( secs > GC_ETIME_MIN * 60 && 10#$cpu_int > GC_CPU_MIN )); then
-    reap "$pid" "$cpu" "$etime" "$base" orphan
+    reap "$pid" "$cpu" "$etime" "$base" orphan "$(( GC_ETIME_MIN * 60 ))"
     continue
   fi
 
@@ -147,9 +165,9 @@ while read -r pid ppid cpu etime tty comm; do
   # Rule B: NAS search past the tool-timeout ceiling — dead by construction,
   # regardless of parent liveness or CPU (SMB stalls park in I/O-wait).
   if (( secs > GC_NAS_ETIME_MIN * 60 )); then
-    args=$(ps -ww -o args= -p "$pid" 2>/dev/null || true)
+    args="$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
     if [[ "$args" == *"$GC_NAS_PATH"* ]]; then
-      reap "$pid" "$cpu" "$etime" "$base" nas-search
+      reap "$pid" "$cpu" "$etime" "$base" nas-search "$(( GC_NAS_ETIME_MIN * 60 ))"
       continue
     fi
   fi
@@ -157,7 +175,7 @@ while read -r pid ppid cpu etime tty comm; do
   # Rule C: any tty-less search spinning hot for an hour+ (live-wrapper variant
   # of rule A — the 2026-06-10 incident class when the search is NOT on the NAS).
   if (( secs > GC_ANCIENT_MIN * 60 && 10#$cpu_int > GC_CPU_MIN )); then
-    reap "$pid" "$cpu" "$etime" "$base" ancient
+    reap "$pid" "$cpu" "$etime" "$base" ancient "$(( GC_ANCIENT_MIN * 60 ))"
   fi
 done < <(ps -Ao pid=,ppid=,%cpu=,etime=,tty=,comm= 2>/dev/null)
 
