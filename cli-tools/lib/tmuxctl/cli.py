@@ -304,9 +304,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "metal-restart":
             from .metal_restart import metal_restart, render_metal_restart_result
 
-            result = metal_restart(control.adapter, args.session, dry_run=args.dry_run)
-            print(render_metal_restart_result(result))
-            return 0 if result.ok else 1
+            metal_result = metal_restart(control.adapter, args.session, dry_run=args.dry_run)
+            print(render_metal_restart_result(metal_result))
+            return 0 if metal_result.ok else 1
 
         if args.command == "doctor":
             print(control.doctor(args.session))
