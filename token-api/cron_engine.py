@@ -749,9 +749,9 @@ class CronEngine:
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT COUNT(*) FROM claude_instances ci
+                """SELECT COUNT(*) FROM instances ci
                    JOIN session_documents sd ON ci.session_doc_id = sd.id
-                   WHERE sd.cron_job_id = ? AND ci.status != 'stopped'""",
+                   WHERE sd.cron_job_id = ? AND ci.status NOT IN ('stopped', 'archived')""",
                 (job["id"],),
             )
             count = (await cursor.fetchone())[0]

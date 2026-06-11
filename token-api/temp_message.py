@@ -167,11 +167,11 @@ async def _candidate_rows(
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id AS instance_id, tmux_pane, engine, tab_name, pane_label,
+            SELECT id AS instance_id, tmux_pane, engine, name AS tab_name, pane_label,
                    dispatch_target, dispatch_window, status
-            FROM claude_instances
+            FROM instances
             WHERE COALESCE(tmux_pane, '') != ''
-              AND status IN ('processing', 'idle', 'active')
+              AND status NOT IN ('stopped', 'archived')
             ORDER BY last_activity DESC
             """
         )

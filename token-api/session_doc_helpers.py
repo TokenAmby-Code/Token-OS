@@ -1114,7 +1114,7 @@ def create_session_doc_file(
 async def _update_doc_agents_list(db, doc_id: int) -> None:
     """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
     cursor = await db.execute(
-        "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
+        "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ? AND status NOT IN ('stopped', 'archived')",
         (doc_id,),
     )
     rows = await cursor.fetchall()

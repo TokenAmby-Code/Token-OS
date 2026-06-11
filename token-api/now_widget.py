@@ -56,9 +56,9 @@ def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
 
         for row in conn.execute(
             """
-            SELECT id, tab_name, working_dir, tmux_pane, pane_label
-            FROM claude_instances
-            WHERE status IN ('processing', 'idle')
+            SELECT id, name AS tab_name, working_dir, tmux_pane, pane_label
+            FROM instances
+            WHERE status NOT IN ('stopped', 'archived')
             ORDER BY last_activity DESC
             LIMIT 6
             """

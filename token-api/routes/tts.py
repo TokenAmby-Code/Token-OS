@@ -618,7 +618,7 @@ async def dispatch_notify(
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
-                    "SELECT tts_voice FROM claude_instances WHERE id = ?", (instance_id,)
+                    "SELECT tts_voice FROM instances WHERE id = ?", (instance_id,)
                 )
                 row = await cursor.fetchone()
             if row and row["tts_voice"] is None:
@@ -838,7 +838,10 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT device_id, tmux_pane, tts_mode FROM claude_instances WHERE id = ?",
+                """SELECT device_id, tmux_pane,
+                          CASE WHEN interaction_mode = 'voice_chat'
+                               THEN 'voice-chat' ELSE notification_mode END AS tts_mode
+                   FROM instances WHERE id = ?""",
                 (item.instance_id,),
             )
             row = await cursor.fetchone()
@@ -1041,7 +1044,11 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT tab_name, tts_voice, notification_sound, tts_mode, tmux_pane FROM claude_instances WHERE id = ?",
+            """SELECT name AS tab_name, tts_voice, notification_sound,
+                      CASE WHEN interaction_mode = 'voice_chat'
+                           THEN 'voice-chat' ELSE notification_mode END AS tts_mode,
+                      tmux_pane
+               FROM instances WHERE id = ?""",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1451,14 +1458,19 @@ async def set_global_tts_mode(request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         if mode == "silent":
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
+                "SELECT id FROM instances WHERE status NOT IN ('stopped', 'archived') AND is_subagent = 0"
             )
             rows = await cursor.fetchall()
             for row in rows:
                 await sanctioned_update_instance(
                     db,
                     instance_id=row[0],
-                    updates={"tts_mode": mode, "tts_voice": None, "notification_sound": None},
+                    updates={
+                        "notification_mode": mode,
+                        "interaction_mode": "text",
+                        "tts_voice": None,
+                        "notification_sound": None,
+                    },
                     mutation_type="instance_updated",
                     write_source="api",
                     actor="tts-global-mode",
@@ -1468,12 +1480,12 @@ async def set_global_tts_mode(request: Request):
             cursor = await db.execute(
                 """
                 SELECT ci.id
-                FROM claude_instances ci
-                LEFT JOIN personas p ON p.slug = ci.profile_name
-                WHERE ci.status IN ('processing', 'idle')
+                FROM instances ci
+                LEFT JOIN personas p ON p.id = ci.persona_id
+                WHERE ci.status NOT IN ('stopped', 'archived')
                   AND ci.tts_voice IS NULL
                   AND ci.is_subagent = 0
-                  AND (p.default_rank = 'astartes' OR ci.profile_name IS NULL)
+                  AND (p.default_rank = 'astartes' OR ci.persona_id IS NULL)
                 """
             )
             rows = await cursor.fetchall()
@@ -1484,8 +1496,9 @@ async def set_global_tts_mode(request: Request):
                     db,
                     instance_id=row[0],
                     updates={
-                        "profile_name": profile["name"],
-                        "tts_mode": mode,
+                        "persona_id": persona["id"],
+                        "notification_mode": mode,
+                        "interaction_mode": "text",
                         "tts_voice": profile["wsl_voice"],
                         "notification_sound": profile["notification_sound"],
                     },
@@ -1495,14 +1508,14 @@ async def set_global_tts_mode(request: Request):
                 )
         else:
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"
+                "SELECT id FROM instances WHERE status NOT IN ('stopped', 'archived') AND is_subagent = 0"
             )
             rows = await cursor.fetchall()
             for row in rows:
                 await sanctioned_update_instance(
                     db,
                     instance_id=row[0],
-                    updates={"tts_mode": mode},
+                    updates={"notification_mode": mode, "interaction_mode": "text"},
                     mutation_type="instance_updated",
                     write_source="api",
                     actor="tts-global-mode",
