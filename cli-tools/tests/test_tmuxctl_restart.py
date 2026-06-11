@@ -497,3 +497,51 @@ def test_builder_creates_canonical_workspace_roles():
     assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
     pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
     assert "tui" not in pane_types
+
+
+def test_normalize_instance_status_accepts_live_api_vocabulary():
+    # /api/instances serves token-api's VALID_STATUSES vocabulary, which renames
+    # "processing" to "working" and adds mid-conversation states. An unmapped
+    # status normalizes to UNKNOWN, fails _is_resumable, and silently drops the
+    # instance from every restart plan — an actively working instance must not
+    # vanish from the plan just because it was busy at capture time.
+    from tmuxctl.registry import normalize_instance_status
+
+    for active in ("working", "questioning", "preplanning", "planning", "compacting", "reviewing"):
+        assert normalize_instance_status(active) is InstanceStatus.PROCESSING, active
+    assert normalize_instance_status("processing") is InstanceStatus.PROCESSING
+    assert normalize_instance_status("idle") is InstanceStatus.IDLE
+    assert normalize_instance_status("victorious") is InstanceStatus.IDLE
+    assert normalize_instance_status("stopped") is InstanceStatus.STOPPED
+    assert normalize_instance_status("archived") is InstanceStatus.UNKNOWN
+    assert normalize_instance_status(None) is InstanceStatus.UNKNOWN
+
+
+def test_restart_plan_resumes_instance_reported_working_by_api():
+    # End-to-end through build_registry_snapshot: a registry row with the raw
+    # API status "working" and a live pane stamp must land in plan.resumes.
+    from tmuxctl.registry import build_registry_snapshot
+
+    workspace = _workspace(
+        _pane("%53", "palace:W", window="palace", stamp_instance_id="busy"),
+        _pane("%55", "palace:E", window="palace"),
+        window="palace",
+        archetype=WindowArchetype.PALACE,
+    )
+    registry = build_registry_snapshot(
+        device_id="Mac-Mini",
+        instances=[
+            {
+                "id": "busy",
+                "device_id": "Mac-Mini",
+                "status": "working",
+                "last_activity": _iso_ago(seconds=5),
+            }
+        ],
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
+        ("busy", "palace:W", "%53")
+    ]
