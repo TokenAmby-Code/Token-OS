@@ -138,6 +138,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     invoke_skill_parser.add_argument("--dry-run", action="store_true")
 
+    # Decomposed prompt-cursor ops. The plan-menu pre-buffers prompt-start (the
+    # expensive, selection-independent 50x PgUp) while the picker is open, inserts
+    # the chosen leader, then always runs prompt-end on exit to restore the cursor.
+    prompt_start_parser = subparsers.add_parser(
+        "prompt-start",
+        help="Move the pane cursor to the prompt start (N x PgUp + Home).",
+    )
+    prompt_start_parser.add_argument("--pane", required=True)
+    prompt_start_parser.add_argument("--page-ups", type=int, default=50)
+
+    insert_text_parser = subparsers.add_parser(
+        "insert-text",
+        help="Insert literal text at the cursor (no leader logic, no submit).",
+    )
+    insert_text_parser.add_argument("--pane", required=True)
+    insert_text_parser.add_argument("--text", required=True)
+
+    prompt_end_parser = subparsers.add_parser(
+        "prompt-end",
+        help="Return the pane cursor to the prompt end (N x PgDn + End).",
+    )
+    prompt_end_parser.add_argument("--pane", required=True)
+    prompt_end_parser.add_argument("--page-downs", type=int, default=50)
+
     resolve_agent_parser = subparsers.add_parser(
         "resolve-agent",
         help="Print the harness (claude|codex) bound to a pane.",
@@ -430,6 +454,18 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     end="",
                 )
+            return 0
+
+        if args.command == "prompt-start":
+            control.move_to_prompt_start(args.pane, page_ups=args.page_ups)
+            return 0
+
+        if args.command == "insert-text":
+            control.insert_text(args.pane, args.text)
+            return 0
+
+        if args.command == "prompt-end":
+            control.move_to_prompt_end(args.pane, page_downs=args.page_downs)
             return 0
 
         if args.command == "resolve-agent":
