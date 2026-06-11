@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# metal-restart-sandbox — throwaway rig proving DB-free metal restart persistence.
+# TAGS: tmux, restart, sandbox
+# AUDIENCE: human, agent
+#
+# Stands up an isolated tmux session (`metalrt`, no session-group — it can
+# never drag main) with 1 live claude pane + 1 live codex pane + 1 bare shell,
+# then proves `tmuxctl metal-restart` re-attaches both agents to their original
+# transcripts with zero token-api/agents.db involvement.
+#
+# The whole sandbox runs dark: TOKEN_API_DB points at a nonexistent path and
+# TOKEN_API_URL at a dead port (session env, inherited by every pane), so
+# neither launch hooks nor dispatch lookups ever touch the live DB/API.
+#
+# Usage:
+#   metal-restart-sandbox up       # create session, launch claude + codex
+#   metal-restart-sandbox state    # metal-observe the sandbox (read-only)
+#   metal-restart-sandbox verify   # full restart round-trip proof (M4)
+#   metal-restart-sandbox down     # kill the session
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+TMUXCTL="${SCRIPT_DIR}/tmuxctl"
+DISPATCH="${SCRIPT_DIR}/dispatch"
+
+SESSION="${METALRT_SESSION:-metalrt}"
+SCRATCH_BASE="${METALRT_SCRATCH:-$HOME/.cache/metalrt}"
+SCRATCH_CLAUDE="${SCRATCH_BASE}/claude-a"
+SCRATCH_CODEX="${SCRATCH_BASE}/codex-b"
+MARKER="metalrt-marker-$$"
+MARKER_FILE="${SCRATCH_BASE}/marker"
+
+# Dark-side env: dispatch's DB helpers no-op on a nonexistent path; in-pane
+# hook curls die instantly on a dead port. Exported here for harness-invoked
+# dispatch, and stamped into the session env for everything inside the panes.
+DEAD_DB="/nonexistent/metalrt-no-db.sqlite"
+DEAD_API="http://127.0.0.1:9"
+export TOKEN_API_DB="$DEAD_DB"
+export TOKEN_API_URL="$DEAD_API"
+
+err() { echo "metal-restart-sandbox: $*" >&2; }
+
+pane_id_for() {
+    # physical %id of pane stamped metalrt:<slot>
+    local slot="$1" line pane label
+    while IFS=$'\t' read -r pane label; do
+        [[ "$label" == "${SESSION}:${slot}" ]] && { printf '%s' "$pane"; return 0; }
+    done < <(tmux list-panes -s -t "$SESSION" -F $'#{pane_id}\t#{@PANE_ID}')
+    return 1
+}
+
+wait_for_agent() {
+    # Block until metal-observe resolves <slot> to <engine> (or timeout).
+    local slot="$1" engine="$2" timeout="${3:-90}" waited=0
+    while (( waited < timeout )); do
+        if "$TMUXCTL" metal-observe --session "$SESSION" --format json 2>/dev/null \
+            | python3 -c "
+import json, sys
+obs = json.load(sys.stdin)
+for o in obs:
+    if o['pane_label'] == '${SESSION}:${slot}' and o['engine'] == '${engine}' and o['resume']:
+        sys.exit(0)
+sys.exit(1)
+"; then
+            return 0
+        fi
+        sleep 3
+        waited=$(( waited + 3 ))
+    done
+    err "timed out waiting for ${engine} in ${SESSION}:${slot}"
+    return 1
+}
+
+resume_id_for() {
+    local slot="$1"
+    "$TMUXCTL" metal-observe --session "$SESSION" --format json \
+        | python3 -c "
+import json, sys
+for o in json.load(sys.stdin):
+    if o['pane_label'] == '${SESSION}:${slot}' and o['resume']:
+        print(o['resume']['resume_id'])
+        sys.exit(0)
+sys.exit(1)
+"
+}
+
+cmd_up() {
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        err "session $SESSION already exists — run 'down' first"
+        exit 70
+    fi
+    mkdir -p "$SCRATCH_CLAUDE" "$SCRATCH_CODEX"
+    echo "$MARKER" > "$MARKER_FILE"
+
+    # No session-group, dark env baked into the session.
+    tmux new-session -d -s "$SESSION" -n "$SESSION" -c "$SCRATCH_BASE" \
+        -e "TOKEN_API_DB=$DEAD_DB" -e "TOKEN_API_URL=$DEAD_API"
+    tmux set-environment -t "$SESSION" TOKEN_API_DB "$DEAD_DB"
+    tmux set-environment -t "$SESSION" TOKEN_API_URL "$DEAD_API"
+    tmux split-window -d -t "${SESSION}:1" -c "$SCRATCH_BASE"
+    tmux split-window -d -t "${SESSION}:1" -c "$SCRATCH_BASE"
+    tmux select-layout -t "${SESSION}:1" even-horizontal
+
+    local panes=() pane
+    while IFS= read -r pane; do panes+=("$pane"); done \
+        < <(tmux list-panes -t "${SESSION}:1" -F '#{pane_id}')
+    [[ ${#panes[@]} -eq 3 ]] || { err "expected 3 panes, got ${#panes[@]}"; exit 71; }
+    tmux set-option -p -t "${panes[0]}" @PANE_ID "${SESSION}:A"
+    tmux set-option -p -t "${panes[1]}" @PANE_ID "${SESSION}:B"
+    tmux set-option -p -t "${panes[2]}" @PANE_ID "${SESSION}:C"
+
+    echo "launching claude into ${SESSION}:A (${panes[0]}) cwd=$SCRATCH_CLAUDE"
+    "$DISPATCH" --direct --no-worktree --engine claude --dir "$SCRATCH_CLAUDE" \
+        --pane "${panes[0]}" \
+        --prompt "Sandbox check. Reply with exactly: ${MARKER}. Then wait for instructions."
+
+    echo "launching codex into ${SESSION}:B (${panes[1]}) cwd=$SCRATCH_CODEX"
+    "$DISPATCH" --direct --no-worktree --engine codex --dir "$SCRATCH_CODEX" \
+        --pane "${panes[1]}" \
+        --prompt "Sandbox check. Reply with exactly: ${MARKER}. Then wait for instructions."
+
+    echo "waiting for transcripts to materialize…"
+    wait_for_agent A claude
+    wait_for_agent B codex
+    echo "sandbox up:"
+    cmd_state
+}
+
+cmd_state() {
+    "$TMUXCTL" metal-observe --session "$SESSION" "${@}"
+}
+
+cmd_down() {
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    echo "session $SESSION killed (scratch kept at $SCRATCH_BASE)"
+}
+
+cmd_verify() {
+    tmux has-session -t "$SESSION" 2>/dev/null || { err "no $SESSION session — run 'up' first"; exit 70; }
+    local marker pre_claude pre_codex post_claude post_codex
+    marker="$(cat "$MARKER_FILE" 2>/dev/null || echo "")"
+
+    echo "── pre-restart state ──"
+    cmd_state
+    pre_claude="$(resume_id_for A)" || { err "pane A did not resolve to a resumable claude"; exit 72; }
+    pre_codex="$(resume_id_for B)" || { err "pane B did not resolve to a resumable codex"; exit 72; }
+    echo "pre:  claude=${pre_claude}  codex=${pre_codex}"
+
+    echo "── tmuxctl metal-restart --session ${SESSION} ──"
+    "$TMUXCTL" metal-restart --session "$SESSION"
+
+    echo "── waiting for agents to re-attach ──"
+    wait_for_agent A claude 120
+    wait_for_agent B codex 120
+
+    post_claude="$(resume_id_for A)"
+    post_codex="$(resume_id_for B)"
+    echo "post: claude=${post_claude}  codex=${post_codex}"
+
+    local failures=0
+
+    if [[ "$post_claude" == "$pre_claude" ]]; then
+        echo "PASS claude: same transcript (${pre_claude})"
+    else
+        echo "FAIL claude: transcript changed ${pre_claude} -> ${post_claude}"
+        failures=$(( failures + 1 ))
+    fi
+    if [[ "$post_codex" == "$pre_codex" ]]; then
+        echo "PASS codex: same transcript (${pre_codex})"
+    else
+        echo "FAIL codex: transcript changed ${pre_codex} -> ${post_codex}"
+        failures=$(( failures + 1 ))
+    fi
+
+    # History-intact evidence: the pre-restart marker phrase must live in the
+    # transcript each pane is bound to NOW (same file or a resume-fork carrying
+    # full history — either way the conversation survived the restart).
+    if [[ -n "$marker" ]]; then
+        local claude_slug claude_transcript
+        claude_slug="$(printf '%s' "$SCRATCH_CLAUDE" | tr '/.' '-')"
+        claude_transcript="$HOME/.claude/projects/${claude_slug}/${post_claude}.jsonl"
+        if [[ -f "$claude_transcript" ]] && grep -q "$marker" "$claude_transcript"; then
+            echo "PASS claude: marker '$marker' present in bound transcript"
+        else
+            echo "FAIL claude: marker missing from $claude_transcript"
+            failures=$(( failures + 1 ))
+        fi
+        local codex_rollout
+        codex_rollout="$(find "$HOME/.codex/sessions" -name "rollout-*-${post_codex}.jsonl" 2>/dev/null | head -1)"
+        if [[ -n "$codex_rollout" ]] && grep -q "$marker" "$codex_rollout"; then
+            echo "PASS codex: marker '$marker' present in bound rollout"
+        else
+            echo "FAIL codex: marker missing from ${codex_rollout:-<no rollout>}"
+            failures=$(( failures + 1 ))
+        fi
+    else
+        echo "WARN: no marker file recorded by 'up'; skipping history check"
+    fi
+
+    # Bare shell pane untouched.
+    local c_pane c_cmd
+    if c_pane="$(pane_id_for C)"; then
+        c_cmd="$(tmux display-message -p -t "$c_pane" '#{pane_current_command}')"
+        case "$c_cmd" in
+            bash|zsh|sh) echo "PASS shell: ${SESSION}:C still a bare shell ($c_cmd)" ;;
+            *) echo "FAIL shell: ${SESSION}:C runs $c_cmd"; failures=$(( failures + 1 )) ;;
+        esac
+    else
+        echo "FAIL shell: ${SESSION}:C pane missing"
+        failures=$(( failures + 1 ))
+    fi
+
+    # DB isolation: the dark env must still be what every pane inherits.
+    if tmux show-environment -t "$SESSION" TOKEN_API_DB 2>/dev/null | grep -q "$DEAD_DB"; then
+        echo "PASS isolation: session env pins TOKEN_API_DB to nonexistent path"
+    else
+        echo "FAIL isolation: session TOKEN_API_DB not dark"
+        failures=$(( failures + 1 ))
+    fi
+
+    if (( failures == 0 )); then
+        echo "VERIFY PASS: both engines persisted across metal-restart, DB-free"
+        return 0
+    fi
+    echo "VERIFY FAIL: $failures check(s) failed"
+    return 1
+}
+
+case "${1:-}" in
+    up)     shift; cmd_up "$@" ;;
+    down)   shift; cmd_down "$@" ;;
+    state)  shift; cmd_state "$@" ;;
+    verify) shift; cmd_verify "$@" ;;
+    *)      err "usage: metal-restart-sandbox up|state|verify|down"; exit 64 ;;
+esac
