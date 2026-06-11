@@ -147,6 +147,33 @@ def _has_flag(args: list[str], flag: str) -> bool:
     return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
 
 
+def _camera_mutating(args: list[str] | tuple[str, ...]) -> bool:
+    """Whether a resolved tmux command can move the client's camera.
+
+    Mirrors the command classification in ``_mechanicus_focus_guard_blocks``
+    but answers a different question: not "is this allowed", but "did the
+    wrapped operation displace focus at all". ``preserve_focus`` restores only
+    when this fired during the operation, so a human navigating mid-op is
+    never snapped back to a stale snapshot.
+    """
+    if not args:
+        return False
+    command = args[0]
+    if command == "select-pane":
+        # select-pane -P/-T changes pane style/title, not the active camera.
+        return not any(arg in ("-P", "-T") for arg in args[1:])
+    if command in {"select-window", "switch-client"}:
+        return True
+    if command in {"split-window", "new-window", "join-pane", "break-pane"}:
+        return not _has_flag(args, "-d")
+    if command in {"kill-pane", "kill-window"}:
+        # Killing the active pane/window moves the camera to a neighbor.
+        return True
+    if command == "resize-pane":
+        return _has_flag(args, "-Z")
+    return False
+
+
 def _tmux_stderr_target(*, allow_failure: bool):
     # allow_failure callers intentionally tolerate tmux errors and almost never
     # consume stderr. Do not spend a second pipe for stderr; the live legion:new
@@ -171,6 +198,10 @@ class TmuxAdapter:
         # Last structured suppression result from the universal send gate, for
         # callers/tests that want to inspect why a send was a silent no-op.
         self.last_send_gate_result: dict | None = None
+        # Monotonic count of camera-mutating commands executed through run().
+        # preserve_focus snapshots it to decide whether the wrapped operation
+        # displaced the camera (restore) or the human moved it (cede).
+        self.focus_mutation_count = 0
 
     def _resolve_pane_target_arg(self, target: str) -> str:
         if not _looks_like_custom_pane_target(target):
@@ -288,6 +319,8 @@ class TmuxAdapter:
         resolved_args = self._resolve_tmux_args(args_tuple)
         if self._mechanicus_focus_guard_blocks(resolved_args):
             return ""
+        if _camera_mutating(resolved_args):
+            self.focus_mutation_count += 1
         # Every send through run() is automated by construction (see this method's
         # docstring): stamp the target pane so compute_work_state discounts the
         # woken agent's reflex activity from productivity. Resolved args carry the

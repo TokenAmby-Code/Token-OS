@@ -497,7 +497,6 @@ def apply_pane_tint(
 
         if str(cli_lib) not in sys.path:
             sys.path.insert(0, str(cli_lib))
-        from tmuxctl.focus_guard import preserve_focus
         from tmuxctl.tmux_adapter import TmuxAdapter
     except Exception as exc:  # tmuxctl unavailable (e.g. non-tmux host)
         logger.warning("pane tint: tmuxctl adapter unavailable (%s)", exc)
@@ -514,8 +513,9 @@ def apply_pane_tint(
         ).strip()
         if voice_locked == "1":
             return
-        with preserve_focus(adapter, source=source, attempted_target=tmux_pane):
-            adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
+        # select-pane -P is camera-neutral (style only) — no focus snapshot or
+        # restore needed around it.
+        adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
     except Exception as exc:
         logger.warning("pane tint failed for %s (bg=%s): %s", tmux_pane, bg, exc)
 
