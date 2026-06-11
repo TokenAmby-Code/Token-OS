@@ -213,6 +213,9 @@ PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "mechanicus", "Mechanicus", "primarch", None, None, "#300808", "#8b1a1a", None, None, None
     ),
+    PersonaSeed(
+        "malcador", "Malcador", "primarch", None, None, "#302810", "#8a7a4a", None, None, None
+    ),
 )
 
 PERSONA_SEEDS: tuple[PersonaSeed, ...] = (
