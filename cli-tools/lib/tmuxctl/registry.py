@@ -11,14 +11,29 @@ from __future__ import annotations
 from .enums import InstanceStatus
 from .models import InstanceRegistryEntry, InstanceRegistrySnapshot
 
+# /api/instances serves the token-api status vocabulary (instance_registry.py
+# VALID_STATUSES), which renames "processing" to "working" and adds the
+# mid-conversation states below. Anything unrecognized falls to UNKNOWN, and
+# UNKNOWN instances are not resumable — so an unmapped live status silently
+# drops the instance from every restart plan.
+_ACTIVE_STATUSES = {
+    "processing",
+    "working",
+    "questioning",
+    "preplanning",
+    "planning",
+    "compacting",
+    "reviewing",
+}
+
 
 def normalize_instance_status(value: str | None) -> InstanceStatus:
     if not value:
         return InstanceStatus.UNKNOWN
     raw = value.strip().lower().replace("-", "_")
-    if raw == "processing":
+    if raw in _ACTIVE_STATUSES:
         return InstanceStatus.PROCESSING
-    if raw == "idle":
+    if raw in {"idle", "victorious"}:
         return InstanceStatus.IDLE
     if raw == "stopped":
         return InstanceStatus.STOPPED
