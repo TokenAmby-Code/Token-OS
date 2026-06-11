@@ -49,6 +49,12 @@
 		<string>40</string>
 		<key>GC_ETIME_MIN</key>
 		<string>30</string>
+		<key>GC_NAS_PATH</key>
+		<string>/Volumes/Imperium</string>
+		<key>GC_NAS_ETIME_MIN</key>
+		<string>10</string>
+		<key>GC_ANCIENT_MIN</key>
+		<string>60</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>/Users/tokenclaw/.claude/process-gc-watchdog-stdout.log</string>
