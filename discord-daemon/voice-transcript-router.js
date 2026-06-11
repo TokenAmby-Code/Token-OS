@@ -46,6 +46,7 @@ const VOICE_PROCESSING_OPTION = '@DISCORD_VOICE_PROCESSING';
 const TMUX_RESOLVE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_RESOLVE_TIMEOUT_MS || 1500);
 const TMUX_WRITE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_WRITE_TIMEOUT_MS || 8000);
 const TMUX_COMMAND_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_COMMAND_TIMEOUT_MS || 3000);
+const TMUX_LIST_DELIMITER = '|';
 
 function execFileAsync(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -169,7 +170,8 @@ export function resolveStaticVoiceTargetToPane(target, {
       'list-panes',
       '-a',
       '-F',
-      '#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{@PANE_ID}',
+      `#{session_name}${TMUX_LIST_DELIMITER}#{window_index}${TMUX_LIST_DELIMITER}` +
+      `#{pane_index}${TMUX_LIST_DELIMITER}#{pane_id}${TMUX_LIST_DELIMITER}#{@PANE_ID}`,
     ], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
@@ -179,7 +181,7 @@ export function resolveStaticVoiceTargetToPane(target, {
     const fallback = [];
     for (const line of out.split(/\r?\n/)) {
       if (!line) continue;
-      const [sessionName, win, paneIndex, pane, paneMarker] = line.split('\t', 5);
+      const [sessionName, win, paneIndex, pane, paneMarker] = line.split(TMUX_LIST_DELIMITER, 5);
       if (sessionName !== 'main' || win !== spec.windowIndex || !pane?.startsWith('%')) continue;
       if (!paneExistsFn(pane)) continue;
       const index = Number.parseInt(paneIndex || '9999', 10);
