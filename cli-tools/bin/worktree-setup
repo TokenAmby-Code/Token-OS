@@ -49,6 +49,7 @@ SKIP_SYNC=false
 NO_TRANSPLANT=false
 REQUIRE_FREE=false
 FORCE=false
+RESUME=false
 ALLOW_PROTECTED_BRANCH=false
 PROJECT="$(detect_default_project)"
 INIT_MODE=false
@@ -72,6 +73,9 @@ Options:
   --no-transplant       Skip session transplant (for subagents or non-interactive use)
   --require-free        Claim the branch atomically; refuse if a live worktree
                         already holds it (1 branch = 1 worktree = 1 PR)
+  --resume              Finish an interrupted setup: if the worktree already
+                        holds this branch, skip creation and re-run the
+                        remaining (idempotent) steps
   --allow-protected-branch
                         Admin escape hatch: allow creating main/master worktrees.
                         Normal agents must not use main/master as work targets.
@@ -265,6 +269,10 @@ while [[ $# -gt 0 ]]; do
             REQUIRE_FREE=true
             shift
             ;;
+        --resume)
+            RESUME=true
+            shift
+            ;;
         --allow-protected-branch|--allow-main-worktree|--admin-readonly-main)
             ALLOW_PROTECTED_BRANCH=true
             shift
@@ -325,10 +333,33 @@ fi
 
 WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
+# Resume: an interrupted setup (SIGKILL mid-sync, dropped SSH) leaves a real
+# worktree with some later steps missing (secrets, port, hooks, venvs). With
+# --resume, if the directory is already this branch's checkout, skip creation
+# and re-run every remaining step — they are all idempotent. Resume is explicit
+# (not automatic) because dispatch relies on the existing-dir refusal to keep
+# 1 branch = 1 worktree = 1 PR: auto-resume would enter a live agent's worktree.
+RESUME_MODE=false
+if [[ -d "$WORKTREE_DIR" ]]; then
+    _existing_branch="$(git -C "$WORKTREE_DIR" branch --show-current 2>/dev/null || true)"
+    if [[ "$RESUME" == "true" && "$_existing_branch" == "$BRANCH_NAME" ]]; then
+        RESUME_MODE=true
+        log_warn "Worktree for '$BRANCH_NAME' already exists — resuming setup (interrupted run?)"
+    elif [[ "$RESUME" == "true" ]]; then
+        log_error "Cannot resume: $WORKTREE_DIR holds '${_existing_branch:-not a git worktree}', not '$BRANCH_NAME'"
+        exit 1
+    else
+        log_error "Directory already exists: $WORKTREE_DIR"
+        log_error "If a previous setup was interrupted, re-run with --resume to finish the remaining steps."
+        exit 1
+    fi
+fi
+
 # Per-branch claim (Gap 1, D1/D2): with --require-free, serialize the create
 # race under a local-FS lock, then refuse a 2nd worktree on a branch already
 # checked out in a live worktree (1 branch = 1 worktree = 1 PR) unless --force.
 # The lock is held until exit, so it also covers the `git worktree add` below.
+# A claim held by our own WORKTREE_DIR is the resume case, not a conflict.
 if [[ "$REQUIRE_FREE" == "true" ]]; then
     if ! acquire_claim_lock "${PROJECT}-${BRANCH_NAME}" 10; then
         log_error "Could not acquire worktree claim lock for ${PROJECT}/${BRANCH_NAME} (another worktree-setup creating it?)"
@@ -337,65 +368,53 @@ if [[ "$REQUIRE_FREE" == "true" ]]; then
     EXISTING_WT="$(git --git-dir="$BARE_REPO" worktree list --porcelain 2>/dev/null \
         | awk -v b="refs/heads/$BRANCH_NAME" '/^worktree /{p=substr($0,10)} /^branch /{if (substr($0,8)==b) print p}' \
         || true)"
-    if [[ -n "$EXISTING_WT" && "$FORCE" != "true" ]]; then
+    _own_resume_claim=false
+    if [[ "$RESUME_MODE" == "true" && "$EXISTING_WT" == "$WORKTREE_DIR" ]]; then
+        _own_resume_claim=true
+    fi
+    if [[ -n "$EXISTING_WT" && "$_own_resume_claim" != "true" && "$FORCE" != "true" ]]; then
         log_error "Branch '$BRANCH_NAME' is already claimed by a live worktree: $EXISTING_WT"
         log_error "1 branch = 1 worktree = 1 PR. Pass --force to override."
         exit 1
     fi
 fi
 
-# Check if worktree already exists
-if [[ -d "$WORKTREE_DIR" ]]; then
-    log_error "Directory already exists: $WORKTREE_DIR"
-    exit 1
-fi
+# Check if branch exists (if --existing not specified). Skipped on resume:
+# the branch necessarily exists and is checked out in WORKTREE_DIR.
+if [[ "$RESUME_MODE" == "false" ]]; then
+    BRANCH_EXISTS=$(git --git-dir="$BARE_REPO" branch --list "$BRANCH_NAME" | wc -l)
+    REMOTE_EXISTS=$(git --git-dir="$BARE_REPO" branch -r --list "origin/$BRANCH_NAME" | wc -l)
 
-# Check if branch exists (if --existing not specified)
-BRANCH_EXISTS=$(git --git-dir="$BARE_REPO" branch --list "$BRANCH_NAME" | wc -l)
-REMOTE_EXISTS=$(git --git-dir="$BARE_REPO" branch -r --list "origin/$BRANCH_NAME" | wc -l)
-
-if [[ "$USE_EXISTING_BRANCH" == "false" ]]; then
-    if [[ $BRANCH_EXISTS -gt 0 ]] || [[ $REMOTE_EXISTS -gt 0 ]]; then
-        if [[ "$FORCE" == "true" ]]; then
-            log_warn "Branch '$BRANCH_NAME' already exists; --force → reusing it"
-            USE_EXISTING_BRANCH=true
-        else
-            log_error "Branch '$BRANCH_NAME' already exists. Use --existing to use it."
+    if [[ "$USE_EXISTING_BRANCH" == "false" ]]; then
+        if [[ $BRANCH_EXISTS -gt 0 ]] || [[ $REMOTE_EXISTS -gt 0 ]]; then
+            if [[ "$FORCE" == "true" ]]; then
+                log_warn "Branch '$BRANCH_NAME' already exists; --force → reusing it"
+                USE_EXISTING_BRANCH=true
+            else
+                log_error "Branch '$BRANCH_NAME' already exists. Use --existing to use it."
+                exit 1
+            fi
+        fi
+    else
+        if [[ $BRANCH_EXISTS -eq 0 ]] && [[ $REMOTE_EXISTS -eq 0 ]]; then
+            log_error "Branch '$BRANCH_NAME' does not exist"
             exit 1
         fi
     fi
-else
-    if [[ $BRANCH_EXISTS -eq 0 ]] && [[ $REMOTE_EXISTS -eq 0 ]]; then
-        log_error "Branch '$BRANCH_NAME' does not exist"
-        exit 1
-    fi
 fi
 
-# Identify files to copy from secrets dir
+# Normalize: strip any trailing slash so the prefix strip below is reliable.
+SECRETS_DIR="${SECRETS_DIR%/}"
+
+# Identify files to copy from secrets dir: mirror every regular file at its
+# relative path. SECRETS_DIR *is* the definition of what a worktree needs —
+# pattern-matching specific layouts here silently skipped projects whose
+# secrets live elsewhere (Token-OS: config.json + token-api/.env were never
+# copied because only .env / widget/.env.* / deploy/*.json were recognized).
 FILES_TO_COPY=()
-
-# Root .env
-if [[ -f "$SECRETS_DIR/.env" ]]; then
-    FILES_TO_COPY+=(".env")
-fi
-
-# widget/.env.* files
-if [[ -d "$SECRETS_DIR/widget" ]]; then
-    for envfile in "$SECRETS_DIR"/widget/.env.*; do
-        if [[ -f "$envfile" ]]; then
-            FILES_TO_COPY+=("widget/$(basename "$envfile")")
-        fi
-    done
-fi
-
-# deploy/*.json files (service account credentials)
-if [[ -d "$SECRETS_DIR/deploy" ]]; then
-    for jsonfile in "$SECRETS_DIR"/deploy/*.json; do
-        if [[ -f "$jsonfile" ]]; then
-            FILES_TO_COPY+=("deploy/$(basename "$jsonfile")")
-        fi
-    done
-fi
+while IFS= read -r -d '' _secret_file; do
+    FILES_TO_COPY+=("${_secret_file#"$SECRETS_DIR/"}")
+done < <(find "$SECRETS_DIR" -type f ! -name '.DS_Store' -print0 2>/dev/null)
 
 # Show plan
 echo ""
@@ -470,23 +489,39 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 # Execute
-log_info "Creating worktree..."
-# Explicit --force (Gap 1 claim override) maps through, and prunes any stale
-# worktree registration left by a removed-but-unpruned dir so the re-add succeeds.
-# main/master are refused above unless --allow-protected-branch is passed.
-FORCE_FLAG=""
-if [[ "$FORCE" == "true" ]]; then
-    FORCE_FLAG="--force"
-fi
-if [[ "$FORCE" == "true" ]]; then
-    git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
-fi
-if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then
-    git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG "$WORKTREE_DIR" "$BRANCH_NAME"
+if [[ "$RESUME_MODE" == "true" ]]; then
+    log_info "Worktree already present — skipping creation, re-running remaining steps..."
 else
-    git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG -b "$BRANCH_NAME" "$WORKTREE_DIR"
+    log_info "Creating worktree..."
+    # Explicit --force (Gap 1 claim override) maps through, and prunes any stale
+    # worktree registration left by a removed-but-unpruned dir so the re-add succeeds.
+    # main/master are refused above unless --allow-protected-branch is passed.
+    FORCE_FLAG=""
+    if [[ "$FORCE" == "true" ]]; then
+        FORCE_FLAG="--force"
+    fi
+    if [[ "$FORCE" == "true" ]]; then
+        git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
+    fi
+    if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then
+        git --git-dir="$BARE_REPO" worktree add ${FORCE_FLAG:+"$FORCE_FLAG"} "$WORKTREE_DIR" "$BRANCH_NAME"
+    else
+        # Base new branches on the freshest origin default branch, not bare HEAD.
+        # Local CD normally keeps bare main current, but if a deploy was missed
+        # (machine asleep, webhook drop) bare HEAD is silently stale and every
+        # branch cut from it starts behind — the classic rebase surprise.
+        BASE_REF="HEAD"
+        DEFAULT_BRANCH="$(git --git-dir="$BARE_REPO" symbolic-ref --short HEAD 2>/dev/null || echo main)"
+        if git --git-dir="$BARE_REPO" fetch --quiet origin "refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
+            BASE_REF="FETCH_HEAD"
+            log_success "Fetched origin/$DEFAULT_BRANCH — basing new branch on it"
+        else
+            log_warn "Could not fetch origin/$DEFAULT_BRANCH — basing on local bare HEAD (may be stale)"
+        fi
+        git --git-dir="$BARE_REPO" worktree add ${FORCE_FLAG:+"$FORCE_FLAG"} -b "$BRANCH_NAME" "$WORKTREE_DIR" "$BASE_REF"
+    fi
+    log_success "Worktree created at $WORKTREE_DIR"
 fi
-log_success "Worktree created at $WORKTREE_DIR"
 
 # Copy files from secrets dir
 if [[ ${#FILES_TO_COPY[@]} -gt 0 ]]; then

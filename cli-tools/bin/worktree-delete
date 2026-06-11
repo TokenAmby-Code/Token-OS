@@ -41,6 +41,8 @@ detect_default_project() {
 # Defaults
 DRY_RUN=false
 DELETE_BRANCH=false
+DELETE_REMOTE=false
+FORCE=false
 PROJECT="$(detect_default_project)"
 
 usage() {
@@ -53,21 +55,28 @@ Arguments:
   branch-name         Branch/worktree to remove
 
 Options:
-  -b, --delete-branch  Also delete the local branch
-  -p, --project NAME   Project config to use (default: askCivic)
-  -n, --dry-run        Show what would happen without making changes
-  -h, --help           Show this help message
+  -b, --delete-branch   Also delete the local branch (refused if unmerged,
+                        unless --force)
+  --delete-remote       Also delete the branch on origin (best-effort)
+  -f, --force           Delete the local branch even if unmerged
+  -p, --project NAME    Project config to use (default: askCivic)
+  -n, --dry-run         Show what would happen without making changes
+  -h, --help            Show this help message
 
 Cleanup performed:
   - Kills any Claude session running from the worktree (ghost prevention)
+  - Frees the worktree's assigned dev port (returned to pool)
+  - Prunes port-registry entries whose worktree dirs are gone
+  - Archives the worktree entry in its session doc (if registered)
   - Removes the worktree directory
   - Prunes git worktree references
   - Removes the cd quick alias (~/.cd_quick_aliases)
-  - Optionally deletes the local branch (-b)
+  - Optionally deletes the local branch (-b) and remote branch (--delete-remote)
 
 Examples:
   worktree-delete feature-auth              # Remove worktree, keep branch
   worktree-delete feature-auth -b           # Also delete the branch
+  worktree-delete feature-auth -b --delete-remote   # Full one-shot teardown
   worktree-delete feature-auth --project Scripts
   worktree-delete feature-auth --dry-run
 EOF
@@ -114,6 +123,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help) usage ;;
         -n|--dry-run) DRY_RUN=true; shift ;;
         -b|--delete-branch) DELETE_BRANCH=true; shift ;;
+        --delete-remote) DELETE_REMOTE=true; shift ;;
+        -f|--force) FORCE=true; shift ;;
         -p|--project)
             if [[ $# -lt 2 ]]; then
                 log_error "--project requires a name"
@@ -174,6 +185,7 @@ echo "  Bare repo:     $BARE_REPO"
 echo "  Branch:        $BRANCH_NAME"
 echo "  Worktree:      $WORKTREE_DIR"
 echo "  Delete branch: $(if $DELETE_BRANCH; then echo "yes"; else echo "no"; fi)"
+echo "  Delete remote: $(if $DELETE_REMOTE; then echo "yes"; else echo "no"; fi)"
 echo "  CD alias:      $(if $HAS_ALIAS; then echo "will remove"; else echo "none found"; fi)"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -184,19 +196,38 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
+# Find a Claude process whose cwd is the worktree. /proc on Linux; pgrep+lsof
+# on macOS, where /proc does not exist and the old loop silently never matched.
+find_ghost_claude() {
+    local worktree_dir="$1" pid comm cwd
+    if [[ -d /proc ]]; then
+        for entry in /proc/[0-9]*; do
+            pid=$(basename "$entry")
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+            [[ "$comm" == "claude" ]] || continue
+            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+            if [[ "${cwd%/}" == "${worktree_dir%/}" ]]; then
+                echo "$pid"
+                return 0
+            fi
+        done
+        return 0
+    fi
+    if command -v pgrep &>/dev/null && command -v lsof &>/dev/null; then
+        for pid in $(pgrep -x claude 2>/dev/null || true); do
+            cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n1)
+            if [[ -n "$cwd" && "${cwd%/}" == "${worktree_dir%/}" ]]; then
+                echo "$pid"
+                return 0
+            fi
+        done
+    fi
+    return 0
+}
+
 # Kill any Claude session running from the worktree (ghost prevention)
 if [[ -d "$WORKTREE_DIR" ]]; then
-    GHOST_PID=""
-    for entry in /proc/[0-9]*; do
-        pid=$(basename "$entry")
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
-        [[ "$comm" == "claude" ]] || continue
-        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
-        if [[ "${cwd%/}" == "${WORKTREE_DIR%/}" ]]; then
-            GHOST_PID="$pid"
-            break
-        fi
-    done
+    GHOST_PID="$(find_ghost_claude "$WORKTREE_DIR")"
 
     if [[ -n "$GHOST_PID" ]]; then
         log_warn "Claude session running from worktree (PID $GHOST_PID)"
@@ -224,11 +255,26 @@ if command -v free_port &>/dev/null; then
     fi
 fi
 
+# Opportunistically reap registry entries for worktrees deleted out-of-band
+# (rm -rf'd without worktree-delete) so the pool can't exhaust on ghosts.
+if command -v prune_ports &>/dev/null; then
+    PRUNED=$(prune_ports 2>/dev/null || true)
+    if [[ -n "$PRUNED" ]]; then
+        while IFS= read -r line; do
+            log_success "Pruned stale port ${line%% *} (${line#* } is gone)"
+        done <<< "$PRUNED"
+    fi
+fi
+
 # Archive this worktree's entry in its session doc (Phase 3 registry), BEFORE the
 # directory (and its .worktree.env) is removed. Entries are flipped active→archived,
 # never deleted. Best-effort: unreachable token-api never blocks teardown.
 if [[ -f "$WORKTREE_DIR/.worktree.env" ]]; then
-    _SESSION_DOC_ID="$(grep -E '^SESSION_DOC_ID=' "$WORKTREE_DIR/.worktree.env" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    # `|| true` is load-bearing: under set -euo pipefail, a .worktree.env without
+    # a SESSION_DOC_ID line (every dispatch-created worktree) made grep's rc=1
+    # abort the whole teardown here — after the port was freed, before the
+    # worktree/branch/alias were removed. Half-deleted worktrees ensued.
+    _SESSION_DOC_ID="$(grep -E '^SESSION_DOC_ID=' "$WORKTREE_DIR/.worktree.env" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
     if [[ -n "$_SESSION_DOC_ID" ]]; then
         _wt_api="${TOKEN_API_URL:-http://localhost:7777}"
         _wt_body=$(printf '{"action":"archive","path":"%s"}' "$WORKTREE_DIR")
@@ -257,11 +303,31 @@ fi
 # Delete branch if requested
 if [[ "$DELETE_BRANCH" == "true" ]]; then
     if git --git-dir="$BARE_REPO" branch --list "$BRANCH_NAME" | grep -q .; then
+        # Merged-guard: refuse to force-delete a branch whose commits are not
+        # reachable from the default branch (squash-merged or genuinely unmerged
+        # work) unless --force. Protects at-scale cleanup sweeps from data loss.
+        DEFAULT_BRANCH="$(git --git-dir="$BARE_REPO" symbolic-ref --short HEAD 2>/dev/null || echo main)"
+        if ! git --git-dir="$BARE_REPO" merge-base --is-ancestor "$BRANCH_NAME" "$DEFAULT_BRANCH" 2>/dev/null \
+            && [[ "$FORCE" != "true" ]]; then
+            log_error "Branch '$BRANCH_NAME' is not merged into '$DEFAULT_BRANCH' — refusing to delete it"
+            log_error "If the work is preserved elsewhere (squash-merge, salvage), pass --force"
+            exit 65
+        fi
         log_info "Deleting local branch..."
         git --git-dir="$BARE_REPO" branch -D "$BRANCH_NAME"
         log_success "Branch deleted: $BRANCH_NAME"
     else
         log_warn "Branch '$BRANCH_NAME' not found locally (may already be deleted)"
+    fi
+fi
+
+# Delete the remote branch if requested (best-effort: a branch that only ever
+# lived locally, or was already pruned on GitHub, must not fail the teardown).
+if [[ "$DELETE_REMOTE" == "true" ]]; then
+    if git --git-dir="$BARE_REPO" push origin --delete "$BRANCH_NAME" 2>/dev/null; then
+        log_success "Remote branch deleted: origin/$BRANCH_NAME"
+    else
+        log_warn "Remote branch origin/$BRANCH_NAME not deleted (absent, or push failed)"
     fi
 fi
 
