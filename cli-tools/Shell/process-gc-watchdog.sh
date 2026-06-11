@@ -10,22 +10,32 @@
 # kills ONLY processes that are simultaneously orphaned, on a search-command
 # allowlist, AND egregiously stuck (high CPU + long-lived).
 #
+# 2026-06-10 tightening (second NAS-ugrep lag incident): the ppid==1 orphan gate
+# MISSED six ugreps spinning 3-4h at ~98% CPU on /Volumes/Imperium/runtimes —
+# their `zsh -c source ~/.claude/shell-snapshots/...` wrappers stayed alive, so
+# they were never orphans. Two rules added; both exploit a hard invariant: the
+# Claude Bash/Grep tool call timeout caps at 600s, so NO live agent turn is ever
+# awaiting a search older than 10 minutes. Both exempt processes with a
+# controlling TTY, so a human's interactive foreground search is never touched.
+#
+# Rules (a process is reaped if ANY rule matches; allowlist applies to all):
+#   A. orphan      — ppid==1            AND cpu > GC_CPU_MIN AND etime > GC_ETIME_MIN
+#   B. nas-search  — args match GC_NAS_PATH AND tty=?? AND etime > GC_NAS_ETIME_MIN
+#                    (no CPU gate: an SMB-stalled grep can sit in I/O-wait at low
+#                    CPU and is just as dead; 10 min >> the 600s tool ceiling)
+#   C. ancient     — tty=??             AND cpu > GC_CPU_MIN AND etime > GC_ANCIENT_MIN
+#                    (catch-all for non-NAS stuck searches with live wrappers)
+#
 # Safety model (conservative by construction):
-#   - ppid==1 is the "not active work" guarantee: a search spawned by a live agent
-#     turn has its bash/claude as parent. Only a search whose spawning turn DIED
-#     reparents to launchd. So this never touches a search a running agent awaits.
 #   - Positive allowlist of command basenames ONLY (GC_PATTERN). This inherently
 #     excludes every long-lived daemon: node (Discord daemon, ppid=1), python/uvicorn
 #     (token-api, ppid=1), tmux, claude, codex, Obsidian. Build tools (node/tsc/
 #     webpack/vite/esbuild) are deliberately NOT in the default set — see the
 #     commented opt-in below — because they overlap with long-lived dev servers.
-#   - BOTH gates must hold: %CPU > GC_CPU_MIN AND elapsed > GC_ETIME_MIN minutes.
-#     The incident was 150-170% CPU for hours; this catches that class and ignores
-#     brief or idle processes.
-#
-# All thresholds + the pattern are env-overridable (set in the plist) so tuning
-# needs no code edit. There is no `timeout`/`gtimeout` on this Mac (confirmed
-# absent) and the script does no unbounded work, so nothing is wrapped.
+#   - Rules B/C require NO controlling terminal (tty=??): tool-spawned searches
+#     run detached; a human's interactive search keeps its tty and is exempt.
+#   - Rule thresholds are all env-overridable (set in the plist) so tuning needs
+#     no code edit.
 #
 # Invoked by launchd every 300s via ai.openclaw.process-gc-watchdog.plist.
 #
@@ -53,8 +63,11 @@ if [[ -f "$LOG_FILE" ]] && (( $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) > 200
 fi
 
 # --- Tunables (env-overridable via the plist) -------------------------------
-GC_CPU_MIN="${GC_CPU_MIN:-40}"       # integer %CPU; reap only above this
-GC_ETIME_MIN="${GC_ETIME_MIN:-30}"   # minutes alive; reap only above this
+GC_CPU_MIN="${GC_CPU_MIN:-40}"             # integer %CPU; rules A/C reap only above this
+GC_ETIME_MIN="${GC_ETIME_MIN:-30}"         # minutes alive; rule A (orphan)
+GC_NAS_PATH="${GC_NAS_PATH:-/Volumes/Imperium}"  # rule B: args substring marking a NAS search
+GC_NAS_ETIME_MIN="${GC_NAS_ETIME_MIN:-10}" # minutes alive; rule B (NAS search, tty-less)
+GC_ANCIENT_MIN="${GC_ANCIENT_MIN:-60}"     # minutes alive; rule C (any tty-less search)
 # Positive allowlist of command basenames. Anchored full-match (see GC_RE).
 GC_PATTERN="${GC_PATTERN:-ugrep|rg|ripgrep|grep|egrep|fgrep|find|mdfind}"
 GC_EMIT_EVENTS="${GC_EMIT_EVENTS:-0}"  # 1 = best-effort POST reaps to Token-API
@@ -89,36 +102,63 @@ etime_to_secs() {
 # Best-effort surface a reap in the Token-API events table (guarded, silent).
 emit_event() {
   [[ "$GC_EMIT_EVENTS" == "1" ]] || return 0
-  local pid="$1" cpu="$2" etime="$3" cmd="$4" payload
-  payload=$(printf '{"event_type":"process_gc_reap","details":{"pid":%s,"cpu":"%s","etime":"%s","cmd":"%s","source":"process-gc-watchdog"}}' \
-    "$pid" "$cpu" "$etime" "$cmd")
+  local pid="$1" cpu="$2" etime="$3" cmd="$4" rule="$5" payload
+  payload=$(printf '{"event_type":"process_gc_reap","details":{"pid":%s,"cpu":"%s","etime":"%s","cmd":"%s","rule":"%s","source":"process-gc-watchdog"}}' \
+    "$pid" "$cpu" "$etime" "$cmd" "$rule")
   curl -fsS -m 2 -X POST -H 'Content-Type: application/json' \
     -d "$payload" "http://localhost:7777/api/events/log" >/dev/null 2>&1 || true
 }
 
-# One ps snapshot. Columns: pid ppid %cpu etime comm. `comm` is the executable
-# path (basename stripped below); using process substitution (not a pipe) keeps
-# the counters in this shell so the summary line is accurate.
-scanned=0
-reaped=0
-while read -r pid ppid cpu etime comm; do
-  [[ "$ppid" == "1" ]] || continue
-  base="${comm##*/}"
-  [[ "$base" =~ $GC_RE ]] || continue
-  scanned=$((scanned + 1))
-
-  secs=$(etime_to_secs "$etime")
-  cpu_int="${cpu%.*}"; cpu_int="${cpu_int:-0}"
-  (( secs > GC_ETIME_MIN * 60 && 10#$cpu_int > GC_CPU_MIN )) || continue
-
-  log "REAP pid=$pid cpu=$cpu etime=$etime cmd=$base"
+reap() {
+  local pid="$1" cpu="$2" etime="$3" base="$4" rule="$5"
+  log "REAP rule=$rule pid=$pid cpu=$cpu etime=$etime cmd=$base"
   kill -TERM "$pid" 2>/dev/null || true
   sleep 2
   if kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
   reaped=$((reaped + 1))
-  emit_event "$pid" "$cpu" "$etime" "$base"
-done < <(ps -Ao pid=,ppid=,%cpu=,etime=,comm= 2>/dev/null)
+  emit_event "$pid" "$cpu" "$etime" "$base" "$rule"
+}
+
+# One ps snapshot. Columns: pid ppid %cpu etime tty comm. `comm` is the executable
+# path (basename stripped below); using process substitution (not a pipe) keeps
+# the counters in this shell so the summary line is accurate. Full args are
+# fetched per-candidate only (allowlist hits are rare), keeping the scan cheap.
+scanned=0
+reaped=0
+while read -r pid ppid cpu etime tty comm; do
+  base="${comm##*/}"
+  [[ "$base" =~ $GC_RE ]] || continue
+  scanned=$((scanned + 1))
+
+  secs=$(etime_to_secs "$etime")
+  cpu_int="${cpu%.*}"; cpu_int="${cpu_int:-0}"
+
+  # Rule A: orphan (ppid==1), high CPU, long-lived.
+  if [[ "$ppid" == "1" ]] && (( secs > GC_ETIME_MIN * 60 && 10#$cpu_int > GC_CPU_MIN )); then
+    reap "$pid" "$cpu" "$etime" "$base" orphan
+    continue
+  fi
+
+  # Rules B/C apply only to tty-less processes (tool-spawned, not interactive).
+  [[ "$tty" == "??" ]] || continue
+
+  # Rule B: NAS search past the tool-timeout ceiling — dead by construction,
+  # regardless of parent liveness or CPU (SMB stalls park in I/O-wait).
+  if (( secs > GC_NAS_ETIME_MIN * 60 )); then
+    args=$(ps -ww -o args= -p "$pid" 2>/dev/null || true)
+    if [[ "$args" == *"$GC_NAS_PATH"* ]]; then
+      reap "$pid" "$cpu" "$etime" "$base" nas-search
+      continue
+    fi
+  fi
+
+  # Rule C: any tty-less search spinning hot for an hour+ (live-wrapper variant
+  # of rule A — the 2026-06-10 incident class when the search is NOT on the NAS).
+  if (( secs > GC_ANCIENT_MIN * 60 && 10#$cpu_int > GC_CPU_MIN )); then
+    reap "$pid" "$cpu" "$etime" "$base" ancient
+  fi
+done < <(ps -Ao pid=,ppid=,%cpu=,etime=,tty=,comm= 2>/dev/null)
 
 log "scanned=$scanned reaped=$reaped"
