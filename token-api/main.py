@@ -15843,8 +15843,12 @@ async def cd_restart(request: Request):
         target_env = ""
         if isinstance(sha, str) and sha.strip():
             target_env = f"TOKEN_RESTART_TARGET_SHA={shlex.quote(sha.strip())} "
+        # The env assignment must precede `exec`, not follow it — `exec VAR=x cmd`
+        # makes bash exec a program literally named "VAR=x" (every post-cutover CD
+        # deploy died with `exec: TOKEN_RESTART_TARGET_SHA=...: not found` while
+        # the workflow reported success, 2026-06-11 incident).
         _cd_spawn_detached(
-            ["bash", "-c", f"sleep 2; exec {target_env}{shlex.quote(token_restart)} --sync"],
+            ["bash", "-c", f"sleep 2; {target_env}exec {shlex.quote(token_restart)} --sync"],
             log_name="self-restart",
         )
         _cd_last_restart_spawn = now
