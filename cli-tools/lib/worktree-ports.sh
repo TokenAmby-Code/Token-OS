@@ -14,6 +14,7 @@
 #   free_port   <worktree-dir>    → frees the port and kills its process
 #   lookup_port <worktree-dir>    → echoes assigned port or empty
 #   list_ports                     → dumps the registry as text
+#   prune_ports                    → frees entries whose worktree dir is gone
 
 WORKTREE_PORT_POOL_START=7100
 WORKTREE_PORT_POOL_END=7199
@@ -27,17 +28,41 @@ _wp_ensure_registry() {
 }
 
 # Lock file so concurrent worktree-setup invocations don't both grab 7101.
+# Prefers flock(1) where present (Linux/CI); falls back to an atomic mkdir
+# lock on macOS, where flock is not installed and skipping the lock entirely
+# produced a real duplicate assignment (port 7159 handed to two worktrees).
+# WORKTREE_PORTS_NO_FLOCK forces the portable path (used by tests).
 _wp_with_lock() {
     _wp_ensure_registry
     local lock="${WORKTREE_PORT_REGISTRY}.lock"
-    local fd=9
-    exec 9>"$lock"
-    if command -v flock &>/dev/null; then
-        flock -w 10 "$fd" || { echo "worktree-ports: could not acquire lock" >&2; return 1; }
+    if [[ -z "${WORKTREE_PORTS_NO_FLOCK:-}" ]] && command -v flock &>/dev/null; then
+        exec 9>"$lock"
+        flock -w 10 9 || { echo "worktree-ports: could not acquire lock" >&2; return 1; }
+        "$@"
+        local rc=$?
+        exec 9>&-
+        return "$rc"
     fi
+    # Portable fallback: atomic mkdir lock with bounded wait + stale-owner steal.
+    local lockdir="${lock}d"
+    local waited=0 owner
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        owner="$(cat "$lockdir/pid" 2>/dev/null || true)"
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$lockdir" 2>/dev/null || true
+            continue
+        fi
+        if (( waited >= 100 )); then
+            echo "worktree-ports: could not acquire lock" >&2
+            return 1
+        fi
+        sleep 0.1
+        waited=$(( waited + 1 ))
+    done
+    printf '%s' "$$" > "$lockdir/pid"
     "$@"
     local rc=$?
-    exec 9>&-
+    rm -rf "$lockdir" 2>/dev/null || true
     return "$rc"
 }
 
@@ -104,9 +129,29 @@ _wp_free_inner() {
     echo "$port"
 }
 
+# Drop registry entries whose worktree directory no longer exists (deleted
+# out-of-band, bypassing worktree-delete). Echoes each pruned "port dir" pair.
+# Registry keys are always local worktree dirs, so a missing dir is authoritative.
+_wp_prune_inner() {
+    local key port tmp
+    while IFS= read -r key; do
+        [[ -n "$key" && ! -d "$key" ]] || continue
+        port=$(jq -r --arg k "$key" '.[$k] // empty' "$WORKTREE_PORT_REGISTRY")
+        tmp=$(mktemp)
+        jq --arg k "$key" 'del(.[$k])' \
+            "$WORKTREE_PORT_REGISTRY" > "$tmp" && mv "$tmp" "$WORKTREE_PORT_REGISTRY"
+        echo "$port $key"
+    done < <(jq -r 'keys[]' "$WORKTREE_PORT_REGISTRY" 2>/dev/null)
+    return 0
+}
+
 assign_port() {
     [[ $# -eq 1 ]] || { echo "assign_port <worktree-dir>" >&2; return 1; }
     _wp_with_lock _wp_assign_inner "$1"
+}
+
+prune_ports() {
+    _wp_with_lock _wp_prune_inner
 }
 
 free_port() {
