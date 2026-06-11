@@ -162,10 +162,24 @@ _detect_agent() {
 # plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
-    local body resp rc=0
+    local body resp rc=0 attempt
     body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
-    resp=$(curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
-        -H 'Content-Type: application/json' -d "$body") || rc=$?
+    # preplan is fail-closed: a timed-out subscribe skips the leader insert, so the
+    # whole pick no-ops (the codex live-test symptom). Give the (sometimes slow)
+    # endpoint real headroom (--max-time 8, was 2) and one retry on a transient
+    # curl failure — DNS/connect/timeout/TLS/recv (6/7/28/35/52/55/56) — before
+    # failing closed. A non-transient failure (e.g. HTTP 4xx via -f -> exit 22) is
+    # not retried; it will not improve on a second attempt.
+    for attempt in 1 2; do
+        rc=0
+        resp=$(curl -sf --max-time 8 -X POST "${API_URL}/api/hooks/subscribe" \
+            -H 'Content-Type: application/json' -d "$body") || rc=$?
+        (( rc == 0 )) && break
+        case "$rc" in
+            6|7|28|35|52|55|56) continue ;;  # transient: one retry
+            *) break ;;                      # non-transient: fail now
+        esac
+    done
     if (( rc != 0 )); then
         echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/hooks/subscribe failed (curl exit $rc)" >&2
         return "$rc"
@@ -192,7 +206,9 @@ set_planning_state() {
     [[ -z "$API_URL" ]] && return 0
     local body rc=0
     body="{\"tmux_pane\":$(json_escape "$PANE"),\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-menu\"}"
-    curl -sf --max-time 1 -X POST "${API_URL}/api/planning/state" \
+    # Advisory/non-blocking, but the same slow-endpoint window applies; give it a
+    # little slack (--max-time 3, was 1) so a transient stall does not log-noise.
+    curl -sf --max-time 3 -X POST "${API_URL}/api/planning/state" \
         -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
     if (( rc != 0 )); then
         echo "tmux-plan-menu: set_planning_state POST ${API_URL}/api/planning/state failed (curl exit $rc)" >&2
@@ -222,9 +238,16 @@ _start_prebuffer() {
     _PRESTART_DONE=$(mktemp -t tmux-plan-menu-prestart.XXXXXX 2>/dev/null) || { _PRESTART_DONE=""; return 0; }
     # Write the done-marker ONLY when prompt-start actually reached the prompt
     # start. A failed move must NOT signal "done" — otherwise an insert could
-    # land at the current cursor instead of prompt start.
+    # land at the current cursor instead of prompt start. Capture tmuxctl's stderr
+    # and log a failed move (previously swallowed by `2>&1`, masking half of the
+    # cursor-op failures) so a missed prompt-start is diagnosable from the log.
     ( trap '' HUP
-      if prebuffer_prompt_start >/dev/null 2>&1; then printf 'done' > "$_PRESTART_DONE"; fi ) \
+      local _ps_err
+      if _ps_err="$(prebuffer_prompt_start 2>&1)"; then
+          printf 'done' > "$_PRESTART_DONE"
+      else
+          log_failure "${SELECTION:-prebuffer}" "$(normalize_agent "$AGENT")" prompt-start "prebuffer rc=$? ${_ps_err}"
+      fi ) \
         </dev/null >/dev/null 2>&1 &
 }
 
@@ -253,7 +276,13 @@ _await_prestart() {
 # Relies on _await_prestart having already run (the run_action drain point).
 _ensure_at_prompt_start() {
     (( _PRESTART_OK == 0 )) && return 0
-    prebuffer_prompt_start >/dev/null 2>&1
+    # Capture tmuxctl's stderr and log a failed synchronous prompt-start instead of
+    # swallowing it — so a cursor op that still fails after batching leaves the real
+    # tmux error in the log, not just a silent missed move.
+    local _ps_err
+    if ! _ps_err="$(prebuffer_prompt_start 2>&1)"; then
+        log_failure "${SELECTION:-?}" "${agent:-?}" prompt-start "ensure rc=$? ${_ps_err}"
+    fi
 }
 
 # Post-mortem-grade failure log (log-only; NO notify/TTS — a missing /plan is the
@@ -282,7 +311,7 @@ run_action() {
     set +e
     _await_prestart
 
-    local agent rc text sub_err
+    local agent rc text sub_err pe_err
     agent="$(normalize_agent "$AGENT")"
 
     case "$SELECTION" in
@@ -330,8 +359,11 @@ run_action() {
     esac
 
     # --- generic cursor restore: runs on EVERY path (incl. cancel/shift+tab) ---
+    # Capture tmuxctl's stderr so a residual cursor-op failure carries the REAL tmux
+    # error into the log (the detached action's own stderr goes to /dev/null), not
+    # just an rc — the diagnostic safety net if batching does not fully fix rc=1.
     sleep 0.05
-    move_prompt_end || log_failure "${SELECTION:-?}" "$agent" prompt-end "prompt-end rc=$?"
+    pe_err="$(move_prompt_end 2>&1)" || log_failure "${SELECTION:-?}" "$agent" prompt-end "rc=$? ${pe_err}"
 
     _action_cleanup
 }

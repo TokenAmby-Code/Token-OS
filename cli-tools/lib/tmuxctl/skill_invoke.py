@@ -156,10 +156,14 @@ def move_to_prompt_start(adapter: TmuxAdapter, pane: str, *, page_ups: int = 50)
     column 0. PgUp-at-top is idempotent, so an overshoot is harmless — this lets
     the move be pre-buffered speculatively (while the plan-menu is open) before
     the operator has committed to an action.
+
+    All keys are dispatched in a SINGLE ``send-keys`` subprocess (``PgUp`` x N then
+    ``Home``) rather than one subprocess per key. tmux applies them in order, so the
+    end state is identical, but the live-pane latency (and the per-key send-gate
+    eval) collapses from N+1 calls to one — and there is no mid-loop window for a
+    single key send to fail against a busy pane and abort the whole move.
     """
-    for _ in range(page_ups):
-        adapter.send_keys(pane, "PgUp")
-    adapter.send_keys(pane, "Home")
+    adapter.send_keys(pane, *(["PgUp"] * page_ups), "Home")
 
 
 def insert_text(adapter: TmuxAdapter, pane: str, text: str) -> None:
@@ -183,10 +187,12 @@ def move_to_prompt_end(adapter: TmuxAdapter, pane: str, *, page_downs: int = 50)
     Used as a generic "restore the cursor" step on every plan-menu exit path —
     including cancel — so the speculative ``move_to_prompt_start`` is always
     neutralized and the operator keeps typing where they left off.
+
+    Like :func:`move_to_prompt_start`, the whole sequence ships in ONE ``send-keys``
+    subprocess (``PgDn`` x N then ``End``) — one tmux call, one gate eval, no
+    per-key contention window.
     """
-    for _ in range(page_downs):
-        adapter.send_keys(pane, "PgDn")
-    adapter.send_keys(pane, "End")
+    adapter.send_keys(pane, *(["PgDn"] * page_downs), "End")
 
 
 def insert_at_prompt_start(

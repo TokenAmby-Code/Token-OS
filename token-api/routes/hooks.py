@@ -4721,12 +4721,29 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
     if request.delivery not in {"prompt", "ephemeral"}:
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        # Resolve each distinct pane at most once per request. The plan-menu
+        # preplan subscribe sends target_pane == subscriber_pane == the same %id,
+        # and _resolve_instance_for_pane is the expensive leg (a tmux show-options
+        # subprocess + a SQLite lookup, plus list-panes -a for non-%id forms). The
+        # original double call paid that twice for one pane; memoizing on the
+        # normalized pane string collapses the common same-pane case to one
+        # resolution with byte-for-byte identical results.
+        _pane_cache: dict[str, dict | None] = {}
+
+        async def _resolve_pane_once(pane: str | None) -> dict | None:
+            key = _normalize_text(pane)
+            if not key:
+                return None
+            if key not in _pane_cache:
+                _pane_cache[key] = await _resolve_instance_for_pane(db, pane)
+            return _pane_cache[key]
+
         target = await _resolve_instance_by_id(db, request.target_instance_id)
         if not target or not target.get("id"):
-            target = await _resolve_instance_for_pane(db, request.target_pane)
+            target = await _resolve_pane_once(request.target_pane)
         subscriber = await _resolve_instance_by_id(db, request.subscriber_instance_id)
         if not subscriber or not subscriber.get("tmux_pane"):
-            subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
+            subscriber = await _resolve_pane_once(request.subscriber_pane)
 
         target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
         target_pane = (target or {}).get("tmux_pane") or _normalize_text(request.target_pane)
