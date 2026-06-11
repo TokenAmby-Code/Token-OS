@@ -238,11 +238,23 @@ def test_resume_refuses_branch_mismatch(project: Project) -> None:
     assert wt.exists()
     mismatch = project.setup("first", "--resume")
     assert mismatch.returncode == 0, "same branch resume is fine"
-    # A different branch whose wt- dir is occupied by 'first' must refuse.
-    (project.parent / "wt-second").mkdir()
+    # A different branch whose wt- dir holds another checked-out branch must
+    # refuse — a real worktree, not just an empty directory, so a regression
+    # in branch-mismatch detection can't slip past on the dir-exists path.
+    _git(
+        "--git-dir",
+        str(project.bare),
+        "worktree",
+        "add",
+        "-b",
+        "occupier",
+        str(project.parent / "wt-second"),
+        env=project.env,
+    )
     refused = project.setup("second", "--resume")
     assert refused.returncode != 0
     assert "Cannot resume" in refused.stderr
+    assert "occupier" in refused.stderr
 
 
 # ── delete: merged-guard + remote deletion ───────────────────────────────────

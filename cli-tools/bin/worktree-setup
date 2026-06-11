@@ -403,6 +403,9 @@ if [[ "$RESUME_MODE" == "false" ]]; then
     fi
 fi
 
+# Normalize: strip any trailing slash so the prefix strip below is reliable.
+SECRETS_DIR="${SECRETS_DIR%/}"
+
 # Identify files to copy from secrets dir: mirror every regular file at its
 # relative path. SECRETS_DIR *is* the definition of what a worktree needs —
 # pattern-matching specific layouts here silently skipped projects whose
@@ -501,7 +504,7 @@ else
         git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
     fi
     if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then
-        git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG "$WORKTREE_DIR" "$BRANCH_NAME"
+        git --git-dir="$BARE_REPO" worktree add ${FORCE_FLAG:+"$FORCE_FLAG"} "$WORKTREE_DIR" "$BRANCH_NAME"
     else
         # Base new branches on the freshest origin default branch, not bare HEAD.
         # Local CD normally keeps bare main current, but if a deploy was missed
@@ -515,7 +518,7 @@ else
         else
             log_warn "Could not fetch origin/$DEFAULT_BRANCH — basing on local bare HEAD (may be stale)"
         fi
-        git --git-dir="$BARE_REPO" worktree add $FORCE_FLAG -b "$BRANCH_NAME" "$WORKTREE_DIR" "$BASE_REF"
+        git --git-dir="$BARE_REPO" worktree add ${FORCE_FLAG:+"$FORCE_FLAG"} -b "$BRANCH_NAME" "$WORKTREE_DIR" "$BASE_REF"
     fi
     log_success "Worktree created at $WORKTREE_DIR"
 fi
