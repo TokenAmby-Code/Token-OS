@@ -9,15 +9,33 @@ All bootstrap paths should go through this module:
 
 import asyncio
 import os
+import sqlite3
 from pathlib import Path
 
 import aiosqlite
 
 from cron_engine import CronEngine
-from instance_registry import INSTANCE_COLUMNS, legacy_row_to_instance_values, slug_from_legacy
+from instance_registry import (
+    INSTANCE_COLUMNS,
+    RUNTIME_ANNEX_COLUMNS,
+    golden_throne_binding,
+    legacy_row_to_instance_values,
+    slug_from_legacy,
+)
 from personas import ensure_personas_table, persona_id_for_slug, repair_legacy_instance_personas
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+
+
+def archive_db_path_for(db_path: Path) -> Path:
+    """Archive DB for extracted legacy tables: <db dir>/archive/archive.db.
+
+    Override with TOKEN_API_ARCHIVE_DB (tests, ad-hoc restores).
+    """
+    env = os.environ.get("TOKEN_API_ARCHIVE_DB")
+    if env:
+        return Path(env)
+    return db_path.parent / "archive" / "archive.db"
 
 
 async def _table_columns(db, table: str) -> set[str]:
@@ -84,6 +102,55 @@ async def _create_instances_table(db) -> None:
             interaction_mode TEXT NOT NULL DEFAULT 'text'
                 CHECK(interaction_mode IN ('text','voice_chat')),
             golden_throne TEXT,
+            -- ── RUNTIME ANNEX (transitional) ─────────────────────────────
+            -- Inherited verbatim from the extracted claude_instances table so
+            -- exterminatus could land without redesigning every subsystem.
+            -- Keep in lockstep with instance_registry.RUNTIME_ANNEX_COLUMNS.
+            -- Do NOT add columns here: each is slated for per-column removal
+            -- (tmux geometry -> @INSTANCE_ID stamps, GT state -> golden_throne
+            -- table, workflow/planning -> status enum).
+            tmux_pane TEXT,
+            pane_label TEXT,
+            dispatch_target TEXT,
+            dispatch_window TEXT,
+            dispatch_mode TEXT,
+            dispatch_slot TEXT,
+            dispatch_session_doc_path TEXT,
+            target_working_dir TEXT,
+            launch_mode TEXT,
+            launcher TEXT,
+            transplant_target_session TEXT,
+            transplant_expected INTEGER DEFAULT 0,
+            input_lock TEXT,
+            tts_voice TEXT,
+            notification_sound TEXT,
+            discord_hosted INTEGER DEFAULT 0,
+            discord_channel TEXT,
+            discord_bot TEXT,
+            workflow_state TEXT,
+            workflow_updated_at TIMESTAMP,
+            workflow_blocked_reason TEXT,
+            next_required_action TEXT,
+            next_action_owner TEXT,
+            planning_state TEXT DEFAULT 'none',
+            planning_updated_at TIMESTAMP,
+            planning_source TEXT,
+            closure_surface TEXT,
+            closure_required INTEGER DEFAULT 0,
+            session_doc_policy TEXT,
+            pr_url TEXT,
+            pr_state TEXT,
+            victory_at TIMESTAMP,
+            victory_reason TEXT,
+            is_subagent INTEGER DEFAULT 0,
+            hook_driven INTEGER DEFAULT 0,
+            zealotry INTEGER DEFAULT 4,
+            gt_resume_count INTEGER DEFAULT 0,
+            gt_resume_window_started_at TIMESTAMP,
+            gt_last_resume_at TIMESTAMP,
+            follow_up_sop TEXT,
+            stop_allowed INTEGER DEFAULT 1,
+            -- ── end runtime annex ────────────────────────────────────────
             CHECK((commander_type = 'emperor' AND commander_id IS NULL) OR
                   (commander_type IN ('persona','chapter') AND commander_id IS NOT NULL)),
             CHECK(status != 'archived' OR rank = 'retired')
@@ -137,14 +204,12 @@ async def _ensure_instances_v2(db) -> None:
             await db.execute("DROP TABLE instances")
     if needs_rebuild:
         await _create_instances_table(db)
+        # Existing v2 rows are the ONLY rebuild source. The legacy
+        # claude_instances projection is gone: it used to take priority here,
+        # clobbering v2 identity with table defaults (rank/commander/origin)
+        # and resurrecting ghost rows. Legacy data is extracted to archive.db
+        # by _extract_claude_instances() instead.
         source_rows = old_rows
-        if await _table_exists(db, "claude_instances"):
-            db.row_factory = aiosqlite.Row
-            try:
-                cursor = await db.execute("SELECT * FROM claude_instances")
-                source_rows = [dict(row) for row in await cursor.fetchall()] or source_rows
-            finally:
-                db.row_factory = None
         for row in source_rows:
             if set(INSTANCE_COLUMNS).issubset(row.keys()):
                 values = {column: row.get(column) for column in INSTANCE_COLUMNS}
@@ -307,6 +372,254 @@ async def _ensure_instances_v2(db) -> None:
     """)
 
 
+# ── claude_instances exterminatus ────────────────────────────────────────────
+# One-shot, idempotent, reversible extraction of the legacy table into
+# archive.db. After this runs, `instances` (v2) is the sole live instance
+# table; the legacy data survives ONLY in the archive.
+
+_LEGACY_FK_REBUILDS = {
+    # canonical FK-free DDL for tables whose historical CREATE carried
+    # `REFERENCES claude_instances(id)` — left in place, those FKs would
+    # poison every insert after the drop (PRAGMA foreign_keys=ON).
+    "workflow_events": """
+        CREATE TABLE workflow_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            workflow_state TEXT,
+            event_type TEXT NOT NULL,
+            event_owner TEXT,
+            details_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "instance_mutations": """
+        CREATE TABLE instance_mutations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            mutation_type TEXT NOT NULL,
+            write_source TEXT NOT NULL,
+            write_txn_id TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            service_version TEXT,
+            wrapper_launch_id TEXT,
+            field_names_json TEXT,
+            before_json TEXT,
+            after_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+}
+
+
+async def _ordered_columns(db, table: str, schema: str = "main") -> list[str]:
+    cursor = await db.execute(f"PRAGMA {schema}.table_info({table})")
+    return [col[1] for col in await cursor.fetchall()]
+
+
+async def _copy_legacy_table_to_archive(db, archive_path: Path) -> None:
+    """Copy claude_instances (schema + all rows) into archive.db, verifying counts."""
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claude_instances'"
+    )
+    ddl = (await cursor.fetchone())[0]
+
+    # ATTACH cannot run inside a transaction; init has open DML by now.
+    await db.commit()
+    await db.execute("ATTACH DATABASE ? AS archive", (str(archive_path),))
+    try:
+        cursor = await db.execute(
+            "SELECT 1 FROM archive.sqlite_master WHERE type = 'table' AND name = 'claude_instances'"
+        )
+        if await cursor.fetchone() is None:
+            archive_ddl = ddl.replace("claude_instances", "archive.claude_instances", 1)
+            if archive_ddl == ddl:
+                raise RuntimeError("could not derive archive DDL for claude_instances")
+            await db.execute(archive_ddl)
+
+        live_cols = await _ordered_columns(db, "claude_instances")
+        archive_cols = set(await _ordered_columns(db, "claude_instances", schema="archive"))
+        copy_cols = ", ".join(col for col in live_cols if col in archive_cols)
+        await db.execute(
+            f"INSERT OR REPLACE INTO archive.claude_instances ({copy_cols}) "
+            f"SELECT {copy_cols} FROM main.claude_instances"
+        )
+
+        cursor = await db.execute("SELECT count(*) FROM main.claude_instances")
+        live_count = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT count(*) FROM archive.claude_instances")
+        archive_count = (await cursor.fetchone())[0]
+        if archive_count < live_count:
+            raise RuntimeError(
+                f"archive copy verification failed: {live_count} live rows, "
+                f"{archive_count} archived"
+            )
+        await db.commit()
+    finally:
+        await db.execute("DETACH DATABASE archive")
+
+
+async def _backfill_annex_from_legacy(db) -> None:
+    """Fill runtime-annex (and NULL identity gaps) on live v2 rows from legacy rows.
+
+    v2 identity always wins: persona_id/golden_throne are filled only when
+    NULL. Legacy-only rows (no matching instances.id) stay archive-only.
+    """
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute("SELECT * FROM claude_instances")
+        legacy_rows = [dict(row) for row in await cursor.fetchall()]
+    finally:
+        db.row_factory = None
+
+    legacy_cols = set(await _ordered_columns(db, "claude_instances"))
+    annex_cols = [col for col in RUNTIME_ANNEX_COLUMNS if col in legacy_cols]
+
+    for row in legacy_rows:
+        instance_id = row.get("id")
+        if not instance_id:
+            continue
+        cursor = await db.execute(
+            "SELECT persona_id, golden_throne, status FROM instances WHERE id = ?",
+            (instance_id,),
+        )
+        existing = await cursor.fetchone()
+        if existing is None:
+            continue  # legacy-only row: archive carries it, live does not
+
+        updates: dict = {col: row.get(col) for col in annex_cols}
+
+        existing_persona, existing_marker, existing_status = existing
+        if existing_persona is None:
+            persona_id = await _persona_id_for_legacy_row(db, row)
+            if persona_id:
+                updates["persona_id"] = persona_id
+
+        if existing_marker is None:
+            marker = golden_throne_binding(row)
+            if marker:
+                updates["golden_throne"] = marker
+            elif (
+                row.get("instance_type") or ""
+            ).strip().lower() == "golden_throne" and existing_status not in ("stopped", "archived"):
+                # Promote the legacy GT engine state into a golden_throne row
+                # so the marker references real data (guard trigger enforces it).
+                cursor = await db.execute(
+                    """INSERT INTO golden_throne
+                       (zealotry, resume_count, resume_window_started_at,
+                        last_resume_at, follow_up_sop, stop_allowed)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        row.get("zealotry") or 4,
+                        row.get("gt_resume_count") or 0,
+                        row.get("gt_resume_window_started_at"),
+                        row.get("gt_last_resume_at"),
+                        row.get("follow_up_sop"),
+                        1 if row.get("stop_allowed") in (None, 1) else 0,
+                    ),
+                )
+                updates["golden_throne"] = str(cursor.lastrowid)
+
+        if updates:
+            assignments = ", ".join(f"{col} = ?" for col in updates)
+            await db.execute(
+                f"UPDATE instances SET {assignments} WHERE id = ?",
+                [*updates.values(), instance_id],
+            )
+
+
+async def _rebuild_tables_without_legacy_fk(db) -> None:
+    """Rebuild provenance tables whose DDL still REFERENCES claude_instances."""
+    for table, canonical_ddl in _LEGACY_FK_REBUILDS.items():
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        )
+        found = await cursor.fetchone()
+        if not found or "claude_instances" not in (found[0] or ""):
+            continue
+        await db.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_fk")
+        await db.execute(canonical_ddl)
+        old_cols = await _ordered_columns(db, f"{table}_legacy_fk")
+        new_cols = set(await _ordered_columns(db, table))
+        copy_cols = ", ".join(col for col in old_cols if col in new_cols)
+        await db.execute(
+            f"INSERT INTO {table} ({copy_cols}) SELECT {copy_cols} FROM {table}_legacy_fk"
+        )
+        await db.execute(f"DROP TABLE {table}_legacy_fk")
+
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND sql LIKE '%REFERENCES claude_instances%'"
+    )
+    stragglers = [row[0] for row in await cursor.fetchall()]
+    if stragglers:
+        raise RuntimeError(
+            "tables still reference claude_instances after FK rebuild: " + ", ".join(stragglers)
+        )
+
+
+async def _extract_claude_instances(db, db_path: Path) -> None:
+    """One-shot extraction: archive the legacy table, backfill annex, drop it.
+
+    Idempotent (no-op once the table is gone) and reversible
+    (restore_claude_instances_from_archive copies it back).
+    """
+    if not await _table_exists(db, "claude_instances"):
+        return
+
+    archive_path = archive_db_path_for(db_path)
+    await _copy_legacy_table_to_archive(db, archive_path)
+    await _backfill_annex_from_legacy(db)
+    await _rebuild_tables_without_legacy_fk(db)
+    await db.execute("DROP TABLE claude_instances")
+    await db.commit()
+    print(f"Extracted claude_instances to {archive_path} and dropped it from the live DB")
+
+
+def restore_claude_instances_from_archive(db_path: Path | None = None) -> int:
+    """Emergency reverse path: copy claude_instances back from archive.db.
+
+    Returns the number of restored rows. Does NOT re-wire any code to read
+    it — this exists so the extraction is operationally reversible.
+    """
+    db_path = db_path or DEFAULT_DB_PATH
+    archive_path = archive_db_path_for(db_path)
+    if not archive_path.exists():
+        raise FileNotFoundError(f"no archive db at {archive_path}")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS archive", (str(archive_path),))
+        ddl_row = conn.execute(
+            "SELECT sql FROM archive.sqlite_master WHERE type = 'table' AND name = 'claude_instances'"
+        ).fetchone()
+        if not ddl_row:
+            raise RuntimeError(f"archive db {archive_path} has no claude_instances table")
+        exists = conn.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'claude_instances'"
+        ).fetchone()
+        if not exists:
+            ddl = ddl_row[0].replace("archive.claude_instances", "claude_instances")
+            conn.execute(ddl)
+        cols = [
+            row[1] for row in conn.execute("PRAGMA archive.table_info(claude_instances)").fetchall()
+        ]
+        main_cols = {
+            row[1] for row in conn.execute("PRAGMA main.table_info(claude_instances)").fetchall()
+        }
+        copy_cols = ", ".join(col for col in cols if col in main_cols)
+        conn.execute(
+            f"INSERT OR REPLACE INTO main.claude_instances ({copy_cols}) "
+            f"SELECT {copy_cols} FROM archive.claude_instances"
+        )
+        count = conn.execute("SELECT count(*) FROM main.claude_instances").fetchone()[0]
+        conn.commit()
+        conn.execute("DETACH DATABASE archive")
+        return count
+    finally:
+        conn.close()
+
+
 async def init_database_async(db_path: Path | None = None) -> None:
     """Initialize the SQLite database with the canonical schema and migrations."""
     db_path = db_path or DEFAULT_DB_PATH
@@ -317,205 +630,25 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("PRAGMA busy_timeout=5000")
         await ensure_personas_table(db)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS claude_instances (
-                id TEXT PRIMARY KEY,
-                session_id TEXT UNIQUE NOT NULL,
-                tab_name TEXT,
-                working_dir TEXT,
-                origin_type TEXT NOT NULL,
-                source_ip TEXT,
-                device_id TEXT NOT NULL,
-                profile_name TEXT,
-                tts_voice TEXT,
-                notification_sound TEXT,
-                primarch TEXT,
-                pane_label TEXT,
-                pid INTEGER,
-                status TEXT DEFAULT 'idle',
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                stopped_at TIMESTAMP
-            )
-        """)
-
-        cursor = await db.execute("PRAGMA table_info(claude_instances)")
-        columns = {col[1] for col in await cursor.fetchall()}
-        instance_migrations = [
-            ("working_dir", "ALTER TABLE claude_instances ADD COLUMN working_dir TEXT"),
-            (
-                "is_subagent",
-                "ALTER TABLE claude_instances ADD COLUMN is_subagent INTEGER DEFAULT 0",
-            ),
-            ("tts_mode", "ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'"),
-            ("session_doc_id", "ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER"),
-            ("zealotry", "ALTER TABLE claude_instances ADD COLUMN zealotry INTEGER DEFAULT 4"),
-            (
-                "gt_resume_count",
-                "ALTER TABLE claude_instances ADD COLUMN gt_resume_count INTEGER DEFAULT 0",
-            ),
-            (
-                "gt_resume_window_started_at",
-                "ALTER TABLE claude_instances ADD COLUMN gt_resume_window_started_at TIMESTAMP",
-            ),
-            (
-                "gt_last_resume_at",
-                "ALTER TABLE claude_instances ADD COLUMN gt_last_resume_at TIMESTAMP",
-            ),
-            ("tmux_pane", "ALTER TABLE claude_instances ADD COLUMN tmux_pane TEXT"),
-            ("pane_label", "ALTER TABLE claude_instances ADD COLUMN pane_label TEXT"),
-            ("primarch", "ALTER TABLE claude_instances ADD COLUMN primarch TEXT"),
-            ("victory_at", "ALTER TABLE claude_instances ADD COLUMN victory_at TIMESTAMP"),
-            ("victory_reason", "ALTER TABLE claude_instances ADD COLUMN victory_reason TEXT"),
-            ("input_lock", "ALTER TABLE claude_instances ADD COLUMN input_lock TEXT"),
-            (
-                "transplant_target_session",
-                "ALTER TABLE claude_instances ADD COLUMN transplant_target_session TEXT",
-            ),
-            ("legion", "ALTER TABLE claude_instances ADD COLUMN legion TEXT DEFAULT 'astartes'"),
-            ("synced", "ALTER TABLE claude_instances ADD COLUMN synced INTEGER DEFAULT 0"),
-            (
-                "discord_hosted",
-                "ALTER TABLE claude_instances ADD COLUMN discord_hosted INTEGER DEFAULT 0",
-            ),
-            ("discord_channel", "ALTER TABLE claude_instances ADD COLUMN discord_channel TEXT"),
-            ("discord_bot", "ALTER TABLE claude_instances ADD COLUMN discord_bot TEXT"),
-            ("follow_up_sop", "ALTER TABLE claude_instances ADD COLUMN follow_up_sop TEXT"),
-            (
-                "instance_type",
-                "ALTER TABLE claude_instances ADD COLUMN instance_type TEXT DEFAULT 'one_off'",
-            ),
-            ("launcher", "ALTER TABLE claude_instances ADD COLUMN launcher TEXT"),
-            ("engine", "ALTER TABLE claude_instances ADD COLUMN engine TEXT"),
-            ("dispatch_target", "ALTER TABLE claude_instances ADD COLUMN dispatch_target TEXT"),
-            ("dispatch_window", "ALTER TABLE claude_instances ADD COLUMN dispatch_window TEXT"),
-            ("dispatch_mode", "ALTER TABLE claude_instances ADD COLUMN dispatch_mode TEXT"),
-            ("dispatch_slot", "ALTER TABLE claude_instances ADD COLUMN dispatch_slot TEXT"),
-            (
-                "dispatch_session_doc_path",
-                "ALTER TABLE claude_instances ADD COLUMN dispatch_session_doc_path TEXT",
-            ),
-            (
-                "target_working_dir",
-                "ALTER TABLE claude_instances ADD COLUMN target_working_dir TEXT",
-            ),
-            ("launch_mode", "ALTER TABLE claude_instances ADD COLUMN launch_mode TEXT"),
-            (
-                "transplant_expected",
-                "ALTER TABLE claude_instances ADD COLUMN transplant_expected INTEGER DEFAULT 0",
-            ),
-            (
-                "session_doc_policy",
-                "ALTER TABLE claude_instances ADD COLUMN session_doc_policy TEXT",
-            ),
-            ("wrapper_launch_id", "ALTER TABLE claude_instances ADD COLUMN wrapper_launch_id TEXT"),
-            (
-                "continuity_binding_source",
-                "ALTER TABLE claude_instances ADD COLUMN continuity_binding_source TEXT",
-            ),
-            ("closure_surface", "ALTER TABLE claude_instances ADD COLUMN closure_surface TEXT"),
-            (
-                "closure_required",
-                "ALTER TABLE claude_instances ADD COLUMN closure_required INTEGER DEFAULT 0",
-            ),
-            ("workflow_state", "ALTER TABLE claude_instances ADD COLUMN workflow_state TEXT"),
-            (
-                "workflow_updated_at",
-                "ALTER TABLE claude_instances ADD COLUMN workflow_updated_at TIMESTAMP",
-            ),
-            (
-                "workflow_blocked_reason",
-                "ALTER TABLE claude_instances ADD COLUMN workflow_blocked_reason TEXT",
-            ),
-            (
-                "stop_allowed",
-                "ALTER TABLE claude_instances ADD COLUMN stop_allowed INTEGER DEFAULT 1",
-            ),
-            (
-                "next_required_action",
-                "ALTER TABLE claude_instances ADD COLUMN next_required_action TEXT",
-            ),
-            ("next_action_owner", "ALTER TABLE claude_instances ADD COLUMN next_action_owner TEXT"),
-            (
-                "parent_instance_id",
-                "ALTER TABLE claude_instances ADD COLUMN parent_instance_id TEXT",
-            ),
-            (
-                "planning_state",
-                "ALTER TABLE claude_instances ADD COLUMN planning_state TEXT DEFAULT 'none'",
-            ),
-            (
-                "planning_updated_at",
-                "ALTER TABLE claude_instances ADD COLUMN planning_updated_at TIMESTAMP",
-            ),
-            (
-                "planning_source",
-                "ALTER TABLE claude_instances ADD COLUMN planning_source TEXT",
-            ),
-            # "Agent has a PR open" flag (Phase 1). Additive + nullable, no backfill
-            # lock. pr_state ∈ {open, merged}; surfaced as a /ui/ops badge. pr_state is
-            # flipped to 'merged' by the CD restart-on-merge webhook (Phase 2).
-            (
-                "pr_url",
-                "ALTER TABLE claude_instances ADD COLUMN pr_url TEXT",
-            ),
-            (
-                "pr_state",
-                "ALTER TABLE claude_instances ADD COLUMN pr_state TEXT",
-            ),
-            # Per-instance "this instance is being driven autonomously, not by the
-            # Emperor" flag. Set =1 before an automated / agent-to-agent wake is sent
-            # to the target; cleared =0 on Stop/SessionEnd. compute_work_state discounts
-            # hook_driven instances at read-time (belt-and-suspenders with the low-level
-            # automated_pane_activity marker). See hook_driven redesign.
-            (
-                "hook_driven",
-                "ALTER TABLE claude_instances ADD COLUMN hook_driven INTEGER DEFAULT 0",
-            ),
-        ]
-        for column_name, sql in instance_migrations:
-            if column_name not in columns:
-                await db.execute(sql)
-
-        if "instance_type" not in columns:
-            await db.execute("""UPDATE claude_instances SET instance_type = CASE
-                WHEN synced = 1 AND status IN ('processing', 'idle') THEN 'sync'
-                WHEN victory_at IS NOT NULL THEN 'one_off'
-                WHEN zealotry >= 4 AND COALESCE(is_subagent, 0) = 0 THEN 'golden_throne'
-                ELSE 'one_off'
-            END""")
-
-        # Drop dead columns (phase 1 DB thinning)
-        dead_columns = {
-            "pre_stop_status",
-            "retrigger_count",
-            "spawner",
-            "is_processing",
-        }
-        drop_targets = dead_columns & columns
-        for col in drop_targets:
-            await db.execute(f"ALTER TABLE claude_instances DROP COLUMN {col}")
-
-        repaired_personas = await repair_legacy_instance_personas(db)
-        if repaired_personas:
-            print(f"Repaired {repaired_personas} legacy active persona assignments")
+        # Legacy `claude_instances` is never created anymore. On a DB that
+        # still carries it, run the last legacy persona repair (it reads the
+        # legacy table), then extract: archive.db gets the data, live loses
+        # the table. Fresh DBs skip all of this.
+        if await _table_exists(db, "claude_instances"):
+            repaired_personas = await repair_legacy_instance_personas(db)
+            if repaired_personas:
+                print(f"Repaired {repaired_personas} legacy active persona assignments")
 
         await _ensure_instances_v2(db)
+        await _extract_claude_instances(db, db_path)
 
+        # Annex-era indexes on the surviving predicates (golden_throne marker
+        # replaced legion/synced; discord routing reads the annex columns).
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)"
+            "CREATE INDEX IF NOT EXISTS idx_instances_v2_gt ON instances(golden_throne, status)"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_legion_synced ON claude_instances(legion, synced, status)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_discord ON claude_instances(discord_channel, status)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_parent ON claude_instances(parent_instance_id)"
+            "CREATE INDEX IF NOT EXISTS idx_instances_v2_discord ON instances(discord_channel, status)"
         )
 
         await db.execute("""
@@ -745,8 +878,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 event_type TEXT NOT NULL,
                 event_owner TEXT,
                 details_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.execute("""
@@ -771,8 +903,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 field_names_json TEXT,
                 before_json TEXT,
                 after_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (instance_id) REFERENCES claude_instances(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.execute("""
@@ -1209,8 +1340,11 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("DROP TRIGGER IF EXISTS trg_tmux_pane_recolor")
 
         # ── Pane State Queue (@CC_STATE) ──
-        # Trigger-driven pane variable updates. Any status change on claude_instances
-        # queues a tmux set-option, so @CC_STATE stays in sync without caller cooperation.
+        # Trigger-driven pane variable updates. Any status change on instances
+        # queues a tmux set-option, so @CC_STATE stays in sync without caller
+        # cooperation. Post-exterminatus these triggers live on `instances` and
+        # push the v2 status vocabulary (working/questioning/... not processing);
+        # @CC_STATE consumers accept both vocabularies during the transition.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pane_state_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1222,9 +1356,13 @@ async def init_database_async(db_path: Path | None = None) -> None:
             )
         """)
 
+        # DROP+CREATE (not IF NOT EXISTS): on upgraded DBs the old triggers of
+        # the same name were bound to claude_instances and died with the table,
+        # but mid-transition states must converge on the instances-bound ones.
+        await db.execute("DROP TRIGGER IF EXISTS trg_status_pane_state")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_status_pane_state
-            AFTER UPDATE OF status ON claude_instances
+            CREATE TRIGGER trg_status_pane_state
+            AFTER UPDATE OF status ON instances
             WHEN OLD.status IS NOT NEW.status
             BEGIN
                 INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
@@ -1232,9 +1370,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
+        await db.execute("DROP TRIGGER IF EXISTS trg_planning_pane_state")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_planning_pane_state
-            AFTER UPDATE OF planning_state ON claude_instances
+            CREATE TRIGGER trg_planning_pane_state
+            AFTER UPDATE OF planning_state ON instances
             WHEN OLD.planning_state IS NOT NEW.planning_state
             BEGIN
                 INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
@@ -1247,15 +1386,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
         # of shelling out to tmux-pane-label every status-interval. Mirrors
         # trg_status_pane_state; pane_state_worker pushes it generically. Styling
         # stays in the format string — the var carries data, not presentation.
-        # NEW.tab_name IS NOT NULL guards the queue's NOT NULL value column: a rename
+        # NEW.name IS NOT NULL guards the queue's NOT NULL value column: a rename
         # to NULL would otherwise abort the parent UPDATE on the constraint.
+        await db.execute("DROP TRIGGER IF EXISTS trg_tab_name_pane_state")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_tab_name_pane_state
-            AFTER UPDATE OF tab_name ON claude_instances
-            WHEN OLD.tab_name IS NOT NEW.tab_name AND NEW.tab_name IS NOT NULL
+            CREATE TRIGGER trg_tab_name_pane_state
+            AFTER UPDATE OF name ON instances
+            WHEN OLD.name IS NOT NEW.name AND NEW.name IS NOT NULL
             BEGIN
                 INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                VALUES (NEW.id, '@PANE_LABEL', NEW.tab_name, NEW.tmux_pane);
+                VALUES (NEW.id, '@PANE_LABEL', NEW.name, NEW.tmux_pane);
             END
         """)
 
@@ -1272,9 +1412,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         # When status changes on an instance with a session doc, queue sync
+        await db.execute("DROP TRIGGER IF EXISTS trg_doc_sync_status")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_status
-            AFTER UPDATE OF status ON claude_instances
+            CREATE TRIGGER trg_doc_sync_status
+            AFTER UPDATE OF status ON instances
             WHEN OLD.status IS NOT NEW.status AND NEW.session_doc_id IS NOT NULL
             BEGIN
                 INSERT INTO session_doc_sync_queue (doc_id, reason)
@@ -1282,11 +1423,12 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
-        # When tab_name changes, queue sync
+        # When the display name changes, queue sync
+        await db.execute("DROP TRIGGER IF EXISTS trg_doc_sync_rename")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_rename
-            AFTER UPDATE OF tab_name ON claude_instances
-            WHEN OLD.tab_name IS NOT NEW.tab_name AND NEW.session_doc_id IS NOT NULL
+            CREATE TRIGGER trg_doc_sync_rename
+            AFTER UPDATE OF name ON instances
+            WHEN OLD.name IS NOT NEW.name AND NEW.session_doc_id IS NOT NULL
             BEGIN
                 INSERT INTO session_doc_sync_queue (doc_id, reason)
                 VALUES (NEW.session_doc_id, 'tab_renamed');
@@ -1294,9 +1436,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         # When session_doc_id is set on an instance, queue sync for the new doc
+        await db.execute("DROP TRIGGER IF EXISTS trg_doc_sync_linked")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_linked
-            AFTER UPDATE OF session_doc_id ON claude_instances
+            CREATE TRIGGER trg_doc_sync_linked
+            AFTER UPDATE OF session_doc_id ON instances
             WHEN NEW.session_doc_id IS NOT NULL AND (OLD.session_doc_id IS NULL OR OLD.session_doc_id != NEW.session_doc_id)
             BEGIN
                 INSERT INTO session_doc_sync_queue (doc_id, reason)
@@ -1305,9 +1448,10 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         # When session_doc_id is cleared, queue sync for the OLD doc
+        await db.execute("DROP TRIGGER IF EXISTS trg_doc_sync_unlinked")
         await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_doc_sync_unlinked
-            AFTER UPDATE OF session_doc_id ON claude_instances
+            CREATE TRIGGER trg_doc_sync_unlinked
+            AFTER UPDATE OF session_doc_id ON instances
             WHEN OLD.session_doc_id IS NOT NULL AND (NEW.session_doc_id IS NULL OR OLD.session_doc_id != NEW.session_doc_id)
             BEGIN
                 INSERT INTO session_doc_sync_queue (doc_id, reason)

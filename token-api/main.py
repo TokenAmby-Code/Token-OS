@@ -74,10 +74,10 @@ from dailynote_callout import (
 from db_schema import init_database_async
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
+    create_golden_throne_binding,  # noqa: F401 — used in PATCH /type GT promotion
     get_instance_mutations,
     reconcile_instance,
     sanctioned_insert_instance,
-    sanctioned_update_canonical_instance,
     sanctioned_update_instance,
 )
 from instance_registry import derived_cockpit_label
@@ -9404,37 +9404,35 @@ async def set_instance_legion(instance_id: str, request: Request):
         )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        updates = {"legion": legion}
+        # The legacy `legion`/`profile_name` columns died with claude_instances —
+        # legion identity now lives in persona_id. Resolve the legion to its persona
+        # and bind persona_id (plus annex voice/sound from the profile).
+        updates: dict = {}
         persona_slug = LEGION_PERSONA_SLUGS.get(legion)
-        if persona_slug:
+        if legion == "civic":
+            # Civic/Pax has no persona tint authority: clear the assignment.
+            updates["persona_id"] = None
+        elif persona_slug:
             persona = await resolve_persona(db, persona_slug)
             if persona:
                 profile = persona_to_profile(persona)
                 updates.update(
                     {
-                        "profile_name": profile["name"],
+                        "persona_id": persona["id"],
                         "tts_voice": profile["wsl_voice"],
                         "notification_sound": profile["notification_sound"],
                     }
                 )
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates=updates,
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="set-legion",
-        )
-        if legion == "civic":
-            await sanctioned_update_canonical_instance(
+        if updates:
+            await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
-                updates={"persona_id": None},
-                mutation_type="persona_unassigned",
+                updates=updates,
+                mutation_type="instance_updated",
                 write_source="api",
                 actor="set-legion",
             )
@@ -9466,19 +9464,28 @@ async def set_instance_synced(instance_id: str, request: Request):
     synced_int = 1 if synced else 0
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # The legacy `synced` column died into the golden_throne marker
+        # (synced=1 ⇔ golden_throne='sync'); legion lives in persona_id.
         cursor = await db.execute(
-            "SELECT id, legion FROM claude_instances WHERE id = ?", (instance_id,)
+            """SELECT i.id, i.persona_id,
+                      (SELECT slug FROM personas WHERE id = i.persona_id) AS legion
+               FROM instances i WHERE i.id = ?""",
+            (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        legion = row[1] or "astartes"
+        persona_id = row[1]
+        legion = row[2] or "astartes"
 
         if synced_int:
-            # Check for existing synced session in this legion
+            # One synced session per legion: another live row with the same persona
+            # already carrying the 'sync' marker is a conflict.
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing') AND id != ?",
-                (legion, instance_id),
+                """SELECT id FROM instances
+                   WHERE persona_id IS ? AND golden_throne = 'sync'
+                     AND status NOT IN ('stopped', 'archived') AND id != ?""",
+                (persona_id, instance_id),
             )
             conflict = await cursor.fetchone()
             if conflict:
@@ -9490,7 +9497,7 @@ async def set_instance_synced(instance_id: str, request: Request):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"synced": synced_int},
+            updates={"golden_throne": "sync" if synced_int else None},
             mutation_type="instance_updated",
             write_source="api",
             actor="set-synced",
@@ -10100,12 +10107,24 @@ async def set_instance_type(instance_id: str, request: Request):
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         instance = await cursor.fetchone()
         if not instance:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        old_type = instance["instance_type"] or "one_off"
+        # Legacy instance_type derived from v2 state: status='archived' → archived;
+        # golden_throne='sync' → sync; any other non-null marker (a golden_throne.id)
+        # → golden_throne; NULL → one_off. The instance_type column died with
+        # claude_instances; its v2 home is the golden_throne marker.
+        _gt_marker = instance["golden_throne"]
+        if instance["status"] == "archived":
+            old_type = "archived"
+        elif _gt_marker == "sync":
+            old_type = "sync"
+        elif _gt_marker:
+            old_type = "golden_throne"
+        else:
+            old_type = "one_off"
 
         # Archived instances can only unarchive to one_off
         if old_type == "archived" and new_type != "one_off":
@@ -10113,25 +10132,49 @@ async def set_instance_type(instance_id: str, request: Request):
                 status_code=400, detail="Archived instances can only be unarchived to one_off"
             )
 
-        updates = {"instance_type": new_type}
-
         # Optional follow_up_sop — persist custom SOP path for GT follow-ups
         follow_up_sop = body.get("follow_up_sop")
-        if follow_up_sop is not None:
-            updates["follow_up_sop"] = follow_up_sop if follow_up_sop else None
-
         # Optional zealotry override in same call
         zealotry_override = body.get("zealotry")
+        zealotry_value = None
         if isinstance(zealotry_override, int) and 1 <= zealotry_override <= 10:
-            updates["zealotry"] = zealotry_override
+            zealotry_value = zealotry_override
+        elif new_type == "golden_throne" and (instance["zealotry"] or 4) < 4:
+            # Auto-set zealotry minimum when promoting to golden_throne
+            zealotry_value = 4
 
-        # Auto-set zealotry minimum when promoting to golden_throne
-        if (
-            new_type == "golden_throne"
-            and (instance["zealotry"] or 4) < 4
-            and zealotry_override is None
-        ):
-            updates["zealotry"] = 4
+        updates: dict = {}
+        if follow_up_sop is not None:
+            updates["follow_up_sop"] = follow_up_sop if follow_up_sop else None
+        if zealotry_value is not None:
+            updates["zealotry"] = zealotry_value
+
+        # Translate the requested type onto the golden_throne marker (its v2 home).
+        if new_type == "sync":
+            updates["golden_throne"] = "sync"
+        elif new_type == "one_off":
+            updates["golden_throne"] = None
+        elif new_type == "archived":
+            updates["golden_throne"] = None
+            updates["status"] = "archived"
+            updates["rank"] = "retired"
+        elif new_type == "golden_throne":
+            # A golden_throne row holds the GT engine state; the marker references it.
+            # Reuse an existing GT binding when present, else mint one seeded from
+            # the requested/annex values. Insert the row BEFORE setting the marker
+            # (the guard trigger requires the marker to be NULL | 'sync' | a GT id).
+            if _gt_marker and _gt_marker != "sync":
+                marker = _gt_marker
+            else:
+                marker = await create_golden_throne_binding(
+                    db,
+                    zealotry=zealotry_value if zealotry_value is not None else instance["zealotry"],
+                    follow_up_sop=updates.get("follow_up_sop", instance["follow_up_sop"]),
+                    stop_allowed=instance["stop_allowed"],
+                )
+            updates["golden_throne"] = marker
+        # new_type == "hook_driven": no marker change (hook_driven is an annex flag,
+        # not a golden_throne state); leave the marker untouched.
 
         await sanctioned_update_instance(
             db,
@@ -10178,13 +10221,15 @@ async def set_instance_type(instance_id: str, request: Request):
 async def archive_instance(instance_id: str):
     """Archive an instance — manual user action only."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
+        # Archived is a v2 status; the legacy instance_type='archived' marker died.
+        # Clear the golden_throne marker so an archived row carries no GT state.
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"instance_type": "archived", "status": "stopped"},
+            updates={"status": "archived", "golden_throne": None, "rank": "retired"},
             mutation_type="instance_archived",
             write_source="api",
             actor="archive-instance",
@@ -10205,13 +10250,14 @@ async def archive_instance(instance_id: str):
 async def unarchive_instance(instance_id: str):
     """Unarchive an instance — returns to one_off."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
+        # Unarchive → one_off: status back to idle, golden_throne marker cleared.
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"instance_type": "one_off"},
+            updates={"status": "idle", "golden_throne": None},
             mutation_type="instance_updated",
             write_source="api",
             actor="unarchive-instance",
