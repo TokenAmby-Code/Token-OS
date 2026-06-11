@@ -111,6 +111,7 @@ preplan_leader() {
 # plan/compact are universal slash commands and never consult this.
 _AGENT_FILE=""
 _PRESTART_DONE=""
+_PRESTART_OK=1   # 0 once the pre-buffer is confirmed at prompt start (set by _await_prestart)
 # Blind page-key counts: 50 each clears a multi-page draft (proven). Env-tunable so
 # tests can shrink the gated-send volume (and a future "saucy" computed PgDn can
 # override the restore count). PgUp-at-top / End are idempotent, so 50 is a safe floor.
@@ -219,21 +220,40 @@ _start_prebuffer() {
     $DRY_RUN && return 0
     [[ -z "$PANE" ]] && return 0
     _PRESTART_DONE=$(mktemp -t tmux-plan-menu-prestart.XXXXXX 2>/dev/null) || { _PRESTART_DONE=""; return 0; }
-    ( trap '' HUP; prebuffer_prompt_start >/dev/null 2>&1; printf 'done' > "$_PRESTART_DONE" ) \
+    # Write the done-marker ONLY when prompt-start actually reached the prompt
+    # start. A failed move must NOT signal "done" — otherwise an insert could
+    # land at the current cursor instead of prompt start.
+    ( trap '' HUP
+      if prebuffer_prompt_start >/dev/null 2>&1; then printf 'done' > "$_PRESTART_DONE"; fi ) \
         </dev/null >/dev/null 2>&1 &
 }
 
-# Block (bounded ~1.5s) until the pre-buffer signals the cursor is at the prompt
-# start. On timeout, proceed: PgUp-at-top is idempotent, so a small overshoot
-# from a still-running pre-buffer is harmless.
+# Block (bounded ~1.5s) until the pre-buffer signals the cursor reached the
+# prompt start. Records the outcome in _PRESTART_OK (0=confirmed, 1=timeout/
+# failed/none) so inserts can self-position without re-waiting, and returns it.
+# Called once per run (drain point): even on a 1 the background pre-buffer has
+# exited (marker written, or 1.5s elapsed), so the on-exit prompt-end restore no
+# longer races a live PgUp. With no marker to wait on (dry-run / no pane) there
+# is nothing to position, so it reports confirmed.
 _await_prestart() {
-    [[ -z "$_PRESTART_DONE" ]] && return 0
+    [[ -z "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
     local i
     for i in $(seq 1 15); do
-        [[ -s "$_PRESTART_DONE" ]] && return 0
+        [[ -s "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
         sleep 0.1
     done
-    return 0
+    _PRESTART_OK=1
+    return 1
+}
+
+# Guarantee the cursor is at prompt start before an insert. Honors a confirmed
+# pre-buffer; on an unconfirmed one (failure/timeout, per _PRESTART_OK) runs
+# prompt-start synchronously. prompt-start is idempotent (PgUp-at-top is a
+# no-op), so this is safe even if the detached pre-buffer is still draining.
+# Relies on _await_prestart having already run (the run_action drain point).
+_ensure_at_prompt_start() {
+    (( _PRESTART_OK == 0 )) && return 0
+    prebuffer_prompt_start >/dev/null 2>&1
 }
 
 # Post-mortem-grade failure log (log-only; NO notify/TTS — a missing /plan is the
@@ -286,15 +306,18 @@ run_action() {
                 else
                     set_planning_state preplanning >/dev/null 2>&1   # advisory hint
                     text="$(preplan_leader "$agent") "
+                    _ensure_at_prompt_start
                     insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
                 fi
             fi
             ;;
         plan)
             set_planning_state planning >/dev/null 2>&1   # advisory; /plan is token-api-independent
+            _ensure_at_prompt_start
             insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
             ;;
         compact)
+            _ensure_at_prompt_start
             insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
             ;;
         shift+tab|shifttab)
