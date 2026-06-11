@@ -7,7 +7,7 @@
 --   Left click    -> F18                  -> tap/hold state machine
 --   Right click   -> Ctrl+Shift+F6        -> Wispr toggle passthrough + state tracking
 --   Middle click  -> F17                  -> ". "
---   Dial CW       -> F13                  -> scroll down/up equivalent
+--   Dial CW       -> F13                  -> scroll (unified curve, see postDialScroll)
 --   Dial CCW      -> F14                  -> opposite scroll
 --   F15           -> Ctrl+Space           -> tmux prefix (mirrors ahk/script-compiler.ahk)
 
@@ -92,9 +92,56 @@ local function sendTmuxPrefix()
     hs.eventtap.keyStroke({"ctrl"}, "space")
 end
 
-local function postDialScroll(delta)
+-- ===== Dial scroll: unified curve (event-driven, zero timers) =====
+-- twin: ahk/dial-scroll.ahk — same algorithm + constants drive Windows directly.
+--
+-- One scroll event per dial tick, scaled by a multiplier that ramps while ticks
+-- arrive faster than FAST_WINDOW_MS and resets to base on any slow tick.
+-- Output happens only inside the tick handler — releasing the dial is a dead stop.
+-- Brake: a reverse tick while ripping (multiplier ramped AND last tick within
+-- BRAKE_WINDOW_MS) is swallowed — freezes output instead of scrolling backward.
+-- The next reverse tick, now at rest, scrolls normally.
+--
+-- Shared constants (keep in sync with twin):
+--   BASE_LINES=1  FAST_WINDOW_MS=120  ACCEL_RATE=1.2  ACCEL_MAX=12.0  BRAKE_WINDOW_MS=300
+--   MIN_INPUT_GAP_MS=3 is AHK-only (BT phantom guard); the deskflow path doesn't need it.
+local DIAL_BASE_LINES      = 1     -- scroll lines for a single deliberate tick
+local DIAL_FAST_WINDOW_MS  = 120   -- gaps below this ramp acceleration
+local DIAL_ACCEL_RATE      = 1.2   -- multiplier growth per fast tick
+local DIAL_ACCEL_MAX       = 12.0  -- cap on the multiplier
+local DIAL_BRAKE_WINDOW_MS = 300   -- reversal within this of last tick while ramped = brake
+
+local dialLastTickMs = 0
+local dialLastDir    = 0
+local dialMult       = 1.0
+
+-- Called from the eventtap callback — must stay pure arithmetic + one post();
+-- slow callbacks get the tap disabled by macOS.
+local function postDialScroll(dir)
     dialEvents = dialEvents + 1
-    hs.eventtap.event.newScrollEvent({0, delta}, {}, "line"):post()
+    local nowMs = hs.timer.absoluteTime() / 1e6
+    local gap = nowMs - dialLastTickMs
+    dialLastTickMs = nowMs
+
+    if dir ~= dialLastDir and dialLastDir ~= 0 then
+        local wasRipping = (dialMult > 1.0 and gap < DIAL_BRAKE_WINDOW_MS)
+        dialMult = 1.0
+        dialLastDir = dir
+        if wasRipping then
+            return -- BRAKE: swallow the stop-tick, scroll nothing
+        end
+        -- slow-gap reversal = deliberate turnaround → fall through, scroll at base
+    end
+    dialLastDir = dir
+
+    if gap < DIAL_FAST_WINDOW_MS then
+        dialMult = math.min(dialMult * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
+    else
+        dialMult = 1.0
+    end
+
+    local lines = math.max(1, math.floor(DIAL_BASE_LINES * dialMult + 0.5))
+    hs.eventtap.event.newScrollEvent({0, dir * lines}, {}, "line"):post()
 end
 
 local function cancelHoldTimer()
@@ -252,10 +299,10 @@ inputTap = hs.eventtap.new(eventTypes, function(e)
     -- are a common reason macOS disables eventtaps.
     if typ == types.keyDown then
         if keyCode == F13_CODE then
-            postDialScroll(3)
+            postDialScroll(1)
             return true
         elseif keyCode == F14_CODE then
-            postDialScroll(-3)
+            postDialScroll(-1)
             return true
         elseif keyCode == F17_CODE then
             sendPeriodSpace()
