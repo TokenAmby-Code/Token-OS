@@ -77,6 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resolve_instance_parser.add_argument("instance_id")
 
+    freelist_parser = subparsers.add_parser(
+        "freelist",
+        help="List clean, agent-free panes (derived live from @PANE_CLEAN stamps).",
+    )
+    freelist_parser.add_argument("--format", choices=["text", "json", "ids"], default="text")
+    freelist_parser.add_argument(
+        "--first",
+        action="store_true",
+        help="Print only the first free pane id (empty + exit 1 if none).",
+    )
+
     session_doc_parser = subparsers.add_parser(
         "session-doc",
         help="Resolve a cardinal pane id to its linked session document.",
@@ -313,6 +324,26 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"pane_role: {result['pane_role'] or '(unset)'}")
                 print(f"found: {str(result['found']).lower()}")
             return 0 if result["found"] else 1
+
+        if args.command == "freelist":
+            import json
+
+            panes = control.freelist()
+            if args.first:
+                if not panes:
+                    return 1
+                print(panes[0]["pane_id"])
+                return 0
+            if args.format == "json":
+                print(json.dumps(panes))
+            elif args.format == "ids":
+                for pane in panes:
+                    print(pane["pane_id"])
+            else:  # text
+                for pane in panes:
+                    role = pane["pane_role"] or "-"
+                    print(f"{pane['pane_id']}\t{role}\t{pane['window_name']}")
+            return 0
 
         if args.command == "session-doc":
             import json

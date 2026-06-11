@@ -24,7 +24,13 @@ from .labels import canonical_pane_role
 from .models import GroupedSessionSnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
-from .resolver import resolve_instance, resolve_pane, resolve_to_physical, resolve_to_public
+from .resolver import (
+    list_free_panes,
+    resolve_instance,
+    resolve_pane,
+    resolve_to_physical,
+    resolve_to_public,
+)
 from .skill_invoke import invoke_skill_in_pane, send_skill_invocation_to_pane
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
@@ -124,6 +130,21 @@ class TmuxControlPlane:
             "pane_role": resolved.pane_role or "",
             "found": resolved.found,
         }
+
+    def freelist(self) -> list[dict]:
+        """List the clean, agent-free panes (the freelist).
+
+        Purely derived from the live ``@PANE_CLEAN`` stamps — no stored state.
+        Each entry is ``{pane_id, pane_role, window_name}``.
+        """
+        return [
+            {
+                "pane_id": p.pane_id,
+                "pane_role": p.pane_role or "",
+                "window_name": p.window_name,
+            }
+            for p in list_free_panes(self.adapter)
+        ]
 
     def cardinal_pane_label(self, target: str) -> str:
         """Resolve a target to its stable cardinal @PANE_ID label.

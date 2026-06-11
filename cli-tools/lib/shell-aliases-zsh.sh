@@ -18,12 +18,18 @@ source() {
 
 autoload -Uz add-zsh-hook
 
-# Agent exit cleanup: hooks stage /tmp/agent-resume-${TMUX_PANE}; the next shell
-# prompt returns to ~, clears the terminal, and records the resume command
-# directly; dispatch resolves cwd from Token-API.
-_agent_resume_precmd() {
+# --- Agent exit cleanup + clean-pane stamp lifecycle ------------------------
+# Agent exit hooks stage /tmp/agent-resume-${TMUX_PANE}. The clean stamp
+# (@PANE_CLEAN) is set by clear() (shell-aliases.sh) and dropped here on the
+# first command or ^C. The two concerns share a single consume primitive so the
+# late-landing resume sentinel can NEVER wipe a command the user has already run.
+
+# Read + consume (delete) the pane-scoped resume sentinel. Echoes the resume
+# command (possibly empty) on stdout; returns 0 if a sentinel was present, 1 if
+# none. Deleting the file is what *cancels* a pending auto-reset.
+_agent_resume_consume() {
     local pane="${TMUX_PANE:-}"
-    [[ -z "$pane" ]] && return
+    [[ -z "$pane" ]] && return 1
 
     local f="/tmp/agent-resume-${pane}"
     local legacy="/tmp/claude-resume-${pane}"
@@ -31,20 +37,62 @@ _agent_resume_precmd() {
 
     if [[ -f "$f" ]]; then
         cmd="$(sed -n '3p' "$f" 2>/dev/null)"
-        if [[ -z "$cmd" ]]; then
-            cmd="$(sed -n '2p' "$f" 2>/dev/null)"
-        fi
+        [[ -z "$cmd" ]] && cmd="$(sed -n '2p' "$f" 2>/dev/null)"
         rm -f "$f"
     elif [[ -f "$legacy" ]]; then
         cmd="$(cat "$legacy" 2>/dev/null)"
         rm -f "$legacy"
     else
-        return
+        return 1
     fi
 
+    print -r -- "$cmd"
+    return 0
+}
+
+# precmd: auto-reset ONLY when a sentinel is present AND untouched (the user has
+# not acted yet). Returns to ~, clears (→ stamps clean), records the resume
+# command in history. precmd fires before the user can type, so the common
+# typed-`claude`/`codex`-then-exit path resets here race-free. If the sentinel
+# lands late, the preexec/^C path below consumes it on the user's first action.
+_agent_resume_precmd() {
+    local cmd
+    cmd="$(_agent_resume_consume)" || return
     cd ~ 2>/dev/null || true
     clear
     [[ -z "$cmd" ]] && return
     print -s "$cmd"
 }
 add-zsh-hook precmd _agent_resume_precmd
+
+# Drop the clean stamp AND cancel any pending post-agent auto-reset. Called from
+# preexec (first command) and the ^C widget (first interrupt). Consuming the
+# sentinel here means the late `cd ~; clear` can never wipe what the user just
+# did — `cd o` lands in the vault with `ls` visible. The resume command is still
+# recorded in history so up-arrow still resumes.
+_agent_pane_dirty() {
+    _pane_drop_clean
+    local cmd
+    cmd="$(_agent_resume_consume)" || return
+    [[ -z "$cmd" ]] && return
+    print -s "$cmd"
+}
+
+# preexec runs on the first real command — dirty the pane + cancel the reset.
+_agent_clean_preexec() {
+    _agent_pane_dirty
+}
+add-zsh-hook preexec _agent_clean_preexec
+
+# ^C on a partial line dirties too (the user is likelier to ^C than to backspace
+# a whole line). A ZLE widget intercepts ^C at the prompt: dirty + cancel, then
+# perform the standard interrupt (abort the line via send-break). Guarded so a
+# ZLE quirk can never wedge the prompt — if anything fails, fall through to the
+# break. The keystroke-then-backspace edge (visually clear but still stamped
+# clean) is accepted.
+_agent_clean_interrupt() {
+    _agent_pane_dirty 2>/dev/null
+    zle send-break
+}
+zle -N _agent_clean_interrupt
+bindkey '^C' _agent_clean_interrupt
