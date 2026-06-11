@@ -94,9 +94,8 @@ test('Imperial Guard clear restores Cadia overlay ownership for its own draft', 
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
     resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=default' : 'old-title'; },
+    displayValue() { return 'old-title'; },
     async setPaneTitle(target, title) { ops.push(['title', target, title]); },
-    async setPaneStyle(target, style) { ops.push(['style', target, style]); },
     async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
     async typeIntoTarget(target, text) { ops.push(['type', target, text]); },
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
@@ -116,37 +115,93 @@ test('Imperial Guard clear restores Cadia overlay ownership for its own draft', 
   assert.deepEqual(ops, [
     ['title', '%42', 'IG🔒 old-title'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '1'],
-    ['style', '%42', 'bg=#2b1645'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '1'],
     ['type', '%42', 'hold this draft'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
     ['title', '%42', 'old-title'],
-    ['style', '%42', 'bg=default'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
   ]);
 });
 
 
-test('Imperial Guard cleanup clears voice lock even if style restore fails', async () => {
+test('Imperial Guard cleanup clears voice lock even if processing clear fails', async () => {
   const ops = [];
+  let clearing = false;
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
     resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=bad-old' : 'old-title'; },
+    displayValue() { return 'old-title'; },
     async setPaneTitle() {},
-    async setPaneStyle(target, style) {
-      ops.push(['style', target, style]);
-      if (style === 'bg=bad-old') throw new Error('style restore failed');
+    async setPaneOption(target, option, value) {
+      ops.push(['option', target, option, value]);
+      if (clearing && option === '@DISCORD_VOICE_PROCESSING') throw new Error('processing clear failed');
     },
-    async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
     async typeIntoTarget() {},
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
   });
 
   await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft', lockedTmuxPane: '%42' });
+  clearing = true;
   const cleared = await router.clear({ bot: 'imperial_guard' });
 
   assert.equal(cleared.length, 1);
   assert.deepEqual(ops.slice(-2), [
-    ['style', '%42', 'bg=bad-old'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
+    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
+  ]);
+});
+
+test('a flaky processing-flag write never blocks transcript delivery', async () => {
+  const typed = [];
+  const router = createVoiceTranscriptRouter({
+    logger: { warn() {}, info() {} },
+    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
+    displayValue() { return 'old-title'; },
+    async setPaneTitle() {},
+    async setPaneOption(_target, option) {
+      // Lock acquire works; only the cosmetic processing edges flake.
+      if (option === '@DISCORD_VOICE_PROCESSING') throw new Error('set-option flaked');
+    },
+    async typeIntoTarget(target, text) { typed.push([target, text]); },
+    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+  });
+
+  const result = await router.route({
+    botName: 'imperial_guard',
+    userId: 'u1',
+    text: 'must still land',
+    lockedTmuxPane: '%42',
+  });
+
+  assert.equal(result.routed, true);
+  assert.deepEqual(typed, [['%42', 'must still land']]);
+  assert.equal(router.listDrafts().length, 1);
+});
+
+test('voice processing flag is cleared even when typing into the pane fails', async () => {
+  const ops = [];
+  const router = createVoiceTranscriptRouter({
+    logger: { warn() {}, info() {} },
+    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
+    displayValue() { return 'old-title'; },
+    async setPaneTitle() {},
+    async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
+    async typeIntoTarget() { throw new Error('pane write failed'); },
+    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+  });
+
+  await assert.rejects(
+    router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft', lockedTmuxPane: '%42' }),
+    /pane write failed/
+  );
+
+  // First-utterance failure tears the draft down: processing cleared, lock released.
+  assert.deepEqual(router.listDrafts(), []);
+  assert.deepEqual(ops.slice(-3), [
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
   ]);
 });
@@ -156,9 +211,8 @@ test('clearing a persona bot leaves Cadia drafts intact', async () => {
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
     resolveTargetToPane(target) { return target === '3:0' || target === '%42' ? target : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=default' : 'old-title'; },
+    displayValue() { return 'old-title'; },
     async setPaneTitle() {},
-    async setPaneStyle() {},
     async setPaneOption() {},
     async typeIntoTarget(target, text) { typed.push([target, text]); },
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
@@ -182,9 +236,8 @@ test('late transcript after bot leave is ignored and clears stale draft', async 
       getStatus() { return { connected, listening }; },
     },
     resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=default' : 'old-title'; },
+    displayValue() { return 'old-title'; },
     async setPaneTitle() {},
-    async setPaneStyle() {},
     async setPaneOption() {},
     async typeIntoTarget() {},
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
@@ -202,7 +255,7 @@ test('late transcript after bot leave is ignored and clears stale draft', async 
 });
 
 
-test('late transcript with stale epoch/channel is ignored and clears Cadia tint draft', async () => {
+test('late transcript with stale epoch/channel is ignored and clears Cadia lock draft', async () => {
   const ops = [];
   const warnings = [];
   let status = { connected: true, listening: true, channelId: 'cadia', routeEpoch: 1 };
@@ -210,9 +263,8 @@ test('late transcript with stale epoch/channel is ignored and clears Cadia tint 
     logger: { warn(msg) { warnings.push(msg); }, info() {} },
     voiceManager: { getStatus() { return status; } },
     resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=default' : 'old-title'; },
+    displayValue() { return 'old-title'; },
     async setPaneTitle(target, title) { ops.push(['title', target, title]); },
-    async setPaneStyle(target, style) { ops.push(['style', target, style]); },
     async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
     async typeIntoTarget(target, text) { ops.push(['type', target, text]); },
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
@@ -243,7 +295,7 @@ test('late transcript with stale epoch/channel is ignored and clears Cadia tint 
   assert.ok(warnings.some(msg => String(msg).includes('ignored stale transcript')));
   assert.deepEqual(ops.slice(-3), [
     ['title', '%42', 'old-title'],
-    ['style', '%42', 'bg=default'],
+    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
   ]);
 });

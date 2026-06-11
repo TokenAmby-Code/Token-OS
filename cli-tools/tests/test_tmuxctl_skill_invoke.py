@@ -9,13 +9,18 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
+import tmuxctl.cli as tmuxctl_cli
 import tmuxctl.skill_invoke as skill_invoke
 from tmuxctl.enums import InstanceStatus
 from tmuxctl.models import InstanceRegistryEntry, InstanceRegistrySnapshot
+from tmuxctl.service import TmuxControlPlane
 from tmuxctl.skill_invoke import (
     codex_skill_sink_keys,
+    insert_text,
     invoke_skill_in_pane,
     looks_like_codex_skill_invocation,
+    move_to_prompt_end,
+    move_to_prompt_start,
     normalize_skill_name,
     send_skill_invocation_to_pane,
     skill_invocation_text,
@@ -90,11 +95,19 @@ def test_invoke_skill_in_pane_inserts_at_prompt_start_with_harness_prefix(monkey
     text = invoke_skill_in_pane(adapter, "%42", "/preplan", agent="codex")
 
     assert text == "$preplan "
-    assert adapter.calls[:51] == [("send-keys", "-t", "%42", "PgUp")] * 50 + [
-        ("send-keys", "-t", "%42", "Home")
+    # PgUp x50 + Home, then the right-side buffer (space, Left) and the rstripped
+    # leader, then the codex Tab sink — never a concatenated "$preplanexisting".
+    expected_insert = [
+        ("send-keys", "-t", "%42", "PgUp"),
+    ] * 50 + [
+        ("send-keys", "-t", "%42", "Home"),
+        ("send-keys", "-t", "%42", "-l", " "),
+        ("send-keys", "-t", "%42", "Left"),
+        ("send-keys", "-t", "%42", "-l", "$preplan"),
+        ("send-keys", "-t", "%42", "Tab"),
     ]
-    assert ("send-keys", "-t", "%42", "-l", "$preplan ") in adapter.calls
-    assert ("send-keys", "-t", "%42", "Tab") in adapter.calls
+    assert adapter.calls[:55] == expected_insert
+    assert adapter.calls[55:105] == [("send-keys", "-t", "%42", "PgDn")] * 50
     assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
 
 
@@ -105,7 +118,127 @@ def test_invoke_skill_in_pane_does_not_tab_sink_claude(monkeypatch):
     text = invoke_skill_in_pane(adapter, "%42", "preplan", agent="claude")
 
     assert text == "/preplan "
+    assert adapter.calls[:54] == [
+        ("send-keys", "-t", "%42", "PgUp"),
+    ] * 50 + [
+        ("send-keys", "-t", "%42", "Home"),
+        ("send-keys", "-t", "%42", "-l", " "),
+        ("send-keys", "-t", "%42", "Left"),
+        ("send-keys", "-t", "%42", "-l", "/preplan"),
+    ]
     assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls
+    assert adapter.calls[54:104] == [("send-keys", "-t", "%42", "PgDn")] * 50
+    assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
+
+
+def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    text = invoke_skill_in_pane(
+        adapter,
+        "%42",
+        "golden-throne-sop",
+        agent="codex",
+        arguments='victory condition "needs tests passing" is unmet   ',
+    )
+
+    assert text == '$golden-throne-sop victory condition "needs tests passing" is unmet'
+    typed_literals = [
+        call for call in adapter.calls if call[:4] == ("send-keys", "-t", "%42", "-l")
+    ]
+    assert typed_literals == [
+        ("send-keys", "-t", "%42", "-l", " "),
+        (
+            "send-keys",
+            "-t",
+            "%42",
+            "-l",
+            '$golden-throne-sop victory condition "needs tests passing" is unmet',
+        ),
+    ]
+    tab_index = adapter.calls.index(("send-keys", "-t", "%42", "Tab"))
+    first_pgdn_index = adapter.calls.index(("send-keys", "-t", "%42", "PgDn"))
+    assert tab_index < first_pgdn_index
+
+
+def test_move_to_prompt_start_emits_pgup_then_home():
+    adapter = RecordingAdapter()
+    move_to_prompt_start(adapter, "%42")
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 50 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
+
+
+def test_move_to_prompt_start_honors_page_ups():
+    adapter = RecordingAdapter()
+    move_to_prompt_start(adapter, "%42", page_ups=3)
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 3 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
+
+
+def test_insert_text_emits_buffer_separated_send():
+    # insert_text now preloads a right-side buffer (space, Left) before the
+    # rstripped payload so a prepend onto existing composer text can never form a
+    # concatenated token — three sends, not one literal.
+    adapter = RecordingAdapter()
+    insert_text(adapter, "%42", "/plan ")
+    assert adapter.calls == [
+        ("send-keys", "-t", "%42", "-l", " "),
+        ("send-keys", "-t", "%42", "Left"),
+        ("send-keys", "-t", "%42", "-l", "/plan"),
+    ]
+
+
+def test_move_to_prompt_end_emits_pgdn_then_end():
+    adapter = RecordingAdapter()
+    move_to_prompt_end(adapter, "%42")
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 50 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
+
+
+def test_move_to_prompt_end_honors_page_downs():
+    adapter = RecordingAdapter()
+    move_to_prompt_end(adapter, "%42", page_downs=3)
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 3 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
+
+
+def _cli_with_adapter(adapter, monkeypatch):
+    """Route tmuxctl.main through a stub adapter so subcommands record their sends."""
+    monkeypatch.setattr(tmuxctl_cli, "TmuxControlPlane", lambda: TmuxControlPlane(adapter))
+
+
+def test_cli_prompt_start_routes_to_adapter(monkeypatch):
+    adapter = RecordingAdapter()
+    _cli_with_adapter(adapter, monkeypatch)
+    assert tmuxctl_cli.main(["prompt-start", "--pane", "%42", "--page-ups", "2"]) == 0
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 2 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
+
+
+def test_cli_insert_text_routes_to_adapter(monkeypatch):
+    adapter = RecordingAdapter()
+    _cli_with_adapter(adapter, monkeypatch)
+    assert tmuxctl_cli.main(["insert-text", "--pane", "%42", "--text", "/compact "]) == 0
+    assert adapter.calls == [
+        ("send-keys", "-t", "%42", "-l", " "),
+        ("send-keys", "-t", "%42", "Left"),
+        ("send-keys", "-t", "%42", "-l", "/compact"),
+    ]
+
+
+def test_cli_prompt_end_routes_to_adapter(monkeypatch):
+    adapter = RecordingAdapter()
+    _cli_with_adapter(adapter, monkeypatch)
+    assert tmuxctl_cli.main(["prompt-end", "--pane", "%42", "--page-downs", "2"]) == 0
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 2 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
 
 
 def test_send_skill_invocation_to_pane_submits_through_gated_adapter(monkeypatch):

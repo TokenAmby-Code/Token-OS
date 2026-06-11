@@ -26,8 +26,41 @@ test('"maximum duration" without the 60-min phrase is NOT suppressed (narrow mat
   );
 });
 
-test('buffer-commit error still pages the fixer', () => {
+test('buffer-commit error without a duration still pages the fixer', () => {
   assert.equal(isBenignFixerError('realtime_input_audio_buffer_commit', 'buffer too small'), false);
+});
+
+test('empty-buffer (0ms) commit response after local cleanup race is benign', () => {
+  assert.equal(
+    isBenignFixerError(
+      'realtime_input_audio_buffer_commit',
+      'Error committing input audio buffer: buffer too small. Expected at least 100ms of audio, but buffer only has 0.00ms of audio.'
+    ),
+    true
+  );
+  assert.equal(
+    isBenignFixerError('realtime_input_audio_buffer_commit', 'buffer too small: 0ms of audio'),
+    true
+  );
+});
+
+test('buffer too small with a non-zero duration still pages the fixer', () => {
+  assert.equal(
+    isBenignFixerError(
+      'realtime_input_audio_buffer_commit',
+      'Error committing input audio buffer: buffer too small. Expected at least 100ms of audio, but buffer only has 250ms of audio.'
+    ),
+    false
+  );
+  // Fractional zeros inside a non-zero duration must not read as empty.
+  assert.equal(
+    isBenignFixerError('realtime_input_audio_buffer_commit', 'buffer too small: 250.0ms of audio'),
+    false
+  );
+});
+
+test('a 0ms mention without the buffer-too-small signature still pages the fixer', () => {
+  assert.equal(isBenignFixerError('realtime_error', 'latency was 0ms somehow'), false);
 });
 
 test('empty/undefined inputs are not benign', () => {
