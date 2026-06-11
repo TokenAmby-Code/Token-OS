@@ -202,6 +202,48 @@ _resolve_claude_wrapper_bin() {
     return 1
 }
 
+# =============================================================================
+# Clean-pane stamp (@PANE_CLEAN)
+# =============================================================================
+# @PANE_CLEAN=1 is a pure *descriptive* per-pane tmux option meaning "this pane
+# is a clean, idle shell". It is set by clear() and dropped on the first command
+# or ^C (see shell-aliases-{zsh,bash}.sh). It NEVER intercepts a command — it is
+# semantics only, never control flow. The stamps ARE the source of truth;
+# `tmuxctl freelist` derives a live view over them (no second registry).
+#
+# The stamp does NOT drive pane-border rendering — hostname nametags are killed
+# globally in tmux-base.conf regardless of clean state.
+_pane_stamp_clean() {
+    [[ -n "${TMUX_PANE:-}" ]] || return 0
+    command -v tmux >/dev/null 2>&1 || return 0
+    tmux set-option -p -t "${TMUX_PANE}" @PANE_CLEAN 1 2>/dev/null || true
+}
+
+_pane_drop_clean() {
+    [[ -n "${TMUX_PANE:-}" ]] || return 0
+    command -v tmux >/dev/null 2>&1 || return 0
+    tmux set-option -p -u -t "${TMUX_PANE}" @PANE_CLEAN 2>/dev/null || true
+}
+
+# Wrap `clear` so every clear stamps the pane clean. `command clear` runs the
+# real binary; the stamp follows. c() calls this, so it inherits the stamp; the
+# post-agent reset (precmd / _agent_post_exit_reset) does too.
+clear() {
+    command clear "$@"
+    _pane_stamp_clean
+}
+
+# Post-agent reset, run synchronously in-shell the instant the agent wrapper
+# returns (typed-`claude`/`codex` path). Clears + stamps clean immediately so a
+# freshly-closed pane is visually reset without waiting on the racy resume
+# sentinel. The resume command is dropped into history by the prompt hook
+# (_agent_resume_precmd fires before the user can type; if the sentinel lands
+# late, the preexec/^C cancel path prints it on the user's first action). Either
+# way the pending auto-reset can never wipe a command the user has already run.
+_agent_post_exit_reset() {
+    clear
+}
+
 _codex_launch() {
     local dispatch_bin=""
     dispatch_bin="$(_resolve_dispatch_bin)" || {
@@ -209,12 +251,18 @@ _codex_launch() {
         return 1
     }
 
+    local rc=0
     clear
     if [[ $# -gt 0 ]]; then
         "$dispatch_bin" --engine codex --dir "$PWD" --prompt "$*"
     else
         "$dispatch_bin" --engine codex --dir "$PWD"
     fi
+    rc=$?
+    # Only reset on a clean exit — a failed launch must keep its error output
+    # on screen and propagate its exit code, not be cleared into a fresh prompt.
+    [[ $rc -eq 0 ]] && _agent_post_exit_reset
+    return "$rc"
 }
 
 _claude_launch() {
@@ -224,10 +272,15 @@ _claude_launch() {
         return 1
     }
 
+    local rc=0
     clear
     TOKEN_API_LAUNCHER="${TOKEN_API_LAUNCHER:-shell-aliases}" \
     TOKEN_API_ENGINE="${TOKEN_API_ENGINE:-claude}" \
     "$claude_wrapper_bin" --dangerously-skip-permissions "$@"
+    rc=$?
+    # Only reset on a clean exit — preserve a failed wrapper's error + exit code.
+    [[ $rc -eq 0 ]] && _agent_post_exit_reset
+    return "$rc"
 }
 
 claude() {
