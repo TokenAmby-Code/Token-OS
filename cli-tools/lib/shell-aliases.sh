@@ -251,13 +251,18 @@ _codex_launch() {
         return 1
     }
 
+    local rc=0
     clear
     if [[ $# -gt 0 ]]; then
         "$dispatch_bin" --engine codex --dir "$PWD" --prompt "$*"
     else
         "$dispatch_bin" --engine codex --dir "$PWD"
     fi
-    _agent_post_exit_reset
+    rc=$?
+    # Only reset on a clean exit — a failed launch must keep its error output
+    # on screen and propagate its exit code, not be cleared into a fresh prompt.
+    [[ $rc -eq 0 ]] && _agent_post_exit_reset
+    return "$rc"
 }
 
 _claude_launch() {
@@ -267,11 +272,15 @@ _claude_launch() {
         return 1
     }
 
+    local rc=0
     clear
     TOKEN_API_LAUNCHER="${TOKEN_API_LAUNCHER:-shell-aliases}" \
     TOKEN_API_ENGINE="${TOKEN_API_ENGINE:-claude}" \
     "$claude_wrapper_bin" --dangerously-skip-permissions "$@"
-    _agent_post_exit_reset
+    rc=$?
+    # Only reset on a clean exit — preserve a failed wrapper's error + exit code.
+    [[ $rc -eq 0 ]] && _agent_post_exit_reset
+    return "$rc"
 }
 
 claude() {

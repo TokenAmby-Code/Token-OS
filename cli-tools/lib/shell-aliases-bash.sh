@@ -22,6 +22,17 @@ alias reload='builtin source ~/.bashrc'
 # (shell-aliases.sh) and dropped on the first command (DEBUG trap) or ^C
 # (INT trap).
 
+# A sentinel is only trusted when it is a regular, non-symlinked file owned by us
+# — the path lives in shared /tmp, so a symlink or another user's file at the same
+# name would otherwise let a local attacker inject into our history or wedge a
+# fake sentinel in place. Untrusted files are treated as absent. (Moving the
+# namespace into a per-user runtime dir also needs the writer in
+# agent-session-end-resume.sh and is tracked separately; this is the consumer guard.)
+_agent_resume_trusted() {
+    local f="$1"
+    [[ -f "$f" && ! -h "$f" && -O "$f" ]]
+}
+
 # Read + consume (delete) the pane-scoped resume sentinel. Echoes the resume
 # command (possibly empty); returns 0 if a sentinel was present, 1 if none.
 _agent_resume_consume() {
@@ -32,11 +43,11 @@ _agent_resume_consume() {
     local legacy="/tmp/claude-resume-${pane}"
     local cmd=""
 
-    if [[ -f "$f" ]]; then
+    if _agent_resume_trusted "$f"; then
         cmd="$(sed -n '3p' "$f" 2>/dev/null)"
         [[ -z "$cmd" ]] && cmd="$(sed -n '2p' "$f" 2>/dev/null)"
         rm -f "$f"
-    elif [[ -f "$legacy" ]]; then
+    elif _agent_resume_trusted "$legacy"; then
         cmd="$(cat "$legacy" 2>/dev/null)"
         rm -f "$legacy"
     else

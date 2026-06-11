@@ -337,12 +337,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.format == "json":
                 print(json.dumps(panes))
             elif args.format == "ids":
-                for pane in panes:
-                    print(pane["pane_id"])
+                for free_pane in panes:
+                    print(free_pane["pane_id"])
             else:  # text
-                for pane in panes:
-                    role = pane["pane_role"] or "-"
-                    print(f"{pane['pane_id']}\t{role}\t{pane['window_name']}")
+                for free_pane in panes:
+                    role = free_pane["pane_role"] or "-"
+                    print(f"{free_pane['pane_id']}\t{role}\t{free_pane['window_name']}")
             return 0
 
         if args.command == "session-doc":
