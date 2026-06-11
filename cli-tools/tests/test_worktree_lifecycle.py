@@ -323,3 +323,68 @@ def test_delete_prunes_stale_port_entries(project: Project) -> None:
     reg = _registry(project)
     assert str(ghost_dir) not in reg, "stale entry must be pruned"
     assert str(project.parent / "wt-stays") not in reg
+
+
+# ── edge cases proven during the 2026-06-10 backlog sweep ────────────────────
+
+
+def test_slash_branch_full_lifecycle(project: Project) -> None:
+    """Branch names with `/` survive create→delete: the alias upsert/removal
+    must not feed the name into a sed address (delimiter collision, proven
+    live on fix/token-os-env-runtime-derivation)."""
+    res = project.setup("feat/slashy")
+    assert res.returncode == 0, res.stderr
+    aliases_file = project.home / ".cd_quick_aliases"
+    assert "feat/slashy=" in aliases_file.read_text(encoding="utf-8")
+
+    done = project.delete("feat/slashy", "-b")
+    assert done.returncode == 0, done.stderr
+    assert "feat/slashy=" not in aliases_file.read_text(encoding="utf-8")
+    assert "sed:" not in done.stderr, "no sed errors on slash branches"
+    assert not (project.parent / "wt-feat" / "slashy").exists()
+
+
+def test_delete_resolves_renamed_worktree_dir(project: Project) -> None:
+    """When the dir isn't wt-<branch> (dispatch named it from --worktree),
+    delete resolves the branch's registered worktree from git."""
+    custom_dir = project.parent / "wt-custom-name"
+    custom_dir.parent.mkdir(parents=True, exist_ok=True)
+    _git(
+        "--git-dir",
+        str(project.bare),
+        "worktree",
+        "add",
+        "-b",
+        "real-branch",
+        str(custom_dir),
+        env=project.env,
+    )
+
+    done = project.delete("real-branch", "-b")
+    assert done.returncode == 0, done.stderr
+    assert not custom_dir.exists(), "the registered (renamed) dir must be removed"
+    assert (
+        _git("--git-dir", str(project.bare), "branch", "--list", "real-branch", env=project.env)
+        == ""
+    )
+
+
+def test_delete_handles_orphaned_dir(project: Project) -> None:
+    """A dir whose git registration is already gone (external worktree
+    remove/prune raced us — pr-merge does this) is still cleaned up."""
+    res = project.setup("orphan")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-orphan"
+
+    # Orphan it: stash the dir, prune the registration, restore the dir.
+    import shutil
+
+    stash = project.parent / "stash-orphan"
+    shutil.move(str(wt), str(stash))
+    _git("--git-dir", str(project.bare), "worktree", "prune", env=project.env)
+    shutil.move(str(stash), str(wt))
+
+    done = project.delete("orphan", "-b")
+    assert done.returncode == 0, done.stderr
+    assert not wt.exists(), "orphaned dir must be removed"
+    assert _git("--git-dir", str(project.bare), "branch", "--list", "orphan", env=project.env) == ""

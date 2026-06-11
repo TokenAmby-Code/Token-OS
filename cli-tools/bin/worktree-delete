@@ -161,6 +161,20 @@ load_config "$PROJECT"
 
 WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
 
+# The conventional dir is wt-<branch>, but dispatch can name the dir from its
+# --worktree argument while the branch inside was created/renamed differently
+# (e.g. wt-purge-legacy-… holding fix-voice-send-keys-…). When the conventional
+# dir is absent, resolve the branch's real worktree from git itself.
+if [[ ! -d "$WORKTREE_DIR" ]]; then
+    _REGISTERED_WT="$(git --git-dir="$BARE_REPO" worktree list --porcelain 2>/dev/null \
+        | awk -v b="refs/heads/$BRANCH_NAME" '/^worktree /{p=substr($0,10)} /^branch /{if (substr($0,8)==b) print p}' \
+        || true)"
+    if [[ -n "$_REGISTERED_WT" && -d "$_REGISTERED_WT" ]]; then
+        WORKTREE_DIR="$_REGISTERED_WT"
+        log_warn "Conventional dir wt-$BRANCH_NAME missing; using the branch's registered worktree: $WORKTREE_DIR"
+    fi
+fi
+
 # Verify worktree exists
 if [[ ! -d "$WORKTREE_DIR" ]]; then
     # Still try to clean up alias and prune
@@ -169,8 +183,11 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
 fi
 
 CD_QUICK_ALIASES_FILE="$HOME/.cd_quick_aliases"
+# Literal prefix match (awk index, not a regex): branch names may contain
+# regex/sed metacharacters — `fix/...` broke the old `sed "/^$BRANCH=/d"`.
 HAS_ALIAS=false
-if grep -q "^${BRANCH_NAME}=" "$CD_QUICK_ALIASES_FILE" 2>/dev/null; then
+if awk -v p="${BRANCH_NAME}=" 'index($0, p) == 1 {found=1} END {exit !found}' \
+    "$CD_QUICK_ALIASES_FILE" 2>/dev/null; then
     HAS_ALIAS=true
 fi
 
@@ -292,8 +309,24 @@ fi
 # Remove worktree
 if [[ -d "$WORKTREE_DIR" ]]; then
     log_info "Removing worktree..."
-    git --git-dir="$BARE_REPO" worktree remove "$WORKTREE_DIR" --force
-    log_success "Worktree removed: $WORKTREE_DIR"
+    if git --git-dir="$BARE_REPO" worktree remove "$WORKTREE_DIR" --force 2>/dev/null; then
+        log_success "Worktree removed: $WORKTREE_DIR"
+    else
+        # Orphaned dir: the registration is already gone (external `git
+        # worktree remove`/prune raced us — pr-merge does this) but the
+        # directory survived. Only ever rm a path inside WORKTREE_PARENT.
+        case "$WORKTREE_DIR" in
+            "$WORKTREE_PARENT"/*)
+                rm -rf "$WORKTREE_DIR"
+                git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
+                log_success "Removed orphaned worktree dir (registration was already gone): $WORKTREE_DIR"
+                ;;
+            *)
+                log_error "git worktree remove failed and $WORKTREE_DIR is outside $WORKTREE_PARENT — refusing to rm -rf"
+                exit 1
+                ;;
+        esac
+    fi
 else
     log_info "Pruning stale worktree references..."
     git --git-dir="$BARE_REPO" worktree prune
@@ -331,11 +364,14 @@ if [[ "$DELETE_REMOTE" == "true" ]]; then
     fi
 fi
 
-# Remove cd quick alias
+# Remove cd quick alias. awk literal-prefix filter, not sed: a branch name
+# containing `/` collides with sed's address delimiter (proven live on
+# fix/token-os-env-runtime-derivation) and regex metachars could over-match.
 if $HAS_ALIAS; then
     log_info "Removing cd alias..."
-    sed -i '' "/^${BRANCH_NAME}=/d" "$CD_QUICK_ALIASES_FILE" 2>/dev/null || \
-    sed -i "/^${BRANCH_NAME}=/d" "$CD_QUICK_ALIASES_FILE"
+    _tmp_aliases=$(mktemp)
+    awk -v p="${BRANCH_NAME}=" 'index($0, p) != 1' "$CD_QUICK_ALIASES_FILE" > "$_tmp_aliases" \
+        && mv "$_tmp_aliases" "$CD_QUICK_ALIASES_FILE"
     log_success "CD alias removed: $BRANCH_NAME"
 fi
 

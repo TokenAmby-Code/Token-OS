@@ -694,14 +694,14 @@ fi
 
 echo ""
 
-# Register quick cd alias (branch name → worktree dir)
+# Register quick cd alias (branch name → worktree dir). Upsert via an awk
+# literal-prefix filter + append — branch names may contain regex/sed
+# metacharacters (`fix/…` broke the sed delimiter in worktree-delete).
 CD_QUICK_ALIASES_FILE="$HOME/.cd_quick_aliases"
-if grep -q "^${BRANCH_NAME}=" "$CD_QUICK_ALIASES_FILE" 2>/dev/null; then
-    sed -i '' "s|^${BRANCH_NAME}=.*|${BRANCH_NAME}=${WORKTREE_DIR}|" "$CD_QUICK_ALIASES_FILE" 2>/dev/null || \
-    sed -i "s|^${BRANCH_NAME}=.*|${BRANCH_NAME}=${WORKTREE_DIR}|" "$CD_QUICK_ALIASES_FILE"
-else
-    echo "${BRANCH_NAME}=${WORKTREE_DIR}" >> "$CD_QUICK_ALIASES_FILE"
-fi
+_tmp_aliases=$(mktemp)
+awk -v p="${BRANCH_NAME}=" 'index($0, p) != 1' "$CD_QUICK_ALIASES_FILE" 2>/dev/null > "$_tmp_aliases" || true
+echo "${BRANCH_NAME}=${WORKTREE_DIR}" >> "$_tmp_aliases"
+mv "$_tmp_aliases" "$CD_QUICK_ALIASES_FILE"
 log_success "CD alias registered: cd $BRANCH_NAME → $WORKTREE_DIR"
 
 echo ""
