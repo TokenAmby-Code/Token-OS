@@ -4,7 +4,88 @@
 **Branch**: `claude-instances-archive-extraction` (worktree `wt-claude-instances-archive-extraction`)
 **Base**: `d096810` (== origin/main)
 **Persona**: Mechanicus worker, dispatched by Fabricator-General
-**Status**: 🟡 BLOCKED on scope confirmation — premise contradicted by ground truth. No code written yet (investigation only).
+**Status**: 🟢 GREEN CORE COMMITTED (`ad7ef88`). 17/17 exterminatus tests pass. Schema extraction +
+single-write mutation + full hooks.py repoint + the 4 legacy PATCH endpoints done. Remaining: a
+mechanical read-site sweep (main.py ~85 sites, ~14 small modules, cli-tools, ~40 test files) — see the
+RESUME PLAYBOOK directly below, written so a cheaper model can execute it without re-deriving anything.
+
+---
+
+## RESUME PLAYBOOK (cheap-model executable) — START HERE
+
+**Goal of remaining work:** drive `git grep -l claude_instances` (non-archive, non-comment) to ZERO
+across the repo, keeping every test GREEN, then run the SOP tail (restart → live-test → PR → merge).
+
+**Ground rules (do not violate):**
+- Work ONLY in this worktree: `/Users/tokenclaw/worktrees/Token-OS/wt-claude-instances-archive-extraction`.
+  Never branch-switch or edit the live shared Token-OS checkout.
+- NEVER `uv run`/`uv sync` against the live Token-API NAS `.venv` (it downs the service). Use this
+  worktree's own `.venv` only. Test cmd is always `.venv/bin/python -m pytest ... -q` from `token-api/`.
+- A formatter (ruff) runs after every Edit and WILL strip a newly-added import if the using code isn't
+  present yet → `NameError`/`F821`. After adding an import, add the using code in the SAME edit, or guard
+  the import with `# noqa: F401`. Re-grep the import after editing.
+- RENAME/REPOINT ONLY — do not restructure control flow or response-shapes. A parallel branch
+  (registration worker) rebases onto this file set; keep diffs surgical.
+
+**The disposition map (legacy column → v2 home) is the single source of truth for every conversion.**
+It is the "DISPOSITION MAP" / "Field disposition" section further down this doc. Summary:
+- table `claude_instances` → `instances`.
+- `tab_name` → `name` (alias `name AS tab_name` when a dict consumer needs the old key).
+- status vocab: `processing`→`working`; `status IN ('processing','idle')` (="active") →
+  `status NOT IN ('stopped','archived')`; `status != 'stopped'` → `NOT IN ('stopped','archived')`.
+- `legion`/`primarch`/`profile_name` → `persona_id` (JOIN personas p ON p.id=i.persona_id, compare
+  `p.slug`; emit `COALESCE(p.slug,'astartes') AS legion`; resolve a legion NAME to slug via
+  `instance_registry.LEGACY_PERSONA_ALIASES`).
+- `synced=1` ⇔ `golden_throne='sync'`. `instance_type`: 'sync'⇔marker='sync',
+  'golden_throne'⇔marker not null and != 'sync' (a golden_throne.id), 'one_off'⇔marker IS NULL,
+  'archived'⇔status='archived'.
+- `parent_instance_id` → `commander_id` where `commander_type='chapter'` (alias
+  `CASE WHEN commander_type='chapter' THEN commander_id END AS parent_instance_id`).
+- `registered_at` → `created_at`. DEAD (remove): `session_id`, `pid`, `source_ip`, `tts_mode`
+  (→notification_mode+interaction_mode). Annex columns keep their names (tmux_pane, pane_label,
+  dispatch_*, workflow_*, planning_*, pr_*, victory_*, zealotry, gt_*, follow_up_sop, stop_allowed, …).
+- Reference implementations already in-tree: `routes/hooks.py` (every pattern above) and the 4 PATCH
+  endpoints in `main.py` (set_instance_legion/synced/type/archive). Helpers:
+  `instance_mutation.create_golden_throne_binding`, `routes/hooks._launch_golden_throne_marker`,
+  `routes/hooks._row_parent_instance_id`, `instance_registry.legacy_row_to_instance_values`.
+
+**Order of execution (commit in coherent packages after each GREEN step):**
+1. **main.py** (~85 sites). `git grep -n claude_instances main.py`. Convert per the map. The 9 plain
+   `SELECT * ... WHERE id = ?` are pure table renames. Watch the `/api/instances` list (~11210),
+   COUNT(*) active predicates, the dead `pid`/`working_dir` lookups (10474/10482), `WHERE legion=?`
+   (20501), `SELECT legion` (10985). Verify: `git grep -c claude_instances main.py` == 0 (rewrite
+   comments too), `.venv/bin/python -c "import ast; ast.parse(open('main.py').read())"`, then the
+   exterminatus suite stays 17/17.
+2. **Small token-api modules** (~14): tts.py, voice.py, day_start.py, db_helpers.py, shared.py,
+   custodes_heartbeat.py, custodes_checkin.py, custodes_watchtower.py, morning_session.py,
+   now_widget.py, cron_engine.py, talk.py, temp_message.py, session_doc_helpers.py,
+   morning_supervisor.py, backfill_instance_id_stamps.py. (personas.py's
+   `repair_legacy_instance_personas` reads the legacy table but is guarded by a table-exists check in
+   init — it may stay, just confirm it no-ops post-drop.)
+3. **cli-tools + @CC_STATE consumers** (separate processes; won't crash token-api but needed for
+   completeness): dispatch, instance-stop, instances-clear, guardsman, notify, tmux-goto-spoken,
+   tmux-multiprompt, tmux-pane-label, tmux-shuttle, open-session-doc, discord-routing, civic-thread,
+   agents-db, send_gate.py, agent-session-end-resume.sh; vocab consumers tmux-base.conf:59,
+   tmux-instance-exit, tmux-shuttle, lib/tmuxctl/assertions.py (accept 'working' etc.);
+   discord-daemon/daemon.js; Scripts/engine-column-audit.py.
+4. **Test fixtures** (~40 files seed/assert claude_instances): heaviest are test_legion_synced.py,
+   test_instance_provenance.py, test_enforcement_core.py. Re-seed into `instances` v2 (use the
+   `legacy_seed`-style fixture in test_claude_instances_exterminatus.py as the pattern).
+5. **Full suite GREEN:** `.venv/bin/python -m pytest -q` (whole token-api/tests).
+6. **SOP tail (task 8):** `token-restart` (NOT uv) → live-test: confirm `~/.claude/archive/archive.db`
+   holds the extracted legacy rows (live pre-migration: claude_instances=144 rows / 3 processing,
+   instances=167), `claude_instances` gone from the live DB, FG/custodes/admin identity reads correct
+   from v2, ghost rows resolved, a fresh SessionStart round-trips → PR (pr-create) → CodeRabbit (NEVER
+   `--admin-bypass`) → address → restart → live-test 2 → merge → restart. Fresh-clone completeness:
+   `git ls-files` + import-graph check, and `git grep -l claude_instances -- ':!**/archive/**' ':!*.md'`
+   returns nothing but intentional archive/restore code in db_schema.py.
+
+**Already committed in `ad7ef88` (do NOT redo):** db_schema.py (archive extraction machinery +
+triggers/indexes moved + legacy CREATE/migrations deleted), instance_mutation.py (single-write +
+create_golden_throne_binding), instance_registry.py (IDENTITY+ANNEX columns + legacy_row mapping),
+routes/hooks.py (FULL repoint), main.py (4 PATCH endpoints only), tests/test_claude_instances_exterminatus.py.
+
+---
 
 ## Mandate (as briefed)
 
@@ -138,26 +219,36 @@ until the `golden_throne`-table cutover lands).
 6. ✅ `routes/hooks.py` (partial): import + `_persist_legacy_runtime_fields`→`_persist_runtime_fields`
    (4 call sites renamed) — REST OF hooks.py STILL PENDING (see below).
 
-**Test state:** 11/17 GREEN. All TestArchiveExtraction (6) + TestSanctionedWritesV2Only (2) +
-fresh-DB schema tests pass. Remaining 6 RED need main.py + hooks.py repoints:
-session_start_registers_into_instances_only, status_trigger_pushes_v2_vocab, 4× PATCH endpoint tests.
+**Test state: 17/17 GREEN.** All of TestArchiveExtraction, TestSanctionedWritesV2Only,
+TestFreshDatabase (incl. session_start_registers_into_instances_only + status_trigger_pushes_v2_vocab),
+and TestLegacyPatchEndpoints (all 4) pass. Cmd:
+`.venv/bin/python -m pytest tests/test_claude_instances_exterminatus.py -q`.
 
-**In flight:**
-- **main.py repoint dispatched to fleet pane %116** (session doc
-  `Mars/Sessions/2026-06-11-catch-repoint-main-py-to-instances-v2.md`) — full disposition map +
-  PATCH endpoint semantics in its brief. CHECK ITS RESULT before continuing main.py work.
-- **hooks.py repoint agent FAILED to start (API 529, 0 tokens, agent id ab106227bc467750a)** — needs
-  re-dispatch or do manually. Full prompt spec was: repoint ~30 SQL sites + ~120 python-side legacy
-  field reads (tab_name×12, legion×14, instance_type×19, synced×7, profile_name×5,
-  parent_instance_id×20, registered_at×2, pid×10, session_id×10, primarch×14, processing×12);
-  RENAME ONLY, no flow restructuring (registration worker rebases onto this file). Key sites:
-  660, 685, 907, 924, 946 (drop `OR session_id = ?`), 971, 1130, 1293, 1947, 1956, 1979, 2007
-  (primarch supplant → p.slug), 2027 (PID+pane match: drop `AND pid = ?`, keep pane-stamp gate),
-  2219, 2387, 2645, 2706 (parent legion → persona slug subquery), 3030, 3140, 3215, 3235+3365+4288
-  ({"status":"processing"}→"working"), 3439 (instance_type→golden_throne=='sync'), 3688, 4156,
-  4311, 4364, 4462, 4532, 4809, 4864; SessionStart insert dict ~2715 (drop session_id/source_ip/pid
-  keys; legacy-shaped rest auto-canonicalizes); PERSONA_PANE_IDENTITY writes → persona_id +
-  golden_throne='sync'.
+**COMMITTED:** `ad7ef88` (WIP checkpoint, branch `claude-instances-archive-extraction`, base d096810).
+Contains the GREEN core: db_schema + instance_mutation + instance_registry + full routes/hooks.py
+repoint + the four main.py PATCH endpoints. ruff clean.
+
+**hooks.py: FULLY repointed** (the fleet-dispatched agent never landed; done manually). Every
+claude_instances SQL site → instances; SessionStart/Stop/Prompt/PreTool/PostTool write paths all on
+v2; dead cols (pid/session_id/source_ip) dropped; status writes use v2 vocab (working); legacy reads
+derived — primarch→persona_id via LEGACY_PERSONA_ALIASES, parent_instance_id via
+`_row_parent_instance_id` (commander_type='chapter'), instance_type via golden_throne marker,
+synced→marker clear-if-'sync'. New helpers: `_launch_golden_throne_marker`,
+`instance_mutation.create_golden_throne_binding`. NOTE: both new imports were stripped by the
+formatter once — re-added; keep an eye out (the `# noqa: F401` on main.py's import guards it).
+
+**main.py: 4 PATCH endpoints DONE** (/legion→persona_id+voice/sound; /synced→golden_throne='sync'
+with persona-singleton 409; /type→marker semantics + GT-row mint via create_golden_throne_binding;
+/archive+/unarchive→status+marker-clear). **~85 read-sites STILL PENDING** (see below).
+
+**main.py remaining ~85 sites** (git grep -n claude_instances main.py): the `/api/instances` list
+(~11210, `ORDER BY registered_at`→created_at, project legion via persona join, name AS tab_name,
+status vocab, derive instance_type/synced from marker), cockpit/census COUNT(*) active predicates
+(1865/1966/1973/18509/25246/25252: `status IN ('processing','idle')`→`NOT IN ('stopped','archived')`,
+`='processing'`→`='working'`), pid/working_dir lookups (10474/10482 — pid column dead, drop or switch
+to pane-stamp), `WHERE legion = ?` (20501→persona slug join), `SELECT legion` (10985→persona subquery),
+tab_name/session_doc selects (2746/7876/9683/9760/10001/23890→name AS tab_name), plus the 9 plain
+`SELECT * ... WHERE id = ?` (pure table rename). Test-only `DELETE FROM claude_instances` (1901)→instances.
 
 **Still pending (tasks 5–8):**
 - 14 small token-api files (mine): tts.py, voice.py, day_start.py, db_helpers.py, shared.py,
@@ -179,7 +270,7 @@ session_start_registers_into_instances_only, status_trigger_pushes_v2_vocab, 4×
 
 **Key facts for resume:**
 - Worktree: `/Users/tokenclaw/worktrees/Token-OS/wt-claude-instances-archive-extraction`, branch
-  `claude-instances-archive-extraction`, base d096810 = origin/main. NOTHING COMMITTED YET.
+  `claude-instances-archive-extraction`, base d096810 = origin/main. Checkpoint `ad7ef88` committed.
 - Test cmd: `.venv/bin/python -m pytest tests/test_claude_instances_exterminatus.py -q` (from token-api/).
 - Formatter hook auto-runs on edits (once stripped my new imports mid-edit — re-add if NameError).
 - Emperor's ruling verbatim is in "Scope ruling" above; full extraction in THIS branch, staged
