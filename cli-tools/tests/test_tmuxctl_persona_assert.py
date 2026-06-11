@@ -92,7 +92,7 @@ def test_persona_specs_pin_model_defaults():
     assert persona_spec("mechanicus:admin").model == "sonnet"
 
 
-def test_malcador_spec_is_not_sync():
+def test_malcador_spec_is_not_sync() -> None:
     spec = persona_spec("legion:malcador")
     assert spec.sync is False
     assert spec.persona == "malcador"

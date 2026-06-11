@@ -454,6 +454,18 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     tab = (getattr(row, "tab_name", "") or "").lower()
     if spec.persona == "custodes":
         return row.legion == "custodes" and row.instance_type in {"sync", "hook_driven"}
+    if spec.persona == "malcador":
+        # Malcador is a singleton primarch sharing the `astartes` legion with the
+        # regiment workers, so legion cannot identify it — its load-bearing key is
+        # `primarch='malcador'` (the same column the registry seeds and dispatch
+        # resolves on), mirroring Administratum. Keying on primarch decouples the
+        # match from agent self-naming: a freshly registered row has
+        # tab_name='needs-name' yet IS Malcador, so requiring the persona substring
+        # in tab_name would re-arm the correction loop. tab_name stays a fallback
+        # for rows predating the primarch column.
+        return row.pane_label == spec.pane_label and (
+            getattr(row, "primarch", "") == "malcador" or spec.persona in tab
+        )
     if spec.persona == "fabricator-general":
         # FG owns a dedicated legion (`fabricator`, see ALLOWED_LEGIONS in the
         # token-api). Prefer that DB-level identity column; tab_name reflects
