@@ -59,6 +59,28 @@ test('static resolver falls back only to first live pane in persona window', () 
   assert.equal(pane, '%8');
 });
 
+test('static resolver reads via the local tmux binary, not the NAS guard wrapper', () => {
+  // The hot-path spawn must prefer /opt/homebrew/bin over the SMB-hosted
+  // cli-tools/bin wrapper. When that wrapper is first on PATH and the NAS
+  // stalls, the spawn times out (ETIMEDOUT) and the transcript is dropped.
+  let seenPath = '';
+  resolveStaticVoiceTargetToPane('3:0', {
+    execSync: (_cmd, _args, opts) => {
+      seenPath = opts?.env?.PATH || '';
+      return 'main\t3\t0\t%9\tlegion:custodes';
+    },
+    paneExistsFn: () => true,
+  });
+
+  const brew = seenPath.indexOf('/opt/homebrew/bin');
+  const nas = seenPath.indexOf('cli-tools/bin');
+  assert.ok(brew >= 0, `resolution PATH must include the local tmux dir: ${seenPath}`);
+  assert.ok(
+    nas === -1 || brew < nas,
+    `resolution PATH must prefer local tmux over the NAS wrapper: ${seenPath}`,
+  );
+});
+
 test('persona bots use stable tmuxctl public targets, not physical pane ids', () => {
   assert.equal(defaultVoiceTargetForBot('custodes'), '3:0');
   assert.equal(defaultVoiceTargetForBot('mechanicus'), '4:0');
