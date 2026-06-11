@@ -472,7 +472,7 @@ class InstanceResponse(BaseModel):
     notification_sound: str
     pid: int | None
     status: str
-    registered_at: str
+    created_at: str
     last_activity: str
     stopped_at: str | None
 
@@ -1099,8 +1099,8 @@ async def cleanup_stale_instances() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT id
-               FROM claude_instances
-               WHERE status IN ('processing', 'idle')
+               FROM instances
+               WHERE status NOT IN ('stopped', 'archived')
                  AND last_activity < ?""",
             (cutoff,),
         )
@@ -1111,7 +1111,6 @@ async def cleanup_stale_instances() -> dict:
                 instance_id=row[0],
                 updates={
                     "status": "stopped",
-                    "synced": 0,
                     "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
                 },
@@ -1680,10 +1679,10 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.tab_name, ci.tmux_pane, ci.workflow_blocked_reason,
+            SELECT ci.id, ci.name AS tab_name, ci.tmux_pane, ci.workflow_blocked_reason,
                    ci.session_doc_id, ci.dispatch_session_doc_path,
                    sd.file_path AS session_doc_path
-            FROM claude_instances ci
+            FROM instances ci
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.id = ?
             """,
@@ -1836,7 +1835,7 @@ async def register_instance(request: InstanceRegisterRequest):
             "notification_sound": profile["notification_sound"],
             "pid": request.pid,
             "status": "idle",
-            "registered_at": now,
+            "created_at": now,
             "last_activity": now,
         }
         await sanctioned_insert_instance(
@@ -1862,7 +1861,7 @@ async def register_instance(request: InstanceRegisterRequest):
     # Push updated instance count to phone widget
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
@@ -1888,17 +1887,19 @@ async def delete_all_instances():
 
     async with aiosqlite.connect(DB_PATH) as db:
         # Get all instances before deleting
-        cursor = await db.execute("SELECT id, device_id, status FROM claude_instances")
+        cursor = await db.execute("SELECT id, device_id, status FROM instances")
         all_instances = await cursor.fetchall()
 
         if not all_instances:
             return {"status": "no_instances", "deleted_count": 0}
 
         # Count active instances for enforcement check
-        active_count = sum(1 for _, _, status in all_instances if status in ("processing", "idle"))
+        active_count = sum(
+            1 for _, _, status in all_instances if status not in ("stopped", "archived")
+        )
 
         # Delete all instances from the database
-        await db.execute("DELETE FROM claude_instances")
+        await db.execute("DELETE FROM instances")
         await db.commit()
 
     # Log bulk deletion event
@@ -1929,7 +1930,7 @@ async def stop_instance(instance_id: str):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1951,7 +1952,6 @@ async def stop_instance(instance_id: str):
             instance_id=instance_id,
             updates={
                 "status": "stopped",
-                "synced": 0,
                 "input_lock": None,
                 "stopped_at": now,
             },
@@ -1963,14 +1963,14 @@ async def stop_instance(instance_id: str):
 
         # Check remaining active instances (all)
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived')"
         )
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
 
         # Count remaining non-subagent active instances
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
         )
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
@@ -2058,7 +2058,10 @@ async def kill_instance(instance_id: str):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            "SELECT i.*, i.name AS tab_name FROM instances i WHERE i.id = ?",
+            (instance_id,),
+        )
         row = await cursor.fetchone()
 
     if not row:
@@ -2084,7 +2087,6 @@ async def kill_instance(instance_id: str):
                         instance_id=instance_id,
                         updates={
                             "status": "stopped",
-                            "synced": 0,
                             "input_lock": None,
                             "stopped_at": now,
                         },
@@ -2111,7 +2113,6 @@ async def kill_instance(instance_id: str):
                     instance_id=instance_id,
                     updates={
                         "status": "stopped",
-                        "synced": 0,
                         "input_lock": None,
                         "stopped_at": now,
                     },
@@ -2142,7 +2143,6 @@ async def kill_instance(instance_id: str):
                     instance_id=instance_id,
                     updates={
                         "status": "stopped",
-                        "synced": 0,
                         "input_lock": None,
                         "stopped_at": now,
                     },
@@ -2172,7 +2172,6 @@ async def kill_instance(instance_id: str):
                     instance_id=instance_id,
                     updates={
                         "status": "stopped",
-                        "synced": 0,
                         "input_lock": None,
                         "stopped_at": now,
                     },
@@ -2271,7 +2270,6 @@ async def kill_instance(instance_id: str):
             instance_id=instance_id,
             updates={
                 "status": "stopped",
-                "synced": 0,
                 "input_lock": None,
                 "stopped_at": now,
             },
@@ -2309,7 +2307,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
     if not row:
@@ -2358,17 +2356,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
             if new_pid:
                 pid = new_pid
                 logger.info(f"Unstick: rediscovered PID {pid} for {working_dir}")
-                # Update the stored PID
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await sanctioned_update_instance(
-                        db,
-                        instance_id=instance_id,
-                        updates={"pid": pid},
-                        mutation_type="instance_updated",
-                        write_source="api",
-                        actor="unstick-instance",
-                    )
-                    await db.commit()
+                # PID is archive-only after instance cutover; do not persist it.
             else:
                 raise HTTPException(
                     status_code=400,
@@ -2411,7 +2399,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT last_activity FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT last_activity FROM instances WHERE id = ?", (instance_id,)
         )
         row = await cursor.fetchone()
 
@@ -2591,7 +2579,7 @@ async def diagnose_instance(instance_id: str):
     # Look up instance
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
 
     if not row:
@@ -2743,7 +2731,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, tab_name, session_doc_id, session_doc_policy FROM claude_instances WHERE id = ?",
+            "SELECT id, name AS tab_name, session_doc_id, session_doc_policy FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -2757,7 +2745,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"tab_name": request.tab_name},
+            updates={"name": request.tab_name},
             mutation_type="instance_updated",
             write_source="api",
             actor="rename-instance",
@@ -2807,10 +2795,10 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tab_name
-               FROM claude_instances
+            """SELECT id, name AS tab_name
+               FROM instances
                WHERE id = ?
-                 AND COALESCE(status, '') != 'stopped'
+                 AND COALESCE(status, '') NOT IN ('stopped', 'archived')
                LIMIT 1""",
             (pane_instance_id,),
         )
@@ -2823,7 +2811,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         result = await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"tab_name": tab_name},
+            updates={"name": tab_name},
             mutation_type="instance_updated",
             write_source="api",
             actor="instance-name-cli",
@@ -2858,7 +2846,7 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
     enabling cross-device transplants where file-based handoff doesn't work.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         await sanctioned_update_instance(
@@ -2870,7 +2858,7 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
             actor="transplant-pending",
         )
         await db.commit()
-        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
@@ -2889,7 +2877,7 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -2914,9 +2902,7 @@ async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
     """Release input lock for an instance's tmux pane."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,)
-        )
+        cursor = await db.execute("SELECT input_lock FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -2946,7 +2932,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
             "prompt_submit",
             {"instance_id": instance_id, "action": request.action},
         )
-        new_status = "processing"
+        new_status = "working"
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
         # Prompt submit is a SATISFY work signal: it clears this instance's acks
         # plus distraction/backlog acks. Productivity for instances is owned by
@@ -2967,7 +2953,13 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
+            """SELECT i.*,
+                      CASE WHEN i.golden_throne = 'sync' THEN 'sync'
+                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                           ELSE 'one_off'
+                      END AS instance_type
+               FROM instances i
+               WHERE i.id = ?""",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -3869,7 +3861,7 @@ async def _coderabbit_sync_once(instance_id: str) -> dict:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
     if not row:
         _disarm_coderabbit_sync(instance_id)
@@ -3954,8 +3946,8 @@ async def _arm_coderabbit_sync_for_doc(doc_id: int) -> list[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, device_id FROM claude_instances "
-            "WHERE session_doc_id = ? AND status != 'stopped'",
+            "SELECT id, device_id FROM instances "
+            "WHERE session_doc_id = ? AND status NOT IN ('stopped', 'archived')",
             (doc_id,),
         )
         rows = await cursor.fetchall()
@@ -3980,11 +3972,11 @@ async def recover_coderabbit_sync_jobs() -> list[str]:
         cursor = await db.execute(
             """
             SELECT ci.id AS id, sd.file_path AS file_path
-            FROM claude_instances ci
+            FROM instances ci
             JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.device_id = ?
               AND ci.pr_url IS NOT NULL
-              AND ci.status != 'stopped'
+              AND ci.status NOT IN ('stopped', 'archived')
               AND (sd.status IS NULL OR sd.status != 'archived')
             """,
             (LOCAL_DEVICE_NAME,),
@@ -4041,7 +4033,10 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
     schedule normally; the fire callback differentiates them.
     """
     instance_id = instance["id"]
-    instance_type = instance.get("instance_type", "one_off")
+    marker = instance.get("golden_throne")
+    instance_type = instance.get("instance_type")
+    if instance_type is None:
+        instance_type = "sync" if marker == "sync" else ("golden_throne" if marker else "one_off")
     zealotry = int(instance.get("zealotry") or 4)
     if instance_type != "golden_throne":
         return {"scheduled": False, "reason": "not_golden_throne"}
@@ -4129,11 +4124,16 @@ async def recover_recent_stopped_golden_throne_timers(
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.*
-            FROM claude_instances ci
+            SELECT ci.*,
+                   CASE WHEN ci.golden_throne = 'sync' THEN 'sync'
+                        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
+                        ELSE 'one_off'
+                   END AS instance_type
+            FROM instances ci
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.status IN ('idle', 'stopped')
-              AND ci.instance_type = 'golden_throne'
+              AND ci.golden_throne IS NOT NULL
+              AND ci.golden_throne != 'sync'
               AND COALESCE(ci.zealotry, 4) >= 4
               AND (sd.status IS NULL OR sd.status != 'archived')
               AND COALESCE(ci.stopped_at, ci.last_activity) IS NOT NULL
@@ -4656,9 +4656,7 @@ async def _flag_hook_driven(
             db.row_factory = aiosqlite.Row
             target_id: str | None = None
             if (instance_id or "").strip():
-                cur = await db.execute(
-                    "SELECT id FROM claude_instances WHERE id = ?", (instance_id,)
-                )
+                cur = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
                 row = await cur.fetchone()
                 if row:
                     target_id = row["id"]
@@ -4668,7 +4666,7 @@ async def _flag_hook_driven(
                 pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
                 if pane_instance_id:
                     cur = await db.execute(
-                        "SELECT id FROM claude_instances WHERE id = ? AND status != 'stopped'",
+                        "SELECT id FROM instances WHERE id = ? AND status NOT IN ('stopped', 'archived')",
                         (pane_instance_id,),
                     )
                     row = await cur.fetchone()
@@ -4890,7 +4888,7 @@ async def _tmux_send_payload_then_submit(
 async def _pane_write_instance_engine(instance_id: str) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT engine FROM claude_instances WHERE id = ?",
+            "SELECT engine FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -5371,11 +5369,14 @@ async def compute_work_state() -> WorkStateResponse:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id, tab_name, status, engine, working_dir, tmux_pane, device_id,
-                   last_activity, legion, COALESCE(hook_driven, 0) AS hook_driven
-            FROM claude_instances
-            WHERE status IN ('processing', 'idle')
-              AND COALESCE(is_subagent, 0) = 0
+            SELECT i.id, i.name AS tab_name, i.status, i.engine, i.working_dir,
+                   i.tmux_pane, i.device_id, i.last_activity,
+                   COALESCE(p.slug, 'astartes') AS legion,
+                   COALESCE(i.hook_driven, 0) AS hook_driven
+            FROM instances i
+            LEFT JOIN personas p ON p.id = i.persona_id
+            WHERE i.status NOT IN ('stopped', 'archived')
+              AND COALESCE(i.is_subagent, 0) = 0
             """
         )
         rows = await cursor.fetchall()
@@ -5384,7 +5385,7 @@ async def compute_work_state() -> WorkStateResponse:
             SELECT tmux_pane,
                    MAX(last_activity) AS last_activity,
                    MAX(COALESCE(hook_driven, 0)) AS hook_driven
-            FROM claude_instances
+            FROM instances
             WHERE tmux_pane IS NOT NULL
               AND device_id = ?
             GROUP BY tmux_pane
@@ -5406,7 +5407,7 @@ async def compute_work_state() -> WorkStateResponse:
         # TTL window. Their reflex activity (instance last_activity bump +
         # work_action) is discounted from productivity below so the mechanicus
         # pane's reflex wake does not anchor WORKING. injected_at is naive-local
-        # (matches claude_instances.last_activity); a pane's activity is only
+        # (matches instances.last_activity); a pane's activity is only
         # discounted when it post-dates the injection (>= injected_at guard).
         marker_cursor = await db.execute(
             """
@@ -5465,7 +5466,7 @@ async def compute_work_state() -> WorkStateResponse:
                 if wa_sid:
                     wa_pane_cursor = await db.execute(
                         "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
-                        "FROM claude_instances WHERE id = ?",
+                        "FROM instances WHERE id = ?",
                         (wa_sid,),
                     )
                     wa_pane_row = await wa_pane_cursor.fetchone()
@@ -5523,7 +5524,7 @@ async def compute_work_state() -> WorkStateResponse:
                 )
             else:
                 pane_is_agent = False
-        if row["status"] == "processing" and is_recent:
+        if row["status"] == "working" and is_recent:
             processing_recent_count += 1
         if not is_recent:
             continue
@@ -7080,7 +7081,6 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
             instance_id=session_id,
             updates={
                 "status": "stopped",
-                "synced": 0,
                 "input_lock": None,
                 "stopped_at": now,
                 # The GT sweep uses stopped_at/last_activity as the quiet edge
@@ -7142,7 +7142,16 @@ async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (session_id,))
+        cursor = await db.execute(
+            """SELECT i.*, i.name AS tab_name,
+                      CASE WHEN i.golden_throne = 'sync' THEN 'sync'
+                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                           ELSE 'one_off'
+                      END AS instance_type
+               FROM instances i
+               WHERE i.id = ?""",
+            (session_id,),
+        )
         instance = await cursor.fetchone()
 
     if not instance:
@@ -7159,7 +7168,7 @@ async def golden_throne_followup(session_id: str):
 
     # Skip if already processing (user beat us to it)
     # Sync instances are permanently processing — never skip them
-    if instance["status"] == "processing" and instance.get("instance_type") != "sync":
+    if instance["status"] == "working" and instance.get("instance_type") != "sync":
         logger.info(f"Golden Throne: {session_id[:12]} already processing, skipping")
         return
 
@@ -7670,7 +7679,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         instance = await cursor.fetchone()
 
     if not instance:
@@ -7679,8 +7688,8 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
 
     instance = dict(instance)
 
-    if instance["status"] == "processing":
-        logger.info(f"Nudge: {instance_id[:12]} already processing, skipping")
+    if instance["status"] == "working":
+        logger.info(f"Nudge: {instance_id[:12]} already working, skipping")
         return {"nudged": False, "reason": "already_processing"}
 
     if instance.get("victory_at"):
@@ -7873,8 +7882,8 @@ async def _custodes_state_snapshot() -> dict:
                 cascade_count_today = int(row[0] or 0)
 
             cursor = await db.execute(
-                "SELECT tab_name, status FROM claude_instances "
-                "WHERE status IN ('processing', 'idle') "
+                "SELECT name AS tab_name, status FROM instances "
+                "WHERE status NOT IN ('stopped', 'archived') "
                 "AND COALESCE(is_subagent, 0) = 0 "
                 "AND device_id = ?",
                 (LOCAL_DEVICE_NAME,),
@@ -7882,7 +7891,7 @@ async def _custodes_state_snapshot() -> dict:
             inst_rows = await cursor.fetchall()
             open_panes = len(inst_rows)
             for tab_name, status in inst_rows:
-                if status == "processing":
+                if status == "working":
                     active_threads_count += 1
                     if tab_name:
                         active_threads_names.append(str(tab_name))
@@ -8446,12 +8455,13 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND synced = 1
-                 AND status IN ('idle', 'processing')
-               ORDER BY last_activity DESC
+            """SELECT i.id, i.tmux_pane, i.device_id
+               FROM instances i
+               JOIN personas p ON p.id = i.persona_id
+               WHERE p.slug = 'custodes'
+                 AND i.golden_throne = 'sync'
+                 AND i.status NOT IN ('stopped', 'archived')
+               ORDER BY i.last_activity DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -8636,9 +8646,9 @@ async def _resolve_administratum_instance() -> dict | None:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT id, tmux_pane, device_id, dispatch_session_doc_path
-               FROM claude_instances
+               FROM instances
                WHERE primarch = 'administratum'
-                 AND status IN ('idle', 'processing')
+                 AND status NOT IN ('stopped', 'archived')
                ORDER BY last_activity DESC
                LIMIT 1"""
         )
@@ -9356,7 +9366,7 @@ async def set_zealotry(instance_id: str, request: Request):
         raise HTTPException(status_code=400, detail="zealotry must be integer 1-10")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         await sanctioned_update_instance(
@@ -9408,7 +9418,7 @@ async def set_instance_legion(instance_id: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        # The legacy `legion`/`profile_name` columns died with claude_instances —
+        # The legacy `legion`/`profile_name` columns died with the old table —
         # legion identity now lives in persona_id. Resolve the legion to its persona
         # and bind persona_id (plus annex voice/sound from the profile).
         updates: dict = {}
@@ -9531,7 +9541,7 @@ async def set_instance_pr(instance_id: str, request: Request):
         raise HTTPException(status_code=400, detail="no pr fields provided (pr_url, pr_state)")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -9557,7 +9567,7 @@ async def set_instance_discord(instance_id: str, request: Request):
     discord_channel = body.get("discord_channel")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
 
@@ -9603,9 +9613,13 @@ async def get_synced_session(legion: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tab_name, tmux_pane, device_id, legion, status
-               FROM claude_instances
-               WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+            """SELECT i.id, i.name AS tab_name, i.tmux_pane, i.device_id,
+                      COALESCE(p.slug, 'astartes') AS legion, i.status
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE COALESCE(p.slug, 'astartes') = ?
+                 AND i.golden_throne = 'sync'
+                 AND i.status NOT IN ('stopped', 'archived')
                LIMIT 1""",
             (legion,),
         )
@@ -9624,7 +9638,7 @@ async def get_zealotry(instance_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT zealotry, victory_at, victory_reason FROM claude_instances WHERE id = ?",
+            "SELECT zealotry, victory_at, victory_reason FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -9680,7 +9694,7 @@ async def _victory_ack_core(
                 # sees the live tab name(s) of the linked instance(s). An empty
                 # list (no linked instance) derives True — never a false block.
                 names_cursor = await db.execute(
-                    "SELECT tab_name FROM claude_instances WHERE session_doc_id = ?",
+                    "SELECT name AS tab_name FROM instances WHERE session_doc_id = ?",
                     (doc_id,),
                 )
                 fm["_instance_tab_names"] = [r["tab_name"] for r in await names_cursor.fetchall()]
@@ -9757,7 +9771,7 @@ async def _victory_ack_core(
 
         # Resolve all instances linked to this doc; downgrade and cancel timers.
         cursor = await db.execute(
-            "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ?",
+            "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ?",
             (doc_id,),
         )
         linked_rows = await cursor.fetchall()
@@ -9774,7 +9788,7 @@ async def _victory_ack_core(
                 updates={
                     "victory_at": now,
                     "victory_reason": reason,
-                    "instance_type": "one_off",
+                    "golden_throne": None,
                     "gt_resume_count": 0,
                     "gt_resume_window_started_at": None,
                     "gt_last_resume_at": None,
@@ -9998,7 +10012,7 @@ async def declare_victory(instance_id: str, request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, tab_name, session_doc_id FROM claude_instances WHERE id = ?",
+            "SELECT id, name AS tab_name, session_doc_id FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -10028,7 +10042,7 @@ async def declare_victory(instance_id: str, request: Request):
             updates={
                 "victory_at": now,
                 "victory_reason": reason,
-                "instance_type": "one_off",
+                "golden_throne": None,
                 "gt_resume_count": 0,
                 "gt_resume_window_started_at": None,
                 "gt_last_resume_at": None,
@@ -10115,7 +10129,7 @@ async def set_instance_type(instance_id: str, request: Request):
         # Legacy instance_type derived from v2 state: status='archived' → archived;
         # golden_throne='sync' → sync; any other non-null marker (a golden_throne.id)
         # → golden_throne; NULL → one_off. The instance_type column died with
-        # claude_instances; its v2 home is the golden_throne marker.
+        # instances; its v2 home is the golden_throne marker.
         _gt_marker = instance["golden_throne"]
         if instance["status"] == "archived":
             old_type = "archived"
@@ -10468,24 +10482,33 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
         db.row_factory = aiosqlite.Row
         instance = None
 
-        # Method 1: PID match
-        if pid:
-            cursor = await db.execute(
-                "SELECT * FROM claude_instances WHERE pid = ? AND status IN ('processing', 'idle') LIMIT 1",
-                (pid,),
-            )
-            instance = await cursor.fetchone()
+        # Method 1 used to match a persisted PID. PID is archive-only after the
+        # instance-table cutover; callers should pass cwd or use tmux @INSTANCE_ID.
 
         # Method 2: CWD match (prefer processing)
         if not instance and cwd:
             cursor = await db.execute(
-                "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'processing' ORDER BY last_activity DESC LIMIT 1",
+                """SELECT i.*, i.name AS tab_name,
+                          CASE WHEN i.golden_throne = 'sync' THEN 'sync'
+                               WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                               ELSE 'one_off'
+                          END AS instance_type
+                   FROM instances i
+                   WHERE i.working_dir = ? AND i.status = 'working'
+                   ORDER BY i.last_activity DESC LIMIT 1""",
                 (cwd,),
             )
             instance = await cursor.fetchone()
             if not instance:
                 cursor = await db.execute(
-                    "SELECT * FROM claude_instances WHERE working_dir = ? AND status = 'idle' ORDER BY last_activity DESC LIMIT 1",
+                    """SELECT i.*, i.name AS tab_name,
+                              CASE WHEN i.golden_throne = 'sync' THEN 'sync'
+                                   WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                                   ELSE 'one_off'
+                              END AS instance_type
+                       FROM instances i
+                       WHERE i.working_dir = ? AND i.status = 'idle'
+                       ORDER BY i.last_activity DESC LIMIT 1""",
                     (cwd,),
                 )
                 instance = await cursor.fetchone()
@@ -10513,7 +10536,22 @@ async def get_instance(instance_id: str):
     """Get details of a specific instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute(
+            """SELECT i.*, i.name AS tab_name,
+                      COALESCE(p.slug, 'astartes') AS legion,
+                      COALESCE(p.slug, 'astartes') AS profile_name,
+                      CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced,
+                      CASE WHEN i.status = 'archived' THEN 'archived'
+                           WHEN i.golden_throne = 'sync' THEN 'sync'
+                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                           ELSE 'one_off'
+                      END AS instance_type,
+                      CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ?""",
+            (instance_id,),
+        )
         row = await cursor.fetchone()
 
         if not row:
@@ -10539,7 +10577,7 @@ async def get_instance_workflow_events(instance_id: str, limit: int = 20):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT 1 FROM claude_instances WHERE id = ?",
+            "SELECT 1 FROM instances WHERE id = ?",
             (instance_id,),
         )
         if not await cursor.fetchone():
@@ -10569,7 +10607,7 @@ async def get_instance_provenance(instance_id: str, limit: int = 20):
     """Return recent sanctioned mutation history for a specific instance."""
     limit = max(1, min(limit, 100))
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT 1 FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         mutations = await get_instance_mutations(db, instance_id, limit=limit)
@@ -10614,7 +10652,7 @@ async def list_instance_reconciliation(limit: int = 50, suspicious_only: bool = 
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT id
-               FROM claude_instances
+               FROM instances
                ORDER BY datetime(last_activity) DESC
                LIMIT ?""",
             (limit,),
@@ -10679,7 +10717,7 @@ async def pane_session_doc(tmux_pane: str):
         cursor = await db.execute(
             """SELECT ci.id AS instance_id, sd.id AS doc_id, sd.file_path,
                       sd.title, sd.project
-               FROM claude_instances ci
+               FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
                WHERE ci.id = ?
                  AND COALESCE(ci.status, '') != 'stopped'
@@ -10716,8 +10754,8 @@ async def pane_instance(tmux_pane: str):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT *
-               FROM claude_instances
-               WHERE id = ? AND status != 'stopped'
+               FROM instances
+               WHERE id = ? AND status NOT IN ('stopped', 'archived')
                LIMIT 1""",
             (instance_id,),
         )
@@ -10737,7 +10775,7 @@ async def pane_instance(tmux_pane: str):
 async def orchestrator_pane_truth():
     """Merged tmux↔DB pane truth for the orchestrator.
 
-    Joins live ``tmux list-panes -a`` against ``claude_instances`` (active or
+    Joins live ``tmux list-panes -a`` against ``instances`` (active or
     pane-resident) and ``session_documents``. Drift flags are computed live —
     independent of whether the reconciler has run yet.
 
@@ -10751,14 +10789,16 @@ async def orchestrator_pane_truth():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT ci.id AS instance_id, ci.tmux_pane, ci.pane_label, ci.tab_name,
-                      ci.status, ci.last_activity, ci.engine, ci.legion,
+            """SELECT ci.id AS instance_id, ci.tmux_pane, ci.pane_label, ci.name AS tab_name,
+                      ci.status, ci.last_activity, ci.engine,
+                      COALESCE(p.slug, 'astartes') AS legion,
                       ci.session_doc_id, ci.workflow_state, ci.workflow_blocked_reason,
                       sd.file_path AS session_doc_path,
                       sd.title AS session_doc_title
-               FROM claude_instances ci
+               FROM instances ci
+               LEFT JOIN personas p ON p.id = ci.persona_id
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.status IN ('processing', 'idle', 'active')
+               WHERE ci.status NOT IN ('stopped', 'archived')
                   OR (ci.tmux_pane IS NOT NULL AND ci.tmux_pane != '')
                ORDER BY ci.last_activity DESC"""
         )
@@ -10768,7 +10808,7 @@ async def orchestrator_pane_truth():
     # (A stopped row whose pane never existed in tmux is noise.)
     filtered: list[dict] = []
     for row in rows:
-        if row.get("status") in ("processing", "idle", "active"):
+        if row.get("status") not in ("stopped", "archived"):
             filtered.append(row)
             continue
         if row.get("tmux_pane") and row["tmux_pane"] in pane_ids_in_tmux:
@@ -10853,12 +10893,12 @@ PANE_TAP_DIR = Path.home() / ".claude" / "tmp" / "panes"
 async def _resolve_instance_pane(instance_id: str) -> str | None:
     """Resolve a durable ``instance_id`` to its tmux pane (``%N``), or None.
 
-    Same source of truth ``pane_truth`` joins against — ``claude_instances``.
+    Same source of truth ``pane_truth`` joins against — ``instances``.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT tmux_pane FROM claude_instances WHERE id = ?",
+            "SELECT tmux_pane FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -10982,7 +11022,10 @@ async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT legion FROM claude_instances WHERE id = ? AND status != 'stopped'",
+                """SELECT COALESCE(p.slug, 'astartes') AS legion
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ? AND i.status NOT IN ('stopped', 'archived')""",
                 (caller_instance_id,),
             )
             row = await cur.fetchone()
@@ -11207,12 +11250,12 @@ async def get_dashboard():
 
         # Get all instances
         cursor = await db.execute(
-            "SELECT * FROM claude_instances ORDER BY status ASC, registered_at DESC"
+            "SELECT i.*, i.name AS tab_name, COALESCE(p.slug, 'astartes') AS legion, COALESCE(p.slug, 'astartes') AS profile_name, COALESCE(p.slug, 'astartes') AS primarch, CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced, CASE WHEN i.status = 'archived' THEN 'archived' WHEN i.golden_throne = 'sync' THEN 'sync' WHEN i.golden_throne IS NOT NULL THEN 'golden_throne' ELSE 'one_off' END AS instance_type, CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id FROM instances i LEFT JOIN personas p ON p.id = i.persona_id ORDER BY i.status ASC, i.created_at DESC"
         )
         instances = [dict(row) for row in await cursor.fetchall()]
 
         # Check productivity (any active instances = productive)
-        active_count = sum(1 for i in instances if i["status"] in ("processing", "idle"))
+        active_count = sum(1 for i in instances if i["status"] not in ("stopped", "archived"))
         productivity_active = active_count > 0
 
         # Get recent events (last 20)
@@ -15481,9 +15524,9 @@ async def get_recent_events(limit: int = 10):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT e.*, ci.tab_name as instance_tab_name, ci.working_dir as instance_working_dir
+            SELECT e.*, ci.name as instance_tab_name, ci.working_dir as instance_working_dir
             FROM events e
-            LEFT JOIN claude_instances ci ON e.instance_id = ci.id
+            LEFT JOIN instances ci ON e.instance_id = ci.id
             ORDER BY e.created_at DESC
             LIMIT ?
         """,
@@ -15801,7 +15844,7 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
     """Flip pr_state→merged for instances whose pr_url matches the merged PR."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id FROM claude_instances WHERE pr_url = ? AND pr_state = 'open'",
+            "SELECT id FROM instances WHERE pr_url = ? AND pr_state = 'open'",
             (pr_url,),
         )
         ids = [r[0] for r in await cursor.fetchall()]
@@ -16780,7 +16823,7 @@ def _ops_parse_event_details(raw: str | None) -> dict | list | str | None:
 def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict:
     if age_seconds is None:
         return {"is_stale": False, "threshold_seconds": None, "reason": None}
-    threshold = 10 * 60 if status == "processing" else 2 * 60 * 60
+    threshold = 10 * 60 if status == "working" else 2 * 60 * 60
     is_stale = age_seconds >= threshold
     return {
         "is_stale": is_stale,
@@ -17257,16 +17300,24 @@ async def _ops_read_instances(now: datetime) -> dict:
         cursor = await db.execute(
             """
             SELECT ci.*,
+                   ci.name AS tab_name,
+                   COALESCE(p.slug, 'astartes') AS legion,
+                   COALESCE(p.slug, 'astartes') AS profile_name,
+                   CASE WHEN ci.golden_throne = 'sync' THEN 'sync'
+                        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
+                        ELSE 'one_off'
+                   END AS instance_type,
                    sd.title AS session_doc_title,
                    sd.file_path AS session_doc_path,
                    sd.status AS session_doc_status,
                    sd.project AS session_doc_project,
                    sd.cron_job_id AS session_doc_cron_job_id
-            FROM claude_instances ci
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
             LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-            WHERE ci.status IN ('processing', 'idle')
+            WHERE ci.status NOT IN ('stopped', 'archived')
             ORDER BY
-                CASE ci.status WHEN 'processing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                CASE ci.status WHEN 'working' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
                 ci.last_activity DESC
             LIMIT 160
             """
@@ -17290,7 +17341,7 @@ async def _ops_read_instances(now: datetime) -> dict:
         engine_counts[engine] = engine_counts.get(engine, 0) + 1
         legion_counts[legion] = legion_counts.get(legion, 0) + 1
         work_class_counts[work_class] = work_class_counts.get(work_class, 0) + 1
-        activity_anchor = inst.get("last_activity") or inst.get("registered_at")
+        activity_anchor = inst.get("last_activity") or inst.get("created_at")
         age_seconds = _ops_seconds_since(activity_anchor, now=now)
         staleness = _ops_instance_staleness(status, age_seconds)
         if staleness["is_stale"]:
@@ -17316,7 +17367,7 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "tmux_pane": inst.get("tmux_pane"),
                 "pane_label": inst.get("pane_label"),
                 "last_activity": inst.get("last_activity"),
-                "registered_at": inst.get("registered_at"),
+                "created_at": inst.get("created_at"),
                 "age_seconds": age_seconds,
                 "age_minutes": None if age_seconds is None else age_seconds // 60,
                 "is_subagent": bool(inst.get("is_subagent") or 0),
@@ -17714,7 +17765,7 @@ def _ops_build_state_assertions(
             "warn" if stale_count else "good" if active_count else "neutral",
             evidence=[
                 f"stale={stale_count}",
-                f"processing={instances.get('counts', {}).get('by_status', {}).get('processing', 0)}",
+                f"working={instances.get('counts', {}).get('by_status', {}).get('working', 0)}",
                 f"idle={instances.get('counts', {}).get('by_status', {}).get('idle', 0)}",
             ],
             correction_hint="If wrong, refresh pane registrations or inspect stale instance rows.",
@@ -18052,7 +18103,7 @@ async def get_ops_session_docs(
         rows = await cursor.fetchall()
         linked: dict[int, int] = {}
         cnt = await db.execute(
-            "SELECT session_doc_id, COUNT(*) FROM claude_instances "
+            "SELECT session_doc_id, COUNT(*) FROM instances "
             "WHERE session_doc_id IS NOT NULL GROUP BY session_doc_id"
         )
         for r in await cnt.fetchall():
@@ -18506,7 +18557,7 @@ async def timer_worker():
                     _session_start_ms = now_ms
                     async with aiosqlite.connect(DB_PATH) as _wdb:
                         _cur = await _wdb.execute(
-                            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+                            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
                         )
                         _row = await _cur.fetchone()
                         _active = _row[0] if _row else 0
@@ -18723,7 +18774,7 @@ async def process_pane_state_queue_once() -> list[dict]:
     tmuxctl is the sole owner of ``instance_id -> pane`` resolution. This drainer
     resolves the LIVE pane per row via ``shared.resolve_instance_pane`` rather than
     trusting the stored ``pane_state_queue.tmux_pane`` (which the trigger stamped
-    from ``claude_instances.tmux_pane`` and which goes stale the moment geometry
+    from ``instances.tmux_pane`` and which goes stale the moment geometry
     changes, a pane is reused, or the agent dies). It fails closed when the pane no
     longer resolves: no ``set-option``, no close-down assertion — but the queue row
     is still drained so a dead instance cannot wedge the queue. The
@@ -18896,13 +18947,13 @@ def _reconcile_eligible(row: dict, now: datetime) -> bool:
     """Reconciler only mutates rows that aren't fresh writes from a live dispatch.
 
     - idle/active rows: ≥60s of inactivity (don't fight a fresh dispatch).
-    - processing rows: ≥10s of inactivity (the bot is mid-tool-use; let it be).
+    - working rows: ≥10s of inactivity (the bot is mid-tool-use; let it be).
     """
     last = _parse_last_activity(row.get("last_activity"))
     if last is None:
         return True
     age = (now - last).total_seconds()
-    if row.get("status") == "processing":
+    if row.get("status") == "working":
         return age >= RECONCILE_PROCESSING_THRESHOLD_SECONDS
     return age >= RECONCILE_IDLE_THRESHOLD_SECONDS
 
@@ -19001,12 +19052,12 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         await db.execute("PRAGMA busy_timeout = 5000")
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT ci.id, ci.tmux_pane, ci.pane_label, ci.tab_name, ci.session_doc_id,
+            """SELECT ci.id, ci.tmux_pane, ci.pane_label, ci.name AS tab_name, ci.session_doc_id,
                       ci.status, ci.last_activity, ci.workflow_blocked_reason,
                       sd.file_path AS session_doc_path
-               FROM claude_instances ci
+               FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.status != 'stopped'"""
+               WHERE ci.status NOT IN ('stopped', 'archived')"""
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -19186,7 +19237,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
 
 
 async def tmux_db_reconciler_worker():
-    """Background worker that converges ``claude_instances`` to tmux truth.
+    """Background worker that converges ``instances`` to tmux truth.
 
     Every ``RECONCILE_CYCLE_SECONDS`` it walks ``tmux list-panes -a``, marks
     orphan rows stopped, fixes ``pane_label`` drift, dedupes duplicate rows for
@@ -19261,8 +19312,8 @@ async def clear_stale_processing_flags():
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
                     """SELECT *
-                       FROM claude_instances
-                       WHERE status IN ('processing', 'idle')
+                       FROM instances
+                       WHERE status NOT IN ('stopped', 'archived')
                          AND tmux_pane IS NOT NULL
                          AND device_id = ?""",
                     (LOCAL_DEVICE_NAME,),
@@ -19278,7 +19329,6 @@ async def clear_stale_processing_flags():
                             instance_id=row["id"],
                             updates={
                                 "status": "stopped",
-                                "synced": 0,
                                 "input_lock": None,
                                 "stopped_at": datetime.now().isoformat(),
                             },
@@ -19292,8 +19342,8 @@ async def clear_stale_processing_flags():
 
                 cursor = await db.execute(
                     """SELECT *
-                       FROM claude_instances
-                       WHERE status = 'processing'
+                       FROM instances
+                       WHERE status = 'working'
                          AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')"""
                 )
                 rows = await cursor.fetchall()
@@ -19328,7 +19378,8 @@ async def clear_stale_processing_flags():
                             "clear-dead-tmux-pane",
                         )
                     for stopped in stopped_dead_panes:
-                        if stopped.get("instance_type") != "golden_throne":
+                        marker = stopped.get("golden_throne")
+                        if not marker or marker == "sync":
                             continue
                         try:
                             await schedule_golden_throne_followup(
@@ -19339,9 +19390,10 @@ async def clear_stale_processing_flags():
                                 "Golden Throne: failed to schedule dead-pane follow-up "
                                 f"for {stopped.get('id', '')[:12]}: {exc}"
                             )
-                for stale_idle in stale_idle_instances:
-                    if stale_idle.get("instance_type") != "golden_throne":
-                        continue
+                    for stale_idle in stale_idle_instances:
+                        marker = stale_idle.get("golden_throne")
+                        if not marker or marker == "sync":
+                            continue
                     stale_idle["status"] = "idle"
                     try:
                         await schedule_golden_throne_followup(
@@ -19377,9 +19429,9 @@ async def detect_stuck_instances():
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("""
-                    SELECT id, tab_name, working_dir, pid, status, device_id, last_activity
-                    FROM claude_instances
-                    WHERE status IN ('processing', 'idle')
+                    SELECT id, name AS tab_name, working_dir, status, device_id, last_activity
+                    FROM instances
+                    WHERE status NOT IN ('stopped', 'archived')
                       AND device_id = 'desktop'
                       AND datetime(last_activity) < datetime('now', 'localtime', '-10 minutes')
                 """)
@@ -19777,12 +19829,13 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND status IN ('idle', 'processing')
-                 AND stopped_at IS NULL
-               ORDER BY last_activity DESC
+            """SELECT i.id, i.tmux_pane, i.device_id
+               FROM instances i
+               JOIN personas p ON p.id = i.persona_id
+               WHERE p.slug = 'custodes'
+                 AND i.status NOT IN ('stopped', 'archived')
+                 AND i.stopped_at IS NULL
+               ORDER BY i.last_activity DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -19912,12 +19965,17 @@ async def end_morning_session():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, instance_type
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND status IN ('idle', 'processing')
-                 AND stopped_at IS NULL
-               ORDER BY last_activity DESC
+            """SELECT i.id,
+                      CASE WHEN i.golden_throne = 'sync' THEN 'sync'
+                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                           ELSE 'one_off'
+                      END AS instance_type
+               FROM instances i
+               JOIN personas p ON p.id = i.persona_id
+               WHERE p.slug = 'custodes'
+                 AND i.status NOT IN ('stopped', 'archived')
+                 AND i.stopped_at IS NULL
+               ORDER BY i.last_activity DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -19930,7 +19988,7 @@ async def end_morning_session():
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"instance_type": "one_off"},
+            updates={"golden_throne": None},
             mutation_type="instance_updated",
             write_source="api",
             actor="morning-end",
@@ -19957,7 +20015,7 @@ async def end_morning_session():
     )
     return {
         "instance_id": instance_id,
-        "instance_type": "one_off",
+        "golden_throne": None,
         "morning_status": morning_status,
     }
 
@@ -20340,9 +20398,11 @@ async def _resolve_discord_fixer_target(redirect: str | None = None) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tmux_pane, pane_label, tab_name, parent_instance_id, status
-               FROM claude_instances
-               WHERE status IN ('idle', 'processing') AND tmux_pane IS NOT NULL"""
+            """SELECT id, tmux_pane, pane_label, name AS tab_name,
+                      CASE WHEN commander_type = 'chapter' THEN commander_id END AS parent_instance_id,
+                      status
+               FROM instances
+               WHERE status NOT IN ('stopped', 'archived') AND tmux_pane IS NOT NULL"""
         )
         live = [dict(row) for row in await cursor.fetchall()]
 
@@ -20498,14 +20558,19 @@ async def _discord_voice_error(legion: str, transcript: str):
     # Determine why injection failed
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, status, tmux_pane FROM claude_instances WHERE legion = ? ORDER BY last_activity DESC LIMIT 1",
+            """SELECT i.id, i.status, i.tmux_pane
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE COALESCE(p.slug, 'astartes') = ?
+               ORDER BY i.last_activity DESC
+               LIMIT 1""",
             (legion,),
         )
         row = await cursor.fetchone()
 
     if not row:
         reason = f"No {legion} instance is running."
-    elif row[1] not in ("idle", "processing"):
+    elif row[1] in ("stopped", "archived"):
         reason = f"{legion.capitalize()} instance is {row[1]}, not active."
     elif not row[2]:
         reason = f"{legion.capitalize()} instance has no terminal attached."
@@ -20628,15 +20693,22 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                """SELECT i.id, i.tmux_pane, i.device_id
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE COALESCE(p.slug, 'astartes') = ?
+                     AND i.golden_throne = 'sync'
+                     AND i.status NOT IN ('stopped', 'archived')
                    LIMIT 1""",
                 (legion,),
             )
         else:
             cursor = await db.execute(
-                """SELECT id, tmux_pane, device_id FROM claude_instances
-                   WHERE legion = ? AND status IN ('idle', 'processing')
+                """SELECT i.id, i.tmux_pane, i.device_id
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE COALESCE(p.slug, 'astartes') = ?
+                     AND i.status NOT IN ('stopped', 'archived')
                    LIMIT 1""",
                 (legion,),
             )
@@ -20880,15 +20952,22 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
-                """SELECT tmux_pane FROM claude_instances
-                   WHERE legion = ? AND synced = 1 AND status IN ('idle', 'processing')
+                """SELECT i.tmux_pane
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE COALESCE(p.slug, 'astartes') = ?
+                     AND i.golden_throne = 'sync'
+                     AND i.status NOT IN ('stopped', 'archived')
                    LIMIT 1""",
                 (bot,),
             )
         else:
             cursor = await db.execute(
-                """SELECT tmux_pane FROM claude_instances
-                   WHERE legion = ? AND status IN ('idle', 'processing')
+                """SELECT i.tmux_pane
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE COALESCE(p.slug, 'astartes') = ?
+                     AND i.status NOT IN ('stopped', 'archived')
                    LIMIT 1""",
                 (bot,),
             )
@@ -23576,7 +23655,7 @@ async def _run_stop_evaluators(
                     mutation_type="status_changed",
                     write_source="system",
                     actor="stop-evaluator",
-                    where_clause="id = ? AND status = 'processing'",
+                    where_clause="id = ? AND status = 'working'",
                     where_params=(instance_id,),
                 )
             except LookupError:
@@ -23714,7 +23793,7 @@ async def _handle_orphan_doc(doc_id: int) -> None:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?", (doc_id,)
+            "SELECT COUNT(*) FROM instances WHERE session_doc_id = ?", (doc_id,)
         )
         count = (await cursor.fetchone())[0]
         if count > 0:
@@ -23853,7 +23932,7 @@ async def list_session_docs(status: str | None = None, project: str | None = Non
             doc = dict(row)
             # Count linked instances
             cnt_cursor = await db.execute(
-                "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?", (row["id"],)
+                "SELECT COUNT(*) FROM instances WHERE session_doc_id = ?", (row["id"],)
             )
             doc["linked_instances"] = (await cnt_cursor.fetchone())[0]
             docs.append(doc)
@@ -23887,7 +23966,7 @@ async def get_session_doc(doc_id: int):
 
         # Get linked instances
         cursor = await db.execute(
-            "SELECT id, tab_name, status, working_dir FROM claude_instances WHERE session_doc_id = ?",
+            "SELECT id, name AS tab_name, status, working_dir FROM instances WHERE session_doc_id = ?",
             (doc_id,),
         )
         instances = [dict(r) for r in await cursor.fetchall()]
@@ -23986,11 +24065,12 @@ async def get_golden_throne_timers():
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.tab_name, ci.status, ci.zealotry, ci.device_id,
+            SELECT ci.id, ci.name AS tab_name, ci.status, ci.zealotry, ci.device_id,
                    ci.session_doc_id, sd.status AS doc_status
-            FROM claude_instances ci
+            FROM instances ci
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-            WHERE ci.instance_type = 'golden_throne'
+            WHERE ci.golden_throne IS NOT NULL
+              AND ci.golden_throne != 'sync'
               AND ci.status IN ('idle', 'stopped')
               AND COALESCE(ci.zealotry, 4) >= 4
               AND (sd.status IS NULL OR sd.status != 'archived')
@@ -24111,10 +24191,10 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         if request.title is not None:
             base = human_filename_stem(request.title, fallback="session-doc")
             cursor = await db.execute(
-                """SELECT id, tab_name
-                   FROM claude_instances
+                """SELECT id, name AS tab_name
+                   FROM instances
                    WHERE session_doc_id = ?
-                   ORDER BY registered_at ASC, id ASC""",
+                   ORDER BY created_at ASC, id ASC""",
                 (doc_id,),
             )
             linked = await cursor.fetchall()
@@ -24128,7 +24208,7 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
                 await sanctioned_update_instance(
                     db,
                     instance_id=inst_id,
-                    updates={"tab_name": f"{base}-{ordinal}"},
+                    updates={"name": f"{base}-{ordinal}"},
                     mutation_type="instance_updated",
                     write_source="api",
                     actor="session-doc-rename",
@@ -24153,7 +24233,7 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
 
         if hard:
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE session_doc_id = ?",
+                "SELECT id FROM instances WHERE session_doc_id = ?",
                 (doc_id,),
             )
             linked_rows = await cursor.fetchall()
@@ -24295,7 +24375,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
-            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
             (instance_id,),
         )
         inst_row = await cursor.fetchone()
@@ -24363,7 +24443,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     async with aiosqlite.connect(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
-            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
             (instance_id,),
         )
         inst_row = await cursor.fetchone()
@@ -24466,7 +24546,7 @@ async def unassign_doc_from_instance(instance_id: str):
     """Unlink a session document from an instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, session_doc_id, workflow_state FROM claude_instances WHERE id = ?",
+            "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
             (instance_id,),
         )
         inst_row = await cursor.fetchone()
@@ -24524,7 +24604,7 @@ async def get_instance_session_doc(instance_id: str):
     """Get the session document linked to this instance."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT session_doc_id FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT session_doc_id FROM instances WHERE id = ?", (instance_id,)
         )
         row = await cursor.fetchone()
         if not row:
@@ -25243,14 +25323,12 @@ async def get_state():
     # Instances
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived')"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
 
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'processing'"
-        )
+        cursor = await db.execute("SELECT COUNT(*) FROM instances WHERE status = 'working'")
         row = await cursor.fetchone()
         processing_count = row[0] if row else 0
 
