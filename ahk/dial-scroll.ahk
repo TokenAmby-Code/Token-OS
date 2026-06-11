@@ -9,14 +9,15 @@
 ;
 ; One wheel event per dial tick, scaled by a multiplier that ramps while ticks
 ; arrive faster than FAST_WINDOW_MS and resets to base on any slow tick.
-; A ripped dial (multiplier past COAST_MIN_MULT) coasts after release: a pulse
-; timer keeps emitting decaying scroll until the multiplier runs out.
+; Sustained turning (GLIDE_TICKS consecutive ticks faster than GLIDE_WINDOW_MS)
+; enters glide: a pulse timer keeps emitting decaying scroll between ticks and
+; after release, scaled by the current multiplier, until momentum runs out.
 ; Brake: a reverse tick while ripping OR coasting is swallowed — freezes output
 ; instead of scrolling backward. The next reverse tick, at rest, scrolls normally.
 ;
 ; Shared constants (keep in sync with twin):
 ;   BASE_LINES=1  FAST_WINDOW_MS=120  ACCEL_RATE=1.2  ACCEL_MAX=12.0  BRAKE_WINDOW_MS=300
-;   COAST_DECAY=0.85  COAST_TICK_MS=30  COAST_MIN_MULT=3.0  RELEASE_MS=60
+;   COAST_DECAY=0.85  COAST_TICK_MS=30  GLIDE_WINDOW_MS=500  GLIDE_TICKS=2  RELEASE_MS=60
 ;   MIN_INPUT_GAP_MS=3 is AHK-only (BT phantom guard); the deskflow path doesn't need it.
 
 ; Buffer rather than warn when dial spams (BT noise can fire F13/F14 while AFK)
@@ -31,7 +32,8 @@ DIAL_ACCEL_MAX := 12.0               ; Cap on the multiplier
 DIAL_BRAKE_WINDOW_MS := 300          ; Reversal within this of last tick while ramped = brake
 DIAL_COAST_DECAY := 0.85             ; Multiplier decay per coast pulse
 DIAL_COAST_TICK_MS := 30             ; Coast pulse interval
-DIAL_COAST_MIN_MULT := 3.0           ; Only rips coast; gentle ticking still stops dead
+DIAL_GLIDE_WINDOW_MS := 500          ; Ticks faster than this (>2/sec) count toward glide
+DIAL_GLIDE_TICKS := 2                ; Consecutive fast ticks needed to enter glide
 DIAL_RELEASE_MS := 60                ; No tick for this long = dial released, coast may pulse
 DIAL_MIN_INPUT_GAP_MS := 3           ; Drop inputs faster than this (BT phantom guard)
 DIAL_DEBUG := false                  ; Log gap:lines per tick to dial-debug.log (tuning only)
@@ -41,6 +43,7 @@ DIAL_DEBUG := false                  ; Log gap:lines per tick to dial-debug.log 
 global dialLastTickMs := 0
 global dialLastDir := 0
 global dialMult := 1.0
+global dialRunLen := 0
 global dialCoastOn := false
 global dialDbgBuf := ""
 
@@ -52,9 +55,9 @@ global dialDbgBuf := ""
 *F14::DialTick(-1)
 
 DialTick(dir) {
-    global dialLastTickMs, dialLastDir, dialMult, dialCoastOn
+    global dialLastTickMs, dialLastDir, dialMult, dialRunLen, dialCoastOn
     global DIAL_BASE_LINES, DIAL_FAST_WINDOW_MS, DIAL_ACCEL_RATE, DIAL_ACCEL_MAX
-    global DIAL_BRAKE_WINDOW_MS, DIAL_COAST_MIN_MULT, DIAL_COAST_TICK_MS
+    global DIAL_BRAKE_WINDOW_MS, DIAL_GLIDE_WINDOW_MS, DIAL_GLIDE_TICKS, DIAL_COAST_TICK_MS
     global DIAL_MIN_INPUT_GAP_MS, DIAL_DEBUG
 
     now := A_TickCount
@@ -71,12 +74,14 @@ DialTick(dir) {
         wasMoving := coasting || (dialMult > 1.0 && gap < DIAL_BRAKE_WINDOW_MS)
         DialCoastStop()
         dialMult := 1.0
+        dialRunLen := 0
         dialLastDir := dir
         if (wasMoving)
             return  ; BRAKE: swallow the stop-tick, scroll nothing
         ; slow-gap reversal = deliberate turnaround → fall through, scroll at base
     }
     dialLastDir := dir
+    dialRunLen := (gap < DIAL_GLIDE_WINDOW_MS) ? dialRunLen + 1 : 1
 
     ; A same-direction tick during coast re-engages the flywheel: keep the
     ; decayed multiplier and ramp from there instead of resetting to base.
@@ -91,7 +96,7 @@ DialTick(dir) {
     if (DIAL_DEBUG)
         DialDebugLog(gap, lines)
 
-    if (dialMult >= DIAL_COAST_MIN_MULT && !dialCoastOn) {
+    if (dialRunLen >= DIAL_GLIDE_TICKS && !dialCoastOn) {
         dialCoastOn := true
         SetTimer(DialCoastPulse, DIAL_COAST_TICK_MS)
     }

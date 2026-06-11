@@ -103,14 +103,15 @@ end
 --
 -- One scroll event per dial tick, scaled by a multiplier that ramps while ticks
 -- arrive faster than FAST_WINDOW_MS and resets to base on any slow tick.
--- A ripped dial (multiplier past COAST_MIN_MULT) coasts after release: a pulse
--- timer keeps emitting decaying scroll until the multiplier runs out.
+-- Sustained turning (GLIDE_TICKS consecutive ticks faster than GLIDE_WINDOW_MS)
+-- enters glide: a pulse timer keeps emitting decaying scroll between ticks and
+-- after release, scaled by the current multiplier, until momentum runs out.
 -- Brake: a reverse tick while ripping OR coasting is swallowed — freezes output
 -- instead of scrolling backward. The next reverse tick, at rest, scrolls normally.
 --
 -- Shared constants (keep in sync with twin):
 --   BASE_LINES=1  FAST_WINDOW_MS=120  ACCEL_RATE=1.2  ACCEL_MAX=12.0  BRAKE_WINDOW_MS=300
---   COAST_DECAY=0.85  COAST_TICK_MS=30  COAST_MIN_MULT=3.0  RELEASE_MS=60
+--   COAST_DECAY=0.85  COAST_TICK_MS=30  GLIDE_WINDOW_MS=500  GLIDE_TICKS=2  RELEASE_MS=60
 --   MIN_INPUT_GAP_MS=3 is AHK-only (BT phantom guard); the deskflow path doesn't need it.
 local DIAL_BASE_LINES      = 1     -- scroll lines for a single deliberate tick
 local DIAL_FAST_WINDOW_MS  = 120   -- gaps below this ramp acceleration
@@ -119,12 +120,14 @@ local DIAL_ACCEL_MAX       = 12.0  -- cap on the multiplier
 local DIAL_BRAKE_WINDOW_MS = 300   -- reversal within this of last tick while ramped = brake
 local DIAL_COAST_DECAY     = 0.85  -- multiplier decay per coast pulse
 local DIAL_COAST_TICK_MS   = 30    -- coast pulse interval
-local DIAL_COAST_MIN_MULT  = 3.0   -- only rips coast; gentle ticking still stops dead
+local DIAL_GLIDE_WINDOW_MS = 500   -- ticks faster than this (>2/sec) count toward glide
+local DIAL_GLIDE_TICKS     = 2     -- consecutive fast ticks needed to enter glide
 local DIAL_RELEASE_MS      = 60    -- no tick for this long = dial released, coast may pulse
 
 local dialLastTickMs = 0
 local dialLastDir    = 0
 local dialMult       = 1.0
+local dialRunLen     = 0
 local dialCoastTimer = nil
 -- Telemetry rings (read via ImperiumHammerspoonStatus): last 16 tick gaps + lines
 local dialGapRing    = {}
@@ -164,6 +167,7 @@ local function postDialScroll(dir)
         local wasMoving = coasting or (dialMult > 1.0 and gap < DIAL_BRAKE_WINDOW_MS)
         dialCoastTimer:stop()
         dialMult = 1.0
+        dialRunLen = 0
         dialLastDir = dir
         if wasMoving then
             return -- BRAKE: swallow the stop-tick, scroll nothing
@@ -171,6 +175,7 @@ local function postDialScroll(dir)
         -- slow-gap reversal = deliberate turnaround → fall through, scroll at base
     end
     dialLastDir = dir
+    dialRunLen = (gap < DIAL_GLIDE_WINDOW_MS) and dialRunLen + 1 or 1
 
     -- A same-direction tick during coast re-engages the flywheel: keep the
     -- decayed multiplier and ramp from there instead of resetting to base.
@@ -187,7 +192,7 @@ local function postDialScroll(dir)
     dialGapRing[dialRingIdx] = math.floor(gap)
     dialLineRing[dialRingIdx] = lines
 
-    if dialMult >= DIAL_COAST_MIN_MULT and not dialCoastTimer:running() then
+    if dialRunLen >= DIAL_GLIDE_TICKS and not dialCoastTimer:running() then
         dialCoastTimer:start()
     end
 end
