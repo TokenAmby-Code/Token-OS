@@ -33,6 +33,7 @@ from .metal_resolver import (
     observe_and_resolve,
     read_process_table,
 )
+from .tmux_adapter import TmuxAdapter
 
 _AGENT_EXIT_TIMEOUT_SECONDS = 12.0
 _AGENT_EXIT_POLL_SECONDS = 0.5
@@ -73,7 +74,7 @@ def _dispatch_bin() -> Path:
     return Path(__file__).resolve().parents[2] / "bin" / "dispatch"
 
 
-def assert_legal_session(adapter, session_name: str) -> None:
+def assert_legal_session(adapter: TmuxAdapter, session_name: str) -> None:
     """Refuse main outright — the metal path is sandbox-only until graduated."""
     if session_name == "main":
         raise MetalRestartRefused(
@@ -170,7 +171,7 @@ def resume_pane(
 
 
 def metal_restart(
-    adapter,
+    adapter: TmuxAdapter,
     session_name: str,
     *,
     dry_run: bool = False,

@@ -42,6 +42,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .tmux_adapter import TmuxAdapter
+
 ENGINE_CLAUDE = "claude"
 ENGINE_CODEX = "codex"
 
@@ -152,7 +154,7 @@ def classify_engine(command: str) -> str | None:
     if not command:
         return None
     argv0 = command.split()[0]
-    basename = os.path.basename(argv0)
+    basename = Path(argv0).name
     if basename in (ENGINE_CLAUDE, ENGINE_CODEX):
         return basename
     return None
@@ -333,7 +335,7 @@ def resolve_resume(pane: MetalPane, probe: MetalProbe) -> MetalObservation:
     )
 
 
-def observe_session(adapter, session_name: str) -> list[MetalPane]:
+def observe_session(adapter: TmuxAdapter, session_name: str) -> list[MetalPane]:
     """Walk a session's live panes via tmux only (read-only)."""
     fmt = "\t".join(
         [
@@ -366,7 +368,7 @@ def observe_session(adapter, session_name: str) -> list[MetalPane]:
 
 
 def observe_and_resolve(
-    adapter, session_name: str, probe: MetalProbe | None = None
+    adapter: TmuxAdapter, session_name: str, probe: MetalProbe | None = None
 ) -> list[MetalObservation]:
     probe = probe or MetalProbe.live()
     return [resolve_resume(pane, probe) for pane in observe_session(adapter, session_name)]
