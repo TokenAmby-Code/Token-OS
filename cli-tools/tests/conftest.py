@@ -9,11 +9,13 @@ investigation. Every test gets redirected paths, unconditionally.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_live_observability(tmp_path, monkeypatch):
+def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_LOG", str(tmp_path / "tmux-focus-guard.log"))
     monkeypatch.setenv(
         "IMPERIUM_MECHANICUS_FOCUS_LOG", str(tmp_path / "mechanicus-focus-guard.log")

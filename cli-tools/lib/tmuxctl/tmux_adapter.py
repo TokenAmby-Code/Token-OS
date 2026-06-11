@@ -143,7 +143,7 @@ def _target_arg(args: list[str], flag: str = "-t") -> str:
     return ""
 
 
-def _has_flag(args: list[str], flag: str) -> bool:
+def _has_flag(args: list[str] | tuple[str, ...], flag: str) -> bool:
     return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
 
 

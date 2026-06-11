@@ -68,7 +68,7 @@ class FakeTmuxServer:
         self.client_activity = 1_000
         self.argv_log: list[tuple[str, ...]] = []
 
-    def patch_into(self, monkeypatch) -> None:
+    def patch_into(self, monkeypatch: pytest.MonkeyPatch) -> None:
         server = self
 
         class _Completed:
@@ -128,7 +128,7 @@ def _general_log_events() -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def test_preserve_focus_restores_window_and_pane_after_automation_snap():
+def test_preserve_focus_restores_window_and_pane_after_automation_snap() -> None:
     adapter = FakeFocusAdapter()
 
     with preserve_focus(adapter, source="test", attempted_target="%2"):
@@ -141,7 +141,9 @@ def test_preserve_focus_restores_window_and_pane_after_automation_snap():
     assert ("select-pane", "-Z", "-t", "%1") in adapter.commands
 
 
-def test_preserve_focus_skips_restore_when_op_never_moved_camera(monkeypatch):
+def test_preserve_focus_skips_restore_when_op_never_moved_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The live resnap bug: a camera-neutral op (tint, option write) must not
     yank the human back to a stale start-of-op snapshot when they navigated
     mid-operation."""
@@ -161,7 +163,7 @@ def test_preserve_focus_skips_restore_when_op_never_moved_camera(monkeypatch):
     assert not any(event["event"] == "restored" for event in _general_log_events())
 
 
-def test_preserve_focus_restores_when_op_displaced_camera(monkeypatch):
+def test_preserve_focus_restores_when_op_displaced_camera(monkeypatch: pytest.MonkeyPatch) -> None:
     server = FakeTmuxServer()
     server.patch_into(monkeypatch)
     adapter = TmuxAdapter(tmux_binary="tmux")
@@ -175,7 +177,7 @@ def test_preserve_focus_restores_when_op_displaced_camera(monkeypatch):
     assert any(event["event"] == "restored" for event in _general_log_events())
 
 
-def test_preserve_focus_restore_keeps_zoom(monkeypatch):
+def test_preserve_focus_restore_keeps_zoom(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restoring into a zoomed window must not collapse the zoom; a zoom the
     op itself collapsed is re-applied."""
     server = FakeTmuxServer()
@@ -193,7 +195,9 @@ def test_preserve_focus_restore_keeps_zoom(monkeypatch):
     assert "main:1" in server.zoomed_windows, "zoom must survive the restore"
 
 
-def test_preserve_focus_cedes_to_human_input_even_when_op_displaced(monkeypatch):
+def test_preserve_focus_cedes_to_human_input_even_when_op_displaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Belt + suspenders: client_activity advanced past the snapshot means the
     human acted mid-op — never fight them for the camera."""
     server = FakeTmuxServer()
@@ -211,7 +215,7 @@ def test_preserve_focus_cedes_to_human_input_even_when_op_displaced(monkeypatch)
     assert not any(event["event"] == "restored" for event in events)
 
 
-def test_conftest_redirects_focus_logs_away_from_live_tmp():
+def test_conftest_redirects_focus_logs_away_from_live_tmp() -> None:
     """The pollution regression: test-suite fake-adapter events must never land
     in the live /tmp focus logs."""
     redirected = os.environ["IMPERIUM_TMUX_FOCUS_LOG"]
@@ -226,7 +230,9 @@ def test_conftest_redirects_focus_logs_away_from_live_tmp():
     assert unique in pathlib.Path(redirected).read_text()
 
 
-def test_focus_log_paths_resolve_env_at_call_time(monkeypatch, tmp_path):
+def test_focus_log_paths_resolve_env_at_call_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     target = tmp_path / "redirected-after-import.log"
     monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_LOG", str(target))
     monkeypatch.setenv("IMPERIUM_MECHANICUS_FOCUS_LOG", str(target))
@@ -237,7 +243,9 @@ def test_focus_log_paths_resolve_env_at_call_time(monkeypatch, tmp_path):
     assert "hook-bounced" in target.read_text()
 
 
-def test_general_events_skip_the_mechanicus_log(monkeypatch, tmp_path):
+def test_general_events_skip_the_mechanicus_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     general = tmp_path / "general.log"
     mech = tmp_path / "mech.log"
     monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_LOG", str(general))
@@ -253,7 +261,9 @@ def test_general_events_skip_the_mechanicus_log(monkeypatch, tmp_path):
     assert "restored" not in mech_text
 
 
-def test_focus_log_rolls_over_past_size_cap(monkeypatch, tmp_path):
+def test_focus_log_rolls_over_past_size_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     log = tmp_path / "general.log"
     monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_LOG", str(log))
     monkeypatch.setenv("IMPERIUM_MECHANICUS_FOCUS_LOG", str(log))
@@ -266,7 +276,7 @@ def test_focus_log_rolls_over_past_size_cap(monkeypatch, tmp_path):
     assert "restored" in log.read_text()
 
 
-def test_preserve_focus_restore_failure_does_not_mask_body_exception():
+def test_preserve_focus_restore_failure_does_not_mask_body_exception() -> None:
     class FailingRestoreAdapter(FakeFocusAdapter):
         fail_restore = False
 

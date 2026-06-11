@@ -224,11 +224,11 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
 
 
 @pytest.fixture
-def fake_clock(monkeypatch):
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Deterministic time for the delay path: sleep() advances the clock."""
     clock = {"now": 1_000.0, "sleeps": []}
 
-    def _sleep(seconds):
+    def _sleep(seconds: float) -> None:
         clock["sleeps"].append(seconds)
         clock["now"] += seconds
 
@@ -241,11 +241,11 @@ def fake_clock(monkeypatch):
 
 
 @pytest.fixture
-def counted_typing_delay(monkeypatch):
+def counted_typing_delay(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     """Force evaluate() to diagnose a typing-guard delay, counting every call."""
     calls: list[tuple] = []
 
-    def _evaluate(args, **kwargs):
+    def _evaluate(args, **kwargs) -> dict:
         calls.append(tuple(args))
         return {"suppressed": True, "policy": "delay", "reason": "typing_guard"}
 
@@ -257,8 +257,8 @@ def counted_typing_delay(monkeypatch):
 # (0.25s poll, 2 sqlite opens each); now it is one evaluation plus one
 # deadline-sleep to the typing window's expiry.
 def test_wait_for_gate_clear_sleeps_to_deadline_not_polls(
-    monkeypatch, fake_clock, counted_typing_delay
-):
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
+) -> None:
     monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: 998)
 
     assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
@@ -270,8 +270,8 @@ def test_wait_for_gate_clear_sleeps_to_deadline_not_polls(
 
 
 def test_wait_for_gate_clear_extends_when_typing_resumes(
-    monkeypatch, fake_clock, counted_typing_delay
-):
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
+) -> None:
     # Keystroke at 998; human types again at 1005 (visible after the first wake).
     monkeypatch.setattr(
         send_gate,
@@ -287,7 +287,9 @@ def test_wait_for_gate_clear_extends_when_typing_resumes(
     assert abs(sum(sleeps) - 15.1) < 0.01  # ends at 1015.1 = 1005 + 10 + 0.1
 
 
-def test_wait_for_gate_clear_honors_delay_timeout(monkeypatch, fake_clock, counted_typing_delay):
+def test_wait_for_gate_clear_honors_delay_timeout(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
+) -> None:
     monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: fake_clock["now"] - 1)
     monkeypatch.setenv("TMUX_SEND_GATE_DELAY_TIMEOUT", "5")
 
