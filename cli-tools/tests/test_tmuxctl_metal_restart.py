@@ -329,3 +329,31 @@ def test_render_shape():
     )
     assert rendered.startswith("metal-restart metalrt (dry-run): 0 resumable, 3 skipped, 0 failed")
     assert "metalrt:A" in rendered
+
+
+def test_metal_modules_are_statically_db_free():
+    # The whole point of the metal path: restore decisions never consult the
+    # registry. Enforce it at the import level so a future edit can't quietly
+    # re-anchor on the DB or the HTTP registry.
+    import ast
+
+    forbidden_modules = {"sqlite3", "urllib", "requests", "http", "socket"}
+    forbidden_names = {"instance_registry", "fetch_instance_registry", "api"}
+    for module in ("metal_resolver.py", "metal_restart.py"):
+        tree = ast.parse((ROOT / "lib" / "tmuxctl" / module).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_name = alias.name.split(".")[0]
+                    assert root_name not in forbidden_modules, (
+                        f"{module} imports forbidden module: {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                source_module = (node.module or "").split(".")[-1]
+                assert source_module not in forbidden_modules | forbidden_names, (
+                    f"{module} imports from forbidden module: {node.module}"
+                )
+                for alias in node.names:
+                    assert alias.name not in forbidden_names, (
+                        f"{module} imports forbidden name: {alias.name}"
+                    )

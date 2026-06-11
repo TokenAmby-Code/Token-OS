@@ -39,8 +39,12 @@ _AGENT_EXIT_POLL_SECONDS = 0.5
 _POST_KILL_SETTLE_SECONDS = 1.0
 
 
-class MetalRestartRefused(RuntimeError):
-    """Raised when the target session is not a legal metal-restart target."""
+class MetalRestartRefused(ValueError):
+    """Raised when the target session is not a legal metal-restart target.
+
+    Subclasses ValueError so cli.main()'s existing handler renders it as a
+    clean one-line refusal (exit 1) instead of a traceback.
+    """
 
 
 @dataclass(frozen=True)

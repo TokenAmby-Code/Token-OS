@@ -49,10 +49,25 @@ pane_id_for() {
     return 1
 }
 
+ack_trust_prompts() {
+    # Codex prompts per-project directory trust on first launch into a fresh
+    # scratch dir (persisted to the active profile config afterwards). Option 1
+    # ("Yes, continue") is preselected — a bare Enter accepts it.
+    local pane content
+    while IFS= read -r pane; do
+        content="$(tmux capture-pane -t "$pane" -p 2>/dev/null || true)"
+        if grep -q "Do you trust" <<< "$content"; then
+            echo "acking directory-trust prompt in $pane"
+            tmux send-keys -t "$pane" Enter
+        fi
+    done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+}
+
 wait_for_agent() {
     # Block until metal-observe resolves <slot> to <engine> (or timeout).
     local slot="$1" engine="$2" timeout="${3:-90}" waited=0
     while (( waited < timeout )); do
+        ack_trust_prompts
         if "$TMUXCTL" metal-observe --session "$SESSION" --format json 2>/dev/null \
             | python3 -c "
 import json, sys
@@ -127,7 +142,8 @@ cmd_up() {
 }
 
 cmd_state() {
-    "$TMUXCTL" metal-observe --session "$SESSION" "${@}"
+    # ${1:+"$@"}: bash 3.2 + set -u errors on bare "$@" when no args remain.
+    "$TMUXCTL" metal-observe --session "$SESSION" ${1:+"$@"}
 }
 
 cmd_down() {
@@ -197,6 +213,45 @@ cmd_verify() {
         echo "WARN: no marker file recorded by 'up'; skipping history check"
     fi
 
+    # Strongest evidence: the resumed agents must APPEND new turns to the very
+    # same transcript files (verified live 2026-06-11: `claude --resume <id>`
+    # continues the same jsonl; `codex resume <id>` the same rollout).
+    local ping="metalrt-ping-$$" a_pane b_pane
+    if a_pane="$(pane_id_for A)" && b_pane="$(pane_id_for B)"; then
+        for pane in "$a_pane" "$b_pane"; do
+            tmux send-keys -t "$pane" -l "Reply with exactly: ${ping}"
+            sleep 1
+            tmux send-keys -t "$pane" C-m
+            sleep 1
+            tmux send-keys -t "$pane" C-m
+        done
+        local claude_slug claude_jsonl codex_jsonl waited=0
+        claude_slug="$(printf '%s' "$SCRATCH_CLAUDE" | tr '/.' '-')"
+        claude_jsonl="$HOME/.claude/projects/${claude_slug}/${post_claude}.jsonl"
+        codex_jsonl="$(find "$HOME/.codex/sessions" -name "rollout-*-${post_codex}.jsonl" 2>/dev/null | head -1)"
+        while (( waited < 90 )); do
+            grep -q "$ping" "$claude_jsonl" 2>/dev/null \
+                && grep -q "$ping" "${codex_jsonl:-/dev/null}" 2>/dev/null && break
+            sleep 3
+            waited=$(( waited + 3 ))
+        done
+        if grep -q "$ping" "$claude_jsonl" 2>/dev/null; then
+            echo "PASS claude: post-restart turn appended to original jsonl"
+        else
+            echo "FAIL claude: post-restart turn missing from $claude_jsonl"
+            failures=$(( failures + 1 ))
+        fi
+        if [[ -n "$codex_jsonl" ]] && grep -q "$ping" "$codex_jsonl" 2>/dev/null; then
+            echo "PASS codex: post-restart turn appended to original rollout"
+        else
+            echo "FAIL codex: post-restart turn missing from ${codex_jsonl:-<no rollout>}"
+            failures=$(( failures + 1 ))
+        fi
+    else
+        echo "FAIL append: could not locate panes A/B for the live-append check"
+        failures=$(( failures + 1 ))
+    fi
+
     # Bare shell pane untouched.
     local c_pane c_cmd
     if c_pane="$(pane_id_for C)"; then
@@ -227,9 +282,9 @@ cmd_verify() {
 }
 
 case "${1:-}" in
-    up)     shift; cmd_up "$@" ;;
-    down)   shift; cmd_down "$@" ;;
-    state)  shift; cmd_state "$@" ;;
-    verify) shift; cmd_verify "$@" ;;
+    up)     shift; cmd_up ${1:+"$@"} ;;
+    down)   shift; cmd_down ${1:+"$@"} ;;
+    state)  shift; cmd_state ${1:+"$@"} ;;
+    verify) shift; cmd_verify ${1:+"$@"} ;;
     *)      err "usage: metal-restart-sandbox up|state|verify|down"; exit 64 ;;
 esac

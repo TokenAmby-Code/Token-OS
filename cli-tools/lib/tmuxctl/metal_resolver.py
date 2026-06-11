@@ -18,7 +18,13 @@ engines' own transcript stores:
   updated_at}`` newest-first, correlated to the pane's cwd via the rollout
   file's first-line ``payload.cwd`` (``~/.codex/sessions/<Y>/<M>/<D>/
   rollout-*-<uuid>.jsonl``). Falls back to a newest-mtime rollout scan when
-  the index is absent.
+  the index is absent or has no cwd match — verified live 2026-06-11: codex
+  0.139 leaves ``session_index.jsonl`` stale (last row 2026-05-03), so the
+  mtime scan is the path that actually carries current sessions.
+
+Resume semantics (verified live 2026-06-11 in the metalrt sandbox): both
+``claude --resume <id>`` and ``codex resume <id>`` re-attach to and APPEND to
+the original transcript file — same sessionId/rollout, no fork.
 
 Known limitation (accepted): two live agents of the same engine sharing one
 cwd resolve to the single newest transcript for that cwd. Sandbox panes use
