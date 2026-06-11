@@ -18,9 +18,9 @@ test('Custodes static resolver uses main:3 marker even when other panes exist', 
     assert.equal(cmd, 'tmux');
     assert.equal(args[0], 'list-panes');
     return [
-      'main	3	1	%8	',
-      'main	3	0	%9	legion:custodes',
-      'main	1	0	%42	imperial_guard:cadia',
+      'main|3|1|%8|',
+      'main|3|0|%9|legion:custodes',
+      'main|1|0|%42|imperial_guard:cadia',
     ].join('\n');
   };
 
@@ -31,14 +31,15 @@ test('Custodes static resolver uses main:3 marker even when other panes exist', 
 
   assert.equal(pane, '%9');
   assert.equal(calls.length, 1);
+  assert.equal(calls[0][1][3], '#{session_name}|#{window_index}|#{pane_index}|#{pane_id}|#{@PANE_ID}');
 });
 
 test('Mechanicus static resolver uses main:4 Fabricator-General marker', () => {
   const pane = resolveStaticVoiceTargetToPane('4:0', {
     execSync: () => [
-      'main	4	2	%10	',
-      'main	4	0	%11	mechanicus:fabricator-general',
-      'main	3	0	%9	legion:custodes',
+      'main|4|2|%10|',
+      'main|4|0|%11|mechanicus:fabricator-general',
+      'main|3|0|%9|legion:custodes',
     ].join('\n'),
     paneExistsFn: () => true,
   });
@@ -49,9 +50,9 @@ test('Mechanicus static resolver uses main:4 Fabricator-General marker', () => {
 test('static resolver falls back only to first live pane in persona window', () => {
   const pane = resolveStaticVoiceTargetToPane('3:0', {
     execSync: () => [
-      'main	1	0	%42	imperial_guard:cadia',
-      'main	3	1	%8	',
-      'main	3	0	%9	wrong-marker',
+      'main|1|0|%42|imperial_guard:cadia',
+      'main|3|1|%8|',
+      'main|3|0|%9|wrong-marker',
     ].join('\n'),
     paneExistsFn: p => p === '%8',
   });
@@ -67,7 +68,7 @@ test('static resolver reads via the local tmux binary, not the NAS guard wrapper
   resolveStaticVoiceTargetToPane('3:0', {
     execSync: (_cmd, _args, opts) => {
       seenPath = opts?.env?.PATH || '';
-      return 'main\t3\t0\t%9\tlegion:custodes';
+      return 'main|3|0|%9|legion:custodes';
     },
     paneExistsFn: () => true,
   });
