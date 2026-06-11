@@ -125,6 +125,7 @@ PERSONA_SEEDS = [
         {"color": "#300808"},
     ),
     ("administratum", "Administratum", "overseer", "default", None, None, 1, {"color": "#300808"}),
+    ("malcador", "Malcador", "primarch", "default", None, None, 1, {"color": "#8a7a4a"}),
     ("vulkan", "Vulkan", "primarch", "green", None, None, 1, {}),
     ("inquisitor", "Inquisitor", "overseer", "default", None, None, 1, {}),
     (
@@ -230,6 +231,7 @@ LEGACY_PERSONA_ALIASES = {
     "mechanicus:administratum": "administratum",
     "mechanicus:admin": "administratum",
     "legion:custodes": "custodes",
+    "legion:malcador": "malcador",
     "mechanicus": "administratum",
 }
 

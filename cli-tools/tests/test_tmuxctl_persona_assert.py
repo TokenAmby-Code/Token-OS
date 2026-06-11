@@ -86,9 +86,17 @@ class FakeAdapter:
 
 
 def test_persona_specs_pin_model_defaults():
-    assert persona_spec("legion:custodes").model == ""
+    assert persona_spec("legion:custodes").model == "opus"
+    assert persona_spec("legion:malcador").model == "fable"
     assert persona_spec("mechanicus:fabricator-general").model == ""
     assert persona_spec("mechanicus:admin").model == "sonnet"
+
+
+def test_malcador_spec_is_not_sync() -> None:
+    spec = persona_spec("legion:malcador")
+    assert spec.sync is False
+    assert spec.persona == "malcador"
+    assert spec.session_doc.endswith("Terra/Sessions/malcador.md")
 
 
 def test_dispatch_args_include_model_when_present():
