@@ -217,6 +217,7 @@ def build_window_snapshot(
                 pane_kind=_parse_pane_kind(adapter.show_pane_option(pane_id, "@PANE_TYPE")),
                 reserved=adapter.show_pane_option(pane_id, "@GRID_RESERVED") == "true",
                 active=record["active"] == "1",
+                instance_id=adapter.show_pane_option(pane_id, "@INSTANCE_ID"),
                 tombstone_target=adapter.show_pane_option(pane_id, "@TOMBSTONE_TARGET"),
                 tombstone_source=adapter.show_pane_option(pane_id, "@TOMBSTONE_SOURCE"),
             )

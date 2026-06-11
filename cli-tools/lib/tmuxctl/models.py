@@ -31,6 +31,9 @@ class PaneSnapshot:
     pane_kind: PaneKind
     reserved: bool
     active: bool
+    # Live @INSTANCE_ID stamp (the post-Slice-B reverse-lookup source of truth).
+    # Empty when no agent is registered in the pane.
+    instance_id: str = ""
     tombstone_target: str = ""
     tombstone_source: str = ""
 

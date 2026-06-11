@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from .enums import CoherenceSeverity, InstanceStatus, RestartPhase, ResumeDisposition
@@ -45,7 +46,8 @@ def build_restart_plan(
     resumes: list[PlannedResume] = []
     skipped: list[PlannedResume] = []
 
-    candidate_instances = _candidate_instances(registry.instances)
+    registry_instances = _backfill_pane_labels_from_stamps(registry.instances, workspace)
+    candidate_instances = _candidate_instances(registry_instances)
     candidates = _dedupe_candidates(candidate_instances)
     active_labels = [
         canonical_pane_role(inst.pane_label) for inst in candidates if _is_resumable(inst)
@@ -177,6 +179,38 @@ def build_restart_plan(
         client_attachments=tuple(client_attachments),
         grouped_sessions=tuple(grouped_sessions),
         coherence_issues=tuple(issues),
+    )
+
+
+def _backfill_pane_labels_from_stamps(
+    instances: tuple[InstanceRegistryEntry, ...],
+    workspace: WorkspaceSnapshot,
+) -> tuple[InstanceRegistryEntry, ...]:
+    """Recover each instance's pane_label from the live ``@INSTANCE_ID`` stamp.
+
+    Cutover Slice B (#84) repointed instance->pane reverse lookups to the live
+    ``@INSTANCE_ID`` pane stamp and retired ``pane_label``/``tmux_pane`` from
+    ``/api/instances``. The restart planner was the lone consumer still reading
+    the now-absent ``pane_label``, so every instance fell out of the candidate
+    set (see ``_is_candidate``) and nothing resumed across a ``tx restart``.
+
+    Here we rebuild the reverse map from the live workspace: ``@INSTANCE_ID`` ->
+    pane role. An instance whose registry ``pane_label`` is empty but whose id
+    is stamped on a live pane inherits that pane's role. Instances that already
+    carry a ``pane_label`` are left untouched, so a future registry that resumes
+    serving pane labels keeps working unchanged.
+    """
+    label_by_instance: dict[str, str] = {}
+    for pane in workspace.iter_panes():
+        if pane.instance_id and pane.pane_role:
+            label_by_instance.setdefault(pane.instance_id, canonical_pane_role(pane.pane_role))
+    if not label_by_instance:
+        return instances
+    return tuple(
+        inst
+        if inst.pane_label or inst.instance_id not in label_by_instance
+        else replace(inst, pane_label=label_by_instance[inst.instance_id])
+        for inst in instances
     )
 
 
