@@ -32,6 +32,7 @@ def test_shell_config_keeps_imperium_nas_but_uses_local_runtime_when_present(tmp
 set -e
 HOME={home!s}
 PATH=/usr/bin:/bin
+uname() {{ echo Darwin; }}
 source {NAS_PATH!s}
 printf '%s\n%s\n%s\n' "$IMPERIUM" "$TOKEN_OS" "$CLI_TOOLS"
 """
