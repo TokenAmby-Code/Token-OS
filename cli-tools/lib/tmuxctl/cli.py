@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .api import RegistryError
@@ -224,6 +225,14 @@ def build_parser() -> argparse.ArgumentParser:
     stack_dispatch.add_argument("--command", dest="launch_command", required=True)
     stack_dispatch.add_argument("--no-focus", action="store_true")
     stack_dispatch.add_argument("--settle", type=float, default=0.5)
+    stack_adopt = stack_subparsers.add_parser("adopt")
+    stack_adopt.add_argument("base", help="orchestrator stack base: legion, mechanicus")
+    stack_adopt.add_argument(
+        "--pane", required=True, help="existing live pane to join into the stack"
+    )
+    stack_adopt.add_argument("--cwd", default=None)
+    stack_adopt.add_argument("--session", default="main")
+    stack_adopt.add_argument("--no-focus", action="store_true")
     stack_enforce = stack_subparsers.add_parser("enforce")
     stack_enforce.add_argument("--pane", default="current")
     stack_enforce.add_argument("--window", default="")
@@ -573,6 +582,27 @@ def main(argv: list[str] | None = None) -> int:
                     focus=not args.no_focus,
                     settle_seconds=args.settle,
                 )
+                print(pane_id)
+                return 0
+            if args.stack_command == "adopt":
+                from .focus_guard import preserve_focus
+                from .stack import add_stack_pane
+
+                # join-pane is focus-mutating, so guard it like stack dispatch.
+                with preserve_focus(
+                    control.adapter,
+                    source="tmuxctl stack adopt",
+                    attempted_target=f"{args.session}:{args.base}",
+                    enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
+                ):
+                    pane_id = add_stack_pane(
+                        control.adapter,
+                        args.session,
+                        args.base,
+                        cwd=args.cwd,
+                        focus=not args.no_focus,
+                        adopt_pane=args.pane,
+                    )
                 print(pane_id)
                 return 0
             if args.stack_command == "sweep":

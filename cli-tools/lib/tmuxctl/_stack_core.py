@@ -722,6 +722,7 @@ def add_orchestrator_stack_pane(
     *,
     cwd: str | None = None,
     focus: bool = True,
+    adopt_pane: str | None = None,
 ) -> str:
     spec = STACK_PAGE_SPECS.get(base)
     if spec is None:
@@ -752,38 +753,68 @@ def add_orchestrator_stack_pane(
         if not workers:
             win_w = int(_show(adapter, target, "#{window_width}") or "240")
             right_w = max(1, win_w - ((win_w * spec.orchestrator_ratio) // 100) - 1)
-            pane = adapter.run(
-                "split-window",
-                "-h",
-                "-t",
-                orchestrator.pane_id,
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-l",
-                str(right_w),
-                "-c",
-                cwd,
-            ).strip()
+            if adopt_pane:
+                # Adopt an existing live pane (preserves its pane id + running
+                # process) into the empty stack instead of opening a fresh shell.
+                adapter.run(
+                    "join-pane",
+                    "-h",
+                    "-d",
+                    "-s",
+                    adopt_pane,
+                    "-t",
+                    orchestrator.pane_id,
+                    "-l",
+                    str(right_w),
+                )
+                pane = adopt_pane
+            else:
+                pane = adapter.run(
+                    "split-window",
+                    "-h",
+                    "-t",
+                    orchestrator.pane_id,
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-l",
+                    str(right_w),
+                    "-c",
+                    cwd,
+                ).strip()
         else:
             worker_ids = {worker.pane_id for worker in workers}
             stored_focus = _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION)
             split_target = stored_focus if stored_focus in worker_ids else workers[0].pane_id
-            pane = adapter.run(
-                "split-window",
-                "-v",
-                "-t",
-                split_target,
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-l",
-                str(STACK_COLLAPSED_HEIGHT),
-                "-c",
-                cwd,
-            ).strip()
+            if adopt_pane:
+                adapter.run(
+                    "join-pane",
+                    "-v",
+                    "-d",
+                    "-s",
+                    adopt_pane,
+                    "-t",
+                    split_target,
+                    "-l",
+                    str(STACK_COLLAPSED_HEIGHT),
+                )
+                pane = adopt_pane
+            else:
+                pane = adapter.run(
+                    "split-window",
+                    "-v",
+                    "-t",
+                    split_target,
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-l",
+                    str(STACK_COLLAPSED_HEIGHT),
+                    "-c",
+                    cwd,
+                ).strip()
     finally:
         _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "false")
 
@@ -795,7 +826,10 @@ def add_orchestrator_stack_pane(
             _lowest_available_worker_ordinal(workers, spec),
             reason="worker_birth",
         )
-        _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
+        if not adopt_pane:
+            # A fresh shell starts pending (no agent yet); an adopted pane is a
+            # live worker that must never be culled as a blank pending shell.
+            _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
         adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
         focus_new_worker = focus and not (base == "mechanicus" and not _mechanicus_focus_allowed())
         enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus_new_worker)
@@ -803,8 +837,9 @@ def add_orchestrator_stack_pane(
     except Exception:
         # If post-split normalization fails, do not leave a blank pending worker
         # pane behind. This was the visible failure mode of legion:new dispatch:
-        # an empty stack pane opened, then no agent ever started.
-        if pane:
+        # an empty stack pane opened, then no agent ever started. Never kill an
+        # adopted pane — it is the user's live agent, joined in from elsewhere.
+        if pane and not adopt_pane:
             adapter.run("kill-pane", "-t", pane, allow_failure=True)
         raise
 

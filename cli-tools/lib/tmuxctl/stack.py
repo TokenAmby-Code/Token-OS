@@ -107,8 +107,13 @@ def add_stack_pane(
     *,
     cwd: str | None = None,
     focus: bool = True,
+    adopt_pane: str | None = None,
 ) -> str:
     """Add a new worker pane to the named stack, spilling if the canonical window is full.
+
+    When ``adopt_pane`` is given, the existing live pane is joined into the stack
+    (preserving its pane id + running process) instead of opening a fresh shell.
+    Only the orchestrator-backed stacks (legion/mechanicus) support adoption.
 
     Returns the new pane id. Raises ValueError if `base` is not a known stack window.
     """
@@ -119,7 +124,12 @@ def add_stack_pane(
     if base in {"legion", "mechanicus"}:
         from .stack import add_orchestrator_stack_pane
 
-        return add_orchestrator_stack_pane(adapter, session, base, cwd=cwd, focus=focus)
+        return add_orchestrator_stack_pane(
+            adapter, session, base, cwd=cwd, focus=focus, adopt_pane=adopt_pane
+        )
+
+    if adopt_pane is not None:
+        raise ValueError(f"stack adopt is only supported for orchestrator stacks, not {base!r}")
 
     existing = _list_spill_windows(adapter, session, base)
     if not existing:
