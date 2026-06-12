@@ -59,6 +59,20 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
 
+    metal_observe_parser = subparsers.add_parser(
+        "metal-observe",
+        help="Read-only metal observation: per-pane engine + resume id from live tmux + filesystem (no DB).",
+    )
+    metal_observe_parser.add_argument("--session", required=True)
+    metal_observe_parser.add_argument("--format", choices=["text", "json"], default="text")
+
+    metal_restart_parser = subparsers.add_parser(
+        "metal-restart",
+        help="DB-free restart: resume each live agent pane from metal-observed transcripts (sandbox-only).",
+    )
+    metal_restart_parser.add_argument("--session", required=True)
+    metal_restart_parser.add_argument("--dry-run", action="store_true")
+
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--session", default="main")
 
@@ -76,6 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=["json", "physical", "role", "full"], default="full"
     )
     resolve_instance_parser.add_argument("instance_id")
+
+    freelist_parser = subparsers.add_parser(
+        "freelist",
+        help="List clean, agent-free panes (derived live from @PANE_CLEAN stamps).",
+    )
+    freelist_parser.add_argument("--format", choices=["text", "json", "ids"], default="text")
+    freelist_parser.add_argument(
+        "--first",
+        action="store_true",
+        help="Print only the first free pane id (empty + exit 1 if none).",
+    )
 
     session_doc_parser = subparsers.add_parser(
         "session-doc",
@@ -123,6 +148,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clear the prompt before --submit delivery.",
     )
     invoke_skill_parser.add_argument("--dry-run", action="store_true")
+
+    # Decomposed prompt-cursor ops. The plan-menu pre-buffers prompt-start (the
+    # expensive, selection-independent 50x PgUp) while the picker is open, inserts
+    # the chosen leader, then always runs prompt-end on exit to restore the cursor.
+    prompt_start_parser = subparsers.add_parser(
+        "prompt-start",
+        help="Move the pane cursor to the prompt start (N x PgUp + Home).",
+    )
+    prompt_start_parser.add_argument("--pane", required=True)
+    prompt_start_parser.add_argument("--page-ups", type=int, default=50)
+
+    insert_text_parser = subparsers.add_parser(
+        "insert-text",
+        help="Insert literal text at the cursor (no leader logic, no submit).",
+    )
+    insert_text_parser.add_argument("--pane", required=True)
+    insert_text_parser.add_argument("--text", required=True)
+
+    prompt_end_parser = subparsers.add_parser(
+        "prompt-end",
+        help="Return the pane cursor to the prompt end (N x PgDn + End).",
+    )
+    prompt_end_parser.add_argument("--pane", required=True)
+    prompt_end_parser.add_argument("--page-downs", type=int, default=50)
 
     resolve_agent_parser = subparsers.add_parser(
         "resolve-agent",
@@ -271,6 +320,29 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0 if ok else 1
 
+        if args.command == "metal-observe":
+            import json
+
+            from .metal_resolver import (
+                observation_to_dict,
+                observe_and_resolve,
+                render_observations,
+            )
+
+            observations = observe_and_resolve(control.adapter, args.session)
+            if args.format == "json":
+                print(json.dumps([observation_to_dict(obs) for obs in observations], indent=2))
+            else:
+                print(render_observations(observations))
+            return 0
+
+        if args.command == "metal-restart":
+            from .metal_restart import metal_restart, render_metal_restart_result
+
+            metal_result = metal_restart(control.adapter, args.session, dry_run=args.dry_run)
+            print(render_metal_restart_result(metal_result))
+            return 0 if metal_result.ok else 1
+
         if args.command == "doctor":
             print(control.doctor(args.session))
             return 0
@@ -313,6 +385,26 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"pane_role: {result['pane_role'] or '(unset)'}")
                 print(f"found: {str(result['found']).lower()}")
             return 0 if result["found"] else 1
+
+        if args.command == "freelist":
+            import json
+
+            panes = control.freelist()
+            if args.first:
+                if not panes:
+                    return 1
+                print(panes[0]["pane_id"])
+                return 0
+            if args.format == "json":
+                print(json.dumps(panes))
+            elif args.format == "ids":
+                for free_pane in panes:
+                    print(free_pane["pane_id"])
+            else:  # text
+                for free_pane in panes:
+                    role = free_pane["pane_role"] or "-"
+                    print(f"{free_pane['pane_id']}\t{role}\t{free_pane['window_name']}")
+            return 0
 
         if args.command == "session-doc":
             import json
@@ -393,6 +485,18 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     end="",
                 )
+            return 0
+
+        if args.command == "prompt-start":
+            control.move_to_prompt_start(args.pane, page_ups=args.page_ups)
+            return 0
+
+        if args.command == "insert-text":
+            control.insert_text(args.pane, args.text)
+            return 0
+
+        if args.command == "prompt-end":
+            control.move_to_prompt_end(args.pane, page_downs=args.page_downs)
             return 0
 
         if args.command == "resolve-agent":

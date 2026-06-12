@@ -3,18 +3,18 @@
 # TAGS: shell, init, profile, shared
 #
 # Source this ONE file from each machine's shell profile (.bashrc / .zshenv).
-# It handles all NAS-hosted tooling setup so machine profiles stay minimal.
+# It handles machine-local Token-OS tooling setup so machine profiles stay minimal.
 #
 # Usage in ~/.bashrc (WSL):
-#   if [[ -r /mnt/imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh ]]; then
-#       source /mnt/imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh
+#   if [[ -r ~/runtimes/token-os/live/cli-tools/lib/shell-init.sh ]]; then
+#       source ~/runtimes/token-os/live/cli-tools/lib/shell-init.sh
 #   elif [[ -f ~/.imperium-shell-cache ]]; then
 #       source ~/.imperium-shell-cache
 #   fi
 #
 # Usage in ~/.zshenv (Mac):
-#   if [[ -r /Volumes/Imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh ]]; then
-#       source /Volumes/Imperium/runtimes/token-os/live/cli-tools/lib/shell-init.sh
+#   if [[ -r ~/runtimes/Token-OS/live/cli-tools/lib/shell-init.sh ]]; then
+#       source ~/runtimes/Token-OS/live/cli-tools/lib/shell-init.sh
 #   elif [[ -f ~/.imperium-shell-cache ]]; then
 #       source ~/.imperium-shell-cache
 #   fi

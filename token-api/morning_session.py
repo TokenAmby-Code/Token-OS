@@ -6,8 +6,9 @@ or directly via `python3 morning_launcher.py` (cron).
 
 Gathers context, builds the Custodes prompt inline, resolves the managed
 main:legion Custodes orchestrator pane, and launches an interactive Claude
-session via `primarch custodes`. The session
-self-registers as legion=custodes, instance_type=sync via the SessionStart hook.
+session via `primarch custodes`. The session's identity (persona=custodes,
+rank=overseer) is owned by the SessionStart hook from the legion:custodes pane;
+the launcher then sets sync MODE while the morning session is live.
 
 The launcher exits after launch — the Claude session is autonomous from there.
 """
@@ -43,19 +44,12 @@ MORNING_MAX_DURATION_HOURS = 2
 MORNING_ACTIVE_STATUSES = ("launched", "active")
 
 # In-pathway self-validation budget: after the prompt is injected, poll the
-# instances table this long for the launched Custodes to self-register as
-# legion=custodes, instance_type=sync. Generous by default so a normal cold
-# boot is never mistaken for a failure; the supervisor layer is the redundant
-# net for anything that slips past this window.
+# instances table this long for the launched Custodes to self-register by
+# persona identity (slug=custodes, rank=overseer). Generous by default so a
+# normal cold boot is never mistaken for a failure; the supervisor layer is the
+# redundant net for anything that slips past this window.
 CUSTODES_CONFIRM_TIMEOUT_S = int(os.environ.get("CUSTODES_CONFIRM_TIMEOUT_S", "90"))
 CUSTODES_CONFIRM_INTERVAL_S = float(os.environ.get("CUSTODES_CONFIRM_INTERVAL_S", "3"))
-
-# Canonical "this row is a Custodes" signal — mirrors tmuxctl's own check
-# (assertions.py: legion=custodes and instance_type in {sync, hook_driven}).
-# We accept either type on purpose: a resting/desynced custodes (hook_driven)
-# is still THE custodes the morning prompt was injected into, and the launcher
-# reconciles its row to the active-morning identity rather than failing.
-CUSTODES_INSTANCE_TYPES = ("sync", "hook_driven")
 
 
 def morning_state_dir() -> Path:
@@ -129,57 +123,61 @@ def update_morning_state(updates: dict, *, today: str | None = None) -> dict | N
 def find_live_custodes() -> dict | None:
     """Return the live Custodes singleton row, or None if no custodes is alive.
 
-    Matches the canonical custodes signal (CUSTODES_INSTANCE_TYPES): a live row
-    with legion=custodes and instance_type in {sync, hook_driven}. Custodes is a
-    singleton (launch demotes any prior custodes) and stale rows are swept, so at
-    most one such row exists. Reads the same /api/instances surface the Custodes
-    prompt and supervisor use, so all three agree.
+    Identity is **persona + rank**, not sync mode: a live row whose
+    ``persona.slug == 'custodes'`` with a non-``retired`` rank, a non-``chapter``
+    ``commander_type``, and an active status (the canonical ``instances`` table
+    normalizes ``processing``→``working`` and never exposes
+    ``legion``/``instance_type``/``synced`` on ``/api/instances``, so the old
+    sync-shaped predicate matched nothing here). The ``commander_type != 'chapter'``
+    filter matches ``personas.resolve_live_persona_instance`` so a custodes chapter
+    child (a subagent sharing the persona_id) cannot shadow the overseer. Custodes
+    is a singleton (the rank-stamp + singleton-guard triggers collapse duplicates to
+    one), so at most one such row exists. Reads the same ``/api/instances`` surface
+    the Custodes prompt and supervisor use, so all three agree.
 
-    This intentionally accepts a *desynced* custodes (hook_driven / synced=0):
-    injecting the morning prompt into an already-running custodes pane is the
-    expected path, so the launcher needs to FIND that row in order to reconcile
-    it to the active-morning identity. Returns None only when no custodes process
-    is alive at all — the one genuine launch failure.
+    This finds the custodes regardless of sync MODE — injecting the morning prompt
+    into an already-running (resting) custodes pane is the expected path, so the
+    launcher needs to FIND that row in order to set sync mode for the live morning.
+    Returns None only when no custodes process is alive at all — the one genuine
+    launch failure.
     """
     instances = _get("/api/instances?sort=recent_activity")
     if not isinstance(instances, list):
         return None
     for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        persona = inst.get("persona") or {}
         if (
-            isinstance(inst, dict)
-            and inst.get("legion") == "custodes"
-            and inst.get("instance_type") in CUSTODES_INSTANCE_TYPES
-            and inst.get("stopped_at") in (None, "")
+            persona.get("slug") == "custodes"
+            and inst.get("rank") != "retired"
+            and inst.get("commander_type") != "chapter"
+            and inst.get("status") not in ("stopped", "archived")
         ):
             return inst
     return None
 
 
 def reconcile_custodes_active(inst: dict) -> dict:
-    """Upsert a desynced Custodes row to the active-morning identity.
+    """Set sync MODE on the resolved Custodes for the live morning session.
 
-    The morning prompt is often injected into an already-running custodes that
-    is still in its resting row state (instance_type=hook_driven and/or
-    synced=0). Rather than treat that as a missing session, promote the row to
-    the canonical active-morning identity (instance_type=sync, synced=1) — the
-    same identity the SessionStart hook derives for a custodes — so every
-    downstream signal (keepalive, supervisor, Discord routing) agrees a morning
-    session is live. Best-effort and idempotent: a no-op when already sync+synced,
-    and individual PATCH failures are returned, not raised.
+    Identity is already settled by persona + rank (``find_live_custodes`` found
+    THE custodes). This flips the runtime sync MODE (instance_type=sync, synced=1)
+    so the morning prompt's rip-cord / `/api/morning/end` (which toggle sync) have
+    something to toggle, and any residual sync-mode consumers see an active
+    morning. Sync is NOT identity — the keepalive already gates on Custodes
+    persona — so this is best-effort: the canonical ``/api/instances`` surface
+    does not expose instance_type/synced, so there is nothing to short-circuit on;
+    the PATCHes are simply issued and their results returned (never raised).
     """
     instance_id = inst.get("id")
     if not instance_id:
         return {"reconciled": False, "reason": "no_instance_id"}
-    is_sync = inst.get("instance_type") == "sync"
-    is_synced = bool(inst.get("synced"))
-    if is_sync and is_synced:
-        return {"reconciled": False, "reason": "already_active", "instance_id": instance_id}
-    results: dict = {}
-    if not is_sync:
-        results["type"] = _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"})
-    if not is_synced:
-        results["synced"] = _patch(f"/api/instances/{instance_id}/synced", {"synced": True})
-    logger.info("Morning session: reconciled desynced custodes %s -> sync/synced", instance_id[:12])
+    results: dict = {
+        "type": _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"}),
+        "synced": _patch(f"/api/instances/{instance_id}/synced", {"synced": True}),
+    }
+    logger.info("Morning session: set sync mode on custodes %s", instance_id[:12])
     return {"reconciled": True, "instance_id": instance_id, "results": results}
 
 
@@ -209,7 +207,9 @@ def confirm_custodes_registered(
         inst = find_live_custodes()
         if inst is not None:
             recon = reconcile_custodes_active(inst)
-            inst_pane = inst.get("tmux_pane")
+            # The canonical surface carries the live pane under `runtime`, not a
+            # top-level tmux_pane (pane identity is never durably stored).
+            inst_pane = (inst.get("runtime") or {}).get("tmux_pane")
             return {
                 "live": True,
                 "instance_id": inst.get("id"),
@@ -426,7 +426,7 @@ fresh:
   `/api/timer/state`, `/api/instances?sort=recent_activity`,
   `/api/fleet/state`, `/api/habits/today` directly.
 - Worktrees: `git -C ~/AskCivic/askcivic worktree list`,
-  `git -C /Volumes/Imperium/runtimes/token-os/live worktree list`.
+  `git -C ~/runtimes/Token-OS/live worktree list`.
 
 ## Mandate
 
@@ -450,19 +450,19 @@ them.
 
 You spawned in the custodes orchestrator pane, so `SessionStart` already
 registered your row from the pane identity:
-- **legion=custodes** (triggers singleton enforcement — any prior custodes are demoted)
-- **instance_type=sync**
-- **synced=1** (kept for state-hook identity predicates)
+- **persona=custodes** (the singleton-guard triggers demote any prior custodes)
+- **rank=overseer** (your durable identity — resolved by persona + rank, never sync)
 
-You do **not** self-register — identity is owned by the harness. Just verify
-and report:
+Sync is a runtime MODE the morning launcher sets while this session is live, NOT
+your identity. You do **not** self-register — identity is owned by the harness.
+Just verify and report:
 ```bash
-curl -s http://localhost:7777/api/instances?sort=recent_activity | jq '.[0] | {{id, legion, instance_type, synced, status}}'
+curl -s http://localhost:7777/api/instances?sort=recent_activity | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | .[0] | {{id, persona: .persona.slug, rank, status}}'
 ```
 
-If legion is not `custodes` or instance_type is not `sync`, do **not**
-PATCH yourself — report it immediately. The harness is broken and that's the
-finding. Do not silently proceed without custodes identity.
+If there is no non-retired `custodes` row at `rank=overseer`, do **not** PATCH
+yourself — report it immediately. The harness is broken and that's the finding.
+Do not silently proceed without custodes identity.
 
 ## Your First Turn
 
@@ -515,17 +515,18 @@ not a notification that can be swiped away.
 the Stop hook accepts it and immediately re-injects a fresh timestamped
 keepalive prompt — you cannot go quiet and let the morning drift. Keep
 moving: advance the regiment/plan, prompt the Emperor via `tts` /
-AskUserQuestion. The loop ends ONLY when the Emperor officially says he's
-done, at which point YOU call:
+AskUserQuestion. The keepalive is gated on the morning session being ACTIVE
+(your custodes identity + an in-bound morning record), so the loop ends when
+that morning record is closed. When the Emperor officially says he's done, YOU
+call:
 ```bash
 curl -s -X POST http://localhost:7777/api/morning/end
 ```
-That flips this instance off `sync` (→ one_off); the next Stop is then a
-normal clean stop. **Rip cord:** if you ever need to force-exit the loop,
-PATCH this instance off `sync` directly:
-```bash
-curl -s -X PATCH "http://localhost:7777/api/instances/$INSTANCE_ID/type" -H 'Content-Type: application/json' -d '{{"instance_type":"one_off"}}'
-```
+That ends the morning record (and clears sync mode); the next Stop is then a
+normal clean stop. The loop also auto-ends past the Emperor's 2-hour bound.
+Note: PATCHing yourself off `sync` does NOT exit the loop on its own anymore —
+the keepalive follows the morning record, not sync mode — so end the morning
+record to stop.
 
 ## Conversation Phases
 

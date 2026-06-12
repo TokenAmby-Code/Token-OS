@@ -295,8 +295,8 @@ class TestArchiveExtraction:
         ).fetchone()
         conn.close()
         assert row is not None
-        # instance identity preserved — NOT re-projected from legacy defaults
-        assert row["rank"] == "primarch"
+        # singleton rank reconciliation applies, while legacy defaults do not re-project origin/status
+        assert row["rank"] == "overseer"
         assert row["origin_type"] == "perpetual"
         assert row["status"] == "working"
         # annex backfilled from the legacy row

@@ -1,101 +1,140 @@
-; Antikater dial → smooth scroll with exponential acceleration
-; Dial mapped to F13 (up/right) and F14 (down/left) via Antikater software
-; Slow ticks = precise sub-line scroll. Fast swipe = exponential ramp.
+; Antikater dial → unified scroll curve + momentum coast
+; Dial rotation mapped to F13 (up/right) and F14 (down/left) via Antikater software.
+; twin: hammerspoon/init.lua — same algorithm + constants.
+;
+; THIS engine is the live one for BOTH surfaces: deskflow ignores the dial's
+; injected F13/F14 but forwards our injected wheel events, so when KVM focus is
+; on the Mac the Mac feels this curve too (the Hammerspoon twin is a dormant
+; fallback for if the dial ever talks to the Mac directly).
+;
+; One wheel event per dial tick, scaled by a multiplier that ramps while ticks
+; arrive faster than FAST_WINDOW_MS and resets to base on any slow tick.
+; Sustained turning (GLIDE_TICKS consecutive ticks faster than GLIDE_WINDOW_MS)
+; enters glide: a pulse timer keeps emitting decaying scroll between ticks and
+; after release, scaled by the current multiplier, until momentum runs out.
+; Brake: a reverse tick while ripping OR coasting is swallowed — freezes output
+; instead of scrolling backward. The next reverse tick, at rest, scrolls normally.
+;
+; Shared constants (keep in sync with twin):
+;   BASE_LINES=1  FAST_WINDOW_MS=120  ACCEL_RATE=1.2  ACCEL_MAX=12.0  BRAKE_WINDOW_MS=300
+;   COAST_DECAY=0.85  COAST_TICK_MS=30  GLIDE_WINDOW_MS=500  GLIDE_TICKS=2  RELEASE_MS=60
+;   MIN_INPUT_GAP_MS=3 is AHK-only (BT phantom guard); the deskflow path doesn't need it.
 
 ; Buffer rather than warn when dial spams (BT noise can fire F13/F14 while AFK)
 #MaxThreadsPerHotkey 2
 #MaxThreadsBuffer true
 
 ; ============== CONFIGURATION ==============
-DIAL_BASE_AMOUNT := 0.4              ; Scroll lines per tick at minimum speed
-DIAL_ACCEL_RATE := 1.15              ; Exponential multiplier per rapid input
-DIAL_ACCEL_MAX := 12.0               ; Cap on acceleration multiplier
-DIAL_ACCEL_DECAY := 0.88             ; Multiplier decay per tick (back to base)
-DIAL_ACCEL_WINDOW_MS := 120          ; Inputs faster than this increase accel
-DIAL_TICK_MS := 8                    ; Output timer interval
-DIAL_MIN_ACCUM := 0.05              ; Stop threshold for accumulator
+DIAL_BASE_LINES := 1                 ; Scroll lines for a single deliberate tick
+DIAL_FAST_WINDOW_MS := 120           ; Gaps below this ramp acceleration
+DIAL_ACCEL_RATE := 1.2               ; Multiplier growth per fast tick
+DIAL_ACCEL_MAX := 12.0               ; Cap on the multiplier
+DIAL_BRAKE_WINDOW_MS := 300          ; Reversal within this of last tick while ramped = brake
+DIAL_COAST_DECAY := 0.85             ; Multiplier decay per coast pulse
+DIAL_COAST_TICK_MS := 30             ; Coast pulse interval
+DIAL_GLIDE_WINDOW_MS := 500          ; Ticks faster than this (>2/sec) count toward glide
+DIAL_GLIDE_TICKS := 2                ; Consecutive fast ticks needed to enter glide
+DIAL_RELEASE_MS := 60                ; No tick for this long = dial released, coast may pulse
 DIAL_MIN_INPUT_GAP_MS := 3           ; Drop inputs faster than this (BT phantom guard)
+DIAL_DEBUG := false                  ; Log gap:lines per tick to dial-debug.log (tuning only)
 ; ===========================================
 
 ; State
-global dialAccum := 0.0
-global dialAccelMultiplier := 1.0
-global dialTimerRunning := false
-global dialLastInputTime := 0
+global dialLastTickMs := 0
 global dialLastDir := 0
+global dialMult := 1.0
+global dialRunLen := 0
+global dialCoastOn := false
+global dialDbgBuf := ""
 
 ; Wildcard (*) so the dial fires even while Ctrl/Shift/Alt/Win are held —
 ; a bare F13:: would be bypassed as a distinct Ctrl+F13 combo. Blind-mode
-; Send in DialInput then carries the held modifier into the wheel event.
-*F13::DialInput(1)
-*F14::DialInput(-1)
+; Send in DialTick then carries the held modifier into the wheel event,
+; so Ctrl+dial → Ctrl+scroll (zoom), etc.
+*F13::DialTick(1)
+*F14::DialTick(-1)
 
-DialInput(dir) {
-    global dialAccum, dialAccelMultiplier, dialTimerRunning, dialLastInputTime, dialLastDir
-    global DIAL_BASE_AMOUNT, DIAL_ACCEL_RATE, DIAL_ACCEL_MAX, DIAL_ACCEL_WINDOW_MS, DIAL_TICK_MS
-    global DIAL_MIN_INPUT_GAP_MS
+DialTick(dir) {
+    global dialLastTickMs, dialLastDir, dialMult, dialRunLen, dialCoastOn
+    global DIAL_BASE_LINES, DIAL_FAST_WINDOW_MS, DIAL_ACCEL_RATE, DIAL_ACCEL_MAX
+    global DIAL_BRAKE_WINDOW_MS, DIAL_GLIDE_WINDOW_MS, DIAL_GLIDE_TICKS, DIAL_COAST_TICK_MS
+    global DIAL_MIN_INPUT_GAP_MS, DIAL_DEBUG
 
     now := A_TickCount
-    timeSinceLast := now - dialLastInputTime
+    gap := now - dialLastTickMs
 
     ; Drop inputs faster than human-possible — guards against BT/HID phantom spam
-    if (timeSinceLast > 0 && timeSinceLast < DIAL_MIN_INPUT_GAP_MS)
+    if (gap > 0 && gap < DIAL_MIN_INPUT_GAP_MS)
         return
+    dialLastTickMs := now
 
-    dialLastInputTime := now
+    coasting := dialCoastOn
 
-    ; Direction change resets acceleration
     if (dir != dialLastDir && dialLastDir != 0) {
-        dialAccelMultiplier := 1.0
-        dialAccum := 0.0
+        wasMoving := coasting || (dialMult > 1.0 && gap < DIAL_BRAKE_WINDOW_MS)
+        DialCoastStop()
+        dialMult := 1.0
+        dialRunLen := 0
+        dialLastDir := dir
+        if (wasMoving)
+            return  ; BRAKE: swallow the stop-tick, scroll nothing
+        ; slow-gap reversal = deliberate turnaround → fall through, scroll at base
     }
     dialLastDir := dir
+    dialRunLen := (gap < DIAL_GLIDE_WINDOW_MS) ? dialRunLen + 1 : 1
 
-    ; Ramp acceleration if inputs arrive faster than the window
-    if (timeSinceLast < DIAL_ACCEL_WINDOW_MS && timeSinceLast > 0)
-        dialAccelMultiplier := Min(dialAccelMultiplier * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
-
-    ; Every input guarantees at least 1 scroll line immediately.
-    ; Blind mode keeps any held modifier down so Ctrl+dial → Ctrl+scroll (zoom), etc.
-    if (dir > 0)
-        Send("{Blind}{WheelUp}")
+    ; A same-direction tick during coast re-engages the flywheel: keep the
+    ; decayed multiplier and ramp from there instead of resetting to base.
+    if (gap < DIAL_FAST_WINDOW_MS || coasting)
+        dialMult := Min(dialMult * DIAL_ACCEL_RATE, DIAL_ACCEL_MAX)
     else
-        Send("{Blind}{WheelDown}")
+        dialMult := 1.0
 
-    ; Add surplus to accumulator for momentum (subtract the 1 we already sent)
-    surplus := (DIAL_BASE_AMOUNT * dialAccelMultiplier) - 1
-    if (surplus > 0)
-        dialAccum += dir * surplus
+    lines := Max(1, Round(DIAL_BASE_LINES * dialMult))
+    Send("{Blind}{Wheel" (dir > 0 ? "Up" : "Down") " " lines "}")
 
-    ; Start timer if we have accumulator debt to pay out
-    if (Abs(dialAccum) >= 1 && !dialTimerRunning) {
-        dialTimerRunning := true
-        SetTimer(DialScrollTick, DIAL_TICK_MS)
+    if (DIAL_DEBUG)
+        DialDebugLog(gap, lines)
+
+    if (dialRunLen >= DIAL_GLIDE_TICKS && !dialCoastOn) {
+        dialCoastOn := true
+        SetTimer(DialCoastPulse, DIAL_COAST_TICK_MS)
     }
 }
 
-DialScrollTick() {
-    global dialAccum, dialAccelMultiplier, dialTimerRunning
-    global DIAL_ACCEL_DECAY, DIAL_MIN_ACCUM
+; Coast pulse: while the dial is still actively ticking it no-ops; once released
+; it pays out decaying momentum until the multiplier runs dry.
+DialCoastPulse() {
+    global dialLastTickMs, dialLastDir, dialMult
+    global DIAL_BASE_LINES, DIAL_COAST_DECAY, DIAL_RELEASE_MS
 
-    ; Decay acceleration toward 1.0
-    dialAccelMultiplier := Max(1.0, dialAccelMultiplier * DIAL_ACCEL_DECAY)
-
-    ; Output accumulated scroll
-    if (dialAccum >= 1) {
-        outputAmount := Min(8, Max(1, Integer(dialAccum)))
-        dialAccum -= outputAmount
-        Send("{Blind}{WheelUp " outputAmount "}")
-    } else if (dialAccum <= -1) {
-        outputAmount := Min(8, Max(1, Integer(-dialAccum)))
-        dialAccum += outputAmount
-        Send("{Blind}{WheelDown " outputAmount "}")
+    if (A_TickCount - dialLastTickMs < DIAL_RELEASE_MS)
+        return
+    dialMult := dialMult * DIAL_COAST_DECAY
+    lines := Round(DIAL_BASE_LINES * dialMult)
+    if (lines < 1) {
+        DialCoastStop()
+        dialMult := 1.0
+        return
     }
+    Send("{Blind}{Wheel" (dialLastDir > 0 ? "Up" : "Down") " " lines "}")
+}
 
-    ; Stop when nothing left
-    if (dialAccum > -DIAL_MIN_ACCUM && dialAccum < DIAL_MIN_ACCUM && dialAccelMultiplier <= 1.0) {
-        dialAccum := 0.0
-        dialTimerRunning := false
-        SetTimer(DialScrollTick, 0)
+DialCoastStop() {
+    global dialCoastOn
+    if (dialCoastOn) {
+        dialCoastOn := false
+        SetTimer(DialCoastPulse, 0)
     }
+}
+
+; Tuning telemetry: buffers "gap:lines" per tick, flushes to dial-debug.log next
+; to the script only on a burst boundary so no file I/O happens mid-rip.
+DialDebugLog(gap, lines) {
+    global dialDbgBuf
+    if (gap > 1000 && dialDbgBuf != "") {
+        try FileAppend(dialDbgBuf, A_ScriptDir "\dial-debug.log")
+        dialDbgBuf := ""
+    }
+    dialDbgBuf .= gap ":" lines "`n"
 }

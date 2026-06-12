@@ -318,7 +318,6 @@ def _dock_secondary_personas_under_orchestrator(
     spec: StackPageSpec,
     orchestrator_w: int,
 ) -> None:
-    selected_before = _show(adapter, target, "#{pane_id}")
     personas = [
         pane
         for pane in _stack_panes(adapter, target)
@@ -331,6 +330,7 @@ def _dock_secondary_personas_under_orchestrator(
             continue
         adapter.run(
             "join-pane",
+            "-d",
             "-v",
             "-s",
             pane.pane_id,
@@ -348,8 +348,6 @@ def _dock_secondary_personas_under_orchestrator(
         adapter.run(
             "resize-pane", "-t", pane.pane_id, "-x", str(orchestrator_w), allow_failure=True
         )
-    if selected_before and not (spec.base == "mechanicus" and not _mechanicus_focus_allowed()):
-        adapter.run("select-pane", "-t", selected_before, allow_failure=True)
 
 
 def _tag_worker(

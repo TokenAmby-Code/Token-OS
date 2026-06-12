@@ -313,3 +313,63 @@ def resolve_instance(adapter: TmuxAdapter, instance_id: str) -> InstanceResoluti
         pane_id=pane_id,
         pane_role=role or None,
     )
+
+
+@dataclass(frozen=True)
+class FreePane:
+    """A clean, agent-free pane — a candidate for split-alias-style routing.
+
+    Derived purely from the live ``@PANE_CLEAN`` stamp (set by the shell's
+    ``clear`` wrapper, dropped on the first command or ^C). A pane is *free* when
+    it is stamped clean AND carries no live ``@INSTANCE_ID``. There is no stored
+    registry: the stamps are the single source of truth and this is a live view.
+    """
+
+    pane_id: str
+    pane_role: str | None
+    window_name: str
+
+
+def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
+    """Single global tmux scan → the clean, agent-free panes (the freelist).
+
+    Mirrors ``_instance_pane_index``: one ``list-panes -a -F`` reading the
+    clean stamp, the instance stamp, the cardinal role, and the window name. A
+    pane qualifies when ``@PANE_CLEAN == 1`` AND no live ``@INSTANCE_ID``. Order
+    follows tmux enumeration so the result is deterministic across calls.
+    """
+    raw = adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        "\t".join(
+            [
+                "#{pane_id}",
+                "#{@PANE_CLEAN}",
+                "#{@INSTANCE_ID}",
+                "#{@PANE_ID}",
+                "#{window_name}",
+            ]
+        ),
+        allow_failure=True,
+    )
+    free: list[FreePane] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        pane_id, clean, instance_id, pane_role, window_name = parts
+        if clean.strip() != "1":
+            continue
+        if instance_id.strip():
+            # A live agent owns this pane — never free, regardless of the stamp.
+            continue
+        role = canonical_pane_role(pane_role.strip()) if pane_role.strip() else ""
+        free.append(
+            FreePane(
+                pane_id=pane_id,
+                pane_role=role or None,
+                window_name=window_name.strip(),
+            )
+        )
+    return free

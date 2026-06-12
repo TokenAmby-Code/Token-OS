@@ -376,6 +376,61 @@ async def resolve_persona(db: aiosqlite.Connection, persona_id_or_slug: str) -> 
     return _row_to_dict(await cursor.fetchone())
 
 
+async def resolve_live_persona_instance(db: aiosqlite.Connection, slug: str) -> dict | None:
+    """Live singleton instance row for a persona, resolved by identity + rank.
+
+    Custodes (and later FG/Administratum) are THE persona by virtue of
+    ``personas.slug`` + a non-``retired`` ``instances.rank`` — never by sync mode.
+    ``synced``/``instance_type``/``golden_throne='sync'`` are runtime *modes*, not
+    identity (see ``instance_registry.golden_throne_binding``). Returns the
+    highest-rank, then most-recently-active non-retired, non-stopped/archived row
+    for the persona (rank is the primary sort so a correctly-stamped overseer wins
+    over a stale ``astartes`` row even if the latter is more recently active), or
+    ``None`` when no such instance is alive.
+
+    Note: the ``instances`` table normalizes ``processing``→``working`` (see
+    ``instance_registry.normalize_status``), so the active set is expressed as
+    "not stopped/archived" rather than an ``IN ('idle','processing')`` allowlist
+    that would never match a live row.
+
+    ``commander_type != 'chapter'`` isolates the singleton orchestrator from its
+    chapter children (subagents that share the persona_id) — the same definition
+    the singleton-guard and rank-stamp triggers use. Without it, a more-recently
+    active subagent would shadow the overseer (live archive.db had four custodes
+    chapter children under the overseer).
+
+    Does not depend on the caller's ``row_factory``: the fixed column list is
+    rebuilt by position so a plain tuple and an :class:`aiosqlite.Row` both work.
+    """
+    cursor = await db.execute(
+        """
+        SELECT i.id, i.device_id, i.status, i.rank
+        FROM instances i
+        JOIN personas p ON p.id = i.persona_id
+        WHERE p.slug = ?
+          AND i.rank != 'retired'
+          AND i.commander_type != 'chapter'
+          AND i.status NOT IN ('stopped', 'archived')
+        ORDER BY
+          CASE i.rank
+            WHEN 'primarch' THEN 3
+            WHEN 'overseer' THEN 2
+            WHEN 'astartes' THEN 1
+            ELSE 0
+          END DESC,
+          i.last_activity DESC,
+          i.created_at DESC,
+          i.id DESC
+        LIMIT 1
+        """,
+        (slug,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "device_id": row[1], "status": row[2], "rank": row[3]}
+
+
 async def persona_tint_for_instance(
     db: aiosqlite.Connection, instance_id: str | None, *, default: str = "default"
 ) -> str:

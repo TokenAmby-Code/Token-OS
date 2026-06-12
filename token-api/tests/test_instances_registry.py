@@ -348,6 +348,192 @@ def test_persona_commander_and_golden_throne_triggers(app_env):
     conn.close()
 
 
+def test_rank_stamp_trigger_overrides_astartes_clobber(app_env):
+    """A custodes row inserted at rank='astartes' (the mirror's column default) is
+    stamped back to its registry default_rank='overseer' by the AFTER INSERT trigger."""
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    _insert_instance(conn, id="clobbered", persona_id=custodes, rank="astartes")
+    row = conn.execute("SELECT rank FROM instances WHERE id = 'clobbered'").fetchone()
+    conn.close()
+    assert row["rank"] == "overseer"
+
+
+def test_rank_stamp_collapses_duplicate_custodes_to_one_overseer(app_env):
+    """Two custodes inserted at the astartes default collapse to exactly one
+    non-retired row at rank='overseer' (singleton guard + rank stamp together)."""
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    _insert_instance(conn, id="cust-a", persona_id=custodes, rank="astartes")
+    _insert_instance(conn, id="cust-b", persona_id=custodes, rank="astartes")
+    live = conn.execute(
+        "SELECT id, rank FROM instances WHERE persona_id = ? AND rank != 'retired'",
+        (custodes,),
+    ).fetchall()
+    conn.close()
+    assert [(r["id"], r["rank"]) for r in live] == [("cust-b", "overseer")]
+
+
+def test_mirror_upsert_clobber_is_restamped_to_overseer(app_env):
+    """The canonical mirror upserts with ON CONFLICT DO UPDATE SET rank=excluded.rank,
+    carrying the astartes default on every custodes mutation. The AFTER UPDATE stamp
+    must re-stamp the surviving row back to overseer."""
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    _insert_instance(conn, id="cust-live", persona_id=custodes, rank="overseer")
+    assert (
+        conn.execute("SELECT rank FROM instances WHERE id='cust-live'").fetchone()[0] == "overseer"
+    )
+
+    now = datetime.now().isoformat()
+    # Mimic mirror_instance_to_canonical's upsert clobbering rank back to 'astartes'.
+    conn.execute(
+        """INSERT INTO instances
+               (id, name, device_id, origin_type, commander_type, status,
+                created_at, last_activity, persona_id, rank, automated,
+                notification_mode, interaction_mode)
+           VALUES (?, 'cust', 'Mac-Mini', 'local', 'emperor', 'working',
+                   ?, ?, ?, 'astartes', 0, 'verbose', 'text')
+           ON CONFLICT(id) DO UPDATE SET rank = excluded.rank, status = excluded.status""",
+        ("cust-live", now, now, custodes),
+    )
+    row = conn.execute("SELECT rank, status FROM instances WHERE id='cust-live'").fetchone()
+    conn.close()
+    assert (row["rank"], row["status"]) == ("overseer", "working")
+
+
+def test_reconciliation_collapses_pretrigger_astartes_rows(app_env):
+    """Rows that predate the rank-stamp trigger (inserted during the trigger-less
+    bulk rebuild) are reconciled at init: the most-recently-active non-retired row
+    per non-astartes persona is stamped to its default_rank and the rest retire."""
+    import asyncio
+
+    import aiosqlite
+
+    import db_schema
+
+    async def run():
+        async with aiosqlite.connect(app_env.db_path) as db:
+            custodes = (
+                await (await db.execute("SELECT id FROM personas WHERE slug='custodes'")).fetchone()
+            )[0]
+            # Drop the collapse/stamp triggers to mimic the trigger-less rebuild path.
+            for trg in (
+                "trg_instances_stamp_persona_rank",
+                "trg_instances_stamp_persona_rank_update",
+                "trg_instances_singleton_guard",
+                "trg_instances_singleton_guard_update",
+            ):
+                await db.execute(f"DROP TRIGGER IF EXISTS {trg}")
+            for iid, ts in (
+                ("c-old", "2025-01-01T00:00:00"),
+                ("c-new", "2025-06-01T00:00:00"),
+                ("c-mid", "2025-03-01T00:00:00"),
+            ):
+                await db.execute(
+                    """INSERT INTO instances
+                           (id, name, device_id, origin_type, commander_type, status,
+                            created_at, last_activity, persona_id, rank, automated,
+                            notification_mode, interaction_mode)
+                       VALUES (?, 'cust', 'Mac-Mini', 'local', 'emperor', 'idle',
+                               ?, ?, ?, 'astartes', 0, 'verbose', 'text')""",
+                    (iid, ts, ts, custodes),
+                )
+            await db.commit()
+            # Re-running ensure recreates the triggers and runs the reconciliation UPDATE.
+            await db_schema._ensure_instances(db)
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            rows = [
+                dict(r)
+                for r in await (
+                    await db.execute(
+                        "SELECT id, rank FROM instances WHERE persona_id = ? AND rank != 'retired'",
+                        (custodes,),
+                    )
+                ).fetchall()
+            ]
+        return rows
+
+    rows = asyncio.run(run())
+    assert [(r["id"], r["rank"]) for r in rows] == [("c-new", "overseer")]
+
+
+def test_resolve_live_persona_instance_finds_synced_less_custodes(app_env):
+    """Regression: a Custodes row with NO sync marker (just persona=custodes +
+    rank=overseer) is still resolved by personas.resolve_live_persona_instance — and
+    a retired/stopped custodes is not."""
+    import asyncio
+
+    import aiosqlite
+
+    import personas
+
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    _insert_instance(conn, id="retired-cust", persona_id=custodes, rank="retired", status="stopped")
+    _insert_instance(conn, id="live-cust", persona_id=custodes, rank="overseer", status="working")
+    conn.commit()
+    conn.close()
+
+    async def run():
+        async with aiosqlite.connect(app_env.db_path) as db:
+            return await personas.resolve_live_persona_instance(db, "custodes")
+
+    resolved = asyncio.run(run())
+    assert resolved is not None
+    assert resolved["id"] == "live-cust"
+    assert resolved["rank"] == "overseer"
+    assert resolved["status"] == "working"
+
+
+def test_resolve_live_persona_instance_excludes_chapter_children(app_env):
+    """Regression: a custodes *chapter* child (subagent sharing the persona_id),
+    even one that is more recently active and stamped overseer, must NOT shadow the
+    overseer singleton. The resolver's ``commander_type != 'chapter'`` filter is the
+    objective-critical guard (live archive.db had four custodes chapter children
+    under the overseer)."""
+    import asyncio
+
+    import aiosqlite
+
+    import personas
+
+    conn = _conn(app_env.db_path)
+    custodes = _persona(conn, "custodes")
+    # The overseer singleton, active but with an OLDER last_activity.
+    _insert_instance(
+        conn,
+        id="live-cust",
+        persona_id=custodes,
+        rank="overseer",
+        status="working",
+        last_activity="2025-01-01T00:00:00",
+    )
+    # A chapter child commanded by the overseer, more recently active and even
+    # stamped overseer — it would win on both rank and recency if not excluded.
+    _insert_instance(
+        conn,
+        id="chapter-cust",
+        persona_id=custodes,
+        commander_type="chapter",
+        commander_id="live-cust",
+        rank="overseer",
+        status="working",
+        last_activity="2025-12-31T00:00:00",
+    )
+    conn.commit()
+    conn.close()
+
+    async def run():
+        async with aiosqlite.connect(app_env.db_path) as db:
+            return await personas.resolve_live_persona_instance(db, "custodes")
+
+    resolved = asyncio.run(run())
+    assert resolved is not None
+    assert resolved["id"] == "live-cust"
+
+
 def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
     import asyncio
     import sys

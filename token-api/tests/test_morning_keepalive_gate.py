@@ -1,9 +1,13 @@
 """Tests for the morning-keepalive gate and Custodes singleton-pane Discord routing.
 
-Part A — the Stop-hook keepalive is gated on an ACTIVE morning session, not on
-instance_type=='sync' alone:
-- sync + no/ended/expired morning session  → clean Stop, NO keepalive re-injection
-- sync + active in-bound morning session    → keepalive re-injected
+Part A — the Stop-hook keepalive is gated on **Custodes persona identity** + an
+ACTIVE morning session, NOT on instance_type=='sync'. Identity is resolved from
+the canonical instances/personas join, so a resting Custodes (instance_type !=
+'sync') still owns the keepalive while a morning is live:
+- custodes persona + no/ended/expired morning  → clean Stop, NO keepalive re-injection
+- custodes persona + active in-bound morning    → keepalive re-injected (even sans sync mode)
+- residual sync MODE (non-custodes) + active     → still keepalives (the OR-branch)
+- a non-custodes / non-sync instance             → never reaches the keepalive
 - 2h bound trips → auto-end (status="ended", ended_by="auto-2h-bound") + ONE notice
 - POST /api/morning/end durably writes status="ended" to the state file
 
@@ -32,20 +36,19 @@ class _FakeProc:
         return SimpleNamespace(decode=lambda *a, **k: "")
 
 
-def _insert_sync_instance(db_path, *, instance_type="sync", tmux_pane="%42", legion="custodes"):
-    sid = str(uuid.uuid4())
+def _insert_claude_row(conn, sid, *, instance_type, tmux_pane, legion, status="idle"):
     now = datetime.now().isoformat()
-    conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, instance_type, tmux_pane, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
         (
             sid,
             str(uuid.uuid4()),
             f"test-{sid[:8]}",
             "/tmp",
+            status,
             legion,
             instance_type,
             tmux_pane,
@@ -53,6 +56,46 @@ def _insert_sync_instance(db_path, *, instance_type="sync", tmux_pane="%42", leg
             now,
         ),
     )
+
+
+def _insert_custodes_instance(
+    db_path, *, instance_type="hook_driven", tmux_pane="%42", rank="overseer", status="idle"
+):
+    """A resting Custodes: canonical instances row (persona=custodes, rank=overseer)
+    plus a claude_instances row that carries NO sync mode by default. The keepalive
+    must fire on persona identity alone, so instance_type defaults to hook_driven."""
+    sid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(db_path)
+    _insert_claude_row(
+        conn,
+        sid,
+        instance_type=instance_type,
+        tmux_pane=tmux_pane,
+        legion="custodes",
+        status=status,
+    )
+    persona_id = conn.execute("SELECT id FROM personas WHERE slug = 'custodes'").fetchone()[0]
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, engine, working_dir, device_id, origin_type, commander_type,
+            status, created_at, last_activity, persona_id, rank, automated,
+            notification_mode, interaction_mode)
+           VALUES (?, ?, 'claude', '/tmp', 'Mac-Mini', 'local', 'emperor',
+                   ?, ?, ?, ?, ?, 0, 'verbose', 'text')""",
+        (sid, f"Custodes-{sid[:6]}", status, now, now, persona_id, rank),
+    )
+    conn.commit()
+    conn.close()
+    return sid
+
+
+def _insert_plain_instance(db_path, *, instance_type="sync", tmux_pane="%42", legion="mechanicus"):
+    """A claude_instances row with NO canonical custodes identity — used to exercise
+    the residual sync-MODE branch (non-custodes) and the non-custodes/non-sync case."""
+    sid = str(uuid.uuid4())
+    conn = sqlite3.connect(db_path)
+    _insert_claude_row(conn, sid, instance_type=instance_type, tmux_pane=tmux_pane, legion=legion)
     conn.commit()
     conn.close()
     return sid
@@ -78,10 +121,11 @@ def _write_morning_state(status="launched", *, started_at=None, today=None, extr
 # ── Part A: keepalive gate ───────────────────────────────────
 
 
-def test_sync_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
-    """A sync instance with NO morning session record → clean Stop, no re-injection."""
+def test_custodes_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
+    """A resting Custodes (persona identity, NO sync mode) with no morning record →
+    clean Stop, no re-injection. Identity alone reaches the gate; morning gates it."""
     hooks = sys.modules["routes.hooks"]
-    sid = _insert_sync_instance(app_env.db_path)
+    sid = _insert_custodes_instance(app_env.db_path)
 
     calls = []
 
@@ -99,10 +143,10 @@ def test_sync_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkeypatc
     assert calls == []  # no keepalive claude-cmd delivery
 
 
-def test_sync_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
-    """status='ended' → necessary `sync` is not sufficient; no keepalive."""
+def test_custodes_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
+    """status='ended' → custodes identity is necessary but not sufficient; no keepalive."""
     hooks = sys.modules["routes.hooks"]
-    sid = _insert_sync_instance(app_env.db_path)
+    sid = _insert_custodes_instance(app_env.db_path)
     _write_morning_state(status="ended")
 
     calls = []
@@ -118,10 +162,12 @@ def test_sync_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatch):
     assert calls == []
 
 
-def test_sync_active_morning_reinjects_keepalive(app_env, monkeypatch):
-    """A sync instance WITH an active, in-bound morning session DOES get the keepalive."""
+def test_custodes_active_morning_reinjects_keepalive_without_sync_mode(app_env, monkeypatch):
+    """THE key case: a Custodes resolved by PERSONA identity (instance_type='hook_driven',
+    NOT 'sync') WITH an active morning session still gets the keepalive — proving the
+    gate is persona+morning, not sync."""
     hooks = sys.modules["routes.hooks"]
-    sid = _insert_sync_instance(app_env.db_path)
+    sid = _insert_custodes_instance(app_env.db_path, instance_type="hook_driven")
     _write_morning_state(status="launched", started_at=datetime.now().isoformat())
 
     calls = []
@@ -140,12 +186,12 @@ def test_sync_active_morning_reinjects_keepalive(app_env, monkeypatch):
     assert "morning session is still active" in cmd[3]
 
 
-def test_sync_expired_morning_autoends_and_sends_one_notice(app_env, monkeypatch):
+def test_custodes_expired_morning_autoends_and_sends_one_notice(app_env, monkeypatch):
     """Past the 2h bound: auto-end (status='ended', ended_by='auto-2h-bound') + one notice."""
     hooks = sys.modules["routes.hooks"]
     import morning_session
 
-    sid = _insert_sync_instance(app_env.db_path)
+    sid = _insert_custodes_instance(app_env.db_path)
     old = (datetime.now() - timedelta(hours=3)).isoformat()
     _write_morning_state(status="launched", started_at=old)
 
@@ -173,10 +219,33 @@ def test_sync_expired_morning_autoends_and_sends_one_notice(app_env, monkeypatch
     assert state["ended_by"] == "auto-2h-bound"
 
 
-def test_non_sync_instance_never_reaches_keepalive(app_env, monkeypatch):
-    """Even with an active morning record, a one_off instance gets no keepalive."""
+def test_residual_sync_mode_instance_also_keepalives(app_env, monkeypatch):
+    """A non-custodes instance still in sync MODE (instance_type='sync', no canonical
+    custodes row) keeps the keepalive via the OR-branch — sync mode remains a valid,
+    if no-longer-primary, signal."""
     hooks = sys.modules["routes.hooks"]
-    sid = _insert_sync_instance(app_env.db_path, instance_type="one_off")
+    sid = _insert_plain_instance(app_env.db_path, instance_type="sync", legion="mechanicus")
+    _write_morning_state(status="launched", started_at=datetime.now().isoformat())
+
+    calls = []
+
+    async def fake_offloop(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeProc(0)
+
+    monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
+
+    result = asyncio.run(hooks.handle_stop({"session_id": sid}))
+    assert result["action"] == "stop_processed_sync"
+    assert len(calls) == 1
+    assert calls[0][0] == "claude-cmd"
+
+
+def test_non_custodes_non_sync_instance_never_reaches_keepalive(app_env, monkeypatch):
+    """Neither a custodes persona nor sync mode → even with an active morning record,
+    a plain one_off instance gets no keepalive."""
+    hooks = sys.modules["routes.hooks"]
+    sid = _insert_plain_instance(app_env.db_path, instance_type="one_off", legion="astartes")
     _write_morning_state(status="launched")
 
     calls = []

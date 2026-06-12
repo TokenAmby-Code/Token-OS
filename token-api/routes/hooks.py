@@ -340,10 +340,12 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
     CUSTODES_PANE_LABEL: {
         "legion": "custodes",
         "primarch": "custodes",
-        "instance_type": "sync",
-        # synced is NOT derived at registration: custodes now resolves via the
-        # legion:custodes pane marker, not synced (#67), so the correct startup
-        # default is synced=0. The morning session flips it to 1 while live.
+        # Custodes identity is persona + rank (resolve_live_persona_instance), not
+        # sync. The resting registration default matches FG/Admin (hook_driven);
+        # the morning session sets sync MODE (instance_type='sync', synced=1) only
+        # while a session is live, and clears it on /api/morning/end. Do NOT touch
+        # the legion:custodes pane marker — that is the pane source of truth.
+        "instance_type": "hook_driven",
         "synced": False,
     },
     MECHANICUS_FG_LABEL: {
@@ -2102,11 +2104,11 @@ async def handle_session_start(payload: dict) -> dict:
 
         # 4. Pane-occupant match (covers plan-mode context-clear: Claude Code emits
         # a fresh session_id but the underlying process keeps the same tmux pane).
-        # Without this, custodes rows lose their persona/golden_throne binding on
-        # plan-mode exit, breaking the state-hook dispatcher's
-        # `p.slug='custodes' AND golden_throne='sync'` predicate.
-        # The legacy pid column died with legacy instance table; the @INSTANCE_ID pane
-        # stamp (or the stored tmux_pane as pre-stamp fallback) carries identity.
+        # Without this, a custodes plan-mode exit spawns a duplicate row and the prior
+        # row's persona_id/rank identity is stranded — breaking the state-hook
+        # dispatcher's persona+rank resolution (resolve_live_persona_instance).
+        # Prefer tmuxctl's live @INSTANCE_ID pane stamp; fall back to stored tmux_pane
+        # only for rows created before stamps existed.
         if not supplant_id:
             payload_pid = payload.get("pid")
             if payload_pid and tmux_pane:
@@ -3581,6 +3583,20 @@ async def handle_stop(payload: dict) -> dict:
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (session_id,))
         instance = await cursor.fetchone()
 
+        # Is this session the live Custodes orchestrator by persona identity (NOT
+        # sync mode)? The morning keepalive is gated on Custodes identity + an active
+        # morning session, so resolve identity from the canonical instances/personas
+        # join rather than instance_type. A superseded (retired) custodes is excluded
+        # (it should stop cleanly, not keepalive), and so are custodes chapter
+        # children (subagents share the persona_id but are not the orchestrator).
+        cursor = await db.execute(
+            """SELECT 1 FROM instances i JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ? AND p.slug = 'custodes'
+                 AND i.rank != 'retired' AND i.commander_type != 'chapter'""",
+            (session_id,),
+        )
+        is_custodes_persona = await cursor.fetchone() is not None
+
     if not instance:
         return {"success": False, "action": "instance_not_found"}
 
@@ -3606,8 +3622,11 @@ async def handle_stop(payload: dict) -> dict:
     elif _gt_marker:
         instance_type = "golden_throne"
     else:
-        instance_type = "one_off"
-    is_sync_instance = instance_type == "sync"
+        instance_type = instance.get("instance_type", "one_off")
+    # The Custodes persona never auto-idles and owns the morning keepalive path,
+    # regardless of whether sync MODE is currently set. `sync` remains a valid
+    # mode signal, so the gate is "Custodes persona OR still in sync mode".
+    is_sync_instance = is_custodes_persona or instance_type == "sync"
     is_subagent_instance_quick = bool(instance.get("is_subagent"))
     has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
 
@@ -3813,20 +3832,26 @@ async def handle_stop(payload: dict) -> dict:
         )
         return result
 
-    if instance_type == "sync":
-        # Self-continuing morning session. The keepalive is gated on an ACTIVE
-        # morning session — NOT on instance_type alone. `sync` is NECESSARY (a
-        # non-sync instance never reaches here) but NOT SUFFICIENT: a correctly
-        # registered Custodes singleton stays `sync` for state-hook interventions,
-        # yet must stop looping once the morning session is ended (POST
-        # /api/morning/end) or past the Emperor's MORNING_MAX_DURATION_HOURS bound.
+    if is_sync_instance:
+        # Self-continuing morning session. The keepalive is gated on Custodes
+        # persona identity (or residual sync mode) AND an ACTIVE morning session —
+        # NOT on identity alone. Being the Custodes is NECESSARY (a normal instance
+        # never reaches here) but NOT SUFFICIENT: the resting Custodes singleton
+        # also reaches this branch, yet must stop cleanly once the morning session
+        # is ended (POST /api/morning/end) or past the Emperor's
+        # MORNING_MAX_DURATION_HOURS bound.
         from morning_session import MORNING_MAX_DURATION_HOURS, morning_session_active
 
         active, morning_reason = morning_session_active()
         await log_event(
             "hook_stop",
             instance_id=session_id,
-            details={"sync": True, "keepalive": active, "morning": morning_reason},
+            details={
+                "custodes_persona": is_custodes_persona,
+                "instance_type": instance_type,
+                "keepalive": active,
+                "morning": morning_reason,
+            },
         )
 
         # Resolve the pane once — needed for the keepalive OR the expiry notice.
@@ -4888,12 +4913,29 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
     if request.delivery not in {"prompt", "ephemeral"}:
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        # Resolve each distinct pane at most once per request. The plan-menu
+        # preplan subscribe sends target_pane == subscriber_pane == the same %id,
+        # and _resolve_instance_for_pane is the expensive leg (a tmux show-options
+        # subprocess + a SQLite lookup, plus list-panes -a for non-%id forms). The
+        # original double call paid that twice for one pane; memoizing on the
+        # normalized pane string collapses the common same-pane case to one
+        # resolution with byte-for-byte identical results.
+        _pane_cache: dict[str, dict | None] = {}
+
+        async def _resolve_pane_once(pane: str | None) -> dict | None:
+            key = _normalize_text(pane)
+            if not key:
+                return None
+            if key not in _pane_cache:
+                _pane_cache[key] = await _resolve_instance_for_pane(db, pane)
+            return _pane_cache[key]
+
         target = await _resolve_instance_by_id(db, request.target_instance_id)
         if not target or not target.get("id"):
-            target = await _resolve_instance_for_pane(db, request.target_pane)
+            target = await _resolve_pane_once(request.target_pane)
         subscriber = await _resolve_instance_by_id(db, request.subscriber_instance_id)
         if not subscriber or not subscriber.get("tmux_pane"):
-            subscriber = await _resolve_instance_for_pane(db, request.subscriber_pane)
+            subscriber = await _resolve_pane_once(request.subscriber_pane)
 
         target_id = (target or {}).get("id") or _normalize_text(request.target_instance_id)
         target_pane = (target or {}).get("tmux_pane") or _normalize_text(request.target_pane)

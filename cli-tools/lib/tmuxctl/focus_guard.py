@@ -5,15 +5,19 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .tmux_adapter import TmuxAdapter
 
-LOG_PATH = Path(os.environ.get("IMPERIUM_MECHANICUS_FOCUS_LOG", "/tmp/mechanicus-focus-guard.log"))
-GENERAL_LOG_PATH = Path(os.environ.get("IMPERIUM_TMUX_FOCUS_LOG", "/tmp/tmux-focus-guard.log"))
+_DEFAULT_MECHANICUS_LOG = "/tmp/mechanicus-focus-guard.log"
+_DEFAULT_GENERAL_LOG = "/tmp/tmux-focus-guard.log"
+# Kept for import compatibility; the logger resolves paths per call via
+# _log_paths() so test processes can redirect them after import.
+LOG_PATH = Path(os.environ.get("IMPERIUM_MECHANICUS_FOCUS_LOG", _DEFAULT_MECHANICUS_LOG))
+GENERAL_LOG_PATH = Path(os.environ.get("IMPERIUM_TMUX_FOCUS_LOG", _DEFAULT_GENERAL_LOG))
 ALLOW_UNTIL_OPTION = "@IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL"
 ALLOW_REASON_OPTION = "@IMPERIUM_ALLOW_MECHANICUS_FOCUS_REASON"
 HUMAN_FOCUS_CLIENT_OPTION = "@IMPERIUM_HUMAN_MECHANICUS_FOCUS_CLIENT"
@@ -27,6 +31,10 @@ RESTORE_ENV = "IMPERIUM_TMUX_FOCUS_RESTORE"
 class FocusSnapshot:
     window: str = ""
     pane: str = ""
+    # Zoom and client-activity ride along for restore fidelity but stay out of
+    # equality: "same focus" remains window+pane.
+    zoomed: bool = field(default=False, compare=False)
+    client_activity: str = field(default="", compare=False)
 
     @property
     def ok(self) -> bool:
@@ -37,8 +45,29 @@ def _clean_window_name(raw: str) -> str:
     return (raw or "").strip().split("(", 1)[0]
 
 
+def _log_paths() -> tuple[Path, Path]:
+    """Resolve log paths per call so tests can redirect them after import."""
+    return (
+        Path(os.environ.get("IMPERIUM_MECHANICUS_FOCUS_LOG", _DEFAULT_MECHANICUS_LOG)),
+        Path(os.environ.get("IMPERIUM_TMUX_FOCUS_LOG", _DEFAULT_GENERAL_LOG)),
+    )
+
+
+_LOG_ROLLOVER_BYTES = 5 * 1024 * 1024
+
+# Events about the mechanicus focus barrier itself (block/allow/bounce) land in
+# both logs; everything else (restores, human-focus markers) is general-only so
+# the mechanicus log stays a pure guard audit trail.
+_MECHANICUS_GUARD_EVENTS = frozenset({"wrapper-blocked", "allowed", "hook-bounced"})
+
+
 def _write_log(path: Path, payload: dict[str, object]) -> None:
     try:
+        try:
+            if path.stat().st_size > _LOG_ROLLOVER_BYTES:
+                path.rename(path.with_name(path.name + ".1"))
+        except OSError:
+            pass
         with path.open("a") as fh:
             fh.write(json.dumps(payload, sort_keys=True) + "\n")
     except Exception:
@@ -51,12 +80,33 @@ def _log(event: str, **fields: object) -> None:
         "event": event,
         **fields,
     }
-    _write_log(LOG_PATH, payload)
-    if GENERAL_LOG_PATH != LOG_PATH:
-        _write_log(GENERAL_LOG_PATH, payload)
+    mechanicus_path, general_path = _log_paths()
+    _write_log(general_path, payload)
+    if event in _MECHANICUS_GUARD_EVENTS and mechanicus_path != general_path:
+        _write_log(mechanicus_path, payload)
+
+
+_CAPTURE_FORMAT = (
+    "#{session_name}:#{window_index}\t#{pane_id}\t#{window_zoomed_flag}\t#{client_activity}"
+)
 
 
 def capture_focus(adapter: TmuxAdapter) -> FocusSnapshot:
+    raw = adapter.run(
+        "display-message",
+        "-p",
+        _CAPTURE_FORMAT,
+        allow_failure=True,
+    ).strip()
+    parts = raw.split("\t")
+    if len(parts) >= 2 and parts[0] and parts[1]:
+        return FocusSnapshot(
+            window=parts[0].strip(),
+            pane=parts[1].strip(),
+            zoomed=(parts[2].strip() == "1") if len(parts) > 2 else False,
+            client_activity=parts[3].strip() if len(parts) > 3 else "",
+        )
+    # Older test fakes often only understand the individual formats.
     raw = adapter.run(
         "display-message",
         "-p",
@@ -66,7 +116,6 @@ def capture_focus(adapter: TmuxAdapter) -> FocusSnapshot:
     if "\t" in raw:
         window, pane = raw.split("\t", 1)
         return FocusSnapshot(window=window.strip(), pane=pane.strip())
-    # Older test fakes often only understand the individual formats.
     window = adapter.run(
         "display-message", "-p", "#{session_name}:#{window_index}", allow_failure=True
     ).strip()
@@ -89,6 +138,19 @@ def _focus_exists(adapter: TmuxAdapter, snapshot: FocusSnapshot) -> bool:
     )
 
 
+def _human_acted_since(snapshot: FocusSnapshot, current: FocusSnapshot) -> bool:
+    """True when ``#{client_activity}`` advanced past the snapshot's value.
+
+    ``client_activity`` only moves on direct client input, never on automation
+    through ``run()``, so an advance means the human acted mid-operation and
+    owns the camera.
+    """
+    try:
+        return int(current.client_activity) > int(snapshot.client_activity)
+    except (TypeError, ValueError):
+        return False
+
+
 def restore_focus(
     adapter: TmuxAdapter,
     snapshot: FocusSnapshot,
@@ -105,7 +167,23 @@ def restore_focus(
     if not snapshot.ok:
         return False
     before_restore = capture_focus(adapter)
+    if _human_acted_since(snapshot, before_restore):
+        # Human-wins arbitration: the client registered input after the
+        # snapshot was taken, so the camera position is the human's choice now.
+        _log(
+            "restore-ceded",
+            action="ceded_to_human",
+            command_surface=source,
+            attempted_target=attempted_target,
+            previous_window=snapshot.window,
+            previous_pane=snapshot.pane,
+            final_window=before_restore.window,
+            final_pane=before_restore.pane,
+        )
+        return False
     if before_restore == snapshot:
+        if snapshot.zoomed and not before_restore.zoomed:
+            adapter.run("resize-pane", "-Z", "-t", snapshot.pane, allow_failure=True)
         return False
     if not _focus_exists(adapter, snapshot):
         _log(
@@ -124,13 +202,16 @@ def restore_focus(
     os.environ[RESTORE_ENV] = "1"
     try:
         adapter.run("select-window", "-t", snapshot.window, allow_failure=True)
-        adapter.run("select-pane", "-t", snapshot.pane, allow_failure=True)
+        # -Z keeps the destination window zoomed instead of collapsing it.
+        adapter.run("select-pane", "-Z", "-t", snapshot.pane, allow_failure=True)
+        final = capture_focus(adapter)
+        if final == snapshot and snapshot.zoomed and not final.zoomed:
+            adapter.run("resize-pane", "-Z", "-t", snapshot.pane, allow_failure=True)
     finally:
         if old_restore is None:
             os.environ.pop(RESTORE_ENV, None)
         else:
             os.environ[RESTORE_ENV] = old_restore
-    final = capture_focus(adapter)
     restored = final == snapshot
     _log(
         "restored" if restored else "restore-failed",
@@ -158,18 +239,31 @@ def preserve_focus(
     enabled: bool = True,
 ) -> Iterator[FocusSnapshot]:
     snapshot = capture_focus(adapter) if enabled else FocusSnapshot()
+    # Displacement-awareness: restore only if the wrapped operation itself
+    # moved the camera (the adapter counts camera-mutating commands). A focus
+    # change with no mutation recorded is the human navigating mid-op — never
+    # snap them back to a stale snapshot. Adapters without the counter (older
+    # test fakes) keep the unconditional-restore behavior.
+    mutations_before = getattr(adapter, "focus_mutation_count", None)
     try:
         yield snapshot
     finally:
         if enabled:
+            mutations_after = getattr(adapter, "focus_mutation_count", None)
+            displaced_by_op = (
+                mutations_before is None
+                or mutations_after is None
+                or mutations_after != mutations_before
+            )
             try:
-                restore_focus(
-                    adapter,
-                    snapshot,
-                    source=source,
-                    attempted_target=attempted_target,
-                    previous=snapshot,
-                )
+                if displaced_by_op:
+                    restore_focus(
+                        adapter,
+                        snapshot,
+                        source=source,
+                        attempted_target=attempted_target,
+                        previous=snapshot,
+                    )
             except Exception as exc:
                 # Focus restore is best-effort automation hygiene. It must never
                 # mask the real stack/dispatch failure (notably EMFILE from tmux
@@ -255,7 +349,13 @@ def allow_human_focus(
     marker is cleared.
     """
     client = client or current_client(adapter)
-    set_global_option(adapter, HUMAN_FOCUS_CLIENT_OPTION, client or "*")
+    marker = client or "*"
+    # Transition-only writes: per-keypress pane-select calls this on every
+    # navigation, so when the marker is already this client skip the two
+    # set-option writes and the log append (one read replaces them).
+    if show_global_option(adapter, HUMAN_FOCUS_CLIENT_OPTION) == marker:
+        return
+    set_global_option(adapter, HUMAN_FOCUS_CLIENT_OPTION, marker)
     set_global_option(adapter, HUMAN_FOCUS_REASON_OPTION, reason)
     _log(
         "human-focus-opened",

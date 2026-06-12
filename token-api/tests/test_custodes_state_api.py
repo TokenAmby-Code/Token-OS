@@ -104,7 +104,10 @@ def test_no_live_custodes_launches_replacement(client, monkeypatch):
     assert len(_events("custodes_intervention")) == 1
 
 
-def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
+def test_marker_resolves_visible_custodes_tmux_pane(client, monkeypatch):
+    """With no DB singleton to resolve, the tmux marker IS the pane source of truth:
+    the dispatcher injects straight into the marked pane (no DB-pane vs recovered-pane
+    distinction anymore), so the happy-path reason is the injector's own 'dispatched'."""
     injections = []
 
     async def fake_find():
@@ -120,13 +123,13 @@ def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
         }
 
     async def fake_launch(prompt):
-        raise AssertionError("should recover pane before launching")
+        raise AssertionError("should resolve the marked pane before launching")
 
     monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find)
     monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fake_inject)
     monkeypatch.setattr(main, "_launch_custodes_for_intervention", fake_launch)
 
-    # Enforcement hook recovers + injects into the live Custodes pane.
+    # Enforcement hook resolves the marked pane and injects into the live Custodes.
     resp = client.post(
         "/api/custodes/state-event",
         json={
@@ -139,8 +142,10 @@ def test_db_miss_recovers_visible_custodes_tmux_pane(client, monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["intervention_dispatched"] is True
-    assert data["reason"] == "recovered_tmux_pane"
+    assert data["reason"] == "dispatched"
     assert injections[0][1] == "%310"
+    # No DB singleton resolved → no instance_id stamp on the injection.
+    assert injections[0][2] is None
 
 
 def test_enforcement_dispatches_behavioral_prompt_once(client, monkeypatch):

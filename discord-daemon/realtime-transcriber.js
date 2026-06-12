@@ -103,12 +103,13 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
         const message = event.error?.message || JSON.stringify(event.error || event);
         const errorCode = event.error?.code || event.error?.type || 'realtime_error';
         if (isBenignFixerError(errorCode, message)) {
-          // The platform's 60-minute Realtime cap is a normal lifecycle event:
-          // cleanupSession deletes the session and the next audio frame recreates
-          // a fresh one. Logging this at info (not error) keeps it from paging the
-          // fixer for a self-healing event.
+          // Benign provider lifecycle events (the 60-minute Realtime cap, the
+          // empty-buffer commit response after a local 0ms cleanup race) are
+          // self-healing: cleanupSession deletes the session and the next audio
+          // frame recreates a fresh one. Logging at info (not error) keeps them
+          // from paging the fixer.
           logger.info(
-            `Realtime [${botName}]: session expired (60-min max) for user ${userId}; reconnecting on next audio`
+            `Realtime [${botName}]: benign lifecycle event for user ${userId} (${errorCode}: ${message}); reconnecting on next audio`
           );
           cleanupSession(session);
           return;

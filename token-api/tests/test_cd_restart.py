@@ -115,6 +115,11 @@ def test_merge_spawns_one_git_aware_token_restart(client, spawned):
     shell = restarts[0][-1]
     assert shell.rstrip().endswith("--sync")
     assert "TOKEN_RESTART_TARGET_SHA=deadbeef" in shell
+    # Regression (2026-06-11): `exec VAR=x cmd` makes bash exec a program literally
+    # named "VAR=x" — the assignment must precede exec (`VAR=x exec cmd`). Every
+    # post-cutover deploy silently no-op'd on this ordering.
+    assert "exec TOKEN_RESTART_TARGET_SHA" not in shell
+    assert "TOKEN_RESTART_TARGET_SHA=deadbeef exec " in shell
     # No per-service side-spawns anymore (no discord kickstart / push-mobile / curl).
     assert len(spawned) == 1
 

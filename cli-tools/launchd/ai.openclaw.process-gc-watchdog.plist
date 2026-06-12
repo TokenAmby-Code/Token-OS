@@ -42,13 +42,19 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin:/Users/tokenclaw/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin:/Users/tokenclaw/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>HOME</key>
 		<string>/Users/tokenclaw</string>
 		<key>GC_CPU_MIN</key>
 		<string>40</string>
 		<key>GC_ETIME_MIN</key>
 		<string>30</string>
+		<key>GC_NAS_PATH</key>
+		<string>/Volumes/Imperium</string>
+		<key>GC_NAS_ETIME_MIN</key>
+		<string>10</string>
+		<key>GC_ANCIENT_MIN</key>
+		<string>60</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>/Users/tokenclaw/.claude/process-gc-watchdog-stdout.log</string>

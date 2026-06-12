@@ -36,15 +36,17 @@ const TITLE_PREFIX = {
   custodes: 'CUST🔒',
 };
 
-// Cadia voice locks are active-pane locks, so the operator needs an unmistakable
-// visual target. This tint is owned only by the voice draft lock lifecycle: set
-// when the lock is born, cleared only after the lock is deleted. If a lock goes
-// stale, the tint intentionally stays stale with it.
-const CADIA_LOCK_STYLE = 'bg=#2b1645';
+// Cadia voice locks are active-pane locks. The operator-visible signal is the
+// tmux status bar reading these pane options (tmux-base.conf pane-border-format);
+// the lock deliberately owns no pane styling. @DISCORD_VOICE_LOCK is the source
+// of truth for ownership; @DISCORD_VOICE_PROCESSING is 1 only while transcript
+// text is actively being applied to the pane.
 const VOICE_LOCK_OPTION = '@DISCORD_VOICE_LOCK';
+const VOICE_PROCESSING_OPTION = '@DISCORD_VOICE_PROCESSING';
 const TMUX_RESOLVE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_RESOLVE_TIMEOUT_MS || 1500);
 const TMUX_WRITE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_WRITE_TIMEOUT_MS || 8000);
 const TMUX_COMMAND_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_COMMAND_TIMEOUT_MS || 3000);
+const TMUX_LIST_DELIMITER = '|';
 
 function execFileAsync(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -64,6 +66,23 @@ function tmuxEnv(extra = {}) {
   return {
     ...process.env,
     PATH: [CLI_DIR, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || ''].join(':'),
+    ...extra,
+  };
+}
+
+// Read-only tmux state lookups (pane existence, the static-target list-panes,
+// title reads) must resolve to the LOCAL tmux binary, never the NAS-hosted
+// cli-tools/bin/tmux guard wrapper. That wrapper lives on the SMB mount; when
+// the mount stalls, spawning it times out (spawnSync tmux ETIMEDOUT) and a live
+// voice transcript is silently dropped as "no target pane" — observed dropping
+// both a Custodes static-target route and a Cadia locked-pane route. The guard
+// wrapper exists for interactive typing/focus safety, which read lookups never
+// need, so prefer the local binary here. Writes keep tmuxEnv()'s wrapper path
+// (they rely on its TMUX_SEND_GATE_ALLOW handling).
+function tmuxReadEnv(extra = {}) {
+  return {
+    ...process.env,
+    PATH: ['/opt/homebrew/bin', '/usr/local/bin', CLI_DIR, process.env.PATH || ''].join(':'),
     ...extra,
   };
 }
@@ -115,7 +134,7 @@ function paneExists(pane, execSync = execFileSync) {
     const out = execSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     }).trim();
     return out === pane || out.startsWith('%');
   } catch {
@@ -151,17 +170,18 @@ export function resolveStaticVoiceTargetToPane(target, {
       'list-panes',
       '-a',
       '-F',
-      '#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{@PANE_ID}',
+      `#{session_name}${TMUX_LIST_DELIMITER}#{window_index}${TMUX_LIST_DELIMITER}` +
+      `#{pane_index}${TMUX_LIST_DELIMITER}#{pane_id}${TMUX_LIST_DELIMITER}#{@PANE_ID}`,
     ], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     });
     const marked = [];
     const fallback = [];
     for (const line of out.split(/\r?\n/)) {
       if (!line) continue;
-      const [sessionName, win, paneIndex, pane, paneMarker] = line.split('\t', 5);
+      const [sessionName, win, paneIndex, pane, paneMarker] = line.split(TMUX_LIST_DELIMITER, 5);
       if (sessionName !== 'main' || win !== spec.windowIndex || !pane?.startsWith('%')) continue;
       if (!paneExistsFn(pane)) continue;
       const index = Number.parseInt(paneIndex || '9999', 10);
@@ -233,7 +253,7 @@ function displayValue(target, format) {
     return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
+      env: tmuxReadEnv(),
     }).replace(/\n$/, '');
   } catch {
     return '';
@@ -251,15 +271,6 @@ async function setPaneTitle(target, title) {
   } catch {
     // title restore is cosmetic
   }
-}
-
-async function setPaneStyle(target, style) {
-  const pane = resolveTargetToPane(target);
-  if (!pane) throw new Error(`target not live: ${target}`);
-  await execFileAsync('tmux', ['select-pane', '-t', pane, '-P', style || 'bg=default'], {
-    timeout: TMUX_COMMAND_TIMEOUT_MS,
-    env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-style' }),
-  });
 }
 
 async function setPaneOption(target, option, value) {
@@ -315,7 +326,6 @@ export function createVoiceTranscriptRouter({
   resolveTargetToPane: resolvePane = resolveTargetToPane,
   displayValue: readDisplayValue = displayValue,
   setPaneTitle: writePaneTitle = setPaneTitle,
-  setPaneStyle: writePaneStyle = setPaneStyle,
   setPaneOption: writePaneOption = setPaneOption,
   typeIntoTarget: writeText = typeIntoTarget,
   sendKey: writeKey = sendKey,
@@ -338,31 +348,31 @@ export function createVoiceTranscriptRouter({
     if (state?.target && resolvePaneWithDiagnostics(state.target)) await writePaneTitle(state.target, state.title || '');
   }
 
+  async function setStateProcessing(state, processing) {
+    if (!state?.lockOverlay) return;
+    await writePaneOption(state.target, VOICE_PROCESSING_OPTION, processing ? '1' : '0');
+  }
+
   async function applyStateLockOverlay(state) {
     if (!state?.lockOverlay) return;
     await writePaneOption(state.target, VOICE_LOCK_OPTION, '1');
+    // Cosmetic init of the processing flag — best-effort, must not fail acquire.
     try {
-      await writePaneStyle(state.target, CADIA_LOCK_STYLE);
-    } catch (err) {
-      try {
-        await writePaneOption(state.target, VOICE_LOCK_OPTION, '0');
-      } catch {}
-      throw err;
-    }
+      await writePaneOption(state.target, VOICE_PROCESSING_OPTION, '0');
+    } catch {}
   }
 
   async function restoreStateLockOverlay(state) {
     if (!state?.lockOverlay) return;
     try {
-      await writePaneStyle(state.target, state.paneStyle || 'bg=default');
+      await writePaneOption(state.target, VOICE_PROCESSING_OPTION, '0');
     } catch {
-      // Cosmetic restore is best-effort. Ownership must still be cleared so a
-      // failed style restore cannot leave stale Cadia draft ownership behind.
+      // Best effort.
     }
     try {
       await writePaneOption(state.target, VOICE_LOCK_OPTION, '0');
     } catch {
-      // Best effort.
+      // Best effort. Ownership clearing must not depend on the processing write.
     }
   }
 
@@ -406,6 +416,24 @@ export function createVoiceTranscriptRouter({
       if (item) cleared.push(item);
     }
     return cleared;
+  }
+
+  async function appendDraftText(state, draftText) {
+    const segment = state.utterances ? ` ${draftText}` : draftText;
+    // Discord voice is explicit Emperor/user dictation into the locked pane.
+    // It pierces the universal recent-typing gate as direct input, while still
+    // being audited via TMUX_SEND_GATE_ALLOW.
+    // The processing flag is operator-visible status only — a flaky option
+    // write must never block transcript delivery, so both edges are best-effort.
+    try { await setStateProcessing(state, true); } catch {}
+    try {
+      await writeText(state.target, segment, { bypassGuard: true });
+    } finally {
+      // The text already landed (or the error is propagating); a failed
+      // processing-clear must not fail the route or strand the draft.
+      try { await setStateProcessing(state, false); } catch {}
+    }
+    state.utterances = (state.utterances || 0) + 1;
   }
 
   async function route(result) {
@@ -464,9 +492,7 @@ export function createVoiceTranscriptRouter({
 
     if (parsed.command === 'mute') {
       if (parsed.draftText && state) {
-        const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
-        await writeText(state.target, segment, { bypassGuard: true });
-        state.utterances = (state.utterances || 0) + 1;
+        await appendDraftText(state, parsed.draftText);
       }
       const muted = voiceManager?.muteMember
         ? await voiceManager.muteMember(key.userId, key.bot, 15_000).then(r => !!r?.muted).catch(() => false)
@@ -484,9 +510,7 @@ export function createVoiceTranscriptRouter({
     if (parsed.command === 'ship') {
       if (!state) return { routed: false, command: 'ship', reason: 'no_draft' };
       if (parsed.draftText) {
-        const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
-        await writeText(state.target, segment, { bypassGuard: true });
-        state.utterances = (state.utterances || 0) + 1;
+        await appendDraftText(state, parsed.draftText);
       }
       await writeKey(state.target, 'Enter');
       await clearDraft(key);
@@ -504,13 +528,11 @@ export function createVoiceTranscriptRouter({
         return { routed: false, reason: 'no_target' };
       }
       const oldTitle = readDisplayValue(target, '#{pane_title}');
-      const oldStyle = readDisplayValue(target, '#{pane_style}');
       const prefix = TITLE_PREFIX[key.bot] || `${key.bot.toUpperCase().slice(0, 4)}🔒`;
       if (!oldTitle.startsWith(prefix)) await writePaneTitle(target, `${prefix} ${oldTitle}`.trim());
       state = {
         target,
         title: oldTitle,
-        paneStyle: oldStyle,
         lockOverlay: key.bot === 'imperial_guard',
         createdAt: new Date().toISOString(),
         utterances: 0,
@@ -527,12 +549,8 @@ export function createVoiceTranscriptRouter({
       logger?.info?.(`Voice route [${key.bot}/${key.userId}]: locked ${target} (${pane})`);
     }
 
-    const segment = state.utterances ? ` ${parsed.draftText}` : parsed.draftText;
     try {
-      // Discord voice is explicit Emperor/user dictation into the locked pane.
-      // It pierces the universal recent-typing gate as direct input, while still
-      // being audited via TMUX_SEND_GATE_ALLOW.
-      await writeText(state.target, segment, { bypassGuard: true });
+      await appendDraftText(state, parsed.draftText);
     } catch (err) {
       if ((state.utterances || 0) === 0) {
         drafts.delete(key.value);
@@ -541,7 +559,6 @@ export function createVoiceTranscriptRouter({
       }
       throw err;
     }
-    state.utterances = (state.utterances || 0) + 1;
     return { routed: true, drafting: true, target: state.target, pane: resolvePaneWithDiagnostics(state.target) };
   }
 

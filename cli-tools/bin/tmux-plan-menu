@@ -110,18 +110,34 @@ preplan_leader() {
 # "claude") when detection is genuinely inconclusive, so preplan can fail closed.
 # plan/compact are universal slash commands and never consult this.
 _AGENT_FILE=""
-# Always return 0: under `set -e` a falsey final command in the EXIT trap (when
-# _AGENT_FILE is empty) would override the script's real exit status with 1.
-_cleanup() { [[ -n "$_AGENT_FILE" ]] && rm -f "$_AGENT_FILE"; return 0; }
-trap _cleanup EXIT
+_PRESTART_DONE=""
+_PRESTART_OK=1   # 0 once the pre-buffer is confirmed at prompt start (set by _await_prestart)
+# Blind page-key counts: 50 each clears a multi-page draft (proven). Env-tunable so
+# tests can shrink the gated-send volume (and a future "saucy" computed PgDn can
+# override the restore count). PgUp-at-top / End are idempotent, so 50 is a safe floor.
+PAGE_UPS="${TMUX_PLAN_MENU_PAGE_UPS:-50}"     # pre-buffer cursor->prompt start
+PAGE_DOWNS="${TMUX_PLAN_MENU_PAGE_DOWNS:-50}" # generic on-exit cursor->prompt end
+# Always return 0: under `set -e` a falsey final command in the EXIT trap (when a
+# temp path is empty) would override the script's real exit status with 1. On the
+# detached path the parent clears this trap (trap - EXIT) and the detached child
+# removes the temp files at the end of run_action — see the dispatch tail.
+_action_cleanup() {
+    [[ -n "$_AGENT_FILE" ]] && rm -f "$_AGENT_FILE"
+    [[ -n "$_PRESTART_DONE" ]] && rm -f "$_PRESTART_DONE"
+    return 0
+}
+trap _action_cleanup EXIT
 
 _start_agent_detect() {
     $DRY_RUN && return 0
     [[ "$(normalize_agent "$AGENT")" != auto ]] && return 0   # explicit override: no probe
     [[ -z "$PANE" ]] && return 0
     _AGENT_FILE=$(mktemp -t tmux-plan-menu-agent.XXXXXX 2>/dev/null) || { _AGENT_FILE=""; return 0; }
-    ( "${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto \
-        >"$_AGENT_FILE" 2>/dev/null || true ) &
+    # trap '' HUP so the probe survives popup teardown (display-popup -E SIGHUPs the
+    # popup pane's process group on close); </dev/null detaches stdin from the dying
+    # popup PTY. The detached action reads the result (sync-probe fallback if unset).
+    ( trap '' HUP; "${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto \
+        >"$_AGENT_FILE" 2>/dev/null || true ) </dev/null >/dev/null 2>&1 &
 }
 
 # Resolve the harness for preplan: prefer the async result (wait up to ~1s for
@@ -146,10 +162,24 @@ _detect_agent() {
 # plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
-    local body resp rc=0
+    local body resp rc=0 attempt
     body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
-    resp=$(curl -sf --max-time 2 -X POST "${API_URL}/api/hooks/subscribe" \
-        -H 'Content-Type: application/json' -d "$body") || rc=$?
+    # preplan is fail-closed: a timed-out subscribe skips the leader insert, so the
+    # whole pick no-ops (the codex live-test symptom). Give the (sometimes slow)
+    # endpoint real headroom (--max-time 8, was 2) and one retry on a transient
+    # curl failure — DNS/connect/timeout/TLS/recv (6/7/28/35/52/55/56) — before
+    # failing closed. A non-transient failure (e.g. HTTP 4xx via -f -> exit 22) is
+    # not retried; it will not improve on a second attempt.
+    for attempt in 1 2; do
+        rc=0
+        resp=$(curl -sf --max-time 8 -X POST "${API_URL}/api/hooks/subscribe" \
+            -H 'Content-Type: application/json' -d "$body") || rc=$?
+        (( rc == 0 )) && break
+        case "$rc" in
+            6|7|28|35|52|55|56) continue ;;  # transient: one retry
+            *) break ;;                      # non-transient: fail now
+        esac
+    done
     if (( rc != 0 )); then
         echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/hooks/subscribe failed (curl exit $rc)" >&2
         return "$rc"
@@ -176,7 +206,9 @@ set_planning_state() {
     [[ -z "$API_URL" ]] && return 0
     local body rc=0
     body="{\"tmux_pane\":$(json_escape "$PANE"),\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-menu\"}"
-    curl -sf --max-time 1 -X POST "${API_URL}/api/planning/state" \
+    # Advisory/non-blocking, but the same slow-endpoint window applies; give it a
+    # little slack (--max-time 3, was 1) so a transient stall does not log-noise.
+    curl -sf --max-time 3 -X POST "${API_URL}/api/planning/state" \
         -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
     if (( rc != 0 )); then
         echo "tmux-plan-menu: set_planning_state POST ${API_URL}/api/planning/state failed (curl exit $rc)" >&2
@@ -184,16 +216,162 @@ set_planning_state() {
     fi
 }
 
-# insert_at_prompt_start (via invoke-skill) drops the leader at the prompt START
-# and returns the cursor to the END without submitting — the operator keeps
-# typing and submits when ready. plan/compact force the claude leader so they
-# stay universal "/" commands (not codex "$") for both harnesses.
-invoke_skill() {
-    "${_script_dir}/tmuxctl" invoke-skill "$1" --pane "$PANE" --agent "$2"
+# --- decomposed cursor ops (real-tmux path; pierce env inherited) -----------
+# All three route through `tmuxctl` -> TmuxAdapter -> the real tmux binary with
+# the in-process send gate, NOT the gating `tmux` shim in the keystroke path (the
+# old tmux-plan-prefix freeze: a Python startup + gate eval per PgUp keystroke).
+# They run backgrounded / detached so even their modest latency never blocks the
+# popup. plan/compact insert the universal "/" leader (not codex "$").
+prebuffer_prompt_start() { "${_script_dir}/tmuxctl" prompt-start --pane "$PANE" --page-ups "$PAGE_UPS"; }
+insert_text()           { "${_script_dir}/tmuxctl" insert-text  --pane "$PANE" --text "$1"; }
+move_prompt_end()       { "${_script_dir}/tmuxctl" prompt-end   --pane "$PANE" --page-downs "$PAGE_DOWNS"; }
+
+# Pre-buffer the expensive, selection-independent 50x PgUp while the picker is
+# open (fzf-viewing time) — it directly helps preplan/plan/compact and is inert
+# for cancel/shift+tab (the on-exit prompt-end restores the cursor). Writes a
+# done-marker the detached action waits on so the insert never lands before the
+# cursor reaches the prompt start. HUP-immune so it completes even when the
+# operator picks fast and the popup tears down mid-move.
+_start_prebuffer() {
+    $DRY_RUN && return 0
+    [[ -z "$PANE" ]] && return 0
+    _PRESTART_DONE=$(mktemp -t tmux-plan-menu-prestart.XXXXXX 2>/dev/null) || { _PRESTART_DONE=""; return 0; }
+    # Write the done-marker ONLY when prompt-start actually reached the prompt
+    # start. A failed move must NOT signal "done" — otherwise an insert could
+    # land at the current cursor instead of prompt start. Capture tmuxctl's stderr
+    # and log a failed move (previously swallowed by `2>&1`, masking half of the
+    # cursor-op failures) so a missed prompt-start is diagnosable from the log.
+    ( trap '' HUP
+      local _ps_err
+      if _ps_err="$(prebuffer_prompt_start 2>&1)"; then
+          printf 'done' > "$_PRESTART_DONE"
+      else
+          log_failure "${SELECTION:-prebuffer}" "$(normalize_agent "$AGENT")" prompt-start "prebuffer rc=$? ${_ps_err}"
+      fi ) \
+        </dev/null >/dev/null 2>&1 &
 }
 
-# Kick off harness detection before the picker opens so it overlaps the choice.
+# Block (bounded ~1.5s) until the pre-buffer signals the cursor reached the
+# prompt start. Records the outcome in _PRESTART_OK (0=confirmed, 1=timeout/
+# failed/none) so inserts can self-position without re-waiting, and returns it.
+# Called once per run (drain point): even on a 1 the background pre-buffer has
+# exited (marker written, or 1.5s elapsed), so the on-exit prompt-end restore no
+# longer races a live PgUp. With no marker to wait on (dry-run / no pane) there
+# is nothing to position, so it reports confirmed.
+_await_prestart() {
+    [[ -z "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
+    local i
+    for i in $(seq 1 15); do
+        [[ -s "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
+        sleep 0.1
+    done
+    _PRESTART_OK=1
+    return 1
+}
+
+# Guarantee the cursor is at prompt start before an insert. Honors a confirmed
+# pre-buffer; on an unconfirmed one (failure/timeout, per _PRESTART_OK) runs
+# prompt-start synchronously. prompt-start is idempotent (PgUp-at-top is a
+# no-op), so this is safe even if the detached pre-buffer is still draining.
+# Relies on _await_prestart having already run (the run_action drain point).
+_ensure_at_prompt_start() {
+    (( _PRESTART_OK == 0 )) && return 0
+    # Capture tmuxctl's stderr and log a failed synchronous prompt-start instead of
+    # swallowing it — so a cursor op that still fails after batching leaves the real
+    # tmux error in the log, not just a silent missed move.
+    local _ps_err
+    if ! _ps_err="$(prebuffer_prompt_start 2>&1)"; then
+        log_failure "${SELECTION:-?}" "${agent:-?}" prompt-start "ensure rc=$? ${_ps_err}"
+    fi
+}
+
+# Post-mortem-grade failure log (log-only; NO notify/TTS — a missing /plan is the
+# self-evident signal). Lets an agent diagnose a failed detached action.
+#   log_failure <selection> <agent> <step> <detail...>
+log_failure() {
+    local selection="$1" agent="$2" step="$3"; shift 3
+    local detail="$*"
+    local logdir="${HOME}/.claude/logs"
+    mkdir -p "$logdir" 2>/dev/null || return 0
+    local ts
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+    printf '%s pane=%s selection=%s agent=%s step=%s detail=%s\n' \
+        "$ts" "${PANE:-?}" "$selection" "$agent" "$step" "${detail//$'\n'/ }" \
+        >> "${logdir}/tmux-plan-menu.log" 2>/dev/null || true
+    return 0
+}
+
+# The full selection-dependent action phase. Detached from the popup (see the
+# dispatch tail) so the popup vanishes the instant Enter is pressed; this runs on
+# after teardown. `set +e` makes failures log-and-continue so the generic cursor
+# restore always runs. move_prompt_end sits in a "finally" position — every path
+# (including cancel and shift+tab) restores the cursor and neutralizes the
+# speculative pre-buffer PgUp.
+run_action() {
+    set +e
+    _await_prestart
+
+    local agent rc text sub_err pe_err
+    agent="$(normalize_agent "$AGENT")"
+
+    case "$SELECTION" in
+        preplan)
+            if [[ "$agent" == auto ]]; then
+                agent="$(_detect_agent)"
+            fi
+            # Fail closed: a real preplan must resolve to a concrete harness.
+            # Inserting /preplan into a Codex pane (wrong leader) would mask the
+            # miss, so skip the insert and log. prompt-end still restores below.
+            if [[ "$agent" == auto ]]; then
+                log_failure preplan auto agent-unresolved "harness detection inconclusive for pane ${PANE:-?}"
+            else
+                # Arm the one-shot Stop handoff BEFORE inserting so it is in place
+                # by the time the operator submits the preplan turn. On failure,
+                # skip the insert (no armed subscription -> no /plan ever comes)
+                # and log — never insert a leader whose handoff did not arm.
+                sub_err="$(subscribe_preplan 2>&1)"; rc=$?
+                if (( rc != 0 )); then
+                    log_failure preplan "$agent" subscribe "rc=${rc} ${sub_err}"
+                else
+                    set_planning_state preplanning >/dev/null 2>&1   # advisory hint
+                    text="$(preplan_leader "$agent") "
+                    _ensure_at_prompt_start
+                    insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
+                fi
+            fi
+            ;;
+        plan)
+            set_planning_state planning >/dev/null 2>&1   # advisory; /plan is token-api-independent
+            _ensure_at_prompt_start
+            insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
+            ;;
+        compact)
+            _ensure_at_prompt_start
+            insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
+            ;;
+        shift+tab|shifttab)
+            tmux send-keys -t "$PANE" BTab || log_failure shift+tab "$agent" send-btab "tmux send-keys rc=$?"
+            ;;
+        cancel)
+            : ;;
+        *)
+            log_failure "${SELECTION:-?}" "$agent" unknown-selection "no handler for selection" ;;
+    esac
+
+    # --- generic cursor restore: runs on EVERY path (incl. cancel/shift+tab) ---
+    # Capture tmuxctl's stderr so a residual cursor-op failure carries the REAL tmux
+    # error into the log (the detached action's own stderr goes to /dev/null), not
+    # just an rc — the diagnostic safety net if batching does not fully fix rc=1.
+    sleep 0.05
+    pe_err="$(move_prompt_end 2>&1)" || log_failure "${SELECTION:-?}" "$agent" prompt-end "rc=$? ${pe_err}"
+
+    _action_cleanup
+}
+
+# Kick off harness detection and the speculative cursor pre-buffer before the
+# picker opens so both overlap the operator's choice.
 _start_agent_detect
+_start_prebuffer
 
 # Pick the action via fzf unless one was supplied (--selection, for tests/scripting).
 if [[ -z "$SELECTION" ]]; then
@@ -204,60 +382,43 @@ fi
 SELECTION="${SELECTION%%$'\t'*}"   # tolerate a tab-delimited label, keep the key
 [[ -z "$SELECTION" ]] && SELECTION=cancel
 
-# Resolve the harness only for preplan (its leader differs); skip network on dry-run.
-AGENT_RESOLVED="$(normalize_agent "$AGENT")"
-if [[ "$SELECTION" == "preplan" ]]; then
-    if [[ "$AGENT_RESOLVED" == "auto" ]]; then
-        if $DRY_RUN; then
-            AGENT_RESOLVED="claude"   # dry-run never inserts; default for tests/inspection
-        else
-            AGENT_RESOLVED="$(_detect_agent)"
-        fi
-    fi
-    # Fail closed: a real preplan must resolve to a concrete harness. Inserting
-    # /preplan into a Codex pane (wrong leader) would mask the detection miss, so
-    # abort and point at the explicit --agent override instead.
-    if [[ "$AGENT_RESOLVED" == "auto" ]]; then
-        echo "tmux-plan-menu: could not detect the harness for pane ${PANE:-?}; re-run with --agent claude|codex" >&2
-        exit 1
-    fi
+# --- DRY-RUN: synchronous, print + exit (inspection + tests depend on this) ---
+# preplan defaults an inconclusive harness to claude (dry-run never inserts), so
+# it never fails closed here. Real actions resolve the harness inside run_action.
+if $DRY_RUN; then
+    case "$SELECTION" in
+        preplan)
+            agent_dry="$(normalize_agent "$AGENT")"
+            [[ "$agent_dry" == auto ]] && agent_dry="claude"
+            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning\n' \
+                "$PANE" "$agent_dry" "$(preplan_leader "$agent_dry")"
+            ;;
+        plan)    printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE" ;;
+        compact) printf 'pane=%s selection=compact insert:/compact\n' "$PANE" ;;
+        shift+tab|shifttab) printf 'pane=%s selection=shift+tab send-keys:BTab\n' "$PANE" ;;
+        cancel)  printf 'pane=%s selection=cancel noop\n' "$PANE" ;;
+        *) echo "tmux-plan-menu: unknown selection: $SELECTION" >&2; exit 1 ;;
+    esac
+    exit 0
 fi
 
-case "$SELECTION" in
-    preplan)
-        if $DRY_RUN; then
-            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning\n' \
-                "$PANE" "$AGENT_RESOLVED" "$(preplan_leader "$AGENT_RESOLVED")"
-            exit 0
-        fi
-        # Arm the handoff before inserting so it is in place by the time the
-        # operator submits the preplan turn.
-        if ! subscribe_preplan; then
-            echo "tmux-plan-menu: aborting preplan — could not arm the plan auto-submit subscription" >&2
-            exit 1
-        fi
-        set_planning_state preplanning || true   # advisory hint; never block the insert
-        invoke_skill preplan "$AGENT_RESOLVED"
-        ;;
-    plan)
-        if $DRY_RUN; then printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE"; exit 0; fi
-        set_planning_state planning || true   # advisory hint; /plan is independent of token-api
-        invoke_skill plan claude
-        ;;
-    compact)
-        if $DRY_RUN; then printf 'pane=%s selection=compact insert:/compact\n' "$PANE"; exit 0; fi
-        invoke_skill compact claude
-        ;;
-    shift+tab|shifttab)
-        if $DRY_RUN; then printf 'pane=%s selection=shift+tab send-keys:BTab\n' "$PANE"; exit 0; fi
-        tmux send-keys -t "$PANE" BTab
-        ;;
-    cancel)
-        if $DRY_RUN; then printf 'pane=%s selection=cancel noop\n' "$PANE"; exit 0; fi
-        : # no-op
-        ;;
-    *)
-        echo "tmux-plan-menu: unknown selection: $SELECTION" >&2
-        exit 1
-        ;;
-esac
+# --- REAL ACTION -------------------------------------------------------------
+# Detach the selection-dependent action so the popup vanishes the instant Enter
+# is pressed (display-popup -E closes when THIS process exits — the action must
+# not run inside it). The detached child ignores the teardown SIGHUP (trap '' HUP)
+# and inherits the pierce env, so every send still pierces the typing guard. If
+# live testing on tmux 3.6a ever shows the child dying on teardown despite the
+# trap, fall back to `tmux run-shell -b` (server-hosted, immune to pane teardown).
+if [[ "${TMUX_PLAN_MENU_NO_DETACH:-}" == "1" ]]; then
+    # Synchronous: tests read the send recorder after the process returns; also a
+    # debug knob for diagnosing the action phase without the popup race.
+    run_action
+else
+    # Transfer temp-file cleanup to the child: clear the parent EXIT trap so the
+    # parent does not rm files the detached child still needs (it cleans up at the
+    # end of run_action).
+    trap - EXIT
+    ( trap '' HUP; run_action ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+fi
+exit 0
