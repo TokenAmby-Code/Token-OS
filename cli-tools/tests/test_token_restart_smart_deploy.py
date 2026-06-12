@@ -64,11 +64,18 @@ def _stub_env(
         p.write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> "{logfile}"\nexit 0\n')
         p.chmod(0o755)
 
-    # curl: log + emit a connected payload (discord health greps for it) + exit 0
-    # (token-api/WSL health checks only care about the exit code).
+    # curl: log + emit a connected payload (discord health greps for it) + exit 0.
+    # For token-restart's -w '%{http_code}' refresh path, emit a bare 200.
     curl = stub_bin / "curl"
     curl.write_text(
-        f'#!/usr/bin/env bash\necho "curl $*" >> "{logfile}"\necho \'{{"connected": true}}\'\nexit 0\n'
+        f"""#!/usr/bin/env bash
+echo "curl $*" >> "{logfile}"
+for arg in "$@"; do
+  if [[ "$arg" == *"%{{http_code}}"* ]]; then echo 200; exit 0; fi
+done
+echo '{{"connected": true}}'
+exit 0
+"""
     )
     curl.chmod(0o755)
 
@@ -138,6 +145,7 @@ esac
         "IMPERIUM_MACHINE": "mac",
         "CD_LIVE_CHECKOUT": str(repo),
         "TOKEN_OS_BARE_REPO": str(bare),
+        "TOKEN_SATELLITE_REFRESH_SECRET": "refresh-secret",
         "STUB_REPO": str(repo),
         "STUB_CHANGED_PATHS": changed_paths,
         "MERGE_FAIL_TIMES": str(fail_times),
@@ -193,14 +201,34 @@ def test_mobile_change_runs_push_mobile_only(tmp_path: Path) -> None:
     assert KICK_DISCORD not in calls
 
 
-def test_satellite_change_restarts_wsl_and_token_api(tmp_path: Path) -> None:
-    # token-api/token-satellite.py runs on WSL but is also a token-api *.py.
+def test_satellite_change_refreshes_wsl_only(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, "token-api/token-satellite.py")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
+    assert KICK_TOKENAPI not in calls
+    assert "/runtime/refresh" in calls
+    assert "/restart" not in calls
+    assert KICK_DISCORD not in calls
+
+
+def test_ahk_and_cli_changes_refresh_wsl_runtime(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "ahk/foo.ahk\ncli-tools/lib/nas-path.sh")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
+    assert "/runtime/refresh" in calls
+    assert KICK_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
+
+
+def test_token_api_lockfile_change_restarts_mac_and_refreshes_wsl(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/uv.lock")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
     assert KICK_TOKENAPI in calls
-    assert "/restart" in calls  # WSL satellite restart POST
+    assert "/runtime/refresh" in calls
     assert KICK_DISCORD not in calls
 
 
@@ -282,3 +310,24 @@ def test_dirty_runtime_checkout_aborts_without_restart(tmp_path: Path) -> None:
     calls = logfile.read_text()
     assert KICK_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
+
+
+def test_cd_bare_repo_config_is_distinct_from_worktree_bare_repo(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "README.md")
+    worktree_bare = tmp_path / "worktree-token-os.git"
+    cd_bare = tmp_path / "cd-token-os.git"
+    worktree_bare.mkdir()
+    cd_bare.mkdir()
+    conf = tmp_path / "Token-OS.conf"
+    conf.write_text(
+        f"BARE_REPO={worktree_bare}\n"
+        f"CD_BARE_REPO={cd_bare}\n"
+        f"RUNTIME_CHECKOUT={env['CD_LIVE_CHECKOUT']}\n",
+        encoding="utf-8",
+    )
+    env.pop("TOKEN_OS_BARE_REPO", None)
+    env["TOKEN_OS_WORKTREE_CONF"] = str(conf)
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    assert f"bare skeleton {cd_bare}" in proc.stdout
+    assert f"bare skeleton {worktree_bare}" not in proc.stdout

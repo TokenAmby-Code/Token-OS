@@ -36,7 +36,7 @@ from .session_doc_resolver import (
     resolve_doc_for_branch,
 )
 
-DEFAULT_REPO = "/Volumes/Imperium/runtimes/token-os/live"
+DEFAULT_REPO = str(Path.home() / "runtimes" / "Token-OS" / "live")
 DEFAULT_VAULT = "/Volumes/Imperium/Imperium-ENV"
 BUILDS_SUBDIR = "Terra/Journal/Builds"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")

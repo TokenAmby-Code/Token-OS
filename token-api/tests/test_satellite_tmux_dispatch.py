@@ -224,3 +224,86 @@ def test_tts_engine_synthesize_uses_text_file_transport(monkeypatch, tmp_path):
         }
     ]
     assert (tmp_path / "fixed-id.txt").read_text(encoding="utf-8") == message
+
+
+def test_ahk_scripts_dir_env_override_blocks_path_escape(monkeypatch, tmp_path):
+    ahk_dir = tmp_path / "ahk-cache"
+    ahk_dir.mkdir()
+    (ahk_dir / "ok.ahk").write_text("MsgBox 'ok'\n", encoding="utf-8")
+    outside = tmp_path / "evil.ahk"
+    outside.write_text("bad\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_OS_AHK_DIR", str(ahk_dir))
+
+    satellite = _load_satellite_module()
+    assert satellite.AHK_SCRIPTS_DIR == ahk_dir
+
+    import asyncio
+
+    req = satellite.AhkRequest(script="../evil.ahk")
+    try:
+        asyncio.run(satellite.execute_ahk(req))
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) in {403, 404}
+    else:
+        raise AssertionError("path escape unexpectedly allowed")
+
+
+def test_runtime_refresh_rejects_missing_and_bad_bearer(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKEN_SATELLITE_REFRESH_SECRET", "refresh-secret")
+    helper = tmp_path / "token-satellite-refresh"
+    helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    monkeypatch.setenv("TOKEN_SATELLITE_REFRESH_HELPER", str(helper))
+
+    satellite = _load_satellite_module()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(satellite.app)
+    body = {"sha": "abcdef1234567890", "changed_paths": []}
+    assert client.post("/runtime/refresh", json=body).status_code == 401
+    assert (
+        client.post(
+            "/runtime/refresh",
+            json=body,
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code
+        == 401
+    )
+
+
+def test_runtime_refresh_spawns_helper_with_sha_and_manifest(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKEN_SATELLITE_REFRESH_SECRET", "refresh-secret")
+    helper = tmp_path / "token-satellite-refresh"
+    helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    monkeypatch.setenv("TOKEN_SATELLITE_REFRESH_HELPER", str(helper))
+
+    satellite = _load_satellite_module()
+    spawned = []
+
+    class FakePopen:
+        def __init__(self, args, **kwargs):
+            spawned.append((args, kwargs))
+
+    monkeypatch.setattr(satellite.subprocess, "Popen", FakePopen)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(satellite.app)
+    resp = client.post(
+        "/runtime/refresh",
+        json={
+            "sha": "abcdef1234567890",
+            "changed_paths": ["ahk/foo.ahk", "cli-tools/lib/nas-path.sh"],
+        },
+        headers={"Authorization": "Bearer refresh-secret"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert spawned
+    args, kwargs = spawned[0]
+    assert args[0] == str(helper)
+    assert args[1] == "abcdef1234567890"
+    manifest = Path(args[2])
+    data = __import__("json").loads(manifest.read_text(encoding="utf-8"))
+    assert data["changed_paths"] == ["ahk/foo.ahk", "cli-tools/lib/nas-path.sh"]
+    assert kwargs["start_new_session"] is True

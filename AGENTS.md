@@ -1,9 +1,9 @@
 # Scripts - Generic Utility Scripts and Tools
 
-**Location**: `/Volumes/Imperium/runtimes/token-os/live/` (deploy-owned runtime checkout — read-only for agents)
+**Location**: `~/runtimes/Token-OS/live/` (deploy-owned runtime checkout — read-only for agents)
 **Purpose**: Generic utility scripts, tools, and services
 **Last Updated**: 2026-06-10
-**Status**: Protected-main/local-CD topology (2026-06-10). Main syncs ff-only via the bare skeleton `/Volumes/Imperium/token-os.git`; services run from the detached runtime checkout above. **All agent work happens in branch worktrees under `~/worktrees/Token-OS/wt-<branch>`** (use `worktree-setup <branch> --project Token-OS` or `dispatch --worktree <branch>`). Never edit the runtime checkout — a dirty runtime aborts deploys. The old working checkout (the pre-cutover `Token-OS` tree) is archived as `Token-OS.legacy-20260610`; do not resurrect or push from it.
+**Status**: Protected-main/local-CD topology (2026-06-10). Main syncs ff-only through the Mac-local CD bare cache `~/runtimes/Token-OS/token-os.git` (the NAS bare remains durable/worktree skeleton); services run from the detached runtime checkout above. **All agent work happens in branch worktrees under `~/worktrees/Token-OS/wt-<branch>`** (use `worktree-setup <branch> --project Token-OS` or `dispatch --worktree <branch>`). Never edit the runtime checkout — a dirty runtime aborts deploys. The old working checkout (the pre-cutover `Token-OS` tree) is archived as `Token-OS.legacy-20260610`; do not resurrect or push from it.
 
 ## Structure
 
@@ -21,7 +21,7 @@ Scripts/
 
 ### Token API (port 7777)
 
-**Location**: `/Volumes/Imperium/runtimes/token-os/live/token-api/`
+**Location**: `~/runtimes/Token-OS/live/token-api/`
 **Mac Service**: LaunchAgent `ai.openclaw.tokenapi`
 **WSL Satellite**: systemd `token-satellite.service` (enforcement, `/restart`)
 **Logs**: `~/.claude/token-api-stdout.log`, `~/.claude/token-api-stderr.log`
@@ -39,11 +39,11 @@ Scripts/
 - `token-restart --status`: All-device health check
 - `curl http://localhost:7777/health`: Health check
 
-**See**: `/Volumes/Imperium/runtimes/token-os/live/token-api/CLAUDE.md` for details
+**See**: `~/runtimes/Token-OS/live/token-api/CLAUDE.md` for details
 
 ### Discord Daemon (port 7779)
 
-**Location**: `/Volumes/Imperium/runtimes/token-os/live/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
+**Location**: `~/runtimes/Token-OS/live/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
 **Service**: LaunchAgent `ai.tokenclaw.discord` (KeepAlive)
 **Logs**: `~/.discord-cli/logs/` (also `launchd-stdout.log` for console output)
 
@@ -79,7 +79,7 @@ Standalone Discord WebSocket daemon (discord.js v14) replacing OpenClaw's Discor
 ## Verification After Move
 
 **Completed 2026-02-15**:
-- [x] Scripts exist at /Volumes/Imperium/runtimes/token-os/live
+- [x] Scripts exist at ~/runtimes/Token-OS/live
 - [x] Executable permissions preserved
 - [x] Token API running from new location (port 7777)
 - [x] Cron jobs updated with new paths
@@ -106,7 +106,7 @@ Agents can:
 ### Executor Fleet Deployment
 
 ```bash
-/Volumes/Imperium/runtimes/token-os/live/Shell/deploy-executor-fleet.sh
+~/runtimes/Token-OS/live/Shell/deploy-executor-fleet.sh
 ```
 
 Deploys 6 executors:
@@ -121,13 +121,13 @@ Deploys 6 executors:
 
 ```bash
 # Create snapshot before risky operation
-/Volumes/Imperium/runtimes/token-os/live/Shell/safety-snapshot.sh pre-deployment
+~/runtimes/Token-OS/live/Shell/safety-snapshot.sh pre-deployment
 
 # Rollback if something breaks
-/Volumes/Imperium/runtimes/token-os/live/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
+~/runtimes/Token-OS/live/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
 
 # Check safety status
-/Volumes/Imperium/runtimes/token-os/live/Shell/safety-dashboard.sh
+~/runtimes/Token-OS/live/Shell/safety-dashboard.sh
 ```
 
 ---

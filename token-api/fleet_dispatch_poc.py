@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 BASE = "http://localhost:7777"
 LOG_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md"
@@ -16,19 +17,20 @@ FLEET_REPORT_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Fleet/fleet_status.md"
 N = 10
 DAILY_BUDGET_USD = 2.00
 GUARDSMAN_BIN = (
-    os.environ.get("CLI_TOOLS", "/mnt/imperium/runtimes/token-os/live/cli-tools") + "/bin/guardsman"
+    os.environ.get("CLI_TOOLS", str(Path.home() / "runtimes" / "Token-OS" / "live" / "cli-tools"))
+    + "/bin/guardsman"
 )
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
     (
-        "ls /mnt/imperium/runtimes/token-os/live/token-api/ | fleet_dispatch_poc.py is listed",
+        "ls ~/runtimes/Token-OS/live/token-api/ | fleet_dispatch_poc.py is listed",
         "fallback",
     ),
     ("curl -s localhost:7777/health | response contains a status field", "fallback"),
     ("date | output contains a valid year between 2020 and 2030", "fallback"),
     (
-        "head -3 /mnt/imperium/runtimes/token-os/live/token-api/CLAUDE.md | first lines describe Token-API or port 7777",
+        "head -3 ~/runtimes/Token-OS/live/token-api/CLAUDE.md | first lines describe Token-API or port 7777",
         "fallback",
     ),
 ]
