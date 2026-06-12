@@ -94,7 +94,12 @@ from pane_surface import (
 from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
-from personas import assign_astartes_persona, persona_to_profile, resolve_persona
+from personas import (
+    assign_astartes_persona,
+    persona_to_profile,
+    resolve_live_persona_instance,
+    resolve_persona,
+)
 from phone_service import (
     _send_to_phone,
     load_zap_count_from_daily_note,
@@ -8373,8 +8378,9 @@ async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -
             return canceled
 
     launch_prompt = (
-        "Custodes state hook fired while no live synced Custodes singleton was registered. "
-        "Register yourself as legion=custodes, instance_type=sync, synced=true, then handle this intervention.\n\n"
+        "Custodes state hook fired while no live Custodes singleton was registered. "
+        "Identity is owned by the harness from the legion:custodes pane (persona + rank) — "
+        "do not self-PATCH sync/instance_type. Handle this intervention.\n\n"
         f"{prompt}"
     )
 
@@ -8438,119 +8444,72 @@ async def _launch_custodes_for_intervention_maybe_cancel(
 
 
 async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> dict:
-    """Inject into Custodes, recovering or launching the singleton if needed."""
+    """Inject into Custodes, recovering or launching the singleton if needed.
+
+    Identity is resolved by **persona + rank** on the canonical ``instances``
+    table (``resolve_live_persona_instance``), never by sync mode. The live pane
+    is the authoritative ``@PANE_ID=legion:custodes`` tmux marker
+    (``_find_custodes_tmux_pane``) — the resolved DB row contributes only the
+    ``instance_id`` stamp, and only when the singleton is local. When no marked
+    pane exists we launch a fresh Custodes; a stale/occupied pane re-resolves the
+    marker once and retries, else launches a replacement.
+    """
     if cancel_check:
         canceled = await cancel_check("pre_dispatch_lookup")
         if canceled:
             return canceled
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id
-               FROM claude_instances
-               WHERE legion = 'custodes'
-                 AND synced = 1
-                 AND status IN ('idle', 'processing')
-               ORDER BY last_activity DESC
-               LIMIT 1"""
-        )
-        row = await cursor.fetchone()
+        row = await resolve_live_persona_instance(db, "custodes")
 
-    if not row:
-        recovered_pane = await _find_custodes_tmux_pane()
-        if recovered_pane:
-            logger.warning(
-                f"Custodes state hook: DB singleton missing; recovered Custodes pane={recovered_pane}"
-            )
-            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
-                prompt,
-                recovered_pane,
-                cancel_check=cancel_check,
-            )
-            if delivery.get("dispatched"):
-                delivery["reason"] = "recovered_tmux_pane"
-            return delivery
-        logger.warning("Custodes state hook: no live singleton found; launching new Custodes")
-        return await _launch_custodes_for_intervention_maybe_cancel(
-            prompt,
-            cancel_check=cancel_check,
-        )
-
-    instance = dict(row)
-    tmux_pane = instance.get("tmux_pane")
+    # The tmux marker is the pane source of truth — instances carries no pane.
+    tmux_pane = await _find_custodes_tmux_pane()
     if not tmux_pane:
-        recovered_pane = await _find_custodes_tmux_pane()
-        if recovered_pane:
-            logger.warning(
-                f"Custodes state hook: DB singleton has no pane; recovered pane={recovered_pane}"
-            )
-            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
-                prompt,
-                recovered_pane,
-                instance_id=instance["id"],
-                cancel_check=cancel_check,
-            )
-            if delivery.get("dispatched"):
-                delivery["reason"] = "recovered_tmux_pane"
-            return delivery
-        logger.warning(
-            f"Custodes state hook: {instance['id'][:12]} has no pane; launching replacement"
-        )
+        logger.warning("Custodes state hook: no live custodes pane found; launching new Custodes")
         return await _launch_custodes_for_intervention_maybe_cancel(
             prompt,
             cancel_check=cancel_check,
         )
 
-    device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
-    if device_id != LOCAL_DEVICE_NAME:
-        recovered_pane = await _find_custodes_tmux_pane()
-        if recovered_pane:
-            logger.warning(
-                f"Custodes state hook: DB singleton remote ({device_id}); recovered local pane={recovered_pane}"
-            )
-            delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
-                prompt,
-                recovered_pane,
-                instance_id=instance["id"],
-                cancel_check=cancel_check,
-            )
-            if delivery.get("dispatched"):
-                delivery["reason"] = "recovered_tmux_pane"
-            return delivery
-        logger.warning(
-            f"Custodes state hook: synced singleton remote ({device_id}); launching local replacement"
-        )
-        return await _launch_custodes_for_intervention_maybe_cancel(
-            prompt,
-            cancel_check=cancel_check,
-        )
+    # Only stamp the resolved id when the singleton is local; a remote-owned row
+    # must not claim the local pane's mutation.
+    instance_id = None
+    if row and row.get("device_id") == LOCAL_DEVICE_NAME:
+        instance_id = row.get("id")
 
     delivery = await _inject_custodes_prompt_to_pane_maybe_cancel(
         prompt,
         tmux_pane,
-        instance_id=instance["id"],
+        instance_id=instance_id,
         cancel_check=cancel_check,
     )
-    # L4: the DB pane was stale/occupied (rc=73 occupied, no live instance).
-    # Re-resolve the live Custodes pane from the tmux marker and retry once,
-    # rather than failing. A gated delivery is NOT stale — it bubbles up so the
-    # router can hold-and-queue it (L2).
+    # L4: the marked pane was stale/occupied (rc=73 occupied, no live instance).
+    # Re-resolve the live Custodes pane from the marker and retry once; if the
+    # marker yields nothing new, launch a replacement rather than failing. A gated
+    # delivery is NOT stale — it bubbles up so the router can hold-and-queue (L2).
     if delivery.get("stale_pane") and not delivery.get("canceled"):
         recovered_pane = await _find_custodes_tmux_pane()
         if recovered_pane and recovered_pane != tmux_pane:
             logger.warning(
-                f"Custodes state hook: DB pane {tmux_pane} stale/occupied; "
+                f"Custodes state hook: pane {tmux_pane} stale/occupied; "
                 f"re-resolved live pane={recovered_pane}"
             )
             retry = await _inject_custodes_prompt_to_pane_maybe_cancel(
                 prompt,
                 recovered_pane,
-                instance_id=instance["id"],
+                instance_id=instance_id,
                 cancel_check=cancel_check,
             )
             if retry.get("dispatched"):
                 retry["reason"] = "recovered_tmux_pane"
             return retry
+        logger.warning(
+            f"Custodes state hook: pane {tmux_pane} stale and marker yields no fresh pane; "
+            "launching replacement"
+        )
+        return await _launch_custodes_for_intervention_maybe_cancel(
+            prompt,
+            cancel_check=cancel_check,
+        )
     return delivery
 
 
@@ -9587,11 +9546,33 @@ async def set_instance_discord(instance_id: str, request: Request):
 
 @app.get("/api/legion/{legion}/synced-session")
 async def get_synced_session(legion: str):
-    """Lookup the active synced session for a legion."""
+    """Lookup the active session for a legion.
+
+    Custodes is resolved by **persona identity + rank** on the canonical
+    ``instances`` table — its singleton is no longer found by sync mode. Other
+    legions (Mechanicus) keep the legacy ``claude_instances.synced`` lookup until
+    the later exterminatus cutover.
+    """
     if legion not in ALLOWED_LEGIONS:
         raise HTTPException(
             status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}"
         )
+
+    if legion == "custodes":
+        async with aiosqlite.connect(DB_PATH) as db:
+            row = await resolve_live_persona_instance(db, "custodes")
+        if not row:
+            return {"legion": legion, "synced_session": None}
+        return {
+            "legion": legion,
+            "synced_session": {
+                "id": row.get("id"),
+                "device_id": row.get("device_id"),
+                "status": row.get("status"),
+                "rank": row.get("rank"),
+                "legion": legion,
+            },
+        }
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
