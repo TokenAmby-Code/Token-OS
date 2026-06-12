@@ -112,7 +112,7 @@ Smart-deploy flow (default):
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
          token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
          discord-daemon/**                          → Discord daemon (launchd)
-         WSL runtime paths (satellite/AHK/cli-tools) → WSL /runtime/refresh
+         WSL runtime paths (satellite/AHK/cli-tools/refresh helper) → WSL /runtime/refresh
          mobile/**                                    → push-mobile -a (phone)
     2. If the pull was a no-op (already current) or --no-sync: full restart of
        the standard set (Mac token-api → Discord → WSL), preserving the human
@@ -806,7 +806,7 @@ map_changed_to_services() {
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         case "$path" in
-            token-api/token-satellite.py | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
+            token-api/token-satellite.py | token-api/scripts/token-satellite-refresh | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
                 # WSL-hosted runtime dependencies. Push the target SHA into the
                 # WSL-local runtime/AHK cache instead of merely restarting NAS code.
                 RESTART_WSL=true

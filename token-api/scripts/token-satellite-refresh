@@ -20,6 +20,7 @@ live="${TOKEN_OS_RUNTIME_CHECKOUT:-$base/live}"
 git_url="${TOKEN_OS_GIT_URL:-git@github.com:TokenAmby-Code/Token-OS.git}"
 venv="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/venvs/token-api}"
 ahk_cache="${TOKEN_OS_AHK_DIR:-/mnt/c/TokenOS/ahk}"
+helper_install="${TOKEN_SATELLITE_REFRESH_HELPER_INSTALL:-$HOME/.local/bin/token-satellite-refresh}"
 lock_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
 lock_file="$lock_dir/token-satellite-refresh.lock"
 
@@ -38,9 +39,12 @@ if [[ "$(git --git-dir="$bare" rev-parse --is-bare-repository 2>/dev/null)" != "
   exit 66
 fi
 
-git --git-dir="$bare" fetch origin main --tags
+# Update an actual bare ref, not just FETCH_HEAD.  The live checkout below
+# fetches from this local bare cache by ref; leaving the target commit only in
+# the bare repo's FETCH_HEAD makes fresh merge commits invisible to `checkout`.
+git --git-dir="$bare" fetch --tags origin '+refs/heads/main:refs/heads/main'
 if ! git --git-dir="$bare" cat-file -e "$sha^{commit}" 2>/dev/null; then
-  git --git-dir="$bare" fetch origin "$sha" || true
+  git --git-dir="$bare" fetch origin "$sha:refs/runtime-refresh/$sha" || true
 fi
 git --git-dir="$bare" cat-file -e "$sha^{commit}"
 
@@ -58,8 +62,20 @@ if [[ -n "$(git -C "$live" status --porcelain 2>/dev/null)" ]]; then
   exit 68
 fi
 
-git -C "$live" fetch "$bare" '+refs/heads/*:refs/remotes/local-bare/*'
+git -C "$live" fetch "$bare" '+refs/heads/*:refs/remotes/local-bare/*' '+refs/runtime-refresh/*:refs/remotes/runtime-refresh/*'
+if ! git -C "$live" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  git -C "$live" fetch "$bare" "$sha"
+fi
+git -C "$live" cat-file -e "$sha^{commit}"
 git -C "$live" checkout --detach "$sha"
+
+repo_helper="$live/token-api/scripts/token-satellite-refresh"
+if [[ -f "$repo_helper" && "$helper_install" != "$repo_helper" ]]; then
+  echo "installing refreshed helper: $helper_install"
+  mkdir -p "$(dirname "$helper_install")"
+  cp "$repo_helper" "$helper_install"
+  chmod +x "$helper_install"
+fi
 
 changed_paths=$(
   python3 - "$manifest" <<'PY'
