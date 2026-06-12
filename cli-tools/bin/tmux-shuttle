@@ -133,57 +133,51 @@ fi
 
 # --- DEMOTE: palace/somnium → legion stack ---
 demote() {
-    # Remember the slot tag and working directory before we swap.
+    # Remember the slot identity + working directory before the pane moves.
     local slot_tag="$current_tag"
-    local wdir
+    local wdir src_window src_target
     wdir=$(tmux display-message -t "$current_pane" -p '#{pane_current_path}')
+    # Resolve the live source window so we can refill the vacated slot after the
+    # pane is joined out into the legion stack. window_id (@N) is stable across
+    # the join; session:index is what normalize --window expects.
+    src_window=$(tmux display-message -t "$current_pane" -p '#{window_id}')
+    src_target=$(tmux display-message -t "$current_pane" -p '#{session_name}:#{window_index}')
 
-    # Allocate a real managed stack worker first, then swap the live pane into
-    # that stack slot. Raw `move-pane -t main:legion` can target the orchestrator
-    # side of the stack and clobber the Custodes pane. `tmuxctl stack add`
-    # centralizes split geometry, worker tagging, pending flags, and spillover.
-    local stack_pane stack_tag
-    stack_pane=$(PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack add legion \
+    # Adopt the LIVE pane into the legion stack through the unified allocator —
+    # the same path every other worker takes. `stack adopt` join-panes the pane
+    # in (preserving its pane id + running claude process), ensures the legion
+    # window + Custodes orchestrator exist, tags it as a stack worker, assigns
+    # the lowest free ordinal, and runs enforce. No bespoke stack surgery here.
+    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli stack adopt legion \
+            --pane "$current_pane" \
             --session "$SESSION" \
             --cwd "${wdir:-$HOME}" \
-            --no-focus)
-    [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate legion stack pane"; return 1; }
-    stack_tag=$(pane_id_of "$stack_pane")
+            --no-focus \
+        || { tmux display-message "Shuttle: failed to adopt pane into legion stack"; return 1; }
+
+    # Refill the vacated palace/somnium slot with a fresh shell so the source
+    # grid never collapses to zero panes. `pane_tag` restores the slot identity
+    # and derives the correct @GRID_STATE (side for W/E, small for the center
+    # grid incl. N/S/NE/SE) so normalize._rebalance_grid replaces it cleanly.
+    local replacement
+    replacement=$(tmux split-window -t "$src_window" -d -P -F '#{pane_id}' -c "${wdir:-$HOME}")
+    if [[ -n "$replacement" ]]; then
+        pane_tag "$replacement" "$slot_tag" || true
+        tmux set-option -p -t "$replacement" @GRID_RESERVED "false" 2>/dev/null || true
+        tmux set-option -pu -t "$replacement" @STACK_PENDING 2>/dev/null || true
+    fi
+
+    # Read the ordinal the allocator assigned (legion:N, lowest free) back off
+    # the live pane and tell Token-API where the agent now lives.
+    local stack_tag
+    stack_tag=$(pane_id_of "$current_pane") || true
     [[ -n "$stack_tag" ]] || stack_tag="legion:worker"
-
-    # After swap, pane IDs follow content: current_pane is in the managed stack
-    # slot; stack_pane is the fresh shell now occupying the original palace/
-    # somnium slot.
-    tmux swap-pane -d -s "$current_pane" -t "$stack_pane" || {
-        tmux kill-pane -t "$stack_pane" 2>/dev/null || true
-        tmux display-message "Shuttle: swap into legion stack failed"
-        return 1
-    }
-
-    # Preserve the managed stack identity on the demoted live pane and restore
-    # the original slot identity on the fresh shell replacement.
-    pane_tag "$current_pane" "$stack_tag" || true
-    tmux set-option -p -t "$current_pane" @PANE_TYPE "stack-worker" 2>/dev/null || true
-    tmux set-option -pu -t "$current_pane" @STACK_PENDING 2>/dev/null || true
-    pane_tag "$stack_pane" "$slot_tag" || true
-    tmux set-option -p -t "$stack_pane" @GRID_RESERVED "false" 2>/dev/null || true
-    tmux set-option -pu -t "$stack_pane" @STACK_PENDING 2>/dev/null || true
-
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli legion focus-selected --pane "$current_pane" >/dev/null 2>&1 || true
-
-    # Update Token-API DB so orchestration sees the new location
     relocate_pane "$current_pane" "$stack_tag"
 
-    # Keep the user's camera on the fresh shell replacement in the original slot.
-    tmux select-pane -t "$stack_pane" 2>/dev/null || true
-
-    # Refresh somnium layout so the replacement pane fills the correct geometry
-    tmux-refresh-layout 2>/dev/null || true
-
-    # Trigger workspace audit (backburner cleanup, etc.) — fire and forget
-    tmux-audit --force &
+    # Normalize the source grid, then keep the camera on the replacement.
+    tmux-refresh-layout "$src_target" 2>/dev/null || true
+    [[ -n "$replacement" ]] && tmux select-pane -t "$replacement" 2>/dev/null || true
 
     tmux display-message "Shipped to legion stack"
 }

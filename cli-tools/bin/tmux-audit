@@ -21,7 +21,7 @@
 
 set -eo pipefail
 
-STAMP_FILE="/tmp/.tmux-audit-last-run"
+STAMP_FILE="${TMUX_AUDIT_STAMP_FILE:-/tmp/.tmux-audit-last-run}"
 DEBOUNCE_SECONDS=5
 SESSION="main"
 
@@ -81,35 +81,40 @@ assert_backburner() {
         return 1
     }
 
+    # Static persona/orchestrator slots that must NEVER be culled, regardless of
+    # whether they happen to be sitting at an idle shell prompt (Custodes and the
+    # Fabricator-General routinely do).
+    is_protected_slot() {
+        local ptype="$1" label="$2"
+        case "$ptype" in
+            legion|mechanicus|tombstone) return 0 ;;
+        esac
+        case "$label" in
+            legion:custodes|mechanicus:fabricator-general|mechanicus:admin) return 0 ;;
+        esac
+        return 1
+    }
+
     for win in legion mechanicus mars kreig; do
         local pane_data
         pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
             -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}	#{@PANE_ID}' 2>/dev/null) || continue
 
-        local idle_panes=() real_panes=()
+        local changed=false
 
         while IFS=$'\t' read -r pid cmd ptype pane_label; do
             [[ -z "$pid" ]] && continue
-            if [[ "$ptype" == "tombstone" ]]; then
-                real_panes+=("$pid")
-            elif is_idle_shell "$cmd"; then
-                idle_panes+=("$pid")
-            else
-                real_panes+=("$pid")
+            # Layer 2 (belt-and-suspenders): never touch static persona slots.
+            is_protected_slot "$ptype" "$pane_label" && continue
+            # Layer 1: cull ONLY an explicit stack-worker sitting at an idle shell
+            # (its agent exited, leaving a blank pending pane). Anything that is
+            # not a typed stack-worker — a demoted live agent, a grid pane that
+            # wandered in, an untyped shell — is left strictly alone.
+            if [[ "$ptype" == "stack-worker" ]] && is_idle_shell "$cmd"; then
+                tmux kill-pane -t "$pid" 2>/dev/null || true
+                changed=true
             fi
         done <<< "$pane_data"
-
-        local total=$(( ${#idle_panes[@]} + ${#real_panes[@]} ))
-        local changed=false
-
-        # Preserve the final pane in a stack window; it is the orchestrator slot
-        # or its tombstone. Cull only surplus idle shells.
-        for pid in "${idle_panes[@]}"; do
-            [[ $total -le 1 ]] && continue
-            tmux kill-pane -t "$pid" 2>/dev/null || true
-            (( total-- )) || true
-            changed=true
-        done
 
         if [[ "$changed" == "true" ]]; then
             tmux select-layout -t "${SESSION}:${win}" tiled 2>/dev/null || true

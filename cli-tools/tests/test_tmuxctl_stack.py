@@ -25,11 +25,13 @@ class FakeLegionAdapter:
         window_name: str = "legion",
         rows: list[str] | None = None,
         zoomed: bool = False,
+        window_present: bool = True,
     ) -> None:
         self.guard = guard
         self.window_name = window_name
         self.rows = rows
         self.zoomed = zoomed
+        self.window_present = window_present
         self.commands: list[tuple[str, ...]] = []
         self.window_options: dict[str, str] = {}
 
@@ -66,6 +68,8 @@ class FakeLegionAdapter:
         if args[0] == "list-windows":
             if args[-1] == "#{window_index}\t#{window_name}":
                 return f"3\t{self.window_name}\n"
+            if not self.window_present:
+                return ""
             return f"{self.window_name}\n"
         if args[0] == "list-panes":
             if self.rows is not None:
@@ -105,6 +109,13 @@ class FakeLegionAdapter:
             pane = "%N"
             self.rows.append(f"{pane}\t\t\t0\t80\t0\t80\t10\tzsh\tfalse")
             return f"{pane}\n"
+        if args[0] == "join-pane" and self.rows is not None:
+            # Adoption preserves the source pane id + its running process; the
+            # joined pane simply appears in this window's pane list.
+            src = args[args.index("-s") + 1]
+            if not any(row.startswith(f"{src}\t") for row in self.rows):
+                self.rows.append(f"{src}\t\t\t0\t81\t0\t80\t10\tclaude\tfalse")
+            return ""
         if args[0] == "kill-pane" and self.rows is not None:
             pane = args[args.index("-t") + 1]
             self.rows = [row for row in self.rows if not row.startswith(f"{pane}\t")]
@@ -467,6 +478,163 @@ def test_selecting_already_focused_worker_does_not_reenforce():
 
     assert result == "noop stack focus %1: already focused"
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
+
+
+def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+
+    pane = add_stack_pane(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "legion",
+        cwd="/tmp",
+        focus=False,
+        adopt_pane="%live",
+    )
+
+    # The live pane keeps its id — no fresh %N shell is split.
+    assert pane == "%live"
+    assert not any(command[0] == "split-window" for command in adapter.commands)
+    # Joined in (no-workers geometry: horizontal against the orchestrator).
+    assert any(
+        command[:7] == ("join-pane", "-h", "-d", "-s", "%live", "-t", "%C")
+        for command in adapter.commands
+    )
+    # The allocator tags it as the lowest free worker ordinal.
+    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%live", "@PANE_TYPE", "stack-worker") in adapter.commands
+    # A live worker is never flagged pending (that would mark it for the reap).
+    assert not any(
+        command[:5] == ("set-option", "-p", "-t", "%live", "@STACK_PENDING")
+        and command[-1] == "true"
+        for command in adapter.commands
+    )
+
+
+def test_adopt_with_existing_workers_joins_vertically_onto_the_stack():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tlegion:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
+        ]
+    )
+
+    pane = add_stack_pane(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "legion",
+        cwd="/tmp",
+        focus=False,
+        adopt_pane="%live",
+    )
+
+    assert pane == "%live"
+    assert not any(command[0] == "split-window" for command in adapter.commands)
+    assert (
+        "join-pane",
+        "-v",
+        "-d",
+        "-s",
+        "%live",
+        "-t",
+        "%1",
+        "-l",
+        str(STACK_COLLAPSED_HEIGHT),
+    ) in adapter.commands
+    # Existing worker keeps legion:1; the adopted pane takes the next ordinal.
+    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:2") in adapter.commands
+
+
+def test_adopt_creates_legion_window_and_custodes_before_joining():
+    adapter = FakeLegionAdapter(rows=[], window_present=False)
+
+    add_stack_pane(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "legion",
+        cwd="/tmp",
+        focus=False,
+        adopt_pane="%live",
+    )
+
+    new_window_idx = next(
+        i for i, command in enumerate(adapter.commands) if command[0] == "new-window"
+    )
+    custodes_idx = next(
+        i
+        for i, command in enumerate(adapter.commands)
+        if command[:2] == ("set-option", "-p") and command[-2:] == ("@PANE_ID", "legion:custodes")
+    )
+    join_idx = next(i for i, command in enumerate(adapter.commands) if command[0] == "join-pane")
+
+    assert new_window_idx < join_idx
+    assert custodes_idx < join_idx
+
+
+def test_adopt_does_not_kill_the_live_pane_when_enforce_fails(monkeypatch):
+    import tmuxctl._stack_core as stack_core
+
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(stack_core, "enforce_stack_layout", _boom)
+
+    with pytest.raises(OSError):
+        stack_core.add_orchestrator_stack_pane(
+            adapter, "main", "legion", cwd="/tmp", focus=False, adopt_pane="%live"
+        )
+
+    # The user's live agent must survive a post-join enforce failure.
+    assert not any(command[0] == "kill-pane" and "%live" in command for command in adapter.commands)
+    assert any(row.startswith("%live\t") for row in adapter.rows or [])
+
+
+def test_adopt_no_focus_does_not_select_or_record_focused_pane():
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+
+    add_stack_pane(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "legion",
+        cwd="/tmp",
+        focus=False,
+        adopt_pane="%live",
+    )
+
+    assert not any(command[0] == "select-window" for command in adapter.commands)
+    # The -T "regiment" title select-pane is allowed; a focusing select-pane is not.
+    assert not any(
+        command[0] == "select-pane" and "-T" not in command for command in adapter.commands
+    )
+    assert "@STACK_FOCUSED_PANE" not in adapter.window_options
+
+
+def test_adopt_rejected_for_non_orchestrator_stack():
+    adapter = FakeLegionAdapter(window_name="mars", rows=[])
+
+    with pytest.raises(ValueError):
+        add_stack_pane(  # type: ignore[arg-type]
+            adapter,
+            "main",
+            "mars",
+            cwd="/tmp",
+            focus=False,
+            adopt_pane="%live",
+        )
 
 
 def test_stack_enforce_defers_while_pane_select_zoom_restore_pending():
