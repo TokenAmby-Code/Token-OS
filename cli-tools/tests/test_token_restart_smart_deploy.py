@@ -201,8 +201,11 @@ def test_mobile_change_runs_push_mobile_only(tmp_path: Path) -> None:
     assert KICK_DISCORD not in calls
 
 
-def test_satellite_change_refreshes_wsl_only(tmp_path: Path) -> None:
-    env, logfile = _stub_env(tmp_path, "token-api/token-satellite.py")
+def test_satellite_or_refresh_helper_change_refreshes_wsl_only(tmp_path: Path) -> None:
+    env, logfile = _stub_env(
+        tmp_path,
+        "token-api/token-satellite.py\ntoken-api/scripts/token-satellite-refresh",
+    )
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
