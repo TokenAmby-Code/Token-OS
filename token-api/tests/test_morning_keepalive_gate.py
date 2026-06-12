@@ -61,9 +61,13 @@ def _insert_claude_row(conn, sid, *, instance_type, tmux_pane, legion, status="i
 def _insert_custodes_instance(
     db_path, *, instance_type="hook_driven", tmux_pane="%42", rank="overseer", status="idle"
 ):
-    """A resting Custodes: canonical instances row (persona=custodes, rank=overseer)
-    plus a claude_instances row that carries NO sync mode by default. The keepalive
-    must fire on persona identity alone, so instance_type defaults to hook_driven."""
+    """A resting Custodes: an instances row with persona=custodes, rank=overseer,
+    and NO sync mode by default. The keepalive must fire on persona identity
+    alone, so instance_type defaults to hook_driven.
+
+    The legacy_instances test surface is now a compatibility view over instances;
+    seed through it for the legacy mode fields, then stamp the same row with the
+    instances-table persona identity instead of inserting a duplicate primary key."""
     sid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
@@ -77,13 +81,24 @@ def _insert_custodes_instance(
     )
     persona_id = conn.execute("SELECT id FROM personas WHERE slug = 'custodes'").fetchone()[0]
     conn.execute(
-        """INSERT INTO instances
-           (id, name, engine, working_dir, device_id, origin_type, commander_type,
-            status, created_at, last_activity, persona_id, rank, automated,
-            notification_mode, interaction_mode)
-           VALUES (?, ?, 'claude', '/tmp', 'Mac-Mini', 'local', 'emperor',
-                   ?, ?, ?, ?, ?, 0, 'verbose', 'text')""",
-        (sid, f"Custodes-{sid[:6]}", status, now, now, persona_id, rank),
+        """UPDATE instances
+              SET name = ?,
+                  engine = 'claude',
+                  working_dir = '/tmp',
+                  device_id = 'Mac-Mini',
+                  origin_type = 'local',
+                  commander_type = 'emperor',
+                  commander_id = NULL,
+                  status = ?,
+                  created_at = ?,
+                  last_activity = ?,
+                  persona_id = ?,
+                  rank = ?,
+                  automated = 0,
+                  notification_mode = 'verbose',
+                  interaction_mode = 'text'
+            WHERE id = ?""",
+        (f"Custodes-{sid[:6]}", status, now, now, persona_id, rank, sid),
     )
     conn.commit()
     conn.close()
