@@ -17,6 +17,7 @@ Run:
 
 import asyncio
 import json
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -674,6 +675,7 @@ class TestIntegrationCRUD:
             pass
 
     def test_create_and_get(self):
+        cleanup_job_by_name("int-test-crud")
         job = api_post(
             "/api/cron/jobs",
             {
@@ -691,6 +693,7 @@ class TestIntegrationCRUD:
             self._cleanup_job(job["id"])
 
     def test_update(self):
+        cleanup_job_by_name("int-test-update")
         job = api_post(
             "/api/cron/jobs",
             {
@@ -706,6 +709,7 @@ class TestIntegrationCRUD:
             self._cleanup_job(job["id"])
 
     def test_delete(self):
+        cleanup_job_by_name("int-test-delete")
         job = api_post(
             "/api/cron/jobs",
             {
@@ -1014,7 +1018,7 @@ class TestNewSchemaColumns:
             engine.create_job(
                 create_job_dict(
                     name="output-expand",
-                    command="python3 -c \"print('X' * 3000)\"",
+                    command=f"{sys.executable} -c \"print('X' * 3000)\"",
                 )
             )
         )
@@ -1061,31 +1065,44 @@ class TestVictoryRegex:
 class TestInstanceMutex:
     """Tests for _check_instance_mutex: skips run if live cron instance exists."""
 
-    def _seed_instance(self, db_path, job_name: str, status: str, instance_id: str = None):
-        """Insert a claude_instance row directly into the test DB."""
+    def _ensure_instance_mutex_tables(self, db_path):
+        import sqlite3
+
+        con = sqlite3.connect(str(db_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS session_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                file_path TEXT,
+                cron_job_id TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS instances (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT DEFAULT 'idle',
+                session_doc_id INTEGER
+            )
+        """)
+        con.commit()
+        con.close()
+
+    def _seed_instance(self, db_path, job_id: str, status: str, instance_id: str = None):
+        """Insert a v2 instance row tied to a cron session document."""
         import sqlite3
 
         instance_id = instance_id or f"inst-{time.monotonic_ns()}"
+        self._ensure_instance_mutex_tables(db_path)
         con = sqlite3.connect(str(db_path))
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS legacy_instances (
-                id TEXT PRIMARY KEY,
-                tab_name TEXT,
-                status TEXT DEFAULT 'active',
-                spawner TEXT,
-                is_subagent INTEGER DEFAULT 0,
-                created_at TEXT
-            )
-        """)
+        cur = con.execute(
+            "INSERT INTO session_documents (title, file_path, cron_job_id) VALUES (?, ?, ?)",
+            (f"cron:{job_id}", f"/tmp/{job_id}.md", job_id),
+        )
+        session_doc_id = cur.lastrowid
         con.execute(
-            "INSERT INTO legacy_instances (id, tab_name, status, spawner, is_subagent, created_at) VALUES (?,?,?,?,1,?)",
-            (
-                instance_id,
-                f"sub: cron:{job_name}",
-                status,
-                f"cron:{job_name}",
-                "2026-01-01T00:00:00",
-            ),
+            "INSERT INTO instances (id, name, status, session_doc_id) VALUES (?, ?, ?, ?)",
+            (instance_id, f"sub: cron:{job_id}", status, session_doc_id),
         )
         con.commit()
         con.close()
@@ -1094,39 +1111,28 @@ class TestInstanceMutex:
     def test_mutex_clear_when_no_instances(self, engine, db_path):
         """Returns True (proceed) when no instances exist for the job."""
         job = {"id": "j1", "name": "my-task", "enabled": 1}
-        # Ensure legacy_instances table exists (empty)
-        import sqlite3
-
-        con = sqlite3.connect(str(db_path))
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS legacy_instances (
-                id TEXT PRIMARY KEY, tab_name TEXT, status TEXT DEFAULT 'active',
-                spawner TEXT, is_subagent INTEGER DEFAULT 0, created_at TEXT
-            )
-        """)
-        con.commit()
-        con.close()
+        self._ensure_instance_mutex_tables(db_path)
         result = run(engine._check_instance_mutex(job))
         assert result is True
 
     def test_mutex_blocked_by_active_instance(self, engine, db_path):
         """Returns False (skip) when a live instance with matching spawner exists."""
         job = {"id": "j2", "name": "my-task", "enabled": 1}
-        self._seed_instance(db_path, "my-task", status="active")
+        self._seed_instance(db_path, job["id"], status="idle")
         result = run(engine._check_instance_mutex(job))
         assert result is False
 
     def test_mutex_clear_after_instance_stopped(self, engine, db_path):
         """Returns True (proceed) when the previous instance is stopped."""
         job = {"id": "j3", "name": "my-task", "enabled": 1}
-        self._seed_instance(db_path, "my-task", status="stopped")
+        self._seed_instance(db_path, job["id"], status="stopped")
         result = run(engine._check_instance_mutex(job))
         assert result is True
 
     def test_mutex_only_matches_job_name(self, engine, db_path):
         """Live instance for a different job does not block this job."""
         job = {"id": "j4", "name": "job-alpha", "enabled": 1}
-        self._seed_instance(db_path, "job-beta", status="active")
+        self._seed_instance(db_path, "other-job-id", status="idle")
         result = run(engine._check_instance_mutex(job))
         assert result is True
 
@@ -1135,7 +1141,7 @@ class TestInstanceMutex:
         job_payload = create_job_dict(name="mutex-skip-test")
         created = run(engine.create_job(job_payload))
         job_id = created["id"]
-        self._seed_instance(db_path, "mutex-skip-test", status="active")
+        self._seed_instance(db_path, job_id, status="idle")
 
         run(engine._log_skip(job_id, "instance_mutex"))
 

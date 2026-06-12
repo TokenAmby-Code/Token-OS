@@ -4322,7 +4322,9 @@ def _askq_should_engage_ladder(instance_row: dict | None, session_id: str) -> bo
     if not instance_row:
         return False
     marker = instance_row.get("golden_throne")
-    return bool(marker) and marker != "sync"
+    return (bool(marker) and marker != "sync") or instance_row.get(
+        "instance_type"
+    ) == "golden_throne"
 
 
 async def _askq_ladder_start(

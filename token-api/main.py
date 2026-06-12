@@ -1113,6 +1113,7 @@ async def cleanup_stale_instances() -> dict:
                     "status": "stopped",
                     "input_lock": None,
                     "stopped_at": datetime.now().isoformat(),
+                    "golden_throne": None,
                 },
                 mutation_type="instance_stopped",
                 write_source="task",
@@ -1954,6 +1955,7 @@ async def stop_instance(instance_id: str):
                 "status": "stopped",
                 "input_lock": None,
                 "stopped_at": now,
+                "golden_throne": None,
             },
             mutation_type="instance_stopped",
             write_source="api",
@@ -8645,11 +8647,12 @@ async def _resolve_administratum_instance() -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tmux_pane, device_id, dispatch_session_doc_path
-               FROM instances
-               WHERE primarch = 'administratum'
-                 AND status NOT IN ('stopped', 'archived')
-               ORDER BY last_activity DESC
+            """SELECT i.id, i.tmux_pane, i.device_id, i.dispatch_session_doc_path
+               FROM instances i
+               JOIN personas p ON p.id = i.persona_id
+               WHERE p.slug = 'administratum'
+                 AND i.status NOT IN ('stopped', 'archived')
+               ORDER BY i.last_activity DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()

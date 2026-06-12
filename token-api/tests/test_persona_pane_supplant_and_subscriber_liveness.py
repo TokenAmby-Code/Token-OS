@@ -128,8 +128,6 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
     asyncio.run(run())
 
     rows = _rows_at_pane(app_env.db_path, "%fg")
-    # Exactly one persona row must remain at the pane — the stale row supplanted
-    # (its id migrated to the new session), NOT a second duplicate row.
     assert len(rows) == 1, f"expected supplant (1 row), got {len(rows)}: {rows}"
     surviving_id, surviving_primarch = rows[0]
     assert surviving_id == "new-fg", "the new session must take over the persona row"

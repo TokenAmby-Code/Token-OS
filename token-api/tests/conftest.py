@@ -38,6 +38,7 @@ def _install_legacy_instances_test_view(conn):
               i.device_id,
               i.origin_type,
               i.continuity_binding_source,
+              i.wrapper_launch_id,
               i.automated,
               i.launcher AS spawner,
               i.launcher,
@@ -48,13 +49,24 @@ def _install_legacy_instances_test_view(conn):
               i.stopped_at,
               i.tmux_pane,
               i.pane_label,
-              COALESCE(p.slug, 'astartes') AS legion,
-              p.slug AS primarch,
+              CASE
+                WHEN p.slug = 'custodes' THEN 'custodes'
+                WHEN p.slug = 'fabricator-general' THEN 'fabricator'
+                WHEN p.slug = 'administratum' THEN 'mechanicus'
+                WHEN p.slug = 'mechanicus' THEN 'mechanicus'
+                WHEN COALESCE(p.default_rank, i.rank) = 'astartes' THEN 'astartes'
+                ELSE COALESCE(p.slug, 'astartes')
+              END AS legion,
+              CASE
+                WHEN COALESCE(p.default_rank, '') = 'astartes' THEN NULL
+                ELSE p.slug
+              END AS primarch,
               p.slug AS profile_name,
               CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced,
               CASE
                 WHEN i.golden_throne = 'sync' THEN 'sync'
                 WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                WHEN COALESCE(i.hook_driven, 0) = 1 THEN 'hook_driven'
                 ELSE 'one_off'
               END AS instance_type,
               CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id,
@@ -133,22 +145,47 @@ def _install_legacy_instances_test_view(conn):
                 NEW.engine,
                 NEW.working_dir,
                 COALESCE(NEW.device_id, 'Mac-Mini'),
-                COALESCE(NEW.origin_type, 'local'),
+                CASE COALESCE(NEW.origin_type, 'local')
+                  WHEN 'hook' THEN 'api'
+                  ELSE COALESCE(NEW.origin_type, 'local')
+                END,
                 NEW.continuity_binding_source,
-                CASE WHEN NEW.parent_instance_id IS NOT NULL THEN 'chapter' ELSE 'emperor' END,
-                NEW.parent_instance_id,
+                CASE
+                  WHEN NEW.parent_instance_id IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM instances WHERE id = NEW.parent_instance_id)
+                  THEN 'chapter'
+                  ELSE 'emperor'
+                END,
+                CASE
+                  WHEN NEW.parent_instance_id IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM instances WHERE id = NEW.parent_instance_id)
+                  THEN NEW.parent_instance_id
+                  ELSE NULL
+                END,
                 CASE COALESCE(NEW.status, 'idle') WHEN 'processing' THEN 'working' ELSE COALESCE(NEW.status, 'idle') END,
                 COALESCE(NEW.registered_at, NEW.created_at, CURRENT_TIMESTAMP),
                 COALESCE(NEW.last_activity, NEW.created_at, CURRENT_TIMESTAMP),
                 NEW.stopped_at,
-                (SELECT id FROM personas WHERE slug = COALESCE(NEW.profile_name, NEW.primarch, NEW.legion) LIMIT 1),
+                (SELECT id FROM personas WHERE slug = CASE CASE
+                    WHEN NEW.legion IS NOT NULL AND NEW.legion != 'astartes' THEN NEW.legion
+                    ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
+                  END
+                    WHEN 'fabricator' THEN 'fabricator-general'
+                    WHEN 'mechanicus:admin' THEN 'administratum'
+                    WHEN 'mechanicus:administratum' THEN 'administratum'
+                    WHEN 'legion:custodes' THEN 'custodes'
+                    ELSE CASE
+                      WHEN NEW.legion IS NOT NULL AND NEW.legion != 'astartes' THEN NEW.legion
+                      ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
+                    END
+                  END LIMIT 1),
                 'astartes',
                 NEW.session_doc_id,
                 COALESCE(NEW.is_subagent, 0),
                 CASE COALESCE(NEW.tts_mode, 'verbose') WHEN 'muted' THEN 'muted' WHEN 'silent' THEN 'silent' ELSE 'verbose' END,
                 CASE COALESCE(NEW.tts_mode, '') WHEN 'voice-chat' THEN 'voice_chat' WHEN 'voice_chat' THEN 'voice_chat' ELSE 'text' END,
                 CASE WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync' WHEN NEW.instance_type = 'sync' THEN 'sync' WHEN NEW.instance_type = 'golden_throne' THEN '1' ELSE NULL END,
-                NEW.tmux_pane, NEW.pane_label, COALESCE(NEW.launcher, NEW.spawner), COALESCE(NEW.is_subagent, 0), COALESCE(NEW.hook_driven, 0),
+                NEW.tmux_pane, NEW.pane_label, COALESCE(NEW.launcher, NEW.spawner), COALESCE(NEW.is_subagent, 0), COALESCE(NEW.hook_driven, CASE WHEN NEW.instance_type = 'hook_driven' THEN 1 ELSE 0 END),
                 COALESCE(NEW.zealotry, 4), COALESCE(NEW.gt_resume_count, 0), NEW.gt_resume_window_started_at,
                 NEW.gt_last_resume_at, NEW.follow_up_sop, COALESCE(NEW.stop_allowed, 1), NEW.input_lock,
                 NEW.tts_voice, NEW.notification_sound, COALESCE(NEW.discord_hosted, 0), NEW.discord_channel,
@@ -177,7 +214,27 @@ def _install_legacy_instances_test_view(conn):
                 stopped_at = NEW.stopped_at,
                 tmux_pane = NEW.tmux_pane,
                 pane_label = NEW.pane_label,
-                golden_throne = CASE WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync' WHEN NEW.instance_type = 'sync' THEN 'sync' WHEN NEW.instance_type = 'golden_throne' THEN COALESCE(golden_throne, '1') ELSE golden_throne END,
+                persona_id = (SELECT id FROM personas WHERE slug = CASE
+                    CASE
+                      WHEN NEW.legion IS NOT OLD.legion THEN NEW.legion
+                      ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
+                    END
+                    WHEN 'fabricator' THEN 'fabricator-general'
+                    WHEN 'mechanicus:admin' THEN 'administratum'
+                    WHEN 'mechanicus:administratum' THEN 'administratum'
+                    WHEN 'legion:custodes' THEN 'custodes'
+                    ELSE CASE
+                      WHEN NEW.legion IS NOT OLD.legion THEN NEW.legion
+                      ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
+                    END
+                  END LIMIT 1),
+                golden_throne = CASE
+                  WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync'
+                  WHEN NEW.instance_type = 'sync' THEN 'sync'
+                  WHEN NEW.instance_type = 'golden_throne' THEN COALESCE(golden_throne, '1')
+                  WHEN COALESCE(NEW.synced, 0) = 0 THEN NULL
+                  ELSE golden_throne
+                END,
                 pr_url = NEW.pr_url,
                 pr_state = NEW.pr_state,
                 workflow_state = NEW.workflow_state,

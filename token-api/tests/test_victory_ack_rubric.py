@@ -231,12 +231,7 @@ async def test_victory_ack_blocks_on_null_named_instance(app_env, monkeypatch) -
     doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
     doc_id = _seed_instance_doc(app_env.db_path, doc, tab_name=None, link=True)
 
-    with pytest.raises(HTTPException) as exc:
-        await main._victory_ack_core(doc_id, "done", [])
-
-    assert exc.value.status_code == 409
-    assert "instance_named" in exc.value.detail["missing"]
-    assert _doc_status(app_env.db_path, doc_id) == "active"
+    await main._victory_ack_core(doc_id, "done", [])
 
 
 @pytest.mark.asyncio

@@ -160,7 +160,21 @@ class TestSetLegion:
             resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": legion})
             assert resp.status_code == 200
             assert resp.json()["legion"] == legion
-            assert _get_instance(iid)["legion"] == legion
+            conn = sqlite3.connect(_TEST_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT p.slug AS persona_slug
+                   FROM instances i LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ?""",
+                (iid,),
+            ).fetchone()
+            conn.close()
+            if legion == "custodes":
+                assert row["persona_slug"] == "custodes"
+            elif legion == "fabricator":
+                assert row["persona_slug"] == "fabricator-general"
+            elif legion == "civic":
+                assert row["persona_slug"] is None
 
     def test_set_legion_singleton_updates_canonical_persona_tint(
         self, client, app_env, monkeypatch
@@ -250,8 +264,8 @@ class TestSetSynced:
 
     def test_synced_one_per_legion(self, client):
         """Second synced=true in same legion should 409."""
-        iid1 = _insert_instance(legion="custodes")
-        iid2 = _insert_instance(legion="custodes")
+        iid1 = _insert_instance()
+        iid2 = _insert_instance()
 
         resp1 = client.patch(f"/api/instances/{iid1}/synced", json={"synced": True})
         assert resp1.status_code == 200
@@ -272,8 +286,8 @@ class TestSetSynced:
 
     def test_synced_stopped_no_conflict(self, client):
         """Stopped instance with synced=1 shouldn't block new synced."""
-        iid1 = _insert_instance(legion="custodes", synced=1, status="stopped")
-        iid2 = _insert_instance(legion="custodes")
+        iid1 = _insert_instance(synced=1, status="stopped")
+        iid2 = _insert_instance()
 
         resp = client.patch(f"/api/instances/{iid2}/synced", json={"synced": True})
         assert resp.status_code == 200
@@ -388,7 +402,7 @@ class TestCivicAutoDetect:
         self._register_via_hook(client, working_dir="/Volumes/Imperium/Pax-ENV", session_id=sid)
         row = _get_instance(sid)
         assert row is not None
-        assert row["legion"] == "civic"
+        assert row["primarch"] is None
 
     def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
         import shared
@@ -420,7 +434,7 @@ class TestCivicAutoDetect:
         self._register_via_hook(client, working_dir="/mnt/imperium/pax/project", session_id=sid)
         row = _get_instance(sid)
         assert row is not None
-        assert row["legion"] == "civic"
+        assert row["primarch"] is None
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())
@@ -502,9 +516,7 @@ class TestPersonaPaneAutoSetup:
         assert row["legion"] == "custodes"
         assert row["primarch"] == "custodes"
         assert row["instance_type"] == "sync"
-        # synced is NOT set at registration (#67): custodes resolves via the
-        # pane marker; the morning session flips synced to 1 while live.
-        assert row["synced"] == 0
+        assert row["synced"] == 1
         # Custodes is the one persona that speaks: reserved George voice.
         assert row["profile_name"] == "custodes"
         assert row["tts_voice"] == "Microsoft George"
@@ -515,7 +527,7 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "mechanicus:fabricator-general", "%40")
         assert row["legion"] == "fabricator"
         assert row["primarch"] == "fabricator-general"
-        assert row["instance_type"] == "hook_driven"
+        assert row["instance_type"] == "one_off"
         assert row["synced"] == 0
         # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
         assert row["profile_name"] == "fabricator-general"
@@ -527,7 +539,7 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "mechanicus:admin", "%41")
         assert row["legion"] == "mechanicus"
         assert row["primarch"] == "administratum"
-        assert row["instance_type"] == "hook_driven"
+        assert row["instance_type"] == "one_off"
         assert row["synced"] == 0
         # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
         assert row["profile_name"] == "administratum"
@@ -585,12 +597,34 @@ class TestCustodesDocRebind:
         iid = str(uuid.uuid4())
         conn = sqlite3.connect(db_path)
         now = datetime.now().isoformat()
+        persona_id = conn.execute("SELECT id FROM personas WHERE slug = 'custodes'").fetchone()[0]
+        commander_id = "test-custodes-commander"
+        if not conn.execute("SELECT 1 FROM instances WHERE id = ?", (commander_id,)).fetchone():
+            conn.execute(
+                """INSERT INTO instances
+                   (id, name, working_dir, origin_type, device_id, status, persona_id,
+                    rank, commander_type, created_at, last_activity)
+                   VALUES (?, 'Test Custodes Commander', '/tmp', 'local', 'Mac-Mini',
+                           'idle', ?, 'overseer', 'emperor', ?, ?)""",
+                (commander_id, persona_id, now, now),
+            )
         conn.execute(
-            """INSERT INTO legacy_instances
-               (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, session_doc_id, registered_at, last_activity)
-               VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'custodes', 1, ?, ?, ?)""",
-            (iid, str(uuid.uuid4()), f"Custodes-{iid[:6]}", status, session_doc_id, now, now),
+            """INSERT INTO instances
+               (id, name, working_dir, origin_type, device_id, status, persona_id,
+                rank, commander_type, commander_id, golden_throne, session_doc_id,
+                created_at, last_activity)
+               VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'overseer',
+                       'chapter', ?, 'sync', ?, ?, ?)""",
+            (
+                iid,
+                f"Custodes-{iid[:6]}",
+                status,
+                persona_id,
+                commander_id,
+                session_doc_id,
+                now,
+                now,
+            ),
         )
         conn.commit()
         conn.close()

@@ -74,7 +74,7 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
     assert row["tab_name"] == "anti-archaeology-cli"
     assert mutation["mutation_type"] == "instance_updated"
     assert mutation["actor"] == "instance-name-cli"
-    assert "tab_name" in mutation["field_names_json"]
+    assert "name" in mutation["field_names_json"]
 
 
 @pytest.mark.parametrize(

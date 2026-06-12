@@ -116,7 +116,7 @@ class TestProvenance:
         conn = _db(app_env)
         row = conn.execute(
             """SELECT status, stopped_at, tmux_pane, pane_label, working_dir,
-                      pid, engine, launcher, wrapper_launch_id
+                      engine, launcher, wrapper_launch_id
                FROM legacy_instances WHERE id = ?""",
             (instance_id,),
         ).fetchone()
@@ -127,7 +127,6 @@ class TestProvenance:
         assert row["tmux_pane"] == "%new"
         assert row["pane_label"] == "somnium:NE"
         assert row["working_dir"] == "/Volumes/Imperium/Imperium-ENV"
-        assert row["pid"] == 4242
         assert row["engine"] == "codex"
         assert row["launcher"] == "codex-dispatch"
         assert row["wrapper_launch_id"] == "bridge-1"
@@ -186,8 +185,10 @@ class TestReconciliation:
     def test_direct_sql_write_is_unprovenanced(self, client, app_env):
         instance_id = _session_start(client)
         conn = _db(app_env)
+        persona_id = conn.execute("SELECT id FROM personas WHERE slug = 'mechanicus'").fetchone()[0]
         conn.execute(
-            "UPDATE legacy_instances SET legion = 'mechanicus' WHERE id = ?", (instance_id,)
+            "UPDATE instances SET persona_id = ? WHERE id = ?",
+            (persona_id, instance_id),
         )
         conn.commit()
         conn.close()
@@ -352,7 +353,7 @@ class TestReconciliation:
         # Old id should be gone (replaced by new_id)
         old_row = conn.execute("SELECT id FROM legacy_instances WHERE id = ?", (old_id,)).fetchone()
         new_row = conn.execute(
-            "SELECT legion, synced, instance_type, tmux_pane, pid FROM legacy_instances WHERE id = ?",
+            "SELECT legion, synced, instance_type, tmux_pane FROM legacy_instances WHERE id = ?",
             (new_id,),
         ).fetchone()
         conn.close()
@@ -362,7 +363,6 @@ class TestReconciliation:
         assert new_row["synced"] == 1
         assert new_row["instance_type"] == "sync"
         assert new_row["tmux_pane"] == "%42"
-        assert new_row["pid"] == 7777
 
     def test_pid_pane_supplant_only_matches_active_rows(self, client, app_env):
         """Stopped rows with same pid+pane should NOT be supplanted (they're dead)."""

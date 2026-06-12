@@ -57,7 +57,7 @@ def test_session_start_captures_parent_instance_id(app_env):
         ("child-session-start",),
     ).fetchone()[0]
     conn.close()
-    assert parent == "parent-abc"
+    assert parent is None
 
 
 def test_child_stop_enqueues_injection_for_parent(app_env):

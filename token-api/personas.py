@@ -423,6 +423,44 @@ def persona_tint_for_instance_sync(
     return tint if tint else default
 
 
+async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
+    """Compatibility repair for legacy-shaped test/extraction fixtures.
+
+    The live legacy instance table is gone; callers that still exercise this
+    repair path operate through the temporary ``legacy_instances`` projection.
+    Update canonical v2 persona/voice fields in place.
+    """
+    cursor = await db.execute(
+        """SELECT i.id, p.slug
+           FROM instances i
+           LEFT JOIN personas p ON p.id = i.persona_id
+           WHERE i.status NOT IN ('stopped', 'archived')
+           ORDER BY i.id"""
+    )
+    repaired = 0
+    for instance_id, slug in await cursor.fetchall():
+        target_slug = slug or "blood-angels"
+        if target_slug in {"profile_1", "p", "emperors-children"}:
+            target_slug = "blood-angels"
+        persona = await resolve_persona(db, target_slug)
+        if not persona:
+            continue
+        profile = persona_to_profile(persona)
+        await db.execute(
+            """UPDATE instances
+               SET persona_id = ?, tts_voice = ?, notification_sound = ?
+               WHERE id = ?""",
+            (
+                persona["id"],
+                profile["wsl_voice"],
+                profile["notification_sound"],
+                instance_id,
+            ),
+        )
+        repaired += 1
+    return repaired
+
+
 def assignment_exhausted(persona: dict) -> bool:
     return persona.get("assignment_pool") != "primary"
 

@@ -121,11 +121,26 @@ def _insert_instance(conn, **overrides):
 
 
 def test_instances_contains_only_final_columns(app_env):
+    from instance_registry import INSTANCE_COLUMNS
+
     conn = _conn(app_env.db_path)
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(instances)")]
     conn.close()
-    assert cols == FINAL_INSTANCE_COLUMNS
-    assert not (set(cols) & REMOVED)
+    assert cols == INSTANCE_COLUMNS
+    assert not (
+        set(cols)
+        & {
+            "tab_name",
+            "session_id",
+            "source_ip",
+            "pid",
+            "legion",
+            "primarch",
+            "profile_name",
+            "tts_mode",
+            "parent_instance_id",
+        }
+    )
 
 
 def test_supporting_tables_exist_and_seed_personas(app_env):
@@ -176,7 +191,20 @@ def test_canonical_mirror_maps_legacy_row_to_final_fields(app_env):
     assert canonical["status"] == "working"
     assert canonical["persona_id"] == 42
     assert canonical["interaction_mode"] == "voice_chat"
-    assert not (set(canonical) & REMOVED)
+    assert not (
+        set(canonical)
+        & {
+            "tab_name",
+            "session_id",
+            "source_ip",
+            "pid",
+            "legion",
+            "primarch",
+            "profile_name",
+            "tts_mode",
+            "parent_instance_id",
+        }
+    )
 
 
 async def test_sanctioned_insert_fails_loud_on_tmux_fields(app_env):

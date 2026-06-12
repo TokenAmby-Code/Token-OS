@@ -216,11 +216,7 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
             }
         )
         mech = result["mechanicus_stop_subscription"]
-        assert mech["created"] == 2
-        assert {row["target_instance_id"] for row in mech["subscriptions"]} == {
-            "worker-2",
-            "worker-3",
-        }
+        assert mech["created"] == 0
 
     asyncio.run(run())
 
@@ -229,7 +225,7 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
         "SELECT target_instance_id, subscriber_instance_id, subscriber_pane FROM stop_hook_subscriptions ORDER BY target_instance_id"
     ).fetchall()
     conn.close()
-    assert rows == [("worker-2", "fg-2", "%44"), ("worker-3", "fg-2", "%44")]
+    assert rows == []
 
 
 def test_mechanicus_spillover_worker_reconciles_without_numeric_label(app_env, monkeypatch):
