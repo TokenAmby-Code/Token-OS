@@ -109,6 +109,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
             JOIN personas p ON p.id = ci.persona_id
             LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
             WHERE p.slug = 'custodes'
+              AND ci.golden_throne = 'sync'
               AND ci.status NOT IN ('stopped', 'archived')
               AND ci.stopped_at IS NULL
             """
@@ -131,7 +132,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
                 instance_id=row["id"],
                 updates={"session_doc_id": today_id},
                 mutation_type="instance_updated",
-                write_source="day_start",
+                write_source="system_worker",
                 actor="day_start:custodes_doc_rebind",
             )
             rebound.append({"instance_id": row["id"], "from_date": match.group(1)})

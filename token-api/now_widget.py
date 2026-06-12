@@ -57,7 +57,7 @@ def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
         try:
             instance_rows = conn.execute(
                 """
-                SELECT id, name AS tab_name, working_dir, tmux_pane, pane_label
+                SELECT id, name AS tab_name, working_dir, NULL AS tmux_pane, NULL AS pane_label
                 FROM instances
                 WHERE status NOT IN ('stopped', 'archived')
                 ORDER BY last_activity DESC

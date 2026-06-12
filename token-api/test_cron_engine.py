@@ -17,6 +17,7 @@ Run:
 
 import asyncio
 import json
+import shlex
 import sys
 import time
 from datetime import datetime, timedelta
@@ -574,14 +575,14 @@ class TestConfigLoad:
         config_path.write_text(json.dumps(config))
         run(engine.load_from_config(config_path))
 
-        config[0]["command"] = "echo v2"
+        config[0]["command"] = "echo updated"
         config_path.write_text(json.dumps(config))
         run(engine.load_from_config(config_path))
 
         jobs = run(engine.get_jobs())
         matching = [j for j in jobs if j["name"] == "upsert-test"]
         assert len(matching) == 1
-        assert "v2" in matching[0]["command"]
+        assert "updated" in matching[0]["command"]
 
 
 # ── Unit Tests: Status ────────────────────────────────────────
@@ -1018,7 +1019,7 @@ class TestNewSchemaColumns:
             engine.create_job(
                 create_job_dict(
                     name="output-expand",
-                    command=f"{sys.executable} -c \"print('X' * 3000)\"",
+                    command=f"{shlex.quote(sys.executable)} -c \"print('X' * 3000)\"",
                 )
             )
         )
@@ -1089,7 +1090,7 @@ class TestInstanceMutex:
         con.close()
 
     def _seed_instance(self, db_path, job_id: str, status: str, instance_id: str = None):
-        """Insert a v2 instance row tied to a cron session document."""
+        """Insert a instance row tied to a cron session document."""
         import sqlite3
 
         instance_id = instance_id or f"inst-{time.monotonic_ns()}"

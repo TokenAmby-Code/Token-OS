@@ -26,7 +26,7 @@
 #   fallthrough   if no civic thread: inject activation prompt into the reservist pane
 #                 (alias: ensure). --dry-run to preview the injection.
 #
-set -uo pipefail
+set -euo pipefail
 
 STATE_DIR="${CIVIC_INVARIANT_STATE:-$HOME/.civic-invariant}"
 CIVIC_PATH_PREFIX="${CIVIC_THREAD_PATH:-/Volumes/Civic}"
@@ -47,12 +47,12 @@ _civic_rows() {
   agents-db query "SELECT id, name AS tab_name, working_dir, last_activity \
     FROM instances \
     WHERE status='working' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%' \
-    ORDER BY last_activity DESC" 2>/dev/null
+    ORDER BY last_activity DESC"
 }
 
 cmd_count() {
   agents-db query "SELECT COUNT(*) FROM instances \
-    WHERE status='working' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%'" 2>/dev/null \
+    WHERE status='working' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%'" \
     | grep -oE '[0-9]+' | tail -1
 }
 

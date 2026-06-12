@@ -428,20 +428,30 @@ async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
 
     The live legacy instance table is gone; callers that still exercise this
     repair path operate through the temporary ``legacy_instances`` projection.
-    Update canonical v2 persona/voice fields in place.
+    Update instance persona/voice fields in place.
     """
     cursor = await db.execute(
-        """SELECT i.id, p.slug
+        """SELECT i.id, p.slug, i.persona_id, i.tts_voice, i.notification_sound
            FROM instances i
            LEFT JOIN personas p ON p.id = i.persona_id
            WHERE i.status NOT IN ('stopped', 'archived')
+             AND (
+               i.persona_id IS NULL
+               OR p.slug IN ('profile_1','p','emperors-children')
+               OR i.tts_voice IS NOT p.tts_voice
+               OR i.notification_sound IS NOT p.notification_sound
+             )
            ORDER BY i.id"""
     )
     repaired = 0
-    for instance_id, slug in await cursor.fetchall():
-        target_slug = slug or "blood-angels"
+    for instance_id, slug, persona_id, _tts_voice, _notification_sound in await cursor.fetchall():
+        target_slug = slug
         if target_slug in {"profile_1", "p", "emperors-children"}:
             target_slug = "blood-angels"
+        if not target_slug and persona_id is None:
+            target_slug = "blood-angels"
+        if not target_slug:
+            continue
         persona = await resolve_persona(db, target_slug)
         if not persona:
             continue
@@ -493,7 +503,7 @@ async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
 
 
 async def active_non_retired_persona_ids(db: aiosqlite.Connection) -> set[str]:
-    """Return DB-locked personas for active, non-retired v2 instances."""
+    """Return DB-locked personas for active, non-retired instance rows."""
     locked: set[str] = set()
     instance_cols = await _table_columns(db, "instances")
     if {"persona_id", "rank"}.issubset(instance_cols):
@@ -503,7 +513,7 @@ async def active_non_retired_persona_ids(db: aiosqlite.Connection) -> set[str]:
             FROM instances
             WHERE persona_id IS NOT NULL
               AND COALESCE(rank, '') != 'retired'
-              AND COALESCE(status, 'active') NOT IN ('stopped', 'closed')
+              AND COALESCE(status, 'active') NOT IN ('stopped', 'closed', 'archived')
             """
         )
         locked.update(row[0] for row in await cursor.fetchall() if row[0])

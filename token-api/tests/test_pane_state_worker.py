@@ -356,5 +356,5 @@ def test_rename_trigger_null_does_not_enqueue_or_abort(app_env: Any) -> None:
             "SELECT tab_name FROM legacy_instances WHERE id = ?", ("inst-null",)
         ).fetchone()[0]
 
-    assert tab == "had-name", "v2 instance names are NOT NULL; NULL legacy rename is ignored"
+    assert tab == "had-name", "canonical instance names are NOT NULL; NULL legacy rename is ignored"
     assert _queue_rows(app_env.db_path, "@PANE_LABEL") == []

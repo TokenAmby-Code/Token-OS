@@ -57,7 +57,9 @@ def audit(db_path: Path) -> dict[str, Any]:
     finally:
         conn.close()
 
-    non_stopped = [row for row in rows if (row.get("status") or "") != "stopped"]
+    non_stopped = [
+        row for row in rows if (row.get("status") or "") not in {"stopped", "archived"}
+    ]
     null_all = [row for row in rows if not (row.get("engine") or "").strip()]
     populated_all = [row for row in rows if (row.get("engine") or "").strip()]
     null_non_stopped = [row for row in non_stopped if not (row.get("engine") or "").strip()]

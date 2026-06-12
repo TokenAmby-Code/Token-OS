@@ -7,9 +7,9 @@ import pytest
 
 
 # Test-only compatibility surface: older tests still exercise legacy-shaped SQL,
-# but the live DB must be seeded through instances v2.  Each sqlite3 connection
+# but the live DB must be seeded through the instances table.  Each sqlite3 connection
 # gets a TEMP view named legacy_instances plus INSTEAD OF triggers that project
-# legacy column names onto instances.  TEMP objects do not appear in the main
+# legacy column names onto the instances table.  TEMP objects do not appear in the main
 # schema, preserving the exterminatus invariant.
 def _install_legacy_instances_test_view(conn):
     try:
@@ -206,7 +206,10 @@ def _install_legacy_instances_test_view(conn):
               UPDATE instances SET
                 name = COALESCE(NEW.tab_name, name),
                 working_dir = NEW.working_dir,
-                origin_type = COALESCE(NEW.origin_type, origin_type),
+                origin_type = CASE COALESCE(NEW.origin_type, origin_type)
+                  WHEN 'hook' THEN 'api'
+                  ELSE COALESCE(NEW.origin_type, origin_type)
+                END,
                 continuity_binding_source = NEW.continuity_binding_source,
                 automated = COALESCE(NEW.automated, NEW.is_subagent, automated),
                 status = CASE COALESCE(NEW.status, status) WHEN 'processing' THEN 'working' ELSE COALESCE(NEW.status, status) END,

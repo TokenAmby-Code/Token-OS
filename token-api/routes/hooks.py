@@ -36,8 +36,8 @@ from instance_mutation import (
     create_golden_throne_binding,
     sanctioned_delete_instance,
     sanctioned_insert_instance,
-    sanctioned_update_canonical_instance,
     sanctioned_update_instance,
+    sanctioned_update_instance_record,
     sanctioned_update_runtime_fields,
 )
 from instance_registry import LEGACY_PERSONA_ALIASES
@@ -87,7 +87,7 @@ async def _launch_golden_throne_marker(
     existing_marker: str | None = None,
 ) -> str | None:
     """Map the legacy launch instance_type vocabulary onto the instances.golden_throne
-    marker (its v2 home): 'sync' → 'sync'; 'golden_throne' → a real golden_throne.id
+    marker (its durable home): 'sync' → 'sync'; 'golden_throne' → a real golden_throne.id
     (reusing an existing GT binding when present); 'one_off'/'hook_driven' → NULL.
     """
     if launch_instance_type == "sync":
@@ -463,7 +463,7 @@ async def _persona_id_by_slug(db, slug: str) -> str | None:
     return str(row[0]) if row else None
 
 
-async def _apply_canonical_commander_binding(
+async def _apply_commander_binding(
     db,
     *,
     instance_id: str,
@@ -471,16 +471,36 @@ async def _apply_canonical_commander_binding(
     parent_instance_id: str | None,
     dispatch_mode: str | None = None,
 ) -> None:
-    """Set final v2 commander semantics from SessionStart context.
+    """Set durable commander semantics from SessionStart context.
 
     Runtime dispatch target/window/slot are not stored in ``instances``; this is
     the one-time translation from launch context into durable commander routing.
     """
+    parent_instance_id = _normalize_text(parent_instance_id)
     if parent_instance_id:
+        cursor = await db.execute(
+            """SELECT id, persona_id FROM instances
+               WHERE id = ? AND status != 'archived' AND rank != 'retired'""",
+            (parent_instance_id,),
+        )
+        parent = await cursor.fetchone()
+        if parent:
+            await sanctioned_update_instance_record(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "persona_id": parent[1],
+                    "commander_type": "chapter",
+                    "commander_id": parent[0],
+                },
+                mutation_type="commander_binding_changed",
+                write_source="hooks",
+                actor="SessionStart",
+            )
         return
     mode = (_normalize_text(dispatch_mode) or "").lower()
     if mode in {"silent", "breakoff", "break-off", "break_off"}:
-        await sanctioned_update_canonical_instance(
+        await sanctioned_update_instance_record(
             db,
             instance_id=instance_id,
             updates={"commander_type": "emperor", "commander_id": None},
@@ -500,7 +520,7 @@ async def _apply_canonical_commander_binding(
     commander_persona_id = await _persona_id_by_slug(db, commander_slug)
     if commander_persona_id is None:
         return
-    await sanctioned_update_canonical_instance(
+    await sanctioned_update_instance_record(
         db,
         instance_id=instance_id,
         updates={
@@ -600,7 +620,7 @@ async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) ->
         "input_lock": None,
         "stopped_at": datetime.now().isoformat(),
     }
-    # Legacy `synced=0` cleared the morning-session sync flag. Its v2 home is the
+    # Legacy `synced=0` cleared the morning-session sync flag. Its durable home is the
     # golden_throne marker: clear it ONLY when it is the 'sync' sentinel — a real
     # golden_throne.id binding must survive (the dead-pane GT follow-up below
     # depends on it).
@@ -862,7 +882,7 @@ async def _consume_state_injections(db, audience_instance_id: str) -> list[dict]
 
 
 def _row_parent_instance_id(row: dict) -> str | None:
-    """Legacy `parent_instance_id` derived from the v2 commander edge: only a
+    """Legacy `parent_instance_id` derived from the canonical commander edge: only a
     `commander_type='chapter'` edge carries a parent instance id (the column died
     with legacy instance table). Works for raw `SELECT *` rows that lack the alias."""
     if row.get("parent_instance_id") is not None:
@@ -1989,7 +2009,7 @@ async def handle_session_start(payload: dict) -> dict:
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (session_id,))
         existing_row = await cursor.fetchone()
 
-        # Legacy-shaped derivations off the v2 row (these columns died with
+        # Legacy-shaped derivations off the instance row (these columns died with
         # legacy instance table): parent_instance_id lives in commander_id when the
         # commander edge is a chapter; primarch identity lives in persona_id.
         existing_parent_id = (
@@ -2153,7 +2173,7 @@ async def handle_session_start(payload: dict) -> dict:
 
                 # Same-ID transplant (--continue): update the existing row in-place.
                 # pid died with legacy instance table; the commander edge (legacy
-                # parent_instance_id) is applied by _apply_canonical_commander_binding
+                # parent_instance_id) is applied by _apply_commander_binding
                 # below; primarch/instance_type land on persona_id/golden_throne.
                 now = datetime.now().isoformat()
                 transplant_updates = {
@@ -2215,7 +2235,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_window=dispatch_window,
                     dispatch_slot=dispatch_slot,
                 )
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2277,7 +2297,7 @@ async def handle_session_start(payload: dict) -> dict:
                         session_id[:12],
                         exc,
                     )
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2318,7 +2338,7 @@ async def handle_session_start(payload: dict) -> dict:
                 # a live pane cannot remain represented by a stale stopped row.
                 now = datetime.now().isoformat()
                 # pid died with legacy instance table; the commander edge (legacy
-                # parent_instance_id) is applied by _apply_canonical_commander_binding
+                # parent_instance_id) is applied by _apply_commander_binding
                 # below; instance_type lands on the golden_throne marker.
                 updates = {
                     "working_dir": working_dir,
@@ -2375,7 +2395,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_window=dispatch_window,
                     dispatch_slot=dispatch_slot,
                 )
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2416,7 +2436,7 @@ async def handle_session_start(payload: dict) -> dict:
                     or mechanicus_subscription.get("existing")
                 ):
                     await db.commit()
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2512,7 +2532,7 @@ async def handle_session_start(payload: dict) -> dict:
                 # Update the old row with new session identity, preserve config.
                 # pid/session_id died with legacy instance table; the commander edge
                 # (legacy parent_instance_id) is applied by
-                # _apply_canonical_commander_binding below.
+                # _apply_commander_binding below.
                 supplant_updates = {
                     "id": session_id,
                     "working_dir": working_dir,
@@ -2573,7 +2593,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_window=dispatch_window,
                     dispatch_slot=dispatch_slot,
                 )
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2582,7 +2602,7 @@ async def handle_session_start(payload: dict) -> dict:
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["name"])
 
-                await _apply_canonical_commander_binding(
+                await _apply_commander_binding(
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
@@ -2815,7 +2835,7 @@ async def handle_session_start(payload: dict) -> dict:
         # Insert instance. session_id/source_ip/pid died with legacy instance table
         # (the instance id IS the session uuid); legacy-shaped keys below
         # (tab_name/legion/primarch/parent_instance_id/registered_at) are
-        # auto-canonicalized by sanctioned_insert_instance.
+        # normalized by sanctioned_insert_instance.
         now = datetime.now().isoformat()
         launch_marker = await _launch_golden_throne_marker(
             db, launch_instance_type, zealotry=launch_zealotry
@@ -2870,7 +2890,7 @@ async def handle_session_start(payload: dict) -> dict:
             dispatch_window=dispatch_window,
             dispatch_slot=dispatch_slot,
         )
-        await _apply_canonical_commander_binding(
+        await _apply_commander_binding(
             db,
             instance_id=session_id,
             dispatch_target=dispatch_target,
@@ -3019,7 +3039,7 @@ async def handle_session_start(payload: dict) -> dict:
                     wrapper_launch_id=wrapper_launch_id,
                 )
 
-        await _apply_canonical_commander_binding(
+        await _apply_commander_binding(
             db,
             instance_id=session_id,
             dispatch_target=dispatch_target,
@@ -3222,7 +3242,7 @@ async def handle_session_end(payload: dict) -> dict:
             "next_required_action": None,
             "next_action_owner": None,
         }
-        # Legacy `synced=0` cleared the morning-session sync flag. Its v2 home is the
+        # Legacy `synced=0` cleared the morning-session sync flag. Its durable home is the
         # golden_throne marker: clear it ONLY when it is the 'sync' sentinel — a real
         # golden_throne.id binding survives the session ending.
         if _gt_marker == "sync":
@@ -3577,7 +3597,7 @@ async def handle_stop(payload: dict) -> dict:
     # Sync instances never go idle (permanent processing until SessionEnd).
     # Golden throne / one-off: evaluators write idle on pass, or stay processing on nudge.
     now = datetime.now().isoformat()
-    # Legacy instance_type derived from the golden_throne marker (its v2 home):
+    # Legacy instance_type derived from the golden_throne marker (its durable home):
     # 'sync' marker → sync; any other non-null marker (a golden_throne.id) →
     # golden_throne; NULL → one_off.
     _gt_marker = instance.get("golden_throne")

@@ -26,9 +26,9 @@ RECONCILIATION_SUSPICIOUS = {
     "projection_drift",
 }
 
-# Tracked mutation surface = v2 identity + runtime annex. Legacy column names
+# Tracked mutation surface = durable identity + runtime annex. Legacy column names
 # (tab_name/legion/synced/instance_type/primarch/parent_instance_id/tts_mode/pid)
-# died with the legacy instance table extraction; their v2 homes are name/persona_id/
+# died with the legacy instance table extraction; their durable homes are name/persona_id/
 # golden_throne/commander_*/notification_mode+interaction_mode.
 INSTANCE_MUTATION_FIELDS = {
     # identity
@@ -96,7 +96,7 @@ INSTANCE_MUTATION_FIELDS = {
     "is_subagent",
 }
 
-# Canonical v2 registry columns. These deliberately exclude every raw tmux pane
+# Canonical registry columns. These deliberately exclude every raw tmux pane
 # id and tmuxctl positional/cardinal field. Token-API may return live runtime
 # resolution data, but the DB must not persist it; tmuxctl is the oracle.
 CANONICAL_INSTANCE_FIELDS = set(INSTANCE_COLUMNS)
@@ -120,7 +120,7 @@ def _persona_id_for_row_sync(db, row: dict) -> int | None:
     return found[0] if found else row.get("persona_id")
 
 
-def _canonical_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
+def _instance_values_from_legacy_row(row: dict | None, persona_id: int | None = None) -> dict:
     if not row:
         return {}
     if set(INSTANCE_COLUMNS).issubset(row.keys()):
@@ -166,7 +166,7 @@ def _assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
     assert_no_runtime_tmux_fields(values, context=context)
 
 
-# The dual-write mirror layer (mirror_instance_to_canonical*) died with the
+# The dual-write mirror layer (mirror_instance_to_legacy*) died with the
 # legacy instance table extraction: every sanctioned write now lands directly on
 # `instances`, the one physical table.
 
@@ -194,7 +194,7 @@ async def create_golden_throne_binding(
     return str(cursor.lastrowid)
 
 
-async def _fetch_canonical_instance_row(db, instance_id: str) -> dict | None:
+async def _fetch_instance_record(db, instance_id: str) -> dict | None:
     previous_factory = getattr(db, "row_factory", None)
     db.row_factory = aiosqlite.Row
     try:
@@ -205,7 +205,7 @@ async def _fetch_canonical_instance_row(db, instance_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def sanctioned_update_canonical_instance(
+async def sanctioned_update_instance_record(
     db,
     *,
     instance_id: str,
@@ -215,10 +215,10 @@ async def sanctioned_update_canonical_instance(
     actor: str,
     wrapper_launch_id: str | None = None,
 ) -> dict:
-    assert_no_runtime_tmux_fields(updates, context="sanctioned_update_canonical_instance")
-    before_row = await _fetch_canonical_instance_row(db, instance_id)
+    assert_no_runtime_tmux_fields(updates, context="sanctioned_update_instance_record")
+    before_row = await _fetch_instance_record(db, instance_id)
     if before_row is None:
-        raise LookupError(f"Canonical instance not found: {instance_id}")
+        raise LookupError(f"Instance not found: {instance_id}")
 
     changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
     assignments = ", ".join(f"{field} = ?" for field in updates)
@@ -227,7 +227,7 @@ async def sanctioned_update_canonical_instance(
         [*updates.values(), instance_id],
     )
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned canonical update matched no rows for {instance_id}")
+        raise LookupError(f"Sanctioned instance-record update matched no rows for {instance_id}")
 
     after_row = dict(before_row)
     after_row.update(updates)
@@ -268,6 +268,8 @@ async def sanctioned_update_runtime_fields(
     General sanctioned updates still refuse tmux fields; pane/dispatch
     geometry may only flow through here, so every rebind has provenance.
     """
+    if not updates:
+        raise ValueError("no fields to update")
     forbidden = set(updates) - RUNTIME_TMUX_FIELDS
     if forbidden:
         raise ValueError(
@@ -322,6 +324,8 @@ def sanctioned_update_runtime_fields_sync(
     wrapper_launch_id: str | None = None,
 ) -> dict:
     """Sync twin of sanctioned_update_runtime_fields."""
+    if not updates:
+        raise ValueError("no fields to update")
     forbidden = set(updates) - RUNTIME_TMUX_FIELDS
     if forbidden:
         raise ValueError(
@@ -400,7 +404,7 @@ def _parse_json_column(value):
 
 
 async def _fetch_instance_row(db, instance_id: str) -> dict | None:
-    return await _fetch_canonical_instance_row(db, instance_id)
+    return await _fetch_instance_record(db, instance_id)
 
 
 def _subset_from_row(row: dict | None, fields: list[str]) -> dict | None:
@@ -503,6 +507,8 @@ async def sanctioned_update_instance(
     where_clause: str | None = None,
     where_params: tuple | list | None = None,
 ) -> dict:
+    if not updates:
+        raise ValueError("no fields to update")
     before_row = await _fetch_instance_row(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -576,6 +582,8 @@ def sanctioned_update_instance_sync(
     where_clause: str | None = None,
     where_params: tuple | list | None = None,
 ) -> dict:
+    if not updates:
+        raise ValueError("no fields to update")
     before_row = _fetch_instance_row_sync(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -635,34 +643,36 @@ async def sanctioned_insert_instance(
 ) -> dict:
     """Insert a new row into `instances` (the one physical table).
 
-    Accepts both v2-shaped and transitional legacy-shaped value dicts;
-    everything is canonicalized through legacy_row_to_instance_values
+    Accepts both instance-shaped and transitional legacy-shaped value dicts;
+    everything is normalized through legacy_row_to_instance_values
     (legion/profile_name resolve to persona_id, parent_instance_id to a
     chapter commander edge, tts_mode to notification/interaction modes).
     """
     _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance")
-    canonical = _canonical_instance_values(values, await _persona_id_for_row(db, values))
-    canonical = await _prepare_chapter_commander(db, canonical)
-    if not canonical.get("id"):
+    instance_values = _instance_values_from_legacy_row(
+        values, await _persona_id_for_row(db, values)
+    )
+    instance_values = await _prepare_chapter_commander(db, instance_values)
+    if not instance_values.get("id"):
         raise ValueError("sanctioned_insert_instance requires an id")
-    columns = [column for column in INSTANCE_COLUMNS if column in canonical]
+    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
     placeholders = ", ".join("?" for _ in columns)
     await db.execute(
         f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
-        [canonical[column] for column in columns],
+        [instance_values[column] for column in columns],
     )
 
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     field_names = [field for field in columns if field in tracked]
-    after = {field: canonical.get(field) for field in field_names}
+    after = {field: instance_values.get(field) for field in field_names}
     write_txn_id = str(uuid.uuid4())
     await _append_instance_mutation(
         db,
-        instance_id=canonical["id"],
+        instance_id=instance_values["id"],
         mutation_type=mutation_type,
         write_source=write_source,
         actor=actor,
-        wrapper_launch_id=wrapper_launch_id or canonical.get("wrapper_launch_id"),
+        wrapper_launch_id=wrapper_launch_id or instance_values.get("wrapper_launch_id"),
         write_txn_id=write_txn_id,
         field_names=field_names,
         before=None,
@@ -687,28 +697,28 @@ def sanctioned_insert_instance_sync(
 ) -> dict:
     """Sync twin of sanctioned_insert_instance."""
     _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance_sync")
-    canonical = _canonical_instance_values(values, _persona_id_for_row_sync(db, values))
-    canonical = _prepare_chapter_commander_sync(db, canonical)
-    if not canonical.get("id"):
+    instance_values = _instance_values_from_legacy_row(values, _persona_id_for_row_sync(db, values))
+    instance_values = _prepare_chapter_commander_sync(db, instance_values)
+    if not instance_values.get("id"):
         raise ValueError("sanctioned_insert_instance_sync requires an id")
-    columns = [column for column in INSTANCE_COLUMNS if column in canonical]
+    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
     placeholders = ", ".join("?" for _ in columns)
     db.execute(
         f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
-        [canonical[column] for column in columns],
+        [instance_values[column] for column in columns],
     )
 
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     field_names = [field for field in columns if field in tracked]
-    after = {field: canonical.get(field) for field in field_names}
+    after = {field: instance_values.get(field) for field in field_names}
     write_txn_id = str(uuid.uuid4())
     _append_instance_mutation_sync(
         db,
-        instance_id=canonical["id"],
+        instance_id=instance_values["id"],
         mutation_type=mutation_type,
         write_source=write_source,
         actor=actor,
-        wrapper_launch_id=wrapper_launch_id or canonical.get("wrapper_launch_id"),
+        wrapper_launch_id=wrapper_launch_id or instance_values.get("wrapper_launch_id"),
         write_txn_id=write_txn_id,
         field_names=field_names,
         before=None,

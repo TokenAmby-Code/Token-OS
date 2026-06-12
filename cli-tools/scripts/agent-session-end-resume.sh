@@ -6,7 +6,7 @@
 # should stage the same resume surface as tmux-instance-exit: dispatch resolves
 # cwd/engine from Token-API by instance id, and --pane self resumes in-place.
 
-set -uo pipefail
+set -euo pipefail
 
 AGENT="${1:-${HOOK_AGENT:-agent}}"
 INPUT="$(cat 2>/dev/null || printf '{}')"

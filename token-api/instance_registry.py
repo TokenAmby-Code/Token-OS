@@ -1,12 +1,12 @@
-"""Canonical instance registry v2 helpers.
+"""Instance registry helpers.
 
 The ``instances`` table is the durable registry and — post legacy instance table
 exterminatus — the ONE physical instance table. It has two column tiers:
 
-* IDENTITY_COLUMNS: the durable v2 registry charter (persona/rank/commander/
+* IDENTITY_COLUMNS: the durable instance registry charter (persona/rank/commander/
   origin). Authoritative, never derived from anywhere else.
 * RUNTIME_ANNEX_COLUMNS: transitional runtime/workflow fields inherited from
-  the extracted the legacy instance table table. Each is slated for per-column
+  the extracted legacy instance table. Each is slated for per-column
   demolition as its successor lands (tmux @INSTANCE_ID stamps for pane
   geometry, the golden_throne table for GT state, status enum for workflow/
   planning). New code must not grow this list.
@@ -108,7 +108,7 @@ RUNTIME_ANNEX_COLUMNS = [
 INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
 
 # Legacy legacy instance table columns with NO live home: their values exist only in
-# archive.db. Reads repoint to the v2 derivation noted inline.
+# archive.db. Reads repoint to the instance-table derivation noted inline.
 REMOVED_INSTANCE_COLUMNS = {
     "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
     "session_id",  # archive-only
@@ -216,13 +216,13 @@ def golden_throne_binding(row: dict) -> str | None:
 
 
 def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
-    """Map a legacy legacy instance table row into final instances columns."""
+    """Map a legacy instance table row into instances-table columns."""
     if not row:
         return {}
     status = normalize_status(row.get("status"))
     is_chapter_child = bool(row.get("parent_instance_id")) or bool(row.get("is_subagent"))
     if row.get("commander_type"):
-        # explicit v2 shape wins over the legacy parent_instance_id derivation
+        # explicit instance-table shape wins over the legacy parent_instance_id derivation
         commander_type = row["commander_type"]
         commander_id = row.get("commander_id")
     elif row.get("parent_instance_id"):

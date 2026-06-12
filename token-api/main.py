@@ -1820,7 +1820,7 @@ async def register_instance(request: InstanceRegisterRequest):
         profile = persona_to_profile(persona)
 
         # Insert into the legacy compatibility table, then mirror to the canonical
-        # tmux-free v2 registry. The mirror deliberately drops pane ids/position
+        # tmux-free instance registry. The mirror deliberately drops pane ids/position
         # fields; tmuxctl remains the runtime resolution oracle.
         now = datetime.now().isoformat()
         instance_values = {
@@ -3687,7 +3687,7 @@ async def _fetch_coderabbit_comments(repo: str, pr_number: str) -> dict:
     Mirrors pr-review-loop's calls: inline review comments, issue (summary)
     comments filtered to the CodeRabbit bot, and the `coderabbit` commit-status
     context for terminality (REST has no reliable per-thread `resolved` field —
-    true thread resolution is GraphQL-only and deferred to v2).
+    true thread resolution is GraphQL-only and deferred to a future pass).
 
     Fetches are FULLY paginated (`--paginate`) and ALL-OR-NOTHING: any failed or
     incomplete fetch — a list call that errors, PR metadata that isn't a dict, a
@@ -6527,12 +6527,12 @@ _PANE_LABEL_REPAIR_MIN_INTERVAL_SECONDS = 30.0
 
 
 def _schedule_pane_label_repair(candidates: list[dict]) -> None:
-    # Retired with instances v2. Pane labels are tmuxctl runtime state, not DB state.
+    # Retired with instances. Pane labels are tmuxctl runtime state, not DB state.
     return
 
 
 async def _repair_missing_pane_labels(candidates: list[dict]) -> None:
-    # Retired with instances v2. Kept only so stale imports/tests fail benignly.
+    # Retired with instances. Kept only so stale imports/tests fail benignly.
     return
 
 
@@ -10129,10 +10129,10 @@ async def set_instance_type(instance_id: str, request: Request):
         if not instance:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        # Legacy instance_type derived from v2 state: status='archived' → archived;
+        # Legacy instance_type derived from instance state: status='archived' → archived;
         # golden_throne='sync' → sync; any other non-null marker (a golden_throne.id)
         # → golden_throne; NULL → one_off. The instance_type column died with
-        # instances; its v2 home is the golden_throne marker.
+        # instances; its durable home is the golden_throne marker.
         _gt_marker = instance["golden_throne"]
         if instance["status"] == "archived":
             old_type = "archived"
@@ -10166,8 +10166,21 @@ async def set_instance_type(instance_id: str, request: Request):
         if zealotry_value is not None:
             updates["zealotry"] = zealotry_value
 
-        # Translate the requested type onto the golden_throne marker (its v2 home).
+        # Translate the requested type onto the golden_throne marker (its durable home).
         if new_type == "sync":
+            cursor = await db.execute(
+                """SELECT id FROM instances
+                   WHERE persona_id IS ? AND golden_throne = 'sync'
+                     AND status NOT IN ('stopped', 'archived') AND id != ?
+                   LIMIT 1""",
+                (instance["persona_id"], instance_id),
+            )
+            conflict = await cursor.fetchone()
+            if conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"matching persona already has a synced session: {conflict[0][:12]}",
+                )
             updates["golden_throne"] = "sync"
         elif new_type == "one_off":
             updates["golden_throne"] = None
@@ -10241,7 +10254,7 @@ async def archive_instance(instance_id: str):
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        # Archived is a v2 status; the legacy instance_type='archived' marker died.
+        # Archived is a canonical status; the legacy instance_type='archived' marker died.
         # Clear the golden_throne marker so an archived row carries no GT state.
         await sanctioned_update_instance(
             db,
@@ -10437,7 +10450,7 @@ async def list_instances(
                 "notification_sound": row.pop("persona_notification_sound", None),
             }
             # Compatibility aliases for older tmux-facing callers while storage
-            # remains the final v2 shape.
+            # remains the final instance shape.
             row["tab_name"] = row.get("name")
             row["profile_name"] = row["persona"].get("slug")
             row["tts_voice"] = row["persona"].get("tts_voice")
@@ -14280,7 +14293,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             )
 
         print("    BLOCKED: no break time, no productivity")
-        # v2: Start enforcement cascade instead of Shizuku disable
+        # Start enforcement cascade instead of Shizuku disable
         if is_quiet_hours():
             await log_quiet_hours_suppressed(
                 source="phone_detection",
@@ -14356,8 +14369,8 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     Handle phone system events from MacroDroid.
 
     Events:
-    - app_open: v2 telemetry — app opened (routes through distraction detection)
-    - app_close: v2 telemetry — app closed (stops enforcement cascade)
+    - app_open: current telemetry — app opened (routes through distraction detection)
+    - app_close: current telemetry — app closed (stops enforcement cascade)
     - app_playback: YouTube playback edge via {"app":"Youtube","play":true|false}
     - discord_fallback_received: phone confirmed it received Discord relay
     - shizuku_died: Shizuku service stopped (legacy, kept for transition)
@@ -14484,7 +14497,7 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
             f">>> /phone/event geofence: raw={raw_trigger!r} -> location={location!r} action={action!r}"
         )
 
-        loc_req = LocationEventRequest(location=location, action=action, source="macrodroid_v2")
+        loc_req = LocationEventRequest(location=location, action=action, source="macrodroid")
         result = await handle_location_event(loc_req)
         return {
             "received": True,
@@ -14495,7 +14508,7 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
             "result": result,
         }
 
-    # ---- v2 Discord fallback acknowledgement ----
+    # ---- canonical Discord fallback acknowledgement ----
     elif event == "discord_fallback_received":
         logger.info("Discord fallback received by phone")
         PHONE_STATE["reachable"] = True
@@ -16864,7 +16877,7 @@ def _ops_parse_duration_seconds(value: str | int | float | None, default: int) -
 
 
 def _ops_timer_mode_rate(mode: str | None) -> int:
-    """Timer v2 signed balance rate in ms/ms for history reconstruction."""
+    """Timer canonical signed balance rate in ms/ms for history reconstruction."""
     normalized = (mode or "").lower()
     if normalized == TimerMode.WORKING.value:
         return 1

@@ -122,7 +122,7 @@ class TestSchema:
         ).fetchall()
         conn.close()
         index_names = {row[0] for row in indices}
-        assert "idx_instances_v2_gt" in index_names
+        assert "idx_instances_gt" in index_names
 
     def test_workflow_columns_exist(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
@@ -403,6 +403,11 @@ class TestCivicAutoDetect:
         row = _get_instance(sid)
         assert row is not None
         assert row["primarch"] is None
+        with sqlite3.connect(_TEST_DB_PATH) as conn:
+            persona_id = conn.execute(
+                "SELECT persona_id FROM instances WHERE id = ?", (sid,)
+            ).fetchone()[0]
+        assert persona_id is None
 
     def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
         import shared
@@ -435,6 +440,11 @@ class TestCivicAutoDetect:
         row = _get_instance(sid)
         assert row is not None
         assert row["primarch"] is None
+        with sqlite3.connect(_TEST_DB_PATH) as conn:
+            persona_id = conn.execute(
+                "SELECT persona_id FROM instances WHERE id = ?", (sid,)
+            ).fetchone()[0]
+        assert persona_id is None
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())

@@ -1,5 +1,5 @@
 """
-Canonical SQLite schema and migrations for Token-API.
+SQLite schema and migrations for Token-API.
 
 All bootstrap paths should go through this module:
 - FastAPI startup
@@ -257,7 +257,7 @@ async def _repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
     return changed
 
 
-async def _ensure_instances_v2(db) -> None:
+async def _ensure_instances(db) -> None:
     await db.execute("PRAGMA foreign_keys=ON")
     await ensure_personas_table(db)
 
@@ -303,9 +303,9 @@ async def _ensure_instances_v2(db) -> None:
             await db.execute("DROP TABLE instances")
     if needs_rebuild:
         await _create_instances_table(db)
-        # Existing v2 rows are the ONLY rebuild source. The legacy
+        # Existing instance rows are the ONLY rebuild source. The legacy
         # claude_instances projection is gone: it used to take priority here,
-        # clobbering v2 identity with table defaults (rank/commander/origin)
+        # clobbering instance identity with table defaults (rank/commander/origin)
         # and resurrecting ghost rows. Legacy data is extracted to archive.db
         # by _extract_claude_instances() instead.
         source_rows = old_rows
@@ -330,13 +330,13 @@ async def _ensure_instances_v2(db) -> None:
             f"instances table schema mismatch: expected {INSTANCE_COLUMNS}, got {sorted(columns)}"
         )
 
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_v2_status ON instances(status)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_v2_device ON instances(device_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON instances(device_id)")
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_instances_v2_persona_active ON instances(persona_id, rank)"
+        "CREATE INDEX IF NOT EXISTS idx_instances_persona_active ON instances(persona_id, rank)"
     )
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_instances_v2_commander ON instances(commander_type, commander_id)"
+        "CREATE INDEX IF NOT EXISTS idx_instances_commander ON instances(commander_type, commander_id)"
     )
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_fk_guard")
     await db.execute("""
@@ -473,11 +473,11 @@ async def _ensure_instances_v2(db) -> None:
 
 # ── claude_instances exterminatus ────────────────────────────────────────────
 # One-shot, idempotent, reversible extraction of the legacy table into
-# archive.db. After this runs, `instances` (v2) is the sole live instance
+# archive.db. After this runs, `instances` is the sole live instance
 # table; the legacy data survives ONLY in the archive.
 
 _LEGACY_FK_REBUILDS = {
-    # canonical FK-free DDL for tables whose historical CREATE carried
+    # replacement FK-free DDL for tables whose historical CREATE carried
     # `REFERENCES claude_instances(id)` — left in place, those FKs would
     # poison every insert after the drop (PRAGMA foreign_keys=ON).
     "workflow_events": """
@@ -559,9 +559,9 @@ async def _copy_legacy_table_to_archive(db, archive_path: Path) -> None:
 
 
 async def _backfill_annex_from_legacy(db) -> None:
-    """Fill runtime-annex (and NULL identity gaps) on live v2 rows from legacy rows.
+    """Fill runtime-annex (and NULL identity gaps) on live instance rows from legacy rows.
 
-    v2 identity always wins: persona_id/golden_throne are filled only when
+    instance identity always wins: persona_id/golden_throne are filled only when
     NULL. Legacy-only rows (no matching instances.id) stay archive-only.
     """
     db.row_factory = aiosqlite.Row
@@ -720,7 +720,7 @@ def restore_claude_instances_from_archive(db_path: Path | None = None) -> int:
 
 
 async def init_database_async(db_path: Path | None = None) -> None:
-    """Initialize the SQLite database with the canonical schema and migrations."""
+    """Initialize the SQLite database with the managed schema and migrations."""
     db_path = db_path or DEFAULT_DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -738,16 +738,16 @@ async def init_database_async(db_path: Path | None = None) -> None:
             if repaired_personas:
                 print(f"Repaired {repaired_personas} legacy active persona assignments")
 
-        await _ensure_instances_v2(db)
+        await _ensure_instances(db)
         await _extract_claude_instances(db, db_path)
 
         # Annex-era indexes on the surviving predicates (golden_throne marker
         # replaced legion/synced; discord routing reads the annex columns).
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_v2_gt ON instances(golden_throne, status)"
+            "CREATE INDEX IF NOT EXISTS idx_instances_gt ON instances(golden_throne, status)"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_instances_v2_discord ON instances(discord_channel, status)"
+            "CREATE INDEX IF NOT EXISTS idx_instances_discord ON instances(discord_channel, status)"
         )
 
         await db.execute("""
@@ -1432,7 +1432,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
         # ── Legacy Pane Recolor System (retired) ─────────────────────
         # The DB triggers + 1s polling worker are gone. Pane tint is now applied
         # event-driven at lifecycle moments that actually change it (persona
-        # register/change, pane rebind, vacate, close) from canonical
+        # register/change, pane rebind, vacate, close) from the managed table
         # instances.persona_id → personas.pane_tint. Disable the old writers but
         # do not drop the historical queue table/rows.
         await db.execute("DROP TRIGGER IF EXISTS trg_legion_recolor")
@@ -1442,7 +1442,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
         # Trigger-driven pane variable updates. Any status change on instances
         # queues a tmux set-option, so @CC_STATE stays in sync without caller
         # cooperation. Post-exterminatus these triggers live on `instances` and
-        # push the v2 status vocabulary (working/questioning/... not processing);
+        # push the instance status vocabulary (working/questioning/... not processing);
         # @CC_STATE consumers accept both vocabularies during the transition.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pane_state_queue (

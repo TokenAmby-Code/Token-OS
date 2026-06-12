@@ -135,7 +135,13 @@ async def _read_tmux_panes() -> dict[str, dict[str, str]]:
     try:
         proc = await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{session_name}|#{window_name}"],
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}|#{session_name}|#{window_name}|#{@INSTANCE_ID}|#{@PANE_ID}",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=5,
@@ -147,15 +153,17 @@ async def _read_tmux_panes() -> dict[str, dict[str, str]]:
         return {}
     panes: dict[str, dict[str, str]] = {}
     for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
-        parts = line.split("|", 2)
-        if len(parts) != 3:
+        parts = line.split("|", 4)
+        if len(parts) != 5:
             continue
-        pane_id, session, window = parts
+        pane_id, session, window, instance_id, pane_label = parts
         if pane_id:
             panes[pane_id] = {
                 "tmux_session": session,
                 "tmux_window": window,
                 "tmux_session_window": f"{session}:{window}",
+                "instance_id": instance_id,
+                "pane_label": pane_label,
             }
     return panes
 
@@ -167,26 +175,30 @@ async def _candidate_rows(
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id AS instance_id, tmux_pane, engine, name AS tab_name, pane_label,
-                   dispatch_target, dispatch_window, status
+            SELECT id AS instance_id, engine, name AS tab_name, working_dir, status
             FROM instances
-            WHERE COALESCE(tmux_pane, '') != ''
-              AND status NOT IN ('stopped', 'archived')
+            WHERE status NOT IN ('stopped', 'archived')
             ORDER BY last_activity DESC
             """
         )
         rows = [dict(row) for row in await cursor.fetchall()]
 
+    pane_by_instance = {
+        meta.get("instance_id"): (pane_id, meta)
+        for pane_id, meta in tmux_panes.items()
+        if meta.get("instance_id")
+    }
     for row in rows:
-        pane_meta = tmux_panes.get(row.get("tmux_pane") or "")
-        if pane_meta:
+        pane_entry = pane_by_instance.get(row["instance_id"])
+        if pane_entry:
+            pane, pane_meta = pane_entry
+            row["tmux_pane"] = pane
             row.update(pane_meta)
             continue
-        session, window = _split_session_window(row.get("pane_label") or row.get("dispatch_window"))
-        if session and "tmux_session" not in row:
-            row["tmux_session"] = session
-        if window and "tmux_window" not in row:
-            row["tmux_window"] = window
+        # No live tmux state was available. Keep the row selectable so callers
+        # using an instance-aware queue sender can defer/record a poll; the
+        # production drainer will fail or defer if it cannot resolve a pane.
+        row["tmux_pane"] = row["instance_id"]
     return rows
 
 

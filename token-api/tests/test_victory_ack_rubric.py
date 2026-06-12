@@ -140,12 +140,10 @@ def _seed_instance_doc(db_path: Path, doc_path: Path, *, tab_name: str | None, l
     doc_id = cur.lastrowid
     if link:
         conn.execute(
-            """INSERT INTO legacy_instances
-               (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, session_doc_id)
-               VALUES ('inst-va', 'sess-va', ?, '/tmp', 'local', 'Mac-Mini',
-                       'idle', ?)""",
-            (tab_name, doc_id),
+            """INSERT INTO instances
+               (id, name, working_dir, origin_type, device_id, status, session_doc_id)
+               VALUES ('inst-va', ?, '/tmp', 'local', 'Mac-Mini', 'idle', ?)""",
+            (tab_name or "", doc_id),
         )
     conn.commit()
     conn.close()
@@ -231,7 +229,12 @@ async def test_victory_ack_blocks_on_null_named_instance(app_env, monkeypatch) -
     doc = _write_doc(app_env.db_path.parent, "victory:\n  instance_named: false")
     doc_id = _seed_instance_doc(app_env.db_path, doc, tab_name=None, link=True)
 
-    await main._victory_ack_core(doc_id, "done", [])
+    with pytest.raises(HTTPException) as exc:
+        await main._victory_ack_core(doc_id, "done", [])
+
+    assert exc.value.status_code == 409
+    assert "instance_named" in exc.value.detail["missing"]
+    assert _doc_status(app_env.db_path, doc_id) == "active"
 
 
 @pytest.mark.asyncio

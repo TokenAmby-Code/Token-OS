@@ -21,6 +21,21 @@ def _set_short_durations(shared, t1=0.05, t2=0.05, t3=0.05):
     shared.ASKQ_T3_SECONDS = t3
 
 
+async def _wait_for_file_contains(path: Path, needle: str, timeout: float = 1.0) -> str:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_text = ""
+    while True:
+        if path.exists():
+            last_text = path.read_text(encoding="utf-8")
+            if needle in last_text:
+                return last_text
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"timed out waiting for {needle!r} in {path}; last_text={last_text!r}"
+            )
+        await asyncio.sleep(0.01)
+
+
 @pytest.fixture
 def ladder_env(app_env, monkeypatch):
     """app_env + ladder durations slammed down to a few ms for fast tests."""
@@ -117,8 +132,8 @@ def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
         await hooks._askq_ladder_start(
             sid, "Pick a path?", ["A", "B"], {"tmux_pane": "%9", "device_id": "Mac-Mini"}
         )
-        # Wait long enough for T1 + T2 + T3 to all elapse (each is 0.05s).
-        await asyncio.sleep(0.4)
+        task = shared.ASKQ_LADDER[sid]["task"]
+        await asyncio.wait_for(task, timeout=1)
 
         assert level1_calls == [(sid, "Pick a path?")]
         assert level2_calls == [(sid, "Pick a path?")]
@@ -219,15 +234,13 @@ def test_l2_persists_unanswered(ladder_env, monkeypatch):
             ["A"],
             {"tab_name": "palace:SE", "legion": "custodes", "tmux_pane": "%0"},
         )
-        # Wait past L2 but cancel before L3.
-        await asyncio.sleep(0.2)
+        unanswered_path = Path(hooks._imperium_env_root()) / "Terra" / "Inbox" / "Unanswered.md"
+        unanswered = await _wait_for_file_contains(unanswered_path, "Where to?", timeout=1.0)
         await hooks._askq_ladder_cancel(sid, reason="test_cleanup")
+        return unanswered
 
-    asyncio.run(run())
+    unanswered = asyncio.run(run())
 
-    unanswered = (Path(hooks._imperium_env_root()) / "Terra" / "Inbox" / "Unanswered.md").read_text(
-        encoding="utf-8"
-    )
     assert 'title: "Unanswered Questions"' in unanswered
     assert "Where to?" in unanswered
 
@@ -327,13 +340,15 @@ def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
     monkeypatch.setattr(hooks, "_askq_send_bust_prompt", fake_send_bust)
 
     async def run():
+        sid = "persist-bust"
         await hooks._askq_ladder_start(
-            "persist-bust",
+            sid,
             "Are you there?",
             ["Yes"],
             {"tab_name": "watch", "legion": "custodes", "tmux_pane": "%1"},
         )
-        await asyncio.sleep(0.4)
+        task = hooks.ASKQ_LADDER[sid]["task"]
+        await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(run())
 

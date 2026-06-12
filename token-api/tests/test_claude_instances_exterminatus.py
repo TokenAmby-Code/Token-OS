@@ -1,16 +1,16 @@
-"""Exterminatus tests: `claude_instances` is extracted to archive.db, v2 `instances` is sole truth.
+"""Exterminatus tests: `claude_instances` is extracted to archive.db, `instances` is sole truth.
 
 Written RED-first for the claude-instances-archive-extraction branch:
 - fresh DBs never create `claude_instances`
 - existing DBs get a one-shot, idempotent, reversible extraction into
   `<db dir>/archive/archive.db` (row counts verified), then the live table drops
-- v2 `instances` rows are authoritative on merge; legacy rows only backfill
+- `instances` rows are authoritative on merge; legacy rows only backfill
   runtime-annex fields; legacy-only rows stay in the archive
 - `instance_mutations`/`workflow_events` are rebuilt without the FK to
   `claude_instances` so provenance logging survives the drop
-- pane_state_queue triggers live on `instances` and push v2 status vocab
+- pane_state_queue triggers live on `instances` and push instance status vocab
 - sanctioned writes touch only `instances`
-- legacy PATCH endpoints (/legion, /synced, /type) write v2 semantics
+- legacy PATCH endpoints (/legion, /synced, /type) write instance-table semantics
 """
 
 import sqlite3
@@ -69,8 +69,8 @@ LEGACY_ONLY_ID = "22222222-2222-2222-2222-222222222222"
 def legacy_seed(tmp_path):
     """Build a pre-extraction agents.db BEFORE app_env's init runs.
 
-    Mirrors the live upgrade shape: a populated claude_instances, a v2
-    instances table (old 22-column layout) whose identity fields diverge from
+    Mirrors the live upgrade shape: a populated claude_instances, an instances
+    table (old 22-column layout) whose identity fields diverge from
     the legacy projection, and an instance_mutations table carrying the
     legacy FK.
     """
@@ -153,7 +153,7 @@ def legacy_seed(tmp_path):
         """
     )
     # Active session: present in BOTH tables. The legacy row carries runtime
-    # annex data; the v2 row carries identity the old projection used to
+    # annex data; the instance row carries identity the old projection used to
     # clobber (rank=primarch, working vocab).
     conn.execute(
         """INSERT INTO claude_instances
@@ -247,7 +247,7 @@ class TestFreshDatabase:
         assert row is not None, "SessionStart did not register into instances"
         assert "claude_instances" not in names
 
-    def test_status_trigger_pushes_v2_vocab_to_pane_state_queue(self, client, app_env):
+    def test_status_trigger_pushes_instance_vocab_to_pane_state_queue(self, client, app_env):
         instance_id = _session_start(client, tmux_pane="%99")
         conn = _db(app_env)
         conn.execute(
@@ -286,7 +286,7 @@ class TestArchiveExtraction:
         conn.close()
         assert "claude_instances" not in names, "legacy table still in the live DB"
 
-    def test_v2_identity_wins_and_annex_backfills(self, legacy_seed, app_env):
+    def test_instance_identity_wins_and_annex_backfills(self, legacy_seed, app_env):
         conn = _db(app_env)
         row = conn.execute(
             """SELECT rank, origin_type, status, tmux_pane, workflow_state, golden_throne
@@ -295,14 +295,14 @@ class TestArchiveExtraction:
         ).fetchone()
         conn.close()
         assert row is not None
-        # v2 identity preserved — NOT re-projected from legacy defaults
+        # instance identity preserved — NOT re-projected from legacy defaults
         assert row["rank"] == "primarch"
         assert row["origin_type"] == "perpetual"
         assert row["status"] == "working"
         # annex backfilled from the legacy row
         assert row["tmux_pane"] == "%42"
         assert row["workflow_state"] == "open"
-        # synced=1/instance_type=sync legacy markers land as the v2 marker
+        # synced=1/instance_type=sync legacy markers land as the instance marker
         assert row["golden_throne"] == "sync"
 
     def test_legacy_only_rows_stay_in_archive(self, legacy_seed, app_env):
@@ -417,7 +417,7 @@ class TestSanctionedWritesV2Only:
         assert row["pane_label"] == "test-label"
 
 
-# ── legacy PATCH endpoints write v2 ─────────────────────────────────────────
+# ── legacy PATCH endpoints write instance-table ─────────────────────────────────────────
 
 
 class TestLegacyPatchEndpoints:

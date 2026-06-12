@@ -1,4 +1,4 @@
-"""Canonical instance registry v2 invariants."""
+"""Instance registry invariants."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-FINAL_INSTANCE_COLUMNS = [
+EXPECTED_INSTANCE_COLUMNS = [
     "id",
     "name",
     "engine",
@@ -120,7 +120,7 @@ def _insert_instance(conn, **overrides):
     return values["id"]
 
 
-def test_instances_contains_only_final_columns(app_env):
+def test_instances_contains_only_expected_columns(app_env):
     from instance_registry import INSTANCE_COLUMNS
 
     conn = _conn(app_env.db_path)
@@ -161,7 +161,7 @@ def test_supporting_tables_exist_and_seed_personas(app_env):
     assert "chapter-master" not in slugs
 
 
-def test_canonical_mirror_maps_legacy_row_to_final_fields(app_env):
+def test_instance_normalizer_maps_legacy_row_to_expected_fields(app_env):
     import instance_mutation
 
     now = datetime.now().isoformat()
@@ -184,15 +184,15 @@ def test_canonical_mirror_maps_legacy_row_to_final_fields(app_env):
         "dispatch_window": "main:mechanicus",
         "dispatch_slot": "7",
     }
-    canonical = instance_mutation._canonical_instance_values(values, persona_id=42)
+    normalized = instance_mutation._instance_values_from_legacy_row(values, persona_id=42)
 
-    assert canonical["id"] == iid
-    assert canonical["name"] == "clear-slate"
-    assert canonical["status"] == "working"
-    assert canonical["persona_id"] == 42
-    assert canonical["interaction_mode"] == "voice_chat"
+    assert normalized["id"] == iid
+    assert normalized["name"] == "clear-slate"
+    assert normalized["status"] == "working"
+    assert normalized["persona_id"] == 42
+    assert normalized["interaction_mode"] == "voice_chat"
     assert not (
-        set(canonical)
+        set(normalized)
         & {
             "tab_name",
             "session_id",
