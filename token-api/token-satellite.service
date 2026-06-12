@@ -1,12 +1,13 @@
 [Unit]
 Description=Token Satellite
-After=network.target mnt-imperium.mount
-Requires=mnt-imperium.mount
+After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/mnt/imperium/runtimes/token-os/live/token-api
+WorkingDirectory=/home/token/runtimes/token-os/live/token-api
 Environment=UV_PROJECT_ENVIRONMENT=/home/token/.local/venvs/token-api
+EnvironmentFile=-%h/.config/token-satellite.env
+Environment=TOKEN_OS_AHK_DIR=/mnt/c/TokenOS/ahk
 ExecStart=/home/token/.local/bin/uv run python -m uvicorn token-satellite:app --host 0.0.0.0 --port 7777
 Restart=always
 RestartSec=3

@@ -19,8 +19,8 @@ LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
 TOKEN_API_CODEX_LAUNCHER="${TOKEN_API_LAUNCHER:-codex-hooks}"
 TOKEN_API_CODEX_ENGINE="${TOKEN_API_ENGINE:-codex}"
-RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/scripts/agent-session-end-resume.sh"
-[[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="/Volumes/Imperium/runtimes/token-os/live/cli-tools/scripts/agent-session-end-resume.sh"
+RESUME_SCRIPT="${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/agent-session-end-resume.sh"
+[[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/scripts/agent-session-end-resume.sh"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 HOOK_INPUT="$(cat 2>/dev/null || true)"

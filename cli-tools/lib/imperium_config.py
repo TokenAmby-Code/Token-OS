@@ -48,6 +48,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_api_url": "http://localhost:7777",
         "ssh_alias": "mini",
         "device_name": "Mac-Mini",
+        "token_os_runtime": "~/runtimes/Token-OS/live",
     },
     "wsl": {
         "nas_imperium": "/mnt/imperium",
@@ -56,6 +57,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_api_url": "http://100.95.109.23:7777",
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
+        "token_os_runtime": "/home/token/runtimes/token-os/live",
     },
     "phone": {
         "nas_imperium": "",
@@ -64,6 +66,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_api_url": "http://100.95.109.23:7777",
         "ssh_alias": "phone",
         "device_name": "Token-S24",
+        "token_os_runtime": "",
     },
     "linux": {
         "nas_imperium": "/mnt/imperium",
@@ -72,6 +75,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_api_url": "http://100.95.109.23:7777",
         "ssh_alias": "",
         "device_name": "",
+        "token_os_runtime": "/home/token/runtimes/token-os/live",
     },
 }
 
@@ -92,8 +96,30 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
-TOKEN_OS = os.environ.get("TOKEN_OS") or f"{IMPERIUM}/runtimes/token-os/live"
-CLI_TOOLS = os.environ.get("CLI_TOOLS") or f"{TOKEN_OS}/cli-tools"
+
+
+def _runtime_checkout() -> str:
+    local = os.path.expanduser(cfg("token_os_runtime").strip())
+    env_value = (os.environ.get("TOKEN_OS") or "").strip()
+    known_nas_runtime = f"{IMPERIUM}/runtimes/token-os/live"
+
+    # Explicit non-NAS overrides still work for tests/dev, but a stale exported
+    # NAS runtime must not beat the machine-local hot runtime during cutover.
+    if (
+        env_value
+        and os.path.isdir(os.path.expanduser(env_value))
+        and env_value != known_nas_runtime
+    ):
+        return os.path.expanduser(env_value)
+    if local and os.path.isdir(local):
+        return local
+    if env_value and os.path.isdir(os.path.expanduser(env_value)):
+        return os.path.expanduser(env_value)
+    return known_nas_runtime
+
+
+TOKEN_OS = _runtime_checkout()
+CLI_TOOLS = f"{TOKEN_OS}/cli-tools"
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
 
 # All Tailscale IPs for device resolution (replaces DEVICE_IPS in main.py)

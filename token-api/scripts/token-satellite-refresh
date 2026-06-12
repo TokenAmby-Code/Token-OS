@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# token-satellite-refresh — WSL-local Token-OS runtime/AHK cache updater.
+# Intended install location: ~/.local/bin/token-satellite-refresh (outside runtime).
+set -euo pipefail
+
+sha="${1:-}"
+manifest="${2:-}"
+if [[ -z "$sha" || -z "$manifest" || ! -f "$manifest" ]]; then
+  echo "usage: token-satellite-refresh <sha> <changed-paths-manifest.json>" >&2
+  exit 64
+fi
+if [[ ! "$sha" =~ ^[0-9A-Fa-f]{7,64}$ ]]; then
+  echo "invalid sha: $sha" >&2
+  exit 65
+fi
+
+base="${TOKEN_OS_RUNTIME_BASE:-$HOME/runtimes/token-os}"
+bare="${TOKEN_OS_CD_BARE_REPO:-$base/token-os.git}"
+live="${TOKEN_OS_RUNTIME_CHECKOUT:-$base/live}"
+git_url="${TOKEN_OS_GIT_URL:-git@github.com:TokenAmby-Code/Token-OS.git}"
+venv="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/venvs/token-api}"
+ahk_cache="${TOKEN_OS_AHK_DIR:-/mnt/c/TokenOS/ahk}"
+lock_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
+lock_file="$lock_dir/token-satellite-refresh.lock"
+
+mkdir -p "$lock_dir" "$(dirname "$bare")" "$(dirname "$live")"
+exec 9>"$lock_file"
+flock 9
+
+echo "[$(date -Is)] refresh start sha=${sha:0:9} manifest=$manifest"
+
+if [[ ! -d "$bare" ]]; then
+  echo "creating bare cache: $bare"
+  git clone --bare "$git_url" "$bare"
+fi
+if [[ "$(git --git-dir="$bare" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+  echo "not a bare repo: $bare" >&2
+  exit 66
+fi
+
+git --git-dir="$bare" fetch origin main --tags
+if ! git --git-dir="$bare" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  git --git-dir="$bare" fetch origin "$sha" || true
+fi
+git --git-dir="$bare" cat-file -e "$sha^{commit}"
+
+if [[ -e "$live" && ! -d "$live/.git" && ! -f "$live/.git" ]]; then
+  echo "runtime path exists but is not a git checkout: $live" >&2
+  exit 67
+fi
+if [[ ! -e "$live" ]]; then
+  echo "creating runtime checkout: $live"
+  git clone "$bare" "$live"
+fi
+if [[ -n "$(git -C "$live" status --porcelain 2>/dev/null)" ]]; then
+  echo "runtime checkout dirty; refusing to overwrite: $live" >&2
+  git -C "$live" status --short >&2 || true
+  exit 68
+fi
+
+git -C "$live" fetch "$bare" '+refs/heads/*:refs/remotes/local-bare/*'
+git -C "$live" checkout --detach "$sha"
+
+changed_paths=$(
+  python3 - "$manifest" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+for p in data.get("changed_paths") or []:
+    if isinstance(p, str) and p:
+        print(p)
+PY
+)
+
+needs_uv=false
+needs_ahk=false
+while IFS= read -r path; do
+  case "$path" in
+    token-api/uv.lock|token-api/pyproject.toml) needs_uv=true ;;
+    ahk/*) needs_ahk=true ;;
+  esac
+done <<< "$changed_paths"
+
+if [[ "$needs_uv" == true ]]; then
+  echo "syncing token-api venv: $venv"
+  (cd "$live/token-api" && UV_PROJECT_ENVIRONMENT="$venv" uv sync)
+fi
+
+if [[ "$needs_ahk" == true ]]; then
+  echo "refreshing AHK cache: $ahk_cache"
+  mkdir -p "$ahk_cache"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$live/ahk/" "$ahk_cache/"
+  else
+    find "$ahk_cache" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    cp -a "$live/ahk/." "$ahk_cache/"
+  fi
+fi
+
+echo "restarting token-satellite.service"
+systemctl --user restart --no-block token-satellite.service
+
+echo "[$(date -Is)] refresh complete sha=${sha:0:9}"

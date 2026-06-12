@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_SCHEMA = Path(os.environ.get('TOKEN_OS', '/Volumes/Imperium/runtimes/token-os/live')) / 'mobile' / 'macrodroid-llm-schema.yaml'
+DEFAULT_SCHEMA = Path(os.environ.get('TOKEN_OS', str(Path.home() / 'runtimes' / 'Token-OS' / 'live'))) / 'mobile' / 'macrodroid-llm-schema.yaml'
 
 
 def load_json(path):

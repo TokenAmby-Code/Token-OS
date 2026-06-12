@@ -16,7 +16,8 @@ Endpoints:
     POST /tts/synth-and-play — synthesize to WAV + speak via SAPI (blocking, for queued TTS)
     GET  /tts/status       — current TTS engine state
     POST /ahk/execute      — execute a one-shot AHK v2 script
-    POST /restart          — git pull + restart
+    POST /restart          — restart current service
+    POST /runtime/refresh  — authenticated local runtime/AHK cache refresh
     GET  /kvm/status       — DeskFlow watchdog state
     POST /kvm/control      — manual DeskFlow start/stop/hold
     GET  /files/read       — read a file under ~/.claude/ (for cross-machine transcript fetch)
@@ -25,6 +26,7 @@ Endpoints:
 
 import glob
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -40,8 +42,8 @@ from datetime import datetime
 from pathlib import Path
 
 import requests as http_requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger("token_satellite")
@@ -53,10 +55,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
-# AHK scripts ship in the repo's ahk/ dir (the satellite runs from the NAS
-# checkout). Was ~/Scripts/ahk — the dead pre-rename namespace, absent on this
-# host, which silently broke /ahk/execute.
-AHK_SCRIPTS_DIR = REPO_ROOT / "ahk"
+# AHK scripts default to the repo's ahk/ dir, but WSL production runs from a
+# Windows-local cache (C:\TokenOS\ahk) so AHK execution does not hit the NAS.
+AHK_SCRIPTS_DIR = Path(os.environ.get("TOKEN_OS_AHK_DIR") or (REPO_ROOT / "ahk"))
+RUNTIME_REFRESH_SECRET_ENV = "TOKEN_SATELLITE_REFRESH_SECRET"
+RUNTIME_REFRESH_HELPER = Path(
+    os.environ.get("TOKEN_SATELLITE_REFRESH_HELPER")
+    or (Path.home() / ".local" / "bin" / "token-satellite-refresh")
+)
 
 # PowerShell script for persistent TTS engine.
 # Uses SpeakAsync so the main loop stays responsive to skip/poll/pause/resume commands.
@@ -1624,6 +1630,11 @@ class GoldenThroneFollowupRequest(BaseModel):
     engine: str = "claude"
 
 
+class RuntimeRefreshRequest(BaseModel):
+    sha: str
+    changed_paths: list[str] = Field(default_factory=list)
+
+
 def _pane_input_line_has_text(line: str) -> bool:
     stripped = line.rstrip()
     if not stripped:
@@ -2433,6 +2444,63 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
         }
 
     return {"success": True, "transport": transport, "session_id": req.session_id}
+
+
+@app.post("/runtime/refresh")
+async def runtime_refresh(req: RuntimeRefreshRequest, request: Request):
+    """Refresh WSL-local Token-OS runtime and AHK cache to an authenticated SHA."""
+    configured = os.environ.get(RUNTIME_REFRESH_SECRET_ENV, "").strip()
+    if not configured:
+        logger.error("runtime refresh requested but %s is unset", RUNTIME_REFRESH_SECRET_ENV)
+        raise HTTPException(status_code=503, detail="runtime refresh not configured")
+
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, configured):
+        logger.warning("runtime refresh rejected: bad/missing bearer token")
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    sha = req.sha.strip()
+    if not re.fullmatch(r"[0-9A-Fa-f]{7,64}", sha):
+        raise HTTPException(status_code=400, detail="sha must be a git commit hash")
+    if not RUNTIME_REFRESH_HELPER.exists():
+        raise HTTPException(
+            status_code=503, detail=f"refresh helper not found: {RUNTIME_REFRESH_HELPER}"
+        )
+
+    manifest = {
+        "sha": sha,
+        "changed_paths": [p for p in req.changed_paths if isinstance(p, str) and p],
+        "requested_at": datetime.now().isoformat(),
+    }
+    handle = tempfile.NamedTemporaryFile(
+        "w", prefix="token-runtime-refresh-", suffix=".json", delete=False, encoding="utf-8"
+    )
+    try:
+        json.dump(manifest, handle)
+        handle.write("\n")
+        manifest_path = handle.name
+    finally:
+        handle.close()
+
+    log_path = Path("/tmp/token-satellite-refresh.log")
+    log_handle = log_path.open("a", encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [str(RUNTIME_REFRESH_HELPER), sha, manifest_path],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+
+    logger.info(
+        "runtime refresh scheduled: sha=%s paths=%d", sha[:9], len(manifest["changed_paths"])
+    )
+    return {"ok": True, "refresh": "scheduled", "sha": sha, "manifest": manifest_path}
 
 
 @app.post("/restart")
