@@ -116,7 +116,7 @@ async def test_direct_pane_write_uninitialized_primitive_is_failed_not_sent(
 def _insert_instance(db_path, instance_id, pane=None, parent=None, status="idle"):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             parent_instance_id)

@@ -142,13 +142,13 @@ Investigate and fix the regression. If you are already active, this message shou
 
   local status tmux_pane escaped_id
   escaped_id=$(printf "%s" "$instance_id" | sed "s/'/''/g")
-  status=$(sqlite3 "$DB_PATH" "SELECT COALESCE(status,'') FROM claude_instances WHERE session_id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
-  tmux_pane=$(sqlite3 "$DB_PATH" "SELECT COALESCE(tmux_pane,'') FROM claude_instances WHERE session_id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
+  status=$(sqlite3 "$DB_PATH" "SELECT COALESCE(status,'') FROM instances WHERE id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
+  tmux_pane=$(sqlite3 "$DB_PATH" "SELECT COALESCE(tmux_pane,'') FROM instances WHERE id='${escaped_id}' ORDER BY last_activity DESC LIMIT 1;" 2>/dev/null || true)
 
   local agent_cmd_bin="${SCRIPT_DIR}/agent-cmd"
   local dispatch_bin="${SCRIPT_DIR}/dispatch"
 
-  if [[ -n "$tmux_pane" && ( "$status" == "idle" || "$status" == "processing" ) && -x "$agent_cmd_bin" ]]; then
+  if [[ -n "$tmux_pane" && ( "$status" == "idle" || "$status" == "working" ) && -x "$agent_cmd_bin" ]]; then
     "$agent_cmd_bin" --instance "$instance_id" "$prompt" >/dev/null 2>&1 && return 0
   fi
 

@@ -66,46 +66,24 @@ def request(method, path, body=None):
 
 
 def find_instance_id():
-    """Walk process tree to find Claude ancestor PID, then look up in agents.db."""
-    db_path = os.path.expanduser("~/.claude/agents.db")
-    if not os.path.exists(db_path):
-        return None
+    """Find the current managed instance id from env or tmux pane metadata."""
+    for key in ("TOKEN_API_INSTANCE_ID", "INSTANCE_ID"):
+        value = os.environ.get(key)
+        if value:
+            return value
 
-    # Walk process tree looking for a 'claude' process
-    current_pid = os.getpid()
-    claude_pid = None
-    for _ in range(10):
-        try:
-            out = subprocess.check_output(
-                ["ps", "-p", str(current_pid), "-o", "ppid=,comm="],
-                text=True, stderr=subprocess.DEVNULL
-            ).strip()
-            parts = out.split(None, 1)
-            if len(parts) < 2:
-                break
-            ppid = int(parts[0])
-            comm = parts[1].strip()
-            if comm == "claude":
-                claude_pid = current_pid
-                break
-            if ppid <= 1:
-                break
-            current_pid = ppid
-        except Exception:
-            break
-
-    if not claude_pid:
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
         return None
 
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.execute(
-            "SELECT id FROM claude_instances WHERE pid = ? AND status != 'stopped' LIMIT 1",
-            (claude_pid,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else None
+        value = subprocess.check_output(
+            ["tmux", "show-options", "-pv", "-t", pane, "@INSTANCE_ID"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+        return value or None
     except Exception:
         return None
 

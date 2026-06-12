@@ -18,21 +18,21 @@ SCRIPT = ROOT / "bin" / "tmux-pane-label"
 
 
 def _make_db(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
-    """rows: (id, tab_name, tmux_pane, status)."""
+    """rows: (id, name, tmux_pane, status)."""
     conn = sqlite3.connect(path)
     try:
         conn.execute(
             """
-            CREATE TABLE claude_instances (
+            CREATE TABLE instances (
                 id TEXT PRIMARY KEY,
-                tab_name TEXT,
+                name TEXT,
                 tmux_pane TEXT,
                 status TEXT
             )
             """
         )
         conn.executemany(
-            "INSERT INTO claude_instances (id, tab_name, tmux_pane, status) VALUES (?, ?, ?, ?)",
+            "INSERT INTO instances (id, name, tmux_pane, status) VALUES (?, ?, ?, ?)",
             rows,
         )
         conn.commit()
@@ -75,7 +75,7 @@ def test_backfill_seeds_pane_label_for_live_panes_only(tmp_path: Path) -> None:
         db,
         [
             ("live1", "auth-refactor", "%1", "idle"),
-            ("live2", "docs-fix", "%3", "processing"),
+            ("live2", "docs-fix", "%3", "working"),
             ("dead1", "gone", "%2", "stopped"),  # excluded: stopped
             ("noname", "", "%4", "idle"),  # excluded: empty name
             ("nopane", "has-name", "", "idle"),  # excluded: empty pane

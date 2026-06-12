@@ -864,7 +864,7 @@ async def _consume_state_injections(db, audience_instance_id: str) -> list[dict]
 def _row_parent_instance_id(row: dict) -> str | None:
     """Legacy `parent_instance_id` derived from the v2 commander edge: only a
     `commander_type='chapter'` edge carries a parent instance id (the column died
-    with claude_instances). Works for raw `SELECT *` rows that lack the alias."""
+    with legacy instance table). Works for raw `SELECT *` rows that lack the alias."""
     if row.get("parent_instance_id") is not None:
         return row.get("parent_instance_id")
     if row.get("commander_type") == "chapter":
@@ -1990,7 +1990,7 @@ async def handle_session_start(payload: dict) -> dict:
         existing_row = await cursor.fetchone()
 
         # Legacy-shaped derivations off the v2 row (these columns died with
-        # claude_instances): parent_instance_id lives in commander_id when the
+        # legacy instance table): parent_instance_id lives in commander_id when the
         # commander edge is a chapter; primarch identity lives in persona_id.
         existing_parent_id = (
             existing_row["commander_id"]
@@ -2085,7 +2085,7 @@ async def handle_session_start(payload: dict) -> dict:
         # Without this, custodes rows lose their persona/golden_throne binding on
         # plan-mode exit, breaking the state-hook dispatcher's
         # `p.slug='custodes' AND golden_throne='sync'` predicate.
-        # The legacy pid column died with claude_instances; the @INSTANCE_ID pane
+        # The legacy pid column died with legacy instance table; the @INSTANCE_ID pane
         # stamp (or the stored tmux_pane as pre-stamp fallback) carries identity.
         if not supplant_id:
             payload_pid = payload.get("pid")
@@ -2152,7 +2152,7 @@ async def handle_session_start(payload: dict) -> dict:
                 old_tmux_pane = existing_row["tmux_pane"]
 
                 # Same-ID transplant (--continue): update the existing row in-place.
-                # pid died with claude_instances; the commander edge (legacy
+                # pid died with legacy instance table; the commander edge (legacy
                 # parent_instance_id) is applied by _apply_canonical_commander_binding
                 # below; primarch/instance_type land on persona_id/golden_throne.
                 now = datetime.now().isoformat()
@@ -2317,7 +2317,7 @@ async def handle_session_start(payload: dict) -> dict:
                 # Normal re-registration / Codex resume. Refresh transport fields so
                 # a live pane cannot remain represented by a stale stopped row.
                 now = datetime.now().isoformat()
-                # pid died with claude_instances; the commander edge (legacy
+                # pid died with legacy instance table; the commander edge (legacy
                 # parent_instance_id) is applied by _apply_canonical_commander_binding
                 # below; instance_type lands on the golden_throne marker.
                 updates = {
@@ -2510,7 +2510,7 @@ async def handle_session_start(payload: dict) -> dict:
                 old_tmux_pane = old_inst["tmux_pane"]
 
                 # Update the old row with new session identity, preserve config.
-                # pid/session_id died with claude_instances; the commander edge
+                # pid/session_id died with legacy instance table; the commander edge
                 # (legacy parent_instance_id) is applied by
                 # _apply_canonical_commander_binding below.
                 supplant_updates = {
@@ -2812,7 +2812,7 @@ async def handle_session_start(payload: dict) -> dict:
             if _parent_row and (_parent_row[0] or "").lower() != "custodes":
                 launch_hook_driven = 1
 
-        # Insert instance. session_id/source_ip/pid died with claude_instances
+        # Insert instance. session_id/source_ip/pid died with legacy instance table
         # (the instance id IS the session uuid); legacy-shaped keys below
         # (tab_name/legion/primarch/parent_instance_id/registered_at) are
         # auto-canonicalized by sanctioned_insert_instance.
@@ -3348,7 +3348,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
         consumed_injections = await _consume_state_injections(db, session_id)
 
         # Also resurrect stopped instances - activity means they're active.
-        # (pid died with claude_instances; nothing to backfill.)
+        # (pid died with legacy instance table; nothing to backfill.)
         await sanctioned_update_instance(
             db,
             instance_id=session_id,

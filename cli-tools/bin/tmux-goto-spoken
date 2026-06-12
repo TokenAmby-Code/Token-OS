@@ -7,7 +7,7 @@ Resolve the most recent TTS speaker via agents.db and select that pane.
 
 Lookup chain:
   1. Latest event in (tts_playing, tts_starting, tts_queued) within MAX_AGE seconds.
-  2. instance_id → claude_instances.tmux_pane (canonical pane id, e.g. "%67").
+  2. instance_id → instances.tmux_pane (canonical pane id, e.g. "%67").
   3. tmuxctl resolves tombstones, then tmux select-window + select-pane.
 
 Empty / stale queue → tmux display-message "no recent speaker".
@@ -64,9 +64,9 @@ def main() -> int:
             f"""
             SELECT e.instance_id, e.event_type,
                    CAST((julianday('now') - julianday(e.created_at)) * 86400 AS INTEGER) AS age_seconds,
-                   ci.tmux_pane, ci.tab_name
+                   ci.tmux_pane, ci.name AS tab_name
             FROM events e
-            LEFT JOIN claude_instances ci ON ci.id = e.instance_id
+            LEFT JOIN instances ci ON ci.id = e.instance_id
             WHERE e.event_type IN ({placeholders})
               AND e.instance_id IS NOT NULL
             ORDER BY e.id DESC

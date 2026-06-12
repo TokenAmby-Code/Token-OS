@@ -29,8 +29,8 @@ _lookup_instance_by_token() {
     qtoken="$(_sql_quote "$token")"
     sqlite3 -noheader "$db" "
         SELECT id
-          FROM claude_instances
-         WHERE id = '$qtoken' OR session_id = '$qtoken'
+          FROM instances
+         WHERE id = '$qtoken'
          ORDER BY last_activity DESC
          LIMIT 1;
     " 2>/dev/null | head -n 1 || true
@@ -47,10 +47,10 @@ _lookup_instance_by_pane() {
     fi
     sqlite3 -noheader "$db" "
         SELECT id
-          FROM claude_instances
+          FROM instances
          WHERE tmux_pane = '$qpane' $label_pred
          ORDER BY CASE status
-                    WHEN 'processing' THEN 0
+                    WHEN 'working' THEN 0
                     WHEN 'idle' THEN 1
                     ELSE 2
                   END,

@@ -99,14 +99,14 @@ async def test_active_legacy_instances_lock_personas_but_stopped_release(app_env
     async with aiosqlite.connect(app_env.db_path) as db:
         await db.execute(
             """
-            INSERT INTO claude_instances
+            INSERT INTO legacy_instances
               (id, session_id, origin_type, device_id, profile_name, status)
             VALUES ('i1', 's1', 'local', 'Mac-Mini', 'blood-angels', 'idle')
             """
         )
         await db.execute(
             """
-            INSERT INTO claude_instances
+            INSERT INTO legacy_instances
               (id, session_id, origin_type, device_id, profile_name, status)
             VALUES ('i2', 's2', 'local', 'Mac-Mini', 'ultramarines', 'stopped')
             """
@@ -163,7 +163,7 @@ async def test_null_tts_voice_queues_as_silent_not_fallback(app_env):
     async with aiosqlite.connect(app_env.db_path) as db:
         await db.execute(
             """
-            INSERT INTO claude_instances
+            INSERT INTO legacy_instances
               (id, session_id, origin_type, device_id, profile_name, tts_voice, notification_sound, status)
             VALUES ('fg-silent', 'fg-silent-session', 'local', 'Mac-Mini', 'fabricator-general', NULL, NULL, 'idle')
             """
@@ -243,7 +243,7 @@ async def test_repair_legacy_active_persona_assignments(app_env):
     async with aiosqlite.connect(app_env.db_path) as db:
         await db.execute(
             """
-            INSERT INTO claude_instances
+            INSERT INTO legacy_instances
               (id, session_id, origin_type, device_id, legion, primarch, profile_name,
                tts_voice, notification_sound, status)
             VALUES
@@ -264,7 +264,7 @@ async def test_repair_legacy_active_persona_assignments(app_env):
         cursor = await db.execute(
             """
             SELECT id, profile_name, tts_voice, notification_sound
-            FROM claude_instances
+            FROM legacy_instances
             WHERE id IN ('legacy-custodes', 'legacy-fg', 'legacy-worker')
             ORDER BY id
             """

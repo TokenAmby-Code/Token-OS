@@ -20,7 +20,7 @@ def _insert_ops_fixture(app_env):
     instance_id = str(uuid.uuid4())
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, tmux_pane, engine, registered_at, last_activity, zealotry)
            VALUES (?, ?, 'ops-test', '/tmp/ops', 'local', 'Mac-Mini',
@@ -319,7 +319,7 @@ def test_ops_timer_history_may_28_sparse_snap_regression(client, app_env):
 def test_work_state_ignores_stale_idle_instances(client, app_env):
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, tmux_pane, engine, registered_at, last_activity)
            VALUES (?, ?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',

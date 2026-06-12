@@ -307,7 +307,7 @@ async function main() {
 
   // Route voice transcripts directly to tmux. Persona panes have stable
   // @PANE_ID roles and Cadia/Imperial Guard already carries a locked live pane,
-  // so delivery must not depend on Token API or claude_instances freshness.
+  // so delivery must not depend on Token API instance-row freshness.
   transcriber.onTranscription(async (result) => {
     const botLabel = result.botName || 'voice';
     logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);

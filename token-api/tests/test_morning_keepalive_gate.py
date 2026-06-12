@@ -37,7 +37,7 @@ def _insert_sync_instance(db_path, *, instance_type="sync", tmux_pane="%42", leg
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, instance_type, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, ?, ?, ?)""",
@@ -228,7 +228,7 @@ def test_custodes_injection_resolves_via_pane_marker_not_synced(app_env, monkeyp
     conn = sqlite3.connect(app_env.db_path)
     now = datetime.now().isoformat()
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, instance_type, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'custodes', 0, 'one_off', '%42', ?, ?)""",

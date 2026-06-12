@@ -315,7 +315,7 @@ resolve_caller_instance_id() {
     pane_sql="$(sql_literal "$TMUX_PANE")"
     row="$(sqlite_query "
       SELECT id
-      FROM claude_instances
+      FROM instances
       WHERE tmux_pane = '${pane_sql}'
         AND COALESCE(status, '') != 'stopped'
       ORDER BY last_activity DESC
@@ -337,7 +337,7 @@ resolve_caller_instance_id() {
     label_sql="$(sql_literal "$TOKEN_API_PRIMARCH")"
     row="$(sqlite_query "
       SELECT id
-      FROM claude_instances
+      FROM instances
       WHERE pane_label LIKE '%:' || '${label_sql}'
         AND COALESCE(status, '') != 'stopped'
       ORDER BY last_activity DESC
@@ -387,7 +387,11 @@ apply_persona_engine_binding() {
 
 apply_codex_profile_default() {
   [[ "$ENGINE" == "codex" ]] || return 0
-  [[ -z "$CODEX_PROFILE" && -n "$PERSONA" ]] && CODEX_PROFILE="$(persona_codex_profile "$PERSONA")"
+  if [[ -n "$PERSONA" ]]; then
+    local persona_profile
+    persona_profile="$(persona_codex_profile "$PERSONA")"
+    [[ -n "$persona_profile" ]] && CODEX_PROFILE="$persona_profile"
+  fi
   [[ -z "$CODEX_PROFILE" && -z "$PERSONA" ]] && CODEX_PROFILE="sisters-of-battle"
   return 0
 }
@@ -538,7 +542,7 @@ directory_candidates() {
 
   sqlite_query "
     SELECT DISTINCT working_dir, COALESCE(MAX(last_activity), '')
-    FROM claude_instances
+    FROM instances
     WHERE working_dir IS NOT NULL AND working_dir != ''
     GROUP BY working_dir
     ORDER BY MAX(last_activity) DESC
@@ -572,10 +576,10 @@ session_doc_candidates() {
 
 resume_session_candidates() {
   sqlite_query "
-    SELECT session_id,
-           COALESCE(NULLIF(tab_name, ''), NULLIF(pane_label, ''), NULLIF(primarch, ''), NULLIF(engine, ''), substr(session_id, 1, 8))
-    FROM claude_instances
-    WHERE session_id IS NOT NULL AND session_id != ''
+    SELECT id,
+           COALESCE(NULLIF(name, ''), NULLIF(pane_label, ''), NULLIF(engine, ''), substr(id, 1, 8))
+    FROM instances
+    WHERE id IS NOT NULL AND id != ''
     ORDER BY last_activity DESC
     LIMIT 80;
   " | while IFS=$'\t' read -r session_id label; do
@@ -808,7 +812,11 @@ resolve_resume_id() {
       COALESCE(ci.working_dir, ''),
       COALESCE(ci.dispatch_session_doc_path, ''),
       COALESCE(sd.file_path, ''),
-      COALESCE(ci.instance_type, ''),
+      COALESCE(CASE
+        WHEN ci.golden_throne = 'sync' THEN 'sync'
+        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
+        ELSE 'one_off'
+      END, ''),
       COALESCE(ci.zealotry, ''),
       COALESCE(ci.dispatch_target, ''),
       COALESCE(ci.dispatch_window, ''),
@@ -816,15 +824,16 @@ resolve_resume_id() {
       COALESCE(ci.dispatch_slot, ''),
       COALESCE(ci.launch_mode, ''),
       COALESCE(ci.tmux_pane, ''),
-      COALESCE(ci.primarch, ''),
-      COALESCE(ci.parent_instance_id, ''),
+      COALESCE(p.slug, ''),
+      COALESCE(CASE WHEN ci.commander_type = 'chapter' THEN ci.commander_id ELSE '' END, ''),
       COALESCE(ci.discord_hosted, ''),
       COALESCE(ci.discord_channel, ''),
       COALESCE(ci.discord_bot, '')
-    FROM claude_instances ci
+    FROM instances ci
+    LEFT JOIN personas p ON p.id = ci.persona_id
     LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-    WHERE ci.id = '${sid_sql}' OR ci.session_id = '${sid_sql}'
-    ORDER BY (ci.id = '${sid_sql}') DESC, ci.last_activity DESC
+    WHERE ci.id = '${sid_sql}'
+    ORDER BY ci.last_activity DESC
     LIMIT 1;
   ")"
 
@@ -844,7 +853,7 @@ resolve_resume_id() {
     RESUME_TMUX_PANE RESUME_PRIMARCH RESUME_PARENT_INSTANCE_ID RESUME_DISCORD_HOSTED RESUME_DISCORD_CHANNEL RESUME_DISCORD_BOT <<< "$row"
 
   # Canonical instance id (== @INSTANCE_ID stamped by SessionStart). RESUME_ID may
-  # have been a session_id; resolve-instance keys on ci.id, so stamp ci.id.
+  # already is an instance id; stamp that canonical id.
   RESUME_INSTANCE_ID="$row_id"
   ENGINE="$(infer_engine "$row_engine" "$row_launcher")"
   RESUME_LAUNCHER="$row_launcher"

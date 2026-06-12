@@ -77,7 +77,7 @@ class TestProvenance:
         instance_id = str(uuid.uuid4())
         conn = _db(app_env)
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, synced, tmux_pane, pane_label, engine, stopped_at,
                 registered_at, last_activity)
@@ -117,7 +117,7 @@ class TestProvenance:
         row = conn.execute(
             """SELECT status, stopped_at, tmux_pane, pane_label, working_dir,
                       pid, engine, launcher, wrapper_launch_id
-               FROM claude_instances WHERE id = ?""",
+               FROM legacy_instances WHERE id = ?""",
             (instance_id,),
         ).fetchone()
         conn.close()
@@ -156,7 +156,7 @@ class TestProvenance:
         instance_id = _session_start(client)
         conn = _db(app_env)
         conn.execute(
-            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            "UPDATE legacy_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
             ("2026-06-09T10:00:00", instance_id),
         )
         conn.commit()
@@ -169,7 +169,7 @@ class TestProvenance:
 
         conn = _db(app_env)
         row = conn.execute(
-            "SELECT status, stopped_at FROM claude_instances WHERE id = ?", (instance_id,)
+            "SELECT status, stopped_at FROM legacy_instances WHERE id = ?", (instance_id,)
         ).fetchone()
         conn.close()
         assert row["status"] == "processing"
@@ -187,7 +187,7 @@ class TestReconciliation:
         instance_id = _session_start(client)
         conn = _db(app_env)
         conn.execute(
-            "UPDATE claude_instances SET legion = 'mechanicus' WHERE id = ?", (instance_id,)
+            "UPDATE legacy_instances SET legion = 'mechanicus' WHERE id = ?", (instance_id,)
         )
         conn.commit()
         conn.close()
@@ -289,7 +289,7 @@ class TestReconciliation:
         new_id = str(uuid.uuid4())
         conn = _db(app_env)
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, legion, synced, tmux_pane, primarch, registered_at, last_activity)
                VALUES (?, ?, 'old-custodes', '/tmp/old', 'local', 'Mac-Mini',
@@ -324,7 +324,7 @@ class TestReconciliation:
         new_id = str(uuid.uuid4())
         conn = _db(app_env)
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, legion, synced, instance_type, tmux_pane, pid,
                 registered_at, last_activity)
@@ -350,9 +350,9 @@ class TestReconciliation:
 
         conn = _db(app_env)
         # Old id should be gone (replaced by new_id)
-        old_row = conn.execute("SELECT id FROM claude_instances WHERE id = ?", (old_id,)).fetchone()
+        old_row = conn.execute("SELECT id FROM legacy_instances WHERE id = ?", (old_id,)).fetchone()
         new_row = conn.execute(
-            "SELECT legion, synced, instance_type, tmux_pane, pid FROM claude_instances WHERE id = ?",
+            "SELECT legion, synced, instance_type, tmux_pane, pid FROM legacy_instances WHERE id = ?",
             (new_id,),
         ).fetchone()
         conn.close()
@@ -370,7 +370,7 @@ class TestReconciliation:
         new_id = str(uuid.uuid4())
         conn = _db(app_env)
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, legion, synced, instance_type, tmux_pane, pid,
                 registered_at, last_activity)

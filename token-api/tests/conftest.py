@@ -1,8 +1,243 @@
 import importlib
+import sqlite3
 import sys
 from types import SimpleNamespace
 
 import pytest
+
+
+# Test-only compatibility surface: older tests still exercise legacy-shaped SQL,
+# but the live DB must be seeded through instances v2.  Each sqlite3 connection
+# gets a TEMP view named legacy_instances plus INSTEAD OF triggers that project
+# legacy column names onto instances.  TEMP objects do not appear in the main
+# schema, preserving the exterminatus invariant.
+def _install_legacy_instances_test_view(conn):
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='instances'"
+        ).fetchone()
+    except Exception:
+        return
+    if not exists:
+        return
+    try:
+        conn.execute("INSERT OR IGNORE INTO golden_throne (id) VALUES (1)")
+    except Exception:
+        pass
+    try:
+        conn.executescript(
+            """
+            CREATE TEMP VIEW IF NOT EXISTS legacy_instances AS
+            SELECT
+              i.id,
+              NULL AS session_id,
+              i.name AS tab_name,
+              i.working_dir,
+              CASE i.status WHEN 'working' THEN 'processing' ELSE i.status END AS status,
+              i.engine,
+              i.device_id,
+              i.origin_type,
+              i.continuity_binding_source,
+              i.automated,
+              i.launcher AS spawner,
+              i.launcher,
+              i.is_subagent,
+              i.created_at,
+              i.created_at AS registered_at,
+              i.last_activity,
+              i.stopped_at,
+              i.tmux_pane,
+              i.pane_label,
+              COALESCE(p.slug, 'astartes') AS legion,
+              p.slug AS primarch,
+              p.slug AS profile_name,
+              CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced,
+              CASE
+                WHEN i.golden_throne = 'sync' THEN 'sync'
+                WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
+                ELSE 'one_off'
+              END AS instance_type,
+              CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id,
+              NULL AS pid,
+              NULL AS source_ip,
+              i.session_doc_id,
+              i.pr_url,
+              i.pr_state,
+              i.workflow_state,
+              i.workflow_updated_at,
+              i.workflow_blocked_reason,
+              i.next_required_action,
+              i.next_action_owner,
+              i.planning_state,
+              i.planning_updated_at,
+              i.planning_source,
+              i.input_lock,
+              i.tts_voice,
+              i.notification_sound,
+              CASE i.notification_mode
+                WHEN 'muted' THEN 'muted'
+                WHEN 'silent' THEN 'silent'
+                ELSE CASE i.interaction_mode WHEN 'voice_chat' THEN 'voice-chat' ELSE 'verbose' END
+              END AS tts_mode,
+              i.discord_hosted,
+              i.discord_channel,
+              i.discord_bot,
+              i.hook_driven,
+              i.zealotry,
+              i.gt_resume_count,
+              i.gt_resume_window_started_at,
+              i.gt_last_resume_at,
+              i.follow_up_sop,
+              i.stop_allowed,
+              i.dispatch_target,
+              i.dispatch_window,
+              i.dispatch_mode,
+              i.dispatch_slot,
+              i.dispatch_session_doc_path,
+              i.target_working_dir,
+              i.launch_mode,
+              i.transplant_target_session,
+              i.transplant_expected,
+              i.session_doc_policy,
+              i.victory_at,
+              i.victory_reason,
+              i.closure_surface,
+              i.closure_required
+            FROM instances i
+            LEFT JOIN personas p ON p.id = i.persona_id;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS legacy_instances_insert
+            INSTEAD OF INSERT ON legacy_instances
+            BEGIN
+              INSERT OR REPLACE INTO instances (
+                id, name, engine, working_dir, device_id, origin_type,
+                continuity_binding_source,
+                commander_type, commander_id, status, created_at, last_activity,
+                stopped_at, persona_id, rank, session_doc_id, automated,
+                notification_mode, interaction_mode, golden_throne,
+                tmux_pane, pane_label, launcher, is_subagent, hook_driven,
+                zealotry, gt_resume_count, gt_resume_window_started_at,
+                gt_last_resume_at, follow_up_sop, stop_allowed, input_lock,
+                tts_voice, notification_sound, discord_hosted, discord_channel,
+                discord_bot, workflow_state, workflow_updated_at,
+                workflow_blocked_reason, next_required_action, next_action_owner,
+                planning_state, planning_updated_at, planning_source, pr_url,
+                pr_state, dispatch_target, dispatch_window, dispatch_mode,
+                dispatch_slot, dispatch_session_doc_path, target_working_dir,
+                launch_mode, transplant_target_session, transplant_expected,
+                session_doc_policy, victory_at, victory_reason, closure_surface,
+                closure_required
+              ) VALUES (
+                COALESCE(NEW.id, NEW.session_id),
+                COALESCE(NEW.tab_name, NEW.id, NEW.session_id, 'test-instance'),
+                NEW.engine,
+                NEW.working_dir,
+                COALESCE(NEW.device_id, 'Mac-Mini'),
+                COALESCE(NEW.origin_type, 'local'),
+                NEW.continuity_binding_source,
+                CASE WHEN NEW.parent_instance_id IS NOT NULL THEN 'chapter' ELSE 'emperor' END,
+                NEW.parent_instance_id,
+                CASE COALESCE(NEW.status, 'idle') WHEN 'processing' THEN 'working' ELSE COALESCE(NEW.status, 'idle') END,
+                COALESCE(NEW.registered_at, NEW.created_at, CURRENT_TIMESTAMP),
+                COALESCE(NEW.last_activity, NEW.created_at, CURRENT_TIMESTAMP),
+                NEW.stopped_at,
+                (SELECT id FROM personas WHERE slug = COALESCE(NEW.profile_name, NEW.primarch, NEW.legion) LIMIT 1),
+                'astartes',
+                NEW.session_doc_id,
+                COALESCE(NEW.is_subagent, 0),
+                CASE COALESCE(NEW.tts_mode, 'verbose') WHEN 'muted' THEN 'muted' WHEN 'silent' THEN 'silent' ELSE 'verbose' END,
+                CASE COALESCE(NEW.tts_mode, '') WHEN 'voice-chat' THEN 'voice_chat' WHEN 'voice_chat' THEN 'voice_chat' ELSE 'text' END,
+                CASE WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync' WHEN NEW.instance_type = 'sync' THEN 'sync' WHEN NEW.instance_type = 'golden_throne' THEN '1' ELSE NULL END,
+                NEW.tmux_pane, NEW.pane_label, COALESCE(NEW.launcher, NEW.spawner), COALESCE(NEW.is_subagent, 0), COALESCE(NEW.hook_driven, 0),
+                COALESCE(NEW.zealotry, 4), COALESCE(NEW.gt_resume_count, 0), NEW.gt_resume_window_started_at,
+                NEW.gt_last_resume_at, NEW.follow_up_sop, COALESCE(NEW.stop_allowed, 1), NEW.input_lock,
+                NEW.tts_voice, NEW.notification_sound, COALESCE(NEW.discord_hosted, 0), NEW.discord_channel,
+                NEW.discord_bot, NEW.workflow_state, NEW.workflow_updated_at,
+                NEW.workflow_blocked_reason, NEW.next_required_action, NEW.next_action_owner,
+                COALESCE(NEW.planning_state, 'none'), NEW.planning_updated_at, NEW.planning_source, NEW.pr_url,
+                NEW.pr_state, NEW.dispatch_target, NEW.dispatch_window, NEW.dispatch_mode,
+                NEW.dispatch_slot, NEW.dispatch_session_doc_path, NEW.target_working_dir,
+                NEW.launch_mode, NEW.transplant_target_session, COALESCE(NEW.transplant_expected, 0),
+                NEW.session_doc_policy, NEW.victory_at, NEW.victory_reason, NEW.closure_surface,
+                COALESCE(NEW.closure_required, 0)
+              );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS legacy_instances_update
+            INSTEAD OF UPDATE ON legacy_instances
+            BEGIN
+              UPDATE instances SET
+                name = COALESCE(NEW.tab_name, name),
+                working_dir = NEW.working_dir,
+                origin_type = COALESCE(NEW.origin_type, origin_type),
+                continuity_binding_source = NEW.continuity_binding_source,
+                automated = COALESCE(NEW.automated, NEW.is_subagent, automated),
+                status = CASE COALESCE(NEW.status, status) WHEN 'processing' THEN 'working' ELSE COALESCE(NEW.status, status) END,
+                last_activity = COALESCE(NEW.last_activity, last_activity),
+                stopped_at = NEW.stopped_at,
+                tmux_pane = NEW.tmux_pane,
+                pane_label = NEW.pane_label,
+                golden_throne = CASE WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync' WHEN NEW.instance_type = 'sync' THEN 'sync' WHEN NEW.instance_type = 'golden_throne' THEN COALESCE(golden_throne, '1') ELSE golden_throne END,
+                pr_url = NEW.pr_url,
+                pr_state = NEW.pr_state,
+                workflow_state = NEW.workflow_state,
+                workflow_updated_at = NEW.workflow_updated_at,
+                workflow_blocked_reason = NEW.workflow_blocked_reason,
+                next_required_action = NEW.next_required_action,
+                next_action_owner = NEW.next_action_owner,
+                planning_state = NEW.planning_state,
+                planning_updated_at = NEW.planning_updated_at,
+                planning_source = NEW.planning_source,
+                input_lock = NEW.input_lock,
+                hook_driven = COALESCE(NEW.hook_driven, hook_driven),
+                gt_resume_count = COALESCE(NEW.gt_resume_count, gt_resume_count),
+                gt_last_resume_at = NEW.gt_last_resume_at,
+                follow_up_sop = NEW.follow_up_sop,
+                stop_allowed = COALESCE(NEW.stop_allowed, stop_allowed)
+              WHERE id = OLD.id;
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS legacy_instances_delete
+            INSTEAD OF DELETE ON legacy_instances
+            BEGIN
+              DELETE FROM instances WHERE id = OLD.id;
+            END;
+            """
+        )
+    except Exception:
+        return
+
+
+class _TokenOSTestConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=(), /):
+        if isinstance(sql, str) and "legacy_instances" in sql:
+            _install_legacy_instances_test_view(self)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        if isinstance(sql, str) and "legacy_instances" in sql:
+            _install_legacy_instances_test_view(self)
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql, /):
+        if (
+            isinstance(sql, str)
+            and "legacy_instances" in sql
+            and "CREATE TABLE legacy_instances" not in sql
+        ):
+            _install_legacy_instances_test_view(self)
+        return super().executescript(sql)
+
+
+_ORIG_SQLITE_CONNECT = sqlite3.connect
+
+
+def _token_os_sqlite_connect(*args, **kwargs):
+    kwargs.setdefault("factory", _TokenOSTestConnection)
+    conn = _ORIG_SQLITE_CONNECT(*args, **kwargs)
+    _install_legacy_instances_test_view(conn)
+    return conn
+
 
 _MODULES_TO_RELOAD = [
     "personas",
@@ -23,6 +258,11 @@ _MODULES_TO_RELOAD = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _legacy_instances_sqlite_view(monkeypatch):
+    monkeypatch.setattr(sqlite3, "connect", _token_os_sqlite_connect)
+
+
 @pytest.fixture
 def app_env(tmp_path, monkeypatch):
     db_path = tmp_path / "agents.db"
@@ -31,6 +271,7 @@ def app_env(tmp_path, monkeypatch):
     # Isolate morning-session state from the real /tmp so the keepalive gate and
     # morning/end endpoint operate on a per-test directory.
     monkeypatch.setenv("CUSTODES_MORNING_DIR", str(tmp_path / "custodes_morning"))
+    monkeypatch.setattr(sqlite3, "connect", _token_os_sqlite_connect)
 
     for name in _MODULES_TO_RELOAD:
         if name in sys.modules:

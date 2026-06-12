@@ -493,7 +493,7 @@ def register_automated_send(
     Fires only for mutating send verbs with a resolved ``-t`` target (by the time
     ``run()`` calls this the target is the canonical ``%pane_id``). Best-effort and
     fail-open — never raises into the send path. Timestamps are naive-local to match
-    ``claude_instances.last_activity`` (the convention compute_work_state compares
+    ``instances.last_activity`` (the convention compute_work_state compares
     against); the upsert slides the window forward across a multi-send reflex burst.
     """
     args = tuple(args)

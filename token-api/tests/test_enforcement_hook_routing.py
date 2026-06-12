@@ -55,7 +55,7 @@ def _insert_instance(*, legion="custodes", synced=1, status="idle", tmux_pane="%
     conn = sqlite3.connect(_db_path())
     now = "2026-05-31T12:00:00"
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",

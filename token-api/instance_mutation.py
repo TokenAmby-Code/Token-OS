@@ -28,7 +28,7 @@ RECONCILIATION_SUSPICIOUS = {
 
 # Tracked mutation surface = v2 identity + runtime annex. Legacy column names
 # (tab_name/legion/synced/instance_type/primarch/parent_instance_id/tts_mode/pid)
-# died with the claude_instances extraction; their v2 homes are name/persona_id/
+# died with the legacy instance table extraction; their v2 homes are name/persona_id/
 # golden_throne/commander_*/notification_mode+interaction_mode.
 INSTANCE_MUTATION_FIELDS = {
     # identity
@@ -140,7 +140,7 @@ async def _prepare_chapter_commander(db, values: dict) -> dict:
         values["persona_id"] = commander[0]
     else:
         # A chapter edge must point at a live commander row in `instances`
-        # (the legacy claude_instances fallback died with the extraction).
+        # (the legacy legacy instance table fallback died with the extraction).
         values["commander_type"] = "emperor"
         values["commander_id"] = None
     return values
@@ -167,7 +167,7 @@ def _assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
 
 
 # The dual-write mirror layer (mirror_instance_to_canonical*) died with the
-# claude_instances extraction: every sanctioned write now lands directly on
+# legacy instance table extraction: every sanctioned write now lands directly on
 # `instances`, the one physical table.
 
 

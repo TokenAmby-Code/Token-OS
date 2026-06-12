@@ -172,8 +172,8 @@ def check_static_persona_route(
     if db is not None:
         cursor = db.cursor()
         cursor.execute(
-            """SELECT id, status, synced, last_activity, input_lock
-               FROM claude_instances
+            """SELECT id, status, (golden_throne = 'sync') AS synced, last_activity, input_lock
+               FROM instances
                WHERE tmux_pane = ? AND status != 'stopped'
                ORDER BY last_activity DESC LIMIT 1""",
             (pane,),

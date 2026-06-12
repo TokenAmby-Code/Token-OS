@@ -123,7 +123,7 @@ def test_manual_voice_change_updates_persona_and_tts_fields(client, app_env):
 
     with sqlite3.connect(app_env.db_path) as conn:
         row = conn.execute(
-            "SELECT profile_name, tts_voice, notification_sound FROM claude_instances WHERE id = ?",
+            "SELECT profile_name, tts_voice, notification_sound FROM legacy_instances WHERE id = ?",
             (second_row["id"],),
         ).fetchone()
     assert row == ("imperial-fists", "Microsoft Catherine", "ding.wav")
@@ -148,7 +148,7 @@ def test_manual_voice_change_rejects_collision_without_bumping(client, app_env):
 
     with sqlite3.connect(app_env.db_path) as conn:
         rows = conn.execute(
-            "SELECT tab_name, profile_name, tts_voice FROM claude_instances ORDER BY tab_name"
+            "SELECT tab_name, profile_name, tts_voice FROM legacy_instances ORDER BY tab_name"
         ).fetchall()
     assert rows == [
         ("inst-0", "blood-angels", "Microsoft Ravi"),

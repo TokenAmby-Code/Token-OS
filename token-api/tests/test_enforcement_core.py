@@ -25,7 +25,7 @@ def _stub_instance_pane_resolution(app_env, monkeypatch):
         conn = sqlite3.connect(app_env.db_path)
         try:
             row = conn.execute(
-                "SELECT tmux_pane FROM claude_instances WHERE id = ?", (instance_id,)
+                "SELECT tmux_pane FROM legacy_instances WHERE id = ?", (instance_id,)
             ).fetchone()
         finally:
             conn.close()
@@ -58,7 +58,7 @@ class _FakeProc:
 def _insert_gt_instance(db_path, instance_id="gt-dispatch", *, tmux_pane="%10"):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, tmux_pane, zealotry)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -277,7 +277,7 @@ async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, mo
     assert queue_rows[0]["last_error"] == "send failed"
     instance_row = _rows(
         app_env.db_path,
-        "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
+        "SELECT gt_resume_count FROM legacy_instances WHERE id = ?",
         ("gt-dispatch-fail",),
     )[0]
     assert instance_row["gt_resume_count"] == 0
@@ -352,7 +352,7 @@ async def test_golden_throne_validated_dispatch_counts_without_ack(app_env, monk
     assert queue_result["stdout"] == "injected\ninjected"
     instance_row = _rows(
         app_env.db_path,
-        "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
+        "SELECT gt_resume_count FROM legacy_instances WHERE id = ?",
         ("gt-dispatch-ok",),
     )[0]
     assert instance_row["gt_resume_count"] == 1
@@ -577,7 +577,7 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
     )
     instance_row = _rows(
         app_env.db_path,
-        "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
+        "SELECT gt_resume_count FROM legacy_instances WHERE id = ?",
         ("gt-empty-legion",),
     )[0]
     assert instance_row["gt_resume_count"] == 0
@@ -635,7 +635,7 @@ async def test_golden_throne_typing_block_defers_without_counting(app_env, monke
     assert result["reason"] == "dispatch_deferred_rescheduled"
     instance_row = _rows(
         app_env.db_path,
-        "SELECT gt_resume_count FROM claude_instances WHERE id = ?",
+        "SELECT gt_resume_count FROM legacy_instances WHERE id = ?",
         ("gt-dispatch-defer",),
     )[0]
     assert instance_row["gt_resume_count"] == 0
@@ -786,7 +786,7 @@ async def test_golden_throne_user_activity_cancels_queue_and_resets_resume_count
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, gt_resume_count, gt_resume_window_started_at, gt_last_resume_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -822,7 +822,7 @@ async def test_golden_throne_user_activity_cancels_queue_and_resets_resume_count
         app_env.db_path,
         """
         SELECT gt_resume_count, gt_resume_window_started_at, status
-        FROM claude_instances WHERE id = ?
+        FROM legacy_instances WHERE id = ?
         """,
         ("gt-active",),
     )[0]
@@ -891,7 +891,7 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.executemany(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, zealotry, stopped_at, last_activity, gt_last_resume_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -982,7 +982,7 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, zealotry, tmux_pane, stopped_at, last_activity)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1031,7 +1031,7 @@ async def test_golden_throne_instance_gone_marks_quiet_edge_handled(app_env, mon
     now = datetime.now() - timedelta(minutes=5)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, zealotry, tmux_pane, stopped_at, last_activity)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1058,7 +1058,7 @@ async def test_golden_throne_instance_gone_marks_quiet_edge_handled(app_env, mon
 
     row = _rows(
         app_env.db_path,
-        "SELECT stopped_at, gt_last_resume_at FROM claude_instances WHERE id = ?",
+        "SELECT stopped_at, gt_last_resume_at FROM legacy_instances WHERE id = ?",
         ("gt-instance-gone",),
     )[0]
     assert row["gt_last_resume_at"] == row["stopped_at"]
@@ -1080,7 +1080,7 @@ async def test_golden_throne_followup_skips_disabled_row_before_rubric(app_env, 
 
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, zealotry, tmux_pane, last_activity)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1637,7 +1637,7 @@ def test_work_state_counts_idle_tracked_instance_as_productive(app_env, monkeypa
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
@@ -1686,7 +1686,7 @@ def test_work_state_resolves_noncanonical_tmux_target(app_env, monkeypatch):
     monkeypatch.setattr(app_env.main, "_resolve_tmux_pane_id_for_read_model", resolve_pane_id)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
@@ -1731,7 +1731,7 @@ def test_work_state_ignores_idle_tracked_instance_without_agent_process(app_env,
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (

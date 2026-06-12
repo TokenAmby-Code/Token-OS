@@ -16,7 +16,7 @@ def _insert_instance(
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
-        INSERT INTO claude_instances (
+        INSERT INTO legacy_instances (
             id, session_id, tab_name, origin_type, device_id, tmux_pane, engine, status
         ) VALUES (?, ?, ?, 'local', 'mac', ?, ?, ?)
         """,

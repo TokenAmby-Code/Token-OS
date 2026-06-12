@@ -368,7 +368,7 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
 
     conn = sqlite3.connect(ladder_env.db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, legion, tmux_pane)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",

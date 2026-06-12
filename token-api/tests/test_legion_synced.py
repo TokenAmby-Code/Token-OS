@@ -1,7 +1,7 @@
 """Tests for legion-aware Discord routing and synced sessions.
 
 Covers:
-- Schema: legion + synced columns on claude_instances
+- Schema: legion + synced columns on legacy_instances
 - API: PATCH legion, PATCH synced (one-per-legion), GET synced-session
 - Helpers: _format_discord_injection
 - Cleanup: synced=0 on stop
@@ -58,7 +58,7 @@ def _insert_instance(
     now = last_activity or datetime.now().isoformat()
     conn = sqlite3.connect(db_path or _TEST_DB_PATH)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
@@ -84,7 +84,7 @@ def _get_instance(instance_id):
     """Read an instance row from DB."""
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
+    row = conn.execute("SELECT * FROM legacy_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -118,15 +118,15 @@ class TestSchema:
     def test_legion_synced_index_exists(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
         indices = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='claude_instances'"
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='instances'"
         ).fetchall()
         conn.close()
         index_names = {row[0] for row in indices}
-        assert "idx_instances_legion_synced" in index_names
+        assert "idx_instances_v2_gt" in index_names
 
     def test_workflow_columns_exist(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
-        cols = conn.execute("PRAGMA table_info(claude_instances)").fetchall()
+        cols = conn.execute("PRAGMA table_info(legacy_instances)").fetchall()
         conn.close()
         names = {row[1] for row in cols}
         assert {
@@ -586,7 +586,7 @@ class TestCustodesDocRebind:
         conn = sqlite3.connect(db_path)
         now = datetime.now().isoformat()
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, legion, synced, session_doc_id, registered_at, last_activity)
                VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'custodes', 1, ?, ?, ?)""",
@@ -756,7 +756,7 @@ class TestWorkflowState:
         sid = _insert_instance(status="idle")
         conn = sqlite3.connect(_TEST_DB_PATH)
         conn.execute(
-            """UPDATE claude_instances
+            """UPDATE legacy_instances
                SET instance_type = 'golden_throne',
                    workflow_state = 'worktree',
                    stop_allowed = 1

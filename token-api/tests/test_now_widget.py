@@ -68,7 +68,7 @@ def test_write_today_now_callout_smoke_with_fixture_db(tmp_path):
             ),
         )
         conn.execute(
-            """CREATE TABLE claude_instances (
+            """CREATE TABLE legacy_instances (
                 id TEXT,
                 tab_name TEXT,
                 working_dir TEXT,
@@ -79,7 +79,7 @@ def test_write_today_now_callout_smoke_with_fixture_db(tmp_path):
             )"""
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('1', 'custodes-main', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%1', 'palace:N')"
+            "INSERT INTO legacy_instances VALUES ('1', 'custodes-main', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%1', 'palace:N')"
         )
         conn.execute("CREATE TABLE events (event_type TEXT, details TEXT, created_at TEXT)")
 
@@ -104,7 +104,7 @@ def test_now_widget_active_instances_reject_claude_placeholder(tmp_path):
         conn.execute("CREATE TABLE timer_state (id INTEGER PRIMARY KEY, state_json TEXT)")
         conn.execute("INSERT INTO timer_state (id, state_json) VALUES (1, ?)", (json.dumps({}),))
         conn.execute(
-            """CREATE TABLE claude_instances (
+            """CREATE TABLE legacy_instances (
                 id TEXT,
                 tab_name TEXT,
                 working_dir TEXT,
@@ -115,10 +115,10 @@ def test_now_widget_active_instances_reject_claude_placeholder(tmp_path):
             )"""
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('1', 'Claude 08:14', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%108', 'palace:NW')"
+            "INSERT INTO legacy_instances VALUES ('1', 'Claude 08:14', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%108', 'palace:NW')"
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('2', 'Claude 08:15', '/tmp/y', 'idle', '2026-05-09T18:58:00', '%109', NULL)"
+            "INSERT INTO legacy_instances VALUES ('2', 'Claude 08:15', '/tmp/y', 'idle', '2026-05-09T18:58:00', '%109', NULL)"
         )
         conn.execute("CREATE TABLE events (event_type TEXT, details TEXT, created_at TEXT)")
 

@@ -1,6 +1,6 @@
 """Slice B of the tmuxctl pane-ownership cutover: every ``pane -> instance``
 reverse lookup in main.py reads the pane's live ``@INSTANCE_ID`` stamp instead of
-querying the stored ``claude_instances.tmux_pane`` column.
+querying the stored ``legacy_instances.tmux_pane`` column.
 
 tmuxctl/the wrapper own the pane stamp (set at register, cleared on agent death),
 so it is the authoritative reverse bridge. ``shared.instance_id_for_pane(pane)`` is
@@ -34,7 +34,7 @@ def _insert_instance(
 ) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, tmux_pane, legion, session_doc_id, hook_driven,
             zealotry)
@@ -61,9 +61,9 @@ def _insert_instance(
 
 
 _FETCH_QUERIES = {
-    "tab_name": "SELECT tab_name FROM claude_instances WHERE id = ?",
-    "hook_driven": "SELECT hook_driven FROM claude_instances WHERE id = ?",
-    "status": "SELECT status FROM claude_instances WHERE id = ?",
+    "tab_name": "SELECT tab_name FROM legacy_instances WHERE id = ?",
+    "hook_driven": "SELECT hook_driven FROM legacy_instances WHERE id = ?",
+    "status": "SELECT status FROM legacy_instances WHERE id = ?",
 }
 
 

@@ -1,18 +1,18 @@
 """Canonical instance registry v2 helpers.
 
-The ``instances`` table is the durable registry and — post claude_instances
+The ``instances`` table is the durable registry and — post legacy instance table
 exterminatus — the ONE physical instance table. It has two column tiers:
 
 * IDENTITY_COLUMNS: the durable v2 registry charter (persona/rank/commander/
   origin). Authoritative, never derived from anywhere else.
 * RUNTIME_ANNEX_COLUMNS: transitional runtime/workflow fields inherited from
-  the extracted ``claude_instances`` table. Each is slated for per-column
+  the extracted the legacy instance table table. Each is slated for per-column
   demolition as its successor lands (tmux @INSTANCE_ID stamps for pane
   geometry, the golden_throne table for GT state, status enum for workflow/
   planning). New code must not grow this list.
 
-The legacy ``claude_instances`` table itself lives in archive.db only (see
-db_schema.extract_claude_instances / restore_claude_instances_from_archive).
+The legacy the legacy instance table table itself lives in archive.db only (see
+db_schema.extract_legacy instance table / restore_legacy instance table_from_archive).
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ RUNTIME_ANNEX_COLUMNS = [
 
 INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
 
-# Legacy claude_instances columns with NO live home: their values exist only in
+# Legacy legacy instance table columns with NO live home: their values exist only in
 # archive.db. Reads repoint to the v2 derivation noted inline.
 REMOVED_INSTANCE_COLUMNS = {
     "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
@@ -216,7 +216,7 @@ def golden_throne_binding(row: dict) -> str | None:
 
 
 def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
-    """Map a legacy claude_instances row into final instances columns."""
+    """Map a legacy legacy instance table row into final instances columns."""
     if not row:
         return {}
     status = normalize_status(row.get("status"))

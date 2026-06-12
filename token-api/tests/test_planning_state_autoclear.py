@@ -25,7 +25,7 @@ def _insert_instance(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             legion, planning_state)
@@ -48,7 +48,7 @@ def _insert_instance(
 def _planning(db_path, instance_id):
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT planning_state, planning_source FROM claude_instances WHERE id = ?",
+        "SELECT planning_state, planning_source FROM legacy_instances WHERE id = ?",
         (instance_id,),
     ).fetchone()
     conn.close()

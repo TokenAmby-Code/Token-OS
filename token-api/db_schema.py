@@ -22,7 +22,15 @@ from instance_registry import (
     legacy_row_to_instance_values,
     slug_from_legacy,
 )
-from personas import ensure_personas_table, persona_id_for_slug, repair_legacy_instance_personas
+from personas import (
+    active_non_retired_persona_ids,
+    assign_astartes_persona,
+    ensure_personas_table,
+    persona_id_for_slug,
+    persona_to_profile,
+    resolve_persona,
+    singleton_persona_slug_for_runtime,
+)
 
 DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
@@ -156,6 +164,97 @@ async def _create_instances_table(db) -> None:
             CHECK(status != 'archived' OR rank = 'retired')
         )
     """)
+
+
+async def _repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
+    """Last cutover repair for legacy active persona assignments before extraction."""
+    cols = await _table_columns(db, "claude_instances")
+    required = {"id", "profile_name", "tts_voice", "notification_sound", "status"}
+    if not required.issubset(cols):
+        return 0
+
+    select_cols = [
+        "id",
+        "profile_name",
+        "tts_voice",
+        "notification_sound",
+        "status",
+    ]
+    for optional in ("legion", "primarch", "is_subagent", "registered_at", "last_activity"):
+        if optional in cols:
+            select_cols.append(optional)
+
+    subagent_clause = "AND COALESCE(is_subagent, 0) = 0" if "is_subagent" in cols else ""
+    order_terms = [col for col in ("registered_at", "last_activity", "id") if col in cols]
+    order_sql = ", ".join(order_terms or ["id"])
+    cursor = await db.execute(
+        f"""
+        SELECT {", ".join(select_cols)}
+        FROM claude_instances
+        WHERE status IN ('processing', 'idle')
+          {subagent_clause}
+        ORDER BY {order_sql}
+        """
+    )
+    rows = [dict(zip(select_cols, row, strict=False)) for row in await cursor.fetchall()]
+
+    changed = 0
+    locked_ids = await active_non_retired_persona_ids(db)
+    for row in rows:
+        singleton_slug = singleton_persona_slug_for_runtime(
+            legion=row.get("legion"), primarch=row.get("primarch")
+        )
+        if singleton_slug:
+            persona = await resolve_persona(db, singleton_slug)
+            if not persona:
+                continue
+            profile = persona_to_profile(persona)
+            updates = {
+                "profile_name": profile["name"],
+                "tts_voice": profile["wsl_voice"],
+                "notification_sound": profile["notification_sound"],
+            }
+            if any(row.get(key) != value for key, value in updates.items()):
+                await db.execute(
+                    """
+                    UPDATE claude_instances
+                    SET profile_name = ?, tts_voice = ?, notification_sound = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updates["profile_name"],
+                        updates["tts_voice"],
+                        updates["notification_sound"],
+                        row["id"],
+                    ),
+                )
+                changed += 1
+            locked_ids = await active_non_retired_persona_ids(db)
+            continue
+
+        current = await resolve_persona(db, row.get("profile_name") or "")
+        if current and current.get("default_rank") == "astartes":
+            continue
+
+        assigned, _ = await assign_astartes_persona(db, active_ids=locked_ids)
+        profile = persona_to_profile(assigned)
+        await db.execute(
+            """
+            UPDATE claude_instances
+            SET profile_name = ?, tts_voice = ?, notification_sound = ?
+            WHERE id = ?
+            """,
+            (
+                profile["name"],
+                profile["wsl_voice"],
+                profile["notification_sound"],
+                row["id"],
+            ),
+        )
+        locked_ids.add(assigned["id"])
+        changed += 1
+
+    return changed
 
 
 async def _ensure_instances_v2(db) -> None:
@@ -635,7 +734,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
         # legacy table), then extract: archive.db gets the data, live loses
         # the table. Fresh DBs skip all of this.
         if await _table_exists(db, "claude_instances"):
-            repaired_personas = await repair_legacy_instance_personas(db)
+            repaired_personas = await _repair_legacy_instance_personas(db)
             if repaired_personas:
                 print(f"Repaired {repaired_personas} legacy active persona assignments")
 
@@ -1357,7 +1456,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         # DROP+CREATE (not IF NOT EXISTS): on upgraded DBs the old triggers of
-        # the same name were bound to claude_instances and died with the table,
+        # the same name were bound to the extracted legacy table and died with it,
         # but mid-transition states must converge on the instances-bound ones.
         await db.execute("DROP TRIGGER IF EXISTS trg_status_pane_state")
         await db.execute("""

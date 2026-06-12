@@ -112,7 +112,7 @@ def _insert(
         )
         doc_id = cur.lastrowid
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             tmux_pane, status, instance_type, zealotry, session_doc_id,
             registered_at, last_activity, engine)
@@ -375,7 +375,7 @@ async def test_local_fire_fails_closed_when_pane_unresolved(gt_env, monkeypatch)
     # Marked stopped so the GT timer stops re-firing at a vanished pane.
     conn = sqlite3.connect(gt_env.db_path)
     row = conn.execute(
-        "SELECT status, gt_resume_count FROM claude_instances WHERE id = ?", (iid,)
+        "SELECT status, gt_resume_count FROM legacy_instances WHERE id = ?", (iid,)
     ).fetchone()
     conn.close()
     assert row[0] == "stopped"
@@ -509,7 +509,7 @@ async def test_remote_fire_fails_closed_when_satellite_cannot_resolve(gt_env, mo
 
     conn = sqlite3.connect(gt_env.db_path)
     row = conn.execute(
-        "SELECT status, gt_resume_count FROM claude_instances WHERE id = ?", (iid,)
+        "SELECT status, gt_resume_count FROM legacy_instances WHERE id = ?", (iid,)
     ).fetchone()
     conn.close()
     assert row[0] == "stopped"

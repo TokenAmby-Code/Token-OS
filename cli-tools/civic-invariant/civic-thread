@@ -4,7 +4,7 @@
 #
 # "Alive" here means an agent-thread that is ACTIVELY INFERRING (stop-hook governed),
 # NOT a process that happens to be running. The invariant is satisfied when at least
-# one Claude instance with status=processing has a working_dir in the Civic volume.
+# one agent instance with status=working has a working_dir in the Civic volume.
 # (Per Emperor 2026-06-01: "anything that's in the civic volume and processing" —
 #  reservist/infra threads are NOT excluded; they count.)
 #
@@ -42,17 +42,17 @@ event() { printf '[%s] %s\n' "$(ts)" "$*" >>"$EVENT_LOG"; }
 say()   { printf '%s\n' "$*"; }
 
 # --- Detection ---------------------------------------------------------------
-# Faithful to the Emperor's spec: status=processing AND working_dir under Civic.
+# Faithful to the Emperor's spec: status=working AND working_dir under Civic.
 _civic_rows() {
-  agents-db query "SELECT id, tab_name, working_dir, last_activity \
-    FROM claude_instances \
-    WHERE status='processing' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%' \
+  agents-db query "SELECT id, name AS tab_name, working_dir, last_activity \
+    FROM instances \
+    WHERE status='working' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%' \
     ORDER BY last_activity DESC" 2>/dev/null
 }
 
 cmd_count() {
-  agents-db query "SELECT COUNT(*) FROM claude_instances \
-    WHERE status='processing' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%'" 2>/dev/null \
+  agents-db query "SELECT COUNT(*) FROM instances \
+    WHERE status='working' AND working_dir LIKE '${CIVIC_PATH_PREFIX}%'" 2>/dev/null \
     | grep -oE '[0-9]+' | tail -1
 }
 
@@ -74,7 +74,7 @@ cmd_fallthrough() {
 
   if cmd_check; then
     event "fallthrough: satisfied ($(cmd_count) civic thread(s) inferring); no action"
-    say "✅ civic thread alive ($(cmd_count) processing in $CIVIC_PATH_PREFIX) — no fallthrough"
+    say "✅ civic thread alive ($(cmd_count) working in $CIVIC_PATH_PREFIX) — no fallthrough"
     return 0
   fi
 

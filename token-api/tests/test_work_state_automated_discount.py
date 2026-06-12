@@ -27,7 +27,7 @@ SESSION_ID = "sess-1"
 def _insert_instance(db_path) -> None:
     """Insert one local mechanicus agent instance, filling every NOT-NULL column."""
     with sqlite3.connect(db_path) as conn:
-        cols = conn.execute("PRAGMA table_info(claude_instances)").fetchall()
+        cols = conn.execute("PRAGMA table_info(legacy_instances)").fetchall()
         values: dict[str, Any] = {}
         for _cid, name, ctype, notnull, dflt, _pk in cols:
             if dflt is not None or not notnull:
@@ -48,7 +48,7 @@ def _insert_instance(db_path) -> None:
         )
         keys = list(values)
         conn.execute(
-            f"INSERT INTO claude_instances ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
+            f"INSERT INTO legacy_instances ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
             [values[k] for k in keys],
         )
         conn.commit()
@@ -57,7 +57,7 @@ def _insert_instance(db_path) -> None:
 def _set_last_activity(db_path, seconds_ago: float) -> None:
     ts = (datetime.now() - timedelta(seconds=seconds_ago)).isoformat()
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE claude_instances SET last_activity = ? WHERE id = ?", (ts, SESSION_ID))
+        conn.execute("UPDATE legacy_instances SET last_activity = ? WHERE id = ?", (ts, SESSION_ID))
         conn.commit()
 
 
@@ -77,7 +77,7 @@ def _set_marker(db_path, injected_offset_s: float, ttl_s: float) -> None:
 def _set_hook_driven(db_path, value: int) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "UPDATE claude_instances SET hook_driven = ? WHERE id = ?", (value, SESSION_ID)
+            "UPDATE legacy_instances SET hook_driven = ? WHERE id = ?", (value, SESSION_ID)
         )
         conn.commit()
 

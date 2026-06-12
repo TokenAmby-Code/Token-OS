@@ -16,7 +16,7 @@ def client(app_env, monkeypatch):
     async def _stamp(pane):
         with sqlite3.connect(app_env.db_path) as conn:
             r = conn.execute(
-                "SELECT id FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' "
+                "SELECT id FROM legacy_instances WHERE tmux_pane = ? AND status != 'stopped' "
                 "ORDER BY last_activity DESC LIMIT 1",
                 (pane,),
             ).fetchone()
@@ -36,7 +36,7 @@ def _insert_instance(app_env, *, tmux_pane="%77", status="idle", tab_name="Claud
     instance_id = str(uuid.uuid4())
     conn = _db(app_env)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, tmux_pane, engine, registered_at, last_activity)
            VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'codex',
@@ -63,7 +63,7 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
 
     conn = _db(app_env)
     row = conn.execute(
-        "SELECT tab_name FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT tab_name FROM legacy_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     mutation = conn.execute(
         "SELECT mutation_type, actor, field_names_json FROM instance_mutations WHERE instance_id = ? ORDER BY id DESC LIMIT 1",

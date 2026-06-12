@@ -56,7 +56,7 @@ def _insert_instance(db_path: Path, instance_id: str | None = None) -> str:
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, instance_type, zealotry, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'golden_throne', 4, ?, ?)""",

@@ -99,12 +99,13 @@ def load_instances() -> dict[str, Instance]:
     if not DB_PATH.exists():
         return {}
     query = """
-        SELECT id, COALESCE(tab_name, '') AS tab_name, status,
-               COALESCE(tmux_pane, '') AS tmux_pane, COALESCE(legion, '') AS legion
-        FROM claude_instances
-        WHERE status IN ('idle', 'processing')
-          AND COALESCE(tmux_pane, '') != ''
-          AND COALESCE(is_subagent, 0) = 0
+        SELECT i.id, COALESCE(i.name, '') AS tab_name, i.status,
+               COALESCE(i.tmux_pane, '') AS tmux_pane, COALESCE(p.slug, '') AS legion
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.status IN ('idle', 'working')
+          AND COALESCE(i.tmux_pane, '') != ''
+          AND COALESCE(i.is_subagent, 0) = 0
         ORDER BY last_activity DESC
     """
     with sqlite3.connect(DB_PATH) as conn:

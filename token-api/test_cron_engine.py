@@ -1068,7 +1068,7 @@ class TestInstanceMutex:
         instance_id = instance_id or f"inst-{time.monotonic_ns()}"
         con = sqlite3.connect(str(db_path))
         con.execute("""
-            CREATE TABLE IF NOT EXISTS claude_instances (
+            CREATE TABLE IF NOT EXISTS legacy_instances (
                 id TEXT PRIMARY KEY,
                 tab_name TEXT,
                 status TEXT DEFAULT 'active',
@@ -1078,7 +1078,7 @@ class TestInstanceMutex:
             )
         """)
         con.execute(
-            "INSERT INTO claude_instances (id, tab_name, status, spawner, is_subagent, created_at) VALUES (?,?,?,?,1,?)",
+            "INSERT INTO legacy_instances (id, tab_name, status, spawner, is_subagent, created_at) VALUES (?,?,?,?,1,?)",
             (
                 instance_id,
                 f"sub: cron:{job_name}",
@@ -1094,12 +1094,12 @@ class TestInstanceMutex:
     def test_mutex_clear_when_no_instances(self, engine, db_path):
         """Returns True (proceed) when no instances exist for the job."""
         job = {"id": "j1", "name": "my-task", "enabled": 1}
-        # Ensure claude_instances table exists (empty)
+        # Ensure legacy_instances table exists (empty)
         import sqlite3
 
         con = sqlite3.connect(str(db_path))
         con.execute("""
-            CREATE TABLE IF NOT EXISTS claude_instances (
+            CREATE TABLE IF NOT EXISTS legacy_instances (
                 id TEXT PRIMARY KEY, tab_name TEXT, status TEXT DEFAULT 'active',
                 spawner TEXT, is_subagent INTEGER DEFAULT 0, created_at TEXT
             )
