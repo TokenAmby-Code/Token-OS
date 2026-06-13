@@ -323,6 +323,7 @@ SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
 CUSTODES_PANE_LABEL = "legion:custodes"
+LEGION_MALCADOR_LABEL = "legion:malcador"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
@@ -363,6 +364,17 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         # _resolve_administratum_instance keys on primarch='administratum').
         "legion": "mechanicus",
         "primarch": "administratum",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+    LEGION_MALCADOR_LABEL: {
+        # Malcador (advisor seat) shares the astartes legion with regiment workers,
+        # so legion cannot identify it — its load-bearing key is primarch='malcador'
+        # (personas seed default_rank='primarch'; tmuxctl
+        # assertions._row_matches_persona resolves on the same column), mirroring
+        # Administratum. Outside enforcement and state-hook routing: never sync.
+        "legion": "astartes",
+        "primarch": "malcador",
         "instance_type": "hook_driven",
         "synced": False,
     },
@@ -1984,6 +1996,15 @@ async def handle_session_start(payload: dict) -> dict:
             primarch_name = persona_identity.get("primarch") or ""
         if launch_instance_type is None:
             launch_instance_type = persona_identity.get("instance_type")
+        # A persona singleton is Emperor-commanded, never a chapter child. A
+        # relaunch chain (old persona session dispatching/resuming its successor)
+        # leaks the predecessor into TOKEN_API_PARENT_INSTANCE_ID; honoring it
+        # registers the new row with commander_type='chapter', which exempts it
+        # from the singleton guard, the default-rank stamp triggers, and
+        # resolve_live_persona_instance — leaving the dead predecessor as the
+        # resolvable singleton (live custodes 6a8773e9 commanded by its own
+        # zombie d865db2e).
+        parent_instance_id = ""
     persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
@@ -2812,7 +2833,11 @@ async def handle_session_start(payload: dict) -> dict:
         )
         target_working_dir = target_working_dir or _prior_dispatch.get("target_working_dir")
         launch_mode = launch_mode or _prior_dispatch.get("launch_mode")
-        parent_instance_id = parent_instance_id or _prior_parent_instance_id
+        # Persona singletons stay Emperor-commanded even when the pre-registration
+        # row carried a dispatcher parent (see the persona_identity guard above) —
+        # restoring it here would re-poison the fresh row into a chapter child.
+        if not persona_identity:
+            parent_instance_id = parent_instance_id or _prior_parent_instance_id
         if not transplant_expected:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
