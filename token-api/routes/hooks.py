@@ -3552,6 +3552,90 @@ def _payload_indicates_plan_mode(payload: dict) -> bool:
     return walk(payload)
 
 
+def _transcript_indicates_plan_mode_sync(payload: dict) -> bool:
+    """Detect Codex native Plan Mode from the JSONL transcript turn context.
+
+    Codex's UserPromptSubmit hook payload may contain only the rendered prompt
+    text.  When the user entered native Plan Mode, the `/plan` prefix is
+    consumed by the TUI before the hook sees it, but the transcript records the
+    current turn as plan-mode before the hook is forwarded:
+
+      * event_msg.payload.type == "task_started" with
+        collaboration_mode_kind == "plan"
+      * turn_context.payload.collaboration_mode.mode == "plan"
+
+    Key on the hook's turn_id so an older plan-mode turn in a resumed transcript
+    cannot arm planning for an ordinary later prompt.
+    """
+    turn_id = _normalize_text(payload.get("turn_id"))
+    transcript_path = _normalize_text(payload.get("transcript_path"))
+    if not turn_id or not transcript_path:
+        return False
+
+    try:
+        path = Path(transcript_path).expanduser()
+        if not path.exists() or not path.is_file():
+            return False
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+    seen_matching_turn = False
+    for line in reversed(lines):
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        record_type = record.get("type")
+        record_payload = record.get("payload")
+        if not isinstance(record_payload, dict):
+            continue
+
+        payload_turn_id = _normalize_text(record_payload.get("turn_id"))
+        if payload_turn_id:
+            if payload_turn_id != turn_id:
+                # Ignore newer turns until the target is found.  Once we have
+                # seen the target turn, a different turn_id means we crossed
+                # into an older turn and no turn-less records beyond this point
+                # can belong to the target turn.
+                if seen_matching_turn:
+                    break
+                continue
+            seen_matching_turn = True
+
+        if record_type == "event_msg" and record_payload.get("type") == "task_started":
+            if _normalize_text(record_payload.get("collaboration_mode_kind")) == "plan":
+                return True
+            if payload_turn_id == turn_id:
+                break
+            continue
+
+        if record_type == "turn_context" and payload_turn_id == turn_id:
+            if _payload_indicates_plan_mode(record_payload):
+                return True
+
+        if record_type == "event_msg" and record_payload.get("type") == "item_completed":
+            # Late but useful for re-fired PromptSubmit hooks: a completed Plan
+            # item for this turn proves the pane is still in native Plan Mode.
+            item = record_payload.get("item")
+            item_type = _normalize_text(item.get("type")) if isinstance(item, dict) else None
+            if (
+                item_type
+                and item_type.lower() == "plan"
+                and (payload_turn_id == turn_id or (not payload_turn_id and seen_matching_turn))
+            ):
+                return True
+    return False
+
+
+async def _transcript_indicates_plan_mode(payload: dict) -> bool:
+    """Async wrapper so transcript disk I/O never blocks the hook event loop."""
+    return await asyncio.to_thread(_transcript_indicates_plan_mode_sync, payload)
+
+
 async def handle_prompt_submit(payload: dict) -> dict:
     """Handle UserPromptSubmit hook - mark instance as processing."""
     session_id = payload.get("session_id")
@@ -3596,7 +3680,11 @@ async def handle_prompt_submit(payload: dict) -> dict:
         consumed_injections = await _consume_state_injections(db, session_id)
 
         planning_event = None
-        if _payload_starts_slash_plan(payload) or _payload_indicates_plan_mode(payload):
+        if (
+            _payload_starts_slash_plan(payload)
+            or _payload_indicates_plan_mode(payload)
+            or await _transcript_indicates_plan_mode(payload)
+        ):
             planning_event = await _set_planning_state(
                 db,
                 session_id,

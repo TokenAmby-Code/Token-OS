@@ -217,6 +217,110 @@ def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
     assert source == "auto-clear:prompt-submit"
 
 
+def test_codex_prompt_submit_transcript_plan_context_sets_planning(
+    app_env,
+    monkeypatch,
+    tmp_path,
+):
+    _insert_instance(app_env.db_path, "codex-plan-transcript-1", pane="%51", engine="codex")
+    transcript = tmp_path / "codex-plan.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-plan-1","collaboration_mode_kind":"plan"}}',
+                '{"type":"turn_context","payload":{"turn_id":"turn-plan-1","collaboration_mode":{"mode":"plan"}}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"native plan prompt without slash prefix"}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {
+            "session_id": "codex-plan-transcript-1",
+            "turn_id": "turn-plan-1",
+            "transcript_path": str(transcript),
+            "prompt": "native plan prompt without slash prefix",
+        },
+    )
+
+    state, source = _planning(app_env.db_path, "codex-plan-transcript-1")
+    assert state == "planning"
+    assert source == "auto-clear:prompt-submit"
+
+
+def test_codex_prompt_submit_ignores_prior_transcript_plan_turn(
+    app_env,
+    monkeypatch,
+    tmp_path,
+):
+    _insert_instance(app_env.db_path, "codex-normal-transcript-1", pane="%52", engine="codex")
+    transcript = tmp_path / "codex-normal.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old-plan","collaboration_mode_kind":"plan"}}',
+                '{"type":"turn_context","payload":{"turn_id":"old-plan","collaboration_mode":{"mode":"plan"}}}',
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"normal-turn","collaboration_mode_kind":"default"}}',
+                '{"type":"turn_context","payload":{"turn_id":"normal-turn","collaboration_mode":{"mode":"default"}}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {
+            "session_id": "codex-normal-transcript-1",
+            "turn_id": "normal-turn",
+            "transcript_path": str(transcript),
+            "prompt": "ordinary prompt",
+        },
+    )
+
+    state, source = _planning(app_env.db_path, "codex-normal-transcript-1")
+    assert state == "none"
+    assert source is None
+
+
+def test_codex_prompt_submit_ignores_prior_turnless_plan_item(
+    app_env,
+    monkeypatch,
+    tmp_path,
+):
+    _insert_instance(app_env.db_path, "codex-normal-transcript-2", pane="%53", engine="codex")
+    transcript = tmp_path / "codex-turnless-old-plan.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old-plan","collaboration_mode_kind":"plan"}}',
+                '{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Plan","text":"old plan"}}}',
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"normal-turn","collaboration_mode_kind":"default"}}',
+                '{"type":"turn_context","payload":{"turn_id":"normal-turn","collaboration_mode":{"mode":"default"}}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {
+            "session_id": "codex-normal-transcript-2",
+            "turn_id": "normal-turn",
+            "transcript_path": str(transcript),
+            "prompt": "ordinary prompt",
+        },
+    )
+
+    state, source = _planning(app_env.db_path, "codex-normal-transcript-2")
+    assert state == "none"
+    assert source is None
+
+
 # ── SessionStart reconciliation of a stuck row ─────────────────────────────────
 
 
