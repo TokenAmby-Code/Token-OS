@@ -34,6 +34,12 @@ import asyncio
 import sqlite3
 import sys
 
+# A pane id that does NOT exist on any live tmux server. The hooks' tmux-WRITE
+# paths are also mocked (_mute_tmux_writes), but a fake pane is a second guard:
+# an early version used the real "%19" and clobbered that live pane's
+# @INSTANCE_ID. Never put a real pane id in a hook test.
+_FAKE_PANE = "%999019"
+
 
 def _insert(db_path, instance_id, *, pane=None, status="idle", wrapper_launch_id=None):
     conn = sqlite3.connect(db_path)
@@ -79,6 +85,29 @@ def _blind_tmuxctl(hooks, monkeypatch):
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_stamp)
+    _mute_tmux_writes(hooks, monkeypatch)
+
+
+def _mute_tmux_writes(hooks, monkeypatch):
+    """Neutralize every tmux-WRITE side effect the hooks perform.
+
+    ``_stamp_instance_id`` / ``_unstamp_instance_id`` shell out to
+    ``tmux set-option`` and the tint helpers recolor the live pane. Unmocked +
+    a real pane id, the suite would clobber the live pane's ``@INSTANCE_ID`` /
+    ``@PANE_LABEL`` / tint (it did, once — see PANE constant below). These tests
+    assert on DB rows only, so the writes are pure noise: stub them all.
+    """
+
+    async def _astamp(*_args, **_kwargs):
+        return None
+
+    def _sync_noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(hooks, "_stamp_instance_id", _astamp)
+    monkeypatch.setattr(hooks, "_unstamp_instance_id", _astamp)
+    monkeypatch.setattr(hooks.shared, "clear_pane_tint", _sync_noop)
+    monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
 
 
 def _spy_assertion(hooks, monkeypatch):
@@ -90,6 +119,7 @@ def _spy_assertion(hooks, monkeypatch):
 
     monkeypatch.setattr(hooks, "_spawn_session_end_assertion", rec)
     monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
+    _mute_tmux_writes(hooks, monkeypatch)
     return calls
 
 
@@ -130,7 +160,7 @@ def test_wrapper_launch_id_adopts_prior_row_when_stamp_lost(app_env, monkeypatch
             "pid": 4242,
             "wrapper_launch_id": "LAUNCH-abc123",
             # no pane_instance_id — the stamp was torn down by the race
-            "env": {"TMUX_PANE": "%19", "TOKEN_API_ENGINE": "claude"},
+            "env": {"TMUX_PANE": _FAKE_PANE, "TOKEN_API_ENGINE": "claude"},
         },
     )
 
@@ -163,7 +193,7 @@ def test_wrapper_launch_id_does_not_adopt_across_launches(app_env, monkeypatch):
             "cwd": "/tmp",
             "pid": 5555,
             "wrapper_launch_id": "LAUNCH-second",
-            "env": {"TMUX_PANE": "%19", "TOKEN_API_ENGINE": "claude"},
+            "env": {"TMUX_PANE": _FAKE_PANE, "TOKEN_API_ENGINE": "claude"},
         },
     )
 
@@ -185,7 +215,7 @@ def test_wrapper_launch_id_blank_does_not_adopt(app_env, monkeypatch):
             "cwd": "/tmp",
             "pid": 6666,
             # no wrapper_launch_id at all
-            "env": {"TMUX_PANE": "%19", "TOKEN_API_ENGINE": "claude"},
+            "env": {"TMUX_PANE": _FAKE_PANE, "TOKEN_API_ENGINE": "claude"},
         },
     )
 
@@ -203,7 +233,7 @@ def test_clear_session_end_preserves_row_and_skips_assertion(app_env, monkeypatc
     assertion is NOT spawned. RED today: the row goes stopped + assertion fires.
     """
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "clr", pane="%19", status="working")
+    _insert(app_env.db_path, "clr", pane=_FAKE_PANE, status="working")
     calls = _spy_assertion(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "clr", "reason": "clear"})
@@ -217,7 +247,7 @@ def test_clear_session_end_preserves_row_and_skips_assertion(app_env, monkeypatc
 def test_compact_session_end_preserves_row_and_skips_assertion(app_env, monkeypatch):
     """reason='compact' is the other in-wrapper boundary — same treatment."""
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "cmp", pane="%19", status="working")
+    _insert(app_env.db_path, "cmp", pane=_FAKE_PANE, status="working")
     calls = _spy_assertion(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "cmp", "reason": "compact"})
@@ -236,7 +266,7 @@ def test_terminal_session_end_still_stops_and_asserts(app_env, monkeypatch):
     assertion spawned. The non-terminal allow-list must not over-reach.
     """
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "bye", pane="%19", status="working")
+    _insert(app_env.db_path, "bye", pane=_FAKE_PANE, status="working")
     calls = _spy_assertion(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "bye", "reason": "logout"})
@@ -248,7 +278,7 @@ def test_terminal_session_end_still_stops_and_asserts(app_env, monkeypatch):
 def test_missing_reason_session_end_still_stops(app_env, monkeypatch):
     """No reason field (legacy / unknown) defaults to the full terminal teardown."""
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "noreason", pane="%19", status="working")
+    _insert(app_env.db_path, "noreason", pane=_FAKE_PANE, status="working")
     calls = _spy_assertion(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "noreason"})
