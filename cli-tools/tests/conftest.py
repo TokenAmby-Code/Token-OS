@@ -23,7 +23,8 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("TOKEN_API_DB", str(tmp_path / "agents.db"))
     # Isolate the Obsidian vault too: cli-tools tests that import token-api
     # session-doc helpers must not write placeholder docs into the live vault at
-    # /Volumes/Imperium/Imperium-ENV. Vault-root resolution is lazy, so setting
-    # these redirects all writes into the per-test temp dir.
+    # /Volumes/Imperium/Imperium-ENV. Vault-root resolution is lazy and checks
+    # IMPERIUM_ENV first, so this alone redirects all writes into the temp dir.
+    # Do NOT override IMPERIUM here — it also drives runtime-path resolution
+    # (imperium config) which is unrelated to the vault.
     monkeypatch.setenv("IMPERIUM_ENV", str(tmp_path / "Imperium-ENV"))
-    monkeypatch.setenv("IMPERIUM", str(tmp_path / "imperium-root"))

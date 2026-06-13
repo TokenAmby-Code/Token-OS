@@ -336,8 +336,10 @@ def isolate_vault(tmp_path, monkeypatch):
     The chokepoint guard in session_doc_helpers is the backstop if anything slips.
     """
     vault = tmp_path / "Imperium-ENV"
+    # Set only IMPERIUM_ENV: vault_root() / shared._vault_root() check it first, so
+    # this fully isolates the vault. Do NOT override IMPERIUM here — it also drives
+    # runtime-path resolution (cli-tools imperium config) unrelated to the vault.
     monkeypatch.setenv("IMPERIUM_ENV", str(vault))
-    monkeypatch.setenv("IMPERIUM", str(tmp_path / "imperium-root"))
     return vault
 
 
