@@ -128,22 +128,40 @@ def main(argv: list[str]) -> int:
     # confirmed "sent" counts as delivered. A "pending" target was accepted but
     # NOT yet delivered (gated by quiet hours / typing guard, or deferred) and
     # is surfaced distinctly so a queued brief never reads as a delivery.
+    def _is_blocked(row: dict) -> bool:
+        status_text = str(row.get("status") or "").lower()
+        reason_text = str(row.get("reason") or row.get("error") or "").lower()
+        return (
+            status_text in {"blocked", "cancelled", "canceled", "gated"}
+            or "typing_guard" in reason_text
+            or "send_gated" in reason_text
+            or "user_input_pending" in reason_text
+        )
+
     sent = sum(1 for r in resolved if r.get("status") == "sent")
-    pending = sum(1 for r in resolved if r.get("status") == "pending")
+    blocked = sum(1 for r in resolved if _is_blocked(r))
+    pending = sum(1 for r in resolved if r.get("status") == "pending" and not _is_blocked(r))
 
     targets = ", ".join(
         f"{r.get('position_id') or r.get('pane_id')}"
         for r in resolved
     )
     eph = " (ephemeral)" if args.ephemeral else ""
-    suffix = f" ({pending} pending — not yet delivered)" if pending else ""
+    suffix_parts = []
+    if pending:
+        suffix_parts.append(f"{pending} pending — not yet delivered")
+    if blocked:
+        suffix_parts.append(f"{blocked} blocked — not delivered")
+    suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
     print(f"[brief{eph}] delivered={sent}/{len(resolved)}{suffix} → {targets}")
     for r in resolved:
         st = r.get("status")
         label = r.get("position_id") or r.get("pane_id")
         if st == "sent":
             continue
-        if st == "pending":
+        if _is_blocked(r):
+            _err(f"  {label}: blocked ({r.get('reason') or r.get('error') or 'typing_guard'}) — not delivered")
+        elif st == "pending":
             _err(f"  {label}: pending ({r.get('reason') or 'queued'}) — not yet delivered")
         else:
             _err(f"  {label}: status={st} error={r.get('error') or ''}")

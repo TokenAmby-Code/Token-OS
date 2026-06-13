@@ -12,8 +12,116 @@
 #
 # Functions:
 #   tmux_pane_has_input PANE  — returns 0 if user has pending input, 1 if clear
-#   tmux_wait_for_clear PANE [TIMEOUT]  — blocks until pane is clear or timeout
-#   tmux_send_guarded [send-keys args]  — waits for clear, then sends
+#   tmux_wait_for_clear PANE [TIMEOUT]  — returns 0 if send may proceed, 1 if blocked
+#   tmux_send_guarded [send-keys args]  — guards, then sends
+#
+# Guard model:
+#   * A pane is stamped once when pending prompt input is first observed.
+#   * The stamp is per-pane and never refreshed by further typing.
+#   * The stamp clears when the prompt becomes empty/submitted, or expires after
+#     TMUX_GUARD_TTL seconds (default 300). An expired dirty pane stays allowed
+#     until it becomes empty again; this prevents stale panes from re-blocking
+#     forever.
+#   * TMUX_GUARD_TIMEOUT is only how long a caller is willing to wait before
+#     failing loud. Default 0 means immediate fail-loud, not indefinite wait.
+
+_tmux_guard_tmux() {
+    local bin="${TMUX_GUARD_REAL_TMUX:-}"
+    if [[ -n "$bin" && -x "$bin" ]]; then
+        "$bin" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
+tmux_guard_now() {
+    if [[ -n "${TMUX_GUARD_NOW:-}" ]]; then
+        printf '%s\n' "$TMUX_GUARD_NOW"
+    else
+        date +%s
+    fi
+}
+
+tmux_guard_ttl() {
+    local ttl="${TMUX_GUARD_TTL:-300}"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=300
+    (( ttl > 0 )) || ttl=300
+    printf '%s\n' "$ttl"
+}
+
+tmux_guard_state_dir() {
+    local dir="${TMUX_GUARD_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/tmux-typing-guard-${UID:-$(id -u 2>/dev/null || echo 0)}}"
+    mkdir -p "$dir" 2>/dev/null || true
+    printf '%s\n' "$dir"
+}
+
+tmux_guard_pane_key() {
+    printf '%s' "$1" | sed 's/[^A-Za-z0-9_.:%-]/_/g'
+}
+
+tmux_guard_stamp_file() {
+    local dir key
+    dir="$(tmux_guard_state_dir)"
+    key="$(tmux_guard_pane_key "$1")"
+    printf '%s/%s.stamp\n' "$dir" "$key"
+}
+
+tmux_guard_write_stamp() {
+    local pane="$1" started_at="$2" state="${3:-active}" file
+    file="$(tmux_guard_stamp_file "$pane")"
+    {
+        printf 'started_at=%s\n' "$started_at"
+        printf 'state=%s\n' "$state"
+    } > "${file}.$$" 2>/dev/null && mv "${file}.$$" "$file" 2>/dev/null
+}
+
+tmux_guard_clear_stamp() {
+    local file
+    file="$(tmux_guard_stamp_file "$1")"
+    rm -f "$file" "${file}.$$" 2>/dev/null || true
+}
+
+tmux_guard_log() {
+    local event="$1" pane="$2" reason="${3:-}" timeout="${4:-}" waited="${5:-}" now log
+    now="$(tmux_guard_now)"
+    log="${TMUX_GUARD_LOG:-/tmp/tmux-typing-guard.jsonl}"
+    TMUX_GUARD_LOG_PATH="$log" \
+    TMUX_GUARD_EVENT="$event" \
+    TMUX_GUARD_PANE="$pane" \
+    TMUX_GUARD_REASON="$reason" \
+    TMUX_GUARD_TIMEOUT_VALUE="$timeout" \
+    TMUX_GUARD_WAITED_VALUE="$waited" \
+    TMUX_GUARD_TTL_VALUE="$(tmux_guard_ttl)" \
+    TMUX_GUARD_TS_VALUE="$now" \
+    python3 - <<'PY' 2>/dev/null || true
+import json
+import os
+
+path = os.environ["TMUX_GUARD_LOG_PATH"]
+record = {
+    "ts": int(float(os.environ.get("TMUX_GUARD_TS_VALUE") or "0")),
+    "event": os.environ.get("TMUX_GUARD_EVENT") or "",
+    "pane": os.environ.get("TMUX_GUARD_PANE") or "",
+    "reason": os.environ.get("TMUX_GUARD_REASON") or "",
+    "ttl": int(float(os.environ.get("TMUX_GUARD_TTL_VALUE") or "0")),
+}
+timeout = os.environ.get("TMUX_GUARD_TIMEOUT_VALUE")
+if timeout not in (None, ""):
+    record["timeout"] = timeout
+waited = os.environ.get("TMUX_GUARD_WAITED_VALUE")
+if waited not in (None, ""):
+    record["waited"] = waited
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record, sort_keys=True) + "\n")
+PY
+}
+
+tmux_guard_emit_blocked() {
+    local pane="$1" timeout="${2:-0}" waited="${3:-0}"
+    echo "tmux-guard: BLOCKED send-keys to $pane — user has pending input (waited ${waited}s, timeout ${timeout}s, ttl $(tmux_guard_ttl)s; bypass with TMUX_GUARD_SKIP=1)" >&2
+    tmux_guard_log "blocked" "$pane" "user_input_pending" "$timeout" "$waited"
+}
 
 # Check if a pane has pending user input on the current prompt line.
 # Returns 0 (true) if input detected, 1 (false) if clear.
@@ -39,7 +147,7 @@ tmux_pane_has_input() {
     #   "  ⏵⏵ bypass permissions ..."      — Claude Code hint line
     #   "  esc again to edit previous ..." — Codex CLI hint line
     local last_line
-    last_line=$(tmux capture-pane -t "$pane" -p 2>/dev/null \
+    last_line=$(_tmux_guard_tmux capture-pane -t "$pane" -p 2>/dev/null \
         | sed '/^[[:space:]]*$/d' \
         | grep -vE '^[[:space:]]*[0-9]+%[[:space:]]+[0-9]' \
         | grep -vE '^[[:space:]]*⏵' \
@@ -86,17 +194,72 @@ tmux_pane_has_input() {
     return 0
 }
 
+tmux_guard_pane_blocked() {
+    local pane="$1" file now ttl started_at="" state="" age
+    file="$(tmux_guard_stamp_file "$pane")"
+    now="$(tmux_guard_now)"
+    ttl="$(tmux_guard_ttl)"
+
+    if ! tmux_pane_has_input "$pane"; then
+        # Empty/just-submitted prompt: clear any prior stamp immediately.
+        if [[ -e "$file" ]]; then
+            tmux_guard_clear_stamp "$pane"
+            tmux_guard_log "cleared" "$pane" "prompt_empty_or_submitted"
+        fi
+        return 1
+    fi
+
+    if [[ -f "$file" ]]; then
+        # shellcheck disable=SC1090
+        source "$file" 2>/dev/null || true
+    fi
+
+    if [[ "$state" == "expired" ]]; then
+        return 1
+    fi
+
+    if [[ -z "$started_at" || ! "$started_at" =~ ^[0-9]+$ ]]; then
+        started_at="$now"
+        state="active"
+        tmux_guard_write_stamp "$pane" "$started_at" "$state"
+        tmux_guard_log "stamped" "$pane" "first_pending_input_observed"
+    fi
+
+    age=$(( now - started_at ))
+    if (( age >= ttl )); then
+        # Hard self-heal. Do not re-stamp until the pane becomes empty again.
+        tmux_guard_write_stamp "$pane" "$started_at" "expired"
+        tmux_guard_log "expired" "$pane" "hard_ttl_elapsed"
+        return 1
+    fi
+
+    return 0
+}
+
 # Wait for a pane to be clear of user input.
 # Args: PANE [TIMEOUT_SECONDS]
-# Returns 0 if cleared, 1 if timed out.
+# Returns 0 if sending may proceed, 1 if blocked. Timeout 0 means no wait.
 tmux_wait_for_clear() {
     local pane="$1"
-    local timeout="${2:-10}"
-    local elapsed=0
-    local interval=0.5
+    local timeout="${2:-0}"
+    local start now elapsed=0
+    local interval="${TMUX_GUARD_POLL_INTERVAL:-0.5}"
     local marked_work=0
 
-    while tmux_pane_has_input "$pane"; do
+    if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+        timeout="${timeout%%.*}"
+        [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=0
+    fi
+
+    start="$(tmux_guard_now)"
+
+    while tmux_guard_pane_blocked "$pane"; do
+        now="$(tmux_guard_now)"
+        elapsed=$(( now - start ))
+        if [[ "$timeout" == "0" ]] || (( elapsed >= timeout )); then
+            tmux_guard_emit_blocked "$pane" "$timeout" "$elapsed"
+            return 1
+        fi
         if [[ "$marked_work" == "0" ]]; then
             # Pending human input is a short-lived work signal. This bridges the
             # gap between typing a prompt and submitting it, but Token-API's
@@ -113,11 +276,6 @@ tmux_wait_for_clear() {
             marked_work=1
         fi
         sleep "$interval"
-        elapsed=$(echo "$elapsed + $interval" | bc)
-        if [[ "$timeout" != "0" ]] && (( $(echo "$elapsed >= $timeout" | bc -l) )); then
-            echo "tmux-guard: timed out waiting for clear input in $pane (${timeout}s)" >&2
-            return 1
-        fi
     done
     return 0
 }
@@ -150,7 +308,7 @@ tmux_typing_guard_active() {
 tmux_send_guarded() {
     local allow="${TMUX_SEND_GATE_ALLOW:-tmux-guard}"
     # Bypass if guard is disabled
-    [[ "${TMUX_GUARD_SKIP:-}" == "1" ]] && { TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"; return; }
+    [[ "${TMUX_GUARD_SKIP:-}" == "1" ]] && { TMUX_SEND_GATE_ALLOW="$allow" _tmux_guard_tmux send-keys "$@"; return; }
 
     # Extract pane target from args
     local pane=""
@@ -169,17 +327,16 @@ tmux_send_guarded() {
 
     # If we still can't identify the pane, send without guarding
     if [[ -z "$pane" ]]; then
-        TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
+        TMUX_SEND_GATE_ALLOW="$allow" _tmux_guard_tmux send-keys "$@"
         return
     fi
 
     local timeout="${TMUX_GUARD_TIMEOUT:-0}"
 
     if ! tmux_wait_for_clear "$pane" "$timeout"; then
-        echo "tmux-guard: ABORTED send-keys to $pane — user input not cleared after ${timeout}s" >&2
         return 1
     fi
 
     # Use real binary directly to avoid double-guarding through the wrapper function
-    TMUX_SEND_GATE_ALLOW="$allow" "${TMUX_GUARD_REAL_TMUX:-tmux}" send-keys "$@"
+    TMUX_SEND_GATE_ALLOW="$allow" _tmux_guard_tmux send-keys "$@"
 }

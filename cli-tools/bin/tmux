@@ -120,6 +120,27 @@ send_gate_suppresses() {
     [[ "$rc" -eq 100 ]]
 }
 
+inbound_typing_guard_allows() {
+    case "${1:-}" in
+        send-keys|send-key|send) ;;
+        *) return 0 ;;
+    esac
+    [[ "${TMUX_GUARD_SKIP:-}" == "1" ]] && return 0
+
+    local target
+    target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
+    if [[ -z "$target" ]]; then
+        target="${TMUX_PANE:-}"
+    fi
+    [[ -n "$target" ]] || return 0
+
+    local lib_dir
+    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || return 0
+    # shellcheck disable=SC1091
+    TMUX_GUARD_REAL_TMUX="$_REAL_TMUX" source "${lib_dir}/tmux-guard.sh" || return 0
+    tmux_wait_for_clear "$target" "${TMUX_GUARD_TIMEOUT:-0}"
+}
+
 build_pane_id_map() {
     "$_REAL_TMUX" list-panes -a -F '#{pane_id}	#{@PANE_ID}' 2>/dev/null | awk -F '\t' 'NF>=2 && $2 != "" { print $1 "\t" $2 }'
 }
@@ -314,6 +335,12 @@ if guard_automation_focus "$@"; then
     exit 0
 fi
 
+if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" == "1" ]]; then
+    if ! inbound_typing_guard_allows "$@"; then
+        exit 1
+    fi
+fi
+
 if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; then
     args=("$@")
     i=1
@@ -333,6 +360,17 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
             i=$((i+1))
         fi
     done
+    if ! inbound_typing_guard_allows "${args[@]}"; then
+        exit 1
+    fi
+    case "${args[0]:-}" in
+        send-keys|send-key|send)
+            # The per-pane inbound guard just made the authoritative decision.
+            # Do not let the older global client_activity send gate suppress an
+            # empty/different pane and recreate the silent-swallow path.
+            export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-inbound-guard}"
+            ;;
+    esac
     if send_gate_suppresses "${args[@]}"; then
         exit 0  # cancel policy (e.g. quiet hours): no PTY write
     fi
