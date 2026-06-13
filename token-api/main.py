@@ -1821,6 +1821,50 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Idempotent re-register: a known id is the same instance checking in
+        # again (context-clear, wrapper retry) — refresh liveness and return its
+        # existing identity instead of violating the primary key with a
+        # duplicate INSERT.
+        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (request.instance_id,))
+        existing = await cursor.fetchone()
+        if existing is not None:
+            await sanctioned_update_instance(
+                db,
+                instance_id=request.instance_id,
+                updates={"last_activity": datetime.now().isoformat()},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="register-instance",
+            )
+            await db.commit()
+            persona_row = None
+            if existing["persona_id"]:
+                cursor = await db.execute(
+                    "SELECT * FROM personas WHERE id = ?", (existing["persona_id"],)
+                )
+                persona_row = await cursor.fetchone()
+            if persona_row is not None:
+                profile = persona_to_profile(dict(persona_row))
+            else:
+                profile = {
+                    "name": existing["profile_name"],
+                    "wsl_voice": existing["tts_voice"],
+                    "notification_sound": existing["notification_sound"],
+                }
+            return ProfileResponse(
+                session_id=session_id,
+                profile={
+                    "name": profile["name"],
+                    "tts_voice": profile["wsl_voice"],
+                    "notification_sound": profile["notification_sound"],
+                    "color": profile.get("color", "#0099ff"),
+                    "chip_color": profile.get("chip_color"),
+                    "pane_tint": profile.get("pane_tint"),
+                },
+            )
+
         persona, pool_exhausted = await assign_astartes_persona(db)
         profile = persona_to_profile(persona)
 

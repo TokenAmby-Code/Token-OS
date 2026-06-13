@@ -155,6 +155,13 @@ if [[ -z "$TMUX_PANE" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "Sess
     if [[ -n "$RESOLVED_LABEL" ]]; then
       HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg l "$RESOLVED_LABEL" '.pane_label = $l') || true
     fi
+    # Ship the pane's @INSTANCE_ID stamp so SessionStart can adopt the prior
+    # occupant's row even when the server-side tmuxctl lookup misses
+    # (a plan-approval context-clear would otherwise mint a duplicate row)
+    PANE_STAMP=$(tmux show-options -pqv -t "$RESOLVED_PANE" @INSTANCE_ID 2>/dev/null || true)
+    if [[ -n "$PANE_STAMP" ]]; then
+      HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg s "$PANE_STAMP" '.pane_instance_id = $s') || true
+    fi
   fi
 fi
 
@@ -163,6 +170,10 @@ if [[ -n "$TMUX_PANE" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   RESOLVED_LABEL=$(tmux show-options -pv -t "$TMUX_PANE" @PANE_ID 2>/dev/null || true)
   if [[ -n "$RESOLVED_LABEL" ]]; then
     HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg l "$RESOLVED_LABEL" '.pane_label = $l') || true
+  fi
+  PANE_STAMP=$(tmux show-options -pqv -t "$TMUX_PANE" @INSTANCE_ID 2>/dev/null || true)
+  if [[ -n "$PANE_STAMP" ]]; then
+    HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg s "$PANE_STAMP" '.pane_instance_id = $s') || true
   fi
 fi
 
