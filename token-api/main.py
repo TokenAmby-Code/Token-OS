@@ -4091,6 +4091,17 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
     zealotry = int(instance.get("zealotry") or 4)
     if instance_type != "golden_throne":
         return {"scheduled": False, "reason": "not_golden_throne"}
+    # A retired seat is dead identity — never ARM a GT timer for it, no matter what
+    # stale golden_throne binding it still carries. Gating the central scheduler
+    # here covers every caller (stop-hook activity endpoint, recovery sweep, the
+    # stop hook) so a retired seat's defunct pane can never get a queued resume.
+    if (instance.get("rank") or "") == "retired":
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        await _gt_clear_fire(instance_id)
+        return {"scheduled": False, "reason": "retired"}
 
     status, doc_meta = await _read_instance_session_doc_rubric(instance)
     rubric_state = _golden_throne_rubric_state(status)
@@ -4183,6 +4194,7 @@ async def recover_recent_stopped_golden_throne_timers(
             FROM instances ci
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.status IN ('idle', 'stopped')
+              AND ci.rank != 'retired'
               AND ci.golden_throne IS NOT NULL
               AND ci.golden_throne != 'sync'
               AND COALESCE(ci.zealotry, 4) >= 4
@@ -7235,6 +7247,15 @@ async def golden_throne_followup(session_id: str):
         )
         return
 
+    # A retired seat is dead identity — never resume it, no matter what stale
+    # golden_throne binding it still carries. A timer can reach here off a stale
+    # APScheduler job (or a pre-fix legacy row) even after recovery learned to skip
+    # retired seats; fail closed here too so the fire path can never drive a
+    # dispatch into a retired seat's defunct (old) pane — the "1:NE" phantom.
+    if (instance.get("rank") or "") == "retired":
+        logger.info(f"Golden Throne: {session_id[:12]} retired, skipping")
+        return
+
     # Read the linked session doc rubric and classify the fire state. This is
     # the one genuinely new line of data flow: the fire path now sees the
     # rubric and can name the specific unmet condition instead of a flat SOP.
@@ -9614,8 +9635,10 @@ async def get_synced_session(legion: str):
 
     Custodes is resolved by **persona identity + rank** on the canonical
     ``instances`` table — its singleton is no longer found by sync mode. Other
-    legions (Mechanicus) keep the legacy ``claude_instances.synced`` lookup until
-    the later exterminatus cutover.
+    legions (Mechanicus) still resolve by sync MODE, but read the canonical
+    ``instances.golden_throne = 'sync'`` marker (the legacy synced-instances
+    table was extracted + dropped) and exclude retired/stopped seats so a dead
+    binding can never be returned as the live synced session.
     """
     if legion not in ALLOWED_LEGIONS:
         raise HTTPException(
@@ -9647,6 +9670,7 @@ async def get_synced_session(legion: str):
                LEFT JOIN personas p ON p.id = i.persona_id
                WHERE COALESCE(p.slug, 'astartes') = ?
                  AND i.golden_throne = 'sync'
+                 AND i.rank != 'retired'
                  AND i.status NOT IN ('stopped', 'archived')
                LIMIT 1""",
             (legion,),
@@ -24122,6 +24146,7 @@ async def get_golden_throne_timers():
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.golden_throne IS NOT NULL
               AND ci.golden_throne != 'sync'
+              AND ci.rank != 'retired'
               AND ci.status IN ('idle', 'stopped')
               AND COALESCE(ci.zealotry, 4) >= 4
               AND (sd.status IS NULL OR sd.status != 'archived')

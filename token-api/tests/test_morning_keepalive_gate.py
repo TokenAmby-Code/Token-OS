@@ -256,6 +256,36 @@ def test_residual_sync_mode_instance_also_keepalives(app_env, monkeypatch):
     assert calls[0][0] == "claude-cmd"
 
 
+def test_retired_sync_seat_never_keepalives(app_env, monkeypatch):
+    """A RETIRED seat still carrying sync MODE must NOT keepalive — even with an
+    active morning. A retired seat is dead identity; re-injecting a keepalive into
+    its stale pane is exactly the GT phantom-dispatch the reader filter must stop.
+    Mirrors test_residual_sync_mode_instance_also_keepalives, but retired."""
+    hooks = sys.modules["routes.hooks"]
+    sid = _insert_plain_instance(app_env.db_path, instance_type="sync", legion="mechanicus")
+    # Retire the seat, then re-stamp sync MODE so the gate is what blocks it (not a
+    # missing marker): a legacy retired row that still reads as sync.
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "UPDATE instances SET rank = 'retired', golden_throne = 'sync' WHERE id = ?", (sid,)
+    )
+    conn.commit()
+    conn.close()
+    _write_morning_state(status="launched", started_at=datetime.now().isoformat())
+
+    calls = []
+
+    async def fake_offloop(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeProc(0)
+
+    monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
+
+    result = asyncio.run(hooks.handle_stop({"session_id": sid}))
+    assert result["action"] != "stop_processed_sync"
+    assert all(c[0] != "claude-cmd" for c in calls)
+
+
 def test_non_custodes_non_sync_instance_never_reaches_keepalive(app_env, monkeypatch):
     """Neither a custodes persona nor sync mode → even with an active morning record,
     a plain one_off instance gets no keepalive."""
