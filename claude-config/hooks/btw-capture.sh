@@ -94,7 +94,7 @@ fi
             # "dismiss"+"escape" detection, which no longer exists). Poll briefly;
             # if not seen, nudge focus to the last message with one Up and re-check.
             PANEL_OK=false
-            for _ in $(seq 1 5); do
+            for ((i = 0; i < 5; i++)); do
                 if tmux capture-pane -p -t "$PANE" -S -80 2>/dev/null | grep -qi "esc to close"; then
                     PANEL_OK=true
                     break
@@ -172,8 +172,12 @@ print(data.strip())
             # --- Step 5b: Fallback extraction — pane scrape ---
             if [[ -z "$CLEANED" ]]; then
                 log "c-to-copy yielded nothing — falling back to pane scrape"
-                CONTENT=$(tmux capture-pane -p -t "$PANE" -S -200 2>/dev/null)
-                CLEANED=$(echo "$CONTENT" | python3 -c '
+                # Capture the FULL pane history (not a fixed -200 window): the parser
+                # scans bottom-up for the footer/<<<END>>> boundary, so deeper history
+                # only adds older lines above the slice and never truncates a long
+                # /btw response that scrolled past the last 200 rows.
+                CONTENT=$(tmux capture-pane -p -t "$PANE" -S - 2>/dev/null)
+                CLEANED=$(printf '%s' "$CONTENT" | python3 -c '
 import re
 import sys
 
@@ -245,7 +249,7 @@ print("\n".join(result))
                 exit 1
             fi
 
-            echo "$CLEANED" | pbcopy
+            printf '%s' "$CLEANED" | pbcopy
             log "Captured ${#CLEANED} chars to clipboard"
 
             # --- Step 6: Dismiss panel ---
@@ -257,7 +261,7 @@ print("\n".join(result))
             sleep 0.5
 
             # --- Step 8: Paste into prompt bar (bracketed paste) ---
-            echo "$CLEANED" | tmux load-buffer -
+            printf '%s' "$CLEANED" | tmux load-buffer -
             tmux paste-buffer -p -t "$PANE"
 
             log "Done — pasted into prompt bar"
