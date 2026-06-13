@@ -1948,7 +1948,9 @@ async def handle_session_start(payload: dict) -> dict:
     # Detect persona (env var) and transplant-from (file-based handoff injected by hook).
     # TOKEN_API_PERSONA is canonical; TOKEN_API_PRIMARCH is the transitional
     # fallback for in-flight/pre-deploy shells (dropped in a follow-up PR).
-    primarch_name = env.get("TOKEN_API_PERSONA") or env.get("TOKEN_API_PRIMARCH", "")
+    primarch_name = (
+        _normalize_text(env.get("TOKEN_API_PERSONA") or env.get("TOKEN_API_PRIMARCH", "")) or ""
+    )
     dispatch_legion = _normalize_text(
         payload.get("dispatch_legion") or env.get("TOKEN_API_LEGION", "")
     )
