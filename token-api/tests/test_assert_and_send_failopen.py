@@ -12,16 +12,18 @@ import json
 
 
 class _FakeProc:
-    def __init__(self, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
+    def __init__(self, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> None:
         self._stdout = stdout
         self._stderr = stderr
         self.returncode = returncode
 
-    async def communicate(self, _input=None):
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
         return self._stdout, self._stderr
 
 
-def _patch_subprocess(monkeypatch, main, *, assert_result: dict, send_rc: int = 0):
+def _patch_subprocess(
+    monkeypatch, main, *, assert_result: dict, send_rc: int = 0
+) -> list[list[str]]:
     """Route create_subprocess_exec to canned assert / send-text outputs."""
     calls: list[list[str]] = []
 
@@ -38,7 +40,7 @@ def _patch_subprocess(monkeypatch, main, *, assert_result: dict, send_rc: int = 
     return calls
 
 
-async def test_assert_and_send_fails_open_when_correction_stuck(app_env, monkeypatch):
+async def test_assert_and_send_fails_open_when_correction_stuck(app_env, monkeypatch) -> None:
     main = app_env.main
     calls = _patch_subprocess(
         monkeypatch,
@@ -59,7 +61,7 @@ async def test_assert_and_send_fails_open_when_correction_stuck(app_env, monkeyp
     assert any("send-text" in argv for argv in calls)
 
 
-async def test_assert_and_send_refuses_when_not_deliverable(app_env, monkeypatch):
+async def test_assert_and_send_refuses_when_not_deliverable(app_env, monkeypatch) -> None:
     main = app_env.main
     calls = _patch_subprocess(
         monkeypatch,
