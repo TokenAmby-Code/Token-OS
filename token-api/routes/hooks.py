@@ -78,6 +78,16 @@ _UNANSWERED_TITLE = "Unanswered Questions"
 _ASKQ_PERSIST_LOCK = asyncio.Lock()
 VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off", "hook_driven"}
 
+# SessionEnd `reason` values that are NON-terminal: the wrapper is still alive
+# and a paired SessionStart re-fire follows in the SAME wrapper (plan-accept /
+# `/clear` / compaction). Tearing the row down on these (status=stopped +
+# _spawn_session_end_assertion, which unsets @INSTANCE_ID) destroys the
+# continuity stamp the re-fire needs to re-key — forcing a mint + orphan doc.
+# Everything else (logout, prompt_input_exit, bypass_permissions_disabled,
+# other, unknown/missing) keeps the full terminal teardown. Gate STRICTLY: an
+# unknown reason must fail closed to teardown, never silently preserve a row.
+NON_TERMINAL_SESSION_END_REASONS = {"clear", "compact"}
+
 
 async def _launch_golden_throne_marker(
     db,
@@ -2192,6 +2202,32 @@ async def handle_session_start(payload: dict) -> dict:
                 if row:
                     supplant_id = row["id"]
 
+        # 5. Wrapper-launch adoption (stamp-independent in-wrapper backstop).
+        # An in-wrapper re-fire (plan-accept / `/clear` / compaction) emits a
+        # fresh session_id but keeps the SAME wrapper_launch_id — present in the
+        # SessionStart payload, unique per wrapper launch (so it strings together
+        # re-fires but correctly does NOT span a full close→reboot, which mints a
+        # fresh independent instance). When the @INSTANCE_ID stamp is lost before
+        # this re-fire can read it (the race that defeated the case-4 / payload
+        # stamp paths — Layer 1 removes the trigger, this guarantees the outcome),
+        # wrapper_launch_id is the durable continuity key that survives. Adopt the
+        # most-recent non-archived row carrying it so the supplant path re-keys
+        # that row (one row, same session_doc_id) instead of minting a duplicate +
+        # orphan doc. Scoped to a fresh registration (no existing_row) so a
+        # --continue re-register stays on its own id.
+        if not supplant_id and not existing_row and wrapper_launch_id:
+            cursor = await db.execute(
+                """SELECT id FROM instances
+                   WHERE wrapper_launch_id = ?
+                     AND status != 'archived'
+                     AND COALESCE(is_subagent, 0) = 0
+                   ORDER BY created_at DESC LIMIT 1""",
+                (wrapper_launch_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row["id"] != session_id:
+                supplant_id = row["id"]
+
         # --- Handle --continue (same session ID) with transplant ---
         # With --continue, the session ID doesn't change. If the row already exists
         # and there's a transplant signal, update the row in-place (new device, dir, pid).
@@ -3252,6 +3288,12 @@ async def handle_session_end(payload: dict) -> dict:
     if not session_id:
         return {"success": False, "action": "no_session_id"}
 
+    # Claude Code forwards the SessionEnd `reason` (clear / compact / logout /
+    # prompt_input_exit / ...) via generic-hook.sh. A non-terminal boundary is
+    # the wrapper still alive about to re-fire SessionStart — never tear the row
+    # or stamp down for those (see Layer 1 short-circuit below).
+    end_reason = _normalize_text(payload.get("reason") or "") or None
+
     _pending_background_tasks.pop(session_id, None)
 
     now = datetime.now().isoformat()
@@ -3282,6 +3324,37 @@ async def handle_session_end(payload: dict) -> dict:
         _prior_workflow_state = row[6]
         _stop_pane_label = row[7]
         _gt_marker = row[8]
+
+        # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
+        # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
+        # the SAME wrapper. The default teardown below marks the row `stopped` and
+        # spawns _spawn_session_end_assertion, which (registry row now stopped →
+        # assert ok=False) unsets @INSTANCE_ID — destroying the continuity stamp
+        # the paired SessionStart needs to re-key, so it mints a new id + orphan
+        # doc. The wrapper is still alive: leave the row + stamp intact and let the
+        # re-fire adopt it (clean stamp path; Layer 2 is the backstop).
+        if end_reason in NON_TERMINAL_SESSION_END_REASONS:
+            await log_event(
+                "instance_session_end_skipped",
+                instance_id=session_id,
+                device_id=row[1],
+                details={
+                    "reason": end_reason,
+                    "non_terminal": True,
+                    "source": "hook",
+                },
+            )
+            logger.info(
+                "Hook: SessionEnd non-terminal (%s) for %s — preserving row + stamp",
+                end_reason,
+                session_id[:12],
+            )
+            return {
+                "success": True,
+                "action": "non_terminal_end",
+                "instance_id": session_id,
+                "reason": end_reason,
+            }
 
         # Populate end_time and duration_minutes in session doc frontmatter
         if session_doc_id and not is_subagent:

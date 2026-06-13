@@ -338,6 +338,12 @@ async def _ensure_instances(db) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_instances_commander ON instances(commander_type, commander_id)"
     )
+    # Wrapper-launch adoption (handle_session_start case 5): the in-wrapper
+    # re-fire backstop looks up the most-recent non-archived row by
+    # wrapper_launch_id. Index it so adoption is a probe, not a full scan.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_instances_wrapper_launch_id ON instances(wrapper_launch_id, status)"
+    )
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_fk_guard")
     await db.execute("""
         CREATE TRIGGER trg_instances_persona_fk_guard
