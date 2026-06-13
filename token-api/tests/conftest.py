@@ -323,6 +323,24 @@ def _legacy_instances_sqlite_view(monkeypatch):
     monkeypatch.setattr(sqlite3, "connect", _token_os_sqlite_connect)
 
 
+@pytest.fixture(autouse=True)
+def isolate_vault(tmp_path, monkeypatch):
+    """Point the Obsidian vault at a per-test temp dir for EVERY test.
+
+    Without this, vault-root resolution falls back to the live vault at
+    /Volumes/Imperium/Imperium-ENV whenever IMPERIUM_ENV is unset and the NAS is
+    mounted — which is how thousands of placeholder `needs-session-name-*.md` and
+    `test-job-*.md` docs leaked into the live vault from test runs.  Vault-root
+    resolution is now lazy (shared._vault_root / session_doc_helpers.vault_root),
+    so setting the env here redirects all session-doc writes into the temp dir.
+    The chokepoint guard in session_doc_helpers is the backstop if anything slips.
+    """
+    vault = tmp_path / "Imperium-ENV"
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
+    monkeypatch.setenv("IMPERIUM", str(tmp_path / "imperium-root"))
+    return vault
+
+
 @pytest.fixture
 def app_env(tmp_path, monkeypatch):
     db_path = tmp_path / "agents.db"

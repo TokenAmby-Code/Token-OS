@@ -159,7 +159,6 @@ from session_doc_helpers import (
 from shared import (
     CRASH_LOG_PATH,
     DB_PATH,
-    DEFAULT_SESSIONS_DIR,
     DESKTOP_CONFIG,
     DESKTOP_STATE,
     DICTATION_STATE,
@@ -178,6 +177,7 @@ from shared import (
     STASH_MAX_AGE_HOURS,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
+    default_sessions_dir,
     is_local_device,
     is_pid_claude,
     log_event,
@@ -23865,7 +23865,7 @@ async def create_session_doc(request: SessionDocCreateRequest):
     if request.file_path:
         fp = Path(request.file_path)
     else:
-        fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
+        fp = unique_human_path(default_sessions_dir(), request.title)
 
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
@@ -24465,7 +24465,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     if request.file_path:
         fp = Path(request.file_path)
     else:
-        fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
+        fp = unique_human_path(default_sessions_dir(), request.title)
 
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
@@ -24747,7 +24747,7 @@ async def link_primarch_doc(
             )
         elif request and request.title:
             # Create new doc + link
-            fp = unique_human_path(DEFAULT_SESSIONS_DIR, request.title)
+            fp = unique_human_path(default_sessions_dir(), request.title)
             if fp.exists():
                 raise HTTPException(409, f"File already exists: {fp}")
             cursor = await db.execute(

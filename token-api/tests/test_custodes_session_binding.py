@@ -6,8 +6,7 @@ import pytest
 async def test_custodes_creates_and_binds_today_daily_note(app_env, monkeypatch, tmp_path):
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     async with aiosqlite.connect(app_env.db_path) as db:
         doc_id, reason = await helpers.resolve_session_doc_for_start(
@@ -36,8 +35,7 @@ async def test_custodes_creates_and_binds_today_daily_note(app_env, monkeypatch,
 async def test_custodes_daily_note_binding_is_singleton(app_env, monkeypatch, tmp_path):
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     async with aiosqlite.connect(app_env.db_path) as db:
         first, _ = await helpers.resolve_session_doc_for_start(
@@ -81,9 +79,7 @@ async def test_non_custodes_still_uses_interactive_placeholder_policy(
 ):
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "TERRA_SESSIONS_DIR", vault / "Terra" / "Sessions")
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     async with aiosqlite.connect(app_env.db_path) as db:
         doc_id, reason = await helpers.resolve_session_doc_for_start(
@@ -114,8 +110,7 @@ async def test_custodes_ignores_explicit_dispatch_doc_and_uses_daily_note(
 ):
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     explicit = vault / "Terra" / "Sessions" / "not-custodes-home.md"
     explicit.parent.mkdir(parents=True, exist_ok=True)
@@ -148,9 +143,7 @@ async def test_custodes_legion_without_primarch_binds_daily_note(app_env, monkey
     legion='custodes'. They must still bind today's daily note, not a placeholder."""
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "TERRA_SESSIONS_DIR", vault / "Terra" / "Sessions")
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     async with aiosqlite.connect(app_env.db_path) as db:
         doc_id, reason = await helpers.resolve_session_doc_for_start(
@@ -180,9 +173,7 @@ async def test_automated_unresolved_launch_creates_no_placeholder(app_env, monke
     (None, 'unresolved_dispatch') and mints no session document."""
     helpers = __import__("session_doc_helpers")
     vault = tmp_path / "Imperium-ENV"
-    monkeypatch.setattr(helpers, "_VAULT_ROOT", vault)
-    monkeypatch.setattr(helpers, "TERRA_SESSIONS_DIR", vault / "Terra" / "Sessions")
-    monkeypatch.setattr(helpers, "DAILY_NOTES_DIR", vault / "Terra" / "Journal" / "Daily")
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
 
     async with aiosqlite.connect(app_env.db_path) as db:
         doc_id, reason = await helpers.resolve_session_doc_for_start(

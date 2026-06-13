@@ -26,11 +26,35 @@ _LOG_EVENT_WRITE_LOCK = threading.Lock()
 # ============ Configuration ============
 
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
-_imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-if not _imperium_root.exists():
-    _imperium_root = Path.home()
-DEFAULT_SESSIONS_DIR = _imperium_root / "Imperium-ENV" / "Terra" / "Sessions"
-MARS_SESSIONS_DIR = _imperium_root / "Imperium-ENV" / "Mars" / "Sessions"
+
+
+def _vault_root() -> Path:
+    """Resolve the Obsidian vault root at CALL time (never frozen at import).
+
+    Import-time freezing here let test runs pollute the live vault: with
+    IMPERIUM_ENV unset and /Volumes/Imperium mounted, the session dirs bound the
+    live vault before any test fixture could redirect them.  Reading env per call
+    lets the test isolation fixture point writes at a temp dir.
+    """
+    env = os.environ.get("IMPERIUM_ENV")
+    if env:
+        return Path(env)
+    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
+    if not imperium.exists():
+        imperium = Path.home()
+    return imperium / "Imperium-ENV"
+
+
+def default_sessions_dir() -> Path:
+    """Terra/Sessions under the live vault, resolved lazily."""
+    return _vault_root() / "Terra" / "Sessions"
+
+
+def mars_sessions_dir() -> Path:
+    """Mars/Sessions under the live vault, resolved lazily."""
+    return _vault_root() / "Mars" / "Sessions"
+
+
 SERVER_PORT = 7777
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
