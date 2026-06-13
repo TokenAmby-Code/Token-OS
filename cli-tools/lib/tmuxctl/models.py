@@ -91,6 +91,13 @@ class InstanceRegistryEntry:
     # legion by primarch (e.g. `_resolve_administratum_instance` keys on
     # `primarch='administratum'`); the persona watchdog matches on it too.
     primarch: str = ""
+    # Canonical persona identity. Post sync-decouple, /api/instances no longer
+    # exposes legion/primarch/instance_type — it surfaces the instances.persona_id
+    # JOIN as persona.slug plus the durable rank. These are the load-bearing
+    # identity columns the watchdog must match on (mirrors
+    # personas.resolve_live_persona_instance: persona slug + rank != 'retired').
+    persona_slug: str = ""
+    rank: str = ""
 
     @property
     def was_processing(self) -> bool:

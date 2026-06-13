@@ -50,6 +50,13 @@ def build_registry_snapshot(
         row_device_id = str(row.get("device_id", "") or "")
         if row_device_id and device_id and row_device_id != device_id:
             continue
+        # Canonical persona identity from the instances.persona_id JOIN.
+        # /api/instances nests it as persona.slug; the flat persona_slug/
+        # profile_name aliases are accepted as fallbacks for older shapes.
+        persona_obj = row.get("persona")
+        persona_slug = (persona_obj.get("slug") if isinstance(persona_obj, dict) else None) or (
+            row.get("persona_slug") or row.get("profile_name") or ""
+        )
         normalized.append(
             InstanceRegistryEntry(
                 instance_id=str(row.get("id", "") or ""),
@@ -69,6 +76,8 @@ def build_registry_snapshot(
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
                 primarch=str(row.get("primarch", "") or ""),
+                persona_slug=str(persona_slug or ""),
+                rank=str(row.get("rank", "") or ""),
             )
         )
     return InstanceRegistrySnapshot(device_id=device_id, instances=tuple(normalized))

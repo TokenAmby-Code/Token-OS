@@ -233,6 +233,12 @@ def _observed_row_hash(row, spec: PersonaSpec) -> str:
         "persona": spec.persona,
         "instance_id": getattr(row, "instance_id", "") if row is not None else "",
         "pane_label": getattr(row, "pane_label", "") if row is not None else "",
+        # Canonical identity the predicate now keys on first — must be in the
+        # fingerprint so a slug change (e.g. "" -> "custodes") counts as new input
+        # and the guard re-evaluates instead of suppressing on stale equivalence.
+        "persona_slug": (
+            (getattr(row, "persona_slug", "") or "").strip().lower() if row is not None else ""
+        ),
         "legion": getattr(row, "legion", "") if row is not None else "",
         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
         "instance_type": getattr(row, "instance_type", "") if row is not None else "",
@@ -495,8 +501,24 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     if row is None:
         return False
     tab = (getattr(row, "tab_name", "") or "").lower()
+    # CANONICAL identity first. Post sync-decouple, /api/instances exposes the
+    # instances.persona_id JOIN as persona.slug (carried here as `persona_slug`)
+    # — the same identity personas.resolve_live_persona_instance resolves on
+    # (persona slug + rank != 'retired'; rank is already filtered to non-retired
+    # upstream by the registry's active-set selection). When the slug is present it
+    # is authoritative: it identifies the singleton directly, so we never fall
+    # through to the legacy legion/primarch/instance_type columns the API dropped.
+    # This is the Symptom-2 fix: the old custodes branch required
+    # `instance_type in {sync, hook_driven}` — a sync MODE, not identity — so a
+    # correctly-registered custodes (slug=custodes, legion column gone) failed the
+    # predicate and re-armed the `/persona custodes` injection loop every tick.
+    slug = (getattr(row, "persona_slug", "") or "").strip().lower()
+    if slug:
+        return slug == spec.persona
+    # LEGACY fallbacks for rows/sources predating the persona_slug surface.
     if spec.persona == "custodes":
-        return row.legion == "custodes" and row.instance_type in {"sync", "hook_driven"}
+        # Identity is the custodes legion (persona slug), never sync mode.
+        return row.legion == "custodes" or spec.persona in tab
     if spec.persona == "malcador":
         # Malcador is a singleton primarch sharing the `astartes` legion with the
         # regiment workers, so legion cannot identify it — its load-bearing key is
