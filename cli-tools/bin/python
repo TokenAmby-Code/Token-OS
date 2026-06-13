@@ -1,103 +1,61 @@
 #!/usr/bin/env bash
-# python — Imperium Python shim
+# python — Imperium Python interpreter shim
 # TAGS: python, uv, wrapper
 # AUDIENCE: system, agent, user
 #
-# Enforces uv-backed Python execution at the lowest PATH layer. Plain
-# `python ...` becomes `uv run -- python ...`; explicit uv invocations pass
-# through because uv marks recursive command execution. Use `--no-uv` or
-# IMPERIUM_PYTHON_RAW=1 only for rare bootstrap/debug cases.
+# This file must remain a real-interpreter delegate. Do NOT wrap back into
+# `uv run` here: uv probes the configured interpreter by executing it, so a
+# python->uv shim causes uv->python->uv recursion. Agent/user policy that
+# requires uv-backed Python lives in the PreToolUse hook instead.
 
 set -euo pipefail
 
-_THIS="$(readlink -f "$0")"
 _INVOKED_NAME="$(basename "$0")"
 
-find_real_python() {
-    if [[ -n "${IMPERIUM_PYTHON_BIN:-}" && -x "${IMPERIUM_PYTHON_BIN}" ]]; then
-        echo "${IMPERIUM_PYTHON_BIN}"
-        return 0
-    fi
-    if [[ -n "${REAL_PYTHON:-}" && -x "${REAL_PYTHON}" ]]; then
-        echo "${REAL_PYTHON}"
-        return 0
-    fi
+_find_real_python() {
+    local candidate name self_real cand_real
+    self_real="$(realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 
-    local candidate name
-    # First search the invoked command name (python, python3, etc.), then common
-    # fallbacks. type -aP is bash-compatible; command -v -a is not.
-    for name in "$_INVOKED_NAME" python3 python; do
-        while IFS= read -r candidate; do
-            [[ -n "$candidate" ]] || continue
-            if [[ "$(readlink -f "$candidate")" != "$_THIS" ]]; then
-                echo "$candidate"
+    for candidate in "${IMPERIUM_PYTHON_BIN:-}" "${REAL_PYTHON:-}"; do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            cand_real="$(realpath "$candidate" 2>/dev/null || printf '%s\n' "$candidate")"
+            if [[ "$cand_real" != "$self_real" ]]; then
+                printf '%s\n' "$candidate"
                 return 0
             fi
-        done < <(type -aP "$name" 2>/dev/null || true)
+        fi
     done
 
+    # Prefer Homebrew Python before PATH lookup so uv/tooling does not silently
+    # downgrade to Apple/CLT Python 3.9.
     for candidate in \
         /opt/homebrew/bin/python3 /opt/homebrew/bin/python \
         /usr/local/bin/python3 /usr/local/bin/python \
         /usr/bin/python3 /usr/bin/python; do
-        if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$_THIS" ]]; then
-            echo "$candidate"
-            return 0
+        if [[ -x "$candidate" ]]; then
+            cand_real="$(realpath "$candidate" 2>/dev/null || printf '%s\n' "$candidate")"
+            if [[ "$cand_real" != "$self_real" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
         fi
+    done
+
+    for name in "$_INVOKED_NAME" python3 python; do
+        while IFS= read -r candidate; do
+            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            cand_real="$(realpath "$candidate" 2>/dev/null || printf '%s\n' "$candidate")"
+            if [[ "$cand_real" != "$self_real" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(type -aP "$name" 2>/dev/null || true)
     done
 
     echo "python: real Python interpreter not found" >&2
     return 127
 }
 
-find_uv() {
-    if [[ -n "${IMPERIUM_UV_BIN:-}" && -x "${IMPERIUM_UV_BIN}" ]]; then
-        echo "${IMPERIUM_UV_BIN}"
-        return 0
-    fi
-    local candidate
-    while IFS= read -r candidate; do
-        [[ -n "$candidate" ]] || continue
-        echo "$candidate"
-        return 0
-    done < <(type -aP uv 2>/dev/null || true)
-    for candidate in /opt/homebrew/bin/uv /usr/local/bin/uv /usr/bin/uv; do
-        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    echo "python: uv is required by Imperium Python policy; install uv or use --no-uv for a rare raw bypass" >&2
-    return 127
-}
-
-strip_no_uv_flag() {
-    _STRIPPED_ARGS=()
-    local arg stripped=false
-    for arg in "$@"; do
-        if [[ "$arg" == "--no-uv" && "$stripped" == false ]]; then
-            stripped=true
-            continue
-        fi
-        _STRIPPED_ARGS+=("$arg")
-    done
-    [[ "$stripped" == true ]]
-}
-
-_REAL_PYTHON="$(find_real_python)"
+_REAL_PYTHON="$(_find_real_python)"
 export IMPERIUM_PYTHON_BIN="$_REAL_PYTHON"
-
-# Explicit bypasses: env for bootstrap scripts, flag for humans/agents.
-_STRIPPED_ARGS=()
-if strip_no_uv_flag "$@"; then
-    exec "$_REAL_PYTHON" "${_STRIPPED_ARGS[@]}"
-fi
-if [[ "${IMPERIUM_PYTHON_RAW:-}" == "1" ]]; then
-    exec "$_REAL_PYTHON" "$@"
-fi
-
-# uv sets this when running commands. If `uv run python ...` reaches this shim
-# through PATH, do not wrap again.
-if [[ -n "${UV_RUN_RECURSION_DEPTH:-}" ]]; then
-    exec "$_REAL_PYTHON" "$@"
-fi
-
-_UV="$(find_uv)"
-exec "$_UV" run --python "$_REAL_PYTHON" -- python "$@"
+exec "$_REAL_PYTHON" "$@"
