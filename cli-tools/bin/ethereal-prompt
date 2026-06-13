@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# ethereal-prompt - engine-aware brain-dump reformat dispatcher (claude /btw, codex /side)
+# TAGS: tmux, dispatch, reprompt
+# AUDIENCE: agent
+#
+# One command that resolves a target pane by tmuxctl POSITIONAL identity, detects
+# whether it runs Claude or Codex, and fires the matching in-place brain-dump
+# reformat — instead of stringing /btw vs /side by hand:
+#   claude -> /btw  (btw-capture.sh: reformat staged dump, capture clean panel
+#                    output via the native "c to copy", paste back for review)
+#   codex  -> /side (first-cut injection; see CODEX notes below)
+#
+# Target (exactly one of):
+#   <positional>   1:N | palace:N | somnium:NE  (contains ':')  -> tmuxctl resolve-pane
+#   <instance-id>  bare UUID token                              -> tmuxctl resolve-instance (oracle)
+#   (no arg)       the active pane (prefix+B / run-shell path)
+# Physical tmux ids (%NN) are REFUSED at the human boundary — they are internal
+# plumbing only (cf. feedback_no_raw_pane_ids_in_human_surface). The no-arg
+# active-pane path derives %NN from tmux itself, which is not a human-typed id.
+#
+# Usage:
+#   ethereal-prompt                 # active pane (binding path)
+#   ethereal-prompt palace:3
+#   ethereal-prompt 1:2
+#   ethereal-prompt 7f3a9c2e-...    # instance UUID
+#
+# Exit codes:
+#   0 dispatched        2 %NN refused at boundary    3 resolution miss
+#   4 engine undetermined (never guesses)            5 codex unsupported/gated
+#   6 pane busy (mid-response)
+
+set -euo pipefail
+
+_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+
+HOOK_DIR="${HOME}/.claude/hooks"
+LOG_FILE="${HOME}/.claude/logs/ethereal-prompt.log"
+mkdir -p "${HOME}/.claude/logs" 2>/dev/null || true
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+die() { echo "ethereal-prompt: $1" >&2; log "EXIT $2: $1"; exit "$2"; }
+
+case "${1:-}" in
+    -h|--help)
+        sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' | grep -vE '^(TAGS|AUDIENCE):'
+        exit 0
+        ;;
+esac
+
+INPUT="${1:-}"
+
+# --- Resolve target -> physical %NN (positional identity only, fail-closed) ---
+# UUIDs never contain ':'; positional ids always do -> total partition. We never
+# fall through to a default pane: every miss is a hard non-zero exit.
+if [[ -z "$INPUT" ]]; then
+    # No arg: the active pane (prefix+B / run-shell). Internal derivation from
+    # tmux, not a human-typed physical id, so this is allowed.
+    _id=$(tmux display-message -p '#{pane_id}' 2>/dev/null) || die "no active tmux pane" 3
+    [[ "$_id" == %* ]] && PANE="$_id" || PANE="%${_id}"
+elif [[ "$INPUT" == %* ]]; then
+    die "physical tmux id '$INPUT' refused — use a positional id (1:N, palace:N) or an instance UUID" 2
+elif [[ "$INPUT" == *:* ]]; then
+    command -v tmuxctl >/dev/null 2>&1 || die "tmuxctl not on PATH" 3
+    PANE=$(tmuxctl resolve-pane --format physical "$INPUT" 2>/dev/null || true)
+    [[ "$PANE" == %* ]] || die "positional id '$INPUT' did not resolve to a live pane" 3
+else
+    command -v tmuxctl >/dev/null 2>&1 || die "tmuxctl not on PATH" 3
+    # resolve-instance is fail-closed: prints nothing + exit 1 on miss.
+    PANE=$(tmuxctl resolve-instance --format physical "$INPUT" 2>/dev/null || true)
+    [[ "$PANE" == %* ]] || die "instance id '$INPUT' did not resolve to a live pane" 3
+fi
+
+log "resolved '${INPUT:-<active>}' -> $PANE"
+
+# --- Pre-flight: refuse a pane that is mid-response. btw-capture's SAW_ANSWERING
+# latch could otherwise lock onto the wrong (in-flight) response. ---
+if tmux capture-pane -p -t "$PANE" -S -3 2>/dev/null | grep -qi "Answering"; then
+    die "pane $PANE is mid-response (Answering) — retry when idle" 6
+fi
+
+# --- Detect engine (pure-tmux oracle, DB-free). '--default auto' so an
+# inconclusive read returns 'auto' and we refuse rather than guess 'claude'. ---
+ENGINE=$(tmuxctl resolve-agent --pane "$PANE" --default auto 2>/dev/null || echo auto)
+log "engine($PANE) = $ENGINE"
+
+case "$ENGINE" in
+    claude)
+        log "dispatch: claude /btw -> $PANE"
+        exec bash "${HOOK_DIR}/btw-capture.sh" "$PANE"
+        ;;
+    codex)
+        # --- CODEX /side (first cut) ---------------------------------------
+        # /side is a non-inert, operator-gated command (tool_calls_inert=False;
+        # caveats: requires_started_conversation, unavailable_during_code_review,
+        # unavailable_if_side_conversation_already_open) and must be the first
+        # real message. Until that path is preflighted live, we do NOT auto-fire
+        # /side against a non-inert pane: refuse with a pointer and exit 5.
+        # Flipping this to an active injection is a one-branch change once the
+        # codex flow is validated with the operator.
+        die "codex /side dispatch not yet enabled for $PANE — /side is non-inert and operator-gated; validate the flow live before enabling (see Aspirants/side-command-codex-compatible-command-before-braindump.md)" 5
+        ;;
+    *)
+        die "engine undetermined for '${INPUT:-<active>}' ($PANE) — refusing to guess; run 'tmuxctl resolve-agent --pane $PANE' to debug" 4
+        ;;
+esac
