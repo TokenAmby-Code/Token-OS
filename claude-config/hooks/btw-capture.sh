@@ -174,6 +174,7 @@ print(data.strip())
                 log "c-to-copy yielded nothing — falling back to pane scrape"
                 CONTENT=$(tmux capture-pane -p -t "$PANE" -S -200 2>/dev/null)
                 CLEANED=$(echo "$CONTENT" | python3 -c '
+import re
 import sys
 
 lines = sys.stdin.read().split("\n")
@@ -195,19 +196,14 @@ if end is None:
 #     /btw... <<<END>>>          ← indented echo
 #     response text...
 #   footer line
-# We need the SECOND hit scanning up (skip the indented echo).
+# The response follows the LAST <<<END>>> in the captured region, so scan
+# bottom-up and start right after the first delimiter we hit (the echo
+# closest to the response).
 btw_echo_end = None
-hits = 0
-
 for i in range(end - 1, -1, -1):
     if "<<<END>>>" in lines[i]:
-        hits += 1
-        if hits == 2:
-            btw_echo_end = i
-            break
-        # First hit is the echo — record it as fallback
-        if hits == 1:
-            btw_echo_end = i
+        btw_echo_end = i
+        break
 
 if btw_echo_end is None:
     btw_echo_end = max(0, end - 20)
@@ -220,14 +216,22 @@ if start >= end:
     sys.exit(1)
 
 box_strip = "│┌┐└┘├┤┬┴┼─╭╮╯╰"
-result = []
-for line in lines[start:end]:
-    cleaned = line
-    for ch in box_strip:
-        cleaned = cleaned.replace(ch, "")
-    cleaned = cleaned.strip()
-    if cleaned:
-        result.append(cleaned)
+# Strip panel chrome at the LEFT/RIGHT margins only. Do NOT global-replace box
+# glyphs or .strip() every line — that flattens tables, nested bullets, and code
+# blocks and drops the blank lines between paragraphs. Trim a leading
+# "<spaces><border glyphs><one pad space>" and the symmetric trailing run, keep
+# interior indentation and blank lines, then drop only the outermost
+# blank/border lines of the block.
+box_class = "[" + re.escape(box_strip) + "]"
+lead = re.compile(r"^\s*" + box_class + r"+\s?")
+trail = re.compile(r"\s?" + box_class + r"+\s*$")
+
+result = [trail.sub("", lead.sub("", line)).rstrip() for line in lines[start:end]]
+
+while result and not result[0].strip():
+    result.pop(0)
+while result and not result[-1].strip():
+    result.pop()
 
 if not result:
     sys.exit(1)
