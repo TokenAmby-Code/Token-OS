@@ -97,6 +97,10 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/python-policy-hook.sh"
+          },
+          {
+            "type": "command",
             "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
           }
         ]
