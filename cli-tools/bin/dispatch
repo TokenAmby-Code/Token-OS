@@ -332,9 +332,10 @@ resolve_caller_instance_id() {
   # 3. Persona singleton by bound pane label. Headless personas (e.g. the
   #    Fabricator-General) dispatch from an agent context with neither
   #    $TMUX_PANE nor an instance-id env; resolve the live row by its pane label
-  #    (e.g. pane_label='mechanicus:fabricator-general' for TOKEN_API_PRIMARCH).
-  if [[ -n "${TOKEN_API_PRIMARCH:-}" ]]; then
-    label_sql="$(sql_literal "$TOKEN_API_PRIMARCH")"
+  #    (e.g. pane_label='mechanicus:fabricator-general' for TOKEN_API_PERSONA).
+  local persona_env="${TOKEN_API_PERSONA:-${TOKEN_API_PRIMARCH:-}}"
+  if [[ -n "$persona_env" ]]; then
+    label_sql="$(sql_literal "$persona_env")"
     row="$(sqlite_query "
       SELECT id
       FROM instances
@@ -1095,7 +1096,7 @@ launch_dispatch_aspirant_session() {
   printf '\n'
   TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
   TOKEN_API_INTERNAL_DISPATCH=1 \
-  TOKEN_API_PRIMARCH="${PERSONA:-${TOKEN_API_PRIMARCH:-}}" \
+  TOKEN_API_PERSONA="${PERSONA:-${TOKEN_API_PERSONA:-${TOKEN_API_PRIMARCH:-}}}" \
   TOKEN_API_CODEX_PROFILE="$CODEX_PROFILE" \
   "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
 }
@@ -1435,7 +1436,7 @@ COMMON_ENV=(
   "TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}"
 )
 [[ -n "$CLAUDE_MODEL" ]] && COMMON_ENV+=("TOKEN_API_CLAUDE_MODEL=${CLAUDE_MODEL}")
-[[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PRIMARCH=${PERSONA}")
+[[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PERSONA=${PERSONA}")
 if [[ -n "$DISCORD_CHANNEL" ]]; then
   COMMON_ENV+=(
     "TOKEN_API_DISCORD_HOSTED=1"
@@ -1444,7 +1445,7 @@ if [[ -n "$DISCORD_CHANNEL" ]]; then
   )
 fi
 if [[ -n "$RESUME_PRIMARCH" && -z "$PERSONA" ]]; then
-  COMMON_ENV+=("TOKEN_API_PRIMARCH=${RESUME_PRIMARCH}")
+  COMMON_ENV+=("TOKEN_API_PERSONA=${RESUME_PRIMARCH}")
 fi
 if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "$AUTO_PARENT_INSTANCE_ID" ]]; then
   COMMON_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${RESUME_PARENT_INSTANCE_ID}")
@@ -1503,7 +1504,8 @@ dispatch_codex_launch_inline() {
     [[ -n "${SSH_CLIENT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
     [[ -n "${TMUX:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
     [[ -n "${resolved_tmux_pane:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$resolved_tmux_pane" '. + {TMUX_PANE: $v}')
-    [[ -n "${TOKEN_API_PRIMARCH:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_PRIMARCH" '. + {TOKEN_API_PRIMARCH: $v}')
+    local persona_env="${TOKEN_API_PERSONA:-${TOKEN_API_PRIMARCH:-}}"
+    [[ -n "$persona_env" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$persona_env" '. + {TOKEN_API_PERSONA: $v}')
     [[ -n "${codex_profile:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$codex_profile" '. + {TOKEN_API_CODEX_PROFILE: $v}')
     [[ -n "${parent_instance_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$parent_instance_id" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
     [[ -n "${TOKEN_API_DISPATCH_MCP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP" '. + {TOKEN_API_DISPATCH_MCP: $v}')

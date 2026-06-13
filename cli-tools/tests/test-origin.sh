@@ -127,17 +127,44 @@ IMPERIUM_ORIGIN_DEVICE_ID=Custom-Device
 assert_eq "device_id.explicit_override" "Custom-Device" "$(origin_device_id)"
 
 # ============================================================
-# origin_pane
+# origin_pane — human @PANE_ID contract (never physical %N)
 # ============================================================
 
-_reset_origin
-TMUX_PANE='%42'
-assert_eq "pane.from_tmux_pane_env" "%42" "$(origin_pane)"
-
+# Override wins over everything.
 _reset_origin
 IMPERIUM_ORIGIN_PANE='somnium:NE'
 TMUX_PANE='%99'
 assert_eq "pane.override_beats_env" "somnium:NE" "$(origin_pane)"
+
+# Stampless self-pane (TMUX_PANE set but no live tmux server / no @PANE_ID
+# stamp) resolves to empty — physical %N is never returned as an identity.
+_reset_origin
+TMUX_PANE='%42'
+assert_eq "pane.stampless_self_is_empty" "" "$(origin_pane)"
+
+# No tmux context at all → empty.
+_reset_origin
+assert_eq "pane.no_tmux_is_empty" "" "$(origin_pane)"
+
+# ============================================================
+# origin_instance — reads the @INSTANCE_ID pane stamp
+# ============================================================
+
+# Override wins over everything.
+_reset_origin
+IMPERIUM_ORIGIN_INSTANCE='inst-abc123'
+TMUX_PANE='%42'
+assert_eq "instance.override_beats_stamp" "inst-abc123" "$(origin_instance)"
+
+# Stampless self-pane (no live tmux server / no @INSTANCE_ID stamp) → empty,
+# and the empty result is NOT cached/pinned.
+_reset_origin
+TMUX_PANE='%42'
+assert_eq "instance.stampless_self_is_empty" "" "$(origin_instance)"
+
+# No tmux context at all → empty.
+_reset_origin
+assert_eq "instance.no_tmux_is_empty" "" "$(origin_instance)"
 
 # ============================================================
 # origin_transport
@@ -168,7 +195,21 @@ IMPERIUM_ORIGIN_MACHINE=wsl
 record=$(origin_record)
 assert_match "record.contains_machine_wsl" '"machine":"wsl"' "$record"
 assert_match "record.contains_device_id" '"device_id":"TokenPC"' "$record"
+# instance_id is the canonical identity slot; pane is the human @PANE_ID.
+assert_match "record.contains_instance_id" '"instance_id":' "$record"
+assert_match "record.contains_pane" '"pane":' "$record"
 assert_match "record.is_single_line_json" '^\{.*\}$' "$record"
+
+# No physical-pane slot is ever recorded.
+if [[ "$record" == *'pane_physical'* || "$record" == *'physical_pane'* ]]; then
+    printf '[\033[31mFAIL\033[0m] %s\n' "record.no_physical_pane_slot"
+    printf '       record: %s\n' "$record"
+    FAIL=$((FAIL + 1))
+    FAILED_TESTS+=("record.no_physical_pane_slot")
+else
+    printf '[\033[32mPASS\033[0m] %s\n' "record.no_physical_pane_slot"
+    PASS=$((PASS + 1))
+fi
 
 # Validate JSON parses (python is guaranteed available on every Imperium machine)
 if command -v python3 >/dev/null 2>&1; then

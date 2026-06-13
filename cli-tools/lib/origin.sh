@@ -160,27 +160,62 @@ origin_device_id() {
     imperium_cfg device_name "$m" 2>/dev/null
 }
 
-# Resolve the tmux pane the invocation is running in.
+# Resolve the agent's OWN physical pane id as a transient self-handle.
+# This is NOT a recorded/propagated identity slot — it exists only to look up
+# the pane stamps (@PANE_ID / @INSTANCE_ID) that ARE the identity. Physical
+# pane ids are oracle-resolved (tmuxctl resolve-instance) from instance_id, not
+# stored anywhere.
+_origin_self_pane() {
+    [[ -n "${TMUX_PANE:-}" ]] && { echo "$TMUX_PANE"; return 0; }
+    [[ -z "${TMUX:-}" ]] && return 1
+    tmux display-message -p '#{pane_id}' 2>/dev/null || true
+}
+
+# Resolve the human pane id (@PANE_ID) of the invocation — a display
+# convenience only. The physical %N is never returned as an identity answer;
+# when a physical handle is truly needed it is resolved on demand by the
+# tmuxctl oracle from instance_id.
 origin_pane() {
     if [[ -n "${IMPERIUM_ORIGIN_PANE:-}" ]]; then
         echo "$IMPERIUM_ORIGIN_PANE"
         return 0
     fi
-    if [[ -n "${TMUX_PANE:-}" ]]; then
-        echo "$TMUX_PANE"
-        return 0
-    fi
-    tmux display-message -p '#{pane_id}' 2>/dev/null || true
+    local self_pane
+    self_pane=$(_origin_self_pane) || { echo ""; return 0; }
+    [[ -z "$self_pane" ]] && { echo ""; return 0; }
+    tmux show-options -pqv -t "$self_pane" @PANE_ID 2>/dev/null || true
 }
 
-# STUB: resolve the Claude instance the invocation belongs to.
-# TODO: call GET /api/instances/resolve with pid + pane + cwd.
+# Resolve the Claude instance the invocation belongs to — the identity spine.
+# Reads the @INSTANCE_ID stamp that SessionStart writes onto the pane (the
+# post-Slice-B reverse-lookup source of truth); no API call. Once resolved,
+# downstream attributes derive from instance_id: pane via the tmuxctl oracle,
+# persona via the Token-API DB. Only the agent's own physical pane is read
+# transiently here, purely as a self-handle to find the stamp.
 origin_instance() {
     if [[ -n "${IMPERIUM_ORIGIN_INSTANCE:-}" ]]; then
         echo "$IMPERIUM_ORIGIN_INSTANCE"
         return 0
     fi
-    echo ""
+
+    local client_pid cache_file=""
+    client_pid=$(_origin_client_pid)
+    if [[ -n "$client_pid" ]]; then
+        cache_file=$(_origin_cache_path "$client_pid" instance)
+        if [[ -r "$cache_file" ]]; then
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+
+    local self_pane resolved=""
+    if self_pane=$(_origin_self_pane) && [[ -n "$self_pane" ]]; then
+        resolved=$(tmux show-options -pqv -t "$self_pane" @INSTANCE_ID 2>/dev/null || true)
+    fi
+
+    # Cache non-empty results only — never pin an empty/cleared stamp.
+    [[ -n "$resolved" && -n "$cache_file" ]] && echo "$resolved" > "$cache_file" 2>/dev/null
+    echo "$resolved"
 }
 
 # STUB: resolve the invoker's geofence (home|away|unknown).
