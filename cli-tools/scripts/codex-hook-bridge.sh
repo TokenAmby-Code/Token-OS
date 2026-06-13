@@ -21,6 +21,9 @@ TOKEN_API_CODEX_LAUNCHER="${TOKEN_API_LAUNCHER:-codex-hooks}"
 TOKEN_API_CODEX_ENGINE="${TOKEN_API_ENGINE:-codex}"
 RESUME_SCRIPT="${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/agent-session-end-resume.sh"
 [[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/scripts/agent-session-end-resume.sh"
+PLAN_APPROVER="${TOKEN_API_PLAN_APPROVER:-${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/bin/tmux-plan-approve-clear}"
+[[ -x "$PLAN_APPROVER" ]] || PLAN_APPROVER="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/bin/tmux-plan-approve-clear"
+[[ -x "$PLAN_APPROVER" ]] || PLAN_APPROVER="${SCRIPT_DIR}/../bin/tmux-plan-approve-clear"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 HOOK_INPUT="$(cat 2>/dev/null || true)"
@@ -103,7 +106,46 @@ if command -v jq >/dev/null 2>&1 && [[ -n "${TOKEN_API_CODEX_BRIDGE_ID:-}" ]]; t
     fi
 fi
 
-if [[ "$ACTION_TYPE" == "Stop" ]]; then
+json_value() {
+    local expr="$1"
+    if ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$HOOK_INPUT" | jq -r "$expr" 2>/dev/null || true
+}
+
+maybe_launch_plan_approver() {
+    [[ "$ACTION_TYPE" == "Stop" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -x "$PLAN_APPROVER" ]] || return 0
+
+    local pane state
+    pane="${TMUX_PANE:-}"
+    [[ -n "$pane" ]] || pane="$(json_value '.env.TMUX_PANE // empty')"
+    [[ -n "$pane" ]] || return 0
+
+    state="$(
+        curl -fsS -G --connect-timeout 1 --max-time 2 \
+            --data-urlencode "tmux_pane=${pane}" \
+            "${API_URL}/api/planning/state" 2>/dev/null \
+            | jq -r '.planning_state // empty' 2>/dev/null || true
+    )"
+    case "$state" in
+        planning|approving)
+            (
+                exec 0</dev/null
+                "$PLAN_APPROVER" --pane "$pane" --agent codex --timeout 10 >>"$LOG_FILE" 2>&1
+            ) &
+            disown 2>/dev/null || true
+            [[ "${HOOK_DEBUG:-0}" == "1" ]] && printf '[%s] Stop launched clear-context approver pane=%s state=%s\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$pane" "$state" >> "$LOG_FILE" 2>/dev/null || true
+            ;;
+    esac
+}
+
+maybe_launch_plan_approver
+
+if [[ "$ACTION_TYPE" == "Stop" && "${TOKEN_API_DISABLE_SESSION_RESUME:-0}" != "1" ]]; then
     printf '%s' "$HOOK_INPUT" | bash "$RESUME_SCRIPT" codex 2>/dev/null || true
 fi
 

@@ -21,15 +21,23 @@ import sys
 
 
 def _insert_instance(
-    db_path, instance_id, *, pane=None, planning_state="none", status="idle", legion="astartes"
+    db_path,
+    instance_id,
+    *,
+    pane=None,
+    planning_state="none",
+    status="idle",
+    legion="astartes",
+    engine=None,
+    wrapper_launch_id=None,
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
-            legion, planning_state)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?)""",
+            legion, planning_state, engine, wrapper_launch_id)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
@@ -39,8 +47,15 @@ def _insert_instance(
             pane,
             legion,
             planning_state,
+            engine,
+            wrapper_launch_id,
         ),
     )
+    if wrapper_launch_id:
+        conn.execute(
+            "UPDATE instances SET wrapper_launch_id = ? WHERE id = ?",
+            (wrapper_launch_id, instance_id),
+        )
     conn.commit()
     conn.close()
 
@@ -76,6 +91,16 @@ def _post_tool(app_env, monkeypatch, session_id, tool_name):
 
     async def run():
         return await hooks.handle_post_tool_use({"session_id": session_id, "tool_name": tool_name})
+
+    return asyncio.run(run())
+
+
+def _prompt_submit(app_env, monkeypatch, payload):
+    hooks = sys.modules["routes.hooks"]
+    monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
+
+    async def run():
+        return await hooks.handle_prompt_submit(payload)
 
     return asyncio.run(run())
 
@@ -160,6 +185,38 @@ def test_write_clears_even_when_debounced(app_env, monkeypatch):
     assert source == "auto-clear:tool-exec"
 
 
+# ── Prompt submit arms planning state ──────────────────────────────────────────
+
+
+def test_codex_prompt_submit_plan_context_sets_planning(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "codex-plan-1", pane="%48", engine="codex")
+
+    res = _prompt_submit(
+        app_env,
+        monkeypatch,
+        {
+            "session_id": "codex-plan-1",
+            "turn_context": {"mode": "plan"},
+            "prompt": "implement the approved design",
+        },
+    )
+
+    assert res["action"] == "processing"
+    state, source = _planning(app_env.db_path, "codex-plan-1")
+    assert state == "planning"
+    assert source == "auto-clear:prompt-submit"
+
+
+def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "slash-plan-1", pane="%49", engine="claude")
+
+    _prompt_submit(app_env, monkeypatch, {"session_id": "slash-plan-1", "prompt": "  /plan fix it"})
+
+    state, source = _planning(app_env.db_path, "slash-plan-1")
+    assert state == "planning"
+    assert source == "auto-clear:prompt-submit"
+
+
 # ── SessionStart reconciliation of a stuck row ─────────────────────────────────
 
 
@@ -186,3 +243,40 @@ def test_session_start_reregistration_reconciles_planning(app_env, monkeypatch):
     state, source = _planning(app_env.db_path, "stuck-1")
     assert state == "none"
     assert source == "auto-clear:session-start"
+
+
+def test_session_start_supplant_reconciles_planning_with_supplant_source(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path,
+        "old-plan-1",
+        pane="%50",
+        planning_state="approving",
+        engine="codex",
+        wrapper_launch_id="bridge-plan-1",
+    )
+
+    async def no_label(_pane):
+        return None
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+
+    async def run():
+        return await hooks.handle_session_start(
+            {
+                "session_id": "new-plan-1",
+                "cwd": "/tmp",
+                "env": {
+                    "TMUX_PANE": "%50",
+                    "TOKEN_API_ENGINE": "codex",
+                    "TOKEN_API_WRAPPER_LAUNCH_ID": "bridge-plan-1",
+                },
+            }
+        )
+
+    res = asyncio.run(run())
+    assert res["action"] == "supplanted"
+    assert _planning(app_env.db_path, "old-plan-1") == (None, None)
+    state, source = _planning(app_env.db_path, "new-plan-1")
+    assert state == "none"
+    assert source == "auto-clear:instance-supplanted"

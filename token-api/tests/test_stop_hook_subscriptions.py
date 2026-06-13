@@ -799,3 +799,11 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypat
     assert inst == ("preplanning", "test")
     assert queued == ("@PLANNING_STATE", "preplanning", "%91")
     assert event_count == 1
+
+    get_resp = client.get("/api/planning/state", params={"tmux_pane": "%91"})
+    assert get_resp.status_code == 200
+    get_data = get_resp.json()
+    assert get_data["success"] is True
+    assert get_data["planning_state"] == "preplanning"
+    assert get_data["instance_id"] == "planner-1"
+    assert get_data["engine"] == "codex"

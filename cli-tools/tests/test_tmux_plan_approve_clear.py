@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 
@@ -29,6 +30,42 @@ def test_codex_clear_context_modal_sends_option_two_sequence(tmp_path):
         text=True,
     ).strip()
     assert out == "action=codex option-2 Down Enter"
+
+
+def test_successful_click_leaves_state_for_session_start(tmp_path):
+    fixture = tmp_path / "pane.txt"
+    fixture.write_text(
+        "Codex approval\n> 1. Clear context and auto approve edits\n  2. Clear context and manually approve edits\n"
+    )
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    curl_log = tmp_path / "curl.log"
+    tmux_log = tmp_path / "tmux.log"
+    (fakebin / "curl").write_text(
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {curl_log!s}\nexit 0\n"
+    )
+    (fakebin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f"  capture-pane) cat {fixture!s} ;;\n"
+        f"  send-keys) printf '%s\\n' \"$*\" >> {tmux_log!s} ;;\n"
+        "esac\n"
+    )
+    for script in fakebin.iterdir():
+        script.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_URL"] = "http://token-api.test"
+    subprocess.check_call(
+        [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--timeout", "1"],
+        env=env,
+    )
+
+    body_log = curl_log.read_text()
+    assert '"state":"approving"' in body_log
+    assert '"state":"none"' not in body_log
+    assert tmux_log.read_text().strip() == "send-keys -t %99 Down Enter"
 
 
 def test_non_clear_context_modal_sends_nothing(tmp_path):
