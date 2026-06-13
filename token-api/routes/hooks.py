@@ -1912,6 +1912,16 @@ async def handle_session_start(payload: dict) -> dict:
     if not pane_label:
         pane_label = await _tmux_pane_label(tmux_pane)
 
+    # The pane's @INSTANCE_ID stamp as read by the hook itself, atomically with
+    # the event. The live tmuxctl lookup stays preferred (fresher), but when it
+    # misses (latency, SMB stall, racing the stamp) this is the only surviving
+    # occupancy signal — without it a plan-approval context-clear INSERTs a
+    # duplicate row and strands the prior row's persona/rank identity.
+    pane_stamp_instance_id = _normalize_text(payload.get("pane_instance_id") or "") or None
+    if pane_stamp_instance_id == session_id:
+        # Own stamp: same instance re-registering, not a supplant source.
+        pane_stamp_instance_id = None
+
     # Auto-name subagents
     if is_subagent and not payload.get("env", {}).get("CLAUDE_TAB_NAME"):
         tab_name = f"sub: {subagent_env or 'agent'}"
@@ -2087,7 +2097,9 @@ async def handle_session_start(payload: dict) -> dict:
             persona_primarchs = sorted(
                 {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
             )
-            live_pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+            live_pane_instance_id = (
+                await shared.instance_id_for_pane(tmux_pane) or pane_stamp_instance_id
+            )
             if live_pane_instance_id and live_pane_instance_id != session_id:
                 placeholders = ",".join("?" for _ in persona_primarchs)
                 cursor = await db.execute(
@@ -2112,7 +2124,9 @@ async def handle_session_start(payload: dict) -> dict:
         if not supplant_id:
             payload_pid = payload.get("pid")
             if payload_pid and tmux_pane:
-                live_pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+                live_pane_instance_id = (
+                    await shared.instance_id_for_pane(tmux_pane) or pane_stamp_instance_id
+                )
                 if live_pane_instance_id:
                     cursor = await db.execute(
                         """SELECT id FROM instances
