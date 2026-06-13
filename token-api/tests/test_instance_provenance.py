@@ -318,58 +318,6 @@ class TestReconciliation:
         assert ("apply", "%new", "#302800") in tint_calls
         assert ("clear", "%old") in tint_calls
 
-    def test_primarch_supplant_binds_via_legacy_env_fallback(
-        self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Transitional fallback: an in-flight shell that only carries the
-        deprecated TOKEN_API_PRIMARCH env still resolves its persona (the
-        canonical TOKEN_API_PERSONA is read first, PRIMARCH second)."""
-        import shared
-
-        tint_calls = []
-        monkeypatch.setattr(
-            shared,
-            "apply_pane_tint",
-            lambda pane, pane_tint, **kw: tint_calls.append(("apply", pane, pane_tint)),
-        )
-        monkeypatch.setattr(
-            shared,
-            "clear_pane_tint",
-            lambda pane, **kw: tint_calls.append(("clear", pane)),
-        )
-
-        old_id = str(uuid.uuid4())
-        new_id = str(uuid.uuid4())
-        conn = _db(app_env)
-        conn.execute(
-            """INSERT INTO legacy_instances
-               (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, tmux_pane, primarch, registered_at, last_activity)
-               VALUES (?, ?, 'old-custodes', '/tmp/old', 'local', 'Mac-Mini',
-                       'idle', 'custodes', 1, '%old', 'custodes',
-                       datetime('now'), datetime('now'))""",
-            (old_id, str(uuid.uuid4())),
-        )
-        conn.commit()
-        conn.close()
-
-        resp = client.post(
-            "/api/hooks/SessionStart",
-            json={
-                "session_id": new_id,
-                "cwd": "/tmp/new",
-                "pid": 12345,
-                "tmux_pane": "%new",
-                "env": {"TOKEN_API_PRIMARCH": "custodes"},
-            },
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["action"] == "supplanted"
-
-        # Fallback still resolves the persona → same pane repaint behavior.
-        assert ("apply", "%new", "#302800") in tint_calls
-        assert ("clear", "%old") in tint_calls
-
     def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env):
         """Plan-mode context-clear: Claude Code emits fresh session_id but same pid+pane.
         The supplant chain must catch this so legion='custodes' and synced=1 survive."""

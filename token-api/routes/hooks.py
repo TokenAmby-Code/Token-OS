@@ -1946,11 +1946,7 @@ async def handle_session_start(payload: dict) -> dict:
     device_id = resolve_device_from_ip(client_ip) if client_ip else "Mac-Mini"
 
     # Detect persona (env var) and transplant-from (file-based handoff injected by hook).
-    # TOKEN_API_PERSONA is canonical; TOKEN_API_PRIMARCH is the transitional
-    # fallback for in-flight/pre-deploy shells (dropped in a follow-up PR).
-    primarch_name = (
-        _normalize_text(env.get("TOKEN_API_PERSONA") or env.get("TOKEN_API_PRIMARCH", "")) or ""
-    )
+    primarch_name = _normalize_text(env.get("TOKEN_API_PERSONA", "")) or ""
     dispatch_legion = _normalize_text(
         payload.get("dispatch_legion") or env.get("TOKEN_API_LEGION", "")
     )

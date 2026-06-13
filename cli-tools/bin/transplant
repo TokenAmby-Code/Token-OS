@@ -852,8 +852,8 @@ if $PRIMARCH_MODE && [[ -z "$PRIMARCH_NAME" ]]; then
     if [[ -n "$old_primarch" ]]; then
         PRIMARCH_NAME="$old_primarch"
         log_success "Primarch from instance DB: $PRIMARCH_NAME"
-    elif [[ -n "${TOKEN_API_PERSONA:-${TOKEN_API_PRIMARCH:-}}" ]]; then
-        PRIMARCH_NAME="${TOKEN_API_PERSONA:-${TOKEN_API_PRIMARCH:-}}"
+    elif [[ -n "${TOKEN_API_PERSONA:-}" ]]; then
+        PRIMARCH_NAME="$TOKEN_API_PERSONA"
         log_success "Primarch from env: $PRIMARCH_NAME"
     else
         log_error "No primarch name given and none found in instance DB or env"
