@@ -464,9 +464,12 @@ async def _ensure_instances(db) -> None:
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
         BEGIN
+            -- id != OLD.id too: a BEFORE trigger sees the table pre-update, so a
+            -- supplant that rewrites the row id in the same UPDATE would otherwise
+            -- match its own pre-image and retire the row being supplanted.
             UPDATE instances
                SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
-             WHERE id != NEW.id AND persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
+             WHERE id != NEW.id AND id != OLD.id AND persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
         END
     """)
     # Stamp a singleton persona's row back to its registry default_rank. The
@@ -480,7 +483,9 @@ async def _ensure_instances(db) -> None:
     # (NEW.rank == default → WHEN false → no-op) and converges under
     # recursive_triggers ON or OFF (SQLite default is OFF here; verified). The
     # paired BEFORE-INSERT/UPDATE singleton guards above then collapse any
-    # duplicate non-retired rows to exactly one.
+    # duplicate non-retired rows to exactly one. The update variant also fires on
+    # commander_type: a row leaving chapter sovereignty re-qualifies as the
+    # singleton and must be restamped off whatever rank it held as a child.
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_stamp_persona_rank")
     await db.execute("""
         CREATE TRIGGER trg_instances_stamp_persona_rank
@@ -497,7 +502,7 @@ async def _ensure_instances(db) -> None:
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_stamp_persona_rank_update")
     await db.execute("""
         CREATE TRIGGER trg_instances_stamp_persona_rank_update
-        AFTER UPDATE OF persona_id, rank ON instances
+        AFTER UPDATE OF persona_id, rank, commander_type ON instances
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
              AND NEW.rank != COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes')
