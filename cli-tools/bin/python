@@ -56,6 +56,12 @@ _find_real_python() {
     return 127
 }
 
+# Legacy bypass flag from the retired uv-wrapping shim: accept and drop it so
+# old callers don't hand the real interpreter an unknown option.
+if [[ "${1:-}" == "--no-uv" ]]; then
+    shift
+fi
+
 _REAL_PYTHON="$(_find_real_python)"
 export IMPERIUM_PYTHON_BIN="$_REAL_PYTHON"
 exec "$_REAL_PYTHON" "$@"
