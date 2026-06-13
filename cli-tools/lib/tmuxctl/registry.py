@@ -69,6 +69,16 @@ def build_registry_snapshot(
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
                 primarch=str(row.get("primarch", "") or ""),
+                # Canonical persona identity from the instances.persona_id JOIN.
+                # /api/instances nests it as persona.slug; the flat profile_name
+                # alias is accepted as a fallback for older response shapes.
+                persona_slug=str(
+                    (row.get("persona") or {}).get("slug")
+                    or row.get("persona_slug")
+                    or row.get("profile_name")
+                    or ""
+                ),
+                rank=str(row.get("rank", "") or ""),
             )
         )
     return InstanceRegistrySnapshot(device_id=device_id, instances=tuple(normalized))

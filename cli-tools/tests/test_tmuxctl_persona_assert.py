@@ -144,10 +144,60 @@ def test_fg_fails_on_pane_label_mismatch_even_with_right_legion():
     assert _row_matches_persona(row, spec) is False
 
 
-def test_custodes_predicate_unchanged():
+def test_custodes_matches_canonical_persona_slug():
+    # Canonical identity after the sync-decouple: the instances.persona_id JOIN
+    # surfaces persona.slug on /api/instances. A correctly-registered custodes
+    # carries slug='custodes' and matches REGARDLESS of sync mode / instance_type
+    # (which /api/instances no longer exposes). This is the live-symptom fix: the
+    # old `instance_type in {sync,hook_driven}` gate failed against a clean custodes
+    # row and re-armed the `/persona custodes` injection loop every tick.
     spec = _custodes_spec()
+    row = SimpleNamespace(
+        instance_id="i-c",
+        pane_label="legion:custodes",
+        persona_slug="custodes",
+        legion="",
+        instance_type="",
+        tab_name="custodes-morning",
+    )
+    assert _row_matches_persona(row, spec) is True
+
+
+def test_custodes_matches_without_sync_instance_type():
+    # The exact contradictory-contract case from the ticket: a canonical custodes
+    # row with NO sync/instance_type must still match (legion fallback), never spam.
+    spec = _custodes_spec()
+    assert _row_matches_persona(_row(legion="custodes", instance_type=""), spec) is True
     assert _row_matches_persona(_row(legion="custodes", instance_type="sync"), spec) is True
+
+
+def test_custodes_fails_when_not_custodes():
+    spec = _custodes_spec()
     assert _row_matches_persona(_row(legion="astartes", instance_type="sync"), spec) is False
+    impostor = SimpleNamespace(
+        instance_id="i-x",
+        pane_label="legion:custodes",
+        persona_slug="malcador",
+        legion="",
+        instance_type="",
+        tab_name="",
+    )
+    assert _row_matches_persona(impostor, spec) is False
+
+
+def test_fg_matches_on_canonical_persona_slug():
+    # The whole family reads canonical identity: persona_slug identifies FG even when
+    # the legacy legion/tab columns the API dropped are absent.
+    spec = _fg_spec()
+    row = SimpleNamespace(
+        instance_id="i-fg",
+        pane_label=FG_LABEL,
+        persona_slug="fabricator-general",
+        legion="",
+        instance_type="",
+        tab_name="fg-observed-agents-cutoff",
+    )
+    assert _row_matches_persona(row, spec) is True
 
 
 def test_admin_matches_on_primarch_with_fresh_tab_name():
@@ -404,3 +454,31 @@ def test_clear_pane_overlay_preserves_static_persona_guard():
 
     assert adapter.options[PERSONA_GUARD_OPTION] == "{}"
     assert "@PANE_LABEL" not in adapter.options
+
+
+# ── canonical registry-snapshot extraction ───────────────────────────────────
+
+
+def test_build_snapshot_extracts_persona_slug_and_rank():
+    # The persona watchdog reads identity from the canonical instances table via
+    # /api/instances, which exposes persona.slug + rank (NOT the dropped legion/
+    # instance_type columns). The snapshot must carry persona_slug/rank so the
+    # predicate can match on canonical identity.
+    from tmuxctl.registry import build_registry_snapshot
+
+    snap = build_registry_snapshot(
+        device_id="Mac-Mini",
+        instances=[
+            {
+                "id": "i-c",
+                "device_id": "Mac-Mini",
+                "pane_label": "legion:custodes",
+                "status": "working",
+                "persona": {"slug": "custodes"},
+                "rank": "overseer",
+            }
+        ],
+    )
+    entry = snap.instances[0]
+    assert entry.persona_slug == "custodes"
+    assert entry.rank == "overseer"

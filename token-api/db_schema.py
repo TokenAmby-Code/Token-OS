@@ -1698,6 +1698,17 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 2,
             ),
             (
+                "reconcile_live_panes",
+                "Reconcile Live Panes",
+                "Re-warm registry rows for live agent panes swept to stopped: any "
+                "@INSTANCE_ID stamp on a live Claude/Codex pane that points at a "
+                "stopped/archived row is a false-dead, so reactivate it and refresh "
+                "its tmux geometry. Proactive companion to the cleanup liveness guard.",
+                "interval",
+                "10m",
+                2,
+            ),
+            (
                 "purge_old_events",
                 "Purge Old Events",
                 "Delete events older than 30 days",

@@ -79,6 +79,7 @@ from instance_mutation import (
     reconcile_instance,
     sanctioned_insert_instance,
     sanctioned_update_instance,
+    sanctioned_update_runtime_fields,
 )
 from instance_registry import derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
@@ -1098,9 +1099,160 @@ async def log_task_failed(execution_id: int, error: str):
 # ============ Task Implementations ============
 
 
+async def _ps_process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
+    """One ``ps`` snapshot → (pid→children, pid→lowercased command).
+
+    Built once and reused so live-pane enumeration costs a single ``ps`` rather
+    than one per pane. Fails closed to empty maps on any error.
+    """
+    try:
+        proc = await _run_subprocess_offloop(
+            ("ps", "-axo", "pid=,ppid=,command="),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return {}, {}
+    except Exception:
+        return {}, {}
+
+    children: dict[int, list[int]] = {}
+    commands: dict[int, str] = {}
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        commands[pid] = parts[2].lower()
+        children.setdefault(ppid, []).append(pid)
+    return children, commands
+
+
+def _pid_tree_has_agent(
+    pane_pid: int | None,
+    children: dict[int, list[int]],
+    commands: dict[int, str],
+) -> bool:
+    """True when ``pane_pid`` or any descendant runs a Claude/Codex agent.
+
+    tmux reports the wrapper shell (``node``/``bash``/a version string) as the
+    pane command even while the agent TUI is a descendant, so liveness must walk
+    the process tree, not trust ``pane_current_command`` alone.
+    """
+    if not pane_pid:
+        return False
+    needles = ("claude", "codex")
+    if any(n in commands.get(pane_pid, "") for n in needles):
+        return True
+    stack = list(children.get(pane_pid, []))
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if any(n in commands.get(pid, "") for n in needles):
+            return True
+        stack.extend(children.get(pid, []))
+    return False
+
+
+async def _live_agent_panes() -> list[dict]:
+    """Enumerate live tmux panes that host a live agent (Claude/Codex).
+
+    One ``tmux list-panes -a`` scan plus one ``ps`` snapshot. For each pane we read
+    the pane pid and its ``@INSTANCE_ID`` / ``@PANE_LABEL`` / ``@PANE_ID`` stamps,
+    then gate on liveness: the pane counts only when its command looks like an agent
+    OR a descendant process is one (Claude Code surfaces as ``node`` / a version
+    string, so the command alone is unreliable).
+
+    ``instance_id`` is the pane's ``@INSTANCE_ID`` stamp — the durable
+    pane→instance bridge that survives a DB sweep (the sweep never touches the
+    pane). ``pane_role`` is ``@PANE_ID`` (the persona/role label stored in the
+    instances ``pane_label`` column). Fails closed: returns ``[]`` on any tmux
+    error so a transient hiccup never reaps or churns the fleet.
+    """
+    try:
+        proc = await _run_subprocess_offloop(
+            (
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{pane_pid}\t#{@INSTANCE_ID}\t#{@PANE_LABEL}\t#{@PANE_ID}\t#{pane_current_command}",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+    except Exception:
+        return []
+
+    raw: list[dict] = []
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
+            parts += [""] * (6 - len(parts))
+        pane_id, pane_pid, instance_id, pane_label, pane_role, current_cmd = parts[:6]
+        if not pane_id.startswith("%"):
+            continue
+        try:
+            pid: int | None = int(pane_pid)
+        except ValueError:
+            pid = None
+        raw.append(
+            {
+                "pane_id": pane_id,
+                "pane_pid": pid,
+                "instance_id": instance_id.strip() or None,
+                "pane_label": pane_label.strip() or None,
+                "pane_role": pane_role.strip() or None,
+                "current_command": current_cmd,
+            }
+        )
+
+    children, commands = await _ps_process_tree()
+    live: list[dict] = []
+    for pane in raw:
+        cmd = pane["current_command"]
+        engine = "codex" if "codex" in cmd.lower() else "claude"
+        if _agent_is_alive_command(engine, cmd) or _pid_tree_has_agent(
+            pane["pane_pid"], children, commands
+        ):
+            live.append(pane)
+    return live
+
+
+async def _live_agent_instance_ids() -> set[str]:
+    """Set of instance_ids stamped on a live agent pane (the sweep's liveness oracle)."""
+    return {pane["instance_id"] for pane in await _live_agent_panes() if pane["instance_id"]}
+
+
 async def cleanup_stale_instances() -> dict:
-    """Mark instances with no activity for 3+ hours as stopped."""
+    """Mark instances idle 3+ hours as stopped — UNLESS the pane is genuinely live.
+
+    LIVENESS GUARD: a row whose ``@INSTANCE_ID`` is stamped on a live agent pane is
+    never reaped, no matter how long it has been idle. An idle-but-live pane is
+    indistinguishable from a dead one by ``last_activity`` alone, so without this
+    the overnight sweep collapsed the registry's active set to ~1 row while ~13
+    panes kept running ("live panes, dead rows"). This generalizes the existing
+    persona clear-protection to ANY row whose pane is genuinely alive: only reap
+    when the pane/process is actually gone.
+
+    Note: the liveness signal is the LOCAL tmux server's pane stamps, so remote
+    (satellite) rows keep the prior idle-reap behavior — their liveness can only be
+    judged on their own host. See the PR's "open question" on sweep policy.
+    """
     cutoff = (datetime.now() - timedelta(hours=3)).isoformat()
+    live_ids = await _live_agent_instance_ids()
+    protected = 0
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT id
@@ -1109,11 +1261,17 @@ async def cleanup_stale_instances() -> dict:
                  AND last_activity < ?""",
             (cutoff,),
         )
-        rows = await cursor.fetchall()
-        for row in rows:
+        candidates = [row[0] for row in await cursor.fetchall()]
+        reaped: list[str] = []
+        for instance_id in candidates:
+            if instance_id in live_ids:
+                protected += 1
+                continue
+            reaped.append(instance_id)
+        for instance_id in reaped:
             await sanctioned_update_instance(
                 db,
-                instance_id=row[0],
+                instance_id=instance_id,
                 updates={
                     "status": "stopped",
                     "input_lock": None,
@@ -1125,12 +1283,85 @@ async def cleanup_stale_instances() -> dict:
                 actor="cleanup-stale",
             )
         await db.commit()
-        affected = len(rows)
+        affected = len(reaped)
 
-    if affected > 0:
-        await log_event("task_cleanup", details={"cleaned_up": affected})
+    if affected > 0 or protected > 0:
+        await log_event(
+            "task_cleanup",
+            details={"cleaned_up": affected, "protected_live": protected},
+        )
 
-    return {"cleaned_up": affected}
+    return {"cleaned_up": affected, "protected_live": protected}
+
+
+async def reconcile_live_panes() -> dict:
+    """Re-warm registry rows for live agent panes swept to stopped (proactive heal).
+
+    A DB sweep flips a row to ``stopped`` but never touches the pane, so a live
+    agent pane keeps its ``@INSTANCE_ID`` stamp. Any such stamp pointing at a
+    stopped/archived row is a false-dead: reactivate the row (``status``→idle,
+    clear ``stopped_at``, refresh ``last_activity``) and rebind its tmux geometry
+    (``tmux_pane``, ``pane_label``) from the live pane. This HEALS an already-
+    collapsed active set rather than only preventing future collapses; it is the
+    proactive companion to the cleanup liveness guard.
+
+    Scope: only reactivates rows that already exist and are stopped/archived.
+    Unstamped live panes (and stamps with no DB row) are left to the SessionStart
+    registration path — cold registration needs a persona derivation this
+    reconciler deliberately does not attempt.
+    """
+    panes = await _live_agent_panes()
+    reactivated = 0
+    unmatched = 0
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        for pane in panes:
+            instance_id = pane.get("instance_id")
+            if not instance_id:
+                unmatched += 1
+                continue
+            cursor = await db.execute(
+                "SELECT id, status FROM instances WHERE id = ?", (instance_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                unmatched += 1
+                continue
+            if row["status"] not in ("stopped", "archived"):
+                continue
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={"status": "idle", "stopped_at": None, "last_activity": now},
+                mutation_type="instance_reregistered",
+                write_source="task",
+                actor="reconcile-live-panes",
+            )
+            runtime: dict = {}
+            if pane.get("pane_id"):
+                runtime["tmux_pane"] = pane["pane_id"]
+            if pane.get("pane_role"):
+                runtime["pane_label"] = pane["pane_role"]
+            if runtime:
+                await sanctioned_update_runtime_fields(
+                    db,
+                    instance_id=instance_id,
+                    updates=runtime,
+                    mutation_type="instance_reregistered",
+                    write_source="task",
+                    actor="reconcile-live-panes",
+                )
+            reactivated += 1
+        await db.commit()
+
+    if reactivated > 0:
+        await log_event(
+            "instance_reregistered",
+            details={"reactivated": reactivated, "unmatched": unmatched},
+        )
+
+    return {"reactivated": reactivated, "unmatched": unmatched}
 
 
 async def purge_old_events() -> dict:
@@ -1147,6 +1378,7 @@ async def purge_old_events() -> dict:
 # Task registry mapping task IDs to their implementation functions
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
+    "reconcile_live_panes": reconcile_live_panes,
     "purge_old_events": purge_old_events,
     # The only fixed day-start cron: 04:00 bookkeeping that derives expected wake
     # from history and arms the relative morning watchdog. It never launches a
