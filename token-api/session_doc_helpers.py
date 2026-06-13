@@ -24,16 +24,60 @@ from pane_surface import is_placeholder_tab_name
 
 logger = logging.getLogger(__name__)
 
-_VAULT_ROOT = Path(os.environ.get("IMPERIUM_ENV", "")) if os.environ.get("IMPERIUM_ENV") else None
-_IMPERIUM_ROOT = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-if not _IMPERIUM_ROOT.exists():
-    _IMPERIUM_ROOT = Path.home()
-if _VAULT_ROOT is None:
-    _VAULT_ROOT = _IMPERIUM_ROOT / "Imperium-ENV"
-TERRA_SESSIONS_DIR = _VAULT_ROOT / "Terra" / "Sessions"
-MARS_SESSIONS_DIR = _VAULT_ROOT / "Mars" / "Sessions"
-DAILY_NOTES_DIR = _VAULT_ROOT / "Terra" / "Journal" / "Daily"
+# The live Obsidian vault. Tests MUST NOT write here; the chokepoint guard below
+# hard-fails any session-doc creation that targets this tree while under pytest.
+LIVE_VAULT_ROOT = Path("/Volumes/Imperium/Imperium-ENV")
+
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
+
+
+def vault_root() -> Path:
+    """Resolve the Obsidian vault root at CALL time (never frozen at import).
+
+    Freezing this at import is what let test runs pollute the live vault: when
+    IMPERIUM_ENV was unset and /Volumes/Imperium was mounted, the module bound the
+    live vault before any test fixture could redirect it.  Reading the environment
+    on each call lets the isolation fixture point writes at a temp dir.
+    """
+    env = os.environ.get("IMPERIUM_ENV")
+    if env:
+        return Path(env)
+    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
+    if not imperium.exists():
+        imperium = Path.home()
+    return imperium / "Imperium-ENV"
+
+
+def terra_sessions_dir() -> Path:
+    return vault_root() / "Terra" / "Sessions"
+
+
+def mars_sessions_dir() -> Path:
+    return vault_root() / "Mars" / "Sessions"
+
+
+def daily_notes_dir() -> Path:
+    return vault_root() / "Terra" / "Journal" / "Daily"
+
+
+def _assert_not_live_vault(path: Path) -> None:
+    """Tripwire: under pytest, never create a session doc inside the live vault.
+
+    Converts silent live-vault pollution into a loud failure so a regression is
+    caught by the suite instead of by a human noticing 1,600 junk docs.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if resolved == LIVE_VAULT_ROOT or LIVE_VAULT_ROOT in resolved.parents:
+        raise RuntimeError(
+            f"Test attempted to write a session doc into the LIVE vault: {resolved}. "
+            "Tests must target an isolated vault (the autouse isolate_vault fixture "
+            "sets IMPERIUM_ENV to a temp dir)."
+        )
 
 
 class _ObsidianDumper(yaml.SafeDumper):
@@ -78,6 +122,7 @@ def human_filename_stem(value: str, fallback: str = "needs-session-name", max_le
 
 def unique_human_path(directory: Path, title: str, fallback: str = "needs-session-name") -> Path:
     """Create a non-date-prefixed, hyphenated path with numeric collision suffixes."""
+    _assert_not_live_vault(directory)
     directory.mkdir(parents=True, exist_ok=True)
     stem = human_filename_stem(title, fallback=fallback)
     candidate = directory / f"{stem}.md"
@@ -1052,6 +1097,7 @@ def create_session_doc_file(
     Golden Throne accountability engine can read specific unmet conditions
     instead of firing a generic resume prompt.
     """
+    _assert_not_live_vault(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     fm: dict[str, Any] = {
@@ -1193,7 +1239,7 @@ async def resolve_active_primarch_session_doc(db, primarch_name: str) -> int | N
 async def resolve_today_daily_note_session_doc(db, date_str: str | None = None) -> int | None:
     """Return today's daily note as a session_documents row if the note exists."""
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
-    return await resolve_or_create_session_doc_for_path(db, DAILY_NOTES_DIR / f"{date_str}.md")
+    return await resolve_or_create_session_doc_for_path(db, daily_notes_dir() / f"{date_str}.md")
 
 
 def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
@@ -1222,7 +1268,7 @@ def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
 async def resolve_or_create_today_daily_note_session_doc(db, date_str: str | None = None) -> int:
     """Return today's Custodes daily note, creating note and DB row if absent."""
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
-    fp = (DAILY_NOTES_DIR / f"{date_str}.md").resolve()
+    fp = (daily_notes_dir() / f"{date_str}.md").resolve()
     existing = await resolve_or_create_session_doc_for_path(db, fp)
     if existing:
         return existing
@@ -1273,7 +1319,7 @@ async def resolve_session_doc_for_start(
     if dispatch_session_doc_path:
         fp = Path(dispatch_session_doc_path)
         if not fp.is_absolute():
-            fp = _VAULT_ROOT / dispatch_session_doc_path
+            fp = vault_root() / dispatch_session_doc_path
         doc_id = await resolve_or_create_session_doc_for_path(db, fp)
         if doc_id:
             return doc_id, "dispatch_explicit"
@@ -1295,7 +1341,7 @@ async def resolve_session_doc_for_start(
 
         now_ts = datetime.now().isoformat()
         doc_title = cron_job_name or "cron"
-        fp = unique_human_path(MARS_SESSIONS_DIR, doc_title, fallback="needs-session-name")
+        fp = unique_human_path(mars_sessions_dir(), doc_title, fallback="needs-session-name")
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, cron_job_id, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, 'active', ?, ?)""",
@@ -1320,7 +1366,7 @@ async def resolve_session_doc_for_start(
     # No cwd/date fallback names. A new interactive session gets a placeholder
     # and is expected to name its own session doc via `session-doc-name`.
     doc_title = "Needs Session Name"
-    fp = unique_human_path(TERRA_SESSIONS_DIR, doc_title, fallback="needs-session-name")
+    fp = unique_human_path(terra_sessions_dir(), doc_title, fallback="needs-session-name")
     cursor = await db.execute(
         """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
            VALUES (?, ?, ?, 'active', ?, ?)""",
