@@ -443,7 +443,17 @@ def main(argv: list[str] | None = None) -> int:
                         "persona correction sent; retry after settle before sending payload: "
                         f"{_json.dumps(assertion)}"
                     )
-                raise ValueError(f"pane has no live instance: {_json.dumps(assertion)}")
+                if not assertion.get("deliverable"):
+                    raise ValueError(f"pane has no live instance: {_json.dumps(assertion)}")
+                # FAIL OPEN: the live runtime is present but the persona correction is
+                # stuck after bounded attempts. Payload delivery is primary — deliver
+                # the byte-bearing payload + emit a loud diagnostic rather than
+                # suppressing it (the persona_assert_suppressed_stuck live blocker).
+                print(
+                    "tmuxctl send-text: FAIL-OPEN delivering payload despite stuck persona "
+                    f"correction: {_json.dumps(assertion)}",
+                    file=sys.stderr,
+                )
             text = sys.stdin.read() if args.stdin else args.text
             control.adapter.send_text_then_submit(
                 args.pane,

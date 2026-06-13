@@ -8384,7 +8384,7 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
     if result.get("action") in {"launched", "persona_correction_sent"}:
         await asyncio.sleep(3)
         result, stderr = await _run_assert()
-    if not result.get("ok"):
+    if not result.get("ok") and not result.get("deliverable"):
         logger.warning(
             f"{source}: assert-instance legion:custodes failed: {result.get('reason')} stderr={stderr[:200]}"
         )
@@ -8393,6 +8393,15 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
             "reason": result.get("reason") or "assert_failed",
             "assertion": result,
         }
+    if not result.get("ok"):
+        # FAIL OPEN: the live Custodes runtime is present but the persona correction
+        # is stuck after bounded attempts (action=persona_correction_failopen). Deliver
+        # the enforcement payload anyway + emit a loud diagnostic rather than dropping
+        # it — payload delivery is primary, the persona correction is secondary.
+        logger.warning(
+            f"{source}: persona correction stuck (deliverable) — FAIL-OPEN delivering "
+            f"payload to legion:custodes: {result.get('reason')}"
+        )
 
     proc = await asyncio.create_subprocess_exec(
         str(tmuxctl_bin),

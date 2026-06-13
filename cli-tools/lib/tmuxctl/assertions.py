@@ -195,6 +195,16 @@ def _send_persona_command(adapter: TmuxAdapter, pane_id: str, persona: str) -> t
 # the independent per-tick invocations, matching the @CC_STATE/@TTS_STATE idiom.
 PERSONA_GUARD_OPTION = "@PERSONA_ASSERT_GUARD"
 PERSONA_GUARD_BACKOFF_SECONDS = 300.0
+# Fail-open threshold. The persona correction (`/persona`) is SECONDARY; payload
+# delivery is PRIMARY. A correction that cannot change its own input (the registry
+# row is byte-for-byte unchanged) is held — suppressed — for a few bounded ticks to
+# give a legitimately-mid-transition pane time to settle. Once the attempt count
+# reaches this threshold the loop STOPS suppressing the payload: it flips to the
+# `persona_correction_failopen` action and emits a LOUD diagnostic so the send path
+# delivers the byte-bearing payload anyway, never dropping it forever. The value is
+# pinned at the attempt count A4 observed stuck (`attempts=4`) so the live custodes
+# enforcement channel fails open instead of suppressing on that exact evidence.
+PERSONA_FAILOPEN_ATTEMPTS = 4
 PANE_CLOSE_TRANSIENT_OPTIONS = (
     "@INSTANCE_ID",
     "@PANE_LABEL",
@@ -280,6 +290,44 @@ def _guarded_send_persona_command(
         if elapsed < PERSONA_GUARD_BACKOFF_SECONDS:
             guard["attempts"] = attempts
             _write_persona_guard(adapter, pane_id, guard)
+            observed_row = {
+                "instance_id": getattr(row, "instance_id", "") if row is not None else "",
+                "legion": getattr(row, "legion", "") if row is not None else "",
+                "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
+                "instance_type": getattr(row, "instance_type", "") if row is not None else "",
+            }
+            if attempts >= PERSONA_FAILOPEN_ATTEMPTS:
+                # FAIL OPEN. The correction is provably stuck — re-sending `/persona`
+                # cannot change a verdict that has already failed against this exact
+                # registry row N times. We reach this branch only when the live
+                # runtime IS present (runtime_ok=True, row is not None), so the pane
+                # is deliverable: stop suppressing the payload, emit a LOUD diagnostic,
+                # and signal the send path to deliver. Suppress-on-stuck was the
+                # anti-pattern that silently dropped every enforcement send to %25.
+                log_event(
+                    "persona_assert_failopen",
+                    instance_id=getattr(row, "instance_id", "") if row is not None else "",
+                    details={
+                        "pane": pane_id,
+                        "persona": spec.persona,
+                        "pane_label": spec.pane_label,
+                        "predicate": "_row_matches_persona",
+                        "attempts": attempts,
+                        "threshold": PERSONA_FAILOPEN_ATTEMPTS,
+                        "resolution": (
+                            "persona correction is stuck against an unchanged registry "
+                            "row; failing open — the live runtime is present so the "
+                            "payload is delivered and the persona mismatch is left for "
+                            "the next FG dispatch / restart to reconcile"
+                        ),
+                        "observed_row": observed_row,
+                    },
+                )
+                return (
+                    False,
+                    f"persona_assert_failopen attempts={attempts}",
+                    "persona_correction_failopen",
+                )
             log_event(
                 "persona_assertion_stuck",
                 instance_id=getattr(row, "instance_id", "") if row is not None else "",
@@ -291,14 +339,8 @@ def _guarded_send_persona_command(
                     "attempts": attempts,
                     "backoff_seconds": PERSONA_GUARD_BACKOFF_SECONDS,
                     "elapsed_seconds": round(elapsed, 1),
-                    "observed_row": {
-                        "instance_id": getattr(row, "instance_id", "") if row is not None else "",
-                        "legion": getattr(row, "legion", "") if row is not None else "",
-                        "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
-                        "instance_type": getattr(row, "instance_type", "")
-                        if row is not None
-                        else "",
-                    },
+                    "failopen_at": PERSONA_FAILOPEN_ATTEMPTS,
+                    "observed_row": observed_row,
                 },
             )
             return (
@@ -578,6 +620,13 @@ def _assert_instance_impl(
                 },
             )
             result.update({"ok": False, "action": action, "reason": reason})
+            # The persona correction is stuck past its bounded attempts but the live
+            # runtime IS present (we only reach this branch with runtime_ok=True and a
+            # real row). Mark the pane deliverable so the send path fails open and
+            # delivers the payload instead of treating the stuck correction as a dead
+            # pane — payload delivery is primary, the correction is secondary.
+            if action == "persona_correction_failopen":
+                result["deliverable"] = True
             return finish(result, clear_failed=False)
         if row is None:
             stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)

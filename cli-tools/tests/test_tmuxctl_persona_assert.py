@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 from tmuxctl import assertions
 from tmuxctl.assertions import (
     PANE_CLOSE_TRANSIENT_OPTIONS,
+    PERSONA_FAILOPEN_ATTEMPTS,
     PERSONA_GUARD_OPTION,
     PersonaSpec,
     _clear_pane_overlay,
@@ -204,6 +205,89 @@ def test_guard_sends_once_then_suppresses_unchanged_row():
     stuck = [c for c in log.call_args_list if c.args and c.args[0] == "persona_assertion_stuck"]
     assert len(stuck) == 1
     assert stuck[0].kwargs["details"]["attempts"] == 2
+
+
+def test_guard_fails_open_after_bounded_attempts():
+    # The live-enforcement blocker: a persona correction that cannot change its own
+    # input must STOP suppressing the payload after N bounded attempts and signal
+    # the send path to FAIL OPEN (deliver + loud diagnostic), never suppress forever.
+    adapter = FakeAdapter()
+    spec = _fg_spec()
+    row = _row(legion="astartes", tab_name="needs-name")  # persistently failing
+
+    actions: list[str] = []
+    with (
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
+        patch.object(assertions, "log_event") as log,
+    ):
+        for _ in range(PERSONA_FAILOPEN_ATTEMPTS + 1):
+            _, _, action = _guarded_send_persona_command(adapter, "%27", spec, row)
+            actions.append(action)
+
+    # First tick sends the correction once; the next few bounded ticks hold
+    # (suppressed); once attempts reach the fail-open threshold the action flips to
+    # `persona_correction_failopen` so the payload is delivered, not dropped.
+    assert actions[0] == "persona_correction_sent"
+    assert actions[1] == "persona_correction_suppressed"
+    assert actions[-1] == "persona_correction_failopen"
+    send.assert_called_once()  # /persona is never re-sent — it cannot change the verdict
+    failopen = [c for c in log.call_args_list if c.args and c.args[0] == "persona_assert_failopen"]
+    assert len(failopen) >= 1
+    assert failopen[0].kwargs["details"]["attempts"] >= PERSONA_FAILOPEN_ATTEMPTS
+
+
+def test_guard_stays_failopen_once_threshold_crossed():
+    # Once stuck past the threshold, every subsequent tick must keep failing open
+    # (deliverable) until the observed row actually changes — it must not relapse
+    # into silent suppression.
+    adapter = FakeAdapter()
+    spec = _fg_spec()
+    row = _row(legion="astartes", tab_name="needs-name")
+
+    with (
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")),
+        patch.object(assertions, "log_event"),
+    ):
+        for _ in range(PERSONA_FAILOPEN_ATTEMPTS + 3):
+            _, _, action = _guarded_send_persona_command(adapter, "%27", spec, row)
+
+    assert action == "persona_correction_failopen"
+
+
+def test_assert_instance_marks_pane_deliverable_on_failopen():
+    # End-to-end through the REAL assert_instance: a live persona pane whose registry
+    # row never matches the predicate drives the bounded correction loop to fail-open,
+    # at which point assert_instance must mark the result `deliverable=True` so the
+    # send path delivers the payload (the live-enforcement-to-custodes fix).
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    # Persistently-mismatched live custodes row (legion never 'custodes').
+    row = _row(
+        instance_id="7cd51be3",
+        pane_label="legion:custodes",
+        legion="astartes",
+        tab_name="needs-name",
+        instance_type="hook_driven",
+        primarch="",
+    )
+
+    resolved = SimpleNamespace(pane_id="%25", pane_role="legion:custodes")
+    last = {}
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="legion"),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", return_value=[row]),
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")),
+        patch.object(assertions, "log_event"),
+    ):
+        for _ in range(PERSONA_FAILOPEN_ATTEMPTS + 1):
+            last = assert_instance(adapter, "legion:custodes")
+
+    assert last["ok"] is False
+    assert last["action"] == "persona_correction_failopen"
+    assert last["deliverable"] is True
 
 
 def test_guard_allows_resend_after_row_changes():
