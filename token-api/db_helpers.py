@@ -21,12 +21,12 @@ async def get_instance(
     db: aiosqlite.Connection | None = None,
     db_path: Path = DB_PATH,
 ) -> dict | None:
-    """Fetch a claude_instances row by id. Returns dict or None."""
+    """Fetch a instances row by id. Returns dict or None."""
 
     async def _query(conn: aiosqlite.Connection) -> dict | None:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
-            "SELECT * FROM claude_instances WHERE id = ?",
+            "SELECT * FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -50,9 +50,9 @@ async def count_active_instances(
     exclude_subagents=False: all instances including subagents.
     """
     if exclude_subagents:
-        sql = "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        sql = "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
     else:
-        sql = "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
+        sql = "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived')"
 
     async def _query(conn: aiosqlite.Connection) -> int:
         cursor = await conn.execute(sql)
@@ -75,7 +75,7 @@ async def count_instances_for_doc(
 
     async def _query(conn: aiosqlite.Connection) -> int:
         cursor = await conn.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
+            "SELECT COUNT(*) FROM instances WHERE session_doc_id = ?",
             (session_doc_id,),
         )
         row = await cursor.fetchone()

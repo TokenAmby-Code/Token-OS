@@ -28,13 +28,13 @@ API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 # Persona singleton rows are the canonical DB identity of the orchestrator panes
 # (custodes / Fabricator-General / Administratum). They are resolved by the
 # state-hook dispatcher (e.g. `_resolve_administratum_instance` keys on
-# `primarch='administratum'`) and reactivated in-place by the tmuxctl persona
+# `persona_id/slug='administratum'`) and reactivated in-place by the tmuxctl persona
 # watchdog when their pane goes idle. Hard-deleting a *stopped* persona row
 # stranded the live runtime as "live_runtime_missing_registry": the watchdog
 # could no longer reactivate it, fell back to re-injecting `/persona <name>`
 # (a no-op for singleton panes), and span that correction every ~5 min forever.
 # So: never auto-clear a persona row — preserve it for reactivation.
-PERSONA_PRIMARCHS = {"custodes", "fabricator-general", "administratum"}
+PERSONA_SLUGS = {"custodes", "fabricator-general", "administratum"}
 PERSONA_PANE_LABELS = {
     "legion:custodes",
     "mechanicus:fabricator-general",
@@ -44,7 +44,7 @@ PERSONA_PANE_LABELS = {
 def _is_persona_row(inst: dict) -> bool:
     """True when the row is an orchestrator-persona singleton (never auto-clear)."""
     return (
-        (inst.get("primarch") or "") in PERSONA_PRIMARCHS
+        (inst.get("persona_slug") or "") in PERSONA_SLUGS
         or (inst.get("pane_label") or "") in PERSONA_PANE_LABELS
     )
 
@@ -57,9 +57,9 @@ def get_instances(include_active: bool = False) -> tuple[list[dict[str, object]]
     conn.row_factory = sqlite3.Row
 
     if include_active:
-        query = "SELECT * FROM claude_instances ORDER BY status, registered_at DESC"
+        query = """SELECT i.*, i.name AS tab_name, i.created_at AS registered_at, p.slug AS persona_slug FROM instances i LEFT JOIN personas p ON p.id = i.persona_id ORDER BY i.status, i.created_at DESC"""
     else:
-        query = "SELECT * FROM claude_instances WHERE status = 'stopped' ORDER BY stopped_at DESC"
+        query = """SELECT i.*, i.name AS tab_name, i.created_at AS registered_at, p.slug AS persona_slug FROM instances i LEFT JOIN personas p ON p.id = i.persona_id WHERE i.status = 'stopped' ORDER BY i.stopped_at DESC"""
 
     cursor = conn.execute(query)
     rows = [dict(row) for row in cursor.fetchall()]
@@ -77,7 +77,7 @@ def delete_instance(instance_id: str) -> bool:
 
     conn = sqlite3.connect(DB_PATH)
     try:
-        conn.execute("DELETE FROM claude_instances WHERE id = ?", (instance_id,))
+        conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
         conn.commit()
         return True
     except Exception as e:

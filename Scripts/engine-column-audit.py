@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot audit for claude_instances.engine population on live panes.
+"""One-shot audit for instances.engine population on live panes.
 
 Canonical engine values are exactly: 'claude', 'codex'. Anything else is a bug.
 """
@@ -52,12 +52,14 @@ def audit(db_path: Path) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
     try:
         rows = [dict(row) for row in conn.execute(
-            "SELECT id, tab_name, status, engine, tmux_pane, last_activity FROM claude_instances"
+            "SELECT id, name AS tab_name, status, engine, tmux_pane, last_activity FROM instances"
         )]
     finally:
         conn.close()
 
-    non_stopped = [row for row in rows if (row.get("status") or "") != "stopped"]
+    non_stopped = [
+        row for row in rows if (row.get("status") or "") not in {"stopped", "archived"}
+    ]
     null_all = [row for row in rows if not (row.get("engine") or "").strip()]
     populated_all = [row for row in rows if (row.get("engine") or "").strip()]
     null_non_stopped = [row for row in non_stopped if not (row.get("engine") or "").strip()]

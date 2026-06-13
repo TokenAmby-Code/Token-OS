@@ -35,11 +35,11 @@ def _live_labels() -> list[tuple[str, str]]:
         try:
             rows = conn.execute(
                 """
-                SELECT tmux_pane, tab_name
-                FROM claude_instances
+                SELECT tmux_pane, name AS tab_name
+                FROM instances
                 WHERE status != 'stopped'
                   AND tmux_pane IS NOT NULL AND tmux_pane != ''
-                  AND tab_name IS NOT NULL AND tab_name != ''
+                  AND name IS NOT NULL AND name != ''
                 """
             ).fetchall()
         finally:

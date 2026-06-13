@@ -16,7 +16,7 @@ def client(app_env, monkeypatch):
     async def _stamp(pane):
         with sqlite3.connect(app_env.db_path) as conn:
             r = conn.execute(
-                "SELECT id FROM claude_instances WHERE tmux_pane = ? AND status != 'stopped' "
+                "SELECT id FROM instances WHERE tmux_pane = ? AND status != 'stopped' "
                 "ORDER BY last_activity DESC LIMIT 1",
                 (pane,),
             ).fetchone()
@@ -36,12 +36,12 @@ def _insert_instance(app_env, *, tmux_pane="%77", status="idle", tab_name="Claud
     instance_id = str(uuid.uuid4())
     conn = _db(app_env)
     conn.execute(
-        """INSERT INTO claude_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tmux_pane, engine, registered_at, last_activity)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'codex',
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id, status, tmux_pane,
+            engine, created_at, last_activity)
+           VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'codex',
                    '2026-05-10T13:00:00', '2026-05-10T13:00:00')""",
-        (instance_id, str(uuid.uuid4()), tab_name, status, tmux_pane),
+        (instance_id, tab_name, status, tmux_pane),
     )
     conn.commit()
     conn.close()
@@ -63,7 +63,7 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
 
     conn = _db(app_env)
     row = conn.execute(
-        "SELECT tab_name FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT name AS tab_name FROM instances WHERE id = ?", (instance_id,)
     ).fetchone()
     mutation = conn.execute(
         "SELECT mutation_type, actor, field_names_json FROM instance_mutations WHERE instance_id = ? ORDER BY id DESC LIMIT 1",
@@ -74,7 +74,7 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
     assert row["tab_name"] == "anti-archaeology-cli"
     assert mutation["mutation_type"] == "instance_updated"
     assert mutation["actor"] == "instance-name-cli"
-    assert "tab_name" in mutation["field_names_json"]
+    assert "name" in mutation["field_names_json"]
 
 
 @pytest.mark.parametrize(

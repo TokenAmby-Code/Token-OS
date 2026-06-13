@@ -29,7 +29,7 @@ def _insert_instance(
         )
     conn.execute(
         """
-        INSERT INTO claude_instances (
+        INSERT INTO legacy_instances (
             id, session_id, tab_name, origin_type, device_id, status,
             tmux_pane, session_doc_id, workflow_blocked_reason
         ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?, ?)
@@ -84,7 +84,7 @@ async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monk
 
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM claude_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "tab_name_placeholder"
 
@@ -137,7 +137,7 @@ async def test_naming_nudge_caps_at_three_and_marks_refused(app_env, monkeypatch
     assert result["workflow_blocked_reason"] == "naming_refused"
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM claude_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "naming_refused"
 
@@ -223,7 +223,7 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
 
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM claude_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "tab_name_placeholder"
 

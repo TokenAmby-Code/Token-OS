@@ -33,7 +33,7 @@ def _insert_instance(
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, registered_at, last_activity, instance_type, workflow_state,
             stop_allowed, session_doc_id, is_subagent, victory_at)
@@ -73,7 +73,7 @@ def _insert_doc(db_path, path):
 def _row(db_path, sid):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (sid,)).fetchone()
+    row = conn.execute("SELECT * FROM legacy_instances WHERE id = ?", (sid,)).fetchone()
     conn.close()
     return dict(row)
 

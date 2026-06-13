@@ -26,21 +26,40 @@ RECONCILIATION_SUSPICIOUS = {
     "projection_drift",
 }
 
+# Tracked mutation surface = durable identity + runtime annex. Legacy column names
+# (tab_name/legion/synced/instance_type/primarch/parent_instance_id/tts_mode/pid)
+# died with the legacy instance table extraction; their durable homes are name/persona_id/
+# golden_throne/commander_*/notification_mode+interaction_mode.
 INSTANCE_MUTATION_FIELDS = {
-    "tab_name",
+    # identity
+    "name",
+    "engine",
     "status",
     "last_activity",
-    "legion",
-    "synced",
+    "stopped_at",
+    "archived_at",
+    "working_dir",
+    "device_id",
+    "origin_type",
+    "persona_id",
+    "rank",
+    "commander_type",
+    "commander_id",
+    "automated",
+    "notification_mode",
+    "interaction_mode",
+    "golden_throne",
+    "session_doc_id",
+    "continuity_binding_source",
+    "wrapper_launch_id",
+    # runtime annex
     "input_lock",
-    "tts_mode",
     "tts_voice",
     "notification_sound",
-    "session_doc_id",
     "session_doc_policy",
-    "continuity_binding_source",
     "workflow_state",
     "workflow_updated_at",
+    "workflow_blocked_reason",
     "dispatch_target",
     "dispatch_window",
     "dispatch_mode",
@@ -48,14 +67,9 @@ INSTANCE_MUTATION_FIELDS = {
     "dispatch_session_doc_path",
     "target_working_dir",
     "launch_mode",
-    "wrapper_launch_id",
+    "launcher",
     "tmux_pane",
     "pane_label",
-    "working_dir",
-    "device_id",
-    "pid",
-    "stopped_at",
-    "instance_type",
     "follow_up_sop",
     "zealotry",
     "gt_resume_count",
@@ -67,23 +81,22 @@ INSTANCE_MUTATION_FIELDS = {
     "discord_channel",
     "discord_bot",
     "transplant_target_session",
+    "transplant_expected",
     "closure_surface",
     "closure_required",
     "stop_allowed",
     "next_required_action",
     "next_action_owner",
-    "parent_instance_id",
-    "primarch",
-    "transplant_expected",
     "planning_state",
     "planning_updated_at",
     "planning_source",
     "pr_url",
     "pr_state",
     "hook_driven",
+    "is_subagent",
 }
 
-# Canonical v2 registry columns. These deliberately exclude every raw tmux pane
+# Canonical registry columns. These deliberately exclude every raw tmux pane
 # id and tmuxctl positional/cardinal field. Token-API may return live runtime
 # resolution data, but the DB must not persist it; tmuxctl is the oracle.
 CANONICAL_INSTANCE_FIELDS = set(INSTANCE_COLUMNS)
@@ -107,7 +120,7 @@ def _persona_id_for_row_sync(db, row: dict) -> int | None:
     return found[0] if found else row.get("persona_id")
 
 
-def _canonical_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
+def _instance_values_from_legacy_row(row: dict | None, persona_id: int | None = None) -> dict:
     if not row:
         return {}
     if set(INSTANCE_COLUMNS).issubset(row.keys()):
@@ -123,29 +136,11 @@ async def _prepare_chapter_commander(db, values: dict) -> dict:
     commander_id = values["commander_id"]
     cursor = await db.execute("SELECT persona_id FROM instances WHERE id = ?", (commander_id,))
     commander = await cursor.fetchone()
-    if not commander:
-        previous_factory = getattr(db, "row_factory", None)
-        db.row_factory = aiosqlite.Row
-        try:
-            cursor = await db.execute(
-                "SELECT * FROM claude_instances WHERE id = ?", (commander_id,)
-            )
-            legacy_parent = await cursor.fetchone()
-        finally:
-            db.row_factory = previous_factory
-        if legacy_parent:
-            await mirror_instance_to_canonical(db, dict(legacy_parent))
-            cursor = await db.execute(
-                "SELECT persona_id FROM instances WHERE id = ?", (commander_id,)
-            )
-            commander = await cursor.fetchone()
     if commander:
-        commander_persona_id = commander[0]
-        values["persona_id"] = commander_persona_id
+        values["persona_id"] = commander[0]
     else:
-        # A legacy parent id without a live commander row is not a valid v2 chapter
-        # report path. Keep the legacy parent_instance_id in claude_instances, but
-        # do not mirror an invalid chapter edge into canonical instances.
+        # A chapter edge must point at a live commander row in `instances`
+        # (the legacy legacy instance table fallback died with the extraction).
         values["commander_type"] = "emperor"
         values["commander_id"] = None
     return values
@@ -158,20 +153,6 @@ def _prepare_chapter_commander_sync(db, values: dict) -> dict:
     commander = db.execute(
         "SELECT persona_id FROM instances WHERE id = ?", (commander_id,)
     ).fetchone()
-    if not commander:
-        previous_factory = getattr(db, "row_factory", None)
-        db.row_factory = sqlite3.Row
-        try:
-            legacy_parent = db.execute(
-                "SELECT * FROM claude_instances WHERE id = ?", (commander_id,)
-            ).fetchone()
-        finally:
-            db.row_factory = previous_factory
-        if legacy_parent:
-            mirror_instance_to_canonical_sync(db, dict(legacy_parent))
-            commander = db.execute(
-                "SELECT persona_id FROM instances WHERE id = ?", (commander_id,)
-            ).fetchone()
     if commander:
         values["persona_id"] = commander[0]
     else:
@@ -185,76 +166,35 @@ def _assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
     assert_no_runtime_tmux_fields(values, context=context)
 
 
-async def mirror_instance_to_canonical(db, row: dict | None) -> None:
-    """Mirror into the final ``instances`` table without runtime geometry."""
-    if not row:
-        return
-    values = _canonical_instance_values(row, await _persona_id_for_row(db, row))
-    values = await _prepare_chapter_commander(db, values)
-    if not values or not values.get("id"):
-        return
-    columns = [column for column in INSTANCE_COLUMNS if column in values]
-    placeholders = ", ".join("?" for _ in columns)
-    update_columns = [col for col in columns if col != "id"]
-    update_clause = ", ".join(f"{col} = excluded.{col}" for col in update_columns)
-    try:
-        await db.execute(
-            f"""INSERT INTO instances ({", ".join(columns)})
-                VALUES ({placeholders})
-                ON CONFLICT(id) DO UPDATE SET {update_clause}""",
-            [values[column] for column in columns],
-        )
-    except aiosqlite.OperationalError as exc:
-        if "no such table" in str(exc).lower() or "no column named" in str(exc).lower():
-            logger.debug("canonical instances mirror skipped: %s", exc)
-            return
-        raise
+# The dual-write mirror layer (mirror_instance_to_legacy*) died with the
+# legacy instance table extraction: every sanctioned write now lands directly on
+# `instances`, the one physical table.
 
 
-def mirror_instance_to_canonical_sync(db, row: dict | None) -> None:
-    if not row:
-        return
-    values = _canonical_instance_values(row, _persona_id_for_row_sync(db, row))
-    values = _prepare_chapter_commander_sync(db, values)
-    if not values or not values.get("id"):
-        return
-    columns = [column for column in INSTANCE_COLUMNS if column in values]
-    placeholders = ", ".join("?" for _ in columns)
-    update_columns = [col for col in columns if col != "id"]
-    update_clause = ", ".join(f"{col} = excluded.{col}" for col in update_columns)
-    try:
-        db.execute(
-            f"""INSERT INTO instances ({", ".join(columns)})
-                VALUES ({placeholders})
-                ON CONFLICT(id) DO UPDATE SET {update_clause}""",
-            [values[column] for column in columns],
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower() or "no column named" in str(exc).lower():
-            logger.debug("canonical instances mirror skipped: %s", exc)
-            return
-        raise
+async def create_golden_throne_binding(
+    db,
+    *,
+    zealotry: int | None = None,
+    follow_up_sop: str | None = None,
+    stop_allowed: int | None = None,
+) -> str:
+    """Insert a golden_throne row and return its id as the instances.golden_throne
+    marker value. The guard trigger requires the marker to be NULL, 'sync', or a
+    real golden_throne.id — callers must create the row BEFORE setting the marker.
+    """
+    cursor = await db.execute(
+        """INSERT INTO golden_throne (zealotry, follow_up_sop, stop_allowed)
+           VALUES (?, ?, ?)""",
+        (
+            zealotry if zealotry is not None else 4,
+            follow_up_sop,
+            stop_allowed if stop_allowed is not None else 1,
+        ),
+    )
+    return str(cursor.lastrowid)
 
 
-def delete_instance_from_canonical_sync(db, instance_id: str) -> None:
-    try:
-        db.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return
-        raise
-
-
-async def delete_instance_from_canonical(db, instance_id: str) -> None:
-    try:
-        await db.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
-    except aiosqlite.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return
-        raise
-
-
-async def _fetch_canonical_instance_row(db, instance_id: str) -> dict | None:
+async def _fetch_instance_record(db, instance_id: str) -> dict | None:
     previous_factory = getattr(db, "row_factory", None)
     db.row_factory = aiosqlite.Row
     try:
@@ -265,7 +205,7 @@ async def _fetch_canonical_instance_row(db, instance_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def sanctioned_update_canonical_instance(
+async def sanctioned_update_instance_record(
     db,
     *,
     instance_id: str,
@@ -275,10 +215,10 @@ async def sanctioned_update_canonical_instance(
     actor: str,
     wrapper_launch_id: str | None = None,
 ) -> dict:
-    assert_no_runtime_tmux_fields(updates, context="sanctioned_update_canonical_instance")
-    before_row = await _fetch_canonical_instance_row(db, instance_id)
+    assert_no_runtime_tmux_fields(updates, context="sanctioned_update_instance_record")
+    before_row = await _fetch_instance_record(db, instance_id)
     if before_row is None:
-        raise LookupError(f"Canonical instance not found: {instance_id}")
+        raise LookupError(f"Instance not found: {instance_id}")
 
     changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
     assignments = ", ".join(f"{field} = ?" for field in updates)
@@ -287,7 +227,7 @@ async def sanctioned_update_canonical_instance(
         [*updates.values(), instance_id],
     )
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned canonical update matched no rows for {instance_id}")
+        raise LookupError(f"Sanctioned instance-record update matched no rows for {instance_id}")
 
     after_row = dict(before_row)
     after_row.update(updates)
@@ -313,7 +253,7 @@ async def sanctioned_update_canonical_instance(
     }
 
 
-async def sanctioned_update_legacy_runtime_fields(
+async def sanctioned_update_runtime_fields(
     db,
     *,
     instance_id: str,
@@ -323,10 +263,17 @@ async def sanctioned_update_legacy_runtime_fields(
     actor: str,
     wrapper_launch_id: str | None = None,
 ) -> dict:
+    """Dedicated gate for tmux runtime geometry writes (annex columns).
+
+    General sanctioned updates still refuse tmux fields; pane/dispatch
+    geometry may only flow through here, so every rebind has provenance.
+    """
+    if not updates:
+        raise ValueError("no fields to update")
     forbidden = set(updates) - RUNTIME_TMUX_FIELDS
     if forbidden:
         raise ValueError(
-            "sanctioned_update_legacy_runtime_fields only accepts runtime fields: "
+            "sanctioned_update_runtime_fields only accepts runtime fields: "
             + ", ".join(sorted(forbidden))
         )
     before_row = await _fetch_instance_row(db, instance_id)
@@ -336,7 +283,7 @@ async def sanctioned_update_legacy_runtime_fields(
     changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
     assignments = ", ".join(f"{field} = ?" for field in updates)
     cursor = await db.execute(
-        f"UPDATE claude_instances SET {assignments} WHERE id = ?",
+        f"UPDATE instances SET {assignments} WHERE id = ?",
         [*updates.values(), instance_id],
     )
     if cursor.rowcount == 0:
@@ -347,6 +294,62 @@ async def sanctioned_update_legacy_runtime_fields(
     write_txn_id = str(uuid.uuid4())
     if changed_fields:
         await _append_instance_mutation(
+            db,
+            instance_id=instance_id,
+            mutation_type=mutation_type,
+            write_source=write_source,
+            actor=actor,
+            wrapper_launch_id=wrapper_launch_id or after_row.get("wrapper_launch_id"),
+            write_txn_id=write_txn_id,
+            field_names=changed_fields,
+            before=_subset_from_row(before_row, changed_fields),
+            after=_subset_from_row(after_row, changed_fields),
+        )
+    return {
+        "write_txn_id": write_txn_id,
+        "changed_fields": changed_fields,
+        "before": before_row,
+        "after": after_row,
+    }
+
+
+def sanctioned_update_runtime_fields_sync(
+    db,
+    *,
+    instance_id: str,
+    updates: dict,
+    mutation_type: str,
+    write_source: str,
+    actor: str,
+    wrapper_launch_id: str | None = None,
+) -> dict:
+    """Sync twin of sanctioned_update_runtime_fields."""
+    if not updates:
+        raise ValueError("no fields to update")
+    forbidden = set(updates) - RUNTIME_TMUX_FIELDS
+    if forbidden:
+        raise ValueError(
+            "sanctioned_update_runtime_fields_sync only accepts runtime fields: "
+            + ", ".join(sorted(forbidden))
+        )
+    before_row = _fetch_instance_row_sync(db, instance_id)
+    if before_row is None:
+        raise LookupError(f"Instance not found: {instance_id}")
+
+    changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    cursor = db.execute(
+        f"UPDATE instances SET {assignments} WHERE id = ?",
+        [*updates.values(), instance_id],
+    )
+    if cursor.rowcount == 0:
+        raise LookupError(f"Sanctioned runtime update matched no rows for {instance_id}")
+
+    after_row = dict(before_row)
+    after_row.update(updates)
+    write_txn_id = str(uuid.uuid4())
+    if changed_fields:
+        _append_instance_mutation_sync(
             db,
             instance_id=instance_id,
             mutation_type=mutation_type,
@@ -401,14 +404,7 @@ def _parse_json_column(value):
 
 
 async def _fetch_instance_row(db, instance_id: str) -> dict | None:
-    previous_factory = getattr(db, "row_factory", None)
-    db.row_factory = aiosqlite.Row
-    try:
-        cursor = await db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
-        row = await cursor.fetchone()
-    finally:
-        db.row_factory = previous_factory
-    return dict(row) if row else None
+    return await _fetch_instance_record(db, instance_id)
 
 
 def _subset_from_row(row: dict | None, fields: list[str]) -> dict | None:
@@ -456,7 +452,7 @@ def _fetch_instance_row_sync(db, instance_id: str) -> dict | None:
     previous_factory = getattr(db, "row_factory", None)
     db.row_factory = sqlite3.Row
     try:
-        cursor = db.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,))
+        cursor = db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = cursor.fetchone()
     finally:
         db.row_factory = previous_factory
@@ -511,6 +507,8 @@ async def sanctioned_update_instance(
     where_clause: str | None = None,
     where_params: tuple | list | None = None,
 ) -> dict:
+    if not updates:
+        raise ValueError("no fields to update")
     before_row = await _fetch_instance_row(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -527,7 +525,7 @@ async def sanctioned_update_instance(
     params = list(updates.values())
     clause = where_clause or "id = ?"
     params.extend(list(where_params or (instance_id,)))
-    cursor = await db.execute(f"UPDATE claude_instances SET {assignments} WHERE {clause}", params)
+    cursor = await db.execute(f"UPDATE instances SET {assignments} WHERE {clause}", params)
 
     if cursor.rowcount == 0:
         raise LookupError(f"Sanctioned update matched no rows for instance {instance_id}")
@@ -535,7 +533,6 @@ async def sanctioned_update_instance(
     after_row = dict(before_row)
     after_row.update(updates)
     write_txn_id = str(uuid.uuid4())
-    await mirror_instance_to_canonical(db, after_row)
 
     if changed_fields:
         await _append_instance_mutation(
@@ -585,6 +582,8 @@ def sanctioned_update_instance_sync(
     where_clause: str | None = None,
     where_params: tuple | list | None = None,
 ) -> dict:
+    if not updates:
+        raise ValueError("no fields to update")
     before_row = _fetch_instance_row_sync(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -601,7 +600,7 @@ def sanctioned_update_instance_sync(
     params = list(updates.values())
     clause = where_clause or "id = ?"
     params.extend(list(where_params or (instance_id,)))
-    cursor = db.execute(f"UPDATE claude_instances SET {assignments} WHERE {clause}", params)
+    cursor = db.execute(f"UPDATE instances SET {assignments} WHERE {clause}", params)
 
     if cursor.rowcount == 0:
         raise LookupError(f"Sanctioned update matched no rows for instance {instance_id}")
@@ -609,7 +608,6 @@ def sanctioned_update_instance_sync(
     after_row = dict(before_row)
     after_row.update(updates)
     write_txn_id = str(uuid.uuid4())
-    mirror_instance_to_canonical_sync(db, after_row)
 
     if changed_fields:
         _append_instance_mutation_sync(
@@ -643,26 +641,84 @@ async def sanctioned_insert_instance(
     wrapper_launch_id: str | None = None,
     tracked_fields: set[str] | None = None,
 ) -> dict:
+    """Insert a new row into `instances` (the one physical table).
+
+    Accepts both instance-shaped and transitional legacy-shaped value dicts;
+    everything is normalized through legacy_row_to_instance_values
+    (legion/profile_name resolve to persona_id, parent_instance_id to a
+    chapter commander edge, tts_mode to notification/interaction modes).
+    """
     _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance")
-    columns = list(values.keys())
+    instance_values = _instance_values_from_legacy_row(
+        values, await _persona_id_for_row(db, values)
+    )
+    instance_values = await _prepare_chapter_commander(db, instance_values)
+    if not instance_values.get("id"):
+        raise ValueError("sanctioned_insert_instance requires an id")
+    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
     placeholders = ", ".join("?" for _ in columns)
     await db.execute(
-        f"INSERT INTO claude_instances ({', '.join(columns)}) VALUES ({placeholders})",
-        [values[column] for column in columns],
+        f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
+        [instance_values[column] for column in columns],
     )
-    await mirror_instance_to_canonical(db, values)
 
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     field_names = [field for field in columns if field in tracked]
-    after = {field: values.get(field) for field in field_names}
+    after = {field: instance_values.get(field) for field in field_names}
     write_txn_id = str(uuid.uuid4())
     await _append_instance_mutation(
         db,
-        instance_id=values["id"],
+        instance_id=instance_values["id"],
         mutation_type=mutation_type,
         write_source=write_source,
         actor=actor,
-        wrapper_launch_id=wrapper_launch_id or values.get("wrapper_launch_id"),
+        wrapper_launch_id=wrapper_launch_id or instance_values.get("wrapper_launch_id"),
+        write_txn_id=write_txn_id,
+        field_names=field_names,
+        before=None,
+        after=after,
+    )
+    return {
+        "write_txn_id": write_txn_id,
+        "changed_fields": field_names,
+        "after": after,
+    }
+
+
+def sanctioned_insert_instance_sync(
+    db,
+    *,
+    values: dict,
+    mutation_type: str,
+    write_source: str,
+    actor: str,
+    wrapper_launch_id: str | None = None,
+    tracked_fields: set[str] | None = None,
+) -> dict:
+    """Sync twin of sanctioned_insert_instance."""
+    _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance_sync")
+    instance_values = _instance_values_from_legacy_row(values, _persona_id_for_row_sync(db, values))
+    instance_values = _prepare_chapter_commander_sync(db, instance_values)
+    if not instance_values.get("id"):
+        raise ValueError("sanctioned_insert_instance_sync requires an id")
+    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
+    placeholders = ", ".join("?" for _ in columns)
+    db.execute(
+        f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
+        [instance_values[column] for column in columns],
+    )
+
+    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    field_names = [field for field in columns if field in tracked]
+    after = {field: instance_values.get(field) for field in field_names}
+    write_txn_id = str(uuid.uuid4())
+    _append_instance_mutation_sync(
+        db,
+        instance_id=instance_values["id"],
+        mutation_type=mutation_type,
+        write_source=write_source,
+        actor=actor,
+        wrapper_launch_id=wrapper_launch_id or instance_values.get("wrapper_launch_id"),
         write_txn_id=write_txn_id,
         field_names=field_names,
         before=None,
@@ -689,10 +745,9 @@ async def sanctioned_delete_instance(
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
 
-    cursor = await db.execute("DELETE FROM claude_instances WHERE id = ?", (instance_id,))
+    cursor = await db.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
     if cursor.rowcount == 0:
         raise LookupError(f"Sanctioned delete matched no rows for instance {instance_id}")
-    await delete_instance_from_canonical(db, instance_id)
 
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     field_names = [field for field in before_row.keys() if field in tracked]

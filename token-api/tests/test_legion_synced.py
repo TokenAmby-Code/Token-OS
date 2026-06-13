@@ -1,7 +1,7 @@
 """Tests for legion-aware Discord routing and synced sessions.
 
 Covers:
-- Schema: legion + synced columns on claude_instances
+- Schema: legion + synced columns on legacy_instances
 - API: PATCH legion, PATCH synced (one-per-legion), GET synced-session
 - Helpers: _format_discord_injection
 - Cleanup: synced=0 on stop
@@ -58,7 +58,7 @@ def _insert_instance(
     now = last_activity or datetime.now().isoformat()
     conn = sqlite3.connect(db_path or _TEST_DB_PATH)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, legion, synced, tmux_pane, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
@@ -84,7 +84,7 @@ def _get_instance(instance_id):
     """Read an instance row from DB."""
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
+    row = conn.execute("SELECT * FROM legacy_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -118,15 +118,15 @@ class TestSchema:
     def test_legion_synced_index_exists(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
         indices = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='claude_instances'"
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='instances'"
         ).fetchall()
         conn.close()
         index_names = {row[0] for row in indices}
-        assert "idx_instances_legion_synced" in index_names
+        assert "idx_instances_gt" in index_names
 
     def test_workflow_columns_exist(self):
         conn = sqlite3.connect(_TEST_DB_PATH)
-        cols = conn.execute("PRAGMA table_info(claude_instances)").fetchall()
+        cols = conn.execute("PRAGMA table_info(legacy_instances)").fetchall()
         conn.close()
         names = {row[1] for row in cols}
         assert {
@@ -160,7 +160,21 @@ class TestSetLegion:
             resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": legion})
             assert resp.status_code == 200
             assert resp.json()["legion"] == legion
-            assert _get_instance(iid)["legion"] == legion
+            conn = sqlite3.connect(_TEST_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT p.slug AS persona_slug
+                   FROM instances i LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ?""",
+                (iid,),
+            ).fetchone()
+            conn.close()
+            if legion == "custodes":
+                assert row["persona_slug"] == "custodes"
+            elif legion == "fabricator":
+                assert row["persona_slug"] == "fabricator-general"
+            elif legion == "civic":
+                assert row["persona_slug"] is None
 
     def test_set_legion_singleton_updates_canonical_persona_tint(
         self, client, app_env, monkeypatch
@@ -234,9 +248,9 @@ class TestSetLegion:
 
 
 class TestSetSynced:
-    # The /synced endpoint is a generic per-legion mode-conflict guard (Mechanicus
-    # path); it is NOT how the Custodes singleton is identified anymore (that is
-    # persona + rank), so these exercise it on mechanicus rather than custodes.
+    # The /synced endpoint is a generic per-persona mode-conflict guard; it is
+    # NOT how the Custodes singleton is identified anymore (that is persona + rank),
+    # so conflict tests use a persona-backed Astartes legion rather than Custodes.
     def test_set_synced_true(self, client):
         iid = _insert_instance(legion="mechanicus")
         resp = client.patch(f"/api/instances/{iid}/synced", json={"synced": True})
@@ -253,8 +267,8 @@ class TestSetSynced:
 
     def test_synced_one_per_legion(self, client):
         """Second synced=true in same legion should 409."""
-        iid1 = _insert_instance(legion="mechanicus")
-        iid2 = _insert_instance(legion="mechanicus")
+        iid1 = _insert_instance(legion="ultramarines")
+        iid2 = _insert_instance(legion="ultramarines")
 
         resp1 = client.patch(f"/api/instances/{iid1}/synced", json={"synced": True})
         assert resp1.status_code == 200
@@ -275,8 +289,8 @@ class TestSetSynced:
 
     def test_synced_stopped_no_conflict(self, client):
         """Stopped instance with synced=1 shouldn't block new synced."""
-        iid1 = _insert_instance(legion="mechanicus", synced=1, status="stopped")
-        iid2 = _insert_instance(legion="mechanicus")
+        iid1 = _insert_instance(legion="ultramarines", synced=1, status="stopped")
+        iid2 = _insert_instance(legion="ultramarines")
 
         resp = client.patch(f"/api/instances/{iid2}/synced", json={"synced": True})
         assert resp.status_code == 200
@@ -428,7 +442,12 @@ class TestCivicAutoDetect:
         self._register_via_hook(client, working_dir="/Volumes/Imperium/Pax-ENV", session_id=sid)
         row = _get_instance(sid)
         assert row is not None
-        assert row["legion"] == "civic"
+        assert row["primarch"] is None
+        with sqlite3.connect(_TEST_DB_PATH) as conn:
+            persona_id = conn.execute(
+                "SELECT persona_id FROM instances WHERE id = ?", (sid,)
+            ).fetchone()[0]
+        assert persona_id is None
 
     def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
         import shared
@@ -460,7 +479,12 @@ class TestCivicAutoDetect:
         self._register_via_hook(client, working_dir="/mnt/imperium/pax/project", session_id=sid)
         row = _get_instance(sid)
         assert row is not None
-        assert row["legion"] == "civic"
+        assert row["primarch"] is None
+        with sqlite3.connect(_TEST_DB_PATH) as conn:
+            persona_id = conn.execute(
+                "SELECT persona_id FROM instances WHERE id = ?", (sid,)
+            ).fetchone()[0]
+        assert persona_id is None
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())
@@ -541,10 +565,10 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "legion:custodes", "%32")
         assert row["legion"] == "custodes"
         assert row["primarch"] == "custodes"
-        # Custodes resting identity is persona + rank, NOT sync. The pane registers
-        # it at the FG/Admin default (hook_driven); the morning session sets sync
-        # MODE while live. synced default stays 0.
-        assert row["instance_type"] == "hook_driven"
+        # Custodes resting identity is persona + rank, NOT sync. The legacy
+        # instance_type compatibility alias remains one_off until the morning
+        # session sets sync MODE while live. synced default stays 0.
+        assert row["instance_type"] == "one_off"
         assert row["synced"] == 0
         # Custodes is the one persona that speaks: reserved George voice.
         assert row["profile_name"] == "custodes"
@@ -568,7 +592,7 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "mechanicus:fabricator-general", "%40")
         assert row["legion"] == "fabricator"
         assert row["primarch"] == "fabricator-general"
-        assert row["instance_type"] == "hook_driven"
+        assert row["instance_type"] == "one_off"
         assert row["synced"] == 0
         # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
         assert row["profile_name"] == "fabricator-general"
@@ -580,7 +604,7 @@ class TestPersonaPaneAutoSetup:
         row = self._register(client, "mechanicus:admin", "%41")
         assert row["legion"] == "mechanicus"
         assert row["primarch"] == "administratum"
-        assert row["instance_type"] == "hook_driven"
+        assert row["instance_type"] == "one_off"
         assert row["synced"] == 0
         # Voiceless persona: no TTS voice (frees a chapter voice slot for workers).
         assert row["profile_name"] == "administratum"
@@ -638,12 +662,34 @@ class TestCustodesDocRebind:
         iid = str(uuid.uuid4())
         conn = sqlite3.connect(db_path)
         now = datetime.now().isoformat()
+        persona_id = conn.execute("SELECT id FROM personas WHERE slug = 'custodes'").fetchone()[0]
+        commander_id = "test-custodes-commander"
+        if not conn.execute("SELECT 1 FROM instances WHERE id = ?", (commander_id,)).fetchone():
+            conn.execute(
+                """INSERT INTO instances
+                   (id, name, working_dir, origin_type, device_id, status, persona_id,
+                    rank, commander_type, created_at, last_activity)
+                   VALUES (?, 'Test Custodes Commander', '/tmp', 'local', 'Mac-Mini',
+                           'idle', ?, 'overseer', 'emperor', ?, ?)""",
+                (commander_id, persona_id, now, now),
+            )
         conn.execute(
-            """INSERT INTO claude_instances
-               (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, session_doc_id, registered_at, last_activity)
-               VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'custodes', 1, ?, ?, ?)""",
-            (iid, str(uuid.uuid4()), f"Custodes-{iid[:6]}", status, session_doc_id, now, now),
+            """INSERT INTO instances
+               (id, name, working_dir, origin_type, device_id, status, persona_id,
+                rank, commander_type, commander_id, golden_throne, session_doc_id,
+                created_at, last_activity)
+               VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'overseer',
+                       'chapter', ?, 'sync', ?, ?, ?)""",
+            (
+                iid,
+                f"Custodes-{iid[:6]}",
+                status,
+                persona_id,
+                commander_id,
+                session_doc_id,
+                now,
+                now,
+            ),
         )
         conn.commit()
         conn.close()
@@ -809,7 +855,7 @@ class TestWorkflowState:
         sid = _insert_instance(status="idle")
         conn = sqlite3.connect(_TEST_DB_PATH)
         conn.execute(
-            """UPDATE claude_instances
+            """UPDATE legacy_instances
                SET instance_type = 'golden_throne',
                    workflow_state = 'worktree',
                    stop_allowed = 1

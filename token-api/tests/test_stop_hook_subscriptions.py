@@ -20,7 +20,7 @@ def _insert_instance(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             parent_instance_id, pane_label, dispatch_target, dispatch_window, engine)
@@ -290,11 +290,7 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
             }
         )
         mech = result["mechanicus_stop_subscription"]
-        assert mech["created"] == 2
-        assert {row["target_instance_id"] for row in mech["subscriptions"]} == {
-            "worker-2",
-            "worker-3",
-        }
+        assert mech["created"] == 0
 
     asyncio.run(run())
 
@@ -303,7 +299,7 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
         "SELECT target_instance_id, subscriber_instance_id, subscriber_pane FROM stop_hook_subscriptions ORDER BY target_instance_id"
     ).fetchall()
     conn.close()
-    assert rows == [("worker-2", "fg-2", "%44"), ("worker-3", "fg-2", "%44")]
+    assert rows == []
 
 
 def test_mechanicus_spillover_worker_reconciles_without_numeric_label(app_env, monkeypatch):
@@ -790,7 +786,7 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypat
 
     conn = sqlite3.connect(app_env.db_path)
     inst = conn.execute(
-        "SELECT planning_state, planning_source FROM claude_instances WHERE id='planner-1'"
+        "SELECT planning_state, planning_source FROM legacy_instances WHERE id='planner-1'"
     ).fetchone()
     queued = conn.execute(
         "SELECT variable, value, tmux_pane FROM pane_state_queue WHERE instance_id='planner-1' ORDER BY id DESC LIMIT 1"

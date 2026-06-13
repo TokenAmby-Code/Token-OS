@@ -3,7 +3,7 @@
 # TAGS: tmux, obsidian, origin, session
 # AUDIENCE: tmux binding
 #
-# Resolves: cardinal pane id → claude_instances → session_documents → file_path
+# Resolves: cardinal pane id → instances → session_documents → file_path
 # Routes:   open on the machine that triggered the keystroke (origin_machine)
 #
 # Usage:

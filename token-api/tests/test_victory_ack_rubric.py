@@ -140,12 +140,10 @@ def _seed_instance_doc(db_path: Path, doc_path: Path, *, tab_name: str | None, l
     doc_id = cur.lastrowid
     if link:
         conn.execute(
-            """INSERT INTO claude_instances
-               (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, session_doc_id)
-               VALUES ('inst-va', 'sess-va', ?, '/tmp', 'local', 'Mac-Mini',
-                       'idle', ?)""",
-            (tab_name, doc_id),
+            """INSERT INTO instances
+               (id, name, working_dir, origin_type, device_id, status, session_doc_id)
+               VALUES ('inst-va', ?, '/tmp', 'local', 'Mac-Mini', 'idle', ?)""",
+            (tab_name or "", doc_id),
         )
     conn.commit()
     conn.close()
@@ -200,7 +198,7 @@ async def test_victory_ack_passes_after_instance_named(app_env, monkeypatch) -> 
     # Agent self-names → criterion derives True → ack succeeds and archives.
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        "UPDATE claude_instances SET tab_name = 'shipped-the-feature' WHERE id = 'inst-va'"
+        "UPDATE legacy_instances SET tab_name = 'shipped-the-feature' WHERE id = 'inst-va'"
     )
     conn.commit()
     conn.close()

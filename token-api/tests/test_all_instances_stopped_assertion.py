@@ -36,7 +36,7 @@ import pytest
 def _insert_instance(db_path, instance_id, *, status="processing", is_subagent=0):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             instance_type, engine, tmux_pane, is_subagent, last_activity)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",

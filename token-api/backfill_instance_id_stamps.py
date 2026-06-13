@@ -90,9 +90,9 @@ def main() -> int:
         rows = conn.execute(
             """
             SELECT id, tmux_pane, device_id, status
-            FROM claude_instances
+            FROM instances
             WHERE COALESCE(tmux_pane, '') != ''
-              AND COALESCE(status, '') != 'stopped'
+              AND COALESCE(status, '') NOT IN ('stopped', 'archived')
             ORDER BY last_activity DESC
             """
         ).fetchall()

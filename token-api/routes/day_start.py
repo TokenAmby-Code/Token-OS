@@ -105,10 +105,12 @@ async def _consumer_custodes_doc_rebind() -> dict:
         cursor = await db.execute(
             """
             SELECT ci.id AS id, ci.session_doc_id AS session_doc_id, sd.file_path AS file_path
-            FROM claude_instances ci
+            FROM instances ci
+            JOIN personas p ON p.id = ci.persona_id
             LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-            WHERE ci.legion = 'custodes'
-              AND ci.status IN ('idle', 'processing')
+            WHERE p.slug = 'custodes'
+              AND ci.golden_throne = 'sync'
+              AND ci.status NOT IN ('stopped', 'archived')
               AND ci.stopped_at IS NULL
             """
         )
@@ -130,7 +132,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
                 instance_id=row["id"],
                 updates={"session_doc_id": today_id},
                 mutation_type="instance_updated",
-                write_source="day_start",
+                write_source="system_worker",
                 actor="day_start:custodes_doc_rebind",
             )
             rebound.append({"instance_id": row["id"], "from_date": match.group(1)})

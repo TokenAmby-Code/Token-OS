@@ -30,7 +30,7 @@ def _insert_instance(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             parent_instance_id, pane_label)

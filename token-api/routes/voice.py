@@ -26,6 +26,7 @@ from personas import (
     assign_astartes_persona,
     astartes_persona_by_tts_voice,
     persona_to_profile,
+    resolve_persona,
     selectable_astartes_personas,
 )
 from shared import (
@@ -138,10 +139,11 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.tts_voice, ci.notification_sound, ci.profile_name, ci.tab_name,
+            SELECT ci.id, ci.persona_id, ci.tts_voice, ci.notification_sound,
+                   COALESCE(p.slug, 'astartes') AS profile_name, ci.name AS tab_name,
                    COALESCE(p.default_rank, 'astartes') AS current_rank
-            FROM claude_instances ci
-            LEFT JOIN personas p ON p.slug = ci.profile_name
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
             WHERE ci.id = ?
             """,
             (instance_id,),
@@ -158,11 +160,11 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         holder_cursor = await db.execute(
             """
-            SELECT id, tab_name
-            FROM claude_instances
+            SELECT id, name AS tab_name
+            FROM instances
             WHERE id != ?
               AND tts_voice = ?
-              AND status IN ('processing', 'idle')
+              AND status NOT IN ('stopped', 'archived')
             LIMIT 1
             """,
             (instance_id, request.voice),
@@ -195,7 +197,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
             db,
             instance_id=instance_id,
             updates={
-                "profile_name": profile["name"],
+                "persona_id": target_persona["id"],
                 "tts_voice": profile["wsl_voice"],
                 "notification_sound": profile["notification_sound"],
             },
@@ -244,10 +246,13 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.tts_voice, ci.notification_sound, ci.tts_mode, ci.profile_name,
+            SELECT ci.id, ci.persona_id, ci.tts_voice, ci.notification_sound,
+                   CASE WHEN ci.interaction_mode = 'voice_chat'
+                        THEN 'voice-chat' ELSE ci.notification_mode END AS tts_mode,
+                   COALESCE(p.slug, 'astartes') AS profile_name,
                    p.default_rank
-            FROM claude_instances ci
-            LEFT JOIN personas p ON p.slug = ci.profile_name
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
             WHERE ci.id = ?
             """,
             (instance_id,),
@@ -265,28 +270,37 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
-                updates={"tts_mode": mode, "tts_voice": None, "notification_sound": None},
+                updates={
+                    "notification_mode": "silent",
+                    "interaction_mode": "text",
+                    "tts_voice": None,
+                    "notification_sound": None,
+                },
                 mutation_type="instance_updated",
                 write_source="api",
                 actor="tts-mode",
             )
-        elif (
-            mode in ("verbose", "voice-chat")
-            and not old_voice
-            and (row["default_rank"] == "astartes" or row["profile_name"] is None)
-        ):
-            # Re-assign voice from pool
-            persona, _ = await assign_astartes_persona(db)
+        elif mode in ("verbose", "voice-chat") and not old_voice:
+            # Rehydrate from existing persona first; allocate only for persona-less rows.
+            if row["persona_id"]:
+                persona = await resolve_persona(db, row["persona_id"])
+            else:
+                persona, _ = await assign_astartes_persona(db)
+            if not persona:
+                persona, _ = await assign_astartes_persona(db)
             profile = persona_to_profile(persona)
+            updates = {
+                "notification_mode": "verbose" if mode == "voice-chat" else mode,
+                "interaction_mode": "voice_chat" if mode == "voice-chat" else "text",
+                "tts_voice": profile["wsl_voice"],
+                "notification_sound": profile["notification_sound"],
+            }
+            if not row["persona_id"]:
+                updates["persona_id"] = persona["id"]
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
-                updates={
-                    "profile_name": profile["name"],
-                    "tts_mode": mode,
-                    "tts_voice": profile["wsl_voice"],
-                    "notification_sound": profile["notification_sound"],
-                },
+                updates=updates,
                 mutation_type="instance_updated",
                 write_source="api",
                 actor="tts-mode",
@@ -295,7 +309,10 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
-                updates={"tts_mode": mode},
+                updates={
+                    "notification_mode": "verbose" if mode == "voice-chat" else mode,
+                    "interaction_mode": "voice_chat" if mode == "voice-chat" else "text",
+                },
                 mutation_type="instance_updated",
                 write_source="api",
                 actor="tts-mode",
@@ -338,13 +355,16 @@ async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: st
     else:
         VOICE_CHAT_SESSIONS.pop(instance_id, None)
         logger.info(f"Voice chat ENDED for {instance_id[:12]}")
-    # Keep tts_mode column in sync
-    new_mode = "voice-chat" if active else "verbose"
+    # Keep instance notification/interaction modes in sync with the legacy tts-mode API.
+    updates = {
+        "notification_mode": "verbose",
+        "interaction_mode": "voice_chat" if active else "text",
+    }
     async with aiosqlite.connect(DB_PATH) as db:
         await sanctioned_update_instance(
             db,
             instance_id=instance_id,
-            updates={"tts_mode": new_mode},
+            updates=updates,
             mutation_type="instance_updated",
             write_source="api",
             actor="voice-chat",

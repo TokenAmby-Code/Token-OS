@@ -116,12 +116,11 @@ async def test_direct_pane_write_uninitialized_primitive_is_failed_not_sent(
 def _insert_instance(db_path, instance_id, pane=None, parent=None, status="idle"):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane,
-            parent_instance_id)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, "/tmp", status, pane, parent),
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id, status, tmux_pane,
+            commander_type, commander_id)
+           VALUES (?, ?, ?, 'local', 'Mac-Mini', ?, ?, 'emperor', NULL)""",
+        (instance_id, instance_id, "/tmp", status, pane),
     )
     conn.commit()
     conn.close()

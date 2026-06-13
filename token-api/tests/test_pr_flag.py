@@ -1,7 +1,7 @@
 """Tests for the "agent has a PR open" flag (Phase 1 of the CI/CD overhaul).
 
 Covers:
-- Schema: pr_url + pr_state columns on claude_instances (additive, nullable).
+- Schema: pr_url + pr_state columns on legacy_instances (additive, nullable).
 - Registration: pr_url + pr_state are sanctioned mutable fields.
 - API: PATCH /api/instances/{id}/pr sets the flag; validation; 404 on unknown.
 - Surface: /api/ui/ops/state carries pr_url/pr_state per active instance.
@@ -36,7 +36,7 @@ def _insert_instance(instance_id=None, *, status="idle", working_dir="/tmp"):
     now = datetime.now().isoformat()
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, registered_at, last_activity)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?)""",
@@ -50,7 +50,7 @@ def _insert_instance(instance_id=None, *, status="idle", working_dir="/tmp"):
 def _get_instance(instance_id):
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM claude_instances WHERE id = ?", (instance_id,)).fetchone()
+    row = conn.execute("SELECT * FROM legacy_instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -60,7 +60,7 @@ def _get_instance(instance_id):
 
 def test_pr_columns_exist():
     conn = sqlite3.connect(_TEST_DB_PATH)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(claude_instances)")}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(legacy_instances)")}
     conn.close()
     assert "pr_url" in cols
     assert "pr_state" in cols

@@ -37,7 +37,7 @@ def _insert(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             pane_label, primarch, legion, hook_driven)
@@ -62,7 +62,7 @@ def _insert(
 def _hook_driven(db_path, instance_id):
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT hook_driven FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT hook_driven FROM legacy_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     conn.close()
     return row[0] if row else None
@@ -71,7 +71,7 @@ def _hook_driven(db_path, instance_id):
 def _rows_at_pane(db_path, pane):
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT id, primarch FROM claude_instances WHERE tmux_pane = ?", (pane,)
+        "SELECT id, primarch FROM legacy_instances WHERE tmux_pane = ?", (pane,)
     ).fetchall()
     conn.close()
     return rows
@@ -80,7 +80,7 @@ def _rows_at_pane(db_path, pane):
 def _row_by_id(db_path, instance_id):
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT id, primarch FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT id, primarch FROM legacy_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     conn.close()
     return row
@@ -128,8 +128,6 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
     asyncio.run(run())
 
     rows = _rows_at_pane(app_env.db_path, "%fg")
-    # Exactly one persona row must remain at the pane — the stale row supplanted
-    # (its id migrated to the new session), NOT a second duplicate row.
     assert len(rows) == 1, f"expected supplant (1 row), got {len(rows)}: {rows}"
     surviving_id, surviving_primarch = rows[0]
     assert surviving_id == "new-fg", "the new session must take over the persona row"
@@ -248,7 +246,7 @@ def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
     conn = sqlite3.connect(app_env.db_path)
     row = conn.execute(
         "SELECT legion, profile_name, tts_voice, notification_sound "
-        "FROM claude_instances WHERE id = ?",
+        "FROM legacy_instances WHERE id = ?",
         ("cust-new",),
     ).fetchone()
     conn.close()
@@ -296,7 +294,7 @@ def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
 
     conn = sqlite3.connect(app_env.db_path)
     row = conn.execute(
-        "SELECT legion, profile_name, tts_voice FROM claude_instances WHERE id = ?",
+        "SELECT legion, profile_name, tts_voice FROM legacy_instances WHERE id = ?",
         ("fg-new",),
     ).fetchone()
     conn.close()

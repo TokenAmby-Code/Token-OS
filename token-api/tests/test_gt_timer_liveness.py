@@ -50,7 +50,7 @@ def _insert_gt(db_path: Path, *, doc_path: Path, status: str = "idle", zealotry:
     )
     doc_id = cur.lastrowid
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             tmux_pane, status, instance_type, zealotry, session_doc_id,
             registered_at, last_activity)
@@ -93,7 +93,7 @@ async def test_sweep_recovery_skips_acknowledged_doc(gt, tmp_path):
     conn = sqlite3.connect(gt.db_path)
     conn.execute(
         "UPDATE session_documents SET status = 'archived' WHERE id = "
-        "(SELECT session_doc_id FROM claude_instances WHERE id = ?)",
+        "(SELECT session_doc_id FROM legacy_instances WHERE id = ?)",
         (iid,),
     )
     conn.commit()
@@ -145,7 +145,7 @@ def test_timers_endpoint_excludes_archived_docs(gt, tmp_path):
     conn = sqlite3.connect(gt.db_path)
     conn.execute(
         "UPDATE session_documents SET status = 'archived' WHERE id = "
-        "(SELECT session_doc_id FROM claude_instances WHERE id = ?)",
+        "(SELECT session_doc_id FROM legacy_instances WHERE id = ?)",
         (iid,),
     )
     conn.commit()

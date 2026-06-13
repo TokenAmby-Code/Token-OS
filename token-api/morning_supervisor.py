@@ -402,8 +402,8 @@ async def _backup_message_to_custodes(message: str) -> dict:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT tmux_pane FROM claude_instances
-            WHERE pane_label = 'legion:custodes' AND stopped_at IS NULL
+            SELECT tmux_pane FROM instances
+            WHERE pane_label = 'legion:custodes' AND status NOT IN ('stopped', 'archived')
             ORDER BY last_activity DESC LIMIT 1
             """
         )

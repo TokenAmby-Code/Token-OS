@@ -221,9 +221,9 @@ def get_active_session_doc() -> str | None:
             "agents-db",
             "--json",
             "query",
-            "SELECT sd.file_path FROM claude_instances ci "
+            "SELECT sd.file_path FROM instances ci "
             "JOIN session_documents sd ON ci.session_doc_id = sd.id "
-            "WHERE ci.status='active' AND ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
+            "WHERE ci.status NOT IN ('stopped','archived') AND ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
             "ORDER BY ci.last_activity DESC LIMIT 1",
         ],
         capture_output=True,
@@ -248,7 +248,7 @@ def get_recent_session_doc() -> tuple[str | None, str | None]:
             "agents-db",
             "--json",
             "query",
-            "SELECT sd.file_path, sd.title FROM claude_instances ci "
+            "SELECT sd.file_path, sd.title FROM instances ci "
             "JOIN session_documents sd ON ci.session_doc_id = sd.id "
             "WHERE ci.is_subagent=0 AND ci.session_doc_id IS NOT NULL "
             "ORDER BY ci.last_activity DESC LIMIT 1",

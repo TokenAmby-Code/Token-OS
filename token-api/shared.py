@@ -598,7 +598,7 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     tmuxctl and the agent wrapper own the stamp — set at register, cleared on agent
     death — so the pane itself is the authoritative reverse bridge. token-api keeps
     no tmux-pane perspective; this is the only reverse lookup, replacing every
-    ``WHERE tmux_pane = ?`` query against ``claude_instances``. Fails closed: any
+    legacy stored-pane query. Fails closed: any
     miss, error, or unstamped/dead pane returns ``None`` so callers never act on a
     stale or reused pane.
     """
@@ -1034,14 +1034,14 @@ def _sync_insert_timer_sample(
         active_instances = _coerce_work_state_value(work_state, "active_instance_count")
     if active_instances is None:
         cursor = conn.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
         )
         active_instances = int(cursor.fetchone()[0] or 0)
 
     processing_recent = _coerce_work_state_value(work_state, "processing_recent_count")
     if processing_recent is None:
         cursor = conn.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'processing' AND COALESCE(is_subagent, 0) = 0"
+            "SELECT COUNT(*) FROM instances WHERE status = 'working' AND COALESCE(is_subagent, 0) = 0"
         )
         processing_recent = int(cursor.fetchone()[0] or 0)
 
@@ -1091,7 +1091,7 @@ def _sync_log_shift(
     conn.execute("PRAGMA busy_timeout=5000")
 
     cursor = conn.execute(
-        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
     )
     active_instances = cursor.fetchone()[0]
 

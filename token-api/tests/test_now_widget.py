@@ -68,18 +68,16 @@ def test_write_today_now_callout_smoke_with_fixture_db(tmp_path):
             ),
         )
         conn.execute(
-            """CREATE TABLE claude_instances (
+            """CREATE TABLE instances (
                 id TEXT,
-                tab_name TEXT,
+                name TEXT,
                 working_dir TEXT,
                 status TEXT,
-                last_activity TEXT,
-                tmux_pane TEXT,
-                pane_label TEXT
+                last_activity TEXT
             )"""
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('1', 'custodes-main', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%1', 'palace:N')"
+            "INSERT INTO instances VALUES ('1', 'custodes-main', '/tmp/x', 'working', '2026-05-09T18:59:00')"
         )
         conn.execute("CREATE TABLE events (event_type TEXT, details TEXT, created_at TEXT)")
 
@@ -90,7 +88,7 @@ def test_write_today_now_callout_smoke_with_fixture_db(tmp_path):
     assert "Manual text." in text
     assert "<!-- callout:now BEGIN -->" in text
     assert "> **Balance:** -5min · timer mode: BREAK" in text
-    assert "> **Active:** 1:N custodes-main" in text
+    assert "> **Active:** custodes-main" in text
 
 
 def test_now_widget_active_instances_reject_claude_placeholder(tmp_path):
@@ -104,25 +102,23 @@ def test_now_widget_active_instances_reject_claude_placeholder(tmp_path):
         conn.execute("CREATE TABLE timer_state (id INTEGER PRIMARY KEY, state_json TEXT)")
         conn.execute("INSERT INTO timer_state (id, state_json) VALUES (1, ?)", (json.dumps({}),))
         conn.execute(
-            """CREATE TABLE claude_instances (
+            """CREATE TABLE instances (
                 id TEXT,
-                tab_name TEXT,
+                name TEXT,
                 working_dir TEXT,
                 status TEXT,
-                last_activity TEXT,
-                tmux_pane TEXT,
-                pane_label TEXT
+                last_activity TEXT
             )"""
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('1', 'Claude 08:14', '/tmp/x', 'processing', '2026-05-09T18:59:00', '%108', 'palace:NW')"
+            "INSERT INTO instances VALUES ('1', 'Claude 08:14', '/tmp/x', 'working', '2026-05-09T18:59:00')"
         )
         conn.execute(
-            "INSERT INTO claude_instances VALUES ('2', 'Claude 08:15', '/tmp/y', 'idle', '2026-05-09T18:58:00', '%109', NULL)"
+            "INSERT INTO instances VALUES ('2', 'Claude 08:15', '/tmp/y', 'idle', '2026-05-09T18:58:00')"
         )
         conn.execute("CREATE TABLE events (event_type TEXT, details TEXT, created_at TEXT)")
 
     telemetry = load_telemetry(db)
 
-    assert telemetry.active_instances == ["1:NW", "%109"]
+    assert telemetry.active_instances == ["x", "y"]
     assert all("Claude" not in surface for surface in telemetry.active_instances)

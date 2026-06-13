@@ -54,7 +54,7 @@ def _insert_instance_with_pr(pr_url, pr_state="open"):
     now = datetime.now().isoformat()
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, registered_at, last_activity, pr_url, pr_state)
            VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'idle', ?, ?, ?, ?)""",
@@ -67,7 +67,7 @@ def _insert_instance_with_pr(pr_url, pr_state="open"):
 
 def _pr_state(iid):
     conn = sqlite3.connect(_TEST_DB_PATH)
-    row = conn.execute("SELECT pr_state FROM claude_instances WHERE id = ?", (iid,)).fetchone()
+    row = conn.execute("SELECT pr_state FROM legacy_instances WHERE id = ?", (iid,)).fetchone()
     conn.close()
     return row[0] if row else None
 

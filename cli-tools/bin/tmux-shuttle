@@ -62,7 +62,7 @@ relocate_pane() {
     pane_id="${pane_id//\'/\'\'}"
     label="${label//\'/\'\'}"
     sqlite3 "$db_path" \
-        "UPDATE claude_instances SET pane_label='${label}' WHERE tmux_pane='${pane_id}' AND stopped_at IS NULL;" \
+        "UPDATE instances SET pane_label='${label}' WHERE tmux_pane='${pane_id}' AND stopped_at IS NULL;" \
         >/dev/null 2>&1 || true
 }
 

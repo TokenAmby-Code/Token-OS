@@ -3,7 +3,7 @@
 
 tmuxctl is the sole owner of ``instance_id -> pane``. The pane-state queue (the
 ``@CC_STATE``/``@PLANNING_STATE`` pusher) must no longer trust the stored
-``pane_state_queue.tmux_pane`` / ``claude_instances.tmux_pane`` column: it
+``pane_state_queue.tmux_pane`` / ``legacy_instances.tmux_pane`` column: it
 resolves the live pane per row via ``shared.resolve_instance_pane`` and:
 
   * delivers ``tmux set-option`` to the live-resolved pane, never the stored one;
@@ -49,11 +49,11 @@ def _queue_count(db_path: Path) -> int:
 
 
 def _insert_instance(db_path: Path, instance_id: str, tab_name: str, tmux_pane: str = "%1") -> None:
-    """Insert a minimal live claude_instances row so the rename trigger has a target."""
+    """Insert a minimal live legacy_instances row so the rename trigger has a target."""
     now = "2026-06-06T00:00:00"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, legion, synced, tmux_pane, registered_at, last_activity)
                VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'idle', 'astartes', 1, ?, ?, ?)""",
@@ -319,7 +319,7 @@ def test_rename_trigger_enqueues_pane_label(app_env: Any) -> None:
 
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
+            "UPDATE legacy_instances SET tab_name = ? WHERE id = ?",
             ("new-name", "inst-rename"),
         )
         conn.commit()
@@ -334,7 +334,7 @@ def test_rename_trigger_skips_noop(app_env: Any) -> None:
     _insert_instance(app_env.db_path, "inst-noop", "same-name", tmux_pane="%8")
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            "UPDATE claude_instances SET tab_name = ? WHERE id = ?",
+            "UPDATE legacy_instances SET tab_name = ? WHERE id = ?",
             ("same-name", "inst-noop"),
         )
         conn.commit()
@@ -348,13 +348,13 @@ def test_rename_trigger_null_does_not_enqueue_or_abort(app_env: Any) -> None:
     _insert_instance(app_env.db_path, "inst-null", "had-name", tmux_pane="%9")
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            "UPDATE claude_instances SET tab_name = NULL WHERE id = ?",
+            "UPDATE legacy_instances SET tab_name = NULL WHERE id = ?",
             ("inst-null",),
         )
         conn.commit()
         tab = conn.execute(
-            "SELECT tab_name FROM claude_instances WHERE id = ?", ("inst-null",)
+            "SELECT tab_name FROM legacy_instances WHERE id = ?", ("inst-null",)
         ).fetchone()[0]
 
-    assert tab is None, "parent UPDATE must survive (no trigger-side constraint abort)"
+    assert tab == "had-name", "canonical instance names are NOT NULL; NULL legacy rename is ignored"
     assert _queue_rows(app_env.db_path, "@PANE_LABEL") == []

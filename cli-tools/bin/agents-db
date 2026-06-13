@@ -126,9 +126,9 @@ def cmd_query(sql: str, limit: int = 100, json_output: bool = False):
 def cmd_instances(json_output: bool = False):
     """Show active instances."""
     sql = """
-        SELECT id, tab_name, working_dir, status, device_id,
+        SELECT id, name AS tab_name, working_dir, status, device_id,
                datetime(last_activity) as last_activity
-        FROM claude_instances
+        FROM instances
         ORDER BY status ASC, last_activity DESC
     """
     cmd_query(sql, limit=50, json_output=json_output)

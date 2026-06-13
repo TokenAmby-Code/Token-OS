@@ -5,6 +5,18 @@
 **Strategy:** Cherry-pick as grouped commits (not full merge — changes are logically separated)
 **Created:** 2026-03-31
 
+
+## PR #188 Recovery Plan (2026-06-12)
+
+Current branch: `claude-instances-archive-extraction`. Recovery objective is to make PR #188 gate green, close CodeRabbit actionables, and flatten branch-owned orbiting-null-star names without touching the deploy-owned runtime checkout.
+
+Execution checklist:
+1. Audit the interrupted dirty tree and keep only coherent hunks.
+2. Fix the AskQ ladder test deterministically by awaiting `shared.ASKQ_LADDER[sid]["task"]` with a bounded `asyncio.wait_for`, preserving L1/L2/L3 and unanswered-question assertions.
+3. Address CodeRabbit items across shell strictness, canonical schema tests, empty mutation updates, persona repair, GT/day-start/hook provenance, TTS/voice preservation, sync conflict checks, tmux live routing, cron/test command quoting, hook-origin normalization, and victory-ack regressions.
+4. Rename unambiguous branch-introduced `v2`/`unified`/`canonical`/`real`/`final` artifacts to descriptive flat names; leave external version strings and ambiguous established terminology flagged for PR notes.
+5. Verify using `git diff --check`, changed-file syntax checks, targeted pytest suites, naming/schema grep gates, full `token-api` pytest, then push and watch PR #188 checks.
+
 ## Context
 
 Unstaged changes were bulk-committed to `wip/accumulated-2026-03-31` as a single commit (`50d8241`). That reset the working tree to `master`, which deleted files that only existed in the accumulated work (notably `cli-tools/tmux/`). The NAS recycle bin caught the deletions.

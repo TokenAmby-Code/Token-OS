@@ -427,18 +427,19 @@ def test_dispatch_interactive_session_doc_resume_option(tmp_path, monkeypatch):
     conn.executescript(
         f"""
         CREATE TABLE session_documents (id INTEGER, file_path TEXT);
-        CREATE TABLE claude_instances (
-          id TEXT, session_id TEXT, engine TEXT, launcher TEXT, target_working_dir TEXT,
+        CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT);
+        CREATE TABLE instances (
+          id TEXT PRIMARY KEY, name TEXT, engine TEXT, launcher TEXT, target_working_dir TEXT,
           working_dir TEXT, dispatch_session_doc_path TEXT, session_doc_id INTEGER,
-          instance_type TEXT, zealotry TEXT, dispatch_target TEXT, dispatch_window TEXT,
+          golden_throne TEXT, zealotry TEXT, dispatch_target TEXT, dispatch_window TEXT,
           dispatch_mode TEXT, dispatch_slot TEXT, launch_mode TEXT, tmux_pane TEXT,
-          primarch TEXT, parent_instance_id TEXT, discord_hosted TEXT,
-          discord_channel TEXT, discord_bot TEXT, tab_name TEXT, pane_label TEXT,
+          persona_id TEXT, commander_type TEXT, commander_id TEXT, discord_hosted TEXT,
+          discord_channel TEXT, discord_bot TEXT, pane_label TEXT,
           last_activity TEXT
         );
-        INSERT INTO claude_instances (
-          session_id, engine, working_dir, instance_type, zealotry, tab_name, last_activity
-        ) VALUES ('resume-session-id', 'claude', '{escaped_root}', 'golden_throne', '5', 'Readable Name', '2026-05-15');
+        INSERT INTO instances (
+          id, name, engine, working_dir, golden_throne, zealotry, last_activity, commander_type
+        ) VALUES ('resume-session-id', 'Readable Name', 'claude', '{escaped_root}', '1', '5', '2026-05-15', 'emperor');
         """
     )
     conn.commit()

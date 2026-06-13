@@ -136,10 +136,10 @@ async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id, working_dir, engine, tab_name, status, last_activity
-            FROM claude_instances
+            SELECT id, working_dir, engine, name AS tab_name, status, last_activity
+            FROM instances
             WHERE id = ?
-              AND status IN ('processing', 'idle', 'active', 'stopped')
+              AND status NOT IN ('archived')
             ORDER BY last_activity DESC
             LIMIT 1
             """,

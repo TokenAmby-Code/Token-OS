@@ -47,7 +47,7 @@ def _insert_instance(
     iid = instance_id or str(uuid.uuid4())
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             status, tmux_pane, tts_mode, registered_at, last_activity)
            VALUES (?, ?, ?, '/tmp/test', 'local', ?, ?, ?, ?,

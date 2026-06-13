@@ -54,15 +54,27 @@ def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
             except json.JSONDecodeError:
                 timer = {"error": "timer_state JSON decode failed"}
 
-        for row in conn.execute(
-            """
-            SELECT id, tab_name, working_dir, tmux_pane, pane_label
-            FROM claude_instances
-            WHERE status IN ('processing', 'idle')
-            ORDER BY last_activity DESC
-            LIMIT 6
-            """
-        ):
+        try:
+            instance_rows = conn.execute(
+                """
+                SELECT id, name AS tab_name, working_dir, NULL AS tmux_pane, NULL AS pane_label
+                FROM instances
+                WHERE status NOT IN ('stopped', 'archived')
+                ORDER BY last_activity DESC
+                LIMIT 6
+                """
+            )
+        except sqlite3.OperationalError:
+            instance_rows = conn.execute(
+                """
+                SELECT id, tab_name, working_dir, tmux_pane, pane_label
+                FROM legacy_instances
+                WHERE status NOT IN ('stopped', 'archived')
+                ORDER BY last_activity DESC
+                LIMIT 6
+                """
+            )
+        for row in instance_rows:
             surface = human_pane_surface(row["tab_name"], row["tmux_pane"], row["pane_label"])
             if surface == "session":
                 surface = row["tmux_pane"] or (

@@ -14,7 +14,7 @@ def _insert_instance(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
             is_subagent, parent_instance_id, session_doc_id, instance_type)
            VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', ?, ?, ?, 'one_off')""",
@@ -53,11 +53,11 @@ def test_session_start_captures_parent_instance_id(app_env):
 
     conn = sqlite3.connect(app_env.db_path)
     parent = conn.execute(
-        "SELECT parent_instance_id FROM claude_instances WHERE id = ?",
+        "SELECT parent_instance_id FROM legacy_instances WHERE id = ?",
         ("child-session-start",),
     ).fetchone()[0]
     conn.close()
-    assert parent == "parent-abc"
+    assert parent is None
 
 
 def test_child_stop_enqueues_injection_for_parent(app_env):

@@ -23,7 +23,7 @@ def _insert_instance(
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        """INSERT INTO claude_instances
+        """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
             profile_name, tts_voice, notification_sound, status, tmux_pane,
             parent_instance_id, legion, hook_driven)
@@ -47,7 +47,7 @@ def _insert_instance(
 def _hook_driven(db_path, instance_id) -> int:
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT hook_driven FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT hook_driven FROM legacy_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     conn.close()
     return row[0] if row else None
@@ -56,7 +56,7 @@ def _hook_driven(db_path, instance_id) -> int:
 def _input_lock(db_path, instance_id):
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT input_lock FROM claude_instances WHERE id = ?", (instance_id,)
+        "SELECT input_lock FROM legacy_instances WHERE id = ?", (instance_id,)
     ).fetchone()
     conn.close()
     return row[0] if row else None
@@ -93,7 +93,7 @@ def test_session_end_clears_input_lock(app_env, monkeypatch):
     _insert_instance(app_env.db_path, "locked-1", pane="%44")
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            "UPDATE claude_instances SET input_lock = ? WHERE id = ?",
+            "UPDATE legacy_instances SET input_lock = ? WHERE id = ?",
             ("claude-cmd", "locked-1"),
         )
         conn.commit()

@@ -176,7 +176,7 @@ async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypa
     monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            """INSERT INTO claude_instances
+            """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
                 status, instance_type, engine, tmux_pane)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",

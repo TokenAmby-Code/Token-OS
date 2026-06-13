@@ -1,7 +1,18 @@
-"""Canonical instance registry v2 helpers.
+"""Instance registry helpers.
 
-The ``instances`` table is the durable registry. It intentionally excludes tmux
-runtime identity and legacy workflow/PR/victory/planning fields.
+The ``instances`` table is the durable registry and — post legacy instance table
+exterminatus — the ONE physical instance table. It has two column tiers:
+
+* IDENTITY_COLUMNS: the durable instance registry charter (persona/rank/commander/
+  origin). Authoritative, never derived from anywhere else.
+* RUNTIME_ANNEX_COLUMNS: transitional runtime/workflow fields inherited from
+  the extracted legacy instance table. Each is slated for per-column
+  demolition as its successor lands (tmux @INSTANCE_ID stamps for pane
+  geometry, the golden_throne table for GT state, status enum for workflow/
+  planning). New code must not grow this list.
+
+The legacy the legacy instance table table itself lives in archive.db only (see
+db_schema.extract_legacy instance table / restore_legacy instance table_from_archive).
 """
 
 from __future__ import annotations
@@ -17,7 +28,7 @@ RUNTIME_TMUX_FIELDS = {
     "dispatch_slot",
 }
 
-INSTANCE_COLUMNS = [
+IDENTITY_COLUMNS = [
     "id",
     "name",
     "engine",
@@ -42,35 +53,31 @@ INSTANCE_COLUMNS = [
     "golden_throne",
 ]
 
-REMOVED_INSTANCE_COLUMNS = {
-    "tab_name",
-    "session_id",
-    "source_ip",
-    "pid",
+# Transitional runtime annex (see module docstring). Order matters: it is the
+# physical column order in the CREATE TABLE.
+RUNTIME_ANNEX_COLUMNS = [
+    # tmux/dispatch geometry — dies when @INSTANCE_ID-stamp resolution lands
     "tmux_pane",
     "pane_label",
     "dispatch_target",
     "dispatch_window",
+    "dispatch_mode",
     "dispatch_slot",
-    "legion",
-    "primarch",
-    "profile_name",
+    "dispatch_session_doc_path",
+    "target_working_dir",
+    "launch_mode",
+    "launcher",
+    "transplant_target_session",
+    "transplant_expected",
+    "input_lock",
+    # per-instance voice overrides
     "tts_voice",
     "notification_sound",
-    "tts_mode",
-    "is_subagent",
-    "parent_instance_id",
-    "session_doc_policy",
-    "zealotry",
-    "gt_resume_count",
-    "gt_resume_window_started_at",
-    "gt_last_resume_at",
-    "follow_up_sop",
-    "stop_allowed",
-    "victory_at",
-    "victory_reason",
-    "pr_url",
-    "pr_state",
+    # discord hosting
+    "discord_hosted",
+    "discord_channel",
+    "discord_bot",
+    # workflow / planning / closure — dies into the status enum
     "workflow_state",
     "workflow_updated_at",
     "workflow_blocked_reason",
@@ -79,8 +86,42 @@ REMOVED_INSTANCE_COLUMNS = {
     "planning_state",
     "planning_updated_at",
     "planning_source",
-    "transplant_target_session",
-    "transplant_expected",
+    "closure_surface",
+    "closure_required",
+    "session_doc_policy",
+    "pr_url",
+    "pr_state",
+    "victory_at",
+    "victory_reason",
+    # provenance flags kept distinct from `automated` (semantics differ)
+    "is_subagent",
+    "hook_driven",
+    # golden-throne engine state — dies into the golden_throne table
+    "zealotry",
+    "gt_resume_count",
+    "gt_resume_window_started_at",
+    "gt_last_resume_at",
+    "follow_up_sop",
+    "stop_allowed",
+]
+
+INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
+
+# Legacy legacy instance table columns with NO live home: their values exist only in
+# archive.db. Reads repoint to the instance-table derivation noted inline.
+REMOVED_INSTANCE_COLUMNS = {
+    "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
+    "session_id",  # archive-only
+    "source_ip",  # archive-only
+    "pid",  # archive-only
+    "legion",  # -> persona_id (JOIN personas ON slug)
+    "primarch",  # -> persona_id
+    "profile_name",  # -> persona_id
+    "tts_mode",  # -> notification_mode + interaction_mode
+    "instance_type",  # -> golden_throne marker (NULL | 'sync' | golden_throne.id)
+    "synced",  # -> golden_throne = 'sync'
+    "parent_instance_id",  # -> commander_type='chapter' + commander_id
+    "registered_at",  # -> created_at
 }
 
 VALID_ORIGIN_TYPES = {"local", "ssh", "cron", "dispatch", "api", "perpetual"}
@@ -179,19 +220,23 @@ def golden_throne_binding(row: dict) -> str | None:
 
 
 def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
-    """Map a legacy claude_instances row into final instances columns."""
+    """Map a legacy instance table row into instances-table columns."""
     if not row:
         return {}
     status = normalize_status(row.get("status"))
     is_chapter_child = bool(row.get("parent_instance_id")) or bool(row.get("is_subagent"))
-    if row.get("parent_instance_id"):
+    if row.get("commander_type"):
+        # explicit instance-table shape wins over the legacy parent_instance_id derivation
+        commander_type = row["commander_type"]
+        commander_id = row.get("commander_id")
+    elif row.get("parent_instance_id"):
         commander_type = "chapter"
         commander_id = row.get("parent_instance_id")
     else:
         commander_type = "emperor"
         commander_id = None
     created = row.get("registered_at") or row.get("created_at") or datetime.now().isoformat()
-    return {
+    values = {
         "id": row.get("id") or row.get("session_id"),
         "name": row.get("tab_name") or row.get("name") or row.get("id") or row.get("session_id"),
         "engine": row.get("engine"),
@@ -205,16 +250,27 @@ def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = Non
         "last_activity": row.get("last_activity") or created,
         "stopped_at": row.get("stopped_at"),
         "archived_at": row.get("archived_at"),
-        "persona_id": persona_id,
+        "persona_id": persona_id if persona_id is not None else row.get("persona_id"),
         "rank": normalize_rank(row.get("rank"), status=status),
         "session_doc_id": row.get("session_doc_id"),
         "continuity_binding_source": row.get("continuity_binding_source"),
         "wrapper_launch_id": row.get("wrapper_launch_id"),
-        "automated": 1 if (row.get("hook_driven") or is_chapter_child) else 0,
-        "notification_mode": normalize_notification_mode(row.get("tts_mode")),
-        "interaction_mode": normalize_interaction_mode(row.get("tts_mode")),
-        "golden_throne": golden_throne_binding(row),
+        "automated": row["automated"]
+        if row.get("automated") is not None
+        else (1 if (row.get("hook_driven") or is_chapter_child) else 0),
+        "notification_mode": row.get("notification_mode")
+        or normalize_notification_mode(row.get("tts_mode")),
+        "interaction_mode": row.get("interaction_mode")
+        or normalize_interaction_mode(row.get("tts_mode")),
+        "golden_throne": row.get("golden_throne") or golden_throne_binding(row),
     }
+    # Runtime annex passthrough: any annex column present on the legacy row
+    # carries over verbatim (the extraction backfill and transitional
+    # legacy-shaped insert paths both rely on this).
+    for column in RUNTIME_ANNEX_COLUMNS:
+        if column in row:
+            values[column] = row.get(column)
+    return values
 
 
 def derived_cockpit_label(
