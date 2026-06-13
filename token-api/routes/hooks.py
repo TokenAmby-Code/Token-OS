@@ -2660,7 +2660,7 @@ async def handle_session_start(payload: dict) -> dict:
                     # stuck planning_state. No-op for rows already at `none`.
                     "planning_state": "none",
                     "planning_updated_at": now,
-                    "planning_source": "auto-clear:session-start",
+                    "planning_source": "auto-clear:instance-supplanted",
                     "session_doc_id": resolved_session_doc_id or old_inst["session_doc_id"],
                     "wrapper_launch_id": wrapper_launch_id or old_inst["wrapper_launch_id"],
                     "launcher": launcher or old_inst["launcher"],
@@ -3497,6 +3497,61 @@ async def handle_session_end(payload: dict) -> dict:
     return result
 
 
+def _payload_starts_slash_plan(payload: dict) -> bool:
+    """Return true when a prompt-submit payload contains a direct /plan command."""
+    prompt_keys = (
+        "prompt",
+        "user_prompt",
+        "userPrompt",
+        "message",
+        "text",
+        "input",
+        "command",
+    )
+    for key in prompt_keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.lstrip().startswith("/plan"):
+            return True
+
+    for parent_key in ("payload", "event", "data", "turn", "turn_context", "context"):
+        parent = payload.get(parent_key)
+        if isinstance(parent, dict) and _payload_starts_slash_plan(parent):
+            return True
+    return False
+
+
+def _payload_indicates_plan_mode(payload: dict) -> bool:
+    """Detect native Codex plan-mode prompt context without screen scraping."""
+
+    def walk(obj: Any) -> bool:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_norm = str(key).lower().replace("-", "_")
+                if key_norm in {"plan_mode", "planning_mode", "is_plan_mode"}:
+                    if value is True:
+                        return True
+                    if isinstance(value, str) and value.lower() in {"1", "true", "yes", "plan"}:
+                        return True
+                if key_norm in {"mode", "phase", "reasoning_mode", "turn_mode"}:
+                    if isinstance(value, str) and value.lower().replace("-", "_") in {
+                        "plan",
+                        "planning",
+                        "plan_mode",
+                    }:
+                        return True
+                if key_norm in {"item", "message", "event"} and isinstance(value, dict):
+                    item_type = str(value.get("type") or "").lower()
+                    if item_type == "plan":
+                        return True
+                if walk(value):
+                    return True
+        elif isinstance(obj, list):
+            return any(walk(item) for item in obj)
+        return False
+
+    return walk(payload)
+
+
 async def handle_prompt_submit(payload: dict) -> dict:
     """Handle UserPromptSubmit hook - mark instance as processing."""
     session_id = payload.get("session_id")
@@ -3540,6 +3595,17 @@ async def handle_prompt_submit(payload: dict) -> dict:
 
         consumed_injections = await _consume_state_injections(db, session_id)
 
+        planning_event = None
+        if _payload_starts_slash_plan(payload) or _payload_indicates_plan_mode(payload):
+            planning_event = await _set_planning_state(
+                db,
+                session_id,
+                "planning",
+                source="auto-clear:prompt-submit",
+                only_if_in=("none", "preplanning", "planning"),
+                actor="PromptSubmit",
+            )
+
         # Also resurrect stopped instances - activity means they're active.
         # (pid died with legacy instance table; nothing to backfill.)
         await sanctioned_update_instance(
@@ -3555,6 +3621,9 @@ async def handle_prompt_submit(payload: dict) -> dict:
             actor="PromptSubmit",
         )
         await db.commit()
+
+    if planning_event:
+        await log_event("planning_state_changed", instance_id=session_id, details=planning_event)
 
     # NOTE: this hook no longer flips global productivity. Productivity is now a
     # read-time calculus in compute_work_state (the 10s poll), which discounts
@@ -5235,6 +5304,40 @@ async def _set_planning_state(
         "new_state": new_state,
         "source": source,
         "tmux_pane": tmux_pane,
+    }
+
+
+@router.get("/api/planning/state")
+async def get_planning_state(instance_id: str | None = None, tmux_pane: str | None = None) -> dict:
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        instance = await _resolve_instance_by_id(db, instance_id)
+        if not instance or not instance.get("id"):
+            instance = await _resolve_instance_for_pane(db, tmux_pane)
+        resolved_id = (instance or {}).get("id")
+        if not resolved_id:
+            return {
+                "success": False,
+                "action": "instance_unresolved",
+                "tmux_pane": _normalize_text(tmux_pane),
+            }
+
+        cursor = await db.execute(
+            "SELECT planning_state, planning_source, tmux_pane, engine FROM instances WHERE id = ?",
+            (resolved_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"success": False, "action": "instance_not_found", "instance_id": resolved_id}
+
+    return {
+        "success": True,
+        "action": "planning_state",
+        "instance_id": resolved_id,
+        "tmux_pane": row["tmux_pane"],
+        "planning_state": row["planning_state"] or "none",
+        "planning_source": row["planning_source"],
+        "engine": row["engine"],
     }
 
 

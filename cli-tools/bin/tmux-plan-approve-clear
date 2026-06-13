@@ -110,7 +110,9 @@ while true; do
     detected="$(classify "$AGENT" <<<"$content")"
     if [[ "$detected" != "none" ]]; then
         send_action "$detected"
-        set_planning_state none
+        # Do not mark planning complete here.  A successful clear-context
+        # approval causes the harness to re-fire SessionStart/supplant; that
+        # canonical row transition owns planning_state=none.
         exit 0
     fi
     now=$(date +%s)
