@@ -3724,7 +3724,17 @@ async def handle_stop(payload: dict) -> dict:
     # The Custodes persona never auto-idles and owns the morning keepalive path,
     # regardless of whether sync MODE is currently set. `sync` remains a valid
     # mode signal, so the gate is "Custodes persona OR still in sync mode".
-    is_sync_instance = is_custodes_persona or instance_type == "sync"
+    #
+    # Liveness: a retired (dead identity) or already stopped/archived seat must
+    # NEVER keepalive off a residual sync marker — re-injecting into its stale pane
+    # is exactly the GT phantom-dispatch this filter stops. The is_custodes_persona
+    # arm already excludes retired (its join filters rank), so the gate is only on
+    # the sync-MODE OR-branch. Custodes identity, when live, still wins.
+    _seat_is_dead = (instance.get("rank") or "") == "retired" or instance.get("status") in (
+        "stopped",
+        "archived",
+    )
+    is_sync_instance = is_custodes_persona or (instance_type == "sync" and not _seat_is_dead)
     is_subagent_instance_quick = bool(instance.get("is_subagent"))
     has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
 

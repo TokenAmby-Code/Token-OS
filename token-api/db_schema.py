@@ -441,8 +441,27 @@ async def _ensure_instances(db) -> None:
         WHEN NEW.rank = 'retired' AND OLD.rank != 'retired'
         BEGIN
             UPDATE instances
-               SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
+               SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP), golden_throne = NULL
              WHERE commander_type = 'chapter' AND commander_id = NEW.id AND rank != 'retired';
+        END
+    """)
+    # A retired seat is dead identity: it must carry NO golden_throne marker (sync
+    # MODE or a real golden_throne.id), so the GT keepalive/resume readers can
+    # never pick it for a dispatch/resume into its defunct pane (the "1:NE"
+    # phantom). The cascade above already nulls chapter children it retires;
+    # recursive_triggers is OFF here (the rank-stamp trigger comment verifies
+    # this), so the directly-retired row needs its OWN marker cleared by a
+    # dedicated AFTER trigger. Nulling golden_throne always passes the
+    # golden_throne guard (its WHEN is false for NULL), and clearing an
+    # already-NULL marker is a fixed point — so this converges with recursive
+    # triggers ON or OFF.
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_retire_clear_golden_throne")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_retire_clear_golden_throne
+        AFTER UPDATE OF rank ON instances
+        WHEN NEW.rank = 'retired' AND OLD.rank != 'retired' AND NEW.golden_throne IS NOT NULL
+        BEGIN
+            UPDATE instances SET golden_throne = NULL WHERE id = NEW.id;
         END
     """)
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_singleton_guard")

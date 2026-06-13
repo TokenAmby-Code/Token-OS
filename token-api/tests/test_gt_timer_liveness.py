@@ -170,3 +170,106 @@ def test_zealotry_delay_out_of_range_clamps_never_silent_loosest(app_env):
     # A below-range value clamps to the loosest valid level (4), not a KeyError.
     assert f(0) == 1800
     assert f(3) == 1800
+
+
+# ── Retired-seat reader filter (GT "1:NE" phantom-dispatch bug) ───────────────
+#
+# A retired seat (rank='retired') is dead identity: it must NEVER produce a GT
+# dispatch/resume, no matter what stale golden_throne binding it still carries.
+# Half-1 (a reservist) sweeps the existing DB rows; this half is the permanent
+# code filter on every reader that drives a GT dispatch off a stored binding.
+
+
+def _retire_with_stale_gt(db_path: Path, iid: str, *, status: str = "idle") -> None:
+    """Retire a seat but leave a real (non-'sync') golden_throne marker on it.
+
+    Re-stamps golden_throne AFTER the rank flip so the reader-filter test holds
+    independently of the retire trigger that clears it (fix #1) — i.e. it pins the
+    reader behaviour even for a legacy/pre-existing retired row that still carries
+    a stale binding (exactly what the marker-sweep is cleaning up by hand)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE instances SET rank = 'retired', status = ? WHERE id = ?", (status, iid))
+    # Re-arm the stale binding the retire trigger would otherwise have nulled.
+    conn.execute("UPDATE instances SET golden_throne = '1' WHERE id = ?", (iid,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_sweep_recovery_skips_retired_seat(gt, tmp_path):
+    """A retired seat carrying a real GT binding + active doc must NOT be re-armed.
+
+    This is the phantom-dispatch source: the recovery query selected on
+    status/golden_throne with no rank gate, so a retired seat's stale binding
+    re-armed a timer that fired into its defunct (old) pane — the "1:NE" ghost."""
+    main = gt.main
+    doc = _write_doc(tmp_path, "victory:\n  a: true\n  b: false")  # incomplete -> schedulable
+    iid = _insert_gt(gt.db_path, doc_path=doc, status="idle")
+    _retire_with_stale_gt(gt.db_path, iid, status="idle")
+
+    job_id = f"golden-throne-{iid}"
+    if main.scheduler.get_job(job_id) is not None:
+        main.scheduler.remove_job(job_id)
+
+    recovered = await main.recover_recent_stopped_golden_throne_timers()
+    assert all(r["instance_id"] != iid for r in recovered)
+    assert main.scheduler.get_job(job_id) is None
+
+
+@pytest.mark.asyncio
+async def test_followup_fire_skips_retired_seat(gt, tmp_path, monkeypatch):
+    """Even if a stale/externally-armed timer fires, the fire path bails on a
+    retired seat before it ever reads the rubric or dispatches a resume."""
+    main = gt.main
+    doc = _write_doc(tmp_path, "victory:\n  a: true\n  b: false")
+    iid = _insert_gt(gt.db_path, doc_path=doc, status="idle")
+    _retire_with_stale_gt(gt.db_path, iid, status="idle")
+
+    rubric_reads: list[str] = []
+
+    async def _spy_rubric(instance):
+        rubric_reads.append(instance.get("id"))
+        return None, {}
+
+    monkeypatch.setattr(main, "_read_instance_session_doc_rubric", _spy_rubric)
+
+    await main.golden_throne_followup(iid)
+    # A retired seat is skipped BEFORE the rubric read — the only data flow that
+    # precedes (and gates) a dispatch.
+    assert rubric_reads == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_followup_refuses_retired_seat(gt, tmp_path):
+    """The central scheduler must refuse to ARM a timer for a retired seat — this
+    is the single gate that covers every caller (stop-hook endpoint, recovery)."""
+    main = gt.main
+    doc = _write_doc(tmp_path, "victory:\n  a: false")
+    iid = _insert_gt(gt.db_path, doc_path=doc, status="idle")
+    _retire_with_stale_gt(gt.db_path, iid, status="idle")
+
+    conn = sqlite3.connect(gt.db_path)
+    conn.row_factory = sqlite3.Row
+    instance = dict(conn.execute("SELECT * FROM instances WHERE id = ?", (iid,)).fetchone())
+    conn.close()
+
+    result = await main.schedule_golden_throne_followup(instance, reason="test")
+    assert result == {"scheduled": False, "reason": "retired"}
+    assert main.scheduler.get_job(f"golden-throne-{iid}") is None
+
+
+def test_retire_trigger_clears_golden_throne(app_env, tmp_path):
+    """Source-side complement (fix #1): retiring a seat nulls its golden_throne so
+    a retired row can never be selected by the GT readers in the first place."""
+    doc = _write_doc(tmp_path, "victory:\n  a: false")
+    iid = _insert_gt(app_env.db_path, doc_path=doc, status="idle")
+
+    conn = sqlite3.connect(app_env.db_path)
+    before = conn.execute("SELECT golden_throne FROM instances WHERE id = ?", (iid,)).fetchone()[0]
+    assert before == "1"  # real (non-'sync') GT marker present before retire
+
+    conn.execute("UPDATE instances SET rank = 'retired' WHERE id = ?", (iid,))
+    conn.commit()
+    after = conn.execute("SELECT golden_throne FROM instances WHERE id = ?", (iid,)).fetchone()[0]
+    conn.close()
+    assert after is None  # retire cleared the throne
