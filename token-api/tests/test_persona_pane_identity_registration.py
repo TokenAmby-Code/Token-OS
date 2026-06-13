@@ -21,6 +21,9 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 
 def _conn(db_path):
@@ -29,14 +32,28 @@ def _conn(db_path):
     return conn
 
 
-def _insert_legacy(db_path, instance_id, *, primarch=None, legion="astartes", status="idle"):
+def _insert_legacy(
+    db_path, instance_id, *, primarch=None, legion="astartes", status="idle", parent=None
+):
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO claude_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, primarch, legion)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, status, primarch, legion),
+            profile_name, tts_voice, notification_sound, status, primarch, legion,
+            parent_instance_id)
+           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'v', 's', ?, ?, ?, ?)""",
+        (
+            instance_id,
+            f"{instance_id}-session",
+            instance_id,
+            # Mirror reality: persona rows carry their persona slug as profile_name
+            # (slug_from_legacy reads it first when projecting persona_id).
+            primarch or "p",
+            status,
+            primarch,
+            legion,
+            parent,
+        ),
     )
     conn.commit()
     conn.close()
@@ -111,7 +128,9 @@ def _no_pane_occupant(monkeypatch, hooks):
 # ── R-M1: legion:malcador derives the advisor seat identity ────────────────────
 
 
-def test_malcador_pane_registers_with_primarch_identity(app_env, monkeypatch):
+def test_malcador_pane_registers_with_primarch_identity(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:malcador"))
     _no_pane_occupant(monkeypatch, hooks)
@@ -134,7 +153,9 @@ def test_malcador_pane_registers_with_primarch_identity(app_env, monkeypatch):
 # ── R-M2: persona panes never register as chapter children ─────────────────────
 
 
-def test_persona_pane_parent_env_does_not_register_chapter_child(app_env, monkeypatch):
+def test_persona_pane_parent_env_does_not_register_chapter_child(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_legacy(app_env.db_path, "dispatcher-fg", legion="fabricator")
     monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:malcador"))
@@ -156,7 +177,9 @@ def test_persona_pane_parent_env_does_not_register_chapter_child(app_env, monkey
     assert row["rank"] == "primarch"
 
 
-def test_custodes_relaunch_over_zombie_predecessor_retires_it(app_env, monkeypatch):
+def test_custodes_relaunch_over_zombie_predecessor_retires_it(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Incident reproduction: the zombie predecessor holds rank=overseer with
     # status='working' (it never stopped) and has NO legacy row, so the legacy
     # primarch-singleton supplant cannot fire; the relaunch env carries the
@@ -182,3 +205,35 @@ def test_custodes_relaunch_over_zombie_predecessor_retires_it(app_env, monkeypat
     zombie = _canonical_row(app_env.db_path, "zombie-cust")
     assert zombie["rank"] == "retired"
     assert zombie["status"] == "stopped"
+
+
+def test_persona_supplant_does_not_restore_poisoned_prior_parent(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The supplant/update paths restore blank launch fields from the prior row
+    # (`parent_instance_id or old_inst[...]`). When the prior persona row was
+    # already poisoned with a parent, supplanting it must not re-inherit the
+    # poison — _effective_parent suppresses every restore for persona panes.
+    hooks = sys.modules["routes.hooks"]
+    _insert_legacy(
+        app_env.db_path,
+        "stale-cust",
+        primarch="custodes",
+        legion="custodes",
+        status="stopped",
+        parent="dead-dispatcher",
+    )
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:custodes"))
+    _no_pane_occupant(monkeypatch, hooks)
+
+    result = _start_session(hooks, "fresh-cust-2")
+    assert result["success"] is True
+
+    # Primarch-singleton supplant migrates the stale row to the new session id.
+    legacy = _legacy_row(app_env.db_path, "fresh-cust-2")
+    assert legacy is not None
+    assert not legacy["parent_instance_id"]
+
+    row = _canonical_row(app_env.db_path, "fresh-cust-2")
+    assert row["commander_type"] == "emperor"
+    assert row["rank"] == "overseer"

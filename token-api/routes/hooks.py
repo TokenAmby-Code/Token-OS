@@ -2005,6 +2005,15 @@ async def handle_session_start(payload: dict) -> dict:
         # resolvable singleton (live custodes 6a8773e9 commanded by its own
         # zombie d865db2e).
         parent_instance_id = ""
+
+    def _effective_parent(prior_parent: str | None) -> str | None:
+        # Same invariant for every restore path (supplant, --continue, prior
+        # dispatch env): a persona singleton never inherits a parent — not from
+        # the launch env (cleared above) and not from a poisoned prior row.
+        if persona_identity:
+            return ""
+        return parent_instance_id or prior_parent
+
     persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
@@ -2262,7 +2271,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=existing_row["name"])
@@ -2288,7 +2297,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2324,7 +2333,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
@@ -2422,7 +2431,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(
@@ -2447,7 +2456,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane or existing_row["tmux_pane"],
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2463,7 +2472,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
@@ -2620,7 +2629,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["name"])
@@ -2629,7 +2638,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 # Auto-link primarch session doc if applicable
@@ -2678,7 +2687,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2833,11 +2842,7 @@ async def handle_session_start(payload: dict) -> dict:
         )
         target_working_dir = target_working_dir or _prior_dispatch.get("target_working_dir")
         launch_mode = launch_mode or _prior_dispatch.get("launch_mode")
-        # Persona singletons stay Emperor-commanded even when the pre-registration
-        # row carried a dispatcher parent (see the persona_identity guard above) —
-        # restoring it here would re-poison the fresh row into a chapter child.
-        if not persona_identity:
-            parent_instance_id = parent_instance_id or _prior_parent_instance_id
+        parent_instance_id = _effective_parent(_prior_parent_instance_id)
         if not transplant_expected:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
