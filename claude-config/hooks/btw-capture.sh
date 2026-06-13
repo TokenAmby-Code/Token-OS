@@ -22,13 +22,20 @@ mkdir -p "${HOME}/.claude/logs"
 log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
 
 # --- Resolve target pane ---
-# run-shell context: display-message resolves to the active pane.
-# #{pane_id} strips the % prefix inside run-shell — re-add it.
-_id=$(tmux display-message -p '#{pane_id}' 2>/dev/null) || exit 1
-if [[ "$_id" == %* ]]; then
-    PANE="$_id"
+# Optional $1 = caller-resolved physical pane id. ethereal-prompt resolves a
+# positional/instance id to a %NN and passes it here. With no arg, fall back to
+# the active pane (the prefix+B / run-shell path): display-message resolves to
+# it, and #{pane_id} strips the % prefix inside run-shell, so re-add it.
+if [[ -n "${1:-}" ]]; then
+    PANE="$1"
+    [[ "$PANE" == %* ]] || PANE="%${PANE}"
 else
-    PANE="%${_id}"
+    _id=$(tmux display-message -p '#{pane_id}' 2>/dev/null) || exit 1
+    if [[ "$_id" == %* ]]; then
+        PANE="$_id"
+    else
+        PANE="%${_id}"
+    fi
 fi
 
 # --- Background the entire operation so run-shell returns immediately ---
