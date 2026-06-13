@@ -233,6 +233,12 @@ def _observed_row_hash(row, spec: PersonaSpec) -> str:
         "persona": spec.persona,
         "instance_id": getattr(row, "instance_id", "") if row is not None else "",
         "pane_label": getattr(row, "pane_label", "") if row is not None else "",
+        # Canonical identity the predicate now keys on first — must be in the
+        # fingerprint so a slug change (e.g. "" -> "custodes") counts as new input
+        # and the guard re-evaluates instead of suppressing on stale equivalence.
+        "persona_slug": (
+            (getattr(row, "persona_slug", "") or "").strip().lower() if row is not None else ""
+        ),
         "legion": getattr(row, "legion", "") if row is not None else "",
         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
         "instance_type": getattr(row, "instance_type", "") if row is not None else "",
