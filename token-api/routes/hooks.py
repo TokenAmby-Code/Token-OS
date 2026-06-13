@@ -323,6 +323,7 @@ SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
 CUSTODES_PANE_LABEL = "legion:custodes"
+LEGION_MALCADOR_LABEL = "legion:malcador"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
@@ -363,6 +364,17 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         # _resolve_administratum_instance keys on primarch='administratum').
         "legion": "mechanicus",
         "primarch": "administratum",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+    LEGION_MALCADOR_LABEL: {
+        # Malcador (advisor seat) shares the astartes legion with regiment workers,
+        # so legion cannot identify it — its load-bearing key is primarch='malcador'
+        # (personas seed default_rank='primarch'; tmuxctl
+        # assertions._row_matches_persona resolves on the same column), mirroring
+        # Administratum. Outside enforcement and state-hook routing: never sync.
+        "legion": "astartes",
+        "primarch": "malcador",
         "instance_type": "hook_driven",
         "synced": False,
     },
@@ -1994,6 +2006,24 @@ async def handle_session_start(payload: dict) -> dict:
             primarch_name = persona_identity.get("primarch") or ""
         if launch_instance_type is None:
             launch_instance_type = persona_identity.get("instance_type")
+        # A persona singleton is Emperor-commanded, never a chapter child. A
+        # relaunch chain (old persona session dispatching/resuming its successor)
+        # leaks the predecessor into TOKEN_API_PARENT_INSTANCE_ID; honoring it
+        # registers the new row with commander_type='chapter', which exempts it
+        # from the singleton guard, the default-rank stamp triggers, and
+        # resolve_live_persona_instance — leaving the dead predecessor as the
+        # resolvable singleton (live custodes 6a8773e9 commanded by its own
+        # zombie d865db2e).
+        parent_instance_id = ""
+
+    def _effective_parent(prior_parent: str | None) -> str | None:
+        # Same invariant for every restore path (supplant, --continue, prior
+        # dispatch env): a persona singleton never inherits a parent — not from
+        # the launch env (cleared above) and not from a poisoned prior row.
+        if persona_identity:
+            return ""
+        return parent_instance_id or prior_parent
+
     persona_synced = bool(persona_identity and persona_identity.get("synced"))
     launch_zealotry = _parse_launch_zealotry(
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
@@ -2037,6 +2067,20 @@ async def handle_session_start(payload: dict) -> dict:
             cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (persona_slug,))
             persona_row = await cursor.fetchone()
             launch_persona_id = persona_row["id"] if persona_row else None
+        # Persona panes assert their identity rank explicitly in every in-place
+        # update. Retiring a poisoned row's old commander (singleton guard)
+        # cascades trg_instances_retire_children back onto the row mid-statement
+        # — it is still that commander's chapter child at statement start — and
+        # the cascade's rank='retired' survives any column the statement does not
+        # assign. Explicit assignment makes the outcome deterministic; it is a
+        # no-op against the stamp trigger when the rank already matches.
+        persona_default_rank = None
+        if persona_identity and launch_persona_id is not None:
+            cursor = await db.execute(
+                "SELECT default_rank FROM personas WHERE id = ?", (launch_persona_id,)
+            )
+            rank_row = await cursor.fetchone()
+            persona_default_rank = rank_row["default_rank"] if rank_row else None
 
         # --- Supplant logic: reuse existing instance row instead of creating new ---
         # Priority: DB transplant marker > hook file handoff > primarch singleton
@@ -2224,6 +2268,15 @@ async def handle_session_start(payload: dict) -> dict:
                     else existing_row["zealotry"],
                     "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
                 }
+                if persona_identity:
+                    # _effective_parent stops a persona row from re-inheriting a
+                    # poisoned parent, but an in-place refresh keeps whatever
+                    # chapter edge the row already carries — clear it explicitly
+                    # (the commander binding below no-ops on an empty parent).
+                    transplant_updates["commander_type"] = "emperor"
+                    transplant_updates["commander_id"] = None
+                    if persona_default_rank:
+                        transplant_updates["rank"] = persona_default_rank
                 if launch_persona_id is not None:
                     transplant_updates["persona_id"] = launch_persona_id
                 if launch_instance_type:
@@ -2255,7 +2308,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=existing_row["name"])
@@ -2281,7 +2334,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2317,7 +2370,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
@@ -2386,6 +2439,13 @@ async def handle_session_start(payload: dict) -> dict:
                     else existing_row["zealotry"],
                     "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
                 }
+                if persona_identity:
+                    # Persona singletons stay Emperor-commanded: clear any chapter
+                    # edge the refreshed row already carries (see transplant path).
+                    updates["commander_type"] = "emperor"
+                    updates["commander_id"] = None
+                    if persona_default_rank:
+                        updates["rank"] = persona_default_rank
                 if launch_instance_type:
                     updates["golden_throne"] = await _launch_golden_throne_marker(
                         db,
@@ -2415,7 +2475,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(
@@ -2440,7 +2500,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane or existing_row["tmux_pane"],
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2456,7 +2516,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or existing_parent_id,
+                    parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
@@ -2580,6 +2640,14 @@ async def handle_session_start(payload: dict) -> dict:
                     else old_inst["zealotry"],
                     "session_doc_policy": session_doc_policy or old_inst["session_doc_policy"],
                 }
+                if persona_identity:
+                    # Persona singletons stay Emperor-commanded: a supplanted prior
+                    # row may carry a poisoned chapter edge — clear it here, the
+                    # commander binding below no-ops on an empty parent.
+                    supplant_updates["commander_type"] = "emperor"
+                    supplant_updates["commander_id"] = None
+                    if persona_default_rank:
+                        supplant_updates["rank"] = persona_default_rank
                 if launch_persona_id is not None:
                     supplant_updates["persona_id"] = launch_persona_id
                 if launch_instance_type:
@@ -2613,7 +2681,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["name"])
@@ -2622,7 +2690,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     instance_id=session_id,
                     dispatch_target=dispatch_target,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
                 # Auto-link primarch session doc if applicable
@@ -2671,7 +2739,7 @@ async def handle_session_start(payload: dict) -> dict:
                     db,
                     child_instance_id=session_id,
                     child_pane=tmux_pane,
-                    parent_instance_id=parent_instance_id or old_parent_id,
+                    parent_instance_id=_effective_parent(old_parent_id),
                 )
                 if auto_subscription:
                     await db.commit()
@@ -2826,7 +2894,7 @@ async def handle_session_start(payload: dict) -> dict:
         )
         target_working_dir = target_working_dir or _prior_dispatch.get("target_working_dir")
         launch_mode = launch_mode or _prior_dispatch.get("launch_mode")
-        parent_instance_id = parent_instance_id or _prior_parent_instance_id
+        parent_instance_id = _effective_parent(_prior_parent_instance_id)
         if not transplant_expected:
             transplant_expected = bool(_prior_dispatch.get("transplant_expected"))
         session_doc_policy = _prior_session_doc_policy
@@ -3000,8 +3068,15 @@ async def handle_session_start(payload: dict) -> dict:
                 # default instead of an old civic-green or arbitrary chapter colour.
                 legion_updates["persona_id"] = None
             else:
+                # Persona panes bind persona_id by primarch, not legion: a seat in
+                # a shared legion (Malcador in astartes, Administratum in
+                # mechanicus) is invisible to a legion-keyed lookup, leaving the
+                # random chapter drawn at INSERT as the bound persona.
+                persona_source = auto_legion
+                if persona_identity and persona_identity.get("primarch"):
+                    persona_source = persona_identity["primarch"]
                 auto_slug = LEGACY_PERSONA_ALIASES.get(
-                    auto_legion.strip().lower(), auto_legion.strip().lower()
+                    persona_source.strip().lower(), persona_source.strip().lower()
                 )
                 cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (auto_slug,))
                 auto_persona_row = await cursor.fetchone()
@@ -3016,6 +3091,15 @@ async def handle_session_start(payload: dict) -> dict:
             # voiceless personas keep tts_voice=NULL (silent). Pane colour is applied
             # only through tmux select-pane -P bg=<personas.pane_tint>.
             if persona_identity:
+                # Persona panes are identified by their label's primarch, not their
+                # legion. Malcador shares the astartes legion with regiment workers,
+                # so the legion→persona_id bind above cannot resolve it (and at
+                # insert time profile_name still carries the random chapter the row
+                # drew, which slug_from_legacy prefers over primarch). Bind the
+                # canonical persona_id straight from the label's primarch so the
+                # default-rank stamp trigger and singleton guard recognise the row.
+                if launch_persona_id is not None:
+                    legion_updates["persona_id"] = launch_persona_id
                 persona_profile = resolve_persona_profile(
                     persona_identity.get("primarch"), auto_legion
                 )
