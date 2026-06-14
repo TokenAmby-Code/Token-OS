@@ -47,6 +47,14 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_role=CUSTODES_ROLE,
         orchestrator_type="legion",
         worker_role=REGIMENT_ROLE,
+        # Malcador (advisor) and Pax (civic day-job) are durable overseer seats
+        # docked under Custodes in the left column, not regiment workers. Without
+        # registering them here, enforce_stack_layout classifies them as untyped
+        # workers and retags them legion:N, clobbering the seat identity.
+        secondary_personas=(
+            PersonaPaneSpec(MALCADOR_ROLE, "legion"),
+            PersonaPaneSpec(PAX_ROLE, "legion"),
+        ),
     ),
     "mechanicus": StackPageSpec(
         base="mechanicus",

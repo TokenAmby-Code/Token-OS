@@ -505,7 +505,7 @@ def test_builder_creates_canonical_workspace_roles():
     assert "tui" not in pane_types
 
 
-def test_build_legion_window_seats_three_overseers_in_order():
+def test_build_legion_window_seats_three_overseers_in_order() -> None:
     # The legion column is built top-to-bottom: Custodes (.1), then the lower
     # two-thirds split into Malcador (.2) and Pax (.3). Each seat is tagged with
     # its @PANE_ID and the shared legion @PANE_TYPE so resolve_pane can address

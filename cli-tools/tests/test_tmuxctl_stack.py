@@ -483,7 +483,11 @@ def test_selecting_already_focused_worker_does_not_reenforce():
 def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t17\tclaude\tfalse",
+            # The durable overseer seats are already present (builder creates them),
+            # so enforce docks rather than re-splits them.
+            "%M\tlegion:malcador\tlegion\t0\t0\t17\t80\t16\tclaude\tfalse",
+            "%P\tlegion:pax\tlegion\t0\t0\t33\t80\t16\tclaude\tfalse",
         ]
     )
 
@@ -518,7 +522,10 @@ def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
 def test_adopt_with_existing_workers_joins_vertically_onto_the_stack():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t17\tclaude\tfalse",
+            # Durable overseer seats already present alongside the worker stack.
+            "%M\tlegion:malcador\tlegion\t0\t0\t17\t80\t16\tclaude\tfalse",
+            "%P\tlegion:pax\tlegion\t0\t0\t33\t80\t16\tclaude\tfalse",
             "%1\tlegion:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
         ]
     )
