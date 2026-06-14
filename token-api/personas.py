@@ -192,6 +192,18 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "inquisitor", "Inquisitor", "overseer", None, None, "#180830", "#7a4cc2", None, None, None
     ),
+    PersonaSeed(
+        "pax",
+        "Pax",
+        "overseer",
+        None,
+        None,  # assignment_pool, assignment_order (overseer → None)
+        "#1c2b3a",  # pane_tint  — civic slate, deliberately non-40k
+        "#3a6ea5",  # chip_color — civic blue
+        None,
+        None,
+        None,  # tts_voice, tts_rate, notification_sound (silent seat)
+    ),
 )
 
 PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (

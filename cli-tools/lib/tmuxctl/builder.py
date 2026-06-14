@@ -176,10 +176,15 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
 def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
     """Build the legion stack window.
 
-    The left column mirrors mechanicus: Custodes on top, Malcador (the
-    advisor seat) below. Pane 1 is the Custodes orchestrator slot. If that
-    orchestrator is promoted to an audience surface, this pane becomes its
-    tombstone.
+    The left column holds three overseer seats stacked in even thirds:
+    Custodes on top, Malcador (the advisor seat) in the middle, and Pax (the
+    civic day-job seat) on the bottom. Pane 1 is the Custodes orchestrator slot.
+    If that orchestrator is promoted to an audience surface, this pane becomes
+    its tombstone.
+
+    The split sequence re-balances the column for three panes: Custodes keeps
+    the top third, the lower two-thirds becomes Malcador, then Malcador's region
+    is halved to seat Pax in the bottom third.
     """
     target = f"{session}:{LEGION_WINDOW}"
     adapter.run(
@@ -193,11 +198,14 @@ def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
         _window_dir(LEGION_WINDOW),
     )
     custodes = f"{target}.1"
-    malcador = _split_pane(adapter, custodes, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
+    malcador = _split_pane(adapter, custodes, "-v", "-l", "66%", cwd=_window_dir(LEGION_WINDOW))
+    pax = _split_pane(adapter, malcador, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
     _pane_tag(adapter, custodes, "legion:custodes")
     _set_pane_option(adapter, custodes, "@PANE_TYPE", "legion")
     _pane_tag(adapter, malcador, "legion:malcador")
     _set_pane_option(adapter, malcador, "@PANE_TYPE", "legion")
+    _pane_tag(adapter, pax, "legion:pax")
+    _set_pane_option(adapter, pax, "@PANE_TYPE", "legion")
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:

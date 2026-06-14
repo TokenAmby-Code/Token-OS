@@ -1492,6 +1492,21 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "perturabo",
                 "Personas/Perturabo.md",
             ),
+            (
+                # Civic day-job overseer seat (the third legion pane). Unlike the
+                # Imperium personas, Pax lives in the Civic vault (Pax-ENV), so the
+                # dispatch local-file fallback (which only searches Imperium-ENV)
+                # cannot find it — the vault/vault_note_path mapping below is what
+                # lets `dispatch --persona pax` resolve its system prompt from
+                # $CIVIC/Pax-ENV/Personas/pax.md.
+                "pax",
+                "Pax, The Civic Overseer",
+                '["civic", "askcivic", "public-knowledge"]',
+                "Pax-ENV",
+                "Civic day-job overseer. Stewards askCivic / Public Knowledge / Civic work as a standing seat beside the Imperium overseers. Deliberately non-40k.",
+                "pax",
+                "Personas/pax.md",
+            ),
         ]
         for primarch in primarch_seed:
             await db.execute(

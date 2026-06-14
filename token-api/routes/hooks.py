@@ -334,6 +334,7 @@ MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
 MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
 CUSTODES_PANE_LABEL = "legion:custodes"
 LEGION_MALCADOR_LABEL = "legion:malcador"
+LEGION_PAX_LABEL = "legion:pax"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
@@ -385,6 +386,20 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         # Administratum. Outside enforcement and state-hook routing: never sync.
         "legion": "astartes",
         "primarch": "malcador",
+        "instance_type": "hook_driven",
+        "synced": False,
+    },
+    LEGION_PAX_LABEL: {
+        # Pax (civic day-job overseer seat, the third legion pane) registers under
+        # the shared `civic` legion (an ALLOWED_LEGION), so legion cannot identify
+        # it — its load-bearing key is primarch='pax'. That resolves to the `pax`
+        # personas row (default_rank='overseer'), and the rank-stamp trigger
+        # promotes the freshly inserted row off the 'astartes' column default. A
+        # fresh SessionStart in this pane IS Pax: Emperor-commanded, never a
+        # chapter child. Enforcement/state-hook wiring is deliberately out of scope
+        # here (structural bring-up only) — never sync.
+        "legion": "civic",
+        "primarch": "pax",
         "instance_type": "hook_driven",
         "synced": False,
     },

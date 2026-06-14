@@ -17,6 +17,7 @@ PAGE_AUDIENCE = {
 
 AUDIENCE_ROLES = {
     "legion:custodes",
+    "legion:pax",
     "mechanicus:fabricator-general",
 }
 
