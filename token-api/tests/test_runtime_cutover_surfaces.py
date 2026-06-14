@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 def _db(app_env: Any) -> sqlite3.Connection:
@@ -39,10 +40,8 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
 
 
 @pytest.fixture
-def client(app_env: Any) -> Any:
+def client(app_env: Any) -> TestClient:
     """TestClient over the reloaded FastAPI app bound to the test DB."""
-    from fastapi.testclient import TestClient
-
     return TestClient(app_env.main.app)
 
 
