@@ -15422,6 +15422,75 @@ async def hook_work_action_callback(source: str, note: str | None = None):
     return await _work_action(WorkActionRequest(source=source, note=note), explicit=False)
 
 
+# ============ Pavlok Endpoints ============
+# Restored after 97bed98 accidentally dropped this block while carrying
+# unrelated in-progress main.py changes — the stimulus function survived but
+# its HTTP surface vanished, so the `pavlok` CLI + custodes_watchtower got
+# 404 and zaps landed nowhere. Contract matches cli-tools/bin/pavlok.
+
+
+@app.post("/api/pavlok/zap")
+async def pavlok_zap(
+    type: str = "zap",
+    value: int | None = None,
+    reason: str = "manual",
+) -> dict:
+    """Send a stimulus (zap/beep/vibe) to the Pavlok watch.
+
+    The CLI routes beep/vibe through this same endpoint via ``?type=``. Cooldown
+    bypass is implicit now: zap/soft cooldowns + daily caps were retired by the
+    Enforcement Dedup Removal decree, so a manual trigger is never throttled.
+    ``value`` is clamped to 1..100 downstream (``_normalize_stimulus_value``).
+    """
+    stimulus_type = (type or "zap").lower()
+    if stimulus_type not in ("zap", "beep", "vibe"):
+        raise HTTPException(status_code=400, detail="type must be one of: zap, beep, vibe")
+    result = send_pavlok_stimulus(
+        stimulus_type=stimulus_type,
+        value=value,
+        reason=reason,
+    )
+    await log_event("pavlok_stimulus", details=result)
+    return result
+
+
+@app.post("/api/pavlok/toggle")
+async def pavlok_toggle(enabled: bool | None = None) -> dict:
+    """Toggle or set Pavlok enforcement. No arg = invert current state."""
+    if enabled is None:
+        PAVLOK_CONFIG["enabled"] = not PAVLOK_CONFIG["enabled"]
+    else:
+        PAVLOK_CONFIG["enabled"] = enabled
+    await log_event("pavlok_toggled", details={"enabled": PAVLOK_CONFIG["enabled"]})
+    return {"enabled": PAVLOK_CONFIG["enabled"]}
+
+
+@app.get("/api/pavlok/status")
+async def pavlok_status() -> dict:
+    """Get current Pavlok state for the `pavlok` CLI status view."""
+    # min_gap is single-lane actuator serialization, not a cooldown; surface the
+    # remaining gap so the CLI's cooldown line stays meaningful post-dedup-removal.
+    min_gap = float(PAVLOK_CONFIG.get("min_gap_seconds", 0.0) or 0.0)
+    cooldown_remaining = 0.0
+    last_at = PAVLOK_STATE.get("last_stimulus_at")
+    if last_at and min_gap > 0:
+        elapsed = (datetime.now() - datetime.fromisoformat(last_at)).total_seconds()
+        cooldown_remaining = max(0.0, min_gap - elapsed)
+
+    return {
+        "enabled": PAVLOK_CONFIG["enabled"],
+        "token_set": bool(PAVLOK_CONFIG["token"]),
+        "last_stimulus_at": last_at,
+        "cooldown_remaining_seconds": round(cooldown_remaining),
+        "cooldown_seconds": round(min_gap),
+        "default_zap_value": PAVLOK_CONFIG["default_zap_value"],
+        "zap_count_date": PAVLOK_STATE.get("zap_count_date"),
+        "zap_count": PAVLOK_STATE.get("zap_count", 0),
+        "last_zap_at": PAVLOK_STATE.get("last_zap_at"),
+        "last_soft_at": PAVLOK_STATE.get("last_soft_at"),
+    }
+
+
 # ============ Work Mode / Geofence Endpoints ============
 # MacroDroid uses geofence to send work mode changes
 
