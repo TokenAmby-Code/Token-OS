@@ -32,6 +32,26 @@ def test_codex_clear_context_modal_sends_option_two_sequence(tmp_path):
     assert out == "action=codex option-2 Down Enter"
 
 
+def test_codex_current_plan_modal_sends_option_two_sequence(tmp_path: pathlib.Path):
+    fixture = tmp_path / "codex-current.txt"
+    fixture.write_text(
+        "Implement this plan?\n\n"
+        "› 1. Yes, implement this plan          Switch to Default\n"
+        "                                       and start coding.\n"
+        "  2. Yes, clear context and implement  Fresh thread.\n"
+        "                                       Context: 1% used.\n"
+        "  3. No, stay in Plan mode             Continue planning\n"
+        "                                       with the model.\n"
+        "\n"
+        "Press enter to confirm or esc to go back\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=codex option-2 Down Enter"
+
+
 def test_successful_click_leaves_state_for_session_start(tmp_path):
     fixture = tmp_path / "pane.txt"
     fixture.write_text(
