@@ -8,26 +8,15 @@ survived; only the HTTP surface was missing.
 """
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client():
-    from fastapi.testclient import TestClient
-
-    return TestClient(main.app)
+def client(app_env) -> TestClient:
+    return TestClient(app_env.main.app)
 
 
-main = None
-
-
-@pytest.fixture(autouse=True)
-def _bind_main(app_env):
-    global main
-    main = app_env.main
-    yield
-
-
-def test_status_returns_200_not_404(client):
+def test_status_returns_200_not_404(client: TestClient) -> None:
     """GET /api/pavlok/status must exist (was 404 after the route drop)."""
     resp = client.get("/api/pavlok/status")
     assert resp.status_code == 200
@@ -37,7 +26,7 @@ def test_status_returns_200_not_404(client):
         assert key in body, f"status missing {key!r}: {body}"
 
 
-def test_zap_invokes_send_pavlok_stimulus(client, monkeypatch):
+def test_zap_invokes_send_pavlok_stimulus(app_env, client: TestClient, monkeypatch) -> None:
     """POST /api/pavlok/zap must drive send_pavlok_stimulus with the CLI contract."""
     calls = []
 
@@ -45,7 +34,7 @@ def test_zap_invokes_send_pavlok_stimulus(client, monkeypatch):
         calls.append({"stimulus_type": stimulus_type, "value": value, "reason": reason})
         return {"success": True, "type": stimulus_type, "value": value}
 
-    monkeypatch.setattr(main, "send_pavlok_stimulus", fake_send)
+    monkeypatch.setattr(app_env.main, "send_pavlok_stimulus", fake_send)
 
     resp = client.post("/api/pavlok/zap", params={"type": "zap", "value": 75, "reason": "break"})
     assert resp.status_code == 200
@@ -56,11 +45,11 @@ def test_zap_invokes_send_pavlok_stimulus(client, monkeypatch):
     assert resp.json().get("success") is True
 
 
-def test_zap_passes_beep_type(client, monkeypatch):
+def test_zap_passes_beep_type(app_env, client: TestClient, monkeypatch) -> None:
     """The CLI sends beep/vibe through the same /zap route via ?type=."""
     calls = []
     monkeypatch.setattr(
-        main,
+        app_env.main,
         "send_pavlok_stimulus",
         lambda stimulus_type="zap", value=None, reason="manual": (
             calls.append(stimulus_type) or {"success": True}
@@ -71,7 +60,13 @@ def test_zap_passes_beep_type(client, monkeypatch):
     assert calls == ["beep"]
 
 
-def test_toggle_persists_enable_state(client):
+def test_zap_rejects_unknown_type(client: TestClient) -> None:
+    """Unknown stimulus types are rejected at the route boundary with 400."""
+    resp = client.post("/api/pavlok/zap", params={"type": "nuke"})
+    assert resp.status_code == 400
+
+
+def test_toggle_persists_enable_state(client: TestClient) -> None:
     """POST /api/pavlok/toggle with explicit ?enabled flips PAVLOK_CONFIG state."""
     from shared import PAVLOK_CONFIG
 
@@ -86,7 +81,7 @@ def test_toggle_persists_enable_state(client):
     assert PAVLOK_CONFIG["enabled"] is True
 
 
-def test_toggle_no_arg_inverts_state(client):
+def test_toggle_no_arg_inverts_state(client: TestClient) -> None:
     """No-arg toggle inverts the current enable state (CLI `pavlok toggle`)."""
     from shared import PAVLOK_CONFIG
 

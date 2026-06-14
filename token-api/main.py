@@ -15434,15 +15434,19 @@ async def pavlok_zap(
     type: str = "zap",
     value: int | None = None,
     reason: str = "manual",
-):
+) -> dict:
     """Send a stimulus (zap/beep/vibe) to the Pavlok watch.
 
     The CLI routes beep/vibe through this same endpoint via ``?type=``. Cooldown
     bypass is implicit now: zap/soft cooldowns + daily caps were retired by the
     Enforcement Dedup Removal decree, so a manual trigger is never throttled.
+    ``value`` is clamped to 1..100 downstream (``_normalize_stimulus_value``).
     """
+    stimulus_type = (type or "zap").lower()
+    if stimulus_type not in ("zap", "beep", "vibe"):
+        raise HTTPException(status_code=400, detail="type must be one of: zap, beep, vibe")
     result = send_pavlok_stimulus(
-        stimulus_type=type,
+        stimulus_type=stimulus_type,
         value=value,
         reason=reason,
     )
@@ -15451,7 +15455,7 @@ async def pavlok_zap(
 
 
 @app.post("/api/pavlok/toggle")
-async def pavlok_toggle(enabled: bool | None = None):
+async def pavlok_toggle(enabled: bool | None = None) -> dict:
     """Toggle or set Pavlok enforcement. No arg = invert current state."""
     if enabled is None:
         PAVLOK_CONFIG["enabled"] = not PAVLOK_CONFIG["enabled"]
@@ -15462,7 +15466,7 @@ async def pavlok_toggle(enabled: bool | None = None):
 
 
 @app.get("/api/pavlok/status")
-async def pavlok_status():
+async def pavlok_status() -> dict:
     """Get current Pavlok state for the `pavlok` CLI status view."""
     # min_gap is single-lane actuator serialization, not a cooldown; surface the
     # remaining gap so the CLI's cooldown line stays meaningful post-dedup-removal.
