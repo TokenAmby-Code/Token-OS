@@ -13,7 +13,7 @@
 #   4. Extract output → clipboard (panel "c to copy", scrape fallback)
 #   5. Dismiss panel (Escape)
 #   6. Clear prompt bar (Ctrl+C)
-#   7. Paste into prompt bar (user reviews: Enter to send, Ctrl+C to discard)
+#   7. Paste reformatted prompt into prompt bar and auto-submit (Enter)
 
 set -uo pipefail
 
@@ -267,11 +267,17 @@ print("\n".join(result))
             tmux send-keys -t "$PANE" C-c
             sleep 0.5
 
-            # --- Step 8: Paste into prompt bar (bracketed paste) ---
+            # --- Step 8: Paste into prompt bar (bracketed paste) + submit ---
+            # Bracketed paste lands the reformatted prompt without firing it (the
+            # trailing newline is inert under -p), so send an explicit Enter to
+            # auto-submit. Settle briefly first so the paste fully registers in
+            # the composer before the Enter.
             printf '%s' "$CLEANED" | tmux load-buffer -
             tmux paste-buffer -p -t "$PANE"
+            sleep 0.3
+            tmux send-keys -t "$PANE" Enter
 
-            log "Done — pasted into prompt bar"
+            log "Done — pasted and submitted"
             exit 0
         fi
     done
