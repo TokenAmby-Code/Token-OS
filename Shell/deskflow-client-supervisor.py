@@ -35,12 +35,14 @@ blocks NAS executables).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import select
 import signal
 import subprocess
 import sys
 import time
+import urllib.request
 
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
 CONNECT_WINDOW = 20.0  # seconds to first connect before going quiet
@@ -49,6 +51,46 @@ TERM_GRACE = 3.0  # seconds between SIGTERM and SIGKILL on the core
 
 CONNECTED_MARKER = "connected to server"
 DISCONNECTED_MARKER = "disconnected from server"
+
+# Token-API presence feed. While the deskflow client is connected the Emperor is
+# at his desk; we heartbeat that to token-api so its timer counts genuine desk
+# work as WORK (active_process) instead of decaying to idle_break. token-api
+# ages the heartbeat out via its own TTL, so HEARTBEAT_INTERVAL must stay well
+# under that TTL. The feed is best-effort: a down token-api never blocks the
+# supervisor (the timer's typing-guard / work-action signals still apply).
+TOKEN_API_BASE = os.environ.get("TOKEN_API_BASE", "http://127.0.0.1:7777")
+DESKFLOW_STATE_PATH = "/api/desktop/deskflow"
+HEARTBEAT_INTERVAL = 60.0  # seconds between active heartbeats while connected
+POST_TIMEOUT = 2.0  # seconds; a hung token-api must not stall the select loop
+
+
+def post_deskflow_state(active, base=TOKEN_API_BASE, timeout=POST_TIMEOUT, urlopen=None):
+    """Best-effort POST of deskflow connection state to token-api.
+
+    Stdlib-only (urllib). Never raises — telemetry must not crash the supervisor;
+    a token-api that is down simply means no auto active-process signal this tick.
+    Returns True on a 2xx response, False on any non-2xx or error.
+    """
+    opener = urlopen or urllib.request.urlopen
+    payload = json.dumps({"active": bool(active), "source": "deskflow-supervisor"}).encode()
+    req = urllib.request.Request(
+        base + DESKFLOW_STATE_PATH,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        resp = opener(req, timeout=timeout)
+    except Exception as exc:
+        print(f"supervisor: deskflow-state POST failed (active={active}): {exc}", flush=True)
+        return False
+    try:
+        code = resp.getcode()
+    finally:
+        close = getattr(resp, "close", None)
+        if close is not None:
+            close()
+    return code is not None and 200 <= code < 300
 
 
 class Supervisor:
@@ -145,37 +187,69 @@ def run(argv=None) -> int:
     sup = Supervisor(args.connect_window, args.reconnect_window, time.monotonic())
     fd = proc.stdout.fileno()
     buf = b""
+    was_connected = False
+    next_heartbeat = None  # monotonic deadline for the next active heartbeat
 
-    while True:
-        now = time.monotonic()
-        if sup.expired(now):
-            print(
-                f"supervisor: {sup.window_name} window expired — killing core, going quiet",
-                flush=True,
-            )
-            _kill_core(proc)
-            return 0
+    def _select_timeout(now):
+        # Wake for the kill deadline (when armed) and, while connected, for the
+        # next heartbeat. sup.timeout() is None while connected (block forever),
+        # so the heartbeat is the only thing that wakes a connected loop.
+        deadline_to = sup.timeout(now)
+        hb_to = None if next_heartbeat is None else max(0.0, next_heartbeat - now)
+        candidates = [t for t in (deadline_to, hb_to) if t is not None]
+        return min(candidates) if candidates else None
 
-        readable, _, _ = select.select([fd], [], [], sup.timeout(now))
-        if not readable:
-            continue  # loop re-checks expiry
-
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            # Core exited (or we terminated it). Reap and report.
-            code = proc.wait()
-            if terminating:
-                print("supervisor: stopped by signal", flush=True)
+    try:
+        while True:
+            now = time.monotonic()
+            if sup.expired(now):
+                print(
+                    f"supervisor: {sup.window_name} window expired — killing core, going quiet",
+                    flush=True,
+                )
+                _kill_core(proc)
                 return 0
-            print(f"supervisor: core exited on its own (code {code})", flush=True)
-            return code
 
-        buf += chunk
-        while b"\n" in buf:
-            raw, buf = buf.split(b"\n", 1)
-            line = raw.decode("utf-8", errors="replace")
-            print(line, flush=True)
-            sup.handle_line(line, time.monotonic())
+            # Connection-state edge → feed token-api; arm/disarm the heartbeat.
+            if sup.connected and not was_connected:
+                post_deskflow_state(True)
+                next_heartbeat = now + HEARTBEAT_INTERVAL
+            elif not sup.connected and was_connected:
+                post_deskflow_state(False)
+                next_heartbeat = None
+            was_connected = sup.connected
+
+            # Heartbeat while connected so token-api's presence TTL never lapses.
+            if sup.connected and next_heartbeat is not None and now >= next_heartbeat:
+                post_deskflow_state(True)
+                next_heartbeat = now + HEARTBEAT_INTERVAL
+
+            readable, _, _ = select.select([fd], [], [], _select_timeout(now))
+            if not readable:
+                continue  # loop re-checks expiry / heartbeat
+
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                # Core exited (or we terminated it). Reap and report.
+                code = proc.wait()
+                if terminating:
+                    print("supervisor: stopped by signal", flush=True)
+                    return 0
+                print(f"supervisor: core exited on its own (code {code})", flush=True)
+                return code
+
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="replace")
+                print(line, flush=True)
+                sup.handle_line(line, time.monotonic())
+    finally:
+        # Any exit path (quiet, core exit, signal, error) while connected must
+        # tell token-api the desk is no longer actively held by deskflow, so the
+        # timer stops counting work promptly instead of waiting out the TTL.
+        if was_connected:
+            post_deskflow_state(False)
 
 
 if __name__ == "__main__":

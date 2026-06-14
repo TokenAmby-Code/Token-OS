@@ -755,6 +755,16 @@ DESKTOP_STATE = {
     "steam_exe": None,
     # Meeting mode: suppresses TTS when in a Zoom/Google Meet call
     "in_meeting": False,
+    # Deskflow KVM client presence — heartbeated by the Mac deskflow-client
+    # supervisor (Shell/deskflow-client-supervisor.py). While the client is
+    # connected the Emperor is at his desk; compute_work_state treats a FRESH
+    # heartbeat as auto active-process work evidence so genuine desk work counts
+    # as WORK instead of decaying to idle_break. Ages out via TTL when the client
+    # disconnects/quiets. Complements (does not replace) the explicit
+    # work-action / typing-guard signals. Live heartbeat — not persisted across
+    # restart (see _RESTART_STATE_DENYLIST); the supervisor republishes on boot.
+    "deskflow_active": False,
+    "deskflow_last_seen": None,  # ISO-8601 of the last active heartbeat
 }
 
 
