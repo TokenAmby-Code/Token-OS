@@ -20,29 +20,40 @@ Every assertion also confirms the live DB never resurrects `claude_instances`.
 
 import sqlite3
 import uuid
+from typing import Any
 
 import pytest
 
 
-def _db(app_env):
+def _db(app_env: Any) -> sqlite3.Connection:
+    """Open a row-factory connection on the test's isolated agents.db."""
     conn = sqlite3.connect(app_env.db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _table_names(conn):
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    """Return the set of table names in the live (main) schema."""
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return {row[0] for row in rows}
 
 
 @pytest.fixture
-def client(app_env):
+def client(app_env: Any) -> Any:
+    """TestClient over the reloaded FastAPI app bound to the test DB."""
     from fastapi.testclient import TestClient
 
     return TestClient(app_env.main.app)
 
 
-def _session_start(client, *, tmux_pane=None, pane_label=None, cwd=None):
+def _session_start(
+    client: Any,
+    *,
+    tmux_pane: str | None = None,
+    pane_label: str | None = None,
+    cwd: str | None = None,
+) -> str:
+    """Drive a SessionStart hook and return the registered instance id."""
     instance_id = str(uuid.uuid4())
     payload = {
         "session_id": instance_id,
@@ -63,6 +74,7 @@ def _session_start(client, *, tmux_pane=None, pane_label=None, cwd=None):
 
 class TestRenameHitsInstances:
     def test_patch_rename_updates_instances_row(self, client, app_env):
+        """PATCH /api/instances/{id}/rename writes name to instances and the API reflects it."""
         instance_id = _session_start(client)
         resp = client.patch(
             f"/api/instances/{instance_id}/rename", json={"tab_name": "civic-keeper"}
@@ -89,7 +101,8 @@ class TestRenameHitsInstances:
         """
         instance_id = _session_start(client)
 
-        async def _fake_instance_id_for_pane(pane):
+        async def _fake_instance_id_for_pane(pane: str) -> str:
+            """Stub the live @INSTANCE_ID stamp lookup tmuxctl would do."""
             return instance_id
 
         monkeypatch.setattr(app_env.shared, "instance_id_for_pane", _fake_instance_id_for_pane)
@@ -117,6 +130,7 @@ class TestRenameHitsInstances:
 
 class TestPaneBindHitsInstances:
     def test_session_start_pane_bind_persists_to_instances(self, client, app_env):
+        """A SessionStart carrying a pane persists tmux_pane + pane_label onto instances."""
         instance_id = _session_start(client, tmux_pane="%25", pane_label="palace:NW")
 
         conn = _db(app_env)
@@ -132,6 +146,7 @@ class TestPaneBindHitsInstances:
         assert "claude_instances" not in names
 
     def test_list_instances_surfaces_stored_pane_non_null(self, client, app_env):
+        """GET /api/instances surfaces the stored pane non-null after a pane-bind."""
         instance_id = _session_start(client, tmux_pane="%25", pane_label="palace:NW")
         resp = client.get("/api/instances")
         assert resp.status_code == 200, resp.text
@@ -146,6 +161,7 @@ class TestPaneBindHitsInstances:
 
 class TestResolveHitsInstances:
     def test_resolve_by_cwd_returns_instance(self, client, app_env):
+        """GET /api/instances/resolve returns the live instance matched by cwd from instances."""
         cwd = f"/tmp/resolve-{uuid.uuid4()}"
         instance_id = _session_start(client, cwd=cwd)
 
@@ -164,7 +180,8 @@ class TestResolveHitsInstances:
         the live row out of `instances` (the "%25 not resolving" surface)."""
         instance_id = _session_start(client, tmux_pane="%25", pane_label="palace:NW")
 
-        async def _fake_instance_id_for_pane(pane):
+        async def _fake_instance_id_for_pane(pane: str) -> str:
+            """Stub the live @INSTANCE_ID stamp lookup tmuxctl would do."""
             return instance_id
 
         monkeypatch.setattr(app_env.main.shared, "instance_id_for_pane", _fake_instance_id_for_pane)
