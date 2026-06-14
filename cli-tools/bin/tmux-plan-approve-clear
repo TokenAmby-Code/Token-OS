@@ -73,7 +73,7 @@ agent=sys.argv[1]
 text=sys.stdin.read()
 low=text.lower()
 clear = "clear context" in low or "clear the context" in low or "clear current context" in low
-approval = any(s in low for s in ["auto-accept edits", "approve edits", "manually approve", "manual approval", "start fresh", "fresh context"])
+approval = any(s in low for s in ["auto-accept edits", "approve edits", "manually approve", "manual approval", "start fresh", "fresh context", "fresh thread", "implement this plan?"])
 if not (clear and approval):
     print("none")
     raise SystemExit
