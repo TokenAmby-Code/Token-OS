@@ -41,8 +41,6 @@ _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 # shellcheck source=../lib/pane-id.sh
 source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
-# shellcheck source=../lib/origin.sh
-source "${_LIB_DIR}/origin.sh" 2>/dev/null || true
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -66,9 +64,10 @@ SESSION_NAME="main"
 # agent's Bash tool that believes it is running a benign attach), so no static
 # grep over scripts/cron/launchd/CI can find it. Record WHO invokes each
 # destructive entry point, red-handed: timestamp, subcommand, outcome, the
-# resolved origin record (machine/device/pane/instance/geofence/transport, from
-# origin.sh), TTY state, and the parent process (the agent's shell / Bash-tool
-# wrapper). This is a flat, append-only log — deliberately NOT the live
+# resolved origin record (machine/pane/instance/transport — resolved inline from
+# $IMPERIUM_MACHINE and the active pane's @PANE_ID/@INSTANCE_ID stamps), TTY
+# state, and the parent process (the agent's shell / Bash-tool wrapper). This is
+# a flat, append-only log — deliberately NOT the live
 # agents.db or any token-api hot path, so it stays inert and outside the failure
 # modes that caused the wipes. Best-effort: it must NEVER block or fail `tx`.
 TX_INVOCATION_LOG="${TX_INVOCATION_LOG:-${HOME}/.claude/tx-invocations.log}"
@@ -76,9 +75,22 @@ TX_INVOCATION_LOG="${TX_INVOCATION_LOG:-${HOME}/.claude/tx-invocations.log}"
 _tx_log_invocation() {
     local subcmd="${1:-?}" outcome="${2:-?}"
     {
-        local ts origin parent in_tty out_tty
+        local ts origin parent in_tty out_tty machine pane instance transport
         ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')
-        origin=$(origin_record 2>/dev/null || echo '{}')
+        # Resolve the invoking origin inline (machine self-id + the active pane's
+        # human @PANE_ID / @INSTANCE_ID stamps + transport). Kept dependency-free
+        # and best-effort — this log must never block or fail `tx`.
+        machine="${IMPERIUM_MACHINE:-unknown}"
+        pane=""; instance=""
+        if [[ -n "${TMUX_PANE:-}" ]]; then
+            pane=$(pane_id_of "$TMUX_PANE" 2>/dev/null || echo "")
+            instance=$(tmux show-options -pv -t "$TMUX_PANE" @INSTANCE_ID 2>/dev/null || echo "")
+        fi
+        if [[ -n "${TMUX:-}" ]]; then transport=tmux
+        elif [[ -n "${SSH_CONNECTION:-}" ]]; then transport=ssh
+        else transport=local; fi
+        origin=$(printf '{"machine":"%s","pane":"%s","instance":"%s","transport":"%s"}' \
+            "$machine" "$pane" "$instance" "$transport")
         in_tty=0; [[ -t 0 ]] && in_tty=1
         out_tty=0; [[ -t 1 ]] && out_tty=1
         # Parent process = the agent shell / Bash-tool wrapper that ran us.

@@ -1,73 +1,57 @@
 #!/usr/bin/env bash
-# open-session-doc — Open the session doc linked to a tmux pane in Obsidian.
-# TAGS: tmux, obsidian, origin, session
-# AUDIENCE: tmux binding
+# open-session-doc — Open a session doc in Obsidian by id (or for the current pane).
+# TAGS: tmux, obsidian, session
+# AUDIENCE: tmux binding, ops cockpit
 #
-# Resolves: cardinal pane id → instances → session_documents → file_path
-# Routes:   open on the machine that triggered the keystroke (origin_machine)
+# The single "open session doc by id" entry point. Resolves a session doc to its
+# stable id, then POSTs the one open-by-id endpoint
+# (POST /api/session-docs/{id}/open), which invokes the obsidian CLI server-side
+# on the Mac to focus/open the note. Both signals route through that endpoint:
+# this tmux `prefix + S` keybind, and the ops cockpit's double-click on a fleet
+# row (which calls the endpoint directly).
 #
 # Usage:
-#   open-session-doc [cardinal-pane-id|current] [client_pid]
+#   open-session-doc <doc_id>      # open a specific session doc by id
+#   open-session-doc current       # resolve the current pane's doc, then open
+#   open-session-doc               # same as `current`
 #
-# Both args are optional. Without a pane id, tmuxctl resolves the current pane's
-# stable @PANE_ID cardinal label. Do not pass raw tmux %pane ids here.
+# Pane resolution uses cardinal pane identity via tmuxctl — never raw tmux %pane ids.
 
 set -u
 
-# --- Shell plumbing (needed even when invoked outside login shell) ---
 _LIB="$(dirname "$(readlink -f "$0")")/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "$_LIB/nas-path.sh"
-# shellcheck source=../lib/origin.sh
-source "$_LIB/origin.sh"
 
-PANE_ID="${1:-current}"
-CLIENT_PID="${2:-}"
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
-if [[ -z "$PANE_ID" ]]; then
-    echo "open-session-doc: no pane id" >&2
+ARG="${1:-current}"
+
+# --- 1. Resolve to a session doc id ---
+if [[ "$ARG" =~ ^[0-9]+$ ]]; then
+    DOC_ID="$ARG"
+else
+    # Pane mode: resolve the cardinal pane (default: current) to its doc id.
+    PANE="${ARG:-current}"
+    DOC_ID=$(tmuxctl session-doc --pane "$PANE" --format id 2>/dev/null) || {
+        tmux display-message "open-session-doc: no doc for pane $PANE" 2>/dev/null || true
+        echo "open-session-doc: tmuxctl session-doc failed for pane '$PANE'" >&2
+        exit 1
+    }
+fi
+
+if [[ -z "${DOC_ID:-}" || ! "$DOC_ID" =~ ^[0-9]+$ ]]; then
+    tmux display-message "open-session-doc: no session doc resolved" 2>/dev/null || true
+    echo "open-session-doc: no session doc id resolved (got '${DOC_ID:-}')" >&2
     exit 1
 fi
 
-# --- 1. Ask tmuxctl for the session doc using cardinal pane identity ---
-body=$(tmuxctl session-doc --pane "$PANE_ID" --format json 2>&1) || {
-    tmux display-message "open-session-doc: no doc for cardinal pane $PANE_ID" 2>/dev/null || true
-    echo "open-session-doc: tmuxctl session-doc failed: $body" >&2
+# --- 2. Open by id through the one endpoint (obsidian CLI runs server-side) ---
+RESP=$(curl -fsS -X POST "$API_URL/api/session-docs/$DOC_ID/open" 2>/dev/null) || {
+    tmux display-message "open-session-doc: open failed for doc $DOC_ID" 2>/dev/null || true
+    echo "open-session-doc: POST /api/session-docs/$DOC_ID/open failed" >&2
     exit 1
 }
 
-# --- 2. Parse doc fields (python to avoid jq dep) ---
-read -r VAULT FILE_PATH TITLE < <(python3 -c '
-import sys, json
-d = json.loads(sys.stdin.read())
-print("Imperium-ENV", d["file_path"], d.get("title", ""))
-' <<< "$body")
-
-if [[ -z "$VAULT" || -z "$FILE_PATH" ]]; then
-    echo "open-session-doc: malformed response: $body" >&2
-    exit 1
-fi
-
-# --- 3. Resolve the origin machine for routing ---
-TARGET=$(origin_machine "$CLIENT_PID")
-
-# --- 4. Dispatch ---
-case "$TARGET" in
-    mac)
-        obsidian "vault=$VAULT" open "path=$FILE_PATH"
-        tmux display-message "opened: $TITLE" 2>/dev/null || true
-        ;;
-    wsl|phone|linux|unknown)
-        # TODO: cross-machine routing. For wsl/linux: ssh-connect and run the
-        # obsidian wrapper there (WSL proxies to Obsidian.exe which opens via
-        # native CLI). For phone: push an obsidian:// intent via Token-API.
-        tmux display-message "open-session-doc: routing to '$TARGET' not yet implemented" 2>/dev/null || true
-        echo "open-session-doc: origin resolved to '$TARGET' (cross-machine routing TODO)" >&2
-        echo "  vault=$VAULT  file=$FILE_PATH" >&2
-        exit 2
-        ;;
-    *)
-        echo "open-session-doc: unknown origin '$TARGET'" >&2
-        exit 1
-        ;;
-esac
+TITLE=$(python3 -c 'import sys, json; print(json.load(sys.stdin).get("title") or "")' <<< "$RESP" 2>/dev/null || echo "")
+tmux display-message "opened: ${TITLE:-doc $DOC_ID}" 2>/dev/null || true
