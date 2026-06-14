@@ -44,7 +44,7 @@ git branch --show-current 2>/dev/null || [ $? -eq 128 ]
 - Keep it short (2-4 words, kebab-case)
 
 **Session doc** (after naming, for non-primarch sessions):
-- Primarch sessions auto-link via `TOKEN_API_PRIMARCH` — no action needed
+- Primarch sessions auto-link via `TOKEN_API_PERSONA` — no action needed
 - For non-trivial work (3+ steps, multi-file changes), create or link a session doc:
   1. Check for existing active docs: `token-ping "session-docs?status=active"`
   2. If a relevant doc exists, link to it: `instance-name "<name>" --session-id <ID>`

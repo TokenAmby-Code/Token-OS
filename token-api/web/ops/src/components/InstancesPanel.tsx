@@ -3,6 +3,7 @@
 import type { OpsInstance } from '../types';
 import { statusTone, zealotryTone } from '../modes';
 import { formatAge, formatTime, compactPath } from '../format';
+import { openSessionDoc } from '../api';
 
 function Zealotry({ value }: { value: number }) {
   const tone = zealotryTone(value);
@@ -34,8 +35,21 @@ function SessionDocCell({ inst }: { inst: OpsInstance }) {
   const doc = inst.session_doc;
   const title = doc.title ?? (doc.path ? compactPath(doc.path) : null);
   if (!title) return <span className="faint">unbound</span>;
+  const docId = doc.id;
+  const openable = docId != null;
+  // Double-click opens the doc in Obsidian via the one open-by-id endpoint
+  // (server-side obsidian CLI) — the same path the tmux `prefix + S` keybind takes.
+  const onDoubleClick = openable
+    ? () => {
+        void openSessionDoc(docId).catch(() => {});
+      }
+    : undefined;
   return (
-    <span>
+    <span
+      className={openable ? 'sessiondoc is-openable' : 'sessiondoc'}
+      onDoubleClick={onDoubleClick}
+      title={openable ? 'Double-click to open in Obsidian' : undefined}
+    >
       {title}
       <span className="subline">{doc.status ?? doc.policy ?? doc.binding_source ?? ''}</span>
     </span>
