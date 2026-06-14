@@ -9,6 +9,8 @@ from .stack import stack_base_of
 from .tmux_adapter import TmuxAdapter
 
 CUSTODES_ROLE = "legion:custodes"
+MALCADOR_ROLE = "legion:malcador"
+PAX_ROLE = "legion:pax"
 FABRICATOR_ROLE = "mechanicus:fabricator-general"
 REGIMENT_ROLE = "legion:worker"
 STACK_COLLAPSED_HEIGHT = 3

@@ -30,6 +30,29 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 
 @pytest.mark.asyncio
+async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
+    # Pax is the third legion seat: a non-40k civic day-job overseer singleton.
+    # resolve_persona must surface it as an overseer (so the rank-stamp trigger
+    # promotes its instance row off the astartes default) with the civic slate/
+    # blue identity and no voice/sound (a silent seat).
+    import personas
+
+    async with aiosqlite.connect(app_env.db_path) as db:
+        pax = await personas.resolve_persona(db, "pax")
+
+    assert pax is not None
+    assert pax["id"] == personas.persona_id_for_slug("pax")
+    assert pax["default_rank"] == "overseer"
+    assert pax["pane_tint"] == "#1c2b3a"
+    assert pax["chip_color"] == "#3a6ea5"
+    assert pax["assignment_pool"] is None
+    assert pax["assignment_order"] is None
+    assert pax["tts_voice"] is None
+    assert pax["notification_sound"] is None
+    assert pax["silent"] is True
+
+
+@pytest.mark.asyncio
 async def test_resolver_silent_and_voiced_personas(app_env):
     import personas
 
