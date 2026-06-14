@@ -1488,6 +1488,11 @@ _RESTART_STATE_DENYLIST = {
     "steam_app_name",
     "steam_exe",
     "in_meeting",
+    # Live deskflow presence heartbeat — unknown until the supervisor checks in
+    # after restart. Persisting it would let a stale "connected" survive a reboot
+    # and falsely anchor work; the supervisor republishes on its next heartbeat.
+    "deskflow_active",
+    "deskflow_last_seen",
 }
 
 
@@ -5605,6 +5610,35 @@ def _activity_icons() -> list[ActivityIconState]:
 
 WORK_ACTION_BUFFER_SECONDS = 3 * 60
 TYPING_GUARD_ACTIVE_SECONDS = 15
+# Deskflow KVM client heartbeat freshness. The Mac deskflow-client supervisor
+# heartbeats DESKTOP_STATE["deskflow_active"]/["deskflow_last_seen"] while the
+# client is connected; a heartbeat older than this reads as absent so a
+# dead/quiet client stops anchoring work within one window. Matches the 3-minute
+# work-activity cutoff used for agent panes.
+DESKFLOW_ACTIVE_TTL_SECONDS = 3 * 60
+
+
+def _deskflow_active_fresh(now: datetime | None = None) -> bool:
+    """True when the Mac deskflow KVM client is connected with a fresh heartbeat.
+
+    The deskflow-client supervisor heartbeats DESKTOP_STATE["deskflow_active"] +
+    ["deskflow_last_seen"] while the client is connected (Emperor at his desk). A
+    stale heartbeat (client disconnected/quiet, supervisor dead) reads as not
+    active, so the signal can never anchor work indefinitely.
+    """
+    if not DESKTOP_STATE.get("deskflow_active"):
+        return False
+    last_seen = DESKTOP_STATE.get("deskflow_last_seen")
+    if not last_seen:
+        return False
+    try:
+        last_seen_dt = datetime.fromisoformat(last_seen)
+    except (TypeError, ValueError):
+        return False
+    if now is None:
+        now = datetime.now()
+    return (now - last_seen_dt).total_seconds() <= DESKFLOW_ACTIVE_TTL_SECONDS
+
 
 # ---- Action-based enforcement response (ack → action redesign) ----
 # Enforcement is satisfied/deferred by work-signal ACTIONS, not by acking.
@@ -5937,7 +5971,16 @@ async def compute_work_state() -> WorkStateResponse:
             and work_action_age_seconds <= TYPING_GUARD_ACTIVE_SECONDS
         )
 
-    productivity_active = bool(active_instances or observed_agents or recent_work_action)
+    # Auto active-process detection from deskflow KVM client presence. The Mac
+    # deskflow-client supervisor heartbeats while the client is connected (Emperor
+    # at his desk); a fresh heartbeat is work evidence even with no local agent
+    # pane, tmux typing, or explicit work_action. This is the feed the timer was
+    # missing — without it, genuine desk work decayed to idle_break all day.
+    deskflow_active = _deskflow_active_fresh(now)
+
+    productivity_active = bool(
+        active_instances or observed_agents or recent_work_action or deskflow_active
+    )
 
     # Per-class active-instance counts (billable Civic vs personal Imperium).
     # Both registered actives and observed agents count toward the work split
@@ -5962,6 +6005,13 @@ async def compute_work_state() -> WorkStateResponse:
     elif recent_work_action:
         reason = "recent_work_action"
         productivity_hold = "work_action_buffer"
+    elif deskflow_active:
+        # Auto active-process detection: no local agent pane, typing, or explicit
+        # work_action, but the deskflow KVM client is connected (Emperor at his
+        # desk). Hold the productivity door open as active_process. Ranked below
+        # the explicit signals so this complements — never overrides — them.
+        reason = "deskflow_desktop_active"
+        productivity_hold = "active_process"
     else:
         reason = "no_recent_work_activity"
         productivity_hold = "none"
@@ -13870,6 +13920,50 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 active_instance_count=active_count,
             ).model_dump(),
         )
+
+
+class DeskflowStateRequest(BaseModel):
+    """Deskflow KVM client presence heartbeat from the Mac supervisor.
+
+    Posted by Shell/deskflow-client-supervisor.py: active=True on connect and on
+    a periodic heartbeat while connected; active=False when the client
+    disconnects, goes quiet, or the supervisor exits.
+    """
+
+    active: bool
+    source: str = "deskflow-supervisor"
+
+
+@app.post("/api/desktop/deskflow")
+async def handle_deskflow_state(request: DeskflowStateRequest):
+    """Record deskflow KVM client presence as auto active-process work evidence.
+
+    This is the feed the timer was missing: the supervisor reports that the
+    deskflow client is connected (Emperor at his desk), and compute_work_state
+    turns a FRESH heartbeat into productivity_hold=active_process so real desk
+    work registers as WORK instead of decaying to idle_break. It complements the
+    explicit work-action / typing-guard model — it never suppresses them, and a
+    stale heartbeat ages out via DESKFLOW_ACTIVE_TTL_SECONDS.
+    """
+    now = datetime.now()
+    was_active = bool(DESKTOP_STATE.get("deskflow_active"))
+    DESKTOP_STATE["deskflow_active"] = request.active
+    if request.active:
+        DESKTOP_STATE["deskflow_last_seen"] = now.isoformat()
+    if request.active != was_active:
+        await log_event(
+            "deskflow_state_change",
+            details={
+                "active": request.active,
+                "source": request.source,
+                "last_seen": DESKTOP_STATE.get("deskflow_last_seen"),
+            },
+        )
+    return {
+        "deskflow_active": DESKTOP_STATE["deskflow_active"],
+        "deskflow_last_seen": DESKTOP_STATE.get("deskflow_last_seen"),
+        "ttl_seconds": DESKFLOW_ACTIVE_TTL_SECONDS,
+    }
 
 
 MEWGENICS_SPACE_STATE = {
