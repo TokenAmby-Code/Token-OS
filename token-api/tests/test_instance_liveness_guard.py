@@ -48,6 +48,29 @@ def _insert(
     return iid
 
 
+def _insert_sub(app_env, *, target, subscriber, target_pane="%99", subscriber_pane="%10"):
+    """Insert an active stop-hook subscription (watched=target, notify=subscriber)."""
+    conn = sqlite3.connect(str(app_env.db_path))
+    conn.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+            event, delivery, status, purpose)
+           VALUES (?, ?, ?, ?, 'stop', 'prompt', 'active', 'generic')""",
+        (target, target_pane, subscriber, subscriber_pane),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _active_sub_count(app_env):
+    conn = sqlite3.connect(str(app_env.db_path))
+    n = conn.execute(
+        "SELECT COUNT(*) FROM stop_hook_subscriptions WHERE status='active'"
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
 def _set_stopped_at(app_env, iid, when=None):
     conn = sqlite3.connect(str(app_env.db_path))
     conn.execute(
@@ -264,3 +287,53 @@ def test_reconcile_heals_fully_collapsed_state(app_env, monkeypatch):
     assert result["reactivated"] == 5
     for iid in swept:
         assert _row(app_env, iid)["status"] == "idle"
+
+
+# ── (e) sweep also GCs dead stop-hook subscriptions (Symptom 3) ───────────────
+
+
+def test_cleanup_prunes_dead_hook_subscription(app_env, monkeypatch):
+    """A subscription whose watched target is dead is GC'd as part of the sweep."""
+    subscriber = _insert(app_env, status="idle", tmux_pane="%10")  # DB-live
+    dead_target = _insert(app_env, status="stopped", tmux_pane=None)  # gone
+    _set_stopped_at(app_env, dead_target)
+    _insert_sub(app_env, target=dead_target, subscriber=subscriber)
+    _patch_panes(app_env, monkeypatch, [])  # no live panes for the dead target
+
+    result = _run(app_env.main.cleanup_stale_instances())
+
+    assert _active_sub_count(app_env) == 0, "dead-target subscription must be pruned"
+    assert result["pruned_hooks"] >= 1
+
+
+def test_cleanup_spares_hook_for_swept_but_live_target(app_env, monkeypatch):
+    """The critical guard: a stopped ROW whose pane is LIVE keeps its subscription.
+
+    Without unioning the tmux liveness oracle into the prune's live set, a swept-
+    but-live instance (the very Symptom-1 state) would have its still-valid hooks
+    garbage-collected before the reconciler reactivates the row.
+    """
+    subscriber = _insert(app_env, status="idle", tmux_pane="%10")  # DB-live
+    swept_live = _insert(app_env, status="stopped", tmux_pane=None)  # DB-dead...
+    _set_stopped_at(app_env, swept_live)
+    _insert_sub(app_env, target=swept_live, subscriber=subscriber)
+    # ...but its pane is genuinely alive (tmux oracle), so it must be protected.
+    _patch_panes(app_env, monkeypatch, [_pane("%21", swept_live)])
+
+    result = _run(app_env.main.cleanup_stale_instances())
+
+    assert _active_sub_count(app_env) == 1, "swept-but-live target's hook was wrongly pruned"
+    assert result["pruned_hooks"] == 0
+
+
+def test_cleanup_keeps_fully_live_hook(app_env, monkeypatch):
+    """A subscription with both endpoints live survives the sweep untouched."""
+    a = _insert(app_env, status="idle", tmux_pane="%14")
+    b = _insert(app_env, status="idle", tmux_pane="%10")
+    _insert_sub(app_env, target=a, target_pane="%14", subscriber=b)
+    _patch_panes(app_env, monkeypatch, [])
+
+    result = _run(app_env.main.cleanup_stale_instances())
+
+    assert _active_sub_count(app_env) == 1
+    assert result["pruned_hooks"] == 0

@@ -696,6 +696,37 @@ def test_unsubscribe_matches_phantom_notify_uuid(app_env):
 # ---- Prune: GC dangling watched/notify references ---------------------------
 
 
+def test_prune_extra_live_ids_protects_swept_but_live(app_env):
+    """``extra_live_ids`` spares a subscription whose watched row is stopped but
+    whose pane is genuinely live (the tmux liveness oracle the sweep passes in)."""
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "notify", pane="%10")  # DB-live subscriber
+    _insert_instance(app_env.db_path, "swept", pane=None, status="stopped")  # DB-dead
+    _insert_subscription(
+        app_env.db_path,
+        target_instance_id="swept",
+        target_pane="%21",
+        subscriber_instance_id="notify",
+        subscriber_pane="%10",
+    )
+
+    async def run():
+        import aiosqlite
+
+        async with aiosqlite.connect(app_env.db_path) as db:
+            # Without the oracle, "swept" is dangling and would be pruned.
+            bare = await hooks._prune_dangling_stop_subscriptions(db, confirm=False)
+            assert bare["count"] == 1
+            # With the oracle naming "swept" as live, nothing is pruned.
+            guarded = await hooks._prune_dangling_stop_subscriptions(
+                db, confirm=True, extra_live_ids={"swept"}
+            )
+            assert guarded["count"] == 0
+
+    asyncio.run(run())
+    assert len(_active_subscription_ids(app_env.db_path)) == 1
+
+
 def test_prune_removes_dangling_keeps_live(app_env):
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "live-a", pane="%14")

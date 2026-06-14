@@ -1362,6 +1362,7 @@ async def _prune_dangling_stop_subscriptions(
     *,
     confirm: bool,
     event: str = "stop",
+    extra_live_ids: set[str] | None = None,
 ) -> dict:
     """Remove active subscriptions that reference a non-live instance.
 
@@ -1371,6 +1372,12 @@ async def _prune_dangling_stop_subscriptions(
     additive and never removes these, so they accumulate forever, inflate
     `hook list`, and resolve to nothing (false "passive/dead" reads). Dry-run by
     default: nothing is removed unless ``confirm`` is set.
+
+    ``extra_live_ids`` augments the DB-derived live set with instance ids known to
+    be live by some other oracle — specifically the sweep's tmux ``@INSTANCE_ID``
+    stamps. A swept-but-live instance (the "live panes, dead rows" state) has a
+    ``stopped`` row yet a running pane; without this union its still-valid hooks
+    would be GC'd before the reconciler reactivates the row.
     """
     db.row_factory = aiosqlite.Row
     live_cursor = await db.execute(
@@ -1378,6 +1385,8 @@ async def _prune_dangling_stop_subscriptions(
            WHERE status NOT IN ('stopped', 'archived') AND tmux_pane IS NOT NULL"""
     )
     live_ids = {row["id"] for row in await live_cursor.fetchall()}
+    if extra_live_ids:
+        live_ids |= extra_live_ids
 
     cursor = await db.execute(
         """SELECT id, target_instance_id, target_pane, subscriber_instance_id,
