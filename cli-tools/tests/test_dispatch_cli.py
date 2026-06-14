@@ -645,7 +645,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert "engine:          claude" in custodes.stdout
     assert "primarch custodes" not in custodes.stdout
     assert "claude-wrapper.sh" in custodes.stdout
-    assert "TOKEN_API_PRIMARCH=custodes" in custodes.stdout
+    assert "TOKEN_API_PERSONA=custodes" in custodes.stdout
 
     inquisitor = subprocess.run(
         [
@@ -669,7 +669,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert inquisitor.returncode == 0, inquisitor.stderr
     assert "engine:          codex" in inquisitor.stdout
     assert "TOKEN_API_CODEX_PROFILE=inquisitor" in inquisitor.stdout
-    assert "TOKEN_API_PRIMARCH=inquisitor" in inquisitor.stdout
+    assert "TOKEN_API_PERSONA=inquisitor" in inquisitor.stdout
     assert "dispatch_codex_launch_inline" in inquisitor.stdout
 
     vulkan = subprocess.run(
@@ -693,7 +693,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     )
     assert vulkan.returncode == 0, vulkan.stderr
     assert "engine:          codex" in vulkan.stdout
-    assert "TOKEN_API_PRIMARCH=vulkan" in vulkan.stdout
+    assert "TOKEN_API_PERSONA=vulkan" in vulkan.stdout
     assert "primarch vulkan" not in vulkan.stdout
 
 

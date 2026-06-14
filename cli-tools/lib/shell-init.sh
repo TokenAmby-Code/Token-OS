@@ -30,14 +30,10 @@ _SHELL_INIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
 #    O-side: "what is machine X?" — static registry
 source "$_SHELL_INIT_DIR/nas-path.sh"
 
-# 2. Origin resolvers (origin_machine, origin_pane, ...) — I-side primitive:
-#    "who is invoking this?" — dynamic, per-invocation. See ORIGIN.md.
-source "$_SHELL_INIT_DIR/origin.sh"
-
-# 3. CLI tools on PATH
+# 2. CLI tools on PATH
 export PATH="$CLI_TOOLS/bin:$PATH"
 
-# 4. tmux send-keys guard — intercepts all send-keys calls to protect user input
+# 3. tmux send-keys guard — intercepts all send-keys calls to protect user input
 source "$_SHELL_INIT_DIR/tmux-guard-wrapper.sh"
 
 # ============================================================

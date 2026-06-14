@@ -120,6 +120,24 @@ export function focusPane(instanceId: string): Promise<FocusResult> {
   return postJson<FocusResult>(`/api/instances/${encodeURIComponent(instanceId)}/focus-pane`);
 }
 
+export type OpenDocResult = {
+  doc_id: number;
+  title: string | null;
+  file_path: string;
+  obsidian_uri: string;
+  opened: boolean;
+};
+
+/**
+ * Open a session doc in Obsidian by its stable id. The one open-by-id endpoint
+ * shared with the tmux `prefix + S` keybind: the server invokes the obsidian CLI
+ * on the Mac. The cockpit stays read-only — this routes the open *through*
+ * Token-API rather than mutating anything.
+ */
+export function openSessionDoc(docId: number): Promise<OpenDocResult> {
+  return postJson<OpenDocResult>(`/api/session-docs/${docId}/open`);
+}
+
 export type PhoneClearResult = {
   ok: boolean;
   before: { current_app: string | null; is_distracted: boolean };

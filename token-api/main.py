@@ -24490,6 +24490,77 @@ async def get_session_doc_content(doc_id: int):
     return {"id": doc_id, "title": row[1], "file_path": str(fp), "content": fp.read_text()}
 
 
+@app.post("/api/session-docs/{doc_id}/open")
+async def open_session_doc(doc_id: int):
+    """Open a session document in Obsidian by its stable id.
+
+    The single "open session doc by id" interface. Both signals funnel here:
+    the tmux ``prefix + S`` keybind (via cli-tools/bin/open-session-doc, which
+    resolves the current pane to a doc id) and the ops cockpit's double-click on
+    a fleet row. Resolves the doc's file_path, computes its vault-relative note
+    path, and invokes the ``obsidian`` CLI server-side — on the Mac, where
+    Obsidian and Token-API live — to focus/open the note.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+
+    from urllib.parse import quote
+
+    vault_root = Path(
+        os.environ.get("IMPERIUM_ENV")
+        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
+    )
+    vault_name = vault_root.name
+
+    fp = Path(row[0])
+    if not fp.is_absolute():
+        fp = vault_root / row[0]  # file_path may be stored vault-relative
+    try:
+        note_rel = str(fp.relative_to(vault_root))
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Session doc {doc_id} file is outside the vault: {fp}",
+        )
+
+    note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
+    obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
+
+    obsidian_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian"
+    if not obsidian_bin.exists():
+        raise HTTPException(status_code=500, detail="obsidian CLI not found")
+
+    proc = await _run_subprocess_offloop(
+        (str(obsidian_bin), f"vault={vault_name}", "open", f"path={note_rel}"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or "obsidian open failed"
+        logger.warning(
+            "open-session-doc: obsidian open failed for doc %s (%s): %s",
+            doc_id,
+            note_rel,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail)
+
+    return {
+        "doc_id": doc_id,
+        "title": row[1],
+        "file_path": str(fp),
+        "obsidian_uri": obsidian_uri,
+        "opened": True,
+    }
+
+
 @app.get("/api/session-docs/{doc_id}/rubric")
 async def get_session_doc_rubric(doc_id: int):
     """Diagnostic: surface exactly what victory-ack sees for a doc's rubric.

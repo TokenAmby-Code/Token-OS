@@ -308,7 +308,7 @@ class TestReconciliation:
                 "cwd": "/tmp/new",
                 "pid": 12345,
                 "tmux_pane": "%new",
-                "env": {"TOKEN_API_PRIMARCH": "custodes"},
+                "env": {"TOKEN_API_PERSONA": "custodes"},
             },
         )
         assert resp.status_code == 200, resp.text

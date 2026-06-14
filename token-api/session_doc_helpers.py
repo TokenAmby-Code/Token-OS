@@ -1311,7 +1311,7 @@ async def resolve_session_doc_for_start(
     instead of accumulating blank ``needs-session-name-N.md`` docs.
     """
     # Legion-aware so automated custodes launches (cron, GT/state-hook dispatch,
-    # resume) that never set TOKEN_API_PRIMARCH still bind to the shared daily note.
+    # resume) that never set TOKEN_API_PERSONA still bind to the shared daily note.
     if primarch_name == "custodes" or legion == "custodes":
         doc_id = await resolve_or_create_today_daily_note_session_doc(db)
         return doc_id, "daily_note_custodes"

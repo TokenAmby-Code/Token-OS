@@ -1964,8 +1964,8 @@ async def handle_session_start(payload: dict) -> dict:
         source_ip = client_ip
     device_id = resolve_device_from_ip(client_ip) if client_ip else "Mac-Mini"
 
-    # Detect primarch (env var) and transplant-from (file-based handoff injected by hook)
-    primarch_name = env.get("TOKEN_API_PRIMARCH", "")
+    # Detect persona (env var) and transplant-from (file-based handoff injected by hook).
+    primarch_name = _normalize_text(env.get("TOKEN_API_PERSONA", "")) or ""
     dispatch_legion = _normalize_text(
         payload.get("dispatch_legion") or env.get("TOKEN_API_LEGION", "")
     )
