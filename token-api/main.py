@@ -112,6 +112,7 @@ from routes.day_start import fire_day_start_internal
 from routes.day_start import router as day_start_router
 from routes.hooks import (
     NUDGE_COOLDOWN_SECONDS,
+    _prune_dangling_stop_subscriptions,
     _recently_nudged,
 )
 from routes.hooks import (
@@ -1285,13 +1286,30 @@ async def cleanup_stale_instances() -> dict:
         await db.commit()
         affected = len(reaped)
 
-    if affected > 0 or protected > 0:
+        # GC dead stop-hook subscriptions as part of the same liveness sweep
+        # (Symptom 3: stale subscriptions accumulate forever and inflate `hook
+        # list` with dead-pane cruft). The tmux live_ids are unioned into the
+        # prune's DB-derived live set so a swept-but-live instance — already
+        # reaped this morning but still running — keeps its valid hooks until the
+        # reconciler reactivates its row.
+        pruned = await _prune_dangling_stop_subscriptions(db, confirm=True, extra_live_ids=live_ids)
+        pruned_hooks = pruned.get("count", 0)
+
+    if affected > 0 or protected > 0 or pruned_hooks > 0:
         await log_event(
             "task_cleanup",
-            details={"cleaned_up": affected, "protected_live": protected},
+            details={
+                "cleaned_up": affected,
+                "protected_live": protected,
+                "pruned_hooks": pruned_hooks,
+            },
         )
 
-    return {"cleaned_up": affected, "protected_live": protected}
+    return {
+        "cleaned_up": affected,
+        "protected_live": protected,
+        "pruned_hooks": pruned_hooks,
+    }
 
 
 async def reconcile_live_panes() -> dict:
