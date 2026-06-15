@@ -332,6 +332,12 @@ export type PipelineDoc = {
   instance_type: string | null;
   head: string | null; // one-line excerpt only — never the full document
   created_at: string | null;
+  /**
+   * Preferred doc-date basis for cockpit date filters:
+   * frontmatter created/start_time/date, then DB created_at.
+   */
+  session_date?: string | null;
+  session_date_source?: string | null;
   age_seconds: number | null; // since creation — surfaces long-open docs honestly
   linked_instances: number;
 };

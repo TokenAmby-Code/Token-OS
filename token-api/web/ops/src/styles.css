@@ -861,6 +861,45 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
 
 /* ── session pipeline (read-only kanban lanes, authored in Obsidian) ────── */
 
+.pipeline__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 14px;
+  flex-wrap: wrap;
+}
+.pipeline__scope {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.pipeline__scope-btn {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 11px;
+  cursor: pointer;
+  transition: color .12s, background .12s, box-shadow .12s;
+}
+.pipeline__scope-btn:hover { color: var(--brass-bright); }
+.pipeline__scope-btn.is-active {
+  color: var(--phosphor);
+  background: color-mix(in srgb, var(--phosphor) 12%, var(--surface-3));
+  box-shadow: inset 0 0 0 1px var(--phosphor-dim);
+}
+.pipeline__scope-meta {
+  color: var(--faint);
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11.5px;
+}
+
 .lanes {
   display: grid;
   grid-auto-flow: column;

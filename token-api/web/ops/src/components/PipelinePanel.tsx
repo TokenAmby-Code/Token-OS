@@ -4,9 +4,64 @@
 // single writer of `status:`; clicking a card deep-links there. The cockpit
 // never mutates anything here.
 
+import { useMemo, useState } from 'react';
 import type { PipelineDoc, SessionDocsFeed } from '../types';
 import { pipelineLane, type LaneVisual } from '../modes';
 import { formatAge, compactPath } from '../format';
+
+type DateScope = 'today' | 'all';
+
+const OPS_LOCAL_TIME_ZONE = 'America/Denver';
+
+const denverDateFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: OPS_LOCAL_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+function datePartsToKey(parts: Intl.DateTimeFormatPart[]): string | null {
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
+}
+
+function localDateKey(date: Date): string | null {
+  return datePartsToKey(denverDateFormatter.formatToParts(date));
+}
+
+function hasExplicitOffset(value: string): boolean {
+  return /(?:z|[+-]\d{2}:?\d{2})$/i.test(value.trim());
+}
+
+function docDateKey(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  // Date-only and offset-less ISO-ish timestamps in session frontmatter are
+  // authored as local document dates. Keep their calendar date literal rather
+  // than feeding them through Date, which would introduce UTC/local shifts.
+  const datePrefix = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (datePrefix && !hasExplicitOffset(raw)) return datePrefix[1];
+
+  const parsed = new Date(raw.replace(' ', 'T'));
+  if (Number.isNaN(parsed.getTime())) return datePrefix?.[1] ?? null;
+  return localDateKey(parsed);
+}
+
+function pipelineDocDate(d: PipelineDoc): string | null {
+  return docDateKey(d.session_date ?? d.created_at);
+}
+
+function laneCounts(docs: PipelineDoc[]): Record<string, number> {
+  return docs.reduce<Record<string, number>>((acc, doc) => {
+    const key = pipelineLane(doc.status).key;
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
 
 function PipelineCard({ d }: { d: PipelineDoc }) {
   const title = d.title ?? (d.path ? compactPath(d.path) : 'untitled');
@@ -36,10 +91,60 @@ function PipelineCard({ d }: { d: PipelineDoc }) {
 }
 
 export function PipelinePanel({ feed }: { feed: SessionDocsFeed }) {
-  const docs = feed.docs ?? [];
-  const totals = feed.lane_totals ?? {};
+  const [scope, setScope] = useState<DateScope>('today');
+  const allDocs = feed.docs ?? [];
+  const todayKey = localDateKey(new Date());
+  const docs = useMemo(() => {
+    if (scope === 'all') return allDocs;
+    if (!todayKey) return [];
+    return allDocs.filter((doc) => pipelineDocDate(doc) === todayKey);
+  }, [allDocs, scope, todayKey]);
+  const totals = scope === 'all' ? (feed.lane_totals ?? {}) : laneCounts(docs);
+  const visibleCount = docs.length;
+  const allCount = allDocs.length;
+
+  const controls = (
+    <div className="pipeline__toolbar">
+      <div className="pipeline__scope" role="group" aria-label="Session date scope">
+        <button
+          type="button"
+          className={`pipeline__scope-btn ${scope === 'today' ? 'is-active' : ''}`}
+          aria-pressed={scope === 'today'}
+          onClick={() => setScope('today')}
+        >
+          Today
+        </button>
+        <button
+          type="button"
+          className={`pipeline__scope-btn ${scope === 'all' ? 'is-active' : ''}`}
+          aria-pressed={scope === 'all'}
+          onClick={() => setScope('all')}
+        >
+          All
+        </button>
+      </div>
+      <span className="pipeline__scope-meta">
+        {scope === 'today' ? `${visibleCount}/${allCount} cards · ${todayKey ?? 'local today'}` : `${allCount} cards`}
+      </span>
+    </div>
+  );
+
+  if (!allDocs.length) {
+    return (
+      <>
+        {controls}
+        <p className="empty">No session documents registered.</p>
+      </>
+    );
+  }
+
   if (!docs.length) {
-    return <p className="empty">No session documents registered.</p>;
+    return (
+      <>
+        {controls}
+        <p className="empty">No session documents for today. Switch to All to see historical cards.</p>
+      </>
+    );
   }
 
   const groups = new Map<string, { lane: LaneVisual; docs: PipelineDoc[] }>();
@@ -51,29 +156,32 @@ export function PipelinePanel({ feed }: { feed: SessionDocsFeed }) {
   const lanes = [...groups.values()].sort((a, b) => a.lane.order - b.lane.order);
 
   return (
-    <div className="lanes">
-      {lanes.map(({ lane, docs }) => {
-        // True count from the backend (pre-cap); fall back to what we received.
-        const total = totals[lane.key] ?? docs.length;
-        const hidden = Math.max(0, total - docs.length);
-        return (
-          <section className="lane" key={lane.key} style={{ '--lane-c': lane.color } as React.CSSProperties}>
-            <header className="lane__head">
-              <span className="lane__dot" />
-              {lane.label}
-              <span className="lane__count">{total}</span>
-            </header>
-            <div className="lane__cards">
-              {docs.map((d) => (
-                <PipelineCard key={d.id ?? d.path ?? d.title} d={d} />
-              ))}
-              {hidden > 0 ? (
-                <p className="lane__more">+{hidden} more · open in Obsidian</p>
-              ) : null}
-            </div>
-          </section>
-        );
-      })}
-    </div>
+    <>
+      {controls}
+      <div className="lanes">
+        {lanes.map(({ lane, docs }) => {
+          // True count from the backend (pre-cap) in All mode; filtered count in Today mode.
+          const total = totals[lane.key] ?? docs.length;
+          const hidden = scope === 'all' ? Math.max(0, total - docs.length) : 0;
+          return (
+            <section className="lane" key={lane.key} style={{ '--lane-c': lane.color } as React.CSSProperties}>
+              <header className="lane__head">
+                <span className="lane__dot" />
+                {lane.label}
+                <span className="lane__count">{total}</span>
+              </header>
+              <div className="lane__cards">
+                {docs.map((d) => (
+                  <PipelineCard key={d.id ?? d.path ?? d.title} d={d} />
+                ))}
+                {hidden > 0 ? (
+                  <p className="lane__more">+{hidden} more · open in Obsidian</p>
+                ) : null}
+              </div>
+            </section>
+          );
+        })}
+      </div>
+    </>
   );
 }
