@@ -289,8 +289,16 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
     rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null
   fi
 
+  # SessionStart carries the pane's registration. It is fire-and-forget with no
+  # other re-registration path until the next full `tx restart`, so a single
+  # dropped POST (a momentary token-api hiccup — restart race, brief EMFILE fd
+  # exhaustion) strands the pane with no registry row. Retry with a bounded
+  # backoff so a transient server blip self-recovers in-band. --retry-max-time
+  # caps the total retry window so a genuinely-down server still can't block
+  # Claude's startup for long; the hook stays best-effort and exits 0 regardless.
   RESPONSE=$(echo "${HOOK_INPUT}" | \
-    curl -s --connect-timeout 2 --max-time 3 \
+    curl -s --connect-timeout 2 --max-time 5 \
+      --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 12 \
       -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
       -H "Content-Type: application/json" \
       -d @- 2>/dev/null) || true

@@ -13,6 +13,7 @@ from tmuxctl.assertions import (
     PANE_CLOSE_TRANSIENT_OPTIONS,
     PERSONA_FAILOPEN_ATTEMPTS,
     PERSONA_GUARD_OPTION,
+    PERSONA_LABELS,
     PersonaSpec,
     _clear_pane_overlay,
     _dispatch_args,
@@ -21,6 +22,7 @@ from tmuxctl.assertions import (
     _observed_row_hash,
     _row_matches_persona,
     persona_spec,
+    sweep_persona_panes,
 )
 
 FG_LABEL = "mechanicus:fabricator-general"
@@ -457,6 +459,63 @@ def test_clear_pane_overlay_preserves_static_persona_guard():
 
 
 # ── canonical registry-snapshot extraction ───────────────────────────────────
+
+
+# ── periodic persona sweep ────────────────────────────────────────────────────
+
+
+def test_sweep_asserts_every_persona_label_once():
+    # The periodic reconciler runs the same assert_instance the restart path runs,
+    # once per PERSONA_LABELS entry — no teardown, no duplicated predicate.
+    adapter = FakeAdapter()
+    seen: list[str] = []
+
+    def fake_assert(_adapter, label):
+        seen.append(label)
+        return {"ok": True, "pane_label": label, "action": "none", "reason": "live"}
+
+    with patch.object(assertions, "assert_instance", side_effect=fake_assert):
+        results = sweep_persona_panes(adapter)
+
+    assert sorted(seen) == sorted(PERSONA_LABELS)
+    assert len(results) == len(PERSONA_LABELS)
+    assert all(r["ok"] for r in results)
+
+
+def test_sweep_noops_on_healthy_rows():
+    # A healthy fleet must produce no corrective action — assert_instance returns
+    # the live no-op verdict and the sweep simply relays it.
+    adapter = FakeAdapter()
+
+    with patch.object(
+        assertions,
+        "assert_instance",
+        side_effect=lambda _a, label: {"ok": True, "pane_label": label, "action": "none"},
+    ):
+        results = sweep_persona_panes(adapter)
+
+    assert {r["action"] for r in results} == {"none"}
+
+
+def test_sweep_captures_per_pane_errors_without_aborting():
+    # An absent pane (resolve_pane raises) must not stop the rest of the sweep —
+    # the error is captured for that label and the others still run.
+    adapter = FakeAdapter()
+
+    def fake_assert(_adapter, label):
+        if label == "legion:malcador":
+            raise ValueError("no live pane: legion:malcador")
+        return {"ok": True, "pane_label": label, "action": "none"}
+
+    with patch.object(assertions, "assert_instance", side_effect=fake_assert):
+        results = sweep_persona_panes(adapter)
+
+    assert len(results) == len(PERSONA_LABELS)
+    errored = [r for r in results if r["action"] == "error"]
+    assert [r["pane_label"] for r in errored] == ["legion:malcador"]
+    assert errored[0]["ok"] is False
+    # Every other persona pane still got asserted.
+    assert sum(1 for r in results if r.get("action") == "none") == len(PERSONA_LABELS) - 1
 
 
 def test_build_snapshot_extracts_persona_slug_and_rank():

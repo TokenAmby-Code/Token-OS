@@ -743,6 +743,36 @@ def _assert_instance_impl(
     return finish(result)
 
 
+def sweep_persona_panes(adapter: TmuxAdapter) -> list[dict[str, Any]]:
+    """Re-assert every singleton persona pane against the live session.
+
+    Runs the SAME per-pane assertion `tx restart` performs (``assert_instance``
+    over ``PERSONA_LABELS``) WITHOUT a teardown/rebuild, so a persona pane that
+    silently lost its registry row — e.g. a SessionStart registration POST dropped
+    while token-api was momentarily out of file descriptors (EMFILE) — self-heals
+    within one sweep interval instead of staying dead until the next full restart.
+
+    ``assert_instance`` is idempotent: it no-ops on a healthy row and only acts on
+    a live-but-unregistered / mismatched pane. A pane that is not present in the
+    live session (e.g. Malcador not seated) raises during resolution; that is
+    captured per-label so one absent pane never aborts the rest of the sweep.
+    """
+    results: list[dict[str, Any]] = []
+    for pane_label in sorted(PERSONA_LABELS):
+        try:
+            results.append(assert_instance(adapter, pane_label))
+        except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
+            results.append(
+                {
+                    "ok": False,
+                    "pane_label": pane_label,
+                    "action": "error",
+                    "reason": str(exc),
+                }
+            )
+    return results
+
+
 def assert_persona(
     adapter: TmuxAdapter, pane_label: str, *, prompt: str = "", session: str = "main"
 ) -> dict[str, Any]:

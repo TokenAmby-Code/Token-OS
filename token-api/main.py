@@ -1762,6 +1762,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await cron_engine.recover_orphaned_runs()
     await cron_engine.ensure_permanent_jobs()
     cron_engine.register_now_widget_job(DB_PATH, DAILY_NOTE_DIR)
+    cron_engine.register_persona_sweep_job()
     print("Cron engine loaded")
     # Start TTS queue worker
     _tts_mod.tts_worker_task = asyncio.create_task(tts_queue_worker())
