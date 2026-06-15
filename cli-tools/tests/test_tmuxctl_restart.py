@@ -8,7 +8,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.api import build_client_attachments
-from tmuxctl.builder import build_legion_window, build_workspace
+from tmuxctl.builder import (
+    PERSONA_WINDOWS,
+    _window_dir,
+    build_legion_window,
+    build_workspace,
+)
 from tmuxctl.enums import (
     AttachmentClass,
     CoherenceSeverity,
@@ -38,6 +43,8 @@ def _pane(
     command: str = "zsh",
     window: str = "somnium",
     stamp_instance_id: str = "",
+    cwd: str = "/Volumes/Imperium/Imperium-ENV",
+    runtime_engine: str = "",
 ) -> PaneSnapshot:
     return PaneSnapshot(
         pane_id=pane_id,
@@ -55,6 +62,8 @@ def _pane(
         reserved=False,
         active=False,
         instance_id=stamp_instance_id,
+        cwd=cwd,
+        runtime_engine=runtime_engine,
     )
 
 
@@ -88,6 +97,8 @@ def _instance(
     tmux_pane: str = "%1",
     is_subagent: bool = False,
     legion: str = "",
+    rank: str = "",
+    engine: str = "",
 ) -> InstanceRegistryEntry:
     return InstanceRegistryEntry(
         instance_id=instance_id,
@@ -99,6 +110,8 @@ def _instance(
         pre_stop_status=pre_stop_status,
         is_subagent=is_subagent,
         legion=legion,
+        rank=rank,
+        engine=engine,
         last_activity=last_activity if last_activity is not None else _iso_ago(hours=1),
         stopped_at=stopped_at,
     )
@@ -109,7 +122,10 @@ def _iso_ago(*, hours: int = 0, seconds: int = 0) -> str:
 
 
 def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
-    workspace = _workspace(_pane("%1", "somnium:NW"))
+    workspace = _workspace(
+        _pane("%1", "somnium:NW", stamp_instance_id="old"),
+        _pane("%2", "somnium:NW", stamp_instance_id="new"),
+    )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
@@ -128,7 +144,10 @@ def test_restart_plan_dedupes_by_pane_label_and_keeps_newest():
 
 
 def test_restart_plan_ignores_stale_stopped_duplicate_claims():
-    workspace = _workspace(_pane("%1", "somnium:NW"))
+    workspace = _workspace(
+        _pane("%1", "somnium:NW", stamp_instance_id="old-stopped"),
+        _pane("%2", "somnium:NW", stamp_instance_id="active"),
+    )
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(
@@ -146,10 +165,10 @@ def test_restart_plan_ignores_stale_stopped_duplicate_claims():
     plan = build_restart_plan(workspace, registry)
 
     assert [resume.instance_id for resume in plan.resumes] == ["active"]
-    assert not any(issue.code == "duplicate_pane_label" for issue in plan.coherence_issues)
+    assert any(issue.code == "duplicate_pane_label" for issue in plan.coherence_issues)
 
 
-def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
+def test_restart_plan_ignores_db_only_recent_stop_and_stale_activity():
     workspace = _workspace(_pane("%1", "somnium:NW"), _pane("%2", "somnium:NE"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
@@ -168,12 +187,33 @@ def test_restart_plan_includes_recent_stop_and_excludes_stale_activity():
 
     plan = build_restart_plan(workspace, registry)
 
+    assert plan.resumes == ()
+
+
+def test_restart_plan_resumes_live_stopped_pane_and_continues_if_processing():
+    workspace = _workspace(_pane("%2", "somnium:NE", stamp_instance_id="recent-stop"))
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(
+            _instance(
+                "recent-stop",
+                "somnium:NE",
+                status=InstanceStatus.STOPPED,
+                pre_stop_status=InstanceStatus.PROCESSING,
+                stopped_at=_iso_ago(hours=3),
+                tmux_pane="%9",
+            ),
+        ),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
     assert [resume.instance_id for resume in plan.resumes] == ["recent-stop"]
     assert plan.resumes[0].disposition is ResumeDisposition.RESUME_AND_CONTINUE
 
 
-def test_restart_plan_flags_busy_targets_and_pane_id_drift():
-    workspace = _workspace(_pane("%2", "somnium:NW", command="claude"))
+def test_restart_plan_flags_busy_targets_without_persisting_pane_id_drift():
+    workspace = _workspace(_pane("%2", "somnium:NW", command="claude", stamp_instance_id="abc"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(_instance("abc", "somnium:NW", tmux_pane="%1"),),
@@ -182,13 +222,13 @@ def test_restart_plan_flags_busy_targets_and_pane_id_drift():
     plan = build_restart_plan(workspace, registry)
 
     codes = {issue.code: issue.severity for issue in plan.coherence_issues}
-    assert codes["pane_id_mismatch"] is CoherenceSeverity.WARNING
+    assert "pane_id_mismatch" not in codes
     assert codes["target_busy"] is CoherenceSeverity.WARNING
     assert not plan.has_errors
 
 
 def test_restart_plan_flags_codex_targets_busy():
-    workspace = _workspace(_pane("%2", "somnium:NW", command="codex"))
+    workspace = _workspace(_pane("%2", "somnium:NW", command="codex", stamp_instance_id="abc"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(_instance("abc", "somnium:NW", tmux_pane="%2"),),
@@ -202,7 +242,7 @@ def test_restart_plan_flags_codex_targets_busy():
 
 
 def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
-    workspace = _workspace(_pane("%2", "somnium:NE"))
+    workspace = _workspace(_pane("%2", "somnium:NE", stamp_instance_id="custodes"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(_instance("custodes", "somnium:NE", tmux_pane="%2", legion="custodes"),),
@@ -215,7 +255,7 @@ def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
 
 
 def test_restart_plan_marks_promoted_fabricator_for_mechanicus_tombstone():
-    workspace = _workspace(_pane("%2", "palace:N", window="palace"))
+    workspace = _workspace(_pane("%2", "palace:N", window="palace", stamp_instance_id="fabricator"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(_instance("fabricator", "palace:NE", tmux_pane="%2", legion="fabricator"),),
@@ -227,7 +267,7 @@ def test_restart_plan_marks_promoted_fabricator_for_mechanicus_tombstone():
     assert plan.resumes[0].tombstone_role == "mechanicus:fabricator-general"
 
 
-def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
+def test_db_only_hidden_palace_side_is_not_planned():
     workspace = _workspace(
         _pane("%1", "palace:N", window="palace"),
         _pane("%3", "palace:S", window="palace"),
@@ -241,17 +281,15 @@ def test_hidden_but_legal_palace_side_is_planned_for_post_rebuild_resolution():
 
     plan = build_restart_plan(workspace, registry)
 
-    assert len(plan.resumes) == 1
-    assert plan.resumes[0].target_hidden_until_rebuild is True
-    assert not any(issue.code == "missing_target_pane" for issue in plan.coherence_issues)
+    assert plan.resumes == ()
 
 
 def test_palace_happy_path_resumes_grid_and_side_labels():
     workspace = _workspace(
         _pane("%1", "palace:W", window="palace"),
-        _pane("%2", "palace:N", window="palace"),
+        _pane("%2", "palace:N", window="palace", stamp_instance_id="alpha"),
         _pane("%3", "palace:S", window="palace"),
-        _pane("%6", "palace:E", window="palace"),
+        _pane("%6", "palace:E", window="palace", stamp_instance_id="beta"),
         window="palace",
         archetype=WindowArchetype.PALACE,
     )
@@ -296,10 +334,9 @@ def test_restart_plan_backfills_pane_label_from_live_instance_stamp():
     ]
 
 
-def test_restart_plan_prefers_registry_pane_label_over_stamp():
-    # When the registry still carries a pane_label it wins, so a future registry
-    # that resumes serving labels keeps working and a stale stamp cannot hijack
-    # the resume target.
+def test_restart_plan_prefers_live_stamp_label_over_stale_registry_label():
+    # Restart restore follows the live pane snapshot. A stale DB pane_label must
+    # not move a still-open pane to a different target.
     workspace = _workspace(
         _pane("%1", "palace:W", window="palace", stamp_instance_id="abc"),
         _pane("%2", "palace:N", window="palace"),
@@ -314,7 +351,7 @@ def test_restart_plan_prefers_registry_pane_label_over_stamp():
     plan = build_restart_plan(workspace, registry)
 
     assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
-        ("abc", "palace:N", "")
+        ("abc", "palace:W", "")
     ]
 
 
@@ -378,7 +415,7 @@ def test_restart_executor_does_not_fall_back_to_internal_pane_id() -> None:
 
 
 def test_dry_run_emits_deterministic_action_order():
-    workspace = _workspace(_pane("%1", "somnium:NW"))
+    workspace = _workspace(_pane("%1", "somnium:NW", stamp_instance_id="abc12345"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
         instances=(_instance("abc12345", "somnium:NW"),),
@@ -543,6 +580,26 @@ def test_builder_creates_canonical_workspace_roles():
     assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
     pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
     assert "tui" not in pane_types
+
+
+def test_window_dir_persona_windows_use_vault_when_mounted(tmp_path, monkeypatch) -> None:
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    monkeypatch.setenv("IMPERIUM", str(tmp_path))
+
+    # Persona windows launch from the vault; non-persona windows stay in $HOME.
+    for window in PERSONA_WINDOWS:
+        assert _window_dir(window) == str(vault)
+    assert _window_dir("palace") == str(pathlib.Path.home())
+    assert _window_dir("reservists") == str(pathlib.Path.home())
+
+
+def test_window_dir_falls_back_to_home_when_vault_unmounted(tmp_path, monkeypatch) -> None:
+    # IMPERIUM points at a root with no Imperium-ENV dir → not mounted.
+    monkeypatch.setenv("IMPERIUM", str(tmp_path / "nonexistent"))
+
+    for window in PERSONA_WINDOWS:
+        assert _window_dir(window) == str(pathlib.Path.home())
 
 
 def test_build_legion_window_seats_two_overseers_in_order() -> None:

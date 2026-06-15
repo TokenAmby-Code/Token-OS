@@ -383,6 +383,7 @@ class TmuxAdapter:
                 "#{pane_current_command}",
                 "#{pane_tty}",
                 "#{pane_active}",
+                "#{pane_current_path}",
             ]
         )
         lines = self.run("list-panes", "-t", target, "-F", fmt).splitlines()
@@ -399,6 +400,7 @@ class TmuxAdapter:
                 current_command,
                 tty,
                 active,
+                cwd,
             ) = line.split("\t")
             panes.append(
                 {
@@ -412,6 +414,7 @@ class TmuxAdapter:
                     "current_command": current_command,
                     "tty": tty,
                     "active": active,
+                    "cwd": cwd,
                 }
             )
         return panes

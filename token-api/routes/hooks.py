@@ -1898,10 +1898,19 @@ async def handle_wrapper_start(payload: dict) -> dict:
 
 
 async def handle_wrapper_end(payload: dict) -> dict:
-    """Handle wrapper-level exit telemetry without stopping an instance row."""
+    """Handle terminal wrapper exit and stop the correlated live instance row.
+
+    Claude normally emits SessionEnd before WrapperEnd; Codex and crashy wrappers
+    may not. WrapperEnd is terminal, so use wrapper_launch_id as the durable
+    correlation key and mark any still-live row stopped. This is best-effort and
+    idempotent: already stopped/archived/retired rows are left alone.
+    """
     wrapper_launch_id = _normalize_text(
         payload.get("wrapper_launch_id")
         or payload.get("env", {}).get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
+    )
+    tmux_pane = _normalize_text(
+        payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")
     )
     details = {
         "wrapper_launch_id": wrapper_launch_id,
@@ -1912,15 +1921,61 @@ async def handle_wrapper_end(payload: dict) -> dict:
             payload.get("engine") or payload.get("env", {}).get("TOKEN_API_ENGINE", "")
         ),
         "cwd": _normalize_text(payload.get("cwd")),
-        "tmux_pane": _normalize_text(
-            payload.get("tmux_pane") or payload.get("env", {}).get("TMUX_PANE", "")
-        ),
+        "tmux_pane": tmux_pane,
         "pid": payload.get("pid"),
         "exit_code": payload.get("exit_code"),
         "source": "wrapper",
     }
-    await log_event("wrapper_end", details=details)
-    return {"success": True, "action": "wrapper_end_logged", "wrapper_launch_id": wrapper_launch_id}
+    stopped_instance_id = None
+    if wrapper_launch_id:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT id, status, rank, tmux_pane
+                   FROM instances
+                   WHERE wrapper_launch_id = ?
+                   ORDER BY last_activity DESC, created_at DESC
+                   LIMIT 1""",
+                (wrapper_launch_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row["status"] not in {"stopped", "archived"} and row["rank"] != "retired":
+                stopped_instance_id = row["id"]
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=stopped_instance_id,
+                    updates={
+                        "status": "stopped",
+                        "input_lock": None,
+                        "stopped_at": now,
+                        "hook_driven": 0,
+                        "golden_throne": None,
+                    },
+                    mutation_type="instance_stopped",
+                    write_source="hooks",
+                    actor="WrapperEnd",
+                    wrapper_launch_id=wrapper_launch_id,
+                )
+                await db.commit()
+                pane_to_clear = row["tmux_pane"] or tmux_pane
+                if pane_to_clear:
+                    try:
+                        await asyncio.to_thread(
+                            shared.clear_pane_tint, pane_to_clear, source="WrapperEnd"
+                        )
+                    except Exception:
+                        pass
+    details["stopped_instance_id"] = stopped_instance_id
+    await log_event("wrapper_end", instance_id=stopped_instance_id or None, details=details)
+    return {
+        "success": True,
+        "action": "wrapper_end_logged"
+        if not stopped_instance_id
+        else "wrapper_end_stopped_instance",
+        "wrapper_launch_id": wrapper_launch_id,
+        "instance_id": stopped_instance_id,
+    }
 
 
 # ============ Launch Zealotry Parsing ============
@@ -3367,7 +3422,7 @@ async def handle_session_end(payload: dict) -> dict:
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
                       tmux_pane,
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
-                      workflow_state, pane_label, golden_throne
+                      workflow_state, pane_label, golden_throne, status, rank
                FROM instances WHERE id = ?""",
             (session_id,),
         )
@@ -3388,6 +3443,8 @@ async def handle_session_end(payload: dict) -> dict:
         _prior_workflow_state = row[6]
         _stop_pane_label = row[7]
         _gt_marker = row[8]
+        _existing_status = row[9]
+        _existing_rank = row[10]
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
@@ -3468,7 +3525,6 @@ async def handle_session_end(payload: dict) -> dict:
                 }
             )
         session_end_updates = {
-            "status": "stopped",
             "input_lock": None,
             "stopped_at": now,
             "hook_driven": 0,
@@ -3479,6 +3535,8 @@ async def handle_session_end(payload: dict) -> dict:
             "next_required_action": None,
             "next_action_owner": None,
         }
+        if _existing_status != "archived":
+            session_end_updates["status"] = "stopped"
         # Legacy `synced=0` cleared the morning-session sync flag. Its durable home is the
         # golden_throne marker: clear it ONLY when it is the 'sync' sentinel — a real
         # golden_throne.id binding survives the session ending.

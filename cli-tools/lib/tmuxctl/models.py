@@ -36,6 +36,9 @@ class PaneSnapshot:
     instance_id: str = ""
     tombstone_target: str = ""
     tombstone_source: str = ""
+    cwd: str = ""
+    runtime_engine: str = ""
+    wrapper_launch_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,8 @@ class PlannedResume:
     reason: str
     target_hidden_until_rebuild: bool = False
     tombstone_role: str = ""
+    engine: str = ""
+    source: str = "registry"
 
 
 @dataclass(frozen=True)

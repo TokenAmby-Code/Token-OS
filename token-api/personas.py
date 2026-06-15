@@ -152,6 +152,22 @@ ULTIMATE_ASTARTES = PersonaSeed(
     "chimes.wav",
 )
 
+# Retirement/quarantine persona used when an Astartes chapter child is banished.
+# It deliberately has no assignment pool, so moving a row here releases the
+# original chapter/persona lock without putting Black Shields into rotation.
+BLACK_SHIELDS = PersonaSeed(
+    "black-shields",
+    "Black Shields",
+    "astartes",
+    None,
+    None,
+    "default",
+    "#111111",
+    None,
+    None,
+    None,
+)
+
 # Civic worker persona for the koronus/pax-stack worker agents (the right-side
 # stack), analogous to how mechanicus workers are astartes. ``astartes`` rank so
 # it is resolvable like a chapter, but with NO assignment pool so it never enters
@@ -263,12 +279,40 @@ PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (
     ),
 )
 
+# ── Mechanicus worker — the voiceless shared coat ───────────────────────────
+# Declared 2026-06-10 (Terra/Ultramar/Mechanicus Worker Persona). NOT an Astartes
+# chapter and NOT a singleton: a SHARED, non-exclusive role coat worn by any
+# number of silent Fabricator-General subagents at once. ``default_rank='astartes'``
+# is the deliberate encoding — that is the discriminator the singleton guard
+# (``db_schema.trg_instances_singleton_guard``) reads as "non-singleton, no
+# lock-and-retire", so many instances may hold this persona simultaneously. It is
+# kept OUT of the Astartes voice mutex by carrying no ``assignment_pool`` and
+# ``tts_voice=None`` (voiceless): never drawn by ``assign_astartes_persona`` /
+# ``selectable_astartes_personas``, so it provably never squats a chapter voice
+# slot. Uniform mechanicus tint so the silent FG cohort reads as one visual block;
+# instances differ only by tab_name + pane. The biconditional that binds it to the
+# FG commander lives in ``db_schema`` (write triggers) + ``validate_mechanicus_invariant``.
+MECHANICUS_WORKER = PersonaSeed(
+    "mechanicus-worker",
+    "Mechanicus Worker",
+    "astartes",
+    None,
+    None,
+    "#300808",
+    "#8b1a1a",
+    None,
+    None,
+    None,
+)
+
 PERSONA_SEEDS: tuple[PersonaSeed, ...] = (
     *SINGLETON_PERSONAS,
     *PRIMARCH_PERSONAS,
+    MECHANICUS_WORKER,
     *PRIMARY_ASTARTES,
     *BACKUP_ASTARTES,
     ULTIMATE_ASTARTES,
+    BLACK_SHIELDS,
     *CIVIC_WORKER_PERSONAS,
 )
 SEED_BY_SLUG = {seed.slug: seed for seed in PERSONA_SEEDS}
@@ -696,6 +740,7 @@ ALL_COMPAT_PROFILES = [
     *PRIMARY_PROFILES,
     *BACKUP_PROFILES,
     ULTIMATE_FALLBACK_PROFILE,
+    seed_profile(BLACK_SHIELDS),
     *PERSONA_COMPAT_PROFILES,
 ]
 PROFILE_BY_SLUG = {p["name"]: p for p in ALL_COMPAT_PROFILES}
@@ -804,3 +849,81 @@ def _row_to_dict_with_names(row, names: Sequence[str]) -> dict:
     if hasattr(row, "keys"):
         return {key: row[key] for key in row.keys()}
     return dict(zip(names, row, strict=False))
+
+
+# ── Mechanicus-worker biconditional — query-time guard (belt + suspenders) ──
+# The keystone invariant (Terra/Ultramar/Mechanicus Worker Persona) is enforced
+# at write time by the ``db_schema`` triggers; this is the read-time half. For
+# every live (rank != 'retired') *worker-tier* instance it asserts:
+#
+#   * commander resolves to the Fabricator-General persona singleton
+#     IFF persona == mechanicus-worker            (the keystone biconditional)
+#   * persona == mechanicus-worker  =>  automated = 1   (secondary invariant)
+#
+# "Commander resolves to FG" is keyed on the FG *persona* id (resolved by slug,
+# restart-stable) carried as ``commander_type='persona' AND commander_id=<fg>`` —
+# never a volatile commander instance_id. Singletons (personas whose
+# ``default_rank != 'astartes'``: FG, Administratum, Custodes, Inquisitor,
+# Primarchs) are EXEMPT — the biconditional is worker-tier only, and the FG is
+# not its own commander. NULL-persona rows are treated as worker-tier (default
+# rank 'astartes') so a stray FG-commanded row with no persona is still flagged.
+#
+# Column order is fixed and read by position so the guard does not depend on the
+# caller's ``row_factory`` (a plain tuple and an aiosqlite.Row both work).
+_MECH_INVARIANT_SQL = """
+    SELECT
+        i.id,
+        (i.commander_type = 'persona'
+            AND i.commander_id = (SELECT id FROM personas WHERE slug = 'fabricator-general'))
+            AS commander_is_fg,
+        (i.persona_id IS (SELECT id FROM personas WHERE slug = 'mechanicus-worker'))
+            AS persona_is_mech,
+        i.automated
+    FROM instances i
+    LEFT JOIN personas p ON p.id = i.persona_id
+    WHERE i.rank != 'retired'
+      AND COALESCE(p.default_rank, 'astartes') = 'astartes'
+"""
+
+
+def _mech_invariant_violations(rows) -> list[dict]:
+    violations: list[dict] = []
+    for row in rows:
+        instance_id = row[0]
+        commander_is_fg = bool(row[1])
+        persona_is_mech = bool(row[2])
+        automated = bool(row[3])
+        reasons: list[str] = []
+        if commander_is_fg != persona_is_mech:
+            # commander→FG without the mechanicus coat, or the coat without a
+            # FG commander — either half of the biconditional broken.
+            reasons.append("biconditional")
+        if persona_is_mech and not automated:
+            reasons.append("not_automated")
+        if reasons:
+            violations.append(
+                {
+                    "id": instance_id,
+                    "reasons": reasons,
+                    "commander_is_fg": commander_is_fg,
+                    "persona_is_mech": persona_is_mech,
+                    "automated": automated,
+                }
+            )
+    return violations
+
+
+async def validate_mechanicus_invariant(db: aiosqlite.Connection) -> list[dict]:
+    """Return mechanicus-worker biconditional violations among live instances.
+
+    Empty list == healthy. Callers raise/log/heal per policy (the write triggers
+    keep this empty in steady state; a non-empty result is a real anomaly worth
+    surfacing). See :data:`_MECH_INVARIANT_SQL` for the exact contract.
+    """
+    cursor = await db.execute(_MECH_INVARIANT_SQL)
+    return _mech_invariant_violations(await cursor.fetchall())
+
+
+def validate_mechanicus_invariant_sync(conn: sqlite3.Connection) -> list[dict]:
+    """Synchronous variant of :func:`validate_mechanicus_invariant`."""
+    return _mech_invariant_violations(conn.execute(_MECH_INVARIANT_SQL).fetchall())

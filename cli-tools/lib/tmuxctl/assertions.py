@@ -45,8 +45,9 @@ class PersonaSpec:
     sync: bool = False
     model: str = ""
     # Working dir for the launch. Empty → dispatch picks its default ($HOME). The
-    # civic seats pin the Civic vault so their persona notes resolve and legion
-    # auto-detect reads `civic`.
+    # legion/mechanicus seats pin the Imperium-ENV vault and the civic seats pin
+    # the Civic vault, so their persona notes resolve and legion auto-detect reads
+    # the right vault.
     working_dir: str = ""
 
 
@@ -62,6 +63,17 @@ def _vault_root() -> Path:
 CIVIC_VAULT = Path("/Volumes/Civic/Pax-ENV")
 
 
+def _persona_working_dir() -> str:
+    """Imperium-ENV vault as the persona launch cwd, mount-guarded.
+
+    Persona panes (Custodes, Malcador, FG, Admin) must launch from the vault, not
+    $HOME. Returns "" when the vault is not mounted so dispatch falls back to its
+    own default instead of being handed a nonexistent --dir.
+    """
+    vault = _vault_root()
+    return str(vault) if vault.is_dir() else ""
+
+
 def _today_daily_note() -> str:
     return str(_vault_root() / f"{date.today().isoformat()}.md")
 
@@ -73,7 +85,13 @@ def _admin_log() -> str:
 def persona_spec(label: str) -> PersonaSpec:
     if label == "legion:custodes":
         return PersonaSpec(
-            label, "custodes", "hook_driven", _today_daily_note(), sync=True, model="opus"
+            label,
+            "custodes",
+            "hook_driven",
+            _today_daily_note(),
+            sync=True,
+            model="opus",
+            working_dir=_persona_working_dir(),
         )
     if label == "legion:malcador":
         return PersonaSpec(
@@ -82,6 +100,7 @@ def persona_spec(label: str) -> PersonaSpec:
             "hook_driven",
             str(_vault_root() / "Terra" / "Sessions" / "malcador.md"),
             model="fable",
+            working_dir=_persona_working_dir(),
         )
     if label == "mechanicus:fabricator-general":
         return PersonaSpec(
@@ -89,9 +108,17 @@ def persona_spec(label: str) -> PersonaSpec:
             "fabricator-general",
             "hook_driven",
             str(_vault_root() / "Mars" / "Sessions" / "fabricator-general.md"),
+            working_dir=_persona_working_dir(),
         )
     if label == "mechanicus:admin":
-        return PersonaSpec(label, "administratum", "hook_driven", _admin_log(), model="sonnet")
+        return PersonaSpec(
+            label,
+            "administratum",
+            "hook_driven",
+            _admin_log(),
+            model="sonnet",
+            working_dir=_persona_working_dir(),
+        )
     if label == "koronus:pax":
         # Pax: the combined Custodes+Administratum civic seat (human-facing
         # interaction + record-keeper). Opus, launched from the Civic vault.
@@ -247,6 +274,7 @@ PANE_CLOSE_TRANSIENT_OPTIONS = (
     "@CWD",
     "@CC_STATE",
     "@TTS_STATE",
+    "@OPS_SELECTED",
     "@CONTEXT_INFO",
     "@STACK_PENDING",
     "@ACTIVE_TITLE",
@@ -657,6 +685,9 @@ def _assert_instance_impl(
                 "session_doc": spec.session_doc,
                 "sync": spec.sync,
                 "model": spec.model,
+                # Launch the persona from its vault, not $HOME. The legion/mechanicus
+                # seats pin the (mount-guarded) Imperium-ENV vault and civic seats pin
+                # the Civic vault; _dispatch_args omits --dir when blank.
                 "working_dir": spec.working_dir,
                 "no_gt": not spec.sync,
             }

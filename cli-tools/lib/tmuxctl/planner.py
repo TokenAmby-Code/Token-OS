@@ -46,8 +46,13 @@ def build_restart_plan(
     resumes: list[PlannedResume] = []
     skipped: list[PlannedResume] = []
 
-    registry_instances = _backfill_pane_labels_from_stamps(registry.instances, workspace)
-    candidate_instances = _candidate_instances(registry_instances)
+    # Restart restore is sourced from the pre-teardown tmux snapshot. A registry
+    # row alone is never intent to resume: panes closed before `tx restart` have
+    # no live @INSTANCE_ID stamp and therefore do not enter this candidate set.
+    # The DB is metadata only (cwd/engine/rank/status/session), with synthetic
+    # live candidates covering the case where registration readback failed but
+    # the pane still carries runtime identity.
+    candidate_instances = _live_snapshot_candidates(workspace, registry)
     candidates = _dedupe_candidates(candidate_instances)
     active_labels = [
         canonical_pane_role(inst.pane_label) for inst in candidates if _is_resumable(inst)
@@ -93,6 +98,8 @@ def build_restart_plan(
                     reason="target pane hidden in current topology; resolve after rebuild",
                     target_hidden_until_rebuild=True,
                     tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
+                    engine=inst.engine,
+                    source="live_tmux",
                 )
                 if disposition is ResumeDisposition.SKIP:
                     skipped.append(planned)
@@ -117,6 +124,8 @@ def build_restart_plan(
                         disposition=ResumeDisposition.SKIP,
                         reason="target pane missing from workspace snapshot",
                         tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
+                        engine=inst.engine,
+                        source="live_tmux",
                     )
                 )
             continue
@@ -168,6 +177,8 @@ def build_restart_plan(
             reason=_resume_reason(inst, disposition),
             target_hidden_until_rebuild=False,
             tombstone_role=_orchestrator_tombstone_role(inst, pane_label),
+            engine=inst.engine,
+            source="live_tmux",
         )
         if disposition is ResumeDisposition.SKIP:
             skipped.append(planned)
@@ -183,6 +194,54 @@ def build_restart_plan(
         grouped_sessions=tuple(grouped_sessions),
         coherence_issues=tuple(issues),
     )
+
+
+def _live_snapshot_candidates(
+    workspace: WorkspaceSnapshot, registry: InstanceRegistrySnapshot
+) -> list[InstanceRegistryEntry]:
+    registry_by_id = {inst.instance_id: inst for inst in registry.instances if inst.instance_id}
+    live: list[InstanceRegistryEntry] = []
+    now = datetime.now(UTC).isoformat()
+    for pane in workspace.iter_panes():
+        pane_label = canonical_pane_role(pane.pane_role)
+        if not pane_label or not pane.instance_id:
+            continue
+        base = registry_by_id.get(pane.instance_id)
+        engine = _pane_engine(pane, base)
+        working_dir = base.working_dir if base and base.working_dir else pane.cwd
+        if base is None:
+            base = InstanceRegistryEntry(
+                instance_id=pane.instance_id,
+                device_id=registry.device_id,
+                pane_label=pane_label,
+                tmux_pane=pane.pane_id,
+                working_dir=working_dir,
+                status=InstanceStatus.PROCESSING,
+                pre_stop_status=InstanceStatus.UNKNOWN,
+                last_activity=now,
+                engine=engine,
+            )
+        else:
+            base = replace(
+                base,
+                pane_label=pane_label,
+                tmux_pane=pane.pane_id,
+                working_dir=working_dir,
+                engine=engine or base.engine,
+            )
+        if _is_candidate(base):
+            live.append(base)
+    return live
+
+
+def _pane_engine(pane: PaneSnapshot, instance: InstanceRegistryEntry | None = None) -> str:
+    for value in (pane.runtime_engine, instance.engine if instance else "", pane.current_command):
+        text = (value or "").strip().lower()
+        if "codex" in text:
+            return "codex"
+        if "claude" in text or "node" in text:
+            return "claude"
+    return ""
 
 
 def _backfill_pane_labels_from_stamps(
@@ -226,7 +285,13 @@ def _is_resumable(instance: InstanceRegistryEntry) -> bool:
 
 
 def _is_candidate(instance: InstanceRegistryEntry) -> bool:
-    return bool(instance.pane_label) and not instance.is_subagent and _is_resumable(instance)
+    return (
+        bool(instance.pane_label)
+        and bool(instance.instance_id)
+        and not instance.is_subagent
+        and instance.rank != "retired"
+        and _is_resumable(instance)
+    )
 
 
 def _parse_dt(raw: str) -> datetime | None:
@@ -280,16 +345,9 @@ def _recently_stopped(instance: InstanceRegistryEntry) -> bool:
 def _candidate_instances(
     instances: tuple[InstanceRegistryEntry, ...],
 ) -> list[InstanceRegistryEntry]:
-    candidates: list[InstanceRegistryEntry] = []
-    for instance in instances:
-        if not _is_candidate(instance):
-            continue
-        if instance.status is InstanceStatus.STOPPED and not _recently_stopped(instance):
-            continue
-        if instance.status is not InstanceStatus.STOPPED and not _recently_active(instance):
-            continue
-        candidates.append(instance)
-    return candidates
+    # Legacy helper retained for external tests/imports. Normal restart planning
+    # calls _live_snapshot_candidates and does not consider DB-only rows.
+    return [instance for instance in instances if _is_candidate(instance)]
 
 
 def _dedupe_candidates(
@@ -325,7 +383,7 @@ def _resume_reason(instance: InstanceRegistryEntry, disposition: ResumeDispositi
     if disposition is ResumeDisposition.RESUME_AND_CONTINUE:
         return "instance was processing before restart"
     if disposition is ResumeDisposition.RESUME:
-        return "instance has resumable registry state"
+        return "instance has live tmux runtime state"
     return f"instance status {instance.status.value} is not resumable"
 
 

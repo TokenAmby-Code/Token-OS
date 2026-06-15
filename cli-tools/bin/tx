@@ -443,9 +443,9 @@ cmd_restart() {
     fi
     # ------------------------------------------------------------------------
 
-    # Snapshot active instances for resurrection. The Python executor handles
-    # client park/detach/restore + teardown + rebuild + resume internally.
-    tmux-resurrect snapshot 2>/dev/null || true
+    # Restore is planned from the live tmux snapshot captured by tmuxctl before
+    # teardown. Do not invoke legacy tmux-resurrect here: DB-only/stale rows are
+    # not restart intent.
 
     if in_tmux; then
         local current_session group
@@ -497,19 +497,17 @@ cmd_restart() {
         return 0
     fi
 
-    run_tmuxctl restart --execute --session "$session" || true
-    tmux-resurrect restore 2>/dev/null || true
+    run_tmuxctl restart --execute --session "$session"
     exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
 }
 
 # Internal: invoked by `tx restart` from an OS-detached child. Runs the
-# Python restart, resurrects, then re-attaches whichever clients survived.
+# Python restart executor, which owns client parking and live-snapshot restore.
 cmd_internal_tmuxctl_restart() {
     local session="$1"
     local nonce_file="${2:-}" nonce="${3:-}"
     _tx_validate_restart_nonce "$nonce_file" "$nonce" || return 1
-    run_tmuxctl restart --execute --session "$session" || true
-    tmux-resurrect restore 2>/dev/null || true
+    run_tmuxctl restart --execute --session "$session"
 }
 
 cmd_internal_restart_watchdog() {
@@ -552,11 +550,9 @@ cmd_internal_restart_watchdog() {
             return 0
         fi
         _tx_restart_watchdog_log "detached-client-after-restart session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
-        tmux-resurrect restore >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
     else
         _tx_restart_watchdog_log "recreating-missing-session session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
         run_tmuxctl create --session "$session" >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
-        tmux-resurrect restore >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
     fi
 
     # Best-effort local re-entry. We do not attempt TTY injection here: writing

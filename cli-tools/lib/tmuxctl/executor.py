@@ -145,11 +145,20 @@ class RestartExecutor:
                         continue
 
                     pane_target = resume.pane_label or target_pane_ref
-                    self.adapter.send_keys(
-                        target_pane_ref,
-                        f"dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(pane_target)}",
-                        "Enter",
-                    )
+                    dispatch_parts = [
+                        "dispatch",
+                        "--id",
+                        shlex.quote(resume.instance_id),
+                        "--pane",
+                        shlex.quote(pane_target),
+                    ]
+                    if resume.engine:
+                        dispatch_parts.extend(["--engine", shlex.quote(resume.engine)])
+                    if resume.working_dir:
+                        dispatch_parts.extend(
+                            ["--dir", shlex.quote(self._localize_path(resume.working_dir))]
+                        )
+                    self.adapter.send_keys(target_pane_ref, " ".join(dispatch_parts), "Enter")
                     time.sleep(1.5)
                     pane_output = self.adapter.capture_pane(target_pane_ref, lines=8).lower()
                     if any(pattern in pane_output for pattern in RESUME_FAILURE_PATTERNS):
@@ -195,6 +204,24 @@ class RestartExecutor:
                     continue
 
             persistent_violations = self._assert_persistent_runtime_panes(plan.session_name)
+            rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
+            verification = persistent_violations + self._verify(plan, rebuilt, resume_results)
+
+            if verification:
+                self._report_holding_failure(holding_session, verification)
+                return RestartExecutionResult(
+                    session_name=plan.session_name,
+                    phase=RestartPhase.VERIFY,
+                    plan=replace(plan, phase=RestartPhase.VERIFY),
+                    actions=tuple(actions),
+                    resume_results=tuple(resume_results),
+                    coherence_issues=plan.coherence_issues,
+                    postcondition_violations=tuple(verification),
+                    clients_parked=parked,
+                    clients_detached=detached,
+                    clients_restored=restored,
+                    grouped_sessions_recreated=recreated,
+                )
 
             for grouped in grouped_sessions:
                 self.adapter.run(
@@ -220,15 +247,14 @@ class RestartExecutor:
                 self._switch_client(attachment.client_tty, target_session)
                 restored += 1
 
-            verification = persistent_violations + self._verify(plan, rebuilt, resume_results)
             return RestartExecutionResult(
                 session_name=plan.session_name,
-                phase=RestartPhase.COMPLETE if not verification else RestartPhase.VERIFY,
+                phase=RestartPhase.COMPLETE,
                 plan=replace(plan, phase=RestartPhase.COMPLETE),
                 actions=tuple(actions),
                 resume_results=tuple(resume_results),
                 coherence_issues=plan.coherence_issues,
-                postcondition_violations=tuple(verification),
+                postcondition_violations=(),
                 clients_parked=parked,
                 clients_detached=detached,
                 clients_restored=restored,
@@ -236,7 +262,33 @@ class RestartExecutor:
             )
 
         finally:
-            self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
+            # Keep local clients parked in _stash on verification failure. A
+            # successful restart switches them back before teardown; at that
+            # point the holding session is safe to remove.
+            if restored >= parked:
+                self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
+
+    def _report_holding_failure(self, holding_session: str, violations: list[str]) -> None:
+        message = "tx restart verification failed; staying in _stash.\n\n" + "\n".join(
+            f"- {item}" for item in violations
+        )
+        self.adapter.run(
+            "set-option",
+            "-t",
+            holding_session,
+            "status-right",
+            "restart failed — inspect pane output/logs",
+            allow_failure=True,
+        )
+        self.adapter.run("send-keys", "-t", f"{holding_session}:_stash", "C-c", allow_failure=True)
+        self.adapter.run(
+            "send-keys",
+            "-t",
+            f"{holding_session}:_stash",
+            f"printf '%s\\n' {shlex.quote(message)}",
+            "Enter",
+            allow_failure=True,
+        )
 
     def _resume_target_ref(self, resume: PlannedResume) -> str:
         """Return the public tmuxctl target for a planned resume.
@@ -361,19 +413,9 @@ done
         violations: list[str] = []
 
         try:
-            from .assertions import assert_instance
+            from .assertions import PERSONA_LABELS, assert_instance
 
-            for pane_label in (
-                "legion:custodes",
-                "mechanicus:fabricator-general",
-                "mechanicus:admin",
-                # Civic seats on the koronus page. assert_instance launches each
-                # with its persona (pax=opus, orchestrator=sonnet) from the Civic
-                # vault — see assertions.persona_spec — so `tx restart` leaves the
-                # civic page operational instead of with blank shells.
-                "koronus:pax",
-                "koronus:orchestrator",
-            ):
+            for pane_label in sorted(PERSONA_LABELS):
                 try:
                     result = assert_instance(self.adapter, pane_label)
                 except Exception as exc:
