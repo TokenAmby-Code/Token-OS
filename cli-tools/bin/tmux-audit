@@ -130,14 +130,14 @@ assert_backburner() {
 # ============================================================
 assert_grid() {
     local win expected actual focused
-    declare -A expected_for=(
-        [palace]=4
-        [somnium]=5
-    )
 
     for win in palace somnium; do
         tmux list-panes -t "${SESSION}:${win}" -F '' 2>/dev/null || continue
-        expected="${expected_for[$win]}"
+        case "$win" in
+            palace) expected=4 ;;
+            somnium) expected=5 ;;
+            *) continue ;;
+        esac
 
         focused=$(tmux show-options -wv -t "${SESSION}:${win}" @FOCUS_GRID_ACTIVE 2>/dev/null || echo "false")
         if [[ "$focused" == "true" ]]; then
