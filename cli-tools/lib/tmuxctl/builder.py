@@ -16,9 +16,9 @@ KORONUS_WINDOW = "koronus"
 RESERVISTS_WINDOW = "reservists"
 
 # The koronus civic page launches from the Civic vault, where the civic persona
-# notes (pax / orchestrator / agentic-worker) live. Other windows still home to
-# $HOME; the legion/mechanicus Imperium-vault mapping is owned by a separate
-# custodes patch — only add the koronus key here to avoid clobbering it.
+# notes (pax / orchestrator / agentic-worker) live. The legion/mechanicus windows
+# launch from the Imperium-ENV vault (see PERSONA_WINDOWS / _window_dir); all other
+# windows stay in $HOME.
 KORONUS_DIR = "/Volumes/Civic/Pax-ENV"
 
 DETACHED_W = 240
@@ -29,9 +29,35 @@ def _home() -> str:
     return os.path.expanduser("~")
 
 
+# Windows whose panes seat Imperium personas/overseers. These launch from the
+# Imperium-ENV vault (their canon home) instead of $HOME. koronus (civic) seats
+# resolve their own Civic-vault dir; see build_koronus_window.
+PERSONA_WINDOWS = {LEGION_WINDOW, MECHANICUS_WINDOW}
+
+
+def _imperium_vault() -> str | None:
+    """Resolve the Imperium-ENV vault root, or None if it is not mounted."""
+    root = os.environ.get("IMPERIUM") or "/Volumes/Imperium"
+    vault = os.path.join(root, "Imperium-ENV")
+    return vault if os.path.isdir(vault) else None
+
+
 def _window_dir(window: str) -> str:
+    """Start-directory for a window's panes.
+
+    Persona windows (legion, mechanicus) launch from the Imperium-ENV vault so
+    seated personas (Custodes, Malcador, Fabricator-General, Administratum) open
+    in their canon home rather than $HOME. Falls back to $HOME when the vault is
+    not mounted so pane creation never fails on a missing SMB mount. The koronus
+    (civic) window launches from the Civic vault. Non-persona windows (palace,
+    somnium, reservists) stay in $HOME.
+    """
     if window == KORONUS_WINDOW:
         return KORONUS_DIR
+    if window in PERSONA_WINDOWS:
+        vault = _imperium_vault()
+        if vault:
+            return vault
     return _home()
 
 
