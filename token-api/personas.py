@@ -152,6 +152,22 @@ ULTIMATE_ASTARTES = PersonaSeed(
     "chimes.wav",
 )
 
+# Retirement/quarantine persona used when an Astartes chapter child is banished.
+# It deliberately has no assignment pool, so moving a row here releases the
+# original chapter/persona lock without putting Black Shields into rotation.
+BLACK_SHIELDS = PersonaSeed(
+    "black-shields",
+    "Black Shields",
+    "astartes",
+    None,
+    None,
+    "default",
+    "#111111",
+    None,
+    None,
+    None,
+)
+
 # Civic worker persona for the koronus/pax-stack worker agents (the right-side
 # stack), analogous to how mechanicus workers are astartes. ``astartes`` rank so
 # it is resolvable like a chapter, but with NO assignment pool so it never enters
@@ -269,6 +285,7 @@ PERSONA_SEEDS: tuple[PersonaSeed, ...] = (
     *PRIMARY_ASTARTES,
     *BACKUP_ASTARTES,
     ULTIMATE_ASTARTES,
+    BLACK_SHIELDS,
     *CIVIC_WORKER_PERSONAS,
 )
 SEED_BY_SLUG = {seed.slug: seed for seed in PERSONA_SEEDS}
@@ -696,6 +713,7 @@ ALL_COMPAT_PROFILES = [
     *PRIMARY_PROFILES,
     *BACKUP_PROFILES,
     ULTIMATE_FALLBACK_PROFILE,
+    seed_profile(BLACK_SHIELDS),
     *PERSONA_COMPAT_PROFILES,
 ]
 PROFILE_BY_SLUG = {p["name"]: p for p in ALL_COMPAT_PROFILES}

@@ -221,6 +221,9 @@ def build_window_snapshot(
                 instance_id=adapter.show_pane_option(pane_id, "@INSTANCE_ID"),
                 tombstone_target=adapter.show_pane_option(pane_id, "@TOMBSTONE_TARGET"),
                 tombstone_source=adapter.show_pane_option(pane_id, "@TOMBSTONE_SOURCE"),
+                cwd=record.get("cwd", ""),
+                runtime_engine=adapter.show_pane_option(pane_id, "@TOKEN_API_ENGINE"),
+                wrapper_launch_id=adapter.show_pane_option(pane_id, "@TOKEN_API_WRAPPER_LAUNCH_ID"),
             )
         )
 
