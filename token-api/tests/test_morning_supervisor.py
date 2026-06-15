@@ -9,8 +9,9 @@ no-supervision path — plus the arm/poll/failure state machine:
   - arm_morning_supervisor: schedules the relative poller; no-history and
     recover-past-window are no-ops.
   - _supervisor_poll_job: ack+custodes -> disarm; ack-no-custodes -> alert+retry;
-    no-ack within grace -> wait; no-ack past grace -> alert.
-  - _handle_failure: no_ack must NOT relaunch (no phantom); ack_no_custodes does.
+    no-ack within grace -> wait; no-ack past grace -> alert + Custodes day-start backstop.
+  - _handle_failure: no_ack latches day-start through /api/day-start/fire;
+    ack_no_custodes retries /api/morning/start.
 
 Run:
     cd token-api && .venv/bin/python -m pytest tests/test_morning_supervisor.py -v
@@ -21,6 +22,8 @@ import json
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+import pytest
 
 import morning_supervisor as ms
 
@@ -290,7 +293,7 @@ def test_poll_no_ack_past_deadline_alerts(monkeypatch):
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
 
 
-# ── _handle_failure: no phantom relaunch on no_ack ────────────
+# ── _handle_failure recovery actions ──────────────────────────
 
 
 def _capture_failure(monkeypatch):
@@ -298,7 +301,7 @@ def _capture_failure(monkeypatch):
     notices = []
 
     async def fake_post(path, json_body=None):
-        posts.append(path)
+        posts.append((path, json_body))
         return {"ok": True}
 
     async def fake_notify(message):
@@ -313,7 +316,9 @@ def _capture_failure(monkeypatch):
     return posts, notices
 
 
-def test_handle_failure_no_ack_does_not_relaunch(monkeypatch):
+def test_handle_failure_no_ack_fires_custodes_day_start_backstop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     posts, notices = _capture_failure(monkeypatch)
     now = datetime(2026, 6, 5, 8, 20, tzinfo=_TZ)
     asyncio.run(
@@ -324,13 +329,21 @@ def test_handle_failure_no_ack_does_not_relaunch(monkeypatch):
             ack=None,
         )
     )
-    # The Emperor is alerted, but NO morning/start relaunch (that would be a
-    # phantom — there was no Hatch ack behind it).
-    assert notices and "no Hatch alarm-silence ack" in notices[0]
-    assert "/api/morning/start" not in posts
+    # The Emperor is alerted, and recovery goes through the single day-start
+    # latch before the morning fan-out starts Custodes. This is not a bare
+    # /api/morning/start phantom.
+    assert notices and "firing the Custodes day-start backstop now" in notices[0]
+    assert any(path == "/api/day-start/fire" for path, _ in posts)
+    assert any(
+        path == "/api/day-start/fire"
+        and body["source"] == "custodes"
+        and body["details"]["reason"] == "morning_supervisor_no_ack_backstop"
+        for path, body in posts
+    )
+    assert not any(path == "/api/morning/start" for path, _ in posts)
 
 
-def test_handle_failure_ack_no_custodes_relaunches(monkeypatch):
+def test_handle_failure_ack_no_custodes_relaunches(monkeypatch: pytest.MonkeyPatch) -> None:
     posts, notices = _capture_failure(monkeypatch)
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
     asyncio.run(
@@ -342,5 +355,6 @@ def test_handle_failure_ack_no_custodes_relaunches(monkeypatch):
         )
     )
     # A real ack exists, so retrying the launch is legitimate recovery.
-    assert "/api/morning/start" in posts
+    assert any(path == "/api/morning/start" for path, _ in posts)
+    assert not any(path == "/api/day-start/fire" for path, _ in posts)
     assert notices
