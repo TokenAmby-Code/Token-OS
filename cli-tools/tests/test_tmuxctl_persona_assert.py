@@ -19,6 +19,7 @@ from tmuxctl.assertions import (
     _guarded_note_unregistered,
     _guarded_send_persona_command,
     _observed_row_hash,
+    _persona_working_dir,
     _row_matches_persona,
     persona_spec,
 )
@@ -114,6 +115,41 @@ def test_dispatch_args_include_model_when_present():
 
     assert "--model" in args
     assert args[args.index("--model") + 1] == "sonnet"
+
+
+def test_dispatch_args_include_dir_when_present():
+    args = _dispatch_args(
+        "%99",
+        {
+            "engine": "claude",
+            "persona": "custodes",
+            "dir": "/Volumes/Imperium/Imperium-ENV",
+        },
+    )
+
+    assert "--dir" in args
+    assert args[args.index("--dir") + 1] == "/Volumes/Imperium/Imperium-ENV"
+
+
+def test_dispatch_args_omit_dir_when_blank():
+    args = _dispatch_args("%99", {"engine": "claude", "persona": "custodes", "dir": ""})
+
+    assert "--dir" not in args
+
+
+def test_persona_working_dir_resolves_vault_when_mounted(tmp_path, monkeypatch):
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    monkeypatch.setenv("IMPERIUM", str(tmp_path))
+
+    assert _persona_working_dir() == str(vault)
+
+
+def test_persona_working_dir_blank_when_unmounted(tmp_path, monkeypatch):
+    # IMPERIUM points at a root with no Imperium-ENV dir → not mounted.
+    monkeypatch.setenv("IMPERIUM", str(tmp_path / "nonexistent"))
+
+    assert _persona_working_dir() == ""
 
 
 # ── _row_matches_persona ─────────────────────────────────────────────────────

@@ -8,7 +8,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.api import build_client_attachments
-from tmuxctl.builder import build_legion_window, build_workspace
+from tmuxctl.builder import (
+    PERSONA_WINDOWS,
+    _window_dir,
+    build_legion_window,
+    build_workspace,
+)
 from tmuxctl.enums import (
     AttachmentClass,
     CoherenceSeverity,
@@ -503,6 +508,26 @@ def test_builder_creates_canonical_workspace_roles():
     assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
     pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
     assert "tui" not in pane_types
+
+
+def test_window_dir_persona_windows_use_vault_when_mounted(tmp_path, monkeypatch) -> None:
+    vault = tmp_path / "Imperium-ENV"
+    vault.mkdir()
+    monkeypatch.setenv("IMPERIUM", str(tmp_path))
+
+    # Persona windows launch from the vault; non-persona windows stay in $HOME.
+    for window in PERSONA_WINDOWS:
+        assert _window_dir(window) == str(vault)
+    assert _window_dir("palace") == str(pathlib.Path.home())
+    assert _window_dir("reservists") == str(pathlib.Path.home())
+
+
+def test_window_dir_falls_back_to_home_when_vault_unmounted(tmp_path, monkeypatch) -> None:
+    # IMPERIUM points at a root with no Imperium-ENV dir → not mounted.
+    monkeypatch.setenv("IMPERIUM", str(tmp_path / "nonexistent"))
+
+    for window in PERSONA_WINDOWS:
+        assert _window_dir(window) == str(pathlib.Path.home())
 
 
 def test_build_legion_window_seats_three_overseers_in_order() -> None:

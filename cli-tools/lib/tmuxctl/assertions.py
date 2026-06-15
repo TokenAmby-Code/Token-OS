@@ -42,6 +42,10 @@ class PersonaSpec:
     engine: str = "claude"
     sync: bool = False
     model: str = ""
+    # Explicit launch cwd. Empty → resolve the Imperium-ENV vault at launch time
+    # (see _persona_working_dir). A per-persona override can pin a different vault
+    # (e.g. koronus civic seats → Civic/Pax-ENV).
+    working_dir: str = ""
 
 
 def _vault_root() -> Path:
@@ -49,6 +53,17 @@ def _vault_root() -> Path:
     if root:
         return Path(root) / "Imperium-ENV"
     return Path("/Volumes/Imperium/Imperium-ENV")
+
+
+def _persona_working_dir() -> str:
+    """Imperium-ENV vault as the persona launch cwd, mount-guarded.
+
+    Persona panes (Custodes, Malcador, FG, Admin) must launch from the vault, not
+    $HOME. Returns "" when the vault is not mounted so dispatch falls back to its
+    own default instead of being handed a nonexistent --dir.
+    """
+    vault = _vault_root()
+    return str(vault) if vault.is_dir() else ""
 
 
 def _today_daily_note() -> str:
@@ -621,6 +636,9 @@ def _assert_instance_impl(
                 "sync": spec.sync,
                 "model": spec.model,
                 "no_gt": not spec.sync,
+                # Launch the persona from the vault, not $HOME. Empty resolves the
+                # Imperium-ENV vault (mount-guarded); _dispatch_args omits --dir when blank.
+                "dir": spec.working_dir or _persona_working_dir(),
             }
             ok, reason = _launch(pane_id, launch_upsert, str((upsert or {}).get("prompt") or ""))
             result.update(
