@@ -18697,6 +18697,31 @@ async def ops_clear_phone_attention(request: Request) -> dict:
     }
 
 
+def _ops_session_doc_date_basis(
+    fm: dict, db_created_at: object | None
+) -> tuple[str | None, str | None]:
+    """Return the timestamp/date the cockpit should use for date scoping.
+
+    Session docs are authored in Obsidian, so frontmatter owns the document
+    date. Prefer explicit frontmatter creation/start fields, fall back to a
+    frontmatter `date`, and only then use the DB registration timestamp for
+    older docs that do not carry date frontmatter.
+    """
+
+    for key in ("created", "start_time", "date"):
+        value = fm.get(key) if isinstance(fm, dict) else None
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"null", "none"}:
+            return text, f"frontmatter:{key}"
+
+    if db_created_at is None:
+        return None, None
+    text = str(db_created_at).strip()
+    return (text, "db:created_at") if text else (None, None)
+
+
 def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
     """First meaningful prose line of a session-doc body — a *head*, never the
     whole document. The cockpit is a glance surface; Obsidian renders the doc.
@@ -18808,6 +18833,7 @@ async def get_ops_session_docs(
             obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
 
         created = d.get("created_at")
+        session_date, session_date_source = _ops_session_doc_date_basis(fm, created)
         age_seconds = None
         if created:
             try:
@@ -18832,6 +18858,8 @@ async def get_ops_session_docs(
                 "instance_type": fm.get("instance_type"),
                 "head": head,
                 "created_at": created,
+                "session_date": session_date,
+                "session_date_source": session_date_source,
                 "age_seconds": age_seconds,
                 "linked_instances": linked.get(d.get("id"), 0),
             }
