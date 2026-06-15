@@ -159,7 +159,10 @@ def build_restart_plan(
         planned = PlannedResume(
             instance_id=inst.instance_id,
             pane_label=pane_label,
-            target_pane_id=target_pane.pane_id,
+            # Deliberately do not snapshot the volatile tmux %pane id. Restart
+            # execution targets the durable public pane label and lets tmuxctl
+            # resolve it live after rebuild.
+            target_pane_id="",
             working_dir=inst.working_dir,
             disposition=disposition,
             reason=_resume_reason(inst, disposition),
