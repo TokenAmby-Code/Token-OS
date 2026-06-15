@@ -917,6 +917,54 @@ class TestIntegrationAgentLaunch:
                 proof_file.unlink()
 
 
+# ── Unit Tests: Persona Registration Sweep ────────────────────
+
+
+class TestPersonaSweep:
+    """The periodic singleton-persona registration reconciler."""
+
+    def test_register_adds_interval_job(self, engine):
+        engine.register_persona_sweep_job()
+        engine.scheduler.add_job.assert_called_once()
+        _, kwargs = engine.scheduler.add_job.call_args
+        assert kwargs["id"] == "persona_registration_sweep"
+        assert kwargs["name"] == "persona-registration-sweep"
+        assert kwargs["replace_existing"] is True
+        assert kwargs["max_instances"] == 1
+
+    def test_register_honors_interval_override(self, engine):
+        engine.register_persona_sweep_job(interval_minutes=3)
+        _, kwargs = engine.scheduler.add_job.call_args
+        # IntervalTrigger stores the configured period; 3 minutes == 180s.
+        assert kwargs["trigger"].interval == timedelta(minutes=3)
+
+    def test_sweep_job_shells_out_to_tmuxctl(self, engine):
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b'[{"ok": true, "pane_label": "legion:custodes"}]', b"")
+
+        async def _fake_exec(*args, **kwargs):
+            captured["args"] = args
+            return _FakeProc()
+
+        with patch("cron_engine.asyncio.create_subprocess_exec", side_effect=_fake_exec):
+            run(engine._run_persona_sweep_job())
+
+        assert captured["args"][:2] == ("tmuxctl", "assert-personas")
+
+    def test_sweep_job_survives_missing_tmuxctl(self, engine):
+        with patch(
+            "cron_engine.asyncio.create_subprocess_exec",
+            side_effect=FileNotFoundError("tmuxctl"),
+        ):
+            # Must not raise — a missing binary is logged and swallowed.
+            run(engine._run_persona_sweep_job())
+
+
 # ── Unit Tests: Victory Detection ─────────────────────────────
 
 

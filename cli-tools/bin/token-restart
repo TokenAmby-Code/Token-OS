@@ -425,6 +425,15 @@ restart_mac() {
 
     sync_venv_if_needed
 
+    # Keep the fd ceiling current. If the plist actually changed, kickstart -k
+    # would NOT re-read the new resource limits (it reuses the bootstrapped
+    # service definition), so bootout+bootstrap to load them before restarting.
+    if ! ensure_plist_resource_limits; then
+        echo -e "  ${BLUE}→${NC} fd limits updated (soft=${FD_SOFT_LIMIT}/hard=${FD_HARD_LIMIT}); reloading service"
+        launchctl bootout gui/501/${LABEL} 2>/dev/null || true
+        launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
+    fi
+
     launchctl kickstart -k gui/501/${LABEL} 2>/dev/null || {
         echo "  Service not loaded, bootstrapping..."
         launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
@@ -744,6 +753,40 @@ watch_logs() {
 
 # ============ Plist Update ============
 
+# token-api's file-descriptor ceiling, repo-managed here so it is no longer a
+# hand-edited live-plist invariant. A fd/connection burst that hits the old
+# soft=4096 ceiling makes the SessionStart registration POST fail with EMFILE,
+# stranding a live persona pane with no registry row. This is INSURANCE (a
+# band-aid for bursts) — the real fix is finding the burst source — but it buys
+# wide headroom: 16384/32768 sits well under kern.maxfilesperproc (61440).
+FD_SOFT_LIMIT=16384
+FD_HARD_LIMIT=32768
+
+# Idempotently pin the fd resource limits in the LaunchAgent plist. Returns 0 if
+# the plist already carries the target limits (no-op), 1 if it was modified — the
+# caller must then bootout+bootstrap so launchd re-reads the resource limits
+# (`kickstart -k` alone reuses the already-bootstrapped service definition).
+ensure_plist_resource_limits() {
+    [[ -f "$PLIST" ]] || return 0
+    /usr/bin/python3 - "$PLIST" "$FD_SOFT_LIMIT" "$FD_HARD_LIMIT" << 'PYEOF'
+import sys, plistlib
+plist_path, soft, hard = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(plist_path, 'rb') as f:
+    data = plistlib.load(f)
+soft_block = data.get('SoftResourceLimits') or {}
+hard_block = data.get('HardResourceLimits') or {}
+changed = soft_block.get('NumberOfFiles') != soft or hard_block.get('NumberOfFiles') != hard
+if changed:
+    soft_block['NumberOfFiles'] = soft
+    hard_block['NumberOfFiles'] = hard
+    data['SoftResourceLimits'] = soft_block
+    data['HardResourceLimits'] = hard_block
+    with open(plist_path, 'wb') as f:
+        plistlib.dump(data, f, fmt=plistlib.FMT_XML, sort_keys=False)
+sys.exit(1 if changed else 0)
+PYEOF
+}
+
 update_plist() {
     local service_dir="$1"
     local python_path="$service_dir/.venv/bin/python"
@@ -765,6 +808,7 @@ data['WorkingDirectory'] = working_dir
 with open(plist_path, 'wb') as f:
     plistlib.dump(data, f, fmt=plistlib.FMT_XML, sort_keys=False)
 PYEOF
+    ensure_plist_resource_limits || true
     echo -e "  ${GREEN}✓${NC} Plist updated"
 }
 
