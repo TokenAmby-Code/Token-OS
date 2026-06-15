@@ -13,12 +13,16 @@ PAGE_AUDIENCE = {
     "somnium": "_somnium_audience",
     "legion": "_legion_audience",
     "mechanicus": "_mechanicus_audience",
+    "koronus": "_koronus_audience",
 }
 
 AUDIENCE_ROLES = {
     "legion:custodes",
-    "legion:pax",
     "mechanicus:fabricator-general",
+    # The civic pax seat is the human-facing interaction surface, so it can be
+    # expanded into a koronus audience chamber (orchestrator is dispatch-only,
+    # like the mechanicus admin seat, and stays unexpanded).
+    "koronus:pax",
 }
 
 

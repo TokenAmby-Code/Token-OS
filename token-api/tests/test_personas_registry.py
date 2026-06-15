@@ -31,7 +31,8 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 @pytest.mark.asyncio
 async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
-    # Pax is the third legion seat: a non-40k civic day-job overseer singleton.
+    # Pax is the anchor seat of the koronus civic page: a non-40k civic overseer
+    # singleton (the combined Custodes+Administratum interaction/record-keeper).
     # resolve_persona must surface it as an overseer (so the rank-stamp trigger
     # promotes its instance row off the astartes default) with the civic slate/
     # blue identity and no voice/sound (a silent seat).
@@ -50,6 +51,38 @@ async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
     assert pax["tts_voice"] is None
     assert pax["notification_sound"] is None
     assert pax["silent"] is True
+
+
+@pytest.mark.asyncio
+async def test_koronus_civic_seats_resolve_after_seed(app_env):
+    # The koronus civic page seeds three personas: pax (overseer, above),
+    # orchestrator (civic dispatch overseer) and agentic-worker (the civic worker
+    # persona). All three must resolve after seeding, with civic-slate tints, and
+    # all are silent (non-40k, no TTS). orchestrator is a singleton overseer;
+    # agentic-worker is an astartes-rank worker kept OUT of the rotation pool so
+    # it is resolved by slug while ON the koronus page, never auto-assigned.
+    import personas
+
+    async with aiosqlite.connect(app_env.db_path) as db:
+        orchestrator = await personas.resolve_persona(db, "orchestrator")
+        worker = await personas.resolve_persona(db, "agentic-worker")
+
+    assert orchestrator is not None
+    assert orchestrator["id"] == personas.persona_id_for_slug("orchestrator")
+    assert orchestrator["default_rank"] == "overseer"
+    assert orchestrator["pane_tint"] == "#14302a"
+    assert orchestrator["assignment_pool"] is None
+    assert orchestrator["silent"] is True
+
+    assert worker is not None
+    assert worker["id"] == personas.persona_id_for_slug("agentic-worker")
+    assert worker["default_rank"] == "astartes"
+    assert worker["pane_tint"] == "#23323f"
+    # Out of the auto-assignment rotation: no pool/order means it is never handed
+    # out by assign_astartes_persona.
+    assert worker["assignment_pool"] is None
+    assert worker["assignment_order"] is None
+    assert worker["silent"] is True
 
 
 @pytest.mark.asyncio

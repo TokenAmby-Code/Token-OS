@@ -339,6 +339,12 @@ done
                 "legion:custodes",
                 "mechanicus:fabricator-general",
                 "mechanicus:admin",
+                # Civic seats on the koronus page. assert_instance launches each
+                # with its persona (pax=opus, orchestrator=sonnet) from the Civic
+                # vault — see assertions.persona_spec — so `tx restart` leaves the
+                # civic page operational instead of with blank shells.
+                "koronus:pax",
+                "koronus:orchestrator",
             ):
                 try:
                     result = assert_instance(self.adapter, pane_label)

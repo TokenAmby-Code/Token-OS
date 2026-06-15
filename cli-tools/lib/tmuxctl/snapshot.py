@@ -20,6 +20,7 @@ AUDIENCE_WINDOW_PAGES = {
     "_somnium_audience": "somnium",
     "_legion_audience": "legion",
     "_mechanicus_audience": "mechanicus",
+    "_koronus_audience": "koronus",
 }
 
 
@@ -56,7 +57,7 @@ def _infer_archetype(window_name: str) -> WindowArchetype:
         return WindowArchetype.SOMNIUM
     if base == "legion":
         return WindowArchetype.LEGION_STACK
-    if base in {"mechanicus", "mars", "kreig", "reservists"}:
+    if base in {"mechanicus", "koronus", "mars", "kreig", "reservists"}:
         return WindowArchetype.MECHANICUS_STACK
     return WindowArchetype.UNKNOWN
 

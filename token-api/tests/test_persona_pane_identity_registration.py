@@ -131,19 +131,19 @@ def test_malcador_pane_registers_with_primarch_identity(
     assert row["commander_type"] == "emperor"
 
 
-# ── Pax: the civic day-job overseer seat (third legion pane) ───────────────────
+# ── Pax: the civic overseer seat on the koronus page ───────────────────────────
 
 
 def test_pax_pane_registers_with_overseer_identity(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A fresh SessionStart in the legion:pax pane IS Pax: its identity is derived
+    # A fresh SessionStart in the koronus:pax pane IS Pax: its identity is derived
     # from PERSONA_PANE_IDENTITY (primarch='pax' → the `pax` personas row), and
     # the rank-stamp trigger must promote the freshly inserted row off the
     # 'astartes' column default to 'overseer'. Emperor-commanded, like every
     # persona singleton.
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:pax"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "pax-1")
@@ -164,7 +164,7 @@ def test_pax_pane_parent_env_does_not_register_chapter_child(
     # singleton must register Emperor-commanded, always.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "dispatcher-pax")
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:pax"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "pax-2", env={"TOKEN_API_PARENT_INSTANCE_ID": "dispatcher-pax"})
@@ -176,6 +176,44 @@ def test_pax_pane_parent_env_does_not_register_chapter_child(
     assert row["commander_type"] == "emperor"
     assert row["commander_id"] is None
     assert row["hook_driven"] == 0
+
+
+def test_orchestrator_pane_registers_with_overseer_identity(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The koronus:orchestrator pane IS the civic Orchestrator seat: identity is
+    # derived from PERSONA_PANE_IDENTITY (primarch='orchestrator' → the
+    # `orchestrator` personas row), promoted off the astartes default to overseer.
+    hooks = sys.modules["routes.hooks"]
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:orchestrator"))
+    _no_pane_occupant(monkeypatch, hooks)
+
+    result = _start_session(hooks, "orch-1")
+    assert result["success"] is True
+
+    row = _row(app_env.db_path, "orch-1")
+    assert row["persona_slug"] == "orchestrator"
+    assert row["rank"] == "overseer"
+    assert row["commander_type"] == "emperor"
+
+
+def test_pax_pane_off_koronus_page_falls_back_to_astartes(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Off-page fallback: a civic seat promoted to palace/somnium (or any non-koronus
+    # pane) has no PERSONA_PANE_IDENTITY entry, so it must NOT register as the pax
+    # overseer singleton. It falls through to a normal astartes registration so it
+    # obeys the standard tint + TTS rules.
+    hooks = sys.modules["routes.hooks"]
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("palace:N"))
+    _no_pane_occupant(monkeypatch, hooks)
+
+    result = _start_session(hooks, "pax-offpage")
+    assert result["success"] is True
+
+    row = _row(app_env.db_path, "pax-offpage")
+    assert row["persona_slug"] != "pax"
+    assert row["rank"] == "astartes"
 
 
 # ── R-M2: persona panes never register as chapter children ─────────────────────

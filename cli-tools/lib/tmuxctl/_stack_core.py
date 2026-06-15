@@ -10,8 +10,10 @@ from .tmux_adapter import TmuxAdapter
 
 CUSTODES_ROLE = "legion:custodes"
 MALCADOR_ROLE = "legion:malcador"
-PAX_ROLE = "legion:pax"
 FABRICATOR_ROLE = "mechanicus:fabricator-general"
+KORONUS_PAX_ROLE = "koronus:pax"
+KORONUS_ORCHESTRATOR_ROLE = "koronus:orchestrator"
+KORONUS_WORKER_ROLE = "koronus:worker"
 REGIMENT_ROLE = "legion:worker"
 STACK_COLLAPSED_HEIGHT = 3
 STACK_ORCHESTRATOR_RATIO = 40
@@ -47,14 +49,12 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_role=CUSTODES_ROLE,
         orchestrator_type="legion",
         worker_role=REGIMENT_ROLE,
-        # Malcador (advisor) and Pax (civic day-job) are durable overseer seats
-        # docked under Custodes in the left column, not regiment workers. Without
-        # registering them here, enforce_stack_layout classifies them as untyped
-        # workers and retags them legion:N, clobbering the seat identity.
-        secondary_personas=(
-            PersonaPaneSpec(MALCADOR_ROLE, "legion"),
-            PersonaPaneSpec(PAX_ROLE, "legion"),
-        ),
+        # Malcador (advisor) is a durable overseer seat docked under Custodes in
+        # the left column, not a regiment worker. Without registering it here,
+        # enforce_stack_layout classifies it as an untyped worker and retags it
+        # legion:N, clobbering the seat identity. The civic Pax seat moved off
+        # legion onto the dedicated `koronus` page (it is no longer docked here).
+        secondary_personas=(PersonaPaneSpec(MALCADOR_ROLE, "legion"),),
     ),
     "mechanicus": StackPageSpec(
         base="mechanicus",
@@ -62,6 +62,17 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_type="mechanicus",
         worker_role="mechanicus:worker",
         secondary_personas=(PersonaPaneSpec("mechanicus:admin", "mechanicus"),),
+    ),
+    "koronus": StackPageSpec(
+        base="koronus",
+        # pax is the civic page's anchor seat (Custodes+Administratum combo); the
+        # orchestrator seat docks under it as a secondary persona, mirroring how
+        # the mechanicus admin seat docks under the Fabricator-General. Workers
+        # are the civic `agentic-worker` persona on the right stack.
+        orchestrator_role=KORONUS_PAX_ROLE,
+        orchestrator_type="koronus",
+        worker_role=KORONUS_WORKER_ROLE,
+        secondary_personas=(PersonaPaneSpec(KORONUS_ORCHESTRATOR_ROLE, "koronus"),),
     ),
 }
 

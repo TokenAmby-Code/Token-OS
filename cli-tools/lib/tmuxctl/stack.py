@@ -32,7 +32,11 @@ from .tmux_adapter import TmuxAdapter, TmuxError
 # Instance statuses that denote a live, drive-able runtime worth rebinding.
 _LIVE_STATUSES = frozenset({"processing", "idle"})
 
-STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig", "reservists")
+STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "koronus", "mars", "kreig", "reservists")
+
+# Orchestrator-backed stacks have a persona anchor in pane 1 (custodes/FG/pax)
+# and route worker adds through add_orchestrator_stack_pane.
+ORCHESTRATOR_STACK_BASES = frozenset({"legion", "mechanicus", "koronus"})
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 
 
@@ -113,7 +117,8 @@ def add_stack_pane(
 
     When ``adopt_pane`` is given, the existing live pane is joined into the stack
     (preserving its pane id + running process) instead of opening a fresh shell.
-    Only the orchestrator-backed stacks (legion/mechanicus) support adoption.
+    Only the orchestrator-backed stacks (legion/mechanicus/koronus) support
+    adoption.
 
     Returns the new pane id. Raises ValueError if `base` is not a known stack window.
     """
@@ -121,7 +126,7 @@ def add_stack_pane(
         raise ValueError(f"not a stack window: {base}")
     cwd = cwd or os.path.expanduser("~")
 
-    if base in {"legion", "mechanicus"}:
+    if base in ORCHESTRATOR_STACK_BASES:
         from .stack import add_orchestrator_stack_pane
 
         return add_orchestrator_stack_pane(
@@ -192,7 +197,7 @@ def dispatch_stack_command(
             if window_target:
                 adapter.run("select-window", "-t", window_target, allow_failure=True)
             adapter.run("select-pane", "-t", pane, allow_failure=True)
-            if base in {"legion", "mechanicus"}:
+            if base in ORCHESTRATOR_STACK_BASES:
                 target = adapter.run(
                     "display-message",
                     "-t",
@@ -400,9 +405,11 @@ def sweep_stack_assertions(
 from ._stack_core import (  # noqa: E402,F401
     CUSTODES_ROLE,
     FABRICATOR_ROLE,
+    KORONUS_ORCHESTRATOR_ROLE,
+    KORONUS_PAX_ROLE,
+    KORONUS_WORKER_ROLE,
     LEGACY_WORKER_ROLES,
     MALCADOR_ROLE,
-    PAX_ROLE,
     REGIMENT_ROLE,
     STACK_COLLAPSED_HEIGHT,
     STACK_ORCHESTRATOR_RATIO,

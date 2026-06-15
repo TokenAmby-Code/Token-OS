@@ -483,11 +483,10 @@ def test_selecting_already_focused_worker_does_not_reenforce():
 def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t17\tclaude\tfalse",
-            # The durable overseer seats are already present (builder creates them),
-            # so enforce docks rather than re-splits them.
-            "%M\tlegion:malcador\tlegion\t0\t0\t17\t80\t16\tclaude\tfalse",
-            "%P\tlegion:pax\tlegion\t0\t0\t33\t80\t16\tclaude\tfalse",
+            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t25\tclaude\tfalse",
+            # The durable Malcador seat is already present (builder creates it),
+            # so enforce docks rather than re-splits it. (Pax moved to koronus.)
+            "%M\tlegion:malcador\tlegion\t0\t0\t25\t80\t25\tclaude\tfalse",
         ]
     )
 
@@ -522,10 +521,9 @@ def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
 def test_adopt_with_existing_workers_joins_vertically_onto_the_stack():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t17\tclaude\tfalse",
-            # Durable overseer seats already present alongside the worker stack.
-            "%M\tlegion:malcador\tlegion\t0\t0\t17\t80\t16\tclaude\tfalse",
-            "%P\tlegion:pax\tlegion\t0\t0\t33\t80\t16\tclaude\tfalse",
+            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t25\tclaude\tfalse",
+            # Durable Malcador seat present alongside the worker stack.
+            "%M\tlegion:malcador\tlegion\t0\t0\t25\t80\t25\tclaude\tfalse",
             "%1\tlegion:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
         ]
     )
@@ -642,6 +640,76 @@ def test_adopt_rejected_for_non_orchestrator_stack():
             focus=False,
             adopt_pane="%live",
         )
+
+
+def test_koronus_stack_uses_pax_left_column_and_worker_right_stack():
+    adapter = FakeLegionAdapter(
+        window_name="koronus",
+        rows=[
+            "%P\tkoronus:pax\tkoronus\t0\t0\t0\t80\t50\tclaude",
+            "%1\tkoronus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude",
+        ],
+    )
+
+    result = enforce_stack_layout(adapter, "main:5", focused_pane="%1", focus=True)  # type: ignore[arg-type]
+
+    assert result == "focused stack %1 in main:5"
+    assert ("set-window-option", "-t", "main:5", "main-pane-width", "80") in adapter.commands
+    assert ("resize-pane", "-t", "%P", "-x", "80") in adapter.commands
+    assert adapter.window_options["@STACK_FOCUSED_PANE"] == "%1"
+
+
+def test_koronus_orchestrator_is_not_treated_as_worker_and_workers_are_numeric():
+    adapter = FakeLegionAdapter(
+        window_name="koronus",
+        rows=[
+            "%P\tkoronus:pax\tkoronus\t0\t0\t0\t80\t25\tclaude\tfalse",
+            "%O\tkoronus:orchestrator\tkoronus\t0\t0\t26\t80\t24\tclaude\tfalse",
+            "%W\tkoronus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude\tfalse",
+        ],
+    )
+
+    enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
+
+    # The orchestrator seat is a secondary persona, never reclassified as a worker.
+    assert ("set-option", "-p", "-t", "%O", "@PANE_ID", "koronus:1") not in adapter.commands
+    assert ("set-option", "-p", "-t", "%W", "@PANE_ID", "koronus:1") in adapter.commands
+
+
+def test_koronus_enforce_creates_orchestrator_pane_when_missing():
+    adapter = FakeLegionAdapter(
+        window_name="koronus",
+        rows=[
+            "%P\tkoronus:pax\tkoronus\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ],
+    )
+
+    enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
+
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "koronus:orchestrator") in adapter.commands
+
+
+def test_koronus_stack_dispatch_creates_managed_worker_and_launches_command():
+    adapter = FakeLegionAdapter(
+        window_name="koronus",
+        rows=[
+            "%P\tkoronus:pax\tkoronus\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ],
+    )
+
+    pane = dispatch_stack_command(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "koronus",
+        "echo civic",
+        cwd="/Volumes/Civic/Pax-ENV",
+        settle_seconds=0,
+    )
+
+    assert pane == "%N"
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "koronus:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_TYPE", "stack-worker") in adapter.commands
+    assert ("send-keys", "-t", "%N", "echo civic", "Enter") in adapter.commands
 
 
 def test_stack_enforce_defers_while_pane_select_zoom_restore_pending():
