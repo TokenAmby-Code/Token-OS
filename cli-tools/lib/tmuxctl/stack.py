@@ -102,6 +102,12 @@ def _tag_worker(adapter: TmuxAdapter, pane_id: str, base: str) -> None:
     """Tag a freshly added stack worker pane for downstream tools."""
     adapter.run("set-option", "-p", "-t", pane_id, "@PANE_TYPE", "stack-worker", allow_failure=True)
     adapter.run("set-option", "-p", "-t", pane_id, "@PANE_ID", f"{base}:worker", allow_failure=True)
+    # Birth stamp: gives the persona-sweep boot-grace a clock when the worker has
+    # no registry row yet (the ~1.5s agent-boot race), so a newborn pane is not
+    # pruned before its agent process becomes observable.
+    adapter.run(
+        "set-option", "-p", "-t", pane_id, "@PANE_BORN", str(int(time.time())), allow_failure=True
+    )
 
 
 def add_stack_pane(

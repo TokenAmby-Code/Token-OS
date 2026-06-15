@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -266,6 +266,13 @@ PERSONA_GUARD_BACKOFF_SECONDS = 300.0
 # pinned at the attempt count A4 observed stuck (`attempts=4`) so the live custodes
 # enforcement channel fails open instead of suppressing on that exact evidence.
 PERSONA_FAILOPEN_ATTEMPTS = 4
+# Boot-grace for the stack-worker sweep. A freshly-launched stack worker is
+# observable in the registry / @PANE_BORN stamp before its agent process is
+# observable to `_runtime_has_instance` (a ~1.5s boot race). Without a grace the
+# 2-min persona sweep reaches the stack-worker branch, sees `runtime_ok == False`
+# on the newborn, and kills it — a stillbirth. Hold off pruning until the worker
+# is older than this window; the value sits safely above the observed ~1.5s race.
+STACK_WORKER_BOOT_GRACE_SECONDS = 30.0
 PANE_CLOSE_TRANSIENT_OPTIONS = (
     "@INSTANCE_ID",
     "@PANE_LABEL",
@@ -624,6 +631,60 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     return row.pane_label == spec.pane_label and spec.persona in tab
 
 
+def _row_age_seconds(created_at: str) -> float | None:
+    """Age in seconds of a registry row from its ISO `created_at`, or None.
+
+    Mirrors planner._parse_dt: tolerates a trailing `Z`; naive timestamps compare
+    against a naive local clock (matching how /api/instances/register writes
+    `datetime.now().isoformat()`). Returns None when blank/unparseable so a legacy
+    row with no usable timestamp does NOT extend the boot grace.
+    """
+    if not created_at:
+        return None
+    text = created_at.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+    return (now - parsed).total_seconds()
+
+
+def _pane_age_seconds(born: str) -> float | None:
+    """Age in seconds from a `@PANE_BORN` epoch stamp, or None if blank/non-numeric."""
+    if not born:
+        return None
+    try:
+        return time.time() - float(born)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stack_worker_within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows) -> bool:
+    """True while a stack worker is still inside its boot-grace window.
+
+    Source of truth for age is the registry row's `created_at` (youngest known
+    row when several map to the pane); absent any row, the pane's `@PANE_BORN`
+    birth stamp. Rows whose timestamp is missing/unparseable do NOT extend the
+    grace — they contribute no age and a worker with only such rows is prunable.
+    """
+    if rows:
+        ages = [
+            age
+            for row in rows
+            if (age := _row_age_seconds(getattr(row, "created_at", "") or "")) is not None
+        ]
+        if not ages:
+            return False
+        return min(ages) < STACK_WORKER_BOOT_GRACE_SECONDS
+    age = _pane_age_seconds(adapter.show_pane_option(pane_id, "@PANE_BORN"))
+    return age is not None and age < STACK_WORKER_BOOT_GRACE_SECONDS
+
+
 def _base_result(pane_id: str, pane_label: str, pane_type: str, row) -> dict[str, Any]:
     return {
         "ok": False,
@@ -785,6 +846,15 @@ def _assert_instance_impl(
 
     if pane_type == "stack-worker":
         if not runtime_ok:
+            if _stack_worker_within_boot_grace(adapter, pane_id, rows):
+                # Newborn worker: the registry row / @PANE_BORN stamp is younger than
+                # the boot grace, so the missing live runtime is the ~1.5s agent-boot
+                # race, not a dead pane. Hold off — do NOT strip @PANE_ID/@PANE_TYPE or
+                # kill the pane while it is still coming up.
+                result.update(
+                    {"ok": False, "action": "boot_grace", "reason": "stack_worker_boot_grace"}
+                )
+                return finish(result, clear_failed=False)
             if rows:
                 _stop_rows(
                     rows, pane_id=pane_id, pane_label=pane_label, reason="stack_worker_runtime_dead"
