@@ -18,7 +18,11 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 logger = logging.getLogger("token_api")
 _LOG_EVENT_WRITE_LOCK = threading.Lock()
@@ -563,6 +567,115 @@ async def apply_instance_pane_tint(
     if tmux_pane:
         await asyncio.to_thread(apply_pane_tint, tmux_pane, bg, source=source)
     return bg
+
+
+# ── Engine-agnostic pushed statusline @-vars ──
+# The pane-border nametag reads pushed @-vars only (zero #() shell-outs, zero
+# per-pane polling — the 2026-06-05 freeze lesson). Every field sources from the
+# engine-agnostic ``instances`` table via the existing pane_state_queue → 1s
+# pane_state_worker → ``tmux set-option -p`` path, so Claude and Codex panes light
+# up identically (only ``instances.engine`` distinguishes them, and nothing here
+# branches on it). Triggers can't JOIN, so display values are resolved in
+# application code at the points where the underlying field is set, then enqueued.
+
+
+def cwd_basename(working_dir: str | None) -> str:
+    """Basename of an instance working_dir for the @CWD nametag field.
+
+    Trailing slashes are stripped first so ``/a/b/`` → ``b`` (not ``""``). Root
+    ``/`` and empty/None collapse to ``""`` — the border treats "" as unset and
+    renders the empty branch of ``#{?@CWD,…,}``.
+    """
+    if not working_dir:
+        return ""
+    return Path(working_dir.rstrip("/")).name or ""
+
+
+async def _persona_display_name(db, persona_id) -> str:
+    """Resolve ``personas.display_name`` from ``instances.persona_id`` (or "")."""
+    if not persona_id:
+        return ""
+    cursor = await db.execute("SELECT display_name FROM personas WHERE id = ?", (persona_id,))
+    row = await cursor.fetchone()
+    if not row:
+        return ""
+    # Row may be a tuple or aiosqlite.Row depending on the connection's row_factory.
+    return (row[0] if row[0] else "") or ""
+
+
+async def _session_doc_title(db, session_doc_id) -> str:
+    """Resolve ``session_documents.title`` from ``instances.session_doc_id`` (or "")."""
+    if not session_doc_id:
+        return ""
+    cursor = await db.execute("SELECT title FROM session_documents WHERE id = ?", (session_doc_id,))
+    row = await cursor.fetchone()
+    if not row:
+        return ""
+    return (row[0] if row[0] else "") or ""
+
+
+async def queue_pane_var(
+    db: "aiosqlite.Connection",
+    instance_id: str,
+    variable: str,
+    value: str | None,
+    tmux_pane: str | None,
+) -> None:
+    """Enqueue one pushed pane @-var via ``pane_state_queue``.
+
+    Mirrors the trigger INSERTs (``trg_tab_name_pane_state`` etc.) so the single 1s
+    ``pane_state_worker`` stays the only writer of pane options. ``value`` is coerced
+    to "" when None so the NOT NULL ``value`` column never aborts the insert; the
+    border treats "" as unset (the ``#{?@VAR,…,}`` conditional renders the empty
+    branch). The caller's transaction owns the commit.
+    """
+    await db.execute(
+        """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+           VALUES (?, ?, ?, ?)""",
+        (instance_id, variable, value or "", tmux_pane),
+    )
+
+
+async def push_agnostic_pane_vars(
+    db: "aiosqlite.Connection", instance_id: str | None
+) -> dict[str, str]:
+    """Resolve + enqueue the engine-agnostic nametag vars from the canonical row.
+
+    Reads ``persona_id``/``session_doc_id``/``working_dir``/``tmux_pane`` from the
+    freshly-written ``instances`` row (uncommitted writes on the same connection are
+    visible) and enqueues ``@PERSONA``/``@SESSION_DOC``/``@CWD``. Identical for
+    ``engine='codex'`` and ``engine='claude'`` — agnosticism by construction. The
+    stored ``tmux_pane`` is only the queue's bookkeeping column; the worker
+    re-resolves the live pane per row. Best-effort: never raises into a caller in a
+    registration/legion critical section. Returns the resolved values (for tests).
+    """
+    if not instance_id:
+        return {}
+    try:
+        cursor = await db.execute(
+            "SELECT persona_id, session_doc_id, working_dir, tmux_pane FROM instances WHERE id = ?",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {}
+        persona_id, session_doc_id, working_dir, tmux_pane = (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+        )
+        values = {
+            "@PERSONA": await _persona_display_name(db, persona_id),
+            "@SESSION_DOC": await _session_doc_title(db, session_doc_id),
+            "@CWD": cwd_basename(working_dir),
+        }
+        for variable, value in values.items():
+            await queue_pane_var(db, instance_id, variable, value, tmux_pane)
+        return values
+    except Exception as exc:  # pragma: no cover - defensive, never fail the caller
+        logger.warning("push_agnostic_pane_vars failed for %s: %s", instance_id, exc)
+        return {}
 
 
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:

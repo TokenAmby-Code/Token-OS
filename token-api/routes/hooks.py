@@ -1861,6 +1861,12 @@ async def _apply_instance_workflow_state(
         workflow_events=workflow_events,
     )
 
+    # Doc-link path: when the bound session doc changes (bind or rebind), refresh
+    # the engine-agnostic nametag vars so @SESSION_DOC tracks the newly-linked
+    # doc title. Reads the just-updated row; the caller owns the commit.
+    if previous_session_doc_id != session_doc_id:
+        await shared.push_agnostic_pane_vars(db, instance_id)
+
 
 async def handle_wrapper_start(payload: dict) -> dict:
     """Handle wrapper-level launch telemetry without creating an instance row."""
@@ -2497,6 +2503,10 @@ async def handle_session_start(payload: dict) -> dict:
                         session_id[:12],
                         exc,
                     )
+                # Engine-agnostic statusline nametag (@PERSONA/@SESSION_DOC/@CWD):
+                # queue from the canonical row so Claude and Codex panes light up
+                # identically. Best-effort — push swallows its own errors.
+                await shared.push_agnostic_pane_vars(db, session_id)
                 await _apply_commander_binding(
                     db,
                     instance_id=session_id,
@@ -2673,6 +2683,11 @@ async def handle_session_start(payload: dict) -> dict:
                         session_id[:12],
                         exc,
                     )
+                # Engine-agnostic statusline nametag (@PERSONA/@SESSION_DOC/@CWD):
+                # agnostic by construction (sources the canonical row, not engine).
+                # Commit the enqueue before this branch returns.
+                await shared.push_agnostic_pane_vars(db, session_id)
+                await db.commit()
                 await log_event(
                     "instance_reregistered",
                     instance_id=session_id,
@@ -2902,6 +2917,8 @@ async def handle_session_start(payload: dict) -> dict:
                         session_id[:12],
                         exc,
                     )
+                # Engine-agnostic statusline nametag (@PERSONA/@SESSION_DOC/@CWD).
+                await shared.push_agnostic_pane_vars(db, session_id)
                 await db.commit()
 
                 # profiles are persona-keyed; legacy profile_name died into persona_id
@@ -3324,6 +3341,13 @@ async def handle_session_start(payload: dict) -> dict:
                 session_id[:12],
                 exc,
             )
+
+        # Engine-agnostic statusline nametag (@PERSONA/@SESSION_DOC/@CWD): queue
+        # from the canonical row so Claude and Codex panes light up identically.
+        # This is the last write before the `async with` connection closes, so the
+        # enqueue must be committed here (aiosqlite does not commit on close).
+        await shared.push_agnostic_pane_vars(db, session_id)
+        await db.commit()
 
     logger.info(
         f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})"
