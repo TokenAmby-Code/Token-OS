@@ -19,6 +19,8 @@ def test_ctrl_alt_k_routes_through_watchdog_helper() -> None:
 
 def test_deskflow_recover_is_endpoint_wrapper_not_duplicate_lifecycle() -> None:
     helper = (ROOT / "Shell" / "deskflow-recover").read_text()
+    assert "/health" in helper
+    assert "DESKFLOW_RECOVER_STARTUP_TIMEOUT_SECONDS" in helper
     assert "/kvm/control" in helper
     assert "curl -sf --connect-timeout 3 --max-time 60 -X POST" in helper
     assert "open -a Deskflow" not in helper

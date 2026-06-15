@@ -93,6 +93,16 @@ function Register-ImperiumLogonTask {
 $StartupAhk = Join-Path $UserProfile "startup.ahk"
 $AhkNasWait = Join-Path $UserProfile "ahk-nas-wait.bat"
 
+# Belt-and-suspenders fallback for the non-elevated bootstrap. If the scheduled
+# task is stale, disabled, or blocked by permissions, HKCU Run still starts the
+# local startup.ahk copy at interactive logon. #SingleInstance in startup.ahk
+# makes this safe even when ahk_boot also succeeds.
+$RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$RunValue = "`"$AhkExe`" `"$StartupAhk`""
+New-Item -Path $RunKey -Force | Out-Null
+Set-ItemProperty -Path $RunKey -Name "ImperiumStartupAhk" -Value $RunValue
+Write-Host "Registered HKCU Run fallback: ImperiumStartupAhk"
+
 Register-ImperiumLogonTask `
     -TaskName "ahk_boot" `
     -Description "Windows logon bootstrap: monitor TUI, Deskflow phased restart, Bluetooth Audio Receiver, startup hotkeys" `
