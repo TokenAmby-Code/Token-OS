@@ -171,6 +171,14 @@ def test_status_segment_uses_same_stamp_once_hard_ttl(tmp_path: Path) -> None:
         timeout=2,
         check=False,
     )
+    styled = subprocess.run(
+        [sys.executable, str(STATUS)],
+        text=True,
+        capture_output=True,
+        env={**env, "TMUX_GUARD_NOW": "1100"},
+        timeout=2,
+        check=False,
+    )
     env["TMUX_GUARD_NOW"] = "1301"
     expired = subprocess.run(
         [sys.executable, str(STATUS), "--plain"],
@@ -183,6 +191,7 @@ def test_status_segment_uses_same_stamp_once_hard_ttl(tmp_path: Path) -> None:
 
     assert first.stdout == "TYPE"
     assert second.stdout == "TYPE"
+    assert styled.stdout == "#[fg=colour214,bold]⌨ GUARD#[default] "
     assert expired.stdout == ""
     stamp = (tmp_path / "guard-state" / "%1.stamp").read_text()
     assert "started_at=1000" in stamp

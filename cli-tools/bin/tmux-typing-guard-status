@@ -172,7 +172,7 @@ def main() -> int:
     if plain:
         print("TYPE", end="")
     else:
-        print("#[fg=colour214,bold]⌨#[default] ", end="")
+        print("#[fg=colour214,bold]⌨ GUARD#[default] ", end="")
     return 0
 
 
