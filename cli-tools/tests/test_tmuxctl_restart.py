@@ -347,7 +347,7 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
     assert attachments[1].attachment_class is AttachmentClass.REMOTE_GROUPED
 
 
-def test_restart_executor_uses_public_label_not_stale_pane_id():
+def test_restart_executor_uses_public_label_not_stale_pane_id() -> None:
     resume = PlannedResume(
         instance_id="abc123",
         pane_label="mechanicus:admin",
@@ -362,7 +362,7 @@ def test_restart_executor_uses_public_label_not_stale_pane_id():
     assert target == "mechanicus:admin"
 
 
-def test_restart_executor_does_not_fall_back_to_internal_pane_id():
+def test_restart_executor_does_not_fall_back_to_internal_pane_id() -> None:
     resume = PlannedResume(
         instance_id="abc123",
         pane_label="",

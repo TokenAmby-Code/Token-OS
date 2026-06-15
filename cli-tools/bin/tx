@@ -83,6 +83,29 @@ _tx_restart_watchdog_log() {
     } 2>/dev/null || true
 }
 
+_tx_make_restart_nonce() {
+    local file nonce
+    file=$(mktemp "${TMPDIR:-/tmp}/tx-restart-nonce.XXXXXX") || return 1
+    chmod 600 "$file" 2>/dev/null || true
+    nonce=$(uuidgen 2>/dev/null || openssl rand -hex 16 2>/dev/null || date +%s%N)
+    printf '%s' "$nonce" > "$file" || return 1
+    printf '%s	%s
+' "$file" "$nonce"
+}
+
+_tx_validate_restart_nonce() {
+    local file="${1:-}" nonce="${2:-}" stored
+    if [[ -z "$file" || -z "$nonce" || ! -f "$file" ]]; then
+        log_error "internal tx restart entrypoint refused: missing restart nonce"
+        return 1
+    fi
+    stored=$(cat "$file" 2>/dev/null || true)
+    if [[ "$stored" != "$nonce" ]]; then
+        log_error "internal tx restart entrypoint refused: invalid restart nonce"
+        return 1
+    fi
+}
+
 _tx_log_invocation() {
     local subcmd="${1:-?}" outcome="${2:-?}"
     {
@@ -442,14 +465,21 @@ cmd_restart() {
         # executor dies after teardown. That watchdog is a belt-and-suspenders
         # recovery path; if it fires, it means the restart path still has a real
         # bug that needs inspection in $TX_RESTART_WATCHDOG_LOG.
-        local cli_dir client_tty restart_pid
+        local cli_dir client_tty restart_pid nonce_file nonce nonce_row
         cli_dir="$(dirname "$(readlink -f "$0")")"
         client_tty=$(tmux display-message -p '#{client_tty}' 2>/dev/null || echo "")
+        nonce_row=$(_tx_make_restart_nonce) || {
+            log_error "failed to create tx restart nonce"
+            return 1
+        }
+        IFS=$'	' read -r nonce_file nonce <<< "$nonce_row"
         nohup "${cli_dir}/tmux-run" bash -c '
             tx_bin="$1"
             session_name="$2"
-            exec "$tx_bin" __tmuxctl_restart "$session_name"
-        ' _ "${cli_dir}/tx" "$session" >/dev/null 2>&1 &
+            nonce_file="$3"
+            nonce="$4"
+            exec "$tx_bin" __tmuxctl_restart "$session_name" "$nonce_file" "$nonce"
+        ' _ "${cli_dir}/tx" "$session" "$nonce_file" "$nonce" >/dev/null 2>&1 &
         restart_pid=$!
         if [[ "${TX_RESTART_WATCHDOG_DISABLE:-}" != "1" ]]; then
             nohup bash -c '
@@ -458,8 +488,10 @@ cmd_restart() {
                 client_tty="$3"
                 restart_pid="$4"
                 delay="$5"
-                exec "$tx_bin" __restart_watchdog "$session_name" "$client_tty" "$restart_pid" "$delay"
-            ' _ "${cli_dir}/tx" "$session" "$client_tty" "$restart_pid" "$TX_RESTART_WATCHDOG_DELAY" >/dev/null 2>&1 &
+                nonce_file="$6"
+                nonce="$7"
+                exec "$tx_bin" __restart_watchdog "$session_name" "$client_tty" "$restart_pid" "$delay" "$nonce_file" "$nonce"
+            ' _ "${cli_dir}/tx" "$session" "$client_tty" "$restart_pid" "$TX_RESTART_WATCHDOG_DELAY" "$nonce_file" "$nonce" >/dev/null 2>&1 &
         fi
         _tx_restart_watchdog_log "launched session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
         return 0
@@ -474,6 +506,8 @@ cmd_restart() {
 # Python restart, resurrects, then re-attaches whichever clients survived.
 cmd_internal_tmuxctl_restart() {
     local session="$1"
+    local nonce_file="${2:-}" nonce="${3:-}"
+    _tx_validate_restart_nonce "$nonce_file" "$nonce" || return 1
     run_tmuxctl restart --execute --session "$session" || true
     tmux-resurrect restore 2>/dev/null || true
 }
@@ -483,19 +517,27 @@ cmd_internal_restart_watchdog() {
     local client_tty="${2:-}"
     local restart_pid="${3:-}"
     local delay="${4:-$TX_RESTART_WATCHDOG_DELAY}"
+    local nonce_file="${5:-}" nonce="${6:-}"
+    _tx_validate_restart_nonce "$nonce_file" "$nonce" || return 1
+    trap 'rm -f "$nonce_file" 2>/dev/null || true' EXIT
 
     sleep "$delay" 2>/dev/null || sleep 8
 
-    local waited=0
+    local waited=0 saw_client=""
     while [[ -n "$restart_pid" ]] && kill -0 "$restart_pid" 2>/dev/null; do
-        if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
-            _tx_restart_watchdog_log "noop client-still-attached session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
-            return 0
+        if [[ -z "$saw_client" && -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
+            _tx_restart_watchdog_log "observe client-still-attached session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+            saw_client=1
         fi
-        [[ "$waited" -ge 45 ]] && break
+        [[ "$waited" -ge 180 ]] && break
         sleep 1
         waited=$((waited + 1))
     done
+
+    if [[ -n "$restart_pid" ]] && kill -0 "$restart_pid" 2>/dev/null; then
+        _tx_restart_watchdog_log "noop executor-still-running session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+        return 0
+    fi
 
     if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
         _tx_restart_watchdog_log "noop client-restored session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
@@ -510,6 +552,7 @@ cmd_internal_restart_watchdog() {
             return 0
         fi
         _tx_restart_watchdog_log "detached-client-after-restart session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+        tmux-resurrect restore >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
     else
         _tx_restart_watchdog_log "recreating-missing-session session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
         run_tmuxctl create --session "$session" >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
@@ -528,6 +571,7 @@ cmd_internal_restart_watchdog() {
         osascript -e 'tell application "Terminal" to do script "tx start"' >/dev/null 2>&1 || true
         _tx_restart_watchdog_log "opened-terminal session=${session}"
     fi
+    rm -f "$nonce_file" 2>/dev/null || true
 }
 
 cmd_exit() {

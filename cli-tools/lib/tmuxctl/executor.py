@@ -119,15 +119,19 @@ class RestartExecutor:
                             resume.tombstone_role, resume.tombstone_role, target_pane_ref
                         )
 
-                    command = self.adapter.run(
-                        "display-message",
-                        "-t",
-                        target_pane_ref,
-                        "-p",
-                        "#{pane_current_command}",
-                        allow_failure=True,
-                    ).strip()
-                    if "claude" in command:
+                    command = (
+                        self.adapter.run(
+                            "display-message",
+                            "-t",
+                            target_pane_ref,
+                            "-p",
+                            "#{pane_current_command}",
+                            allow_failure=True,
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    if any(agent in command for agent in ("claude", "codex", "node")):
                         resume_results.append(
                             ResumeResult(
                                 instance_id=resume.instance_id,

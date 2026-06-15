@@ -76,7 +76,7 @@ looks_custom_target() {
     slot="${target##*:}"
     [[ -n "$slot" && ! "$slot" =~ ^[0-9]+$ && "$slot" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]
     local left="${target%%:*}"
-    [[ "$left" =~ ^[0-9]+$ || "$left" =~ ^(palace|somnium|legion|mechanicus|reservists|mars|kreig)$ ]]
+    [[ "$left" =~ ^[0-9]+$ || "$left" =~ ^(palace|somnium|legion|mechanicus|reservists|mars|kreig|tui)$ ]]
 }
 
 resolve_target() {
