@@ -315,6 +315,10 @@ class CronEngine:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subprocess_env(),
+                # Own a fresh process group so a timeout can kill the whole tree —
+                # tmuxctl shells out to dispatch/claude-cmd/tmux, which proc.kill()
+                # (direct child only) would orphan. Mirrors _execute()'s pattern.
+                start_new_session=True,
             )
         except FileNotFoundError:
             print("CronEngine: persona-registration-sweep skipped — tmuxctl not on PATH")
@@ -323,9 +327,10 @@ class CronEngine:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
         except TimeoutError:
             try:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            await proc.wait()
             print("CronEngine: persona-registration-sweep timed out after 90s")
             return
         except Exception as exc:
