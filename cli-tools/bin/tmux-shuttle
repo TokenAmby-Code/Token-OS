@@ -133,51 +133,49 @@ fi
 
 # --- DEMOTE: palace/somnium → legion stack ---
 demote() {
-    # Remember the slot identity + working directory before the pane moves.
+    # Remember the slot identity + working directory before we swap.
     local slot_tag="$current_tag"
-    local wdir src_window src_target
+    local wdir src_target
     wdir=$(tmux display-message -t "$current_pane" -p '#{pane_current_path}')
-    # Resolve the live source window so we can refill the vacated slot after the
-    # pane is joined out into the legion stack. window_id (@N) is stable across
-    # the join; session:index is what normalize --window expects.
-    src_window=$(tmux display-message -t "$current_pane" -p '#{window_id}')
     src_target=$(tmux display-message -t "$current_pane" -p '#{session_name}:#{window_index}')
 
-    # Adopt the LIVE pane into the legion stack through the unified allocator —
-    # the same path every other worker takes. `stack adopt` join-panes the pane
-    # in (preserving its pane id + running claude process), ensures the legion
-    # window + Custodes orchestrator exist, tags it as a stack worker, assigns
-    # the lowest free ordinal, and runs enforce. No bespoke stack surgery here.
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack adopt legion \
-            --pane "$current_pane" \
+    # Allocate a real managed stack worker first, then swap the live pane into
+    # that stack slot. This preserves the source leaf exactly: the fresh stack
+    # shell becomes the palace/somnium replacement, and the live pane takes the
+    # allocator-created legion:N slot. Joining the live pane out first collapses
+    # the source layout; a later split can only guess where the vacated leaf was.
+    local stack_pane stack_tag
+    stack_pane=$(PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.cli stack add legion \
             --session "$SESSION" \
             --cwd "${wdir:-$HOME}" \
-            --no-focus \
-        || { tmux display-message "Shuttle: failed to adopt pane into legion stack"; return 1; }
-
-    # Refill the vacated palace/somnium slot with a fresh shell so the source
-    # grid never collapses to zero panes. `pane_tag` restores the slot identity
-    # and derives the correct @GRID_STATE (side for W/E, small for the center
-    # grid incl. N/S/NE/SE) so normalize._rebalance_grid replaces it cleanly.
-    local replacement
-    replacement=$(tmux split-window -t "$src_window" -d -P -F '#{pane_id}' -c "${wdir:-$HOME}")
-    if [[ -n "$replacement" ]]; then
-        pane_tag "$replacement" "$slot_tag" || true
-        tmux set-option -p -t "$replacement" @GRID_RESERVED "false" 2>/dev/null || true
-        tmux set-option -pu -t "$replacement" @STACK_PENDING 2>/dev/null || true
-    fi
-
-    # Read the ordinal the allocator assigned (legion:N, lowest free) back off
-    # the live pane and tell Token-API where the agent now lives.
-    local stack_tag
-    stack_tag=$(pane_id_of "$current_pane") || true
+            --no-focus)
+    [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate legion stack pane"; return 1; }
+    stack_tag=$(pane_id_of "$stack_pane")
     [[ -n "$stack_tag" ]] || stack_tag="legion:worker"
+
+    tmux swap-pane -d -s "$current_pane" -t "$stack_pane" || {
+        tmux kill-pane -t "$stack_pane" 2>/dev/null || true
+        tmux display-message "Shuttle: swap into legion stack failed"
+        return 1
+    }
+
+    # After swap, pane IDs follow content: current_pane is now in the managed
+    # stack slot; stack_pane is the fresh shell now occupying the original
+    # palace/somnium slot.
+    pane_tag "$current_pane" "$stack_tag" || true
+    tmux set-option -p -t "$current_pane" @PANE_TYPE "stack-worker" 2>/dev/null || true
+    tmux set-option -pu -t "$current_pane" @STACK_PENDING 2>/dev/null || true
+    pane_tag "$stack_pane" "$slot_tag" || true
+    tmux set-option -pu -t "$stack_pane" @PANE_TYPE 2>/dev/null || true
+    tmux set-option -p -t "$stack_pane" @GRID_RESERVED "false" 2>/dev/null || true
+    tmux set-option -pu -t "$stack_pane" @STACK_PENDING 2>/dev/null || true
+
     relocate_pane "$current_pane" "$stack_tag"
 
     # Normalize the source grid, then keep the camera on the replacement.
     tmux-refresh-layout "$src_target" 2>/dev/null || true
-    [[ -n "$replacement" ]] && tmux select-pane -t "$replacement" 2>/dev/null || true
+    tmux select-pane -t "$stack_pane" 2>/dev/null || true
 
     tmux display-message "Shipped to legion stack"
 }
