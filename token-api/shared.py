@@ -18,7 +18,11 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 logger = logging.getLogger("token_api")
 _LOG_EVENT_WRITE_LOCK = threading.Lock()
@@ -584,7 +588,7 @@ def cwd_basename(working_dir: str | None) -> str:
     """
     if not working_dir:
         return ""
-    return os.path.basename(working_dir.rstrip("/")) or ""
+    return Path(working_dir.rstrip("/")).name or ""
 
 
 async def _persona_display_name(db, persona_id) -> str:
@@ -611,7 +615,7 @@ async def _session_doc_title(db, session_doc_id) -> str:
 
 
 async def queue_pane_var(
-    db,
+    db: "aiosqlite.Connection",
     instance_id: str,
     variable: str,
     value: str | None,
@@ -632,7 +636,9 @@ async def queue_pane_var(
     )
 
 
-async def push_agnostic_pane_vars(db, instance_id: str | None) -> dict[str, str]:
+async def push_agnostic_pane_vars(
+    db: "aiosqlite.Connection", instance_id: str | None
+) -> dict[str, str]:
     """Resolve + enqueue the engine-agnostic nametag vars from the canonical row.
 
     Reads ``persona_id``/``session_doc_id``/``working_dir``/``tmux_pane`` from the
