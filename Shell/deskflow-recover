@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Route manual Deskflow recovery through token-satellite's KVM watchdog.
+# This is intentionally a thin endpoint wrapper: lifecycle/recovery remains in
+# token-api/token-satellite.py, not in shell/AHK duplicate implementations.
+set -euo pipefail
+
+action="${1:-reload}"
+case "$action" in
+  reload|start|stop) ;;
+  *)
+    echo "usage: deskflow-recover [reload|start|stop]" >&2
+    exit 64
+    ;;
+esac
+
+curl -sf --connect-timeout 3 --max-time 10 -X POST "${SATELLITE_URL:-http://localhost:7777}/kvm/control" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"$action\"}"
+printf '\n'

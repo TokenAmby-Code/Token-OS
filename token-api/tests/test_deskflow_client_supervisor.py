@@ -14,6 +14,7 @@ from typing import Any
 # Real deskflow-core stdout lines, with the timestamp + level prefix as emitted.
 CONNECTED_LINE = '[2026-06-10T09:15:02] IPC: connected to server "TokenPC"'
 DISCONNECTED_LINE = "[2026-06-10T09:43:11] IPC: disconnected from server"
+CONNECT_FAILED_LINE = "[2026-06-15T07:35:15.846] WARNING: failed to connect to server: Timed out"
 NOISE_LINE = '[2026-06-10T09:15:01] NOTE: connecting to "TokenPC": 100.101.102.103:24800'
 
 
@@ -94,6 +95,26 @@ class TestReconnectWindow:
         sup.handle_line(CONNECTED_LINE, 205.0)
         sup.handle_line(DISCONNECTED_LINE, 300.0)
         assert sup.deadline == 315.0
+
+    def test_failed_connect_after_prior_connection_arms_reconnect_window(self) -> None:
+        # Observed 2026-06-15: when WSL disappeared, deskflow-core did not emit
+        # the IPC disconnect marker; it went straight into failed reconnect
+        # attempts. That must still start the bounded reconnect window.
+        module = load_supervisor_module()
+        sup = make_supervisor(module, start_time=100.0)
+        sup.handle_line(CONNECTED_LINE, 105.0)
+        sup.handle_line(CONNECT_FAILED_LINE, 200.0)
+        assert not sup.connected
+        assert sup.connected_once
+        assert sup.deadline == 215.0
+
+    def test_repeated_failed_connect_does_not_extend_reconnect_window(self) -> None:
+        module = load_supervisor_module()
+        sup = make_supervisor(module, start_time=100.0)
+        sup.handle_line(CONNECTED_LINE, 105.0)
+        sup.handle_line(CONNECT_FAILED_LINE, 200.0)
+        sup.handle_line(CONNECT_FAILED_LINE, 210.0)
+        assert sup.deadline == 215.0
 
 
 class TestMarkerDisambiguation:

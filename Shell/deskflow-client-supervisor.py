@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import select
 import signal
@@ -43,14 +44,16 @@ import subprocess
 import sys
 import time
 import urllib.request
+from typing import Any, Callable
 
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
 CONNECT_WINDOW = 20.0  # seconds to first connect before going quiet
 RECONNECT_WINDOW = 15.0  # seconds to recover from a drop before going quiet
 TERM_GRACE = 3.0  # seconds between SIGTERM and SIGKILL on the core
 
-CONNECTED_MARKER = "connected to server"
-DISCONNECTED_MARKER = "disconnected from server"
+CONNECTED_MARKER = "IPC: connected to server"
+DISCONNECTED_MARKER = "IPC: disconnected from server"
+CONNECT_FAILED_MARKER = "failed to connect to server"
 
 # Token-API presence feed. While the deskflow client is connected the Emperor is
 # at his desk; we heartbeat that to token-api so its timer counts genuine desk
@@ -63,8 +66,15 @@ DESKFLOW_STATE_PATH = "/api/desktop/deskflow"
 HEARTBEAT_INTERVAL = 60.0  # seconds between active heartbeats while connected
 POST_TIMEOUT = 2.0  # seconds; a hung token-api must not stall the select loop
 
+logger = logging.getLogger(__name__)
 
-def post_deskflow_state(active, base=TOKEN_API_BASE, timeout=POST_TIMEOUT, urlopen=None):
+
+def post_deskflow_state(
+    active: bool,
+    base: str = TOKEN_API_BASE,
+    timeout: float = POST_TIMEOUT,
+    urlopen: Callable[..., Any] | None = None,
+) -> bool:
     """Best-effort POST of deskflow connection state to token-api.
 
     Stdlib-only (urllib). Never raises — telemetry must not crash the supervisor;
@@ -72,7 +82,9 @@ def post_deskflow_state(active, base=TOKEN_API_BASE, timeout=POST_TIMEOUT, urlop
     Returns True on a 2xx response, False on any non-2xx or error.
     """
     opener = urlopen or urllib.request.urlopen
-    payload = json.dumps({"active": bool(active), "source": "deskflow-supervisor"}).encode()
+    payload = json.dumps(
+        {"active": bool(active), "source": "deskflow-supervisor"}
+    ).encode()
     req = urllib.request.Request(
         base + DESKFLOW_STATE_PATH,
         data=payload,
@@ -82,7 +94,11 @@ def post_deskflow_state(active, base=TOKEN_API_BASE, timeout=POST_TIMEOUT, urlop
     try:
         resp = opener(req, timeout=timeout)
     except Exception as exc:
-        print(f"supervisor: deskflow-state POST failed (active={active}): {exc}", flush=True)
+        logger.warning(
+            "supervisor: deskflow-state POST failed (active=%s): %s",
+            active,
+            exc,
+        )
         return False
     try:
         code = resp.getcode()
@@ -115,11 +131,20 @@ class Supervisor:
         self.connected_once = False
 
     def handle_line(self, line: str, now: float) -> None:
-        # Order matters defensively, though "disconnected from server" does
-        # not contain "connected to server" as a substring.
+        # Order matters. A clean drop emits the IPC disconnect marker, but a
+        # WSL/server disappearance can skip that line and go straight into
+        # Deskflow's retry loop:
+        #   WARNING: failed to connect to server: Timed out
+        # Treat the first such failure after a confirmed connection as the
+        # reconnect edge, otherwise the supervisor thinks it is still connected
+        # and leaves the core retrying forever.
         if DISCONNECTED_MARKER in line:
             self.connected = False
             self.deadline = now + self.reconnect_window
+        elif CONNECT_FAILED_MARKER in line and self.connected_once:
+            self.connected = False
+            if self.deadline is None:
+                self.deadline = now + self.reconnect_window
         elif CONNECTED_MARKER in line:
             self.connected = True
             self.connected_once = True
