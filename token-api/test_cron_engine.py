@@ -964,6 +964,49 @@ class TestPersonaSweep:
             # Must not raise — a missing binary is logged and swallowed.
             run(engine._run_persona_sweep_job())
 
+    def _run_sweep_with_results(self, engine, results):
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (json.dumps(results).encode(), b"")
+
+        async def _fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        with patch("cron_engine.asyncio.create_subprocess_exec", side_effect=_fake_exec):
+            run(engine._run_persona_sweep_job())
+
+    def test_sweep_summary_excludes_absent_panes(self, engine, capsys):
+        # An absent persona seat (resolve failure -> action="error", e.g. koronus
+        # not seated) is the expected, uninteresting state and must NOT appear in
+        # the per-interval summary — only a genuinely present-but-unhealthy pane does.
+        results = [
+            {"ok": True, "pane_label": "legion:custodes", "action": "none"},
+            {"ok": False, "pane_label": "koronus:pax", "action": "error"},
+            {
+                "ok": False,
+                "pane_label": "mechanicus:admin",
+                "action": "persona_unregistered_noted",
+            },
+        ]
+        self._run_sweep_with_results(engine, results)
+        out = capsys.readouterr().out
+        assert "acted on 1" in out
+        assert "mechanicus:admin=persona_unregistered_noted" in out
+        assert "koronus" not in out
+
+    def test_sweep_stays_quiet_when_all_healthy_or_absent(self, engine, capsys):
+        # No present-pane action -> no summary line at all (absent koronus seats
+        # alone never trip the log).
+        results = [
+            {"ok": True, "pane_label": "legion:custodes", "action": "none"},
+            {"ok": False, "pane_label": "koronus:orchestrator", "action": "error"},
+        ]
+        self._run_sweep_with_results(engine, results)
+        out = capsys.readouterr().out
+        assert "acted on" not in out
+
 
 # ── Unit Tests: Victory Detection ─────────────────────────────
 

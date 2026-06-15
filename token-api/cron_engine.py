@@ -7,7 +7,6 @@ job definitions and run history in agents.db.
 
 import asyncio
 import json
-import logging
 import os
 import re
 import signal
@@ -31,8 +30,6 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-
-logger = logging.getLogger("cron_engine")
 
 VICTORY_RE = re.compile(r"##IMPERIUM_VICTORIOUS:\s*(.+?)##", re.DOTALL)
 
@@ -306,9 +303,13 @@ class CronEngine:
             misfire_grace_time=60,
             name="persona-registration-sweep",
         )
-        logger.info(
-            "CronEngine: Registered persona-registration-sweep (interval: %dm)", interval_minutes
-        )
+        # print() (not logging) deliberately: the whole CronEngine class writes
+        # operational messages to stdout so launchd captures them in
+        # ~/.claude/token-api-stdout.log (the documented log operators grep). A
+        # logging.getLogger("cron_engine") record is swallowed here — main.py only
+        # wires the `token_api` logger to a handler — so it would land nowhere
+        # (verified on live 2026-06-15).
+        print(f"CronEngine: Registered persona-registration-sweep (interval: {interval_minutes}m)")
 
     async def _run_persona_sweep_job(self) -> None:
         try:
@@ -326,7 +327,7 @@ class CronEngine:
                 start_new_session=True,
             )
         except FileNotFoundError:
-            logger.warning("CronEngine: persona-registration-sweep skipped — tmuxctl not on PATH")
+            print("CronEngine: persona-registration-sweep skipped — tmuxctl not on PATH")
             return
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
@@ -336,30 +337,29 @@ class CronEngine:
             except ProcessLookupError:
                 pass
             await proc.wait()
-            logger.warning("CronEngine: persona-registration-sweep timed out after 90s")
+            print("CronEngine: persona-registration-sweep timed out after 90s")
             return
         except Exception as exc:
-            logger.error("CronEngine: persona-registration-sweep failed: %s", exc)
+            print(f"CronEngine: persona-registration-sweep failed: {exc}")
             return
         if proc.returncode != 0:
             err = (stderr or b"").decode("utf-8", errors="replace")[-500:]
-            logger.warning("CronEngine: persona-registration-sweep rc=%s: %s", proc.returncode, err)
+            print(f"CronEngine: persona-registration-sweep rc={proc.returncode}: {err}")
             return
-        # Surface any pane that did not end healthy so a persistent silent-drop is
-        # visible in the server log; a clean sweep stays quiet.
+        # Surface only panes the sweep genuinely acted on or found unhealthy WHILE
+        # PRESENT — a clean sweep stays quiet. An absent persona pane (resolve
+        # failure -> action="error", e.g. koronus seats that aren't always seated)
+        # is the expected, uninteresting state and is excluded so it can't spam the
+        # log every interval; run `tmuxctl assert-personas` manually to see those.
         out = (stdout or b"").decode("utf-8", errors="replace").strip()
         try:
             results = json.loads(out) if out else []
         except json.JSONDecodeError:
             return
-        unhealthy = [r for r in results if not r.get("ok")]
-        if unhealthy:
-            summary = ", ".join(
-                f"{r.get('pane_label', '?')}={r.get('action', '?')}" for r in unhealthy
-            )
-            logger.info(
-                "CronEngine: persona-registration-sweep acted on %d: %s", len(unhealthy), summary
-            )
+        acted = [r for r in results if not r.get("ok") and r.get("action") != "error"]
+        if acted:
+            summary = ", ".join(f"{r.get('pane_label', '?')}={r.get('action', '?')}" for r in acted)
+            print(f"CronEngine: persona-registration-sweep acted on {len(acted)}: {summary}")
 
     async def ensure_permanent_jobs(self):
         """Seed permanent jobs into DB on first boot only (INSERT OR IGNORE).
