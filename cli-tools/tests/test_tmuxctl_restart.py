@@ -24,6 +24,7 @@ from tmuxctl.models import (
     InstanceRegistryEntry,
     InstanceRegistrySnapshot,
     PaneSnapshot,
+    PlannedResume,
     WindowSnapshot,
     WorkspaceSnapshot,
 )
@@ -264,8 +265,10 @@ def test_palace_happy_path_resumes_grid_and_side_labels():
 
     plan = build_restart_plan(workspace, registry)
 
-    resumed = {resume.instance_id: resume.target_pane_id for resume in plan.resumes}
-    assert resumed == {"alpha": "%2", "beta": "%6"}
+    resumed = {
+        resume.instance_id: (resume.pane_label, resume.target_pane_id) for resume in plan.resumes
+    }
+    assert resumed == {"alpha": ("palace:N", ""), "beta": ("palace:E", "")}
     assert all(not resume.target_hidden_until_rebuild for resume in plan.resumes)
 
 
@@ -289,7 +292,7 @@ def test_restart_plan_backfills_pane_label_from_live_instance_stamp():
     plan = build_restart_plan(workspace, registry)
 
     assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
-        ("ghost", "palace:W", "%1")
+        ("ghost", "palace:W", "")
     ]
 
 
@@ -311,7 +314,7 @@ def test_restart_plan_prefers_registry_pane_label_over_stamp():
     plan = build_restart_plan(workspace, registry)
 
     assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
-        ("abc", "palace:N", "%2")
+        ("abc", "palace:N", "")
     ]
 
 
@@ -342,6 +345,36 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
 
     assert attachments[0].attachment_class is AttachmentClass.LOCAL_LEADER
     assert attachments[1].attachment_class is AttachmentClass.REMOTE_GROUPED
+
+
+def test_restart_executor_uses_public_label_not_stale_pane_id():
+    resume = PlannedResume(
+        instance_id="abc123",
+        pane_label="mechanicus:admin",
+        target_pane_id="%73",
+        working_dir="/Volumes/Imperium/Imperium-ENV",
+        disposition=ResumeDisposition.RESUME,
+        reason="active",
+    )
+
+    target = RestartExecutor()._resume_target_ref(resume)
+
+    assert target == "mechanicus:admin"
+
+
+def test_restart_executor_does_not_fall_back_to_internal_pane_id():
+    resume = PlannedResume(
+        instance_id="abc123",
+        pane_label="",
+        target_pane_id="%73",
+        working_dir="/Volumes/Imperium/Imperium-ENV",
+        disposition=ResumeDisposition.RESUME,
+        reason="legacy",
+    )
+
+    target = RestartExecutor()._resume_target_ref(resume)
+
+    assert target == ""
 
 
 def test_dry_run_emits_deterministic_action_order():
@@ -392,7 +425,7 @@ def test_dry_run_emits_deterministic_action_order():
         "recreate workspace via builder.build_workspace",
         "normalize managed windows before restore",
         "clear transient stash windows",
-        "resume abc12345 into %1 with resume",
+        "resume abc12345 into somnium:W with resume",
         "recreate grouped session phone on somnium",
         "verify pane labels and resume outcomes",
     ]
@@ -575,5 +608,5 @@ def test_restart_plan_resumes_instance_reported_working_by_api():
     plan = build_restart_plan(workspace, registry)
 
     assert [(r.instance_id, r.pane_label, r.target_pane_id) for r in plan.resumes] == [
-        ("busy", "palace:W", "%53")
+        ("busy", "palace:W", "")
     ]

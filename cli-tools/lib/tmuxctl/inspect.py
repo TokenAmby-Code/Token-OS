@@ -76,7 +76,7 @@ def render_restart_plan(plan: RestartPlan) -> str:
                 f"window={grouped.selected_window_name or grouped.selected_window_index}"
             )
     for resume in plan.resumes:
-        target = resume.target_pane_id or "<post-rebuild>"
+        target = resume.pane_label or resume.target_pane_id or "<unresolved>"
         tombstone = f" tombstone={resume.tombstone_role}" if resume.tombstone_role else ""
         lines.append(
             "  "

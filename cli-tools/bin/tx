@@ -71,6 +71,17 @@ SESSION_NAME="main"
 # agents.db or any token-api hot path, so it stays inert and outside the failure
 # modes that caused the wipes. Best-effort: it must NEVER block or fail `tx`.
 TX_INVOCATION_LOG="${TX_INVOCATION_LOG:-${HOME}/.claude/tx-invocations.log}"
+TX_RESTART_WATCHDOG_LOG="${TX_RESTART_WATCHDOG_LOG:-${HOME}/.claude/tx-restart-watchdog.log}"
+TX_RESTART_WATCHDOG_DELAY="${TX_RESTART_WATCHDOG_DELAY:-8}"
+
+_tx_restart_watchdog_log() {
+    {
+        local ts
+        ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')
+        mkdir -p "$(dirname "$TX_RESTART_WATCHDOG_LOG")" 2>/dev/null || true
+        printf '%s\t%s\n' "$ts" "$*" >> "$TX_RESTART_WATCHDOG_LOG" 2>/dev/null
+    } 2>/dev/null || true
+}
 
 _tx_log_invocation() {
     local subcmd="${1:-?}" outcome="${2:-?}"
@@ -423,11 +434,34 @@ cmd_restart() {
     log_info "Restarting session '${session}' via tmuxctl…"
 
     if in_tmux; then
-        # tmuxctl will detach this client; run it as a server background job so
-        # the script doesn't die mid-restart with the parent client.
-        local cli_dir
+        # tmuxctl will park this client, tear down the leader session, rebuild,
+        # and switch clients back. Do NOT run the executor as a tmux server
+        # background job: if the server/session crashes mid-restart, the control
+        # flow dies with it. Launch it as an OS-detached child instead. A second
+        # watchdog process waits behind it and recreates the workspace if the
+        # executor dies after teardown. That watchdog is a belt-and-suspenders
+        # recovery path; if it fires, it means the restart path still has a real
+        # bug that needs inspection in $TX_RESTART_WATCHDOG_LOG.
+        local cli_dir client_tty restart_pid
         cli_dir="$(dirname "$(readlink -f "$0")")"
-        tmux run-shell -b "tmux-run bash -c '\"${cli_dir}/tx\" __tmuxctl_restart \"$session\"'"
+        client_tty=$(tmux display-message -p '#{client_tty}' 2>/dev/null || echo "")
+        nohup "${cli_dir}/tmux-run" bash -c '
+            tx_bin="$1"
+            session_name="$2"
+            exec "$tx_bin" __tmuxctl_restart "$session_name"
+        ' _ "${cli_dir}/tx" "$session" >/dev/null 2>&1 &
+        restart_pid=$!
+        if [[ "${TX_RESTART_WATCHDOG_DISABLE:-}" != "1" ]]; then
+            nohup bash -c '
+                tx_bin="$1"
+                session_name="$2"
+                client_tty="$3"
+                restart_pid="$4"
+                delay="$5"
+                exec "$tx_bin" __restart_watchdog "$session_name" "$client_tty" "$restart_pid" "$delay"
+            ' _ "${cli_dir}/tx" "$session" "$client_tty" "$restart_pid" "$TX_RESTART_WATCHDOG_DELAY" >/dev/null 2>&1 &
+        fi
+        _tx_restart_watchdog_log "launched session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
         return 0
     fi
 
@@ -436,12 +470,64 @@ cmd_restart() {
     exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
 }
 
-# Internal: invoked by `tx restart` via run-shell -b inside tmux. Runs the
+# Internal: invoked by `tx restart` from an OS-detached child. Runs the
 # Python restart, resurrects, then re-attaches whichever clients survived.
 cmd_internal_tmuxctl_restart() {
     local session="$1"
     run_tmuxctl restart --execute --session "$session" || true
     tmux-resurrect restore 2>/dev/null || true
+}
+
+cmd_internal_restart_watchdog() {
+    local session="${1:-$SESSION_NAME}"
+    local client_tty="${2:-}"
+    local restart_pid="${3:-}"
+    local delay="${4:-$TX_RESTART_WATCHDOG_DELAY}"
+
+    sleep "$delay" 2>/dev/null || sleep 8
+
+    local waited=0
+    while [[ -n "$restart_pid" ]] && kill -0 "$restart_pid" 2>/dev/null; do
+        if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
+            _tx_restart_watchdog_log "noop client-still-attached session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+            return 0
+        fi
+        [[ "$waited" -ge 45 ]] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
+        _tx_restart_watchdog_log "noop client-restored session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+        return 0
+    fi
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+        local attached_clients
+        attached_clients=$(tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null || true)
+        if [[ -n "$attached_clients" ]]; then
+            _tx_restart_watchdog_log "noop session-has-other-client session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+            return 0
+        fi
+        _tx_restart_watchdog_log "detached-client-after-restart session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+    else
+        _tx_restart_watchdog_log "recreating-missing-session session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+        run_tmuxctl create --session "$session" >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
+        tmux-resurrect restore >> "$TX_RESTART_WATCHDOG_LOG" 2>&1 || true
+    fi
+
+    # Best-effort local re-entry. We do not attempt TTY injection here: writing
+    # commands into a user's shell can execute partial input or hit the wrong
+    # foreground program. If the original Mac terminal crashed out and no tmux
+    # client is attached anywhere, open a fresh Terminal running `tx start`.
+    local open_terminal="${TX_RESTART_WATCHDOG_OPEN_TERMINAL:-}"
+    if [[ -z "$open_terminal" && "${IMPERIUM_MACHINE:-}" == "mac" && -z "${SSH_CONNECTION:-}" ]]; then
+        open_terminal=1
+    fi
+    if [[ "${IMPERIUM_MACHINE:-}" == "mac" && "$open_terminal" == "1" ]]; then
+        osascript -e 'tell application "Terminal" to do script "tx start"' >/dev/null 2>&1 || true
+        _tx_restart_watchdog_log "opened-terminal session=${session}"
+    fi
 }
 
 cmd_exit() {
@@ -857,6 +943,9 @@ esac
 case "$CMD" in
     __tmuxctl_restart)
         cmd_internal_tmuxctl_restart "$@"
+        ;;
+    __restart_watchdog)
+        cmd_internal_restart_watchdog "$@"
         ;;
     start)
         cmd_start "$@"

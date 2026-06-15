@@ -115,6 +115,7 @@ def _looks_like_custom_pane_target(target: str) -> bool:
         "somnium",
         "legion",
         "mechanicus",
+        "reservists",
         "mars",
         "kreig",
         "tui",

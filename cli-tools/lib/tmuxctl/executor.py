@@ -11,6 +11,7 @@ from .builder import build_workspace
 from .custodes import _pane_pid, pane_has_active_agent
 from .enums import AttachmentClass, RestartPhase
 from .models import (
+    PlannedResume,
     RestartAction,
     RestartExecutionResult,
     RestartPlan,
@@ -93,13 +94,11 @@ class RestartExecutor:
             self._clear_transient_windows(plan.session_name)
             time.sleep(0.2)
             rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
-            pane_by_label = {
-                pane.pane_role: pane.pane_id for pane in rebuilt.iter_panes() if pane.pane_role
-            }
+            rebuilt_labels = {pane.pane_role for pane in rebuilt.iter_panes() if pane.pane_role}
 
             for resume in plan.resumes:
-                target_pane_id = resume.target_pane_id or pane_by_label.get(resume.pane_label, "")
-                if not target_pane_id:
+                target_pane_ref = self._resume_target_ref(resume)
+                if not target_pane_ref:
                     resume_results.append(
                         ResumeResult(
                             instance_id=resume.instance_id,
@@ -112,71 +111,84 @@ class RestartExecutor:
                     )
                     continue
 
-                if resume.tombstone_role and resume.tombstone_role != resume.pane_label:
-                    source_pane_id = pane_by_label.get(resume.tombstone_role, "")
-                    if source_pane_id and source_pane_id != target_pane_id:
+                try:
+                    if resume.pane_label and resume.pane_label not in rebuilt_labels:
+                        raise ValueError(f"target label missing after rebuild: {resume.pane_label}")
+                    if resume.tombstone_role and resume.tombstone_role != resume.pane_label:
                         self._install_tombstone(
-                            source_pane_id, resume.tombstone_role, target_pane_id
+                            resume.tombstone_role, resume.tombstone_role, target_pane_ref
                         )
 
-                command = self.adapter.run(
-                    "display-message",
-                    "-t",
-                    target_pane_id,
-                    "-p",
-                    "#{pane_current_command}",
-                    allow_failure=True,
-                ).strip()
-                if "claude" in command:
+                    command = self.adapter.run(
+                        "display-message",
+                        "-t",
+                        target_pane_ref,
+                        "-p",
+                        "#{pane_current_command}",
+                        allow_failure=True,
+                    ).strip()
+                    if "claude" in command:
+                        resume_results.append(
+                            ResumeResult(
+                                instance_id=resume.instance_id,
+                                pane_label=resume.pane_label,
+                                target_pane_id=target_pane_ref,
+                                disposition=resume.disposition,
+                                success=False,
+                                message="target pane already busy",
+                            )
+                        )
+                        continue
+
+                    pane_target = resume.pane_label or target_pane_ref
+                    self.adapter.send_keys(
+                        target_pane_ref,
+                        f"dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(pane_target)}",
+                        "Enter",
+                    )
+                    time.sleep(1.5)
+                    pane_output = self.adapter.capture_pane(target_pane_ref, lines=8).lower()
+                    if any(pattern in pane_output for pattern in RESUME_FAILURE_PATTERNS):
+                        self.adapter.send_keys(target_pane_ref, "C-c", allow_failure=True)
+                        time.sleep(0.2)
+                        self.adapter.send_keys(target_pane_ref, "C-c", allow_failure=True)
+                        resume_results.append(
+                            ResumeResult(
+                                instance_id=resume.instance_id,
+                                pane_label=resume.pane_label,
+                                target_pane_id=target_pane_ref,
+                                disposition=resume.disposition,
+                                success=False,
+                                message="resume validation failed",
+                            )
+                        )
+                        continue
+
+                    if resume.disposition.value == "resume_and_continue":
+                        time.sleep(2.0)
+                        self.adapter.send_text_then_submit(target_pane_ref, CONTINUATION_PROMPT)
                     resume_results.append(
                         ResumeResult(
                             instance_id=resume.instance_id,
                             pane_label=resume.pane_label,
-                            target_pane_id=target_pane_id,
+                            target_pane_id=target_pane_ref,
                             disposition=resume.disposition,
-                            success=False,
-                            message="target pane already busy",
+                            success=True,
+                            message="resumed",
                         )
                     )
-                    continue
-
-                pane_target = resume.pane_label or target_pane_id
-                self.adapter.send_keys(
-                    target_pane_id,
-                    f"dispatch --id {shlex.quote(resume.instance_id)} --pane {shlex.quote(pane_target)}",
-                    "Enter",
-                )
-                time.sleep(1.5)
-                pane_output = self.adapter.capture_pane(target_pane_id, lines=8).lower()
-                if any(pattern in pane_output for pattern in RESUME_FAILURE_PATTERNS):
-                    self.adapter.send_keys(target_pane_id, "C-c")
-                    time.sleep(0.2)
-                    self.adapter.send_keys(target_pane_id, "C-c")
+                except Exception as exc:
                     resume_results.append(
                         ResumeResult(
                             instance_id=resume.instance_id,
                             pane_label=resume.pane_label,
-                            target_pane_id=target_pane_id,
+                            target_pane_id=target_pane_ref,
                             disposition=resume.disposition,
                             success=False,
-                            message="resume validation failed",
+                            message=f"resume raised {type(exc).__name__}: {str(exc)[:160]}",
                         )
                     )
                     continue
-
-                if resume.disposition.value == "resume_and_continue":
-                    time.sleep(2.0)
-                    self.adapter.send_text_then_submit(target_pane_id, CONTINUATION_PROMPT)
-                resume_results.append(
-                    ResumeResult(
-                        instance_id=resume.instance_id,
-                        pane_label=resume.pane_label,
-                        target_pane_id=target_pane_id,
-                        disposition=resume.disposition,
-                        success=True,
-                        message="resumed",
-                    )
-                )
 
             persistent_violations = self._assert_persistent_runtime_panes(plan.session_name)
 
@@ -221,6 +233,18 @@ class RestartExecutor:
 
         finally:
             self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
+
+    def _resume_target_ref(self, resume: PlannedResume) -> str:
+        """Return the public tmuxctl target for a planned resume.
+
+        Restart execution must not carry volatile tmux ``%N`` ids across
+        teardown. The durable pane label (for example ``palace:N`` or
+        ``mechanicus:admin``) is the writer-facing target; ``TmuxAdapter`` then
+        resolves that public target against the live rebuilt workspace at the
+        last possible moment. ``target_pane_id`` should be empty for restart
+        plans and is not used as a writer target.
+        """
+        return resume.pane_label or ""
 
     def _run_focus_restore(self, *args: str, allow_failure: bool = False) -> str:
         previous = os.environ.get("IMPERIUM_TMUX_FOCUS_RESTORE")
@@ -530,7 +554,7 @@ done
         )
         actions.append(RestartAction(RestartPhase.REBUILD, "clear transient stash windows"))
         for resume in plan.resumes:
-            target = resume.target_pane_id or f"{resume.pane_label} (resolve post-rebuild)"
+            target = resume.pane_label or resume.target_pane_id or "<unresolved>"
             actions.append(
                 RestartAction(
                     RestartPhase.RESTORE,
