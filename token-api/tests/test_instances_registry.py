@@ -564,3 +564,62 @@ def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
     ).fetchone()
     conn.close()
     assert (row["commander_type"], row["commander_slug"]) == ("persona", "custodes")
+
+
+def test_banish_chapter_instance_moves_to_black_shields_without_retiring(app_env):
+    import asyncio
+
+    conn = _conn(app_env.db_path)
+    try:
+        blood_angels = _persona(conn, "blood-angels")
+        commander = _insert_instance(conn, id="commander", persona_id=blood_angels, rank="overseer")
+        child = _insert_instance(
+            conn,
+            id="child",
+            persona_id=blood_angels,
+            commander_type="chapter",
+            commander_id=commander,
+            rank="astartes",
+            status="idle",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = asyncio.run(app_env.main.banish_instance(child))
+
+    assert result == {"instance_id": child, "status": "stopped", "persona": "black-shields"}
+    conn = _conn(app_env.db_path)
+    try:
+        row = conn.execute(
+            """SELECT i.status, i.rank, p.slug, i.commander_type, i.commander_id
+               FROM instances i JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ?""",
+            (child,),
+        ).fetchone()
+        assert tuple(row) == ("stopped", "astartes", "black-shields", "emperor", None)
+    finally:
+        conn.close()
+
+
+def test_retire_instance_sets_rank_retired_and_stopped(app_env):
+    import asyncio
+
+    conn = _conn(app_env.db_path)
+    try:
+        iid = _insert_instance(conn, id="retire-me", status="idle", rank="astartes")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = asyncio.run(app_env.main.retire_instance(iid))
+
+    assert result == {"instance_id": iid, "rank": "retired", "status": "stopped"}
+    conn = _conn(app_env.db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, rank, golden_throne FROM instances WHERE id = ?", (iid,)
+        ).fetchone()
+        assert tuple(row) == ("stopped", "retired", None)
+    finally:
+        conn.close()

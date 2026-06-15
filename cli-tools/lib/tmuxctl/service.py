@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from .api import build_client_attachments, fetch_instance_registry, fetch_session_doc_for_pane_label
+from .api import (
+    RegistryError,
+    build_client_attachments,
+    fetch_instance_registry,
+    fetch_session_doc_for_pane_label,
+)
 from .audience import audience_return, audience_toggle
 from .builder import (
     PALACE_WINDOW,
@@ -10,6 +15,7 @@ from .builder import (
     build_somnium_window,
     build_workspace,
 )
+from .enums import CoherenceSeverity
 from .executor import RestartExecutor
 from .focus import focus_window
 from .inspect import (
@@ -21,7 +27,7 @@ from .inspect import (
     render_workspace,
 )
 from .labels import canonical_pane_role
-from .models import GroupedSessionSnapshot
+from .models import CoherenceIssue, GroupedSessionSnapshot, InstanceRegistrySnapshot
 from .normalize import normalize_window
 from .planner import build_restart_plan
 from .resolver import (
@@ -79,7 +85,12 @@ class TmuxControlPlane:
 
     def build_restart_plan(self, session_name: str):
         workspace = build_workspace_snapshot(self.adapter, session_name)
-        registry = fetch_instance_registry()
+        registry_error = ""
+        try:
+            registry = fetch_instance_registry()
+        except RegistryError as exc:
+            registry_error = str(exc)
+            registry = InstanceRegistrySnapshot(device_id="", instances=())
         grouped_sessions = self._grouped_sessions(session_name)
         attachments = build_client_attachments(
             self.adapter.list_clients(),
@@ -91,6 +102,23 @@ class TmuxControlPlane:
             client_attachments=attachments,
             grouped_sessions=grouped_sessions,
         )
+        if registry_error:
+            plan = plan.__class__(
+                session_name=plan.session_name,
+                phase=plan.phase,
+                resumes=plan.resumes,
+                skipped=plan.skipped,
+                client_attachments=plan.client_attachments,
+                grouped_sessions=plan.grouped_sessions,
+                coherence_issues=(
+                    *plan.coherence_issues,
+                    CoherenceIssue(
+                        severity=CoherenceSeverity.WARNING,
+                        code="registry_unavailable",
+                        message=f"instance registry unavailable; restoring from live tmux snapshot only: {registry_error}",
+                    ),
+                ),
+            )
         return plan
 
     def dry_run_restart(self, session_name: str) -> str:

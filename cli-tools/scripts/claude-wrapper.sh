@@ -9,6 +9,9 @@ WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:
 WORKING_DIR="$(pwd)"
 TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
 DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:legion}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../lib/tmux-runtime-cleanup.sh
+source "${SCRIPT_DIR}/../lib/tmux-runtime-cleanup.sh" 2>/dev/null || true
 
 post_hook() {
   local action_type="$1"
@@ -97,7 +100,9 @@ cleanup() {
   # Clear the instance->pane stamp the instant the agent dies. Unset by name
   # (no value needed); tmuxctl resolve-instance returns not-found immediately,
   # so no consumer sends to — or speaks the position of — a vanished agent.
-  if [[ -n "$TMUX_PANE_VALUE" ]] && command -v tmux >/dev/null 2>&1; then
+  if declare -F tmux_runtime_cleanup_pane >/dev/null 2>&1; then
+    tmux_runtime_cleanup_pane "$TMUX_PANE_VALUE"
+  elif [[ -n "$TMUX_PANE_VALUE" ]] && command -v tmux >/dev/null 2>&1; then
     tmux set-option -p -u -t "$TMUX_PANE_VALUE" @INSTANCE_ID >/dev/null 2>&1 || true
   fi
   local end_payload
@@ -184,6 +189,9 @@ trap cleanup EXIT INT TERM HUP
 
 start_payload="$(build_payload "WrapperStart")"
 post_hook "WrapperStart" "$start_payload"
+if declare -F tmux_runtime_stamp_wrapper >/dev/null 2>&1; then
+  tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_LAUNCH_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
+fi
 
 export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
 
