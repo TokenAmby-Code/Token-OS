@@ -8,6 +8,7 @@ import { useMemo, useState } from 'react';
 import type { PipelineDoc, SessionDocsFeed } from '../types';
 import { pipelineLane, type LaneVisual } from '../modes';
 import { formatAge, compactPath } from '../format';
+import { openSessionDoc } from '../api';
 
 type DateScope = 'today' | 'all';
 
@@ -63,7 +64,15 @@ function laneCounts(docs: PipelineDoc[]): Record<string, number> {
   }, {});
 }
 
-function PipelineCard({ d }: { d: PipelineDoc }) {
+function PipelineCard({
+  d,
+  selected,
+  onSelect,
+}: {
+  d: PipelineDoc;
+  selected: boolean;
+  onSelect: (doc: PipelineDoc) => void;
+}) {
   const title = d.title ?? (d.path ? compactPath(d.path) : 'untitled');
   const body = (
     <>
@@ -79,6 +88,27 @@ function PipelineCard({ d }: { d: PipelineDoc }) {
     </>
   );
 
+  // A doc with a stable id selects + opens through the one open-by-id endpoint
+  // (server-side obsidian CLI) — the same funnel the tmux `prefix + S` keybind
+  // and the fleet-row double-click use. We route the open *through* Token-API
+  // rather than deep-linking the browser at obsidian://, so the open path stays
+  // single and server-driven. (Selecting highlights the card on top of that.)
+  if (d.id != null) {
+    return (
+      <button
+        type="button"
+        className={`pcard pcard--openable${selected ? ' is-selected' : ''}`}
+        aria-pressed={selected}
+        title="Open in Obsidian"
+        onClick={() => onSelect(d)}
+      >
+        {body}
+        <span className="pcard__open">↗ obsidian</span>
+      </button>
+    );
+  }
+  // No id (can't reach the endpoint) but a direct deep link exists: fall back to
+  // the obsidian:// anchor so the card is still openable.
   if (d.obsidian_uri) {
     return (
       <a className="pcard" href={d.obsidian_uri} title="Open in Obsidian">
@@ -92,6 +122,15 @@ function PipelineCard({ d }: { d: PipelineDoc }) {
 
 export function PipelinePanel({ feed }: { feed: SessionDocsFeed }) {
   const [scope, setScope] = useState<DateScope>('today');
+  // Single-select: the one selected card is highlighted. Selecting also opens
+  // the doc in Obsidian via the shared open-by-id endpoint (read-only cockpit —
+  // the server runs the open; we never mutate the document).
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const onSelect = (doc: PipelineDoc) => {
+    if (doc.id == null) return;
+    setSelectedId(doc.id);
+    void openSessionDoc(doc.id).catch(() => {});
+  };
   const allDocs = feed.docs ?? [];
   const todayKey = localDateKey(new Date());
   const docs = useMemo(() => {
@@ -172,7 +211,12 @@ export function PipelinePanel({ feed }: { feed: SessionDocsFeed }) {
               </header>
               <div className="lane__cards">
                 {docs.map((d) => (
-                  <PipelineCard key={d.id ?? d.path ?? d.title} d={d} />
+                  <PipelineCard
+                    key={d.id ?? d.path ?? d.title}
+                    d={d}
+                    selected={d.id != null && d.id === selectedId}
+                    onSelect={onSelect}
+                  />
                 ))}
                 {hidden > 0 ? (
                   <p className="lane__more">+{hidden} more · open in Obsidian</p>

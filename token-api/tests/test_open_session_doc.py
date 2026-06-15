@@ -65,6 +65,14 @@ def test_open_invokes_obsidian_cli_and_returns_uri(osd_client, app_env) -> None:
         body["obsidian_uri"] == "obsidian://open?vault=Imperium-ENV&file=Mars/Sessions/my-session"
     )
 
+    # The full OpenDocResult contract — pinned because more than one client now
+    # funnels through this one endpoint: the tmux `prefix + S` keybind, the fleet
+    # double-click, AND the ops cockpit Session Pipeline row-select. Every key the
+    # web/ops `OpenDocResult` type reads must be present and well-formed.
+    assert set(body) >= {"doc_id", "title", "file_path", "obsidian_uri", "opened"}
+    assert body["file_path"] == str(doc_path)
+    assert "title" in body  # nullable, but the key must exist for the typed client
+
     # The one open path shells out to the obsidian CLI with cardinal args.
     assert len(osd_client.calls) == 1
     argv = osd_client.calls[0]

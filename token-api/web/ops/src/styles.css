@@ -958,11 +958,27 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
   padding: 11px 12px 10px;
   transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
 }
-a.pcard:hover {
+/* The openable card is a <button> (select + server-side open); reset the UA
+   chrome so it reads identically to the anchor variant. */
+button.pcard {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  appearance: none;
+}
+a.pcard:hover,
+.pcard--openable:hover {
   border-color: var(--line-bright);
   border-left-color: var(--lane-c);
   transform: translateY(-1px);
   box-shadow: 0 10px 26px -16px rgba(0, 0, 0, 0.8);
+}
+/* Single-select highlight — the one selected card stays lit after the open. */
+.pcard.is-selected {
+  border-color: var(--brass);
+  border-left-color: var(--brass);
+  background: var(--surface-3);
 }
 .pcard__title {
   display: -webkit-box;
@@ -1016,7 +1032,9 @@ a.pcard:hover {
   opacity: 0;
   transition: opacity 0.15s;
 }
-a.pcard:hover .pcard__open { opacity: 0.9; }
+a.pcard:hover .pcard__open,
+.pcard--openable:hover .pcard__open,
+.pcard.is-selected .pcard__open { opacity: 0.9; }
 .lane__more {
   margin: 2px 0 0;
   padding: 7px 2px;
