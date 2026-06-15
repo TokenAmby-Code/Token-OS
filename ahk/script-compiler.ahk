@@ -155,11 +155,15 @@ Media_Prev:: {  ; Restart current TTS message from beginning
     PostToTokenApi("/api/work-action", "")
 }
 
-^!k:: {  ; Ctrl+Alt+K = run WSL `deskflow` without opening a terminal
-    ToolTip("deskflow…")
+^!k:: {  ; Ctrl+Alt+K = ask the WSL watchdog to run Deskflow recovery
+    ToolTip("deskflow watchdog…")
     try {
-        Run('wsl.exe -d Ubuntu -e bash -lic "deskflow"',, "Hide")
-        ToolTip("deskflow launched")
+        cmd := "wsl.exe -d Ubuntu -e bash -lc `"/mnt/imperium/runtimes/token-os/live/Shell/deskflow-recover reload`""
+        exitCode := RunWait(cmd,, "Hide")
+        if (exitCode = 0)
+            ToolTip("deskflow recovery requested")
+        else
+            ToolTip("deskflow recovery failed: exit " exitCode)
     } catch as err {
         ToolTip("deskflow failed: " err.Message)
     }
