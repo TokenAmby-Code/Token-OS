@@ -13,7 +13,10 @@ case "$action" in
     ;;
 esac
 
-curl -sf --connect-timeout 3 --max-time 10 -X POST "${SATELLITE_URL:-http://localhost:7777}/kvm/control" \
+# /kvm/control reload is synchronous and may wait on Mac API/reconnect windows.
+# Keep the curl deadline longer than the watchdog recovery path so AHK does not
+# report failure while the endpoint is still recovering successfully.
+curl -sf --connect-timeout 3 --max-time 60 -X POST "${SATELLITE_URL:-http://localhost:7777}/kvm/control" \
   -H "Content-Type: application/json" \
   -d "{\"action\":\"$action\"}"
 printf '\n'
