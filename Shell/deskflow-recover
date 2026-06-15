@@ -13,10 +13,26 @@ case "$action" in
     ;;
 esac
 
+satellite_url="${SATELLITE_URL:-http://localhost:7777}"
+satellite_url="${satellite_url%/}"
+startup_timeout_seconds="${DESKFLOW_RECOVER_STARTUP_TIMEOUT_SECONDS:-90}"
+startup_deadline=$(( $(date +%s) + startup_timeout_seconds ))
+
+# The manual bind can be the first thing that starts WSL. In that case the
+# distro exists before token-satellite is listening, and a raw POST exits 7.
+# Wait for the local satellite health endpoint so Ctrl+Alt+K can bootstrap WSL
+# instead of failing during the systemd/user-service startup gap.
+until curl -sf --connect-timeout 1 --max-time 2 "$satellite_url/health" >/dev/null; do
+  if (( $(date +%s) >= startup_deadline )); then
+    break
+  fi
+  sleep 1
+done
+
 # /kvm/control reload is synchronous and may wait on Mac API/reconnect windows.
 # Keep the curl deadline longer than the watchdog recovery path so AHK does not
 # report failure while the endpoint is still recovering successfully.
-curl -sf --connect-timeout 3 --max-time 60 -X POST "${SATELLITE_URL:-http://localhost:7777}/kvm/control" \
+curl -sf --connect-timeout 3 --max-time 60 -X POST "$satellite_url/kvm/control" \
   -H "Content-Type: application/json" \
   -d "{\"action\":\"$action\"}"
 printf '\n'
