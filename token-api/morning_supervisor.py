@@ -31,7 +31,9 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -315,14 +317,16 @@ async def _handle_failure(
     now_hm = now_local.strftime("%H:%M")
 
     if failure_type == "no_ack":
-        # The wake itself never registered. Do NOT auto-launch a session — a
-        # launch with no Hatch ack behind it is exactly the phantom we removed.
-        # The alert IS the backup; surface it loudly to the Emperor.
+        # The Hatch ack itself never registered. That is no longer allowed to be
+        # a terminal morning failure: the supervisor exists specifically because
+        # the Hatch/MacroDroid ingress can silently decay. The durable invariant
+        # is "expected wake + grace with no ack => Custodes latches day-start as
+        # an explicit recovery source", not "alert the Emperor and leave him in
+        # bed with the alarm silenced".
         message = (
             f"Morning supervisor: it's {now_hm}, {mins_past} minutes past your expected "
             f"{day_type} wake of {expected_hm}, and no Hatch alarm-silence ack has landed. "
-            f"The morning session never started — either you're still down, or the Hatch "
-            f"ack pathway is broken."
+            f"The Hatch ack pathway is broken; firing the Custodes day-start backstop now."
         )
     else:  # ack_no_custodes
         message = (
@@ -344,11 +348,9 @@ async def _handle_failure(
     )
     logger.warning("Morning supervisor failure (%s): %s", failure_type, message)
 
-    # 1) Alert the Emperor (TTS via the canonical comms router + Discord).
-    await _notify(message)
-    await _discord_alert(message)
-
-    # 2) Backup recovery.
+    # 1) Backup recovery. This must not sit behind best-effort notification
+    # timeouts; the durable day-start latch is the thing that prevents the
+    # morning from continuing to drift.
     if failure_type == "ack_no_custodes":
         # There WAS a real ack — relaunching the morning session is legitimate.
         retry = await _post_local("/api/morning/start")
@@ -356,6 +358,36 @@ async def _handle_failure(
             "morning_supervisor_backup",
             details={"action": "remorning_start", "result": retry},
         )
+    elif failure_type == "no_ack":
+        # There was no real Hatch ack, but the learned expected-wake window has
+        # closed. Latch the official day-start hook through the same endpoint as
+        # manual Custodes recovery so quiet-hours/break state and the full
+        # day-start fan-out happen atomically before /api/morning/start runs.
+        retry = await _post_local(
+            "/api/day-start/fire",
+            {
+                "source": "custodes",
+                "details": {
+                    "reason": "morning_supervisor_no_ack_backstop",
+                    "failure_type": failure_type,
+                    "expected_wake": expected_hm,
+                    "day_type": day_type,
+                    "minutes_past": mins_past,
+                    "hatch_ack": "missing",
+                    "anchor": anchor.isoformat(),
+                    "fired_at": now_local.isoformat(),
+                },
+            },
+        )
+        await log_event(
+            "morning_supervisor_backup",
+            details={"action": "day_start_fire", "source": "custodes", "result": retry},
+        )
+
+    # 2) Alert the Emperor (TTS via the canonical comms router + Discord).
+    await _notify(message)
+    await _discord_alert(message)
+
     # 3) If a live custodes pane happens to exist (e.g. wrong type), nudge it
     #    directly. For no_ack this is best-effort and usually a no-op.
     await _backup_message_to_custodes(message)
@@ -392,35 +424,51 @@ async def _discord_alert(content: str) -> None:
 
 
 async def _backup_message_to_custodes(message: str) -> dict:
-    """Best-effort: resolve the live custodes pane from the DB and agent-cmd it.
+    """Best-effort: resolve the live custodes pane from tmux and agent-cmd it.
 
-    Never hardcode the pane — it drifts; resolve tmux_pane from the DB where
-    pane_label='legion:custodes' (see the fg-custodes-comms-agent-cmd memory).
-    A no-op when no live custodes pane exists (the common failure case).
+    Never hardcode the pane and do not trust registry runtime columns. The live
+    pane identity is the tmux @PANE_ID marker resolved by tmuxctl.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT tmux_pane FROM instances
-            WHERE pane_label = 'legion:custodes' AND status NOT IN ('stopped', 'archived')
-            ORDER BY last_activity DESC LIMIT 1
-            """
+    bin_dir = Path(__file__).resolve().parents[1] / "cli-tools" / "bin"
+    tmuxctl = bin_dir / "tmuxctl"
+    agent_cmd = bin_dir / "agent-cmd"
+    try:
+        resolved = await asyncio.to_thread(
+            subprocess.run,
+            [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        row = await cursor.fetchone()
-    pane = row["tmux_pane"] if row else None
+    except Exception as exc:
+        logger.warning("supervisor custodes pane resolve failed: %s", exc)
+        return {"sent": False, "reason": f"resolve_failed:{exc}"}
+    if resolved.returncode != 0:
+        return {
+            "sent": False,
+            "reason": "resolve_failed",
+            "stderr": resolved.stderr.strip()[:200],
+        }
+    pane = resolved.stdout.strip()
     if not pane:
         return {"sent": False, "reason": "no_live_custodes_pane"}
     try:
         proc = await asyncio.create_subprocess_exec(
-            "agent-cmd",
+            str(agent_cmd),
             "--pane",
             pane,
             message,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+            _, stderr = await proc.communicate()
+            logger.warning("supervisor agent-cmd timed out: %s", stderr.decode()[:200])
+            return {"sent": False, "reason": "agent_cmd_timeout", "pane": pane}
         if proc.returncode != 0:
             logger.warning("supervisor agent-cmd failed: %s", stderr.decode()[:200])
             return {"sent": False, "reason": "agent_cmd_failed", "pane": pane}

@@ -14,6 +14,7 @@ Run:
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -244,6 +245,74 @@ def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated
         assert active is False
         # The Emperor is warned in-pathway (the supervisor is the redundant net).
         assert tts_messages and "could not be confirmed" in tts_messages[0]
+
+
+def test_run_morning_session_falls_back_when_custodes_pane_unregistered(
+    isolated_morning_dir: Path,
+) -> None:
+    """A live but unregistered legion:custodes pane must not brick the morning.
+
+    This is the 2026-06-15 failure mode: SessionStart registration was lost, so
+    tmuxctl assert-instance returned persona_unregistered_live_runtime. The
+    morning launcher must open a fresh legion pane instead of failing closed.
+    """
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if _cmd_is(cmd, "stack", "enforce"):
+            return _completed(cmd, 0)
+        if _cmd_is(cmd, "resolve-pane"):
+            return _completed(cmd, 0, stdout="%86\n")
+        if _cmd_is(cmd, "assert-instance"):
+            return _completed(
+                cmd,
+                1,
+                stdout=json.dumps(
+                    {
+                        "ok": False,
+                        "pane": "%86",
+                        "action": "persona_unregistered_noted",
+                        "reason": "persona_unregistered_live_runtime",
+                    }
+                ),
+            )
+        if "dispatch" in str(cmd[0]):
+            assert "legion:new" in cmd
+            return _completed(cmd, 0, stdout="dispatched\n")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    confirmed = {
+        "live": True,
+        "instance_id": "fresh-custodes",
+        "tmux_pane": "%101",
+        "pane_matched": False,
+        "reconciled": True,
+        "waited_s": 0.0,
+    }
+    confirm = MagicMock(return_value=confirmed)
+    day_state = {"day_started_at": "2026-06-15T07:32:00", "source": "custodes"}
+    with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
+        patch("morning_session.subprocess.run", side_effect=fake_run),
+        patch("morning_session.ensure_daily_notes", lambda: None),
+        patch("morning_session.get_daily_thread_id", lambda today: "thread123"),
+        patch("morning_session.create_daily_thread", lambda today: "thread123"),
+        patch("morning_session.send_tts", lambda msg: None),
+        patch("morning_session.confirm_custodes_registered", confirm),
+        patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
+    ):
+        result = morning_session.run_morning_session()
+
+    assert result["status"] == "active"
+    assert result["instance_id"] == "fresh-custodes"
+    assert result["pane_id"] == "%101"
+    assert any("dispatch" in str(cmd[0]) and "legion:new" in cmd for cmd in calls)
+    assert not any(_cmd_is(cmd, "send-text") for cmd in calls)
+    confirm.assert_called_once()
+    assert confirm.call_args.kwargs["pane_id"] is None
+    assert confirm.call_args.kwargs["exclude_pane_id"] == "%86"
 
 
 def test_run_morning_session_no_pane_fails_gracefully(isolated_morning_dir):

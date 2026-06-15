@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -184,6 +185,7 @@ def reconcile_custodes_active(inst: dict) -> dict:
 def confirm_custodes_registered(
     *,
     pane_id: str | None = None,
+    exclude_pane_id: str | None = None,
     timeout_s: int | None = None,
     interval_s: float | None = None,
 ) -> dict:
@@ -206,10 +208,23 @@ def confirm_custodes_registered(
     while True:
         inst = find_live_custodes()
         if inst is not None:
+            inst_pane = (inst.get("runtime") or {}).get("tmux_pane")
+            if exclude_pane_id and inst_pane == exclude_pane_id:
+                if time.monotonic() - start >= budget:
+                    return {
+                        "live": False,
+                        "instance_id": None,
+                        "tmux_pane": None,
+                        "pane_matched": False,
+                        "reconciled": False,
+                        "waited_s": round(time.monotonic() - start, 1),
+                        "excluded_pane": exclude_pane_id,
+                    }
+                time.sleep(interval)
+                continue
             recon = reconcile_custodes_active(inst)
             # The canonical surface carries the live pane under `runtime`, not a
             # top-level tmux_pane (pane identity is never durably stored).
-            inst_pane = (inst.get("runtime") or {}).get("tmux_pane")
             return {
                 "live": True,
                 "instance_id": inst.get("id"),
@@ -785,9 +800,84 @@ def create_legion_pane() -> str | None:
     return pane_id
 
 
-def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
+def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
     """Assert `legion:custodes`, then send the morning prompt after assertion is true."""
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
+    dispatch = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "dispatch"
+
+    def _fallback_new_legion_pane(reason: str) -> dict:
+        """Launch a fresh Custodes when the fixed pane is live but undeliverable.
+
+        The morning path is a wake/rescue path, not a normal state-hook nudge.
+        If the durable legion:custodes pane is stuck in an unregistered or
+        human-modal state, failing closed recreates the exact disaster this
+        launcher exists to prevent. A :new legion target gives the morning a
+        clean prompt without writing bytes into the blocked pane.
+        """
+        fd, prompt_path = tempfile.mkstemp(prefix="custodes-morning-", suffix=".md")
+        os.close(fd)
+        prompt_file = Path(prompt_path)
+        try:
+            prompt_file.write_text(prompt_text)
+            result = subprocess.run(
+                [
+                    str(dispatch),
+                    "--target",
+                    "legion:new",
+                    "--persona",
+                    "custodes",
+                    "--model",
+                    "opus",
+                    "--dir",
+                    VAULT_DIR,
+                    "--prompt-file",
+                    str(prompt_file),
+                    "--sync",
+                    "--instance-type",
+                    "hook_driven",
+                    "--direct",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                env={
+                    **os.environ,
+                    "PATH": ":".join(
+                        [
+                            str(dispatch.parent),
+                            str(Path.home() / ".local" / "bin"),
+                            "/opt/homebrew/bin",
+                            "/usr/local/bin",
+                            os.environ.get("PATH", ""),
+                        ]
+                    ),
+                },
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("morning fallback dispatch timed out after %s", reason)
+            return {"launched": False, "pane_id": pane_id}
+        except Exception as e:
+            logger.error("morning fallback dispatch failed after %s: %s", reason, e)
+            return {"launched": False, "pane_id": pane_id}
+        finally:
+            prompt_file.unlink(missing_ok=True)
+        if result.returncode != 0:
+            logger.error(
+                "morning fallback dispatch rc=%s after %s: stdout=%s stderr=%s",
+                result.returncode,
+                reason,
+                result.stdout.strip()[:200],
+                result.stderr.strip()[:200],
+            )
+            return {"launched": False, "pane_id": pane_id}
+        logger.info("Morning session: fallback dispatched to legion:new after %s", reason)
+        return {
+            "launched": True,
+            "pane_id": None,
+            "fallback": True,
+            "fallback_reason": reason,
+            "exclude_pane_id": pane_id,
+        }
 
     def _assert_once() -> dict:
         result = subprocess.run(
@@ -796,18 +886,18 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
             text=True,
             timeout=45,
         )
-        if result.returncode != 0:
-            # A failed assert may still print stale/partial JSON to stdout; don't
-            # let it be parsed into a false "ok". Gate on the exit code first.
-            return {
-                "ok": False,
-                "reason": f"assert_failed rc={result.returncode}",
-                "stderr": result.stderr.strip()[:200],
-            }
         try:
-            return json.loads(result.stdout.strip() or "{}")
+            parsed = json.loads(result.stdout.strip() or "{}")
         except json.JSONDecodeError:
             return {"ok": False, "reason": f"bad_assert_output rc={result.returncode}"}
+        if not isinstance(parsed, dict):
+            return {"ok": False, "reason": f"bad_assert_output_type rc={result.returncode}"}
+        if result.returncode != 0 and parsed.get("ok"):
+            parsed["ok"] = False
+            parsed["reason"] = parsed.get("reason") or f"assert_failed rc={result.returncode}"
+        if result.returncode != 0:
+            parsed.setdefault("stderr", result.stderr.strip()[:200])
+        return parsed
 
     try:
         assertion = _assert_once()
@@ -815,8 +905,14 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
             time.sleep(3)
             assertion = _assert_once()
         if not assertion.get("ok"):
-            print(f"Error: tmuxctl assert-instance legion:custodes failed: {assertion}")
-            return False
+            if assertion.get("action") in {
+                "persona_unregistered_live_runtime",
+                "persona_unregistered_noted",
+                "persona_unregistered_suppressed",
+            }:
+                return _fallback_new_legion_pane(str(assertion.get("action")))
+            logger.error("tmuxctl assert-instance legion:custodes failed: %s", assertion)
+            return {"launched": False, "pane_id": pane_id}
         result = subprocess.run(
             [str(tmuxctl), "send-text", "--pane", "legion:custodes", "--stdin"],
             input=prompt_text,
@@ -825,20 +921,25 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> bool:
             timeout=45,
         )
     except subprocess.TimeoutExpired:
-        print("Error: tmuxctl assert/send legion:custodes timed out")
-        return False
+        logger.error("tmuxctl assert/send legion:custodes timed out")
+        return {"launched": False, "pane_id": pane_id}
     except Exception as e:
-        print(f"Error launching in legion pane: {e}")
-        return False
+        logger.error("Error launching in legion pane: %s", e)
+        return {"launched": False, "pane_id": pane_id}
 
     if result.returncode != 0:
-        print(
-            f"Error: tmuxctl send-text legion:custodes rc={result.returncode}: "
-            f"stdout={result.stdout.strip()[:200]} stderr={result.stderr.strip()[:200]}"
+        stderr = result.stderr.strip()
+        if "send suppressed by gate" in stderr or "user input not cleared" in stderr:
+            return _fallback_new_legion_pane("fixed_pane_send_gated")
+        logger.error(
+            "tmuxctl send-text legion:custodes rc=%s: stdout=%s stderr=%s",
+            result.returncode,
+            result.stdout.strip()[:200],
+            stderr[:200],
         )
-        return False
-    print(f"Morning session: sent via assert-instance {assertion}")
-    return True
+        return {"launched": False, "pane_id": pane_id}
+    logger.info("Morning session: sent via assert-instance %s", assertion)
+    return {"launched": True, "pane_id": pane_id}
 
 
 def run_morning_session() -> dict:
@@ -961,8 +1062,8 @@ def run_morning_session() -> dict:
         )
         return {"status": "no_pane"}
 
-    launched = launch_in_legion(prompt, pane_id)
-    if not launched:
+    launch_result = launch_in_legion(prompt, pane_id)
+    if not launch_result.get("launched"):
         send_tts("Morning session failed: could not launch in legion pane")
         state_file.write_text(
             json.dumps(
@@ -970,10 +1071,12 @@ def run_morning_session() -> dict:
                     "started_at": datetime.now().isoformat(),
                     "status": "launch_failed",
                     "pane_id": pane_id,
+                    "launch_result": launch_result,
                 }
             )
         )
         return {"status": "launch_failed"}
+    launched_pane_id = launch_result.get("pane_id")
 
     # Transitional state — the prompt is injected; the keepalive may start while
     # we confirm. The session is autonomous from here.
@@ -982,22 +1085,32 @@ def run_morning_session() -> dict:
             {
                 "started_at": datetime.now().isoformat(),
                 "status": "launched",
-                "pane_id": pane_id,
+                "pane_id": launched_pane_id,
+                "fixed_pane_id": pane_id,
+                "launch_result": launch_result,
                 "daily_thread_id": daily_thread_id,
             }
         )
     )
-    print(f"Morning session launched in legion pane {pane_id}; confirming registration")
+    logger.info(
+        "Morning session launched in %s; confirming registration",
+        launched_pane_id or "fallback legion:new pane",
+    )
 
     # In-pathway self-validation. The launch is otherwise fire-and-forget: a
     # "launched" flag with no live Custodes behind it would get keepalive-injected
     # into a dead pane. Poll the instances table for a live legion=custodes,sync
     # row and flip the state file to a real active/failed (not just launched).
-    confirmation = confirm_custodes_registered(pane_id=pane_id)
+    confirmation = confirm_custodes_registered(
+        pane_id=launch_result.get("pane_id"),
+        exclude_pane_id=launch_result.get("exclude_pane_id"),
+    )
     if confirmation["live"]:
+        confirmed_pane_id = confirmation["tmux_pane"] or launched_pane_id
         update_morning_state(
             {
                 "status": "active",
+                "pane_id": confirmed_pane_id,
                 "confirmed_at": datetime.now().isoformat(),
                 "confirmed_instance_id": confirmation["instance_id"],
                 "confirmed_pane": confirmation["tmux_pane"],
@@ -1012,7 +1125,7 @@ def run_morning_session() -> dict:
         )
         return {
             "status": "active",
-            "pane_id": pane_id,
+            "pane_id": confirmed_pane_id,
             "instance_id": confirmation["instance_id"],
             "reconciled": confirmation["reconciled"],
         }
