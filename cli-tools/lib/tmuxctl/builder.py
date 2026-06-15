@@ -12,7 +12,14 @@ PALACE_WINDOW = "palace"
 SOMNIUM_WINDOW = "somnium"
 LEGION_WINDOW = "legion"
 MECHANICUS_WINDOW = "mechanicus"
+KORONUS_WINDOW = "koronus"
 RESERVISTS_WINDOW = "reservists"
+
+# The koronus civic page launches from the Civic vault, where the civic persona
+# notes (pax / orchestrator / agentic-worker) live. Other windows still home to
+# $HOME; the legion/mechanicus Imperium-vault mapping is owned by a separate
+# custodes patch — only add the koronus key here to avoid clobbering it.
+KORONUS_DIR = "/Volumes/Civic/Pax-ENV"
 
 DETACHED_W = 240
 DETACHED_H = 60
@@ -23,6 +30,8 @@ def _home() -> str:
 
 
 def _window_dir(window: str) -> str:
+    if window == KORONUS_WINDOW:
+        return KORONUS_DIR
     return _home()
 
 
@@ -176,15 +185,13 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
 def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
     """Build the legion stack window.
 
-    The left column holds three overseer seats stacked in even thirds:
-    Custodes on top, Malcador (the advisor seat) in the middle, and Pax (the
-    civic day-job seat) on the bottom. Pane 1 is the Custodes orchestrator slot.
-    If that orchestrator is promoted to an audience surface, this pane becomes
-    its tombstone.
+    The left column holds two overseer seats split down the middle: Custodes on
+    top and Malcador (the advisor seat) on the bottom. Pane 1 is the Custodes
+    orchestrator slot. If that orchestrator is promoted to an audience surface,
+    this pane becomes its tombstone.
 
-    The split sequence re-balances the column for three panes: Custodes keeps
-    the top third, the lower two-thirds becomes Malcador, then Malcador's region
-    is halved to seat Pax in the bottom third.
+    The civic Pax seat used to dock here (PR #219) but now lives on its own
+    ``koronus`` page; legion is back to its clean two-seat state.
     """
     target = f"{session}:{LEGION_WINDOW}"
     adapter.run(
@@ -198,14 +205,11 @@ def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
         _window_dir(LEGION_WINDOW),
     )
     custodes = f"{target}.1"
-    malcador = _split_pane(adapter, custodes, "-v", "-l", "66%", cwd=_window_dir(LEGION_WINDOW))
-    pax = _split_pane(adapter, malcador, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
+    malcador = _split_pane(adapter, custodes, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
     _pane_tag(adapter, custodes, "legion:custodes")
     _set_pane_option(adapter, custodes, "@PANE_TYPE", "legion")
     _pane_tag(adapter, malcador, "legion:malcador")
     _set_pane_option(adapter, malcador, "@PANE_TYPE", "legion")
-    _pane_tag(adapter, pax, "legion:pax")
-    _set_pane_option(adapter, pax, "@PANE_TYPE", "legion")
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
@@ -235,8 +239,42 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
 
 
+def build_koronus_window(adapter: TmuxAdapter, session: str) -> None:
+    """Build the koronus civic stack window (index 5).
+
+    The left column holds two civic overseer seats split down the middle: ``pax``
+    (the combined Custodes+Administratum human-facing/record-keeper seat) on top
+    and ``orchestrator`` (the civic dispatch seat) on the bottom. The right stack
+    is reserved for ``agentic-worker`` panes added by ``stack.add_stack_pane``.
+
+    Modeled on ``build_mechanicus_window``: pax is the orchestrator anchor (pane
+    1), orchestrator is the secondary persona seat. Panes are tagged ``koronus:*``
+    with ``@PANE_TYPE koronus`` and launch from the Civic vault so the civic
+    persona notes resolve. ``koronus`` is a recognized orchestrator stack base
+    (see stack.STACK_PAGE_SPECS), so worker dispatch docks onto the right stack.
+    """
+    target = f"{session}:{KORONUS_WINDOW}"
+    wdir = _window_dir(KORONUS_WINDOW)
+    adapter.run(
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        KORONUS_WINDOW,
+        "-d",
+        "-c",
+        wdir,
+    )
+    pax = f"{target}.1"
+    orchestrator = _split_pane(adapter, pax, "-v", "-l", "50%", cwd=wdir)
+    _pane_tag(adapter, pax, "koronus:pax")
+    _set_pane_option(adapter, pax, "@PANE_TYPE", "koronus")
+    _pane_tag(adapter, orchestrator, "koronus:orchestrator")
+    _set_pane_option(adapter, orchestrator, "@PANE_TYPE", "koronus")
+
+
 def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
-    """Build the reservists stack window (index 5), split down the middle.
+    """Build the reservists stack window (index 6), split down the middle.
 
     Left pane is the **civic reservist** — the standing civic day-job thread that
     the civic-thread fallthrough activates when no civic instance is alive. It is
@@ -297,6 +335,7 @@ def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     build_somnium_window(adapter, session, SOMNIUM_WINDOW)
     build_legion_window(adapter, session)
     build_mechanicus_window(adapter, session)
+    build_koronus_window(adapter, session)
     build_reservists_window(adapter, session)
     adapter.run("select-window", "-t", f"{session}:{PALACE_WINDOW}")
 

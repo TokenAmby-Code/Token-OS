@@ -152,6 +152,27 @@ ULTIMATE_ASTARTES = PersonaSeed(
     "chimes.wav",
 )
 
+# Civic worker persona for the koronus/pax-stack worker agents (the right-side
+# stack), analogous to how mechanicus workers are astartes. ``astartes`` rank so
+# it is resolvable like a chapter, but with NO assignment pool so it never enters
+# the rotating Astartes auto-assignment — koronus workers resolve it by slug. It
+# only applies while ON the koronus page; a civic worker started off-page falls
+# through to the normal astartes assignment instead.
+CIVIC_WORKER_PERSONAS: tuple[PersonaSeed, ...] = (
+    PersonaSeed(
+        "agentic-worker",
+        "Agentic Worker",
+        "astartes",
+        None,
+        None,  # assignment_pool, assignment_order — out of the rotation pool
+        "#23323f",  # pane_tint  — civic slate (lighter), deliberately non-40k
+        "#5a8fb5",  # chip_color — civic blue accent
+        None,
+        None,
+        None,  # tts_voice, tts_rate, notification_sound (silent)
+    ),
+)
+
 SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "custodes",
@@ -204,6 +225,18 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,  # tts_voice, tts_rate, notification_sound (silent seat)
     ),
+    PersonaSeed(
+        "orchestrator",
+        "Orchestrator",
+        "overseer",
+        None,
+        None,  # assignment_pool, assignment_order (overseer → None)
+        "#14302a",  # pane_tint  — civic teal, deliberately non-40k
+        "#2f9e8f",  # chip_color — civic teal accent
+        None,
+        None,
+        None,  # tts_voice, tts_rate, notification_sound (silent seat)
+    ),
 )
 
 PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (
@@ -236,6 +269,7 @@ PERSONA_SEEDS: tuple[PersonaSeed, ...] = (
     *PRIMARY_ASTARTES,
     *BACKUP_ASTARTES,
     ULTIMATE_ASTARTES,
+    *CIVIC_WORKER_PERSONAS,
 )
 SEED_BY_SLUG = {seed.slug: seed for seed in PERSONA_SEEDS}
 SEED_BY_ID = {seed.id: seed for seed in PERSONA_SEEDS}

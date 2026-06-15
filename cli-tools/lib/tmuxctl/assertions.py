@@ -30,6 +30,8 @@ PERSONA_LABELS = {
     "legion:malcador",
     "mechanicus:fabricator-general",
     "mechanicus:admin",
+    "koronus:pax",
+    "koronus:orchestrator",
 }
 
 
@@ -42,6 +44,10 @@ class PersonaSpec:
     engine: str = "claude"
     sync: bool = False
     model: str = ""
+    # Working dir for the launch. Empty → dispatch picks its default ($HOME). The
+    # civic seats pin the Civic vault so their persona notes resolve and legion
+    # auto-detect reads `civic`.
+    working_dir: str = ""
 
 
 def _vault_root() -> Path:
@@ -49,6 +55,11 @@ def _vault_root() -> Path:
     if root:
         return Path(root) / "Imperium-ENV"
     return Path("/Volumes/Imperium/Imperium-ENV")
+
+
+# The civic seats live in the Civic vault, not the Imperium vault. Kept separate
+# from _vault_root so the IMPERIUM relocation never rewrites the civic path.
+CIVIC_VAULT = Path("/Volumes/Civic/Pax-ENV")
 
 
 def _today_daily_note() -> str:
@@ -81,6 +92,29 @@ def persona_spec(label: str) -> PersonaSpec:
         )
     if label == "mechanicus:admin":
         return PersonaSpec(label, "administratum", "hook_driven", _admin_log(), model="sonnet")
+    if label == "koronus:pax":
+        # Pax: the combined Custodes+Administratum civic seat (human-facing
+        # interaction + record-keeper). Opus, launched from the Civic vault.
+        return PersonaSpec(
+            label,
+            "pax",
+            "hook_driven",
+            str(CIVIC_VAULT / "Sessions" / "pax.md"),
+            model="opus",
+            working_dir=str(CIVIC_VAULT),
+        )
+    if label == "koronus:orchestrator":
+        # Orchestrator: the civic dispatch seat (the role the Fabricator-General
+        # plays for mechanicus). Sonnet pending a model spike (see the spec doc),
+        # launched from the Civic vault.
+        return PersonaSpec(
+            label,
+            "orchestrator",
+            "hook_driven",
+            str(CIVIC_VAULT / "Sessions" / "orchestrator.md"),
+            model="sonnet",
+            working_dir=str(CIVIC_VAULT),
+        )
     raise ValueError(f"unknown persona pane: {label}")
 
 
@@ -620,6 +654,7 @@ def _assert_instance_impl(
                 "session_doc": spec.session_doc,
                 "sync": spec.sync,
                 "model": spec.model,
+                "working_dir": spec.working_dir,
                 "no_gt": not spec.sync,
             }
             ok, reason = _launch(pane_id, launch_upsert, str((upsert or {}).get("prompt") or ""))
