@@ -1,0 +1,137 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-kill-other-tabs — force-close other Termux app sessions/tabs.
+#
+# This is intentionally about Termux app tabs, not tmux windows/panes.
+# It kills processes attached to other terminal TTYs while protecting:
+#   - the current TTY
+#   - this command's ancestry
+#   - tmux servers and tmux pane process trees
+#
+# Usage:
+#   termux-kill-other-tabs          # prompt, then kill
+#   termux-kill-other-tabs --force  # no prompt
+#   termux-kill-other-tabs --dry-run
+
+set -euo pipefail
+
+force=false
+dry_run=false
+
+usage() {
+    sed -n '8,16p' "$0" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--force) force=true; shift ;;
+        -n|--dry-run) dry_run=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    esac
+done
+
+current_tty=$(tty 2>/dev/null | sed 's#^/dev/##' || true)
+if [[ -z "$current_tty" || "$current_tty" == "not a tty" ]]; then
+    echo "No current TTY; refusing." >&2
+    exit 1
+fi
+
+declare -A ppid_by_pid=()
+declare -A tty_by_pid=()
+declare -A comm_by_pid=()
+declare -A protect_pid=()
+declare -A all_ttys=()
+declare -A tmux_tree_ttys=()
+
+# procps ps is expected in this Termux setup. The fallback keeps the error clear.
+if ! ps -eo pid=,ppid=,tty=,comm= >/dev/null 2>&1; then
+    echo "ps does not support the required -eo fields; install/use procps." >&2
+    exit 1
+fi
+
+while read -r pid ppid tty comm; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    ppid_by_pid[$pid]="${ppid:-0}"
+    tty_by_pid[$pid]="${tty:-?}"
+    comm_by_pid[$pid]="${comm:-}"
+    [[ "${tty:-?}" != "?" ]] && all_ttys[$tty]=1
+done < <(ps -eo pid=,ppid=,tty=,comm=)
+
+# Protect this command's ancestors.
+pid=$$
+while [[ -n "${pid:-}" && "$pid" != "0" && -n "${ppid_by_pid[$pid]+set}" ]]; do
+    protect_pid[$pid]=1
+    pid=${ppid_by_pid[$pid]}
+done
+
+has_tmux_ancestor() {
+    local pid="$1"
+    local guard=0
+    while [[ -n "${pid:-}" && "$pid" != "0" && -n "${ppid_by_pid[$pid]+set}" && $guard -lt 128 ]]; do
+        case "${comm_by_pid[$pid]:-}" in
+            tmux|tmux:*) return 0 ;;
+        esac
+        pid=${ppid_by_pid[$pid]}
+        ((++guard))
+    done
+    return 1
+}
+
+# Mark TTYs owned by tmux pane process trees. Those are tmux panes, not Termux tabs.
+for pid in "${!tty_by_pid[@]}"; do
+    tty=${tty_by_pid[$pid]}
+    [[ "$tty" != "?" ]] || continue
+    if has_tmux_ancestor "$pid"; then
+        tmux_tree_ttys[$tty]=1
+    fi
+done
+
+declare -A target_ttys=()
+for tty in "${!all_ttys[@]}"; do
+    [[ "$tty" != "$current_tty" ]] || continue
+    [[ -z "${tmux_tree_ttys[$tty]+set}" ]] || continue
+    target_ttys[$tty]=1
+done
+
+if [[ ${#target_ttys[@]} -eq 0 ]]; then
+    echo "No other Termux app TTYs found."
+    exit 0
+fi
+
+echo "Current TTY: $current_tty"
+echo "Target TTYs:"
+printf '  %s\n' "${!target_ttys[@]}" | sort
+
+if ! $force && ! $dry_run; then
+    printf 'Kill all processes on those TTYs? [y/N] '
+    read -r answer
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 1 ;;
+    esac
+fi
+
+declare -a victims=()
+for pid in "${!tty_by_pid[@]}"; do
+    tty=${tty_by_pid[$pid]}
+    [[ -n "${target_ttys[$tty]+set}" ]] || continue
+    [[ -z "${protect_pid[$pid]+set}" ]] || continue
+    victims+=("$pid")
+done
+
+if [[ ${#victims[@]} -eq 0 ]]; then
+    echo "No victim processes found."
+    exit 0
+fi
+
+if $dry_run; then
+    echo "Would kill PIDs: ${victims[*]}"
+    exit 0
+fi
+
+# TERM first, then KILL anything still alive.
+kill -TERM "${victims[@]}" 2>/dev/null || true
+sleep 0.2
+kill -KILL "${victims[@]}" 2>/dev/null || true
+
+echo "Killed other Termux tabs (${#victims[@]} processes)."

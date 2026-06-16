@@ -7,7 +7,7 @@
 #   push-mobile -b              # Push bashrc
 #   push-mobile -p              # Push termux.properties
 #   push-mobile -m              # Push macros folder
-#   push-mobile -t              # Push tmux.conf + toolbar-toggle script
+#   push-mobile -t              # Push tmux.conf + Termux helper scripts
 #   push-mobile -bp             # Push bashrc + properties
 #   push-mobile -a              # Push everything
 #
@@ -59,6 +59,7 @@ Files:
     -p  mobile/termux-properties-template   → phone:~/.termux/termux.properties
     -t  mobile/termux-tmux.conf            → phone:~/.tmux.conf
         mobile/termux-toolbar-toggle       → phone:~/.local/bin/termux-toolbar-toggle
+        mobile/termux-kill-other-tabs      → phone:~/.local/bin/termux-kill-other-tabs
     -m  mobile/macros/                      → phone:~/macros/
 EOF
 }
@@ -72,8 +73,8 @@ while [[ $# -gt 0 ]]; do
         --macros) PUSH_MACROS=true; shift ;;
         --all) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_TMUX=true; PUSH_MACROS=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
-        -[bpma]*)
-            # Parse combined short flags: -bp, -bpm, -a, etc.
+        -[bpmta]*)
+            # Parse combined short flags: -bp, -bpt, -a, etc.
             flags="${1#-}"
             for (( i=0; i<${#flags}; i++ )); do
                 case "${flags:$i:1}" in
@@ -143,11 +144,13 @@ fi
 if $PUSH_TMUX; then
     tmux_src="${MOBILE_DIR}/termux-tmux.conf"
     toggle_src="${MOBILE_DIR}/termux-toolbar-toggle"
+    kill_tabs_src="${MOBILE_DIR}/termux-kill-other-tabs"
     if [[ ! -f "$tmux_src" ]]; then
         log_err "Not found: ${tmux_src}"
     elif [[ "$DRY_RUN" == true ]]; then
         log_dry "tmux.conf → phone:~/.tmux.conf"
         log_dry "toolbar-toggle → phone:~/.local/bin/termux-toolbar-toggle"
+        log_dry "kill-other-tabs → phone:~/.local/bin/termux-kill-other-tabs"
     else
         log_info "Pushing tmux config..."
         ssh $SSH_OPTS phone "mkdir -p ~/.local/bin" 2>/dev/null
@@ -162,6 +165,14 @@ if $PUSH_TMUX; then
                 log_ok "toolbar-toggle"
             else
                 log_err "toolbar-toggle failed"
+            fi
+        fi
+        if [[ -f "$kill_tabs_src" ]]; then
+            if scp -q "$kill_tabs_src" phone:~/.local/bin/termux-kill-other-tabs; then
+                ssh $SSH_OPTS phone "chmod +x ~/.local/bin/termux-kill-other-tabs" 2>/dev/null
+                log_ok "kill-other-tabs"
+            else
+                log_err "kill-other-tabs failed"
             fi
         fi
         ssh $SSH_OPTS phone "tmux source-file ~/.tmux.conf" 2>/dev/null && log_ok "tmux reloaded" || true
