@@ -164,6 +164,23 @@ DENY_CASES = [
             "tool_input": {"command": f"echo IMPERIUM_ALLOW_RUNTIME_WRITE=1; echo x > {RT}/z"},
         },
     ),
+    # An escape-hatch assignment in a LATER segment must not green-light a
+    # runtime write in an earlier segment — only a true leading ^ assignment.
+    (
+        "bash_escape_hatch_later_segment_does_not_bypass",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": f"echo x > {RT}/z ; IMPERIUM_ALLOW_RUNTIME_WRITE=1 true"},
+        },
+    ),
+    # git option BEFORE the -C flag must not evade the direct-git-write detector.
+    (
+        "bash_git_opt_before_C",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": f"git -c core.fsmonitor=false -C {RT} reset --hard"},
+        },
+    ),
 ]
 
 

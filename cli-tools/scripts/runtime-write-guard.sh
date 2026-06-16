@@ -197,10 +197,13 @@ CMD="$(
 )"
 
 if [[ -n "$CMD" ]]; then
-    # Inline escape hatch — only a genuine leading env-assignment for a command
-    # segment authorizes (so a bare `echo IMPERIUM_ALLOW_RUNTIME_WRITE=1; ...`
-    # argument or log line can't smuggle a bypass).
-    if printf '%s' "$CMD" | grep -Eq '(^|[;&|][[:space:]]*)(env[[:space:]]+)?IMPERIUM_ALLOW_RUNTIME_WRITE=1([[:space:]]|$)'; then
+    # Inline escape hatch — only a genuine assignment at the VERY START of the
+    # command authorizes. Anchoring to ^ (not any post-separator position) stops
+    # a bypass like `echo x > ~/runtimes/...; IMPERIUM_ALLOW_RUNTIME_WRITE=1 true`,
+    # where the assignment in a later segment would otherwise green-light the
+    # runtime write in an earlier one. A bare `echo IMPERIUM_ALLOW...=1` arg also
+    # can't smuggle a bypass, since it doesn't lead with the assignment.
+    if printf '%s' "$CMD" | grep -Eq '^[[:space:]]*(env[[:space:]]+)?IMPERIUM_ALLOW_RUNTIME_WRITE=1([[:space:]]|$)'; then
         exit 0
     fi
 
@@ -279,10 +282,11 @@ if [[ -n "$CMD" ]]; then
         fi
 
         # e) Direct git tree writes into a runtime checkout via -C / --git-dir.
-        #    Allow arbitrary intervening options between the runtime path and the
-        #    write subcommand (e.g. `git -C <rt> -c advice.detachedHead=false
-        #    reset --hard`), but stay within the same command segment.
-        if printf '%s' "$CMD" | grep -Eq "git[[:space:]]+(-C|--git-dir=?|--work-tree=?)[[:space:]]*['\"]?($RT_FRAG)[^;&|]*[[:space:]](reset|checkout|clean|restore|apply|stash|merge|rebase|cherry-pick|commit|add|rm|mv|switch)([[:space:]]|$)"; then
+        #    Allow arbitrary intervening options BOTH before the dir flag (e.g.
+        #    `git -c core.fsmonitor=false -C <rt> reset`) and between the runtime
+        #    path and the write subcommand (e.g. `git -C <rt> -c advice...=false
+        #    reset --hard`), all within the same command segment.
+        if printf '%s' "$CMD" | grep -Eq "git[[:space:]][^;&|]*(-C|--git-dir=?|--work-tree=?)[[:space:]=]*['\"]?($RT_FRAG)[^;&|]*[[:space:]](reset|checkout|clean|restore|apply|stash|merge|rebase|cherry-pick|commit|add|rm|mv|switch)([[:space:]]|$)"; then
             deny "(git tree write)" "direct git write into runtime"
         fi
     fi
