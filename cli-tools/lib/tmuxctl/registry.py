@@ -75,6 +75,7 @@ def build_registry_snapshot(
                 engine=str(row.get("engine", "") or ""),
                 last_activity=str(row.get("last_activity", "") or ""),
                 stopped_at=str(row.get("stopped_at", "") or ""),
+                created_at=str(row.get("created_at", "") or ""),
                 primarch=str(row.get("primarch", "") or ""),
                 persona_slug=str(persona_slug or ""),
                 rank=str(row.get("rank", "") or ""),

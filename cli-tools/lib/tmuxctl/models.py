@@ -90,6 +90,7 @@ class InstanceRegistryEntry:
     engine: str = ""
     last_activity: str = ""
     stopped_at: str = ""
+    created_at: str = ""
     # Persona identity. The state-hook dispatcher resolves singletons that share a
     # legion by primarch (e.g. `_resolve_administratum_instance` keys on
     # `primarch='administratum'`); the persona watchdog matches on it too.
