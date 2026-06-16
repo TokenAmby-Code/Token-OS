@@ -29,7 +29,7 @@
 # Best-effort & fail-open: any internal error allows the call (never wedge the
 # fleet on a guard bug). Everything is logged for tuning.
 
-set -uo pipefail
+set -euo pipefail
 
 LOG_DIR="${AGENT_HOOK_LOG_DIR:-${HOME}/.codex/log}"
 if [[ "${HOOK_AGENT:-}" == "claude" ]]; then
@@ -197,8 +197,10 @@ CMD="$(
 )"
 
 if [[ -n "$CMD" ]]; then
-    # Inline escape hatch.
-    if printf '%s' "$CMD" | grep -Eq 'IMPERIUM_ALLOW_RUNTIME_WRITE=1'; then
+    # Inline escape hatch — only a genuine leading env-assignment for a command
+    # segment authorizes (so a bare `echo IMPERIUM_ALLOW_RUNTIME_WRITE=1; ...`
+    # argument or log line can't smuggle a bypass).
+    if printf '%s' "$CMD" | grep -Eq '(^|[;&|][[:space:]]*)(env[[:space:]]+)?IMPERIUM_ALLOW_RUNTIME_WRITE=1([[:space:]]|$)'; then
         exit 0
     fi
 
@@ -218,7 +220,10 @@ if [[ -n "$CMD" ]]; then
 
     # Path-spelling fragment that names a runtime root inside a command. Kept
     # broad on the path side; the mutation context below is what gates a deny.
-    RT_FRAG="(~|\\\$HOME|\\\$\\{HOME\\}|${HOME_DIR}|/Volumes/Imperium|/mnt/imperium|\\\$TOKEN_OS|\\\$\\{TOKEN_OS\\})/runtimes/|(\\\$TOKEN_OS|\\\$\\{TOKEN_OS\\})(/|\\b)"
+    # Covers tilde/$HOME, this machine's concrete HOME, any concrete
+    # /Users/<name> or /home/<name> home (so a path that doesn't match the
+    # hook's own $HOME still trips the guard), the NAS mirrors, and $TOKEN_OS.
+    RT_FRAG="(~|\\\$HOME|\\\$\\{HOME\\}|${HOME_DIR}|/Users/[^/[:space:]]+|/home/[^/[:space:]]+|/Volumes/Imperium|/mnt/imperium|\\\$TOKEN_OS|\\\$\\{TOKEN_OS\\})/runtimes/|(\\\$TOKEN_OS|\\\$\\{TOKEN_OS\\})(/|\\b)"
 
     if printf '%s' "$CMD" | grep -Eq "$RT_FRAG"; then
         # The command references a runtime path. Deny ONLY when paired with an
@@ -274,7 +279,10 @@ if [[ -n "$CMD" ]]; then
         fi
 
         # e) Direct git tree writes into a runtime checkout via -C / --git-dir.
-        if printf '%s' "$CMD" | grep -Eq "git[[:space:]]+(-C|--git-dir=?|--work-tree=?)[[:space:]]*['\"]?($RT_FRAG)[^[:space:]]*[[:space:]]+(reset|checkout|clean|restore|apply|stash|merge|rebase|cherry-pick|commit|add|rm|mv|switch)\\b"; then
+        #    Allow arbitrary intervening options between the runtime path and the
+        #    write subcommand (e.g. `git -C <rt> -c advice.detachedHead=false
+        #    reset --hard`), but stay within the same command segment.
+        if printf '%s' "$CMD" | grep -Eq "git[[:space:]]+(-C|--git-dir=?|--work-tree=?)[[:space:]]*['\"]?($RT_FRAG)[^;&|]*[[:space:]](reset|checkout|clean|restore|apply|stash|merge|rebase|cherry-pick|commit|add|rm|mv|switch)([[:space:]]|$)"; then
             deny "(git tree write)" "direct git write into runtime"
         fi
     fi

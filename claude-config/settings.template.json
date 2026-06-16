@@ -105,7 +105,7 @@
           },
           {
             "type": "command",
-            "command": "HOOK_AGENT=claude bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh",
+            "command": "HOOK_AGENT=claude bash \"${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh\"",
             "timeout": 5000
           }
         ]
@@ -115,7 +115,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HOOK_AGENT=claude bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh",
+            "command": "HOOK_AGENT=claude bash \"${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh\"",
             "timeout": 5000
           }
         ]

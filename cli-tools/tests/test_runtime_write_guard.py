@@ -31,6 +31,10 @@ VAULT = "/Volumes/Imperium/Imperium-ENV"
 
 def run_hook(payload: dict, env_extra: dict | None = None):
     env = dict(os.environ)
+    # Never inherit the escape hatch from the host/runner — otherwise a stray
+    # IMPERIUM_ALLOW_RUNTIME_WRITE=1 in the environment would silently turn every
+    # deny-path assertion into an allow. Only explicit env_extra may set it.
+    env.pop("IMPERIUM_ALLOW_RUNTIME_WRITE", None)
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
@@ -130,6 +134,34 @@ DENY_CASES = [
         {
             "tool_name": "Write",
             "tool_input": {"file_path": "/Volumes/Imperium/runtimes/token-os/live/x.py"},
+        },
+    ),
+    # git write subcommand reachable past intervening options.
+    (
+        "bash_git_tree_write_with_opts",
+        {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": f"git -C {RT} -c advice.detachedHead=false reset --hard origin/main"
+            },
+        },
+    ),
+    # Concrete /Users/<other> home must still trip the guard even if it isn't
+    # this hook's own $HOME.
+    (
+        "bash_redirect_other_user_home",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo x > /Users/someone/runtimes/Token-OS/live/z"},
+        },
+    ),
+    # The escape-hatch token only counts as a real leading assignment — here it
+    # is just an echo argument, so the redirect must still be denied.
+    (
+        "bash_fake_escape_hatch_does_not_bypass",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": f"echo IMPERIUM_ALLOW_RUNTIME_WRITE=1; echo x > {RT}/z"},
         },
     ),
 ]
