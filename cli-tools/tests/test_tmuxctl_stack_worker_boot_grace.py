@@ -63,7 +63,7 @@ def _run_assert(adapter, *, runtime_ok, rows):
     return result, stop_rows
 
 
-def test_within_grace_row_not_pruned():
+def test_within_grace_row_not_pruned() -> None:
     adapter = FakeAdapter()
     rows = [_worker_row(datetime.now().isoformat())]
     result, stop_rows = _run_assert(adapter, runtime_ok=False, rows=rows)
@@ -74,7 +74,7 @@ def test_within_grace_row_not_pruned():
     stop_rows.assert_not_called()
 
 
-def test_past_grace_row_is_pruned():
+def test_past_grace_row_is_pruned() -> None:
     adapter = FakeAdapter()
     stale = datetime.fromtimestamp(time.time() - 60).isoformat()
     rows = [_worker_row(stale)]
@@ -85,7 +85,7 @@ def test_past_grace_row_is_pruned():
     stop_rows.assert_called_once()
 
 
-def test_no_row_fresh_pane_not_pruned():
+def test_no_row_fresh_pane_not_pruned() -> None:
     adapter = FakeAdapter()
     adapter.options["@PANE_BORN"] = str(int(time.time()))
     result, stop_rows = _run_assert(adapter, runtime_ok=False, rows=[])
@@ -95,7 +95,7 @@ def test_no_row_fresh_pane_not_pruned():
     stop_rows.assert_not_called()
 
 
-def test_no_row_no_birth_stamp_still_pruned():
+def test_no_row_no_birth_stamp_still_pruned() -> None:
     adapter = FakeAdapter()
     result, stop_rows = _run_assert(adapter, runtime_ok=False, rows=[])
 
@@ -103,7 +103,7 @@ def test_no_row_no_birth_stamp_still_pruned():
     assert any(c and c[0] == "kill-pane" for c in adapter.calls)
 
 
-def test_healthy_row_is_noop():
+def test_healthy_row_is_noop() -> None:
     adapter = FakeAdapter()
     rows = [_worker_row(datetime.now().isoformat())]
     result, _ = _run_assert(adapter, runtime_ok=True, rows=rows)
@@ -113,7 +113,7 @@ def test_healthy_row_is_noop():
     assert not any(c and c[0] == "kill-pane" for c in adapter.calls)
 
 
-def test_unparseable_row_does_not_extend_grace():
+def test_unparseable_row_does_not_extend_grace() -> None:
     # A legacy row with no/garbage created_at must not hold the grace open.
     adapter = FakeAdapter()
     rows = [_worker_row("")]
@@ -122,7 +122,29 @@ def test_unparseable_row_does_not_extend_grace():
     assert result["action"] == "pruned"
 
 
-def test_build_snapshot_carries_created_at():
+def test_far_future_row_does_not_extend_grace() -> None:
+    # A created_at implausibly far in the future (beyond tolerated clock skew)
+    # must NOT shelter a dead worker — a raw negative age would read as < grace
+    # forever. It is treated as unusable, so the worker is pruned.
+    adapter = FakeAdapter()
+    future = datetime.fromtimestamp(time.time() + 3600).isoformat()
+    rows = [_worker_row(future)]
+    result, _ = _run_assert(adapter, runtime_ok=False, rows=rows)
+
+    assert result["action"] == "pruned"
+
+
+def test_within_skew_future_row_is_treated_as_just_born() -> None:
+    # A small future skew (within tolerance) clamps to a just-born age → grace.
+    adapter = FakeAdapter()
+    near_future = datetime.fromtimestamp(time.time() + 2).isoformat()
+    rows = [_worker_row(near_future)]
+    result, _ = _run_assert(adapter, runtime_ok=False, rows=rows)
+
+    assert result["action"] == "boot_grace"
+
+
+def test_build_snapshot_carries_created_at() -> None:
     from tmuxctl.registry import build_registry_snapshot
 
     snap = build_registry_snapshot(
@@ -140,7 +162,7 @@ def test_build_snapshot_carries_created_at():
     assert snap.instances[0].created_at == "2026-06-15T12:00:00"
 
 
-def test_tag_worker_stamps_pane_born():
+def test_tag_worker_stamps_pane_born() -> None:
     from tmuxctl.stack import _tag_worker
 
     adapter = FakeAdapter()

@@ -273,6 +273,10 @@ PERSONA_FAILOPEN_ATTEMPTS = 4
 # on the newborn, and kills it — a stillbirth. Hold off pruning until the worker
 # is older than this window; the value sits safely above the observed ~1.5s race.
 STACK_WORKER_BOOT_GRACE_SECONDS = 30.0
+# Tolerated clock skew between the host that stamps a row's created_at and the
+# sweep host. A future timestamp within this window is treated as just-born
+# (age 0.0); beyond it the stamp is anomalous and does not extend the grace.
+_CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
 PANE_CLOSE_TRANSIENT_OPTIONS = (
     "@INSTANCE_ID",
     "@PANE_LABEL",
@@ -651,7 +655,16 @@ def _row_age_seconds(created_at: str) -> float | None:
     except ValueError:
         return None
     now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-    return (now - parsed).total_seconds()
+    age = (now - parsed).total_seconds()
+    # Guard a future-dated created_at (clock skew between the host that stamped
+    # the row and the sweep host). A few seconds of skew is normal and clamps to
+    # a just-born 0.0 → still within grace; a timestamp implausibly far in the
+    # future is anomalous and must NOT shelter a genuinely-dead worker (a raw
+    # negative age would read as < the grace forever), so it is treated as
+    # unusable — the same "does not extend the grace" semantics as a blank stamp.
+    if age < 0:
+        return 0.0 if age >= -_CLOCK_SKEW_TOLERANCE_SECONDS else None
+    return age
 
 
 def _pane_age_seconds(born: str) -> float | None:
