@@ -1946,7 +1946,13 @@ async def _apply_mark_for_close_lifecycle(
             (doc_id,),
         )
         doc_row = await cursor.fetchone()
-        doc_path_text = doc_row[0] if doc_row else None
+        if not doc_row:
+            return {
+                "status": "failed",
+                "reason": "session_doc_not_found",
+                "session_doc_id": doc_id,
+            }
+        doc_path_text = doc_row[0]
         await db.execute(
             "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
             (now, doc_id),
@@ -2000,6 +2006,14 @@ async def _execute_close_pane_stop_subscription(db, *, subscription: dict) -> di
         lifecycle=lifecycle,
     )
     await db.commit()
+    if lifecycle_result.get("status") == "failed":
+        return {
+            "status": "failed",
+            "subscription_id": subscription["id"],
+            "delivery": "close-pane",
+            "close": close_result,
+            "lifecycle": lifecycle_result,
+        }
     return {
         "status": "closed",
         "subscription_id": subscription["id"],
@@ -2042,6 +2056,7 @@ async def _mark_for_close_subscription(
             "pane": target_pane,
         }
 
+    requested_pane = target_pane
     resolved = await _resolve_instance_for_pane(db, target_pane)
     resolved_id = (resolved or {}).get("id")
     if resolved_id and resolved_id != instance_id:
@@ -2053,13 +2068,17 @@ async def _mark_for_close_subscription(
             "pane": target_pane,
         }
 
+    target_pane = _normalize_text((resolved or {}).get("tmux_pane")) or target_pane
     role = await _tmux_show_pane_option(target_pane, "@PANE_ID")
-    if role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
+    if (
+        requested_pane in PROTECTED_MARK_FOR_CLOSE_PANE_IDS
+        or role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS
+    ):
         return {
             "success": False,
             "action": "protected_pane",
             "pane": target_pane,
-            "pane_role": role,
+            "pane_role": role or requested_pane,
         }
 
     sub_id = await _upsert_stop_subscription(

@@ -138,3 +138,4 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
 fi
 
 _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body now)" >/dev/null
+tmux display-message "mark-for-close: $LIFECYCLE executed" 2>/dev/null || true

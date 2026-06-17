@@ -731,6 +731,85 @@ def test_mark_for_close_now_uses_executor(app_env: object, monkeypatch: object) 
     assert sub_row == ("delivered", "close-pane")
 
 
+def test_mark_for_close_archive_fails_when_session_doc_row_missing(
+    app_env: object, monkeypatch: object
+) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "missing-doc", pane="%99")
+
+    async def bind_missing_doc() -> None:
+        async with hooks.aiosqlite.connect(app_env.db_path, timeout=5.0) as db:
+            await hooks.sanctioned_update_instance(
+                db,
+                instance_id="missing-doc",
+                updates={"session_doc_id": 424242},
+                mutation_type="instance_updated",
+                write_source="test",
+                actor="test",
+            )
+            await db.commit()
+
+    asyncio.run(bind_missing_doc())
+
+    async def fake_close(pane: str) -> dict:
+        return {"status": "closed", "pane": pane}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run() -> None:
+        armed = await hooks.mark_instance_for_close(
+            "missing-doc",
+            hooks.MarkForCloseRequest(
+                mode="after-stop", lifecycle="archive-session-doc", pane="%99"
+            ),
+        )
+        assert armed["success"] is True
+        result = await hooks.handle_stop({"session_id": "missing-doc", "transcript_tail": ""})
+        lifecycle = result["stop_subscriptions"][0]["lifecycle"]
+        assert lifecycle["status"] == "failed"
+        assert lifecycle["reason"] == "session_doc_not_found"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute("SELECT status, rank FROM instances WHERE id='missing-doc'").fetchone()
+    conn.close()
+    assert row == ("idle", "astartes")
+
+
+def test_mark_for_close_checks_resolved_protected_pane(
+    app_env: object, monkeypatch: object
+) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "malcador-pane", pane="%100", pane_label="legion:malcador")
+
+    async def fake_resolve(db: object, pane: str | None) -> dict:
+        assert pane == "legion:malcador"
+        return {"id": "malcador-pane", "tmux_pane": "%100"}
+
+    async def fake_role(pane: str, option: str) -> str:
+        assert pane == "%100"
+        assert option == "@PANE_ID"
+        return "legion:malcador"
+
+    monkeypatch.setattr(hooks, "_resolve_instance_for_pane", fake_resolve)
+    monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
+
+    async def run() -> None:
+        result = await hooks.mark_instance_for_close(
+            "malcador-pane",
+            hooks.MarkForCloseRequest(
+                mode="after-stop", lifecycle="retire", pane="legion:malcador"
+            ),
+        )
+        assert result["success"] is False
+        assert result["action"] == "protected_pane"
+        assert result["pane"] == "%100"
+        assert result["pane_role"] == "legion:malcador"
+
+    asyncio.run(run())
+
+
 def test_refused_close_pane_oneshot_deactivates(app_env: object, monkeypatch: object) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "refuse-close", pane="%98")
