@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # generic-hook.sh - Unified hook dispatcher for Claude Code
 # Forwards hook JSON + action_type to token-api server for centralized handling
 #
@@ -28,11 +29,21 @@ ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
 
 # Resolve token-api URL from centralized machine config.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Drop NAS mount roots that are not live so the `-f` probe below can't hang on a
+# stale SMB mount; resolution falls through to script-relative / localhost.
+if [[ -n "${IMPERIUM:-}" ]] && ! ls "${IMPERIUM}" >/dev/null 2>&1; then
+  IMPERIUM=""
+fi
+if [[ -n "${CIVIC:-}" ]] && ! ls "${CIVIC}" >/dev/null 2>&1; then
+  CIVIC=""
+fi
 for _nas_lib in \
   "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
   "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${CIVIC:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
   "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
-  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh"; do
+  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/token-os/live/cli-tools/lib/nas-path.sh"; do
   if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
     # shellcheck source=/dev/null
     source "$_nas_lib" 2>/dev/null || true
@@ -78,11 +89,11 @@ PENDING_UI_FLUSH=$(_resolve_token_os_bin pending-ui-flush) || true
 
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
-if [[ -n "$SSH_CLIENT" || -n "$TMUX" || -n "$TMUX_PANE" || -n "${TOKEN_API_PERSONA:-}" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
+if [[ -n "${SSH_CLIENT:-}" || -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${TOKEN_API_PERSONA:-}" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
   JQ_FILTER=".env //= {} | .env"
-  [[ -n "$SSH_CLIENT" ]] && JQ_FILTER="$JQ_FILTER + {SSH_CLIENT: \$ssh}"
-  [[ -n "$TMUX" ]] && JQ_FILTER="$JQ_FILTER + {TMUX: \$tmux}"
-  [[ -n "$TMUX_PANE" ]] && JQ_FILTER="$JQ_FILTER + {TMUX_PANE: \$tmux_pane}"
+  [[ -n "${SSH_CLIENT:-}" ]] && JQ_FILTER="$JQ_FILTER + {SSH_CLIENT: \$ssh}"
+  [[ -n "${TMUX:-}" ]] && JQ_FILTER="$JQ_FILTER + {TMUX: \$tmux}"
+  [[ -n "${TMUX_PANE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TMUX_PANE: \$tmux_pane}"
   [[ -n "${TOKEN_API_PERSONA:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_PERSONA: \$persona}"
   [[ -n "${TOKEN_API_LAUNCHER:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_LAUNCHER: \$launcher}"
   [[ -n "${TOKEN_API_ENGINE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_ENGINE: \$engine}"
@@ -148,7 +159,7 @@ for _ in 1 2 3; do
     CLAUDE_PID="$CURRENT"
     break
   fi
-  CURRENT=$(ps -o ppid= -p "$CURRENT" 2>/dev/null | tr -d ' ')
+  CURRENT=$(ps -o ppid= -p "$CURRENT" 2>/dev/null | tr -d ' ') || true
 done
 
 # Inject PID into payload
@@ -158,7 +169,7 @@ fi
 
 # Resolve tmux pane via PID walk when env var is stripped (Claude Code strips $TMUX_PANE)
 # Inject into payload so Token-API can store it for cross-machine dispatch
-if [[ -z "$TMUX_PANE" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+if [[ -z "${TMUX_PANE:-}" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   RESOLVED_PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$RESOLVED_PANE" ]]; then
     HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg p "$RESOLVED_PANE" '.tmux_pane = $p') || true
@@ -178,7 +189,7 @@ if [[ -z "$TMUX_PANE" ]] && [[ -n "$CLAUDE_PID" ]] && [[ "$ACTION_TYPE" == "Sess
 fi
 
 # When $TMUX_PANE IS available, still resolve @PANE_ID for DB persistence
-if [[ -n "$TMUX_PANE" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+if [[ -n "${TMUX_PANE:-}" ]] && [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   RESOLVED_LABEL=$(tmux show-options -pv -t "$TMUX_PANE" @PANE_ID 2>/dev/null || true)
   if [[ -n "$RESOLVED_LABEL" ]]; then
     HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg l "$RESOLVED_LABEL" '.pane_label = $l') || true
@@ -191,7 +202,7 @@ fi
 
 # Write session PID cache for worktree-setup transplant
 if [ -n "$CLAUDE_PID" ]; then
-  SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+  SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null) || true
   if [ -n "$SESSION_ID" ]; then
     if [ "$ACTION_TYPE" = "SessionStart" ]; then
       mkdir -p "${HOME}/.claude/session-pids"
@@ -215,7 +226,7 @@ if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
     if [[ -f "$HANDOFF_FILE" ]]; then
       HANDOFF_TMP="${HANDOFF_FILE}.consumed.$$"
       if mv "$HANDOFF_FILE" "$HANDOFF_TMP" 2>/dev/null; then
-        TRANSPLANT_FROM=$(cat "$HANDOFF_TMP" 2>/dev/null)
+        TRANSPLANT_FROM=$(cat "$HANDOFF_TMP" 2>/dev/null) || true
         rm -f "$HANDOFF_TMP"
         if [[ -n "$TRANSPLANT_FROM" ]]; then
           HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg tf "$TRANSPLANT_FROM" '.transplant_from = $tf') || true
@@ -231,12 +242,12 @@ fi
 # Embedding large transcripts (18KB/line × 60 lines) creates 740KB+ payloads
 # that timeout in the background curl.
 if [[ "$ACTION_TYPE" == "Stop" ]]; then
-  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // ""' 2>/dev/null) || true
   IS_LOCAL=$([[ "$API_URL" == *"localhost"* || "$API_URL" == *"127.0.0.1"* ]] && echo 1 || echo 0)
   if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ] && [ "$IS_LOCAL" = "0" ]; then
     TRANSCRIPT_TAIL=""
     for _ in 1 2 3 4 5 6 7 8; do
-      TAIL=$(tail -n 60 "$TRANSCRIPT_PATH")
+      TAIL=$(tail -n 60 "$TRANSCRIPT_PATH") || true
       if echo "$TAIL" | grep -q '"type":"text"'; then
         TRANSCRIPT_TAIL="$TAIL"
         break
@@ -245,7 +256,7 @@ if [[ "$ACTION_TYPE" == "Stop" ]]; then
     done
     # Fallback: use raw tail even without "type":"text" (short sessions, tool-only output)
     if [ -z "$TRANSCRIPT_TAIL" ]; then
-      TRANSCRIPT_TAIL=$(tail -n 60 "$TRANSCRIPT_PATH" 2>/dev/null)
+      TRANSCRIPT_TAIL=$(tail -n 60 "$TRANSCRIPT_PATH" 2>/dev/null) || true
     fi
     if [ -n "$TRANSCRIPT_TAIL" ]; then
       HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg t "$TRANSCRIPT_TAIL" '.transcript_tail = $t') || true
@@ -285,7 +296,7 @@ if [[ "$ACTION_TYPE" == "PreToolUse" ]]; then
   fi
 
   # Execute local_exec side-effect if present (e.g., AHK for voice chat)
-  LOCAL_EXEC=$(echo "$RESPONSE" | jq -r '.local_exec // empty' 2>/dev/null)
+  LOCAL_EXEC=$(echo "$RESPONSE" | jq -r '.local_exec // empty' 2>/dev/null) || true
   if [[ -n "$LOCAL_EXEC" ]]; then
     (
       exec 0</dev/null 1>/dev/null 2>/dev/null
@@ -296,7 +307,7 @@ if [[ "$ACTION_TYPE" == "PreToolUse" ]]; then
   fi
 elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   # Clear stale tmux-context flush marker so fresh context window gets fresh threshold
-  if [[ -n "$TMUX_PANE" ]]; then
+  if [[ -n "${TMUX_PANE:-}" ]]; then
     SAFE_PANE="${TMUX_PANE#%}"
     rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null
   fi
@@ -317,7 +328,7 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
 
   # Defer auto-rename to next UserPromptSubmit via pending-ui-cmds. Pane tint is
   # DB/persona-resolved and applied by tmux style only; no slash color path.
-  TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null)
+  TAB_NAME=$(echo "$RESPONSE" | jq -r '.tab_name // empty' 2>/dev/null) || true
   PANE=$($CLAUDE_CMD --self --resolve-only 2>/dev/null || true)
   if [[ -n "$PANE" && -n "$TAB_NAME" ]]; then
     SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)

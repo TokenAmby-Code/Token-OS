@@ -1,13 +1,25 @@
 #!/bin/bash
+set -euo pipefail
 # naming-nudge.sh - thin Stop hook shim for active tab-name enforcement.
 
 INPUT=$(cat 2>/dev/null || echo "{}")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Drop NAS mount roots that are not live so the `-f` probe below can't hang on a
+# stale SMB mount; resolution falls through to script-relative / localhost.
+if [[ -n "${IMPERIUM:-}" ]] && ! ls "${IMPERIUM}" >/dev/null 2>&1; then
+  IMPERIUM=""
+fi
+if [[ -n "${CIVIC:-}" ]] && ! ls "${CIVIC}" >/dev/null 2>&1; then
+  CIVIC=""
+fi
 for _nas_lib in \
   "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
   "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${CIVIC:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
   "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
-  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh"; do
+  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/token-os/live/cli-tools/lib/nas-path.sh"; do
   if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
     # shellcheck source=/dev/null
     source "$_nas_lib" 2>/dev/null || true

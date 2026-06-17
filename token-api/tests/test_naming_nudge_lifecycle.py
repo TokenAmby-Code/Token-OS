@@ -6,7 +6,7 @@ import sys
 import pytest
 
 
-def _insert_wrapper_instance(db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1"):
+def _insert_wrapper_instance(db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1") -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
@@ -21,7 +21,7 @@ def _insert_wrapper_instance(db_path, *, instance_id="wrap-unnamed", wrapper_id=
 
 
 @pytest.mark.asyncio
-async def test_wrapper_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch):
+async def test_wrapper_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch) -> None:
     """Wrapper-only Codex launches may miss Stop/SessionEnd; terminal WrapperEnd
     must still route through the same unnamed-pane nudge policy.
     """
@@ -49,7 +49,7 @@ async def test_wrapper_end_schedules_harness_agnostic_naming_nudge(app_env, monk
 
 
 @pytest.mark.asyncio
-async def test_session_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch):
+async def test_session_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch) -> None:
     """SessionEnd is also terminal; the rename interview should not depend on
     Claude's separate naming-nudge shell shim or Codex's Stop hook.
     """
