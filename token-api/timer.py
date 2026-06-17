@@ -30,6 +30,7 @@ class TimerMode(str, Enum):
     DECLARED_BREAK = "declared_break"  # user-initiated rest (appeal-on-file)
     IDLE_BREAK = "idle_break"  # auto / idle-timeout break (no amnesty)
     QUIET = "quiet"
+    MORNING_SESSION = "morning_session"
     SLEEPING = "sleeping"
 
 
@@ -66,6 +67,7 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
     TimerMode.DECLARED_BREAK: (-1, 1),  # -60 min/hr (consuming break)
     TimerMode.IDLE_BREAK: (-1, 1),  # -60 min/hr (consuming break)
     TimerMode.QUIET: (0, 1),  # neutral
+    TimerMode.MORNING_SESSION: (0, 1),  # neutral
     TimerMode.SLEEPING: (0, 1),  # neutral
 }
 
@@ -139,7 +141,7 @@ class TimerEngine:
     def __init__(
         self,
         now_mono_ms: int,
-        reset_hour: int = 7,
+        reset_hour: int = 6,
         break_penalty_multiplier: tuple[int, int] = DEFAULT_BREAK_PENALTY_MULTIPLIER,
     ) -> None:
         # Burn penalty for undeclared/slacked break, as an integer rational.
@@ -536,6 +538,36 @@ class TimerEngine:
             result.old_mode = old_mode
         return True, result
 
+    def enter_morning_session(self, now_mono_ms: int, today_date: str) -> tuple[bool, TickResult]:
+        """Start the daily morning lifecycle.
+
+        This is the authoritative 06:00 reset path: all daily counters, break
+        state, focus, and work-session state are zeroed, then the timer enters a
+        neutral MORNING_SESSION manual mode. It stays there until an explicit
+        resume/morning-end/reset path clears the manual mode.
+        """
+        old_mode = self.effective_mode
+        productivity_score = max(0, self._break_balance_ms // (1000 * 60))
+        self._reset_state(now_mono_ms, today_date, with_buffer=False)
+        self._set_manual_mode(
+            TimerMode.MORNING_SESSION,
+            "morning_session",
+            now_mono_ms,
+            lock_duration_ms=0,
+        )
+        if self._manual_substate:
+            self._manual_substate["lock_until_ms"] = None
+
+        result = TickResult(
+            events=[TimerEvent.DAILY_RESET],
+            old_mode=old_mode if old_mode != self.effective_mode else None,
+            productivity_score=productivity_score,
+            reset_date=today_date,
+        )
+        if old_mode != self.effective_mode:
+            result.events.append(TimerEvent.MODE_CHANGED)
+        return old_mode != self.effective_mode, result
+
     def resume(self, now_mono_ms: int) -> tuple[bool, TickResult]:
         """Exit manual mode (break/sleeping). Returns (changed, result)."""
         if self._manual_mode is None:
@@ -838,7 +870,7 @@ class TimerEngine:
                 "trigger": trigger,
                 "lock_until_ms": now_mono_ms + remaining if has_lock and remaining > 0 else None,
             }
-            if self._manual_mode == TimerMode.QUIET:
+            if self._manual_mode in (TimerMode.QUIET, TimerMode.MORNING_SESSION):
                 self._manual_substate["lock_until_ms"] = None
         else:
             self._manual_substate = None
@@ -1047,7 +1079,7 @@ class TimerEngine:
                 break_debit_ms = elapsed_ms * self._break_penalty_num // self._break_penalty_den
             self._apply_break_delta(-break_debit_ms, result)
 
-        # QUIET/SLEEPING: no accumulation
+        # QUIET/MORNING_SESSION/SLEEPING: no accumulation
 
         # Focus layer: accumulate independently when active
         if self._focus_active:
@@ -1116,7 +1148,7 @@ class TimerEngine:
         result.productivity_score = productivity_score
         result.reset_date = self._daily_start_date
 
-        self._reset_state(now_mono_ms, today_date, with_buffer=True)
+        self._reset_state(now_mono_ms, today_date, with_buffer=False)
         return result
 
     def _reset_state(self, now_mono_ms: int, today_date: str, with_buffer: bool) -> None:

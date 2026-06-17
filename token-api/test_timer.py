@@ -2,7 +2,6 @@
 
 from timer import (
     BREAK_RATE_TABLE,
-    DEFAULT_BREAK_BUFFER_MS,
     DISTRACTION_TIMEOUT_MS,
     GYM_BOUNTY_MS,
     IDLE_TIMEOUT_FROM_MULTITASKING_MS,
@@ -643,7 +642,7 @@ class TestDailyReset:
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")
         engine.tick(61_000, "2026-02-11", current_hour=8)
-        assert engine.break_balance_ms == DEFAULT_BREAK_BUFFER_MS
+        assert engine.break_balance_ms == 0
         assert engine.total_work_time_ms == 0
         assert engine.total_break_time_ms == 0
         assert engine.current_mode == TimerMode.WORKING
@@ -661,16 +660,16 @@ class TestDailyReset:
         engine.tick(0, "2026-02-11")
         assert engine.daily_start_date == "2026-02-11"
 
-    def test_reset_hour_7(self):
-        """Default reset hour is 7, not 9."""
+    def test_reset_hour_6(self):
+        """Default reset hour is 6 for morning-session entry."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 10, date="2026-02-10")
-        # At hour 6 (before 7 AM), should NOT reset
-        result = engine.tick(11_000, "2026-02-11", current_hour=6)
+        # Before 6 AM, should NOT reset.
+        result = engine.tick(11_000, "2026-02-11", current_hour=5)
         assert TimerEvent.DAILY_RESET not in result.events
         assert engine.daily_start_date == "2026-02-10"
-        # At hour 7, SHOULD reset
-        result = engine.tick(12_000, "2026-02-11", current_hour=7)
+        # At hour 6, SHOULD reset.
+        result = engine.tick(12_000, "2026-02-11", current_hour=6)
         assert TimerEvent.DAILY_RESET in result.events
 
     def test_sleeping_auto_wakes_at_reset_hour(self):
@@ -716,6 +715,57 @@ class TestManualMode:
         events = collect_events(engine, 1_000, timeout_secs + 60)
         assert TimerEvent.IDLE_TIMEOUT not in events
         assert engine.effective_mode == TimerMode.QUIET
+
+    def test_enter_morning_session_resets_and_serializes(self):
+        engine = make_engine(0, "2026-02-10")
+        engine._total_work_time_ms = 123_000
+        engine._total_break_time_ms = 456_000
+        engine._break_balance_ms = -789_000
+        engine.start_work_session("2026-02-10T10:00:00")
+
+        changed, result = engine.enter_morning_session(1_000, "2026-02-11")
+
+        assert changed
+        assert TimerEvent.DAILY_RESET in result.events
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert engine.current_mode == TimerMode.MORNING_SESSION
+        assert engine.manual_mode == TimerMode.MORNING_SESSION
+        assert engine.manual_trigger == "morning_session"
+        assert engine.daily_start_date == "2026-02-11"
+        assert engine.total_work_time_ms == 0
+        assert engine.total_break_time_ms == 0
+        assert engine.break_balance_ms == 0
+        assert engine.work_session_active is False
+
+        restored = TimerEngine(now_mono_ms=2_000)
+        restored.from_dict(engine.to_dict(2_000), 2_000)
+        assert restored.current_mode == TimerMode.MORNING_SESSION
+        assert restored.manual_trigger == "morning_session"
+
+    def test_morning_session_no_accrual_idle_timeout_or_break_exhaustion(self):
+        engine = make_engine(0)
+        engine.enter_morning_session(1_000, "2026-02-11")
+        engine.set_productivity(False, 2_000)
+        engine._break_balance_ms = 1_000
+
+        result = engine.tick(2_000 + IDLE_TIMEOUT_FROM_WORKING_MS + 60_000, "2026-02-11")
+
+        assert TimerEvent.IDLE_TIMEOUT not in result.events
+        assert TimerEvent.BREAK_EXHAUSTED not in result.events
+        assert engine.current_mode == TimerMode.MORNING_SESSION
+        assert engine.total_work_time_ms == 0
+        assert engine.total_break_time_ms == 0
+        assert engine.break_balance_ms == 1_000
+
+    def test_resume_from_morning_session_returns_to_derived_mode(self):
+        engine = make_engine(0)
+        engine.enter_morning_session(1_000, "2026-02-11")
+
+        changed, result = engine.resume(2_000)
+
+        assert changed
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert engine.current_mode == TimerMode.WORKING
 
     def test_resume_from_break(self):
         engine = make_engine(0)
