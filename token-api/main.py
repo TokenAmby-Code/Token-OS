@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -203,6 +204,9 @@ from timer import (
 # persisted in timer_shifts / timer_samples (which now store declared_break /
 # idle_break, plus legacy "break").
 BREAK_MODE_VALUES = frozenset(m.value for m in BREAK_MODES)
+MORNING_SESSION_START_HOUR = 6
+MORNING_SESSION_WINDOW_HOURS = 2
+MORNING_SESSION_TIMEZONE = "America/Phoenix"
 from timer_telemetry import (
     GAP_THRESHOLD_SECONDS,
     annotate_timer_telemetry,
@@ -1706,9 +1710,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler.add_job(
         stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True
     )
-    # 7 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
+    # 06:00 America/Phoenix daily lifecycle: reset timer state and enter morning_session.
     scheduler.add_job(
-        timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True
+        _scheduled_morning_session_entry_sync,
+        CronTrigger(
+            hour=MORNING_SESSION_START_HOUR,
+            minute=0,
+            timezone=ZoneInfo(MORNING_SESSION_TIMEZONE),
+        ),
+        id="timer_morning_session_0600",
+        replace_existing=True,
     )
     scheduler.add_job(
         _scheduled_quiet_enter_sync,
@@ -1732,6 +1743,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     scheduler.start()
     print("Scheduler started")
+    try:
+        morning_recovery = await recover_missed_morning_session_startup()
+        if morning_recovery.get("recovered"):
+            print(f"Morning session startup recovery: {morning_recovery}")
+    except Exception as exc:
+        logger.warning(f"Morning session startup recovery failed: {exc}")
     await recover_expected_ack_jobs()
     recovered_gt = await recover_recent_stopped_golden_throne_timers()
     if recovered_gt:
@@ -3849,11 +3866,21 @@ _TIMER_MODE_ICONS = {
     "idle": "⏸",  # ⏸
     "distracted": "⚠️",  # ⚠️
     "break": "☕",  # ☕
+    "declared_break": "☕",  # ☕
+    "idle_break": "☕",  # ☕
+    "morning_session": "🌅",  # 🌅
     "sleeping": "\U0001f319",  # 🌙
 }
 
 # Modes where showing the break balance is meaningful (ported from tmux-status).
-_TIMER_BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+_TIMER_BALANCE_MODES = {
+    "working",
+    "multitasking",
+    "break",
+    "declared_break",
+    "idle_break",
+    "distracted",
+}
 
 
 def _fmt_timer_balance_compact(seconds: int) -> str:
@@ -4595,6 +4622,17 @@ async def _dispatch_timer_intervention(
     suppressed. Never raises into the timer loop.
     """
     try:
+        if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+            await log_event(
+                "timer_intervention_suppressed",
+                details={
+                    "source": source,
+                    "event_type": event_name,
+                    "suppressed_by": "morning_session",
+                    "severity": severity,
+                },
+            )
+            return False
         if is_quiet_hours(now) or shared.get_quiet_hours_status(now).get("active"):
             await log_quiet_hours_suppressed(
                 source=source,
@@ -4659,6 +4697,13 @@ async def enter_quiet_mode_internal(
 ) -> dict:
     """Enter first-class timer quiet mode without recording a timer shift."""
     global _current_session_id, _session_start_ms
+    if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+        return {
+            "status": timer_engine.current_mode.value,
+            "quiet_context": timer_engine.quiet_context,
+            "changed": False,
+            "reason": "morning_session_active",
+        }
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
     changed, _ = timer_engine.enter_quiet(now_ms, context=context)
@@ -12477,6 +12522,8 @@ async def maybe_create_backlog_violation_ack(
     """Create the compressed backlog-enforcement ack when distraction happens in debt."""
     if DESKTOP_STATE.get("work_mode", "clocked_in") != "clocked_in":
         return None
+    if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+        return None
     if timer_engine.break_balance_ms >= 0:
         return None
     if is_quiet_hours():
@@ -12569,6 +12616,8 @@ async def maybe_create_phone_distraction_ack(
 ) -> dict | None:
     """Create a guarded ack for sustained phone distraction while clocked in."""
     if DESKTOP_STATE.get("work_mode", "clocked_in") != "clocked_in":
+        return None
+    if timer_engine.current_mode == TimerMode.MORNING_SESSION:
         return None
     if not PHONE_STATE.get("is_distracted"):
         return None
@@ -13248,38 +13297,200 @@ def timer_load_from_db():
     print("TIMER: Fresh start (no DB state found)")
 
 
-async def timer_9am_reset():
-    """9 AM daily reset: clear accumulated break, wipe prior-day timer events."""
+async def _wipe_prior_day_timer_events() -> None:
     import sqlite3
 
+    def _wipe_old_timer_events():
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            "DELETE FROM events WHERE event_type IN ('timer_mode_change','break_exhausted_enforcement')"
+            " AND DATE(created_at) < DATE('now','localtime')"
+        )
+        conn.commit()
+        conn.close()
+
+    await asyncio.to_thread(_wipe_old_timer_events)
+
+
+async def _inject_custodes_morning_prompt(source: str) -> dict:
+    try:
+        from morning_session import inject_morning_lifecycle_prompt
+
+        result = await asyncio.to_thread(inject_morning_lifecycle_prompt)
+    except Exception as exc:
+        logger.exception("Morning lifecycle prompt injection failed")
+        result = {"injected": False, "reason": "exception", "error": str(exc)}
+    await log_event("custodes_morning_lifecycle_prompt", details={"source": source, **result})
+    return result
+
+
+async def _write_morning_audit_state(source: str, today: str, local_now: datetime) -> None:
+    def _write() -> None:
+        from morning_session import morning_state_file
+
+        state_file = morning_state_file(today)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": local_now.isoformat(),
+                    "status": "active",
+                    "source": source,
+                    "timer_mode": TimerMode.MORNING_SESSION.value,
+                    "authoritative": "timer_engine.current_mode",
+                },
+                sort_keys=True,
+            )
+        )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception as exc:
+        logger.warning("Morning audit state write failed: %s", exc)
+
+
+async def enter_morning_session_internal(
+    *, source: str = "scheduler", inject_prompt: bool = True
+) -> dict:
+    """Authoritative daily 06:00 morning lifecycle entry.
+
+    Resets daily timer metrics/break state to zero, enters first-class
+    ``morning_session`` mode, records the official day-start latch, and injects
+    the Custodes closure/pre-plan prompt.
+    """
+    global _current_session_id, _session_start_ms, _mode_change_count
+    local_now = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE))
+    today = local_now.date().isoformat()
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+
+    changed, result = timer_engine.enter_morning_session(now_ms, today)
+    await shared.set_day_started_at(
+        source="morning",
+        at=local_now,
+        force=True,
+        details={"source": source, "timer_mode": TimerMode.MORNING_SESSION.value},
+    )
+    await _write_morning_audit_state(source, today, local_now)
+    await timer_save_to_db()
+    try:
+        await _wipe_prior_day_timer_events()
+    except Exception as e:
+        print(f"TIMER: Failed to wipe old timer events: {e}")
+
+    if _current_session_id > 0:
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+    _session_start_ms = now_ms
+    _mode_change_count = 0
+    await timer_log_mode_change(old_mode, timer_engine.current_mode.value, is_automatic=True)
+    await timer_log_shift(
+        old_mode,
+        timer_engine.current_mode.value,
+        trigger="morning_session_start",
+        source=source,
+        details={
+            "date": today,
+            "productivity_score": result.productivity_score,
+            "changed": changed,
+        },
+    )
+    await log_event(
+        "morning_session_start",
+        details={
+            "source": source,
+            "date": today,
+            "old_mode": old_mode,
+            "new_mode": timer_engine.current_mode.value,
+            "productivity_score": result.productivity_score,
+        },
+    )
+    injection = await _inject_custodes_morning_prompt(source) if inject_prompt else None
+    return {
+        "status": "morning_session",
+        "date": today,
+        "old_mode": old_mode,
+        "current_mode": timer_engine.current_mode.value,
+        "break_balance_ms": timer_engine.break_balance_ms,
+        "total_work_time_ms": timer_engine.total_work_time_ms,
+        "total_break_time_ms": timer_engine.total_break_time_ms,
+        "injection": injection,
+    }
+
+
+def _scheduled_morning_session_entry_sync() -> dict:
+    try:
+        coro = enter_morning_session_internal(source="scheduler_0600", inject_prompt=True)
+        if APP_LOOP and APP_LOOP.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, APP_LOOP)
+            return future.result(timeout=120)
+        return asyncio.run(coro)
+    except Exception as exc:
+        logger.exception("Scheduled morning-session entry failed")
+        return {"success": False, "error": str(exc)}
+
+
+async def recover_missed_morning_session_startup() -> dict:
+    """Recover if Token-API starts after the 06:00 morning reset boundary.
+
+    Stale prior-day metrics are always reset once 06:00 has passed. The Custodes
+    prompt is injected only during the configured morning-session window.
+    """
+    local_now = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE))
+    today = local_now.date().isoformat()
+    after_start = (
+        local_now.hour + local_now.minute / 60 + local_now.second / 3600
+    ) >= MORNING_SESSION_START_HOUR
+    if not after_start:
+        return {"recovered": False, "reason": "before_0600"}
+    if timer_engine.daily_start_date == today:
+        return {"recovered": False, "reason": "already_today"}
+
+    window_end_hour = MORNING_SESSION_START_HOUR + MORNING_SESSION_WINDOW_HOURS
+    in_window = (local_now.hour + local_now.minute / 60 + local_now.second / 3600) < window_end_hour
+    if in_window:
+        result = await enter_morning_session_internal(source="startup_recovery", inject_prompt=True)
+        result["recovered"] = True
+        return result
+
+    now_ms = int(time.monotonic() * 1000)
+    result = timer_engine.force_daily_reset(now_ms, today)
+    await timer_save_to_db()
+    await log_event(
+        "timer_daily_reset",
+        details={
+            "source": "startup_recovery_after_window",
+            "date": today,
+            "productivity_score": result.productivity_score,
+        },
+    )
+    return {
+        "recovered": True,
+        "injected": False,
+        "reason": "after_morning_session_window",
+        "date": today,
+    }
+
+
+async def timer_daily_reset_manual():
+    """Manual/debug daily reset compatibility endpoint (zeroes daily timer state)."""
     today = datetime.now().strftime("%Y-%m-%d")
     now_ms = int(time.monotonic() * 1000)
 
     result = timer_engine.force_daily_reset(now_ms, today)
     await timer_save_to_db()
 
-    # Wipe timer_mode_change and break events from previous days
     try:
-
-        def _wipe_old_timer_events():
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute(
-                "DELETE FROM events WHERE event_type IN ('timer_mode_change','break_exhausted_enforcement')"
-                " AND DATE(created_at) < DATE('now','localtime')"
-            )
-            conn.commit()
-            conn.close()
-
-        await asyncio.to_thread(_wipe_old_timer_events)
+        await _wipe_prior_day_timer_events()
     except Exception as e:
         print(f"TIMER: Failed to wipe old timer events: {e}")
 
-    print(f"TIMER: 9 AM daily reset complete (productivity_score={result.productivity_score})")
+    print(f"TIMER: manual daily reset complete (productivity_score={result.productivity_score})")
     await log_event(
         "timer_daily_reset",
         details={
-            "source": "9am_scheduler",
+            "source": "manual_compat",
             "productivity_score": result.productivity_score,
             "date": today,
         },
@@ -15562,8 +15773,8 @@ async def toggle_focus_mode():
 
 @app.post("/api/timer/daily-reset")
 async def manual_daily_reset():
-    """Manually trigger the 9 AM daily reset (clears accumulated break + wipes prior-day timer events)."""
-    await timer_9am_reset()
+    """Manual/debug daily reset compatibility endpoint."""
+    await timer_daily_reset_manual()
     return {
         "status": "reset",
         "break_balance_ms": timer_engine.break_balance_ms,
@@ -18903,6 +19114,10 @@ async def _negative_break_enforce_tick(now_ms: int, result) -> dict | None:
     """
     try:
         sit = _negative_break_situation
+        if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+            sit["rep"] = 0
+            sit["last_fire_mono_ms"] = None
+            return None
 
         # During an active work session the work-session gate owns enforcement
         # (stricter: straight to 100 + redirect + auto-cancel). This loop still
@@ -20633,74 +20848,49 @@ async def get_morning_session_status():
 
 @app.post("/api/morning/end")
 async def end_morning_session():
-    """Officially end the morning session.
+    """Officially end first-class morning-session timer mode."""
+    global _current_session_id, _session_start_ms
+    morning_status = "no_session"
+    try:
+        from morning_session import write_morning_status
 
-    Durably flips the state file to status="ended" so the Stop-hook keepalive gate
-    (routes/hooks.py → morning_session_active) stops re-injecting, regardless of the
-    live instance's type. Also flips the live Custodes instance off `sync` (→ one_off)
-    via the sanctioned write path. The state-file write is the authoritative loop
-    terminator; the type flip preserves the historical clean-exit contract.
-    """
-    from morning_session import write_morning_status
+        ended_state = write_morning_status("ended", ended_by="morning-end")
+        morning_status = "ended" if ended_state is not None else "no_session"
+    except Exception as exc:
+        logger.warning("Morning end audit state-file write failed: %s", exc)
 
-    # Authoritative: end the session in the state file even if no live row is found.
-    ended_state = write_morning_status("ended", ended_by="morning-end")
-    morning_status = "ended" if ended_state is not None else "no_session"
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT i.id,
-                      CASE WHEN i.golden_throne = 'sync' THEN 'sync'
-                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
-                           ELSE 'one_off'
-                      END AS instance_type
-               FROM instances i
-               JOIN personas p ON p.id = i.persona_id
-               WHERE p.slug = 'custodes'
-                 AND i.status NOT IN ('stopped', 'archived')
-                 AND i.stopped_at IS NULL
-               ORDER BY i.last_activity DESC
-               LIMIT 1"""
+    now_ms = int(time.monotonic() * 1000)
+    today = datetime.now().strftime("%Y-%m-%d")
+    old_mode = timer_engine.current_mode.value
+    changed = False
+    if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+        changed, _ = timer_engine.resume(now_ms)
+        timer_engine.set_productivity(True, now_ms)
+        if _current_session_id > 0:
+            await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+        _session_start_ms = now_ms
+        await timer_log_mode_change(old_mode, timer_engine.current_mode.value, is_automatic=False)
+        await timer_log_shift(
+            old_mode,
+            timer_engine.current_mode.value,
+            trigger="morning_session_end",
+            source="api",
         )
-        row = await cursor.fetchone()
-        if not row:
-            return {"status": "no_active_custodes", "morning_status": morning_status}
+        await timer_save_to_db()
 
-        instance_id = row["id"]
-        old_type = row["instance_type"] or "one_off"
-
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates={"golden_throne": None},
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="morning-end",
-        )
-        await db.commit()
-
-    # Cancel timers when leaving golden_throne or sync (matches set_instance_type).
-    if old_type in ("golden_throne", "sync"):
-        try:
-            scheduler.remove_job(f"golden-throne-{instance_id}")
-        except Exception:
-            pass
-        await _gt_clear_fire(instance_id)
-        try:
-            scheduler.remove_job(f"sync-retrigger-{instance_id}")
-        except Exception:
-            pass
-
-    logger.info(f"Morning session ended — {instance_id[:12]} flipped {old_type} → one_off")
     await log_event(
         "morning_session_end",
-        instance_id=instance_id,
-        details={"old_type": old_type, "new_type": "one_off", "morning_status": morning_status},
+        details={
+            "old_mode": old_mode,
+            "new_mode": timer_engine.current_mode.value,
+            "changed": changed,
+            "morning_status": morning_status,
+        },
     )
     return {
-        "instance_id": instance_id,
-        "golden_throne": None,
+        "status": timer_engine.current_mode.value,
+        "changed": changed,
         "morning_status": morning_status,
     }
 

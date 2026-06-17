@@ -1,14 +1,13 @@
 """Tests for the morning-keepalive gate and Custodes singleton-pane Discord routing.
 
 Part A — the Stop-hook keepalive is gated on **Custodes persona identity** + an
-ACTIVE morning session, NOT on instance_type=='sync'. Identity is resolved from
-the canonical instances/personas join, so a resting Custodes (instance_type !=
-'sync') still owns the keepalive while a morning is live:
-- custodes persona + no/ended/expired morning  → clean Stop, NO keepalive re-injection
-- custodes persona + active in-bound morning    → keepalive re-injected (even sans sync mode)
-- residual sync MODE (non-custodes) + active     → still keepalives (the OR-branch)
+first-class timer mode `morning_session`, NOT on instance_type=='sync' or
+the legacy state file. Identity is resolved from the canonical instances/personas
+join, so a resting Custodes owns keepalive only while timer mode is morning_session:
+- custodes persona + timer not morning_session → clean Stop, NO keepalive re-injection
+- custodes persona + timer morning_session     → keepalive re-injected (even sans sync mode)
+- residual sync MODE (non-custodes)            → no keepalive
 - a non-custodes / non-sync instance             → never reaches the keepalive
-- 2h bound trips → auto-end (status="ended", ended_by="auto-2h-bound") + ONE notice
 - POST /api/morning/end durably writes status="ended" to the state file
 
 Part B — Custodes Discord injection resolves the target via the `legion:custodes`
@@ -116,6 +115,18 @@ def _insert_plain_instance(db_path, *, instance_type="sync", tmux_pane="%42", le
     return sid
 
 
+def _enter_timer_morning(app_env):
+    now_ms = int(app_env.main.time.monotonic() * 1000)
+    today = datetime.now().strftime("%Y-%m-%d")
+    app_env.main.timer_engine.enter_morning_session(now_ms, today)
+
+
+def _exit_timer_morning(app_env):
+    now_ms = int(app_env.main.time.monotonic() * 1000)
+    if app_env.main.timer_engine.current_mode == app_env.main.TimerMode.MORNING_SESSION:
+        app_env.main.timer_engine.resume(now_ms)
+
+
 def _write_morning_state(status="launched", *, started_at=None, today=None, extra=None):
     import morning_session
 
@@ -154,7 +165,7 @@ def test_custodes_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkey
         return await hooks.handle_stop({"session_id": sid})
 
     result = asyncio.run(run())
-    assert result["action"] == "stop_processed_sync_idle:no_session"
+    assert result["action"] != "stop_processed_sync"
     assert calls == []  # no keepalive claude-cmd delivery
 
 
@@ -173,17 +184,17 @@ def test_custodes_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatc
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] == "stop_processed_sync_idle:ended"
+    assert result["action"] != "stop_processed_sync"
     assert calls == []
 
 
-def test_custodes_active_morning_reinjects_keepalive_without_sync_mode(app_env, monkeypatch):
+def test_custodes_timer_morning_reinjects_keepalive_without_sync_mode(app_env, monkeypatch):
     """THE key case: a Custodes resolved by PERSONA identity (instance_type='hook_driven',
     NOT 'sync') WITH an active morning session still gets the keepalive — proving the
     gate is persona+morning, not sync."""
     hooks = sys.modules["routes.hooks"]
     sid = _insert_custodes_instance(app_env.db_path, instance_type="hook_driven")
-    _write_morning_state(status="launched", started_at=datetime.now().isoformat())
+    _enter_timer_morning(app_env)
 
     calls = []
 
@@ -201,8 +212,8 @@ def test_custodes_active_morning_reinjects_keepalive_without_sync_mode(app_env, 
     assert "morning session is still active" in cmd[3]
 
 
-def test_custodes_expired_morning_autoends_and_sends_one_notice(app_env, monkeypatch):
-    """Past the 2h bound: auto-end (status='ended', ended_by='auto-2h-bound') + one notice."""
+def test_custodes_old_state_file_does_not_keepalive_without_timer_mode(app_env, monkeypatch):
+    """Legacy active/expired state-file data is audit-only; timer mode owns liveness."""
     hooks = sys.modules["routes.hooks"]
     import morning_session
 
@@ -219,28 +230,18 @@ def test_custodes_expired_morning_autoends_and_sends_one_notice(app_env, monkeyp
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] == "stop_processed_sync_expired"
+    assert result["action"] != "stop_processed_sync"
+    assert calls == []
 
-    # ONE final notice — the expiry notice, NOT the keepalive.
-    assert len(calls) == 1
-    cmd = calls[0]
-    assert cmd[0] == "claude-cmd" and cmd[2] == "%42"
-    assert "automatically ended" in cmd[3]
-    assert "morning session is still active" not in cmd[3]
-
-    # State file durably auto-ended.
     state = morning_session.read_morning_state()
-    assert state["status"] == "ended"
-    assert state["ended_by"] == "auto-2h-bound"
+    assert state["status"] == "launched"
 
 
-def test_residual_sync_mode_instance_also_keepalives(app_env, monkeypatch):
-    """A non-custodes instance still in sync MODE (instance_type='sync', no canonical
-    custodes row) keeps the keepalive via the OR-branch — sync mode remains a valid,
-    if no-longer-primary, signal."""
+def test_residual_sync_mode_instance_does_not_keepalive(app_env, monkeypatch):
+    """Residual sync mode is not morning liveness and never keepalives non-Custodes."""
     hooks = sys.modules["routes.hooks"]
     sid = _insert_plain_instance(app_env.db_path, instance_type="sync", legion="mechanicus")
-    _write_morning_state(status="launched", started_at=datetime.now().isoformat())
+    _enter_timer_morning(app_env)
 
     calls = []
 
@@ -251,9 +252,8 @@ def test_residual_sync_mode_instance_also_keepalives(app_env, monkeypatch):
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] == "stop_processed_sync"
-    assert len(calls) == 1
-    assert calls[0][0] == "claude-cmd"
+    assert result["action"] != "stop_processed_sync"
+    assert calls == []
 
 
 def test_retired_sync_seat_never_keepalives(app_env, monkeypatch):
@@ -271,7 +271,7 @@ def test_retired_sync_seat_never_keepalives(app_env, monkeypatch):
     )
     conn.commit()
     conn.close()
-    _write_morning_state(status="launched", started_at=datetime.now().isoformat())
+    _enter_timer_morning(app_env)
 
     calls = []
 
@@ -313,16 +313,54 @@ def test_morning_end_writes_status_ended_to_state_file(app_env):
     import morning_session
 
     _write_morning_state(status="launched")
+    _enter_timer_morning(app_env)
     client = TestClient(app_env.main.app)
 
     resp = client.post("/api/morning/end")
     assert resp.status_code == 200
     body = resp.json()
     assert body["morning_status"] == "ended"
+    assert body["status"] != "morning_session"
 
     state = morning_session.read_morning_state()
     assert state["status"] == "ended"
     assert state["ended_by"] == "morning-end"
+
+
+def test_timer_api_reports_morning_session(app_env):
+    from fastapi.testclient import TestClient
+
+    _enter_timer_morning(app_env)
+    client = TestClient(app_env.main.app)
+
+    resp = client.get("/api/timer")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current_mode"] == "morning_session"
+    assert body["manual_mode"] == "morning_session"
+
+
+def test_morning_entry_resets_metrics_logs_and_injects(app_env, monkeypatch):
+    main = app_env.main
+    main.timer_engine._total_work_time_ms = 123_000
+    main.timer_engine._total_break_time_ms = 456_000
+    main.timer_engine._break_balance_ms = -789_000
+    injected = []
+
+    async def fake_inject(source):
+        injected.append(source)
+        return {"injected": True}
+
+    monkeypatch.setattr(main, "_inject_custodes_morning_prompt", fake_inject)
+
+    result = asyncio.run(main.enter_morning_session_internal(source="pytest", inject_prompt=True))
+
+    assert result["current_mode"] == "morning_session"
+    assert result["break_balance_ms"] == 0
+    assert result["total_work_time_ms"] == 0
+    assert result["total_break_time_ms"] == 0
+    assert injected == ["pytest"]
 
 
 # ── Part B: Custodes Discord injection via the singleton pane marker ──

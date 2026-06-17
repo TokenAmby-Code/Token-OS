@@ -58,7 +58,6 @@ from shared import (
     DB_PATH,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
-    MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
     VOICE_CHAT_SESSIONS,
     append_workflow_event,
@@ -4073,20 +4072,17 @@ async def handle_stop(payload: dict) -> dict:
         instance_type = "golden_throne"
     else:
         instance_type = instance.get("instance_type", "one_off")
-    # The Custodes persona never auto-idles and owns the morning keepalive path,
-    # regardless of whether sync MODE is currently set. `sync` remains a valid
-    # mode signal, so the gate is "Custodes persona OR still in sync mode".
-    #
-    # Liveness: a retired (dead identity) or already stopped/archived seat must
-    # NEVER keepalive off a residual sync marker — re-injecting into its stale pane
-    # is exactly the GT phantom-dispatch this filter stops. The is_custodes_persona
-    # arm already excludes retired (its join filters rank), so the gate is only on
-    # the sync-MODE OR-branch. Custodes identity, when live, still wins.
+    # The morning keepalive is now keyed ONLY to first-class timer mode:
+    # Custodes is treated as "sync" iff timer_engine.current_mode ==
+    # morning_session. A residual golden_throne='sync' marker is audit/debt, not
+    # liveness, and must not wake stale/non-Custodes panes.
     _seat_is_dead = (instance.get("rank") or "") == "retired" or instance.get("status") in (
         "stopped",
         "archived",
     )
-    is_sync_instance = is_custodes_persona or (instance_type == "sync" and not _seat_is_dead)
+    timer_mode = getattr(getattr(_timer_engine, "current_mode", None), "value", None)
+    morning_timer_active = timer_mode == "morning_session"
+    is_sync_instance = is_custodes_persona and morning_timer_active and not _seat_is_dead
     is_subagent_instance_quick = bool(instance.get("is_subagent"))
     has_pending_background = _pending_background_tasks.get(session_id, 0) > 0
 
@@ -4293,22 +4289,16 @@ async def handle_stop(payload: dict) -> dict:
         return result
 
     if is_sync_instance:
-        # Self-continuing morning session. The keepalive is gated on Custodes
-        # persona identity (or residual sync mode) AND an ACTIVE morning session —
-        # NOT on identity alone. Being the Custodes is NECESSARY (a normal instance
-        # never reaches here) but NOT SUFFICIENT: the resting Custodes singleton
-        # also reaches this branch, yet must stop cleanly once the morning session
-        # is ended (POST /api/morning/end) or past the Emperor's
-        # MORNING_MAX_DURATION_HOURS bound.
-        from morning_session import MORNING_MAX_DURATION_HOURS, morning_session_active
-
-        active, morning_reason = morning_session_active()
+        # Self-continuing morning session. Timer mode is the sole authority; no
+        # state-file/sync-marker "pragma once" gate participates here.
+        active, morning_reason = True, "timer_mode"
         await log_event(
             "hook_stop",
             instance_id=session_id,
             details={
                 "custodes_persona": is_custodes_persona,
                 "instance_type": instance_type,
+                "timer_mode": timer_mode,
                 "keepalive": active,
                 "morning": morning_reason,
             },
@@ -4331,32 +4321,7 @@ async def handle_stop(payload: dict) -> dict:
                 pass
 
         if not active:
-            # No active morning session → clean Stop, no keepalive re-injection.
-            # When the 2h bound just tripped, morning_session_active() already
-            # auto-ended the state file; emit ONE final in-band notice and then go
-            # quiet — do NOT keep re-prompting.
-            if morning_reason == "expired":
-                result["action"] = "stop_processed_sync_expired"
-                if tmux_pane:
-                    notice = MORNING_EXPIRY_NOTICE.format(hours=MORNING_MAX_DURATION_HOURS)
-                    try:
-                        proc = await _run_subprocess_offloop(
-                            ("claude-cmd", "--pane", tmux_pane, notice),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            timeout=10,
-                        )
-                        if proc.returncode != 0:
-                            logger.warning(
-                                f"Hook: Stop {session_id[:12]}... morning expiry notice claude-cmd failed: "
-                                f"{proc.stderr.decode()[:200]}"
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"Hook: Stop {session_id[:12]}... morning expiry notice failed: {e}"
-                        )
-            else:
-                result["action"] = f"stop_processed_sync_idle:{morning_reason}"
+            result["action"] = f"stop_processed_sync_idle:{morning_reason}"
             return result
 
         # Active, in-bound morning session → re-inject a fresh timestamped keepalive
