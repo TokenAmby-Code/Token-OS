@@ -318,7 +318,7 @@ Layout:
   tx unfocus          restore side columns
   tx expand           toggle pane expand/retract
   tx inspect          inspect typed workspace state
-  tx resolve ID       resolve stable pane id to live %pane
+  tx resolve ID       resolve stable pane id to public {page}:{id}
     restart-plan      inspect restart registry/restore plan
   tx doctor           diagnose managed workspace drift
   tx normalize        reserved Python normalize path

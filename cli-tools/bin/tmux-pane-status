@@ -12,7 +12,7 @@ Combines:
 Usage:
     tmux-pane-status              # Table of all Claude panes
     tmux-pane-status --json       # Raw JSON output
-    tmux-pane-status --pane %4    # Single pane details
+    tmux-pane-status --pane palace:N  # Single pane details
     tmux-pane-status --idle       # Only show idle panes (waiting for input)
     tmux-pane-status --hot        # Only show panes above 50% context
 """

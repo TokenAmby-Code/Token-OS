@@ -18,11 +18,6 @@ PLACEHOLDER_TAB_NAME_RX = re.compile(
 )
 RAW_TMUX_PANE_RX = re.compile(r"%\d+")
 
-_PANE_PAGE_NUMBERS = {
-    "palace": "1",
-    "somnium": "2",
-}
-
 
 def is_meaningful_tab_name(tab_name: str | None) -> bool:
     """True when ``tab_name`` is not blank and not the default launch stamp."""
@@ -62,33 +57,33 @@ def human_tab_name(tab_name: str | None) -> str | None:
 
 
 def pane_position_id(pane_label: str | None) -> str | None:
-    """Return the stable page-number:slot position, e.g. ``1:N``.
+    """Return the stable public ``{page}:{id}`` pane identifier.
 
-    Only fixed two-dimensional workspaces have positional identity. Dynamic
-    workspaces such as legion/mechanicus/custodes do not get fake positions.
+    Raw tmux physical ids (``%NNN``) are internal-only and never returned.
     """
     if not pane_label:
         return None
-    page, _, slot = pane_label.partition(":")
-    page_number = _PANE_PAGE_NUMBERS.get(page)
-    if page_number and slot:
-        return f"{page_number}:{slot}"
-    return None
+    label = pane_label.strip()
+    if not label or RAW_TMUX_PANE_RX.search(label):
+        return None
+    page, sep, pane_id = label.partition(":")
+    if not sep or not page or not pane_id or ":" in pane_id:
+        return None
+    return f"{page}:{pane_id}"
 
 
 def human_pane_surface(tab_name: str | None, tmux_pane: str | None, pane_label: str | None) -> str:
     """Return the operator-facing pane surface.
 
-    Prefer ``<position> <name>`` when both are available. Never return a
+    Prefer ``<{page}:{id}> <name>`` when both are available. Never return a
     ``Claude HH:MM`` launch-placeholder name. Never return raw tmux ``%N``
     physical ids; those are internal adapter descriptors, not human surfaces.
     """
     position = pane_position_id(pane_label)
     name = human_tab_name(tab_name)
-    label = human_pane_label(pane_label)
     if position and name:
         return f"{position} {name}"
-    return position or name or label or "session"
+    return position or name or "session"
 
 
 def sanitize_human_surface(surface: str | None) -> str | None:
@@ -104,16 +99,7 @@ def sanitize_human_surface(surface: str | None) -> str | None:
 def human_pane_label(pane_label: str | None) -> str | None:
     """Return a public non-positional pane label for dynamic workspaces.
 
-    Palace/somnium are rendered through ``pane_position_id``. Dynamic panes
-    such as legion/mechanicus do not have a fake 2-D coordinate, but their
-    ``@PANE_ID`` role is still a public identifier and is safe to speak/display.
+    Compatibility wrapper for older callers. All public labels, including
+    palace/somnium, are now rendered as canonical ``{page}:{id}``.
     """
-    if not pane_label:
-        return None
-    label = pane_label.strip()
-    if not label or label.startswith("%"):
-        return None
-    page, _, _slot = label.partition(":")
-    if page in _PANE_PAGE_NUMBERS:
-        return None
-    return label
+    return pane_position_id(pane_label)

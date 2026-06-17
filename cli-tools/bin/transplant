@@ -148,7 +148,7 @@ get_ppid() {
 # Find the tmux pane containing a given PID (walks ancestry)
 find_tmux_pane() {
     local target_pid=$1
-    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+    IMPERIUM_TMUX_RAW=1 tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
         local check_pid=$target_pid
         while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
             if [[ "$check_pid" == "$pane_pid" ]]; then
@@ -406,7 +406,7 @@ verify_pane_has_process() {
     local pattern="${2:-claude}"
     local max_depth="${3:-5}"
     local pane_pid
-    pane_pid=$(tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+    pane_pid=$(IMPERIUM_TMUX_RAW=1 tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
     [[ -z "$pane_pid" ]] && return 1
     _walk_children "$pane_pid" "$pattern" "$max_depth" 0
 }
@@ -632,7 +632,7 @@ if $TEST_RECOVERY; then
     test_pane="$TARGET_PANE"
     if [[ -z "$test_pane" ]]; then
         # Find a pane running plain bash (not claude) to use as the test target
-        test_pane=$(tmux list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null | awk '$2 == "bash" {print $1; exit}')
+        test_pane=$(IMPERIUM_TMUX_RAW=1 tmux list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null | awk '$2 == "bash" {print $1; exit}')
     fi
     if [[ -z "$test_pane" ]]; then
         log_error "No idle bash pane found — use --pane <id> to specify a target"

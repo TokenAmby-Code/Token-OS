@@ -3450,6 +3450,7 @@ async def _run_subprocess_offloop(
     stdout=None,
     stderr=None,
     text: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run short utility subprocesses in a worker thread.
 
@@ -3464,6 +3465,7 @@ async def _run_subprocess_offloop(
         stdout=stdout,
         stderr=stderr,
         text=text,
+        env=env,
         timeout=timeout,
         check=False,
     )
@@ -4994,6 +4996,7 @@ async def _tmux_pane_has_pending_input(tmux_pane: str) -> bool:
         ("tmux", "capture-pane", "-t", tmux_pane, "-p"),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
         timeout=5,
     )
     if proc.returncode != 0:
@@ -5628,6 +5631,7 @@ def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
             text=True,
             timeout=1,
             check=False,
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
         )
         if result.returncode != 0:
             return None
@@ -6946,11 +6950,7 @@ async def _repair_missing_pane_labels(candidates: list[dict]) -> None:
 
 
 def _golden_throne_surface(tab_name: str, tmux_pane: str | None, pane_label: str | None) -> str:
-    if pane_label:
-        return pane_label
-    if tmux_pane and not str(tmux_pane).startswith("%"):
-        return tmux_pane
-    return tab_name
+    return _format_human_pane_surface(tab_name, tmux_pane, pane_label)
 
 
 def _golden_throne_human_surface(
@@ -11691,8 +11691,8 @@ async def talk_send(request: TalkSendRequest):
             "status": "returned",
             "talk_id": returned["talk_id"],
             "result_kind": "explicit",
-            "delivery": send_result,
-            "talk": returned,
+            "delivery": await talk_service.publicize_payload(send_result),
+            "talk": await talk_service.publicize_payload(returned),
         }
 
     target_instance = await talk_service.lookup_instance_for_pane(target_pane)
@@ -11710,16 +11710,19 @@ async def talk_send(request: TalkSendRequest):
         )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
-        raise HTTPException(status_code=502, detail=f"talk delivery failed: {exc}") from exc
+        detail = await talk_service.publicize_payload(f"talk delivery failed: {exc}")
+        raise HTTPException(status_code=502, detail=detail) from exc
 
-    return {
-        "status": "open",
-        "talk_id": record["talk_id"],
-        "caller_pane": caller_pane,
-        "target_pane": target_pane,
-        "target_instance_id": record["target_instance_id"],
-        "delivery": send_result,
-    }
+    return await talk_service.publicize_payload(
+        {
+            "status": "open",
+            "talk_id": record["talk_id"],
+            "caller_pane": caller_pane,
+            "target_pane": target_pane,
+            "target_instance_id": record["target_instance_id"],
+            "delivery": send_result,
+        }
+    )
 
 
 @app.get("/api/talk/await/{talk_id}")
@@ -11729,7 +11732,7 @@ async def talk_await(talk_id: str, timeout: float = 30.0):
     record = await talk_service.await_talk(talk_id, timeout=timeout)
     if record is None:
         raise HTTPException(status_code=404, detail=f"talk_id not found: {talk_id}")
-    return record
+    return await talk_service.publicize_payload(record)
 
 
 @app.post("/api/talk/cancel/{talk_id}")
@@ -11763,7 +11766,7 @@ async def brief_send(request: BriefSendRequest):
             "status": "no_targets",
             "ephemeral": request.ephemeral,
             "resolved": [],
-            "unresolved": unresolved,
+            "unresolved": await talk_service.publicize_payload(unresolved),
             "delivered": 0,
         }
 
@@ -11807,8 +11810,8 @@ async def brief_send(request: BriefSendRequest):
         "status": "ok",
         "ephemeral": request.ephemeral,
         "delivered": len([r for r in delivered if r.get("status") in {"sent", "pending"}]),
-        "resolved": delivered,
-        "unresolved": unresolved,
+        "resolved": await talk_service.publicize_payload(delivered),
+        "unresolved": await talk_service.publicize_payload(unresolved),
     }
 
 

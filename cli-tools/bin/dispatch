@@ -256,7 +256,7 @@ dispatch_tmux_pane() {
   if [[ -n "${TMUX_PANE:-}" ]]; then
     printf '%s' "$TMUX_PANE"
   elif command -v tmux >/dev/null 2>&1 && [[ -n "${TMUX:-}" ]]; then
-    tmux display-message -p '#{pane_id}' 2>/dev/null || true
+    IMPERIUM_TMUX_RAW=1 tmux display-message -p '#{pane_id}' 2>/dev/null || true
   fi
 }
 

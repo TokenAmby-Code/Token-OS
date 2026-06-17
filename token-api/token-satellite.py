@@ -1654,6 +1654,7 @@ def _tmux_pane_has_pending_input(pane: str) -> bool:
         capture_output=True,
         text=True,
         timeout=5,
+        env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
     )
     if capture.returncode != 0:
         return False
@@ -2132,6 +2133,7 @@ async def tmux_send_keys(req: TmuxSendKeysRequest):
             capture_output=True,
             text=True,
             timeout=5,
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
         )
         if verify.returncode != 0 or not verify.stdout.strip():
             raise HTTPException(status_code=404, detail=f"Pane {pane} not found")
@@ -2171,6 +2173,7 @@ def _get_or_create_kreig_pane() -> str:
         capture_output=True,
         text=True,
         timeout=5,
+        env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
     )
     if result.returncode == 0 and result.stdout.strip():
         # Window exists — split a new pane into it
@@ -2204,6 +2207,7 @@ def _get_or_create_kreig_pane() -> str:
         capture_output=True,
         text=True,
         timeout=5,
+        env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
     )
     pane_id = result.stdout.strip().split("\n")[0]
     subprocess.run(

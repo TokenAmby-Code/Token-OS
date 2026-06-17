@@ -69,15 +69,14 @@ pane_resolve() {
         echo "$resolved"
         return 0
     fi
-    tmux list-panes -a -F '#{pane_id} #{@PANE_ID}' 2>/dev/null \
-        | awk -v id="$id" '$2 == id { print $1; exit }'
+    return 1
 }
 
 # List all pane IDs and their tmux targets.
-# Output: %0 palace:N\n%1 palace:S\n...
+# Output: palace:N\npalace:S\n...
 pane_list() {
-    tmux list-panes -a -F '#{pane_id} #{@PANE_ID}' 2>/dev/null \
-        | awk '$2 != "" && $2 != "(null)" { print }'
+    tmux list-panes -a -F '#{@PANE_ID}' 2>/dev/null \
+        | awk '$1 != "" && $1 != "(null)" { print }'
 }
 
 # Get the @PANE_ID for a given tmux pane target.

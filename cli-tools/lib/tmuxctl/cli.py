@@ -2,11 +2,33 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 from .api import RegistryError
 from .service import TmuxControlPlane
 from .tmux_adapter import TmuxError
+
+_RAW_TMUX_ID_RX = re.compile(r"%\d+")
+_PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
+
+
+def _public_or_unresolved(control: TmuxControlPlane, target: str | None) -> str:
+    if not target:
+        return "unresolved"
+    try:
+        return control.public_pane_id(target)
+    except Exception:
+        return "unresolved"
+
+
+def _safe_public_role(role: str | None) -> str:
+    value = (role or "").strip()
+    if not value:
+        return "unresolved"
+    if _RAW_TMUX_ID_RX.search(value):
+        return "unresolved"
+    return value if _PUBLIC_PANE_ID_RX.fullmatch(value) else "unresolved"
 
 
 def _parse_window_ref(value: str, control: TmuxControlPlane) -> tuple[str, int]:
@@ -91,6 +113,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=["json", "physical", "role", "full"], default="full"
     )
     resolve_instance_parser.add_argument("instance_id")
+
+    translate_ids_parser = subparsers.add_parser(
+        "translate-ids",
+        help="Translate raw tmux %%pane ids on stdin to public {page}:{id} ids.",
+    )
+    translate_ids_parser.add_argument(
+        "--unresolved",
+        default="unresolved",
+        help="Replacement for raw ids that have no live public @PANE_ID mapping.",
+    )
 
     freelist_parser = subparsers.add_parser(
         "freelist",
@@ -394,13 +426,26 @@ def main(argv: list[str] | None = None) -> int:
             elif args.format == "physical":
                 print(result["pane_id"])
             elif args.format == "role":
-                print(result["pane_role"])
+                print(_safe_public_role(result.get("pane_role")))
             else:  # full
+                public_role = _safe_public_role(result.get("pane_role"))
                 print(f"instance_id: {result['instance_id']}")
-                print(f"pane_id: {result['pane_id'] or '(unset)'}")
-                print(f"pane_role: {result['pane_role'] or '(unset)'}")
+                print(f"public_id: {public_role}")
+                print(f"pane_role: {public_role}")
+                print("physical_pane_id: (internal-only; use --format physical)")
                 print(f"found: {str(result['found']).lower()}")
             return 0 if result["found"] else 1
+
+        if args.command == "translate-ids":
+            from .public_ids import physical_to_public_id_map, translate_physical_ids
+
+            text = sys.stdin.read()
+            mapping = physical_to_public_id_map(control.adapter)
+            translated = translate_physical_ids(text, mapping, unresolved=args.unresolved)
+            if text and not text.endswith("\n"):
+                translated += "\n"
+            sys.stdout.write(translated)
+            return 0
 
         if args.command == "freelist":
             import json
@@ -409,17 +454,25 @@ def main(argv: list[str] | None = None) -> int:
             if args.first:
                 if not panes:
                     return 1
-                print(panes[0]["pane_id"])
+                print(_safe_public_role(panes[0].get("pane_role")))
                 return 0
             if args.format == "json":
+                panes = [
+                    {
+                        **free_pane,
+                        "pane_id": _safe_public_role(free_pane.get("pane_role")),
+                        "pane_role": _safe_public_role(free_pane.get("pane_role")),
+                    }
+                    for free_pane in panes
+                ]
                 print(json.dumps(panes))
             elif args.format == "ids":
                 for free_pane in panes:
-                    print(free_pane["pane_id"])
+                    print(_safe_public_role(free_pane.get("pane_role")))
             else:  # text
                 for free_pane in panes:
-                    role = free_pane["pane_role"] or "-"
-                    print(f"{free_pane['pane_id']}\t{role}\t{free_pane['window_name']}")
+                    role = _safe_public_role(free_pane.get("pane_role"))
+                    print(f"{role}\t{role}\t{free_pane['window_name']}")
             return 0
 
         if args.command == "session-doc":
@@ -585,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
                     cwd=args.cwd,
                     focus=not args.no_focus,
                 )
-                print(pane_id)
+                print(_public_or_unresolved(control, pane_id))
                 return 0
             if args.stack_command == "dispatch":
                 from .stack import dispatch_stack_command
@@ -599,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
                     focus=not args.no_focus,
                     settle_seconds=args.settle,
                 )
-                print(pane_id)
+                print(_public_or_unresolved(control, pane_id))
                 return 0
             if args.stack_command == "adopt":
                 from .focus_guard import preserve_focus
@@ -620,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                         focus=not args.no_focus,
                         adopt_pane=args.pane,
                     )
-                print(pane_id)
+                print(_public_or_unresolved(control, pane_id))
                 return 0
             if args.stack_command == "sweep":
                 from .stack import sweep_stack_assertions

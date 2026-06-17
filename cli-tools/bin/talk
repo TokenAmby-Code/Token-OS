@@ -9,12 +9,13 @@ Usage:
     talk --pane <id> --no-wait "prompt"  # send-only; return talk_id immediately
     talk --pane <id> --timeout 600 "..." # override wait timeout (seconds)
     talk --pane <id> --json "..."        # emit machine-readable JSON
-    talk --pane <id> --caller %23 "..."  # override caller-pane detection
+    talk --pane <id> --caller palace:N "..."  # override caller-pane detection
 
 Pane addressing accepts:
-    %23                  raw tmux pane id
     somnium:SE           position id (window:position)
     main:2:SE            full triple (session:window:position)
+
+Raw tmux %NNN ids are internal-only and are never printed back.
 
 See Mars/Tasks/trinity-chunk-1-talk-cli.md and
 Terra/Ultramar/Inter-Persona Communication.md for the canon spec.
@@ -68,7 +69,7 @@ def _resolve_caller(explicit: str | None) -> str:
         return env_pane
     _err(
         "could not detect caller pane (no --caller and $TMUX_PANE unset). "
-        "Pass --caller %<id> explicitly."
+        "Pass --caller <page:id> explicitly."
     )
     sys.exit(64)
 
@@ -103,7 +104,7 @@ def main(argv: list[str]) -> int:
         description="Two-way inter-persona conversation between tmux panes.",
         add_help=True,
     )
-    parser.add_argument("--pane", required=True, help="Target pane (raw id or position id)")
+    parser.add_argument("--pane", required=True, help="Target pane (public {page}:{id} id)")
     parser.add_argument(
         "--caller",
         default=None,

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sqlite3
 import subprocess
 import uuid
@@ -830,6 +831,7 @@ def _tmux_query(*args: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=2,
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
         )
     except Exception:
         return None

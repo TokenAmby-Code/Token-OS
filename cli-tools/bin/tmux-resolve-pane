@@ -33,7 +33,8 @@ while [[ $# -gt 0 ]]; do
         --id)
             format="id"; shift ;;
         --physical)
-            format="physical"; shift ;;
+            echo "tmux-resolve-pane: --physical is deprecated; use --format physical for internal-only callers" >&2
+            exit 2 ;;
         -h|--help)
             usage; exit 0 ;;
         --)
