@@ -20892,8 +20892,6 @@ async def end_morning_session():
     except Exception as exc:
         logger.warning("Morning end audit state-file write failed: %s", exc)
 
-
-
     now_ms = int(time.monotonic() * 1000)
     today = datetime.now().strftime("%Y-%m-%d")
     old_mode = timer_engine.current_mode.value
