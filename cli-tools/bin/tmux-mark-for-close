@@ -60,7 +60,14 @@ LIFECYCLE="$(_choose 'closeout> ' $'retire\tRetire only\narchive-session-doc\tRe
 [[ -n "$LIFECYCLE" && "$LIFECYCLE" != "cancel" ]] || exit 0
 
 MODE_CHOICE="$(_choose 'final-message> ' $'message\tSend one last message, close on Stop\nnow\tNo message; close now\ncancel\tCancel')"
-[[ -n "$MODE_CHOICE" && "$MODE_CHOICE" != "cancel" ]] || exit 0
+case "$MODE_CHOICE" in
+    message|now) ;;
+    ""|cancel) exit 0 ;;
+    *)
+        echo "tmux-mark-for-close: invalid close mode: $MODE_CHOICE" >&2
+        exit 2
+        ;;
+esac
 
 _api_post_json() {
     local path="$1" body="$2"
@@ -98,7 +105,7 @@ PY
 }
 
 _unsubscribe_mark() {
-    local body
+    local body response
     body="$(python3 - "$INSTANCE_ID" "$PANE" <<'PY'
 import json, sys
 instance_id, pane = sys.argv[1:]
@@ -112,7 +119,15 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    _api_post_json "/api/hooks/unsubscribe" "$body" >/dev/null
+    # The endpoint can return success:true with count:0 when nothing matched;
+    # require a matched row before treating the rollback as a real disarm.
+    response="$(_api_post_json "/api/hooks/unsubscribe" "$body")"
+    python3 - "$response" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+if int(payload.get("count") or 0) <= 0:
+    raise SystemExit("unsubscribe matched zero active mark-for-close subscriptions")
+PY
 }
 
 if [[ "$MODE_CHOICE" == "message" ]]; then
@@ -137,5 +152,7 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
     exit 0
 fi
 
-_api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body now)" >/dev/null
-tmux display-message "mark-for-close: $LIFECYCLE executed" 2>/dev/null || true
+if [[ "$MODE_CHOICE" == "now" ]]; then
+    _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body now)" >/dev/null
+    tmux display-message "mark-for-close: $LIFECYCLE executed" 2>/dev/null || true
+fi

@@ -2040,24 +2040,24 @@ async def _mark_for_close_subscription(
         return {"success": False, "action": "instance_not_found", "instance_id": instance_id}
 
     row_pane_label = _normalize_text(row["pane_label"])
-    target_pane = _normalize_text(pane) or row["tmux_pane"] or row_pane_label
-    if not target_pane:
-        return {"success": False, "action": "pane_unresolved", "instance_id": instance_id}
-    known_panes = {
-        _normalize_text(row["tmux_pane"]),
-        _normalize_text(row["pane_label"]),
-    }
-    known_panes.discard("")
-    known_panes.discard(None)
-    if pane and known_panes and target_pane not in known_panes:
+    stored_tmux_pane = _normalize_text(row["tmux_pane"])
+    target_pane = _normalize_text(pane) or stored_tmux_pane
+    # Fail closed when no live pane is available but the stored role label alone
+    # proves this row is a protected persona singleton.
+    if not target_pane and row_pane_label in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
         return {
             "success": False,
-            "action": "pane_instance_mismatch",
-            "instance_id": instance_id,
-            "pane": target_pane,
+            "action": "protected_pane",
+            "pane": None,
+            "pane_role": row_pane_label,
         }
+    if not target_pane:
+        return {"success": False, "action": "pane_unresolved", "instance_id": instance_id}
 
     requested_pane = target_pane
+    # Resolve live pane ownership (via tmuxctl / @INSTANCE_ID stamps) before
+    # falling back to stored runtime columns, so stale tmux_pane/pane_label values
+    # never reject a valid live pane or arm an unaddressable target.
     resolved = await _resolve_instance_for_pane(db, target_pane)
     resolved_id = (resolved or {}).get("id")
     if resolved_id and resolved_id != instance_id:
@@ -2068,6 +2068,15 @@ async def _mark_for_close_subscription(
             "pane_instance_id": resolved_id,
             "pane": target_pane,
         }
+    if pane and not resolved_id:
+        known_panes = {known for known in (stored_tmux_pane, row_pane_label) if known}
+        if known_panes and target_pane not in known_panes:
+            return {
+                "success": False,
+                "action": "pane_instance_mismatch",
+                "instance_id": instance_id,
+                "pane": target_pane,
+            }
 
     target_pane = _normalize_text((resolved or {}).get("tmux_pane")) or target_pane
     role = await _tmux_show_pane_option(target_pane, "@PANE_ID")

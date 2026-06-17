@@ -834,6 +834,17 @@ def test_mark_for_close_refuses_stored_protected_pane_label_when_pane_omitted(
 
     asyncio.run(run())
 
+    # Refusal must leave persistence untouched: no subscription armed/deactivated
+    # and no lifecycle mutation on the protected pax singleton.
+    conn = sqlite3.connect(app_env.db_path)
+    sub_count = conn.execute(
+        "SELECT COUNT(*) FROM stop_hook_subscriptions WHERE target_instance_id='pax-pane'"
+    ).fetchone()[0]
+    row = conn.execute("SELECT status, rank FROM instances WHERE id='pax-pane'").fetchone()
+    conn.close()
+    assert sub_count == 0
+    assert row == ("idle", "astartes")
+
 
 def test_refused_close_pane_oneshot_deactivates(app_env: object, monkeypatch: object) -> None:
     hooks = sys.modules["routes.hooks"]
