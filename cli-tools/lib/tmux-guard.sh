@@ -127,11 +127,11 @@ tmux_guard_emit_blocked() {
 # Returns 0 (true) if input detected, 1 (false) if clear.
 #
 # Detection strategy:
-#   1. Capture the last line of the pane (the prompt/input line)
-#   2. Strip trailing whitespace
+#   1. Capture the last non-chrome line of the pane (the prompt/input line)
+#   2. Normalize Claude Code's non-breaking prompt space to ordinary space
 #   3. Check if the line has content after common prompt markers:
 #      - Shell prompts: ends with $ % # > followed by user text
-#      - Claude Code: the input line has a > prefix with text after it
+#      - Claude Code: the input line has a > or ❯ prefix with text after it
 #   4. If the stripped last line is empty or is just a prompt marker, it's clear
 #
 # Edge cases handled:
@@ -141,57 +141,71 @@ tmux_guard_emit_blocked() {
 tmux_pane_has_input() {
     local pane="$1"
 
-    # Capture just the cursor line (last line with content), filtering out
-    # Claude Code / Codex status chrome that confuses the prompt-marker heuristic:
+    # Capture the pane and inspect the last real prompt/input line, filtering out
+    # Claude Code / Codex status chrome that can sit below the prompt and confuse
+    # prompt-marker heuristics:
     #   "  4% 38k/1.0M $0.19"             — Claude Code context % footer (the `%` was a false-positive prompt marker)
+    #   "  ... 0/200k $0.00"              — Claude Code context footer after /clear
     #   "  ⏵⏵ bypass permissions ..."      — Claude Code hint line
     #   "  esc again to edit previous ..." — Codex CLI hint line
-    local last_line
-    last_line=$(_tmux_guard_tmux capture-pane -t "$pane" -p 2>/dev/null \
-        | sed '/^[[:space:]]*$/d' \
-        | grep -vE '^[[:space:]]*[0-9]+%[[:space:]]+[0-9]' \
-        | grep -vE '^[[:space:]]*⏵' \
-        | grep -vE '^[[:space:]]*esc again' \
-        | tail -1)
+    local capture
+    capture="$(_tmux_guard_tmux capture-pane -t "$pane" -p 2>/dev/null)"
 
-    # Empty pane or no content
-    [[ -z "$last_line" ]] && return 1
+    TMUX_GUARD_CAPTURE="$capture" python3 - <<'PY'
+import os
+import re
+import sys
 
-    # Strip the line down to check for input after prompt markers.
-    # Common prompt endings: $ % # > (with optional space)
-    # If after removing the prompt marker there's still content, user is typing.
+capture = os.environ.get("TMUX_GUARD_CAPTURE", "")
 
-    # Match: line ends with a bare prompt (no user text after it)
-    # These patterns match a prompt with nothing after it:
-    #   "user@host:~/dir$ "
-    #   "❯ "
-    #   "> "
-    #   "% "
-    #   "# "
-    # The key insight: if the line ends with [$%#>❯] followed by only whitespace,
-    # the prompt is empty. If there's more content after, user is typing.
 
-    # Check for Claude Code idle prompt: line is just ">" or "> " (with possible leading space/box chars)
-    if echo "$last_line" | grep -qE '^[[:space:]│░▒▓]*>[[:space:]]*$'; then
-        return 1  # Empty Claude Code prompt — clear
-    fi
+def normalize(line: str) -> str:
+    return line.replace("\u00a0", " ")
 
-    # Check for shell prompt ending with common markers, nothing after
-    if echo "$last_line" | grep -qE '[$%#>❯][[:space:]]*$'; then
-        # Line ends with prompt marker + optional whitespace — no user input
-        return 1
-    fi
 
-    # If we got here, there's content after the prompt marker (or no recognized prompt).
-    # Check if the pane is showing Claude Code output (not a prompt at all).
-    # Claude Code output lines don't start with > and aren't shell prompts.
-    # If there's no prompt marker anywhere on the line, it's probably output → clear.
-    if ! echo "$last_line" | grep -qE '[$%#>❯]'; then
-        return 1  # No prompt marker found — likely output, not an input line
-    fi
+def is_chrome(line: str) -> bool:
+    normalized = normalize(line)
+    stripped = normalized.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("⏵"):
+        return True
+    if stripped.startswith("esc again"):
+        return True
+    if stripped and all(ch in "─━-" for ch in stripped):
+        return True
+    if re.match(r"^\s*(?:\.\.\.|[0-9]+%)\s+.*\$[0-9]", normalized):
+        return True
+    return False
 
-    # Content exists after a prompt marker — user is typing
-    return 0
+
+current = ""
+for raw in reversed(capture.splitlines()):
+    if is_chrome(raw):
+        continue
+    current = normalize(raw)
+    break
+
+if not current:
+    sys.exit(1)  # empty pane or only UI chrome: clear
+
+# Claude Code prompt. It can be rendered as "❯\u00a0" (NBSP after the marker)
+# and can have box/border chars before it. This must win over stale submitted
+# command echoes above it, such as "❯ /clear".
+lead = current.lstrip(" \t\r\n│░▒▓▐▌")
+if lead.startswith((">", "❯")):
+    rest = lead[1:]
+    sys.exit(0 if rest.strip() else 1)
+
+# Shell-ish fallback for common prompts: marker with text after it blocks;
+# bare marker at end is clear. If there is no marker, treat it as output.
+marker_pos = max(current.rfind(marker) for marker in ("$", "%", "#", ">", "❯"))
+if marker_pos < 0:
+    sys.exit(1)
+
+rest = current[marker_pos + 1 :]
+sys.exit(0 if rest.strip() else 1)
+PY
 }
 
 tmux_guard_pane_blocked() {
