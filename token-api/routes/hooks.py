@@ -2039,7 +2039,8 @@ async def _mark_for_close_subscription(
     if not row:
         return {"success": False, "action": "instance_not_found", "instance_id": instance_id}
 
-    target_pane = _normalize_text(pane) or row["tmux_pane"] or row["pane_label"]
+    row_pane_label = _normalize_text(row["pane_label"])
+    target_pane = _normalize_text(pane) or row["tmux_pane"] or row_pane_label
     if not target_pane:
         return {"success": False, "action": "pane_unresolved", "instance_id": instance_id}
     known_panes = {
@@ -2072,13 +2073,14 @@ async def _mark_for_close_subscription(
     role = await _tmux_show_pane_option(target_pane, "@PANE_ID")
     if (
         requested_pane in PROTECTED_MARK_FOR_CLOSE_PANE_IDS
+        or row_pane_label in PROTECTED_MARK_FOR_CLOSE_PANE_IDS
         or role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS
     ):
         return {
             "success": False,
             "action": "protected_pane",
             "pane": target_pane,
-            "pane_role": role or requested_pane,
+            "pane_role": role or row_pane_label or requested_pane,
         }
 
     sub_id = await _upsert_stop_subscription(

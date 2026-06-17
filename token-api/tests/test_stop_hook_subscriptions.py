@@ -810,6 +810,31 @@ def test_mark_for_close_checks_resolved_protected_pane(
     asyncio.run(run())
 
 
+def test_mark_for_close_refuses_stored_protected_pane_label_when_pane_omitted(
+    app_env: object, monkeypatch: object
+) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "pax-pane", pane="%101", pane_label="koronus:pax")
+
+    async def fake_role(pane: str, option: str) -> str:
+        assert pane == "%101"
+        assert option == "@PANE_ID"
+        return ""
+
+    monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
+
+    async def run() -> None:
+        result = await hooks.mark_instance_for_close(
+            "pax-pane",
+            hooks.MarkForCloseRequest(mode="after-stop", lifecycle="retire"),
+        )
+        assert result["success"] is False
+        assert result["action"] == "protected_pane"
+        assert result["pane_role"] == "koronus:pax"
+
+    asyncio.run(run())
+
+
 def test_refused_close_pane_oneshot_deactivates(app_env: object, monkeypatch: object) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "refuse-close", pane="%98")
