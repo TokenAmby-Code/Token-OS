@@ -21,6 +21,24 @@ import aiosqlite
 
 import personas
 
+_INSTANCE_INSERT_COLUMNS = frozenset(
+    {
+        "id",
+        "name",
+        "engine",
+        "working_dir",
+        "device_id",
+        "origin_type",
+        "commander_type",
+        "commander_id",
+        "status",
+        "created_at",
+        "last_activity",
+        "persona_id",
+        "rank",
+    }
+)
+
 
 def _conn(db_path):
     conn = sqlite3.connect(db_path)
@@ -51,6 +69,8 @@ def _insert_instance(conn, **overrides):
     }
     values.update(overrides)
     cols = list(values)
+    invalid_cols = [col for col in cols if col not in _INSTANCE_INSERT_COLUMNS]
+    assert not invalid_cols, f"unexpected instances columns: {invalid_cols}"
     conn.execute(
         f"INSERT INTO instances ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
         [values[c] for c in cols],
