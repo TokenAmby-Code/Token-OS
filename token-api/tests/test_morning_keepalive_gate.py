@@ -22,6 +22,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -115,13 +116,13 @@ def _insert_plain_instance(db_path, *, instance_type="sync", tmux_pane="%42", le
     return sid
 
 
-def _enter_timer_morning(app_env):
+def _enter_timer_morning(app_env: Any) -> None:
     now_ms = int(app_env.main.time.monotonic() * 1000)
     today = datetime.now().strftime("%Y-%m-%d")
     app_env.main.timer_engine.enter_morning_session(now_ms, today)
 
 
-def _exit_timer_morning(app_env):
+def _exit_timer_morning(app_env: Any) -> None:
     now_ms = int(app_env.main.time.monotonic() * 1000)
     if app_env.main.timer_engine.current_mode == app_env.main.TimerMode.MORNING_SESSION:
         app_env.main.timer_engine.resume(now_ms)

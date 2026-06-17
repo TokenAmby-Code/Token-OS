@@ -12116,7 +12116,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
         logger.info(f"Skipping check-in {checkin_type}: work_mode={work_mode}")
         return {"skipped": True, "reason": f"work_mode={work_mode}"}
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     prompted_at = datetime.now().isoformat()
 
     # Log the prompt in the database

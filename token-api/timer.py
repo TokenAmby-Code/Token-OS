@@ -551,6 +551,7 @@ class TimerEngine:
 
         old_mode = self.effective_mode
         productivity_score = max(0, self._break_balance_ms // (1000 * 60))
+        old_date = self._daily_start_date
         self._reset_state(now_mono_ms, today_date, with_buffer=False)
         self._set_manual_mode(
             TimerMode.MORNING_SESSION,
@@ -565,7 +566,7 @@ class TimerEngine:
             events=[TimerEvent.DAILY_RESET],
             old_mode=old_mode if old_mode != self.effective_mode else None,
             productivity_score=productivity_score,
-            reset_date=today_date,
+            reset_date=old_date or today_date,
         )
         if old_mode != self.effective_mode:
             result.events.append(TimerEvent.MODE_CHANGED)

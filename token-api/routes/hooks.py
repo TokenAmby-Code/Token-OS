@@ -4292,7 +4292,10 @@ async def handle_stop(payload: dict) -> dict:
     if is_sync_instance:
         # Self-continuing morning session. Timer mode is the sole authority; no
         # state-file/sync-marker "pragma once" gate participates here.
-        active, morning_reason = True, "timer_mode"
+        raw_timer_mode = getattr(_timer_engine, "current_mode", None)
+        timer_mode = getattr(raw_timer_mode, "value", raw_timer_mode)
+        active = timer_mode == "morning_session"
+        morning_reason = "timer_mode" if active else "timer_mode_ended"
         await log_event(
             "hook_stop",
             instance_id=session_id,

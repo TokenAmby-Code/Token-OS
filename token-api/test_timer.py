@@ -660,7 +660,7 @@ class TestDailyReset:
         engine.tick(0, "2026-02-11")
         assert engine.daily_start_date == "2026-02-11"
 
-    def test_reset_hour_6(self):
+    def test_reset_hour_6(self) -> None:
         """Default reset hour is 6 for morning-session entry."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 10, date="2026-02-10")
@@ -716,7 +716,7 @@ class TestManualMode:
         assert TimerEvent.IDLE_TIMEOUT not in events
         assert engine.effective_mode == TimerMode.QUIET
 
-    def test_enter_morning_session_resets_and_serializes(self):
+    def test_enter_morning_session_resets_and_serializes(self) -> None:
         engine = make_engine(0, "2026-02-10")
         engine._total_work_time_ms = 123_000
         engine._total_break_time_ms = 456_000
@@ -742,7 +742,7 @@ class TestManualMode:
         assert restored.current_mode == TimerMode.MORNING_SESSION
         assert restored.manual_trigger == "morning_session"
 
-    def test_enter_morning_session_is_idempotent_for_same_day(self):
+    def test_enter_morning_session_is_idempotent_for_same_day(self) -> None:
         engine = make_engine(0, "2026-02-10")
         changed, _ = engine.enter_morning_session(1_000, "2026-02-11")
         assert changed
@@ -757,22 +757,23 @@ class TestManualMode:
         assert engine.total_work_time_ms == 123_000
         assert engine.break_balance_ms == 456_000
 
-    def test_morning_session_no_accrual_idle_timeout_or_break_exhaustion(self):
+    def test_morning_session_no_accrual_idle_timeout_or_break_exhaustion(self) -> None:
         engine = make_engine(0)
         engine.enter_morning_session(1_000, "2026-02-11")
         engine.set_productivity(False, 2_000)
         engine._break_balance_ms = 1_000
 
-        result = engine.tick(2_000 + IDLE_TIMEOUT_FROM_WORKING_MS + 60_000, "2026-02-11")
+        timeout_secs = (IDLE_TIMEOUT_FROM_WORKING_MS // 1000) + 60
+        events = collect_events(engine, 2_000, timeout_secs)
 
-        assert TimerEvent.IDLE_TIMEOUT not in result.events
-        assert TimerEvent.BREAK_EXHAUSTED not in result.events
+        assert TimerEvent.IDLE_TIMEOUT not in events
+        assert TimerEvent.BREAK_EXHAUSTED not in events
         assert engine.current_mode == TimerMode.MORNING_SESSION
         assert engine.total_work_time_ms == 0
         assert engine.total_break_time_ms == 0
         assert engine.break_balance_ms == 1_000
 
-    def test_resume_from_morning_session_returns_to_derived_mode(self):
+    def test_resume_from_morning_session_returns_to_derived_mode(self) -> None:
         engine = make_engine(0)
         engine.enter_morning_session(1_000, "2026-02-11")
 
