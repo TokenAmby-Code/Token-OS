@@ -87,7 +87,7 @@ walk_children() {
 verify_pane_has_process() {
     local pane_id="$1" pattern="$2"
     local pane_pid
-    pane_pid=$(tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
+    pane_pid=$(IMPERIUM_TMUX_RAW=1 tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | awk -v p="$pane_id" '$1 == p {print $2}')
     [[ -z "$pane_pid" ]] && return 1
     walk_children "$pane_pid" "$pattern" 5 0
 }

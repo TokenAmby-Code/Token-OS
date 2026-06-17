@@ -12,8 +12,9 @@ Usage:
     brief --ephemeral --pane <id> "..."       # side-channel (/btw or /side)
     brief --json --pane <id> "..."            # machine-readable JSON
 
-Pane addressing accepts raw ids (``%23``), position ids (``somnium:SE``),
-or full triples (``main:2:SE``). Page names map to tmux window names:
+Pane addressing accepts public ids (``somnium:SE``) or full triples
+(``main:2:SE``). Raw tmux ``%NNN`` ids are internal-only and are never printed
+back. Page names map to tmux window names:
 ``palace``, ``somnium``, ``legion``, ``mechanicus``, ``all``, or a window
 index like ``2``.
 
@@ -62,7 +63,7 @@ def main(argv: list[str]) -> int:
         "--pane",
         action="append",
         default=[],
-        help="Target pane (repeatable; raw id or position id)",
+        help="Target pane (repeatable; public {page}:{id} id)",
     )
     parser.add_argument(
         "--page",

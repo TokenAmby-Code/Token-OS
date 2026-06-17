@@ -455,12 +455,14 @@ async def test_pane_write_queue_rejects_empty_target(app_env):
         )
 
 
-def test_golden_throne_human_surface_includes_page_number(app_env):
+def test_golden_throne_human_surface_includes_page_id(app_env) -> None:
     assert (
-        app_env.main._golden_throne_human_surface("ignored", "%10", "palace:NW") == "1:NW ignored"
+        app_env.main._golden_throne_human_surface("ignored", "%10", "palace:NW")
+        == "palace:NW ignored"
     )
     assert (
-        app_env.main._golden_throne_human_surface("ignored", "%11", "somnium:SE") == "2:SE ignored"
+        app_env.main._golden_throne_human_surface("ignored", "%11", "somnium:SE")
+        == "somnium:SE ignored"
     )
 
 

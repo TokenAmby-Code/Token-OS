@@ -141,33 +141,36 @@ inbound_typing_guard_allows() {
     tmux_wait_for_clear "$target" "${TMUX_GUARD_TIMEOUT:-0}"
 }
 
-build_pane_id_map() {
-    "$_REAL_TMUX" list-panes -a -F '#{pane_id}	#{@PANE_ID}' 2>/dev/null | awk -F '\t' 'NF>=2 && $2 != "" { print $1 "\t" $2 }'
-}
-
 sanitize_pane_ids() {
-    local script
-    script="$(mktemp "${TMPDIR:-/tmp}/imperium-tmux-sanitize.XXXXXX")"
-    build_pane_id_map | while IFS=$'\t' read -r physical public_id; do
-        [[ -n "$physical" && -n "$public_id" ]] || continue
-        printf 's|%s|%s|g\n' "$physical" "$public_id" >>"$script"
-    done
-    if [[ ! -s "$script" ]]; then
-        rm -f "$script"
-        cat
+    local lib_dir
+    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || {
+        # Fail closed: if tmuxctl cannot be located, raw pane ids still must not
+        # reach a human surface.
+        perl -pe 's/%[0-9]+/unresolved/g'
         return 0
-    fi
-    sed -f "$script"
-    rm -f "$script"
+    }
+    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+        IMPERIUM_TMUX_BIN="$_REAL_TMUX" \
+        python3 -m tmuxctl.cli translate-ids 2>/dev/null || \
+        perl -pe 's/%[0-9]+/unresolved/g'
 }
 
 is_read_command_with_pane_ids() {
     [[ $# -gt 0 ]] || return 1
     case "$1" in
-        list-panes|display-message)
+        capture-pane|capturep)
+            # Captured agent transcripts are human-readable surfaces and may
+            # include earlier leaked %pane ids; always sanitize them.
+            return 0 ;;
+        list-panes|lsp|list-windows|lsw|list-sessions|ls)
+            # Default list-panes output includes raw tmux pane ids, and the
+            # other listing commands are human id-printing surfaces. Always
+            # pass them through the public-id sanitizer.
+            return 0 ;;
+        display-message|display)
             local arg
             for arg in "$@"; do
-                [[ "$arg" == *'#{pane_id}'* ]] && return 0
+                [[ "$arg" == *'#{pane_id}'* || "$arg" == *'#D'* || "$arg" == *'#{window_id}'* || "$arg" == *'#{session_id}'* ]] && return 0
             done
             return 1 ;;
         *) return 1 ;;
@@ -374,12 +377,16 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
     if send_gate_suppresses "${args[@]}"; then
         exit 0  # cancel policy (e.g. quiet hours): no PTY write
     fi
+    if is_read_command_with_pane_ids "${args[@]}"; then
+        "$_REAL_TMUX" "${args[@]}" | sanitize_pane_ids
+        exit "${PIPESTATUS[0]}"
+    fi
     exec "$_REAL_TMUX" "${args[@]}"
 fi
 
-if [[ "${IMPERIUM_TMUX_SANITIZE_IDS:-}" == "1" && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_read_command_with_pane_ids "$@"; then
+if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_read_command_with_pane_ids "$@"; then
     "$_REAL_TMUX" "$@" | sanitize_pane_ids
-    exit ${PIPESTATUS[0]}
+    exit "${PIPESTATUS[0]}"
 fi
 
 exec "$_REAL_TMUX" "$@"

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import subprocess
 import time
 import uuid
@@ -27,6 +29,7 @@ from typing import Any
 
 import aiosqlite
 
+from pane_surface import RAW_TMUX_PANE_RX
 from shared import DB_PATH, instance_id_for_pane
 
 # --- in-memory state ----------------------------------------------------------
@@ -55,6 +58,14 @@ def _normalize_pane(value: str | None) -> str:
     return (value or "").strip()
 
 
+_PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
+
+
+def _is_public_pane_id(value: str | None) -> bool:
+    normalized = _normalize_pane(value)
+    return bool(normalized and _PUBLIC_PANE_ID_RX.fullmatch(normalized))
+
+
 async def _tmux_list_panes() -> list[dict[str, str]]:
     """Return all tmux panes with pane_id + @PANE_ID (the position id)."""
     try:
@@ -67,6 +78,7 @@ async def _tmux_list_panes() -> list[dict[str, str]]:
                 "-F",
                 "#D|#{@PANE_ID}|#{session_name}|#{window_index}|#{window_name}",
             ],
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=5,
@@ -96,11 +108,58 @@ async def _tmux_list_panes() -> list[dict[str, str]]:
     return rows
 
 
+async def _public_pane_map() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for row in await _tmux_list_panes():
+        pane_id = _normalize_pane(row.get("pane_id"))
+        position_id = _normalize_pane(row.get("position_id"))
+        if pane_id.startswith("%") and _is_public_pane_id(position_id):
+            mapping[pane_id] = position_id
+    return mapping
+
+
+def _public_pane_id(pane_id: str | None, mapping: dict[str, str]) -> str:
+    value = _normalize_pane(pane_id)
+    if not value:
+        return ""
+    if value.startswith("%"):
+        return mapping.get(value, "unresolved")
+    if _is_public_pane_id(value):
+        return value
+    sanitized = RAW_TMUX_PANE_RX.sub("unresolved", value)
+    return sanitized if sanitized != value else "unresolved"
+
+
+def publicize_pane_payload(payload: Any, mapping: dict[str, str]) -> Any:
+    """Return a public copy of an API payload with no raw ``%NNN`` ids."""
+    if isinstance(payload, dict):
+        out: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in {"pane_id", "tmux_pane", "target_pane", "caller_pane", "returned_by_pane"}:
+                if value is None:
+                    out[key] = None
+                elif isinstance(value, str):
+                    out[key] = _public_pane_id(value, mapping)
+                else:
+                    out[key] = value
+            else:
+                out[key] = publicize_pane_payload(value, mapping)
+        return out
+    if isinstance(payload, list):
+        return [publicize_pane_payload(item, mapping) for item in payload]
+    if isinstance(payload, str):
+        return RAW_TMUX_PANE_RX.sub(lambda m: mapping.get(m.group(0), "unresolved"), payload)
+    return payload
+
+
+async def publicize_payload(payload: Any) -> Any:
+    return publicize_pane_payload(payload, await _public_pane_map())
+
+
 async def resolve_pane(identifier: str) -> str | None:
-    """Resolve a pane identifier to a raw tmux pane id (``%N``).
+    """Resolve a public pane identifier to an internal raw tmux pane id.
 
     Accepts:
-      * raw pane ids (``%23``)
       * position ids (``somnium:SE``)
       * fully qualified ``session:window:position`` (``main:2:SE`` → ``somnium:SE``)
     """

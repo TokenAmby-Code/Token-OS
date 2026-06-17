@@ -1554,7 +1554,7 @@ async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
     the watched instance's Stop, NOT by the Emperor. Resolve by the LIVE occupant of
     subscriber_pane first, falling back to subscriber_instance_id only when the pane
     yields no live row. A subscriber's instance id rotates on resume while it keeps
-    its pane (the live `1402f092`→`f55ac307`-at-`%96` FG split); trusting the recorded
+    its pane (a live old-instance→new-instance same-pane split); trusting the recorded
     id first would flag a now-dead row (a silent no-op) and the autonomous-wakeup
     marker would never reach the live subscriber. Committed by the caller before the
     byte lands (see the commit preceding _direct_pane_write). Best-effort."""
@@ -2241,7 +2241,7 @@ async def handle_session_start(payload: dict) -> dict:
         # yet, so `_tmux_pane_label` returns nothing, no primarch is derived, and the
         # primarch-singleton case (3) cannot fire. The result is a *duplicate* persona
         # row while the prior row lingers un-demoted (its stop subscriptions orphaned —
-        # the live `1402f092`/`f55ac307`-at-`%96` split). Supplant the persona row
+        # a live old-instance/new-instance same-pane split). Supplant the persona row
         # already occupying this pane, keyed off ITS persisted primarch rather than the
         # (possibly-unresolved) new registration's label.
         if not supplant_id and tmux_pane:
@@ -3990,6 +3990,7 @@ _LEGION_BOT_MAP = {
 
 async def _post_discord_mirror(channel: str, bot: str, content: str):
     """Mirror instance output to its Discord channel/thread."""
+    content = re.sub(r"%\d+", "unresolved", content or "")
     is_thread = channel.isdigit()
     payload = {
         "channel": "aspirants" if is_thread else channel,
@@ -4258,6 +4259,9 @@ async def handle_stop(payload: dict) -> dict:
                 "Hook: Stop final-response fallback failed for %s: %s", session_id[:12], exc
             )
 
+    if tts_text:
+        tts_text = re.sub(r"%\d+", "unresolved", tts_text)
+
     # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
     # state_injections so a subscribed parent gets an immediate prompt instead
     # of waiting until its next PromptSubmit.
@@ -4355,7 +4359,7 @@ async def handle_stop(payload: dict) -> dict:
 
         return result
 
-    # Discord output mirroring — fire before TTS sanitization (Discord renders markdown)
+    # Discord output mirroring — fire before TTS markdown sanitization (Discord renders markdown)
     if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):
         discord_bot = _LEGION_BOT_MAP.get(instance.get("legion", ""), "mechanicus")
         asyncio.create_task(
@@ -4986,7 +4990,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
             if questions:
                 q_parts = [q.get("question", "") for q in questions if q.get("question")]
                 if q_parts:
-                    q_text = "\n".join(q_parts)
+                    q_text = re.sub(r"%\d+", "unresolved", "\n".join(q_parts))
                     asyncio.create_task(
                         _post_discord_mirror(
                             discord_channel, discord_bot, f"**Question:** {q_text}"
@@ -5014,7 +5018,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     ):
         questions = tool_input.get("questions", [])
         if questions:
-            q_text = questions[0].get("question", "")[:200]
+            q_text = re.sub(r"%\d+", "unresolved", questions[0].get("question", "")[:200])
             if q_text:
                 # Through the comms middleware: spoken part geofence-routed,
                 # buzz + beep + banner ride along (no callsite-level split).

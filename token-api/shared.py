@@ -448,6 +448,7 @@ async def _resolve_tmux_pane_direct(tmux_pane: str) -> str | None:
             ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
             timeout=1,
         )
     except Exception:

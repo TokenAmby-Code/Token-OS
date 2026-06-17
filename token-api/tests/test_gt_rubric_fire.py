@@ -355,7 +355,7 @@ async def test_acknowledged_rubric_is_skipped(gt_env, monkeypatch):
 async def test_local_fire_fails_closed_when_pane_unresolved(gt_env, monkeypatch):
     """A local instance whose pane no longer resolves must fail closed: no send,
     no notify, no resume counted, and the instance is marked stopped. This is the
-    structural fix for the stale-position ("1:NE") ghost — there is no stored pane
+    structural fix for the stale-position ("palace:NE") ghost — there is no stored pane
     perspective left to send to or speak."""
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
@@ -423,9 +423,9 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
     assert rec.enqueues[0]["tmux_pane"] == "%77"
     # A real delivery counts a resume.
     assert rec.resumes, "a delivered local fire must count a resume"
-    # The spoken surface uses the LIVE role's position (palace:N -> 1:N).
+    # The spoken surface uses the LIVE public role.
     assert rec.notifies, "a delivered local fire notifies the Emperor"
-    assert "1:N" in rec.notifies[0]["message"]
+    assert "palace:N" in rec.notifies[0]["message"]
 
 
 @pytest.mark.asyncio

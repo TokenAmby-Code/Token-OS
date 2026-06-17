@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -54,6 +55,16 @@ from shared import (
 )
 
 logger = logging.getLogger("token_api")
+
+RAW_TMUX_PANE_RX = re.compile(r"%\d+")
+
+
+def _sanitize_public_text(value: str | None) -> str:
+    """Fail-closed sanitizer for human-facing notification/TTS text."""
+    if not value:
+        return ""
+    return RAW_TMUX_PANE_RX.sub("unresolved", str(value))
+
 
 router = APIRouter()
 
@@ -489,8 +500,8 @@ def speak_tts(
     if not message:
         return {"success": False, "error": "No message provided"}
 
-    # Clean markdown syntax for natural TTS output
-    message = clean_markdown_for_tts(message)
+    # Clean markdown syntax for natural TTS output and fail-closed on raw tmux ids.
+    message = _sanitize_public_text(clean_markdown_for_tts(message))
 
     routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
     device = routing["device"]
@@ -596,6 +607,9 @@ async def dispatch_notify(
     transport internals (_send_to_phone, speak_tts_{mac,wsl,discord}) directly,
     circumvents this middleware and is always a violation.
     """
+    message = _sanitize_public_text(message)
+    banner = _sanitize_public_text(banner) if banner is not None else None
+
     if _is_quiet_hours():
         logger.info(f"Notify suppressed (quiet hours): {(message or banner or '')[:80]}")
         return {
@@ -770,7 +784,12 @@ def _tmux(args: list[str], timeout: float = 2) -> subprocess.CompletedProcess | 
     """
     try:
         return subprocess.run(
-            ["tmux", *args], capture_output=True, text=True, timeout=timeout, check=False
+            ["tmux", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
         )
     except Exception:
         return None
@@ -1127,6 +1146,8 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         queue_target: "hot" for immediate playback (VC/sync sessions),
                       "pause" for silent accumulation (default).
     """
+    message = _sanitize_public_text(message)
+
     # Silence TTS during quiet hours (11 PM - 9 AM)
     if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")

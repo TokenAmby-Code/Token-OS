@@ -52,7 +52,7 @@ find_agent_pid() {
 
 find_tmux_pane() {
     local target_pid="$1"
-    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+    IMPERIUM_TMUX_RAW=1 tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
         local check_pid="$target_pid"
         while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
             if [[ "$check_pid" == "$pane_pid" ]]; then
@@ -71,7 +71,15 @@ resolve_instance_id() {
 }
 
 resolve_pane() {
-    "${_BIN_DIR}/tmux-resolve-pane" --format physical "$1" 2>/dev/null || echo "$1"
+    local target="${1:-}"
+    if [[ "$target" =~ ^%[0-9]+$ ]]; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+    if ! "${_BIN_DIR}/tmux-resolve-pane" --format physical "$target" 2>/dev/null; then
+        printf 'agent-cmd: pane target not found: %s\n' "$target" >&2
+        return 1
+    fi
 }
 
 payload_hash() {
