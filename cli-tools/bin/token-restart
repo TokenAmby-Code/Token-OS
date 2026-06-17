@@ -231,8 +231,52 @@ kill_server() {
 }
 
 runtime_root() {
-    printf '%s
-' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+    printf '%s\n' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+}
+
+runtime_write_protect_bin() {
+    local candidate="${_BIN_DIR}/../scripts/runtime-write-protect.sh"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate="${TOKEN_OS_RUNTIME_CHECKOUT}/cli-tools/scripts/runtime-write-protect.sh"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+runtime_write_unlock_for_deploy() {
+    local dir="$1" helper
+    helper="$(runtime_write_protect_bin 2>/dev/null || true)"
+    [[ -n "$helper" ]] || return 0
+    [[ -e "$dir" ]] || return 0
+    "$helper" unlock "$dir" >/dev/null || {
+        echo -e "  ${RED}✗${NC} CD-sync: failed to unlock runtime checkout for deploy: $dir"
+        return 1
+    }
+}
+
+runtime_write_lock_after_deploy() {
+    local dir="$1" helper
+    helper="$(runtime_write_protect_bin 2>/dev/null || true)"
+    [[ -n "$helper" ]] || return 0
+    [[ -e "$dir" ]] || return 0
+    if "$helper" lock "$dir" >/dev/null; then
+        echo -e "  ${GREEN}✓${NC} CD-sync: runtime write-protected: $dir"
+    else
+        echo -e "  ${RED}✗${NC} CD-sync: failed to write-protect runtime checkout: $dir"
+        return 1
+    fi
+}
+
+runtime_write_lock_after_signal() {
+    local sig="$1" dir="$2"
+    runtime_write_lock_after_deploy "$dir" >/dev/null 2>&1 || true
+    trap - "$sig"
+    kill -s "$sig" "$$"
 }
 
 sync_venv_if_needed() {
@@ -283,8 +327,7 @@ resolve_live_checkout() {
 ' "${CD_LIVE_CHECKOUT}"
         return 0
     fi
-    printf '%s
-' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+    printf '%s\n' "${TOKEN_OS_RUNTIME_CHECKOUT}"
 }
 
 ensure_bare_repo() {
@@ -359,12 +402,21 @@ resolve_deploy_target() {
     git --git-dir="$TOKEN_OS_BARE_REPO" rev-parse "$target^{commit}"
 }
 
-ensure_runtime_checkout() {
+validate_runtime_checkout_path() {
     local dir="$1"
+    if [[ -L "$dir" ]]; then
+        echo -e "  ${RED}✗${NC} CD-sync: runtime path must not be a symlink: $dir"
+        return 1
+    fi
     if [[ -e "$dir" && ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
         echo -e "  ${RED}✗${NC} CD-sync: runtime path exists but is not a git checkout: $dir"
         return 1
     fi
+}
+
+ensure_runtime_checkout() {
+    local dir="$1"
+    validate_runtime_checkout_path "$dir" || return 1
     if [[ ! -e "$dir" ]]; then
         echo -e "${BLUE}→${NC} CD-sync: creating runtime checkout $dir..."
         mkdir -p "$(dirname "$dir")"
@@ -381,14 +433,9 @@ ensure_runtime_checkout() {
     fi
 }
 
-sync_live_checkout() {
-    ensure_bare_repo || return 1
-    sync_bare_main || return 1
+_sync_live_checkout_unlocked() {
+    local dir="$1" target="$2" old_head changed_paths
 
-    local dir target old_head changed_paths
-    dir="$(resolve_live_checkout)" || return 1
-    target="$(resolve_deploy_target)" || return 1
-    SYNC_TARGET_SHA="$target"
     ensure_runtime_checkout "$dir" || return 1
 
     old_head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
@@ -418,6 +465,34 @@ sync_live_checkout() {
     SYNC_DID_ADVANCE=true
     SYNC_CHANGED_PATHS="$changed_paths"
     return 0
+}
+
+sync_live_checkout() {
+    ensure_bare_repo || return 1
+    sync_bare_main || return 1
+
+    local dir target rc lock_rc
+    dir="$(resolve_live_checkout)" || return 1
+    target="$(resolve_deploy_target)" || return 1
+    SYNC_TARGET_SHA="$target"
+
+    validate_runtime_checkout_path "$dir" || return 1
+    runtime_write_unlock_for_deploy "$dir" || return 1
+
+    local quoted_dir
+    printf -v quoted_dir '%q' "$dir"
+    trap "runtime_write_lock_after_signal INT $quoted_dir" INT
+    trap "runtime_write_lock_after_signal TERM $quoted_dir" TERM
+
+    set +e
+    _sync_live_checkout_unlocked "$dir" "$target"
+    rc=$?
+    runtime_write_lock_after_deploy "$dir"
+    lock_rc=$?
+    trap - INT TERM
+    set -e
+    [[ "$rc" -eq 0 ]] || return "$rc"
+    return "$lock_rc"
 }
 
 restart_mac() {
