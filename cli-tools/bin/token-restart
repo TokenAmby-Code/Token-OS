@@ -231,8 +231,44 @@ kill_server() {
 }
 
 runtime_root() {
-    printf '%s
-' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+    printf '%s\n' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+}
+
+runtime_write_protect_bin() {
+    local candidate="${_BIN_DIR}/../scripts/runtime-write-protect.sh"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate="${TOKEN_OS_RUNTIME_CHECKOUT}/cli-tools/scripts/runtime-write-protect.sh"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+runtime_write_unlock_for_deploy() {
+    local dir="$1" helper
+    helper="$(runtime_write_protect_bin 2>/dev/null || true)"
+    [[ -n "$helper" ]] || return 0
+    [[ -e "$dir" ]] || return 0
+    "$helper" unlock "$dir" >/dev/null || {
+        echo -e "  ${RED}✗${NC} CD-sync: failed to unlock runtime checkout for deploy: $dir"
+        return 1
+    }
+}
+
+runtime_write_lock_after_deploy() {
+    local dir="$1" helper
+    helper="$(runtime_write_protect_bin 2>/dev/null || true)"
+    [[ -n "$helper" ]] || return 0
+    [[ -e "$dir" ]] || return 0
+    if "$helper" lock "$dir" >/dev/null; then
+        echo -e "  ${GREEN}✓${NC} CD-sync: runtime write-protected: $dir"
+    else
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to write-protect runtime checkout: $dir"
+    fi
 }
 
 sync_venv_if_needed() {
@@ -283,8 +319,7 @@ resolve_live_checkout() {
 ' "${CD_LIVE_CHECKOUT}"
         return 0
     fi
-    printf '%s
-' "${TOKEN_OS_RUNTIME_CHECKOUT}"
+    printf '%s\n' "${TOKEN_OS_RUNTIME_CHECKOUT}"
 }
 
 ensure_bare_repo() {
@@ -381,14 +416,9 @@ ensure_runtime_checkout() {
     fi
 }
 
-sync_live_checkout() {
-    ensure_bare_repo || return 1
-    sync_bare_main || return 1
+_sync_live_checkout_unlocked() {
+    local dir="$1" target="$2" old_head changed_paths
 
-    local dir target old_head changed_paths
-    dir="$(resolve_live_checkout)" || return 1
-    target="$(resolve_deploy_target)" || return 1
-    SYNC_TARGET_SHA="$target"
     ensure_runtime_checkout "$dir" || return 1
 
     old_head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
@@ -418,6 +448,24 @@ sync_live_checkout() {
     SYNC_DID_ADVANCE=true
     SYNC_CHANGED_PATHS="$changed_paths"
     return 0
+}
+
+sync_live_checkout() {
+    ensure_bare_repo || return 1
+    sync_bare_main || return 1
+
+    local dir target rc
+    dir="$(resolve_live_checkout)" || return 1
+    target="$(resolve_deploy_target)" || return 1
+    SYNC_TARGET_SHA="$target"
+
+    runtime_write_unlock_for_deploy "$dir" || return 1
+    set +e
+    _sync_live_checkout_unlocked "$dir" "$target"
+    rc=$?
+    set -e
+    runtime_write_lock_after_deploy "$dir" || true
+    return "$rc"
 }
 
 restart_mac() {
