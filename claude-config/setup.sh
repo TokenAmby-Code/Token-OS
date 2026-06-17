@@ -80,21 +80,6 @@ else
   echo "  WARN: skills-sync not found at $SKILLS_SYNC"
 fi
 
-# 1c. Install/merge required Codex hooks. Codex stores these outside the
-# Claude config tree, so keep user hooks and add only missing Imperium hooks.
-echo ""
-echo "--- Codex Hooks ---"
-CODEX_HOOKS_INSTALL="$CONFIG_DIR/../cli-tools/bin/codex-hooks-install"
-if [[ -x "$CODEX_HOOKS_INSTALL" ]]; then
-  if "$CODEX_HOOKS_INSTALL"; then
-    echo "  OK: Codex hooks installed"
-  else
-    echo "  WARN: Codex hook install failed; run: $CODEX_HOOKS_INSTALL"
-  fi
-else
-  echo "  WARN: codex-hooks-install not found at $CODEX_HOOKS_INSTALL"
-fi
-
 # 2. Install settings.json (copy, not symlink — Claude Code writes to it)
 echo ""
 echo "--- Settings ---"

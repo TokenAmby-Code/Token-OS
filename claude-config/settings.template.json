@@ -102,21 +102,6 @@
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/uv-python-policy.sh"
-          },
-          {
-            "type": "command",
-            "command": "HOOK_AGENT=claude bash \"${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh\"",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "HOOK_AGENT=claude bash \"${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh\"",
-            "timeout": 5000
           }
         ]
       },
