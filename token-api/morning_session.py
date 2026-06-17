@@ -264,7 +264,8 @@ def morning_session_active(today: str | None = None) -> tuple[bool, str]:
 
     The state file is retained only as audit/debug data. It is deliberately not
     a liveness source: a morning is active iff ``shared.timer_engine.current_mode``
-    is ``morning_session``.
+    is ``morning_session``. ``today`` is retained for compatibility with legacy
+    callers that passed a date for the old state-file liveness check.
     """
     try:
         import shared

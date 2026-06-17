@@ -742,6 +742,21 @@ class TestManualMode:
         assert restored.current_mode == TimerMode.MORNING_SESSION
         assert restored.manual_trigger == "morning_session"
 
+    def test_enter_morning_session_is_idempotent_for_same_day(self):
+        engine = make_engine(0, "2026-02-10")
+        changed, _ = engine.enter_morning_session(1_000, "2026-02-11")
+        assert changed
+        engine._total_work_time_ms = 123_000
+        engine._break_balance_ms = 456_000
+
+        changed, result = engine.enter_morning_session(2_000, "2026-02-11")
+
+        assert changed is False
+        assert result.events == []
+        assert engine.current_mode == TimerMode.MORNING_SESSION
+        assert engine.total_work_time_ms == 123_000
+        assert engine.break_balance_ms == 456_000
+
     def test_morning_session_no_accrual_idle_timeout_or_break_exhaustion(self):
         engine = make_engine(0)
         engine.enter_morning_session(1_000, "2026-02-11")

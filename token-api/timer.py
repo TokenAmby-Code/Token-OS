@@ -546,6 +546,9 @@ class TimerEngine:
         neutral MORNING_SESSION manual mode. It stays there until an explicit
         resume/morning-end/reset path clears the manual mode.
         """
+        if self._manual_mode == TimerMode.MORNING_SESSION and self._daily_start_date == today_date:
+            return False, TickResult()
+
         old_mode = self.effective_mode
         productivity_score = max(0, self._break_balance_ms // (1000 * 60))
         self._reset_state(now_mono_ms, today_date, with_buffer=False)

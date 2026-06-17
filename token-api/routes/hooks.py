@@ -4080,7 +4080,8 @@ async def handle_stop(payload: dict) -> dict:
         "stopped",
         "archived",
     )
-    timer_mode = getattr(getattr(_timer_engine, "current_mode", None), "value", None)
+    raw_timer_mode = getattr(_timer_engine, "current_mode", None)
+    timer_mode = getattr(raw_timer_mode, "value", raw_timer_mode)
     morning_timer_active = timer_mode == "morning_session"
     is_sync_instance = is_custodes_persona and morning_timer_active and not _seat_is_dead
     is_subagent_instance_quick = bool(instance.get("is_subagent"))

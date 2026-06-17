@@ -165,7 +165,7 @@ def test_custodes_no_active_morning_gets_clean_stop_no_keepalive(app_env, monkey
         return await hooks.handle_stop({"session_id": sid})
 
     result = asyncio.run(run())
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert calls == []  # no keepalive claude-cmd delivery
 
 
@@ -184,7 +184,7 @@ def test_custodes_ended_morning_gets_clean_stop_no_keepalive(app_env, monkeypatc
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert calls == []
 
 
@@ -230,7 +230,7 @@ def test_custodes_old_state_file_does_not_keepalive_without_timer_mode(app_env, 
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert calls == []
 
     state = morning_session.read_morning_state()
@@ -252,7 +252,7 @@ def test_residual_sync_mode_instance_does_not_keepalive(app_env, monkeypatch):
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert calls == []
 
 
@@ -282,7 +282,7 @@ def test_retired_sync_seat_never_keepalives(app_env, monkeypatch):
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert all(c[0] != "claude-cmd" for c in calls)
 
 
@@ -302,7 +302,7 @@ def test_non_custodes_non_sync_instance_never_reaches_keepalive(app_env, monkeyp
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
-    assert result["action"] != "stop_processed_sync"
+    assert result["action"] == "stop_processed"
     assert all(c[0] != "claude-cmd" for c in calls)
 
 
@@ -320,7 +320,7 @@ def test_morning_end_writes_status_ended_to_state_file(app_env):
     assert resp.status_code == 200
     body = resp.json()
     assert body["morning_status"] == "ended"
-    assert body["status"] != "morning_session"
+    assert body["status"] == "working"
 
     state = morning_session.read_morning_state()
     assert state["status"] == "ended"

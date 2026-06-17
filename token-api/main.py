@@ -13297,18 +13297,18 @@ def timer_load_from_db():
     print("TIMER: Fresh start (no DB state found)")
 
 
-async def _wipe_prior_day_timer_events() -> None:
+async def _wipe_prior_day_timer_events(cutoff_date: str) -> None:
     import sqlite3
 
     def _wipe_old_timer_events():
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute(
-            "DELETE FROM events WHERE event_type IN ('timer_mode_change','break_exhausted_enforcement')"
-            " AND DATE(created_at) < DATE('now','localtime')"
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                "DELETE FROM events WHERE event_type IN "
+                "('timer_mode_change','break_exhausted_enforcement')"
+                " AND DATE(created_at) < ?",
+                (cutoff_date,),
+            )
 
     await asyncio.to_thread(_wipe_old_timer_events)
 
@@ -13375,7 +13375,7 @@ async def enter_morning_session_internal(
     await _write_morning_audit_state(source, today, local_now)
     await timer_save_to_db()
     try:
-        await _wipe_prior_day_timer_events()
+        await _wipe_prior_day_timer_events(today)
     except Exception as e:
         print(f"TIMER: Failed to wipe old timer events: {e}")
 
@@ -13475,14 +13475,14 @@ async def recover_missed_morning_session_startup() -> dict:
 
 async def timer_daily_reset_manual():
     """Manual/debug daily reset compatibility endpoint (zeroes daily timer state)."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     now_ms = int(time.monotonic() * 1000)
 
     result = timer_engine.force_daily_reset(now_ms, today)
     await timer_save_to_db()
 
     try:
-        await _wipe_prior_day_timer_events()
+        await _wipe_prior_day_timer_events(today)
     except Exception as e:
         print(f"TIMER: Failed to wipe old timer events: {e}")
 
