@@ -2069,7 +2069,9 @@ async def _mark_for_close_subscription(
             "pane": target_pane,
         }
     if pane and not resolved_id:
-        known_panes = {known for known in (stored_tmux_pane, row_pane_label) if known}
+        # Only the stored tmux pane id is a stable fallback target; a role label
+        # (pane_label) is not addressable, so it must not satisfy the mismatch check.
+        known_panes = {stored_tmux_pane} if stored_tmux_pane else set()
         if known_panes and target_pane not in known_panes:
             return {
                 "success": False,
