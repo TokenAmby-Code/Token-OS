@@ -16,9 +16,9 @@ Usage:
     timer-status --json               # Raw JSON from API
 """
 
+import json
 import os
 import sys
-import json
 import time
 import urllib.request
 
@@ -26,12 +26,15 @@ API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 # v2 effective modes (lowercase from API)
 MODE_ICONS = {
-    "working":      "\U0001f4bc",   # 💼
-    "multitasking": "\u26a1",       # ⚡
-    "idle":         "\u23f8",       # ⏸
-    "distracted":   "\u26a0\ufe0f", # ⚠️
-    "break":        "\u2615",       # ☕
-    "sleeping":     "\U0001f319",   # 🌙
+    "working": "\U0001f4bc",  # 💼
+    "multitasking": "\u26a1",  # ⚡
+    "idle": "\u23f8",  # ⏸
+    "distracted": "\u26a0\ufe0f",  # ⚠️
+    "break": "\u2615",  # ☕
+    "declared_break": "\u2615",  # ☕
+    "idle_break": "\u2615",  # ☕
+    "morning_session": "\U0001f305",  # 🌅
+    "sleeping": "\U0001f319",  # 🌙
 }
 
 
@@ -40,7 +43,7 @@ def get_timer():
         req = urllib.request.Request(f"{API_URL}/api/timer", method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
             return json.loads(resp.read().decode())
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -101,11 +104,11 @@ def display_balance(data):
     bal_str = ("+" if bal_s >= 0 else "-") + abs_str
 
     if bal_s > 1800:
-        bal_colored = color(bal_str, "32")   # green
+        bal_colored = color(bal_str, "32")  # green
     elif bal_s > 0:
-        bal_colored = color(bal_str, "33")   # yellow
+        bal_colored = color(bal_str, "33")  # yellow
     else:
-        bal_colored = color(bal_str, "31")   # red
+        bal_colored = color(bal_str, "31")  # red
 
     print(f"{icon}  {mode_name}  {bal_colored}")
 
@@ -165,7 +168,9 @@ def display(data, show_layers=False):
         cutoff = data.get("focus_cutoff_time", "21:00")
         focus_str = color(f"  Focus: {focus_time} (off@{cutoff})", "35")
 
-    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{activity_detail}{lock}{backlog}{wm_str}{focus_str}")
+    print(
+        f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{activity_detail}{lock}{backlog}{wm_str}{focus_str}"
+    )
 
     if show_layers:
         activity = data.get("activity", "?")
@@ -175,7 +180,9 @@ def display(data, show_layers=False):
         dm_str = desktop_mode or color("—", "90")
         focus_on = data.get("focus_active", False)
         focus_layer = color("on", "35") if focus_on else color("off", "90")
-        print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}  Focus: {focus_layer}")
+        print(
+            f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}  Focus: {focus_layer}"
+        )
 
 
 def display_billable(data):
@@ -194,7 +201,9 @@ def display_billable(data):
     bc = counts.get("billable", 0)
     pc = counts.get("personal", 0)
     uc = counts.get("unknown", 0)
-    clock = color("● ON THE CLOCK", "32") if b.get("on_the_clock") else color("○ off the clock", "90")
+    clock = (
+        color("● ON THE CLOCK", "32") if b.get("on_the_clock") else color("○ off the clock", "90")
+    )
     extra = f" · unknown {uc}" if uc else ""
     print(f"  {clock}   (Civic {bc} · Imperium {pc}{extra} active)")
 
@@ -243,19 +252,27 @@ def sparkline(series, width=50):
         level = int((v - lo) / span * 7)
         ch = blocks[level]
         if v > 0:
-            bar_chars.append(color(ch, "32"))   # green
+            bar_chars.append(color(ch, "32"))  # green
         elif v < 0:
-            bar_chars.append(color(ch, "31"))   # red
+            bar_chars.append(color(ch, "31"))  # red
         else:
-            bar_chars.append(color(ch, "90"))   # dim
+            bar_chars.append(color(ch, "90"))  # dim
 
     current = series[-1]
     sign = "+" if current >= 0 else ""
     lo_sign = "+" if lo >= 0 else ""
     hi_sign = "+" if hi >= 0 else ""
-    label = (color(f"{lo_sign}{lo:.0f}", "31") + "→" +
-             color(f"{hi_sign}{hi:.0f}", "32") +
-             "  now:" + (color(f"{sign}{current:.0f}", "32") if current >= 0 else color(f"{sign}{current:.0f}", "31")))
+    label = (
+        color(f"{lo_sign}{lo:.0f}", "31")
+        + "→"
+        + color(f"{hi_sign}{hi:.0f}", "32")
+        + "  now:"
+        + (
+            color(f"{sign}{current:.0f}", "32")
+            if current >= 0
+            else color(f"{sign}{current:.0f}", "31")
+        )
+    )
 
     return "  " + "".join(bar_chars) + "  " + label
 
@@ -266,14 +283,27 @@ def display_shifts(shifts, width=50):
     total_s = sum(dist.values()) or 1
 
     # Mode order: productive → neutral → negative
-    mode_order = ["working", "multitasking", "idle", "break", "distracted", "sleeping"]
+    mode_order = [
+        "working",
+        "multitasking",
+        "idle",
+        "break",
+        "declared_break",
+        "idle_break",
+        "distracted",
+        "morning_session",
+        "sleeping",
+    ]
     mode_colors = {
-        "working":      "32",  # green
+        "working": "32",  # green
         "multitasking": "33",  # yellow
-        "idle":         "90",  # dim
-        "break":        "36",  # cyan
-        "distracted":   "31",  # red
-        "sleeping":     "34",  # blue
+        "idle": "90",  # dim
+        "break": "36",  # cyan
+        "declared_break": "36",  # cyan
+        "idle_break": "36",  # cyan
+        "distracted": "31",  # red
+        "morning_session": "35",  # magenta
+        "sleeping": "34",  # blue
     }
 
     parts = []
@@ -301,13 +331,13 @@ def display_shifts(shifts, width=50):
             trig_parts.append(f"{k}:{v}")
 
     trig_str = "  ".join(trig_parts) if trig_parts else "—"
-    enforced_str = color(str(enforced), "31") if enforced > 0 else "0"
-    twitter_str = color(str(twitter), "31") if twitter > 20 else str(twitter)
 
-    print(f"  {color(str(total_shifts) + ' shifts', '90')}  " +
-          color(f"Enforced:{enforced}  ", "31" if enforced > 50 else "37") +
-          color(f"Twitter:{twitter}  ", "31" if twitter > 20 else "37") +
-          color(f"[{trig_str}]", "90"))
+    print(
+        f"  {color(str(total_shifts) + ' shifts', '90')}  "
+        + color(f"Enforced:{enforced}  ", "31" if enforced > 50 else "37")
+        + color(f"Twitter:{twitter}  ", "31" if twitter > 20 else "37")
+        + color(f"[{trig_str}]", "90")
+    )
 
     # Balance trajectory sparkline
     series = shifts.get("balance_series", [])

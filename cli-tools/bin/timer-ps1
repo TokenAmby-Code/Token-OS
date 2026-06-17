@@ -25,24 +25,27 @@ Notes:
     - For ANSI prompt use, wrap in %%{ ... %%} (zsh) around color codes if needed.
 """
 
+import json
 import os
 import sys
-import json
 import urllib.request
 
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 MODE_ICONS = {
-    "working":      "\U0001f4bc",   # 💼
-    "multitasking": "\u26a1",       # ⚡
-    "idle":         "\u23f8",       # ⏸
-    "distracted":   "\u26a0\ufe0f", # ⚠️
-    "break":        "\u2615",       # ☕
-    "sleeping":     "\U0001f319",   # 🌙
+    "working": "\U0001f4bc",  # 💼
+    "multitasking": "\u26a1",  # ⚡
+    "idle": "\u23f8",  # ⏸
+    "distracted": "\u26a0\ufe0f",  # ⚠️
+    "break": "\u2615",  # ☕
+    "declared_break": "\u2615",  # ☕
+    "idle_break": "\u2615",  # ☕
+    "morning_session": "\U0001f305",  # 🌅
+    "sleeping": "\U0001f319",  # 🌙
 }
 
 # Modes where showing balance is meaningful
-BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+BALANCE_MODES = {"working", "multitasking", "break", "declared_break", "idle_break", "distracted"}
 
 
 def get_timer():
@@ -112,11 +115,11 @@ def main():
 
     if use_ansi:
         if bal_s > 1800:
-            bal_colored = color(bal_str, "32")   # green
+            bal_colored = color(bal_str, "32")  # green
         elif bal_s > 0:
-            bal_colored = color(bal_str, "33")   # yellow
+            bal_colored = color(bal_str, "33")  # yellow
         else:
-            bal_colored = color(bal_str, "31")   # red
+            bal_colored = color(bal_str, "31")  # red
         print(f"{icon}{bal_colored}")
     else:
         print(f"{icon}{bal_str}")
