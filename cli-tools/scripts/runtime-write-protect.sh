@@ -93,6 +93,11 @@ for root in "${ROOTS[@]}"; do
         [[ "$ACTION" == "status" ]] && echo "missing $root"
         continue
     fi
+    if [[ -L "$root" ]]; then
+        echo "runtime-write-protect: runtime root must not be a symlink: $root" >&2
+        rc=1
+        continue
+    fi
     if [[ ! -d "$root" ]]; then
         echo "runtime-write-protect: not a directory: $root" >&2
         rc=1

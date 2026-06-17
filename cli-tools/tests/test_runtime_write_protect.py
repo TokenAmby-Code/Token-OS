@@ -18,6 +18,10 @@ def run(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:
     )
 
 
+def has_any_write(path: Path) -> bool:
+    return bool(path.lstat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
 def has_owner_write(path: Path) -> bool:
     return bool(path.lstat().st_mode & stat.S_IWUSR)
 
@@ -29,6 +33,9 @@ def test_lock_removes_write_bits_without_following_symlinks(tmp_path) -> None:
     child.mkdir()
     file = child / "app.py"
     file.write_text("print('x')\n")
+    os.chmod(root, 0o777)
+    os.chmod(child, 0o777)
+    os.chmod(file, 0o666)
     secret = tmp_path / "secret.txt"
     secret.write_text("keep writable\n")
     (root / "config.json").symlink_to(secret)
@@ -37,10 +44,22 @@ def test_lock_removes_write_bits_without_following_symlinks(tmp_path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "locked" in proc.stdout
-    assert not has_owner_write(root)
-    assert not has_owner_write(child)
-    assert not has_owner_write(file)
-    assert has_owner_write(secret), "must not chmod symlink targets outside runtime"
+    assert not has_any_write(root)
+    assert not has_any_write(child)
+    assert not has_any_write(file)
+    assert has_any_write(secret), "must not chmod symlink targets outside runtime"
+
+
+def test_symlink_root_is_rejected(tmp_path) -> None:
+    real_root = tmp_path / "real-runtime"
+    real_root.mkdir()
+    symlink_root = tmp_path / "runtime-link"
+    symlink_root.symlink_to(real_root, target_is_directory=True)
+
+    proc = run("lock", str(symlink_root))
+
+    assert proc.returncode == 1
+    assert "must not be a symlink" in proc.stderr
 
 
 def test_locked_runtime_rejects_plain_shell_write(tmp_path) -> None:

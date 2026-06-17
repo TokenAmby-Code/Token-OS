@@ -272,6 +272,13 @@ runtime_write_lock_after_deploy() {
     fi
 }
 
+runtime_write_lock_after_signal() {
+    local sig="$1" dir="$2"
+    runtime_write_lock_after_deploy "$dir" >/dev/null 2>&1 || true
+    trap - "$sig"
+    kill -s "$sig" "$$"
+}
+
 sync_venv_if_needed() {
     local root
     root="$(runtime_root)"
@@ -397,6 +404,10 @@ resolve_deploy_target() {
 
 validate_runtime_checkout_path() {
     local dir="$1"
+    if [[ -L "$dir" ]]; then
+        echo -e "  ${RED}✗${NC} CD-sync: runtime path must not be a symlink: $dir"
+        return 1
+    fi
     if [[ -e "$dir" && ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
         echo -e "  ${RED}✗${NC} CD-sync: runtime path exists but is not a git checkout: $dir"
         return 1
@@ -467,11 +478,18 @@ sync_live_checkout() {
 
     validate_runtime_checkout_path "$dir" || return 1
     runtime_write_unlock_for_deploy "$dir" || return 1
+
+    local quoted_dir
+    printf -v quoted_dir '%q' "$dir"
+    trap "runtime_write_lock_after_signal INT $quoted_dir" INT
+    trap "runtime_write_lock_after_signal TERM $quoted_dir" TERM
+
     set +e
     _sync_live_checkout_unlocked "$dir" "$target"
     rc=$?
     runtime_write_lock_after_deploy "$dir"
     lock_rc=$?
+    trap - INT TERM
     set -e
     [[ "$rc" -eq 0 ]] || return "$rc"
     return "$lock_rc"
