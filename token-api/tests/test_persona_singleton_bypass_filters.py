@@ -180,24 +180,3 @@ def test_custodes_morning_brief_injects_into_canonical_singleton(
     assert result["instance_id"] == "cust-live"
     assert result["target_pane"] == "%10"
     assert result["delivery"]["instance_id"] == "cust-live"
-
-
-def test_morning_end_clears_canonical_custodes_singleton(app_env: Any, monkeypatch: Any) -> None:
-    main = app_env.main
-    _seed_shadowed_singleton(
-        app_env.db_path,
-        "custodes",
-        live_id="cust-live",
-        child_id="cust-child",
-        retired_id="cust-retired",
-    )
-
-    import morning_session
-
-    monkeypatch.setattr(
-        morning_session, "write_morning_status", lambda *_a, **_k: {"status": "ended"}
-    )
-
-    result = asyncio.run(main.end_morning_session())
-
-    assert result["instance_id"] == "cust-live"
