@@ -1,11 +1,34 @@
 #!/bin/bash
+set -euo pipefail
 # stop-validator.sh - Thin shim: forwards stop validation to token-api.
 # All validation logic lives in Python at /api/hooks/StopValidate.
 
 INPUT=$(cat 2>/dev/null || echo "{}")
 
-# Resolve token-api URL from environment
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+# Resolve token-api URL from centralized machine config.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Drop NAS mount roots that are not live so the `-f` probe below can't hang on a
+# stale SMB mount; resolution falls through to script-relative / localhost.
+if [[ -n "${IMPERIUM:-}" ]] && ! ls "${IMPERIUM}" >/dev/null 2>&1; then
+  IMPERIUM=""
+fi
+if [[ -n "${CIVIC:-}" ]] && ! ls "${CIVIC}" >/dev/null 2>&1; then
+  CIVIC=""
+fi
+for _nas_lib in \
+  "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
+  "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${CIVIC:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/token-os/live/cli-tools/lib/nas-path.sh"; do
+  if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_nas_lib" 2>/dev/null || true
+    break
+  fi
+done
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # Walk process tree to inject the claude PID (portable: uses ps)
 CLAUDE_PID=""
@@ -17,7 +40,7 @@ for _ in 1 2 3; do
     CLAUDE_PID="$CURRENT"
     break
   fi
-  CURRENT=$(ps -o ppid= -p "$CURRENT" 2>/dev/null | tr -d ' ')
+  CURRENT=$(ps -o ppid= -p "$CURRENT" 2>/dev/null | tr -d ' ') || true
 done
 
 if [ -n "$CLAUDE_PID" ]; then
@@ -30,11 +53,11 @@ if [ -n "${TOKEN_API_SUBAGENT:-}" ]; then
 fi
 
 # Embed last 60 lines of transcript. Poll briefly for the final text block to flush.
-TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null) || true
 if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   TRANSCRIPT_TAIL=""
   for _ in 1 2 3 4 5 6 7 8; do
-    TAIL=$(tail -n 60 "$TRANSCRIPT_PATH")
+    TAIL=$(tail -n 60 "$TRANSCRIPT_PATH") || true
     if echo "$TAIL" | grep -q '"type":"text"'; then
       TRANSCRIPT_TAIL="$TAIL"
       break
@@ -43,7 +66,7 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   done
   # Fallback: use raw tail even without "type":"text"
   if [ -z "$TRANSCRIPT_TAIL" ]; then
-    TRANSCRIPT_TAIL=$(tail -n 60 "$TRANSCRIPT_PATH" 2>/dev/null)
+    TRANSCRIPT_TAIL=$(tail -n 60 "$TRANSCRIPT_PATH" 2>/dev/null) || true
   fi
   if [ -n "$TRANSCRIPT_TAIL" ]; then
     INPUT=$(echo "$INPUT" | jq -c --arg t "$TRANSCRIPT_TAIL" '.transcript_tail = $t') || true

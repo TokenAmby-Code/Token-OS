@@ -5318,19 +5318,18 @@ async def process_pane_write_queue_once(
             )
             results.append(result)
             continue
-        is_brief = item["source"] == "brief"
+        clear_replace_source = item["source"] in {"brief", NAMING_NUDGE_QUEUE_SOURCE}
         enable_skill_sink = False
         if item["source"] == "golden_throne" and _looks_like_codex_skill(item["payload"]):
             enable_skill_sink = await _pane_write_instance_engine(instance_id) == "codex"
         try:
-            # brief clears/replaces a stale composer rather than deferring on it
-            # forever. Its live symptom: a leftover draft in the target composer
-            # wedged delivery permanently (the additive deferral never cleared).
-            # The universal send gate still suppresses the C-u clear AND the
-            # payload when a human is actively typing (same client_activity
-            # predicate), so clear/replace never clobbers a live human draft —
-            # it only replaces stale/abandoned text, matching agent-cmd.
-            if not is_brief and await _tmux_pane_has_pending_input(pane):
+            # Some system prompts clear/replace a stale composer rather than
+            # deferring forever. Live symptom: leftover Codex/Claude drafts kept
+            # additive deferral returning pending, so critical brief/name nudges
+            # never delivered. The universal send gate still suppresses the clear
+            # AND the payload when a human is actively typing, so clear/replace
+            # does not clobber live human input.
+            if not clear_replace_source and await _tmux_pane_has_pending_input(pane):
                 result = {**base, "status": PANE_WRITE_PENDING, "reason": "dispatch_deferred"}
                 await _mark_pane_write(
                     item["id"],
@@ -5340,7 +5339,7 @@ async def process_pane_write_queue_once(
                 )
                 results.append(result)
                 continue
-            if is_brief:
+            if clear_replace_source:
                 send_result = await _tmux_send_payload_then_submit(
                     pane, item["payload"], clear_prompt=True
                 )

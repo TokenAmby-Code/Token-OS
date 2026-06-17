@@ -2,13 +2,6 @@
 
 set -euo pipefail
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
-LAUNCHER="${TOKEN_API_LAUNCHER:-claude-wrapper}"
-ENGINE="${TOKEN_API_ENGINE:-claude}"
-WORKING_DIR="$(pwd)"
-TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
-DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:legion}"
-
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 while [[ -L "$SCRIPT_PATH" ]]; do
   SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
@@ -23,6 +16,17 @@ if [[ ! -r "$COMMON_LIB" ]]; then
 fi
 # shellcheck source=../lib/agent-wrapper-common.sh
 source "$COMMON_LIB"
+NAS_PATH_LIB="${SCRIPT_DIR}/../lib/nas-path.sh"
+if [[ -f "$NAS_PATH_LIB" ]]; then
+  # shellcheck source=../lib/nas-path.sh
+  source "$NAS_PATH_LIB" 2>/dev/null || true
+fi
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+LAUNCHER="${TOKEN_API_LAUNCHER:-claude-wrapper}"
+ENGINE="${TOKEN_API_ENGINE:-claude}"
+WORKING_DIR="$(pwd)"
+TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
+DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:legion}"
 WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"
 
 PRINT_MODE=false

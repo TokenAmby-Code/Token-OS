@@ -16,8 +16,13 @@ if [[ ! -r "$COMMON_LIB" ]]; then
 fi
 # shellcheck source=../lib/agent-wrapper-common.sh
 source "$COMMON_LIB"
+NAS_PATH_LIB="${SCRIPT_DIR}/../lib/nas-path.sh"
+if [[ -f "$NAS_PATH_LIB" ]]; then
+  # shellcheck source=../lib/nas-path.sh
+  source "$NAS_PATH_LIB" 2>/dev/null || true
+fi
 
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 LAUNCHER="${TOKEN_API_LAUNCHER:-codex-wrapper}"
 ENGINE="${TOKEN_API_ENGINE:-codex}"
 WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"

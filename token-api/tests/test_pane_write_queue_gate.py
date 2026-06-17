@@ -488,3 +488,45 @@ async def test_dequeue_fails_closed_when_pane_unresolved(app_env: Any, monkeypat
     assert results[0]["reason"] == "pane_unresolved"
     assert sent == [], "a vanished pane must not receive a send"
     assert _fetch_status(app_env.db_path, queued["id"]) == "cancelled"
+
+
+async def test_naming_nudge_clears_stale_composer_instead_of_deferring(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    """Naming requests must not wedge forever behind stale Codex/Claude input.
+
+    The live failure was pending ``naming_nudge`` rows stuck with
+    ``user_input_pending``. Like briefs, naming nudges clear/replace stale
+    composer text; the universal send gate still protects active human typing.
+    """
+    main = app_env.main
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _has_pending_input)
+
+    seen: dict[str, Any] = {}
+
+    async def _ok(pane, payload, *, clear_prompt=False):
+        seen["clear_prompt"] = clear_prompt
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "submitted",
+            "verified_by": "composer_cleared",
+        }
+
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
+
+    queued = await main.enqueue_pane_write(
+        instance_id="unnamed-codex",
+        tmux_pane="%9",
+        source="naming_nudge",
+        purpose="name_missing",
+        payload='Run `session-doc-name "Your Descriptive Title"`.',
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert len(results) == 1
+    assert results[0]["status"] == main.PANE_WRITE_SENT
+    assert seen["clear_prompt"] is True, "naming nudges must clear stale composers"
+    assert _fetch_status(app_env.db_path, queued["id"]) == "sent"
