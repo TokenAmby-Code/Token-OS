@@ -151,6 +151,31 @@ def test_empty_or_just_submitted_pane_clears_stamp_and_never_blocks(tmp_path: Pa
     assert "empty_again:0" in proc.stdout
 
 
+def test_freshly_cleared_claude_prompt_after_clear_echo_drops_stamp(tmp_path: Path) -> None:
+    env = _env(tmp_path, "❯\u00a0draft\n")
+    capture = Path(env["FAKE_TMUX_CAPTURE"])
+    script = f'''
+      set +e
+      source "{GUARD}"
+      TMUX_GUARD_NOW=1000 tmux_wait_for_clear %1 0; echo dirty:$?
+      cat > "{capture}" <<'EOF'
+❯ /clear
+❯\u00a0
+────────────────────────────────────────────────────────────────────────────────
+  ... 0/200k $0.00
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+EOF
+      TMUX_GUARD_NOW=1001 tmux_wait_for_clear %1 0; echo cleared:$?
+      if [[ -e "$(tmux_guard_stamp_file %1)" ]]; then echo stamp:present; else echo stamp:gone; fi
+    '''
+    proc = _bash(script, env)
+
+    assert proc.returncode == 0
+    assert "dirty:1" in proc.stdout
+    assert "cleared:0" in proc.stdout
+    assert "stamp:gone" in proc.stdout
+
+
 def test_status_segment_uses_same_stamp_once_hard_ttl(tmp_path: Path) -> None:
     env = _env(tmp_path, "> draft\n")
     env["TMUX_GUARD_NOW"] = "1000"
