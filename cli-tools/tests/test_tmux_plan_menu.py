@@ -196,7 +196,9 @@ def test_cancel_does_not_touch_pane_without_prebuffer(tmp_path: pathlib.Path) ->
     assert not logfile.exists()
 
 
-def test_shift_tab_forwards_btab_without_prompt_restore_when_no_prebuffer(tmp_path: pathlib.Path) -> None:
+def test_shift_tab_forwards_btab_without_prompt_restore_when_no_prebuffer(
+    tmp_path: pathlib.Path,
+) -> None:
     lines, logfile = _run_action_recording_sends(tmp_path, "shift+tab")
     assert "send-keys -t %1 BTab" in lines
     assert not any("PgDn" in line for line in lines)
@@ -207,7 +209,8 @@ def test_shift_tab_forwards_btab_without_prompt_restore_when_no_prebuffer(tmp_pa
 def test_preplan_skips_insert_and_logs_on_subscribe_failure(tmp_path: pathlib.Path) -> None:
     # The one-shot Stop subscription must arm BEFORE the leader is inserted. With
     # an unreachable API the subscribe fails, so the leader insert is skipped (no
-    # /plan would ever come) and the failure is logged. The cursor still restores.
+    # /plan would ever come) and the failure is logged. With prebuffer off, no
+    # cursor move happened, so prompt-end should not restore.
     lines, logfile = _run_action_recording_sends(
         tmp_path, "preplan", agent="claude", api_url="http://127.0.0.1:1"
     )
@@ -219,9 +222,9 @@ def test_preplan_skips_insert_and_logs_on_subscribe_failure(tmp_path: pathlib.Pa
     assert "step=subscribe" in content
 
 
-
-
-def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(tmp_path: pathlib.Path) -> None:
+def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(
+    tmp_path: pathlib.Path,
+) -> None:
     recorder = tmp_path / "sends.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -233,7 +236,7 @@ def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(tmp_path:
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         "#!/usr/bin/env bash\n"
-        "case \"$*\" in\n"
+        'case "$*" in\n'
         "  *'/api/hooks/subscribe'*) printf '%s\\n' '{\"success\":true}' ;;\n"
         "  *) printf '%s\\n' '{\"success\":true}' ;;\n"
         "esac\n"
@@ -254,7 +257,17 @@ def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(tmp_path:
         "TMUX_SEND_GATE_DELAY_TIMEOUT": "0.1",
     }
     subprocess.check_output(
-        [str(SCRIPT), "--pane", "%1", "--selection", "preplan", "--agent", "codex", "--api-url", "http://stub"],
+        [
+            str(SCRIPT),
+            "--pane",
+            "%1",
+            "--selection",
+            "preplan",
+            "--agent",
+            "codex",
+            "--api-url",
+            "http://stub",
+        ],
         text=True,
         timeout=20,
         env=env,
@@ -347,6 +360,26 @@ def test_failed_prompt_start_logs_real_tmux_stderr(tmp_path: pathlib.Path) -> No
     content = logfile.read_text()
     assert "step=prompt-start" in content
     assert "prompt-start boom" in content  # the real tmux stderr, not just a silent miss
+
+
+def test_failed_prompt_start_skips_leader_insert(tmp_path: pathlib.Path) -> None:
+    # Fail closed: when prompt-start (PgUp) fails the cursor is NOT known to be at
+    # the prompt start, so the leader must not be inserted (it would land mid-draft).
+    # Fail only the PgUp send; the insert (`-l /plan `) must never be recorded.
+    recorder = tmp_path / "sends.txt"
+    tmux_body = (
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(recorder))}\n'
+        'case "$*" in\n'
+        '  *PgUp*) echo "prompt-start boom" >&2; exit 1 ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    logfile = _run_action_with_stubs(tmp_path, "plan", agent="claude", tmux_body=tmux_body)
+    lines = recorder.read_text().splitlines() if recorder.exists() else []
+    assert not any(" -l " in line for line in lines)  # leader insert skipped
+    assert logfile.exists()
+    assert "step=prompt-start" in logfile.read_text()
 
 
 def test_subscribe_preplan_retries_once_then_fails_closed(tmp_path: pathlib.Path) -> None:

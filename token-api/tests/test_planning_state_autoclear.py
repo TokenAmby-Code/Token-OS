@@ -217,7 +217,6 @@ def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
     assert source == "auto-clear:prompt-submit"
 
 
-
 def _subscription(db_path, instance_id):
     conn = sqlite3.connect(db_path)
     row = conn.execute(
@@ -230,10 +229,12 @@ def _subscription(db_path, instance_id):
     return row
 
 
-def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch):
+def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch) -> None:
     _insert_instance(app_env.db_path, "slash-preplan-1", pane="%54", engine="claude")
 
-    _prompt_submit(app_env, monkeypatch, {"session_id": "slash-preplan-1", "prompt": "/preplan prepare"})
+    _prompt_submit(
+        app_env, monkeypatch, {"session_id": "slash-preplan-1", "prompt": "/preplan prepare"}
+    )
 
     state, source = _planning(app_env.db_path, "slash-preplan-1")
     assert state == "preplanning"
@@ -248,7 +249,9 @@ def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, m
     )
 
 
-def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch):
+def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(
+    app_env, monkeypatch
+) -> None:
     _insert_instance(app_env.db_path, "dollar-preplan-1", pane="%55", engine="codex")
 
     _prompt_submit(app_env, monkeypatch, {"session_id": "dollar-preplan-1", "prompt": "$preplan"})
@@ -264,6 +267,28 @@ def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, 
         "%55",
         "%55",
     )
+
+
+def test_preplan_on_already_planning_instance_does_not_arm_followup(app_env, monkeypatch) -> None:
+    # The preplanning CAS gate is only_if_in=(none, preplanning). An instance
+    # already mid-plan fails the gate (planning_event is None), so the /plan
+    # follow-up must NOT be armed — arming there would queue a stray one-shot Stop
+    # handoff against a pane that never ran a fresh preplan turn.
+    _insert_instance(
+        app_env.db_path,
+        "already-planning-1",
+        pane="%56",
+        engine="claude",
+        planning_state="planning",
+    )
+
+    _prompt_submit(
+        app_env, monkeypatch, {"session_id": "already-planning-1", "prompt": "/preplan again"}
+    )
+
+    state, _ = _planning(app_env.db_path, "already-planning-1")
+    assert state == "planning"  # CAS gate preserved the existing state
+    assert _subscription(app_env.db_path, "already-planning-1") is None  # no stray arm
 
 
 def test_codex_prompt_submit_transcript_plan_context_sets_planning(

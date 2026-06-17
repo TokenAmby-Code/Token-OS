@@ -277,6 +277,9 @@ _await_prestart() {
 # prompt-start synchronously. prompt-start is idempotent (PgUp-at-top is a
 # no-op), so this is safe even if the detached pre-buffer is still draining.
 # Relies on _await_prestart having already run (the run_action drain point).
+# Returns the prompt-start rc (0 on a confirmed pre-buffer or a clean synchronous
+# move) so the caller can fail closed: a non-zero rc means the cursor is NOT
+# known to be at prompt start, and inserting a leader there would land it mid-draft.
 _ensure_at_prompt_start() {
     _PROMPT_MOVED=1
     (( _PRESTART_OK == 0 )) && return 0
@@ -287,7 +290,9 @@ _ensure_at_prompt_start() {
     _ps_err="$(prebuffer_prompt_start 2>&1)"; _ps_rc=$?
     if (( _ps_rc != 0 )); then
         log_failure "${SELECTION:-?}" "${agent:-?}" prompt-start "ensure rc=${_ps_rc} ${_ps_err}"
+        return "$_ps_rc"
     fi
+    return 0
 }
 
 # Post-mortem-grade failure log (log-only; NO notify/TTS — a missing /plan is the
@@ -342,22 +347,30 @@ run_action() {
                 else
                     set_planning_state preplanning >/dev/null 2>&1   # advisory hint
                     text="$(preplan_leader "$agent") "
-                    _ensure_at_prompt_start
-                    insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
-                    if [[ "$agent" == codex ]]; then
-                        sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                    # Fail closed on a missed prompt-start (already logged inside
+                    # _ensure_at_prompt_start): skip the leader insert and the Codex
+                    # Tab sink rather than typing into an unknown cursor position.
+                    if _ensure_at_prompt_start; then
+                        insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
+                        if [[ "$agent" == codex ]]; then
+                            sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                        fi
                     fi
                 fi
             fi
             ;;
         plan)
             set_planning_state planning >/dev/null 2>&1   # advisory; /plan is token-api-independent
-            _ensure_at_prompt_start
-            insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
+            # Fail closed on a missed prompt-start (already logged): skip the insert
+            # rather than dropping /plan mid-draft at an unknown cursor position.
+            if _ensure_at_prompt_start; then
+                insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
+            fi
             ;;
         compact)
-            _ensure_at_prompt_start
-            insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
+            if _ensure_at_prompt_start; then
+                insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
+            fi
             ;;
         shift+tab|shifttab)
             tmux send-keys -t "$PANE" BTab || log_failure shift+tab "$agent" send-btab "tmux send-keys rc=$?"

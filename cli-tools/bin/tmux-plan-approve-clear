@@ -63,7 +63,10 @@ set_planning_state() {
 
 
 get_planning_state() {
-    if ! $UPDATE_STATE || $DRY_RUN || [[ -n "$CAPTURE_FILE" || -z "$PANE" || -z "${TOKEN_API_URL:-}" ]]; then
+    # Read-only GET: dry-run must NOT bypass here (dry-run gates writes only).
+    # Reading real state in dry-run is what makes the `state-not-planning` /
+    # `state-left-planning` no-op branches below reachable and testable.
+    if ! $UPDATE_STATE || [[ -n "$CAPTURE_FILE" || -z "$PANE" || -z "${TOKEN_API_URL:-}" ]]; then
         echo "bypass"
         return 0
     fi

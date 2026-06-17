@@ -3663,8 +3663,7 @@ def _payload_starts_slash_plan(payload: dict) -> bool:
 def _payload_starts_preplan(payload: dict) -> bool:
     """Return true when a prompt-submit payload contains /preplan or $preplan."""
     return any(
-        _text_starts_command(text, ("/preplan", "$preplan"))
-        for text in _iter_prompt_texts(payload)
+        _text_starts_command(text, ("/preplan", "$preplan")) for text in _iter_prompt_texts(payload)
     )
 
 
@@ -3880,14 +3879,19 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 only_if_in=("none", "preplanning"),
                 actor="PromptSubmit",
             )
-            tmux_pane = existing_dict.get("tmux_pane") or (payload.get("env") or {}).get(
-                "TMUX_PANE"
-            )
-            preplan_subscription = await _arm_preplan_plan_subscription(
-                db,
-                instance_id=session_id,
-                tmux_pane=tmux_pane,
-            )
+            # Only arm the /plan follow-up when the preplanning transition actually
+            # took. _set_planning_state returns None on a failed CAS gate (already
+            # planning/approving) — arming there would queue a stray one-shot Stop
+            # handoff against a pane that never ran a fresh preplan turn.
+            if planning_event is not None:
+                tmux_pane = existing_dict.get("tmux_pane") or (payload.get("env") or {}).get(
+                    "TMUX_PANE"
+                )
+                preplan_subscription = await _arm_preplan_plan_subscription(
+                    db,
+                    instance_id=session_id,
+                    tmux_pane=tmux_pane,
+                )
         elif (
             _payload_starts_slash_plan(payload)
             or _payload_indicates_plan_mode(payload)
