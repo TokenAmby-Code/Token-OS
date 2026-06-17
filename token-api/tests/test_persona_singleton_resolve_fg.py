@@ -15,6 +15,7 @@ import asyncio
 import sqlite3
 import uuid
 from datetime import datetime
+from os import PathLike
 from typing import Any
 
 import aiosqlite
@@ -40,17 +41,21 @@ _INSTANCE_INSERT_COLUMNS = frozenset(
 )
 
 
-def _conn(db_path):
+def _conn(db_path: str | PathLike[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _persona(conn, slug):
-    return conn.execute("SELECT id FROM personas WHERE slug = ?", (slug,)).fetchone()[0]
+def _persona(conn: sqlite3.Connection, slug: str) -> str:
+    row = conn.execute("SELECT id FROM personas WHERE slug = ?", (slug,)).fetchone()
+    assert row is not None, slug
+    return row[0]
 
 
-def _insert_instance(conn, **overrides):
+def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
+    from instance_mutation import sanctioned_insert_instance_sync
+
     now = datetime.now().isoformat()
     values = {
         "id": str(uuid.uuid4()),
@@ -71,14 +76,17 @@ def _insert_instance(conn, **overrides):
     cols = list(values)
     invalid_cols = [col for col in cols if col not in _INSTANCE_INSERT_COLUMNS]
     assert not invalid_cols, f"unexpected instances columns: {invalid_cols}"
-    conn.execute(
-        f"INSERT INTO instances ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
-        [values[c] for c in cols],
+    sanctioned_insert_instance_sync(
+        conn,
+        values=values,
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="test",
     )
     return values["id"]
 
 
-async def _resolve(db_path, slug):
+async def _resolve(db_path: str | PathLike[str], slug: str) -> dict[str, Any] | None:
     async with aiosqlite.connect(db_path) as db:
         return await personas.resolve_live_persona_instance(db, slug)
 
@@ -161,14 +169,28 @@ def test_chapter_child_cannot_exist_without_live_overseer(app_env: Any) -> None:
     fg = _persona(conn, "fabricator-general")
     raised = False
     try:
-        _insert_instance(
-            conn,
-            id="fg-orphan-child",
-            persona_id=fg,
-            commander_type="chapter",
-            commander_id="fg-over",
-            rank="overseer",
-            status="working",
+        now = datetime.now().isoformat()
+        conn.execute(
+            """INSERT INTO instances
+               (id, name, engine, working_dir, device_id, origin_type,
+                commander_type, commander_id, status, created_at, last_activity,
+                persona_id, rank)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "fg-orphan-child",
+                "inst",
+                "claude",
+                "/tmp",
+                "Mac-Mini",
+                "local",
+                "chapter",
+                "fg-over",
+                "working",
+                now,
+                now,
+                fg,
+                "overseer",
+            ),
         )
     except sqlite3.IntegrityError as exc:
         raised = True

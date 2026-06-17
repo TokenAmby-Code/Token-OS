@@ -10,6 +10,7 @@ import asyncio
 import sqlite3
 import uuid
 from datetime import datetime
+from os import PathLike
 from typing import Any
 
 _INSTANCE_INSERT_COLUMNS = frozenset(
@@ -34,19 +35,21 @@ _INSTANCE_INSERT_COLUMNS = frozenset(
 )
 
 
-def _conn(db_path):
+def _conn(db_path: str | PathLike[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _persona(conn, slug: str) -> str:
+def _persona(conn: sqlite3.Connection, slug: str) -> str:
     row = conn.execute("SELECT id FROM personas WHERE slug = ?", (slug,)).fetchone()
     assert row is not None, slug
     return row[0]
 
 
-def _insert_instance(conn, **overrides) -> str:
+def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
+    from instance_mutation import sanctioned_insert_instance_sync
+
     now = datetime.now().isoformat()
     values = {
         "id": str(uuid.uuid4()),
@@ -70,14 +73,22 @@ def _insert_instance(conn, **overrides) -> str:
     cols = list(values)
     invalid_cols = [col for col in cols if col not in _INSTANCE_INSERT_COLUMNS]
     assert not invalid_cols, f"unexpected instances columns: {invalid_cols}"
-    conn.execute(
-        f"INSERT INTO instances ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
-        [values[c] for c in cols],
+    tmux_pane = values.pop("tmux_pane", None)
+    sanctioned_insert_instance_sync(
+        conn,
+        values=values,
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="test",
     )
+    if tmux_pane is not None:
+        conn.execute("UPDATE instances SET tmux_pane = ? WHERE id = ?", (tmux_pane, values["id"]))
     return values["id"]
 
 
-def _seed_shadowed_singleton(db_path, slug: str, *, live_id: str, child_id: str, retired_id: str):
+def _seed_shadowed_singleton(
+    db_path: str | PathLike[str], slug: str, *, live_id: str, child_id: str, retired_id: str
+) -> None:
     """Seed a live singleton plus newer shadow rows for the same persona.
 
     If a resolver is missing either canonical filter, it will select one of the
