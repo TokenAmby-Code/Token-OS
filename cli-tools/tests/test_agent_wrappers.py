@@ -146,3 +146,78 @@ bash -c "$cmd"
     assert "/api/hooks/WrapperStart" in hook_text
     assert "/api/hooks/WrapperEnd" in hook_text
     assert "codex-wrapper-id" in hook_text
+
+
+def test_wrapper_stack_enforcement_runs_only_for_stack_panes(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (tmp_path / "lib").mkdir()
+    calls = tmp_path / "tmuxctl.calls"
+    tmux = fakebin / "tmux"
+    _write_executable(
+        tmux,
+        """#!/usr/bin/env bash
+if [[ "$*" == *"%stack"* ]]; then
+  printf 'main:7\\tlegion:worker\\tstack-worker\\n'
+elif [[ "$*" == *"%plain"* ]]; then
+  printf 'main:1\\t\\t\\n'
+elif [[ "$*" == *"%custodes"* ]]; then
+  printf 'main:1\\tlegion:custodes\\t\\n'
+fi
+""",
+    )
+    _write_executable(
+        fakebin / "tmuxctl",
+        f"""#!/usr/bin/env bash
+echo "$*" >> {str(calls)!r}
+""",
+    )
+    script = f"""
+set -euo pipefail
+PATH={str(fakebin)!r}:$PATH
+source {str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh")!r}
+TOKEN_WRAPPER_LIB_DIR={str(tmp_path / "lib")!r}
+TMUX_PANE_VALUE=%plain
+token_wrapper_enforce_stack_if_needed %plain
+TMUX_PANE_VALUE=%custodes
+token_wrapper_enforce_stack_if_needed %custodes
+TMUX_PANE_VALUE=%stack
+token_wrapper_enforce_stack_if_needed %stack
+wait
+"""
+    subprocess.run(["bash", "-c", script], check=True, text=True, capture_output=True)
+    assert (
+        calls.read_text(encoding="utf-8").strip()
+        == "stack enforce --window main:7 --kill-pending-clear"
+    )
+
+
+def test_dispatch_stack_enforcement_uses_shared_wrapper_helper() -> None:
+    dispatch = (CLI_TOOLS / "bin" / "dispatch").read_text(encoding="utf-8")
+    assert 'source "${LIB_DIR}/agent-wrapper-common.sh"' in dispatch
+    assert 'token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"' in dispatch
+    marker = "dispatch_codex_stack_enforce_if_needed() {"
+    start = dispatch.index(marker) + len(marker)
+    depth = 1
+    pos = start
+    in_parameter_expansion = 0
+    while pos < len(dispatch) and depth:
+        two = dispatch[pos : pos + 2]
+        char = dispatch[pos]
+        if two == "${":
+            in_parameter_expansion += 1
+            pos += 2
+            continue
+        if char == "}" and in_parameter_expansion:
+            in_parameter_expansion -= 1
+            pos += 1
+            continue
+        if not in_parameter_expansion:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+        pos += 1
+    body = dispatch[start : pos - 1]
+    assert "tmuxctl stack enforce" not in body
+    assert "#{@PANE_TYPE}" not in body

@@ -133,6 +133,32 @@ token_wrapper_cleanup_pane() {
   fi
 }
 
+token_wrapper_enforce_stack_if_needed() {
+  local pane="${1:-$TMUX_PANE_VALUE}"
+  [[ -n "$pane" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  local meta window_target pane_role pane_type
+  meta="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}	#{@PANE_ID}	#{@PANE_TYPE}' 2>/dev/null || true)"
+  [[ -n "$meta" ]] || return 0
+  IFS=$'\t' read -r window_target pane_role pane_type <<< "$meta"
+  case "$pane_role" in
+    legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+      return 0
+      ;;
+  esac
+  if [[ "$pane_type" != "stack-worker" && "$pane_role" != "legion:worker" && "$pane_role" != "legion:regiment" && "$pane_role" != "mechanicus:worker" && ! "$pane_role" =~ ^(legion|mechanicus):[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+  (
+    local tmuxctl_bin="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctl"
+    if [[ -x "$tmuxctl_bin" ]]; then
+      IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" stack enforce --window "$window_target" --kill-pending-clear
+    else
+      IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack enforce --window "$window_target" --kill-pending-clear
+    fi
+  ) >/dev/null 2>&1 &
+}
+
 token_wrapper_start() {
   local start_payload
   start_payload="$(token_wrapper_build_payload "WrapperStart")"
@@ -145,4 +171,5 @@ token_wrapper_end() {
   local end_payload
   end_payload="$(token_wrapper_build_payload "WrapperEnd" "$exit_code")"
   token_wrapper_post_hook "WrapperEnd" "$end_payload"
+  token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"
 }

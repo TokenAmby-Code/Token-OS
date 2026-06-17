@@ -10,6 +10,7 @@ LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
+source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 
@@ -1622,6 +1623,11 @@ dispatch_codex_launch_inline() {
     local exit_code="${1:-$?}"
     local codex_session_id="$session_id"
     local wrapper_end_payload end_payload
+    dispatch_codex_stack_enforce_if_needed() {
+      if declare -F token_wrapper_enforce_stack_if_needed >/dev/null 2>&1; then
+        token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"
+      fi
+    }
     if [[ -s "${bridge_dir}/${bridge_id}.session_id" ]]; then
       codex_session_id="$(cat "${bridge_dir}/${bridge_id}.session_id" 2>/dev/null || printf '%s' "$session_id")"
     fi
@@ -1664,6 +1670,7 @@ dispatch_codex_launch_inline() {
         exit_code: $code
       }')"
     dispatch_codex_post_hook "SessionEnd" "$end_payload"
+    dispatch_codex_stack_enforce_if_needed
   }
   dispatch_codex_signal_cleanup() {
     local exit_code=$?
