@@ -9,8 +9,41 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+# ── Shared per-file write lock ────────────────────────────────────────────────
+# Every in-process writer to a given Obsidian note (the 60s callout writer and
+# the 30s timer-frontmatter writer both hit today's daily note) must serialize,
+# or a read-modify-write from one can clobber the other's update. mtime-guard +
+# retry only protects against a *detectable* concurrent change; it does not
+# prevent two threads from interleaving their own read→write windows. A process-
+# wide lock keyed by the resolved path is the serializer. Both writers run via
+# asyncio.to_thread (real OS threads), so a threading lock is the right primitive.
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def file_write_lock(path: str | Path) -> threading.Lock:
+    """Return the process-wide write lock for ``path`` (canonicalized).
+
+    Callers acquire this around any read-modify-write of the note so the
+    callout writer and the frontmatter writer cannot interleave-destroy each
+    other. Keyed by the resolved path string so two Path objects for the same
+    file share one lock.
+    """
+    try:
+        key = str(Path(path).resolve())
+    except OSError:
+        key = str(path)
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
 
 CALLOUT_ID_RE = re.compile(r"^[a-z0-9_-]+$")
 ALLOWED_CALLOUT_TYPES = {
@@ -136,16 +169,19 @@ def apply_callout(
     path = Path(file_path)
     block = render_callout_block(callout_id, content, title, callout_type)
 
-    last_conflict: CalloutConflictError | None = None
-    for _attempt in range(max_attempts):
-        stat = path.stat()  # FileNotFoundError intentionally bubbles to the API as 404.
-        existing = path.read_text(encoding="utf-8")
-        updated, action = _replace_or_append(existing, callout_id, block)
-        try:
-            bytes_written = _atomic_write(path, updated, stat.st_mtime_ns)
-            return CalloutWriteResult(action=action, bytes_written=bytes_written, path=path)
-        except CalloutConflictError as exc:
-            last_conflict = exc
-            continue
+    # Serialize against the frontmatter writer (and any other in-process writer
+    # to this note) so their read→write windows cannot interleave-destroy.
+    with file_write_lock(path):
+        last_conflict: CalloutConflictError | None = None
+        for _attempt in range(max_attempts):
+            stat = path.stat()  # FileNotFoundError intentionally bubbles to the API as 404.
+            existing = path.read_text(encoding="utf-8")
+            updated, action = _replace_or_append(existing, callout_id, block)
+            try:
+                bytes_written = _atomic_write(path, updated, stat.st_mtime_ns)
+                return CalloutWriteResult(action=action, bytes_written=bytes_written, path=path)
+            except CalloutConflictError as exc:
+                last_conflict = exc
+                continue
 
     raise last_conflict or CalloutConflictError("daily note changed during callout write")
