@@ -2069,10 +2069,11 @@ async def _mark_for_close_subscription(
             "pane": target_pane,
         }
     if pane and not resolved_id:
-        # Only the stored tmux pane id is a stable fallback target; a role label
-        # (pane_label) is not addressable, so it must not satisfy the mismatch check.
-        known_panes = {stored_tmux_pane} if stored_tmux_pane else set()
-        if known_panes and target_pane not in known_panes:
+        # An explicit pane that did not resolve to a live instance can only be
+        # trusted when it matches the stored tmux pane id (the one stable fallback
+        # target; a role label is not addressable). Without a stored pane to
+        # validate against, fail closed rather than arm an unverifiable target.
+        if not stored_tmux_pane or target_pane != stored_tmux_pane:
             return {
                 "success": False,
                 "action": "pane_instance_mismatch",
