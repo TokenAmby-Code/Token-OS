@@ -198,29 +198,130 @@ def serialize_frontmatter(fm: dict[str, Any], body: str) -> str:
     return f"---\n{yaml_str}\n---\n{body}"
 
 
+def _serialize_yaml_block(fm: dict[str, Any]) -> str:
+    """Serialize a frontmatter dict to the YAML text that sits between the fences."""
+    return yaml.dump(
+        fm,
+        Dumper=_ObsidianDumper,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+        width=200,
+    ).rstrip("\n")
+
+
+def _has_valid_frontmatter(content: str) -> bool:
+    """True iff ``parse_frontmatter`` recognized a real frontmatter dict.
+
+    ``parse_frontmatter`` returns ``({}, full_content)`` both when there is no
+    leading fence AND when the fenced YAML doesn't parse to a dict (empty /
+    malformed). In those cases there is no YAML region to splice surgically, so
+    we must fall back to the prepend path rather than mis-detect a fence.
+    """
+    if not content.startswith("---"):
+        return False
+    end_idx = content.find("\n---", 3)
+    if end_idx == -1:
+        return False
+    try:
+        loaded = yaml.safe_load(content[3:end_idx].strip())
+    except yaml.YAMLError:
+        return False
+    return isinstance(loaded, dict)
+
+
+def splice_frontmatter(content: str, fm: dict[str, Any]) -> str:
+    """Replace ONLY the YAML region of ``content`` with the serialized ``fm``.
+
+    Surgical write: the body (the closing ``---`` fence and everything after it)
+    is copied through byte-for-byte from ``content`` — it is never re-parsed or
+    re-serialized. A frontmatter-only rewrite physically cannot clobber body
+    appends made between a read and this write.
+
+    When ``content`` has no parseable frontmatter dict, falls back to
+    ``serialize_frontmatter`` over the whole content as body, so behavior matches
+    the pre-fix writer exactly for those (rare) inputs.
+    """
+    if _has_valid_frontmatter(content):
+        end_idx = content.find("\n---", 3)
+        # Tail = the closing fence and everything after it, preserved verbatim.
+        tail = content[end_idx + 1 :]  # starts at "---" of the closing fence
+        yaml_str = _serialize_yaml_block(fm)
+        return f"---\n{yaml_str}\n{tail}"
+
+    # No valid frontmatter: identical to the pre-fix path (whole content as body).
+    return serialize_frontmatter(fm, content)
+
+
 def update_frontmatter(
     file_path: Path,
-    updates: dict[str, Any],
+    updates: dict[str, Any] | None = None,
     delete_keys: list[str] | None = None,
+    *,
+    transform: Callable[[dict[str, Any]], None] | None = None,
+    max_attempts: int = 3,
 ) -> dict[str, Any]:
-    """Read a session doc, merge updates into frontmatter, write back.
+    """Surgically merge updates into a note's frontmatter, atomically.
 
     Args:
         file_path: Path to the markdown file.
         updates: Key-value pairs to set/overwrite in frontmatter.
         delete_keys: Keys to remove from frontmatter (applied after updates).
+        transform: Optional callback mutating the FRESHLY-read frontmatter dict
+            in place, run *inside* the locked retry loop after updates/delete_keys.
+            Use this for read-modify-write of a nested field (e.g. one rubric
+            subkey) so a concurrent writer touching a *different* subkey of the
+            same dict can't last-write-win — every attempt re-derives from the
+            on-disk state. Must be idempotent across retries.
+        max_attempts: mtime-conflict retries before raising.
+
+    Race-safety (P0 2026-06-17 — the daily-note timer write-race):
+      - **Surgical**: only the YAML block between the ``---`` fences is rewritten;
+        the body is spliced through byte-for-byte (see ``splice_frontmatter``), so
+        an external ``obsidian append`` / ``Edit`` landing during this update is
+        never lost, and untouched keys (``agents``/``instance_ids``) are preserved.
+      - **Locked**: serialized against the callout writer and any other in-process
+        frontmatter writer via the shared per-file lock.
+      - **Atomic + mtime-guarded**: temp file + ``os.replace``; if the file changed
+        between our read and write (e.g. an external append slipped past the lock),
+        retry up to ``max_attempts`` so we re-read the fresh body before writing.
 
     Returns the updated frontmatter dict.
     Raises FileNotFoundError if the file doesn't exist.
     """
-    fm, body = read_frontmatter(file_path)
-    fm.update(updates)
-    if delete_keys:
-        for key in delete_keys:
-            fm.pop(key, None)
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+    # Imported here (not at module top) to keep this module FastAPI/dependency
+    # light at import time and avoid any import-order surprise; the helpers are
+    # plain stdlib-backed primitives.
+    from dailynote_callout import (
+        CalloutConflictError,
+        _atomic_write,
+        file_write_lock,
+    )
+
+    with file_write_lock(file_path):
+        last_conflict: CalloutConflictError | None = None
+        for _attempt in range(max_attempts):
+            stat = file_path.stat()  # FileNotFoundError bubbles intentionally.
+            content = file_path.read_text(encoding="utf-8")
+            fm, _body = parse_frontmatter(content)
+            if updates:
+                fm.update(updates)
+            if delete_keys:
+                for key in delete_keys:
+                    fm.pop(key, None)
+            if transform is not None:
+                transform(fm)
+            new_content = splice_frontmatter(content, fm)
+            try:
+                _atomic_write(file_path, new_content, stat.st_mtime_ns)
+                return fm
+            except CalloutConflictError as exc:
+                last_conflict = exc
+                continue
+
+    raise last_conflict or CalloutConflictError(
+        f"frontmatter target changed during write: {file_path}"
+    )
 
 
 def update_session_doc_worktrees(
@@ -241,48 +342,55 @@ def update_session_doc_worktrees(
     - action="archive": flip the entry matching `path` from active → archived.
       Archived entries are RETAINED, never deleted.
 
-    The caller MUST serialize concurrent calls (the token-api endpoint holds an
-    asyncio.Lock) — read-modify-write on the file is not atomic on its own, and
-    the one-active invariant only holds if claims don't interleave.
+    The token-api endpoint also holds an asyncio.Lock across calls to keep the
+    one-active invariant under interleaving claims. The registry mutation itself
+    is applied inside update_frontmatter's locked retry loop (via ``transform``)
+    over the freshly-read list, so the read-modify-write is atomic against the
+    file even independent of that endpoint lock.
     """
     if action not in ("claim", "archive"):
         raise ValueError(f"unknown action: {action!r}")
     if not path:
         raise ValueError(f"{action} requires path")
 
-    fm, _body = read_frontmatter(file_path)
-    wts = fm.get("worktrees")
-    if not isinstance(wts, list):
-        wts = []
-    # Keep only well-formed dict entries; drop anything malformed.
-    wts = [w for w in wts if isinstance(w, dict)]
+    captured: dict[str, list[dict]] = {}
 
-    if action == "claim":
-        for w in wts:
-            if w.get("status") == "active":
-                w["status"] = "archived"
-        existing = next((w for w in wts if w.get("path") == path), None)
-        if existing is not None:
-            existing.update(
-                {"branch": branch, "port": port, "status": "active", "claimed_at": claimed_at}
-            )
-        else:
-            wts.append(
-                {
-                    "path": path,
-                    "branch": branch,
-                    "port": port,
-                    "status": "active",
-                    "claimed_at": claimed_at,
-                }
-            )
-    else:  # archive
-        for w in wts:
-            if w.get("path") == path and w.get("status") == "active":
-                w["status"] = "archived"
+    def _mutate(fm: dict[str, Any]) -> None:
+        wts = fm.get("worktrees")
+        if not isinstance(wts, list):
+            wts = []
+        # Keep only well-formed dict entries; drop anything malformed.
+        wts = [dict(w) for w in wts if isinstance(w, dict)]
 
-    update_frontmatter(file_path, {"worktrees": wts})
-    return wts
+        if action == "claim":
+            for w in wts:
+                if w.get("status") == "active":
+                    w["status"] = "archived"
+            existing = next((w for w in wts if w.get("path") == path), None)
+            if existing is not None:
+                existing.update(
+                    {"branch": branch, "port": port, "status": "active", "claimed_at": claimed_at}
+                )
+            else:
+                wts.append(
+                    {
+                        "path": path,
+                        "branch": branch,
+                        "port": port,
+                        "status": "active",
+                        "claimed_at": claimed_at,
+                    }
+                )
+        else:  # archive
+            for w in wts:
+                if w.get("path") == path and w.get("status") == "active":
+                    w["status"] = "archived"
+
+        fm["worktrees"] = wts
+        captured["wts"] = wts
+
+    update_frontmatter(file_path, transform=_mutate)
+    return captured.get("wts", [])
 
 
 def update_victory_frontmatter(
@@ -301,7 +409,7 @@ def update_victory_frontmatter(
 
     Returns the updated frontmatter dict.
     """
-    fm, body = read_frontmatter(file_path)
+    fm, _body = read_frontmatter(file_path)
 
     updates = {
         "victory": "declared",
@@ -328,10 +436,8 @@ def update_victory_frontmatter(
     if deliverables is not None:
         updates["deliverables"] = deliverables
 
-    fm.update(updates)
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+    # Surgical + atomic + locked write (see update_frontmatter).
+    return update_frontmatter(file_path, updates)
 
 
 # ============ Generic Rubric Machinery ============
@@ -724,18 +830,21 @@ def update_rubric_field(
 
     If the rubric is missing or legacy-scalar, the field is upgraded to a dict
     containing only the supplied key. Returns the updated frontmatter dict.
+
+    The rubric dict is read-modified *inside* update_frontmatter's locked retry
+    loop (via ``transform``) so a concurrent writer flipping a different subkey
+    of the same rubric can't last-write-win — each attempt re-derives from the
+    freshly-read frontmatter.
     """
-    fm, body = read_frontmatter(file_path)
-    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
-    existing = fm.get(rk)
-    if not isinstance(existing, dict):
-        existing = {}
-    upgraded = dict(existing)
-    upgraded[key] = value
-    fm[rk] = upgraded
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+
+    def _set_subkey(fm: dict[str, Any]) -> None:
+        rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+        existing = fm.get(rk)
+        upgraded = dict(existing) if isinstance(existing, dict) else {}
+        upgraded[key] = value
+        fm[rk] = upgraded
+
+    return update_frontmatter(file_path, transform=_set_subkey)
 
 
 # --- CodeRabbit review reconciliation (pure, network-free) -------------------
@@ -903,22 +1012,18 @@ def reconcile_coderabbit_comments(
 
 def mark_rubric_notified(file_path: Path, rubric_key: str | None = None) -> dict:
     """Stamp <rubric_key>_notified_at = now() — first-touch Emperor notify."""
-    fm, body = read_frontmatter(file_path)
+    fm, _body = read_frontmatter(file_path)
     rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
-    fm[_rubric_sibling(rk, "notified_at")] = datetime.now().isoformat()
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+    return update_frontmatter(
+        file_path, {_rubric_sibling(rk, "notified_at"): datetime.now().isoformat()}
+    )
 
 
 def clear_rubric_notified(file_path: Path, rubric_key: str | None = None) -> dict:
     """Clear <rubric_key>_notified_at — used when a previously-complete rubric regresses."""
-    fm, body = read_frontmatter(file_path)
+    fm, _body = read_frontmatter(file_path)
     rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
-    fm[_rubric_sibling(rk, "notified_at")] = None
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+    return update_frontmatter(file_path, {_rubric_sibling(rk, "notified_at"): None})
 
 
 def mark_rubric_acknowledged(
@@ -927,14 +1032,16 @@ def mark_rubric_acknowledged(
     rubric_key: str | None = None,
 ) -> dict:
     """Stamp <rubric_key>_acknowledged_at + <rubric_key>_reason — final Emperor ack."""
-    fm, body = read_frontmatter(file_path)
+    fm, _body = read_frontmatter(file_path)
     rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
     now = datetime.now().isoformat()
-    fm[_rubric_sibling(rk, "acknowledged_at")] = now
-    fm[_rubric_sibling(rk, "reason")] = reason
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+    return update_frontmatter(
+        file_path,
+        {
+            _rubric_sibling(rk, "acknowledged_at"): now,
+            _rubric_sibling(rk, "reason"): reason,
+        },
+    )
 
 
 def bump_session_doc_up_to_date(file_path: Path, value: bool) -> dict | None:
@@ -947,7 +1054,7 @@ def bump_session_doc_up_to_date(file_path: Path, value: bool) -> dict | None:
     Returns None if the doc has no rubric (legacy/string victory or missing).
     """
     try:
-        fm, body = read_frontmatter(file_path)
+        fm, _body = read_frontmatter(file_path)
     except FileNotFoundError:
         return None
     rk = fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
@@ -955,13 +1062,19 @@ def bump_session_doc_up_to_date(file_path: Path, value: bool) -> dict | None:
     if not isinstance(existing, dict):
         return None
     if existing.get("session_doc_up_to_date") == value:
+        # Already at target — no write needed (the pre-lock read is sufficient
+        # for this fast path; the flag is single-writer-per-turn in practice).
         return fm
-    upgraded = dict(existing)
-    upgraded["session_doc_up_to_date"] = value
-    fm[rk] = upgraded
-    new_content = serialize_frontmatter(fm, body)
-    file_path.write_text(new_content, encoding="utf-8")
-    return fm
+
+    # Re-derive the rubric inside the locked retry loop so a concurrent writer
+    # flipping a different subkey can't be clobbered by a whole-dict overwrite.
+    def _set_flag(fm: dict[str, Any]) -> None:
+        cur = fm.get(rk)
+        upgraded = dict(cur) if isinstance(cur, dict) else {}
+        upgraded["session_doc_up_to_date"] = value
+        fm[rk] = upgraded
+
+    return update_frontmatter(file_path, transform=_set_flag)
 
 
 # ============ Obsidian CLI Wrappers ============
