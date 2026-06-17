@@ -156,7 +156,7 @@ token_wrapper_enforce_stack_if_needed() {
     else
       IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack enforce --window "$window_target" --kill-pending-clear
     fi
-  ) >/tmp/agent-wrapper-stack-enforce.log 2>&1 &
+  ) >/dev/null 2>&1 &
 }
 
 token_wrapper_start() {

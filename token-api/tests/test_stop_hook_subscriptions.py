@@ -52,7 +52,7 @@ def test_session_start_auto_subscribes_parent(app_env, monkeypatch):
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
 
-    async def run():
+    async def run() -> None:
         result = await hooks.handle_session_start(
             {
                 "session_id": "child-1",
@@ -110,7 +110,7 @@ def test_stop_hook_live_delivery_dedupes_and_suppresses_legacy(app_env, monkeypa
         separators=(",", ":"),
     )
 
-    async def run():
+    async def run() -> None:
         first = await hooks.handle_stop({"session_id": "child-2", "transcript_tail": tail})
         second = await hooks.handle_stop({"session_id": "child-2", "transcript_tail": tail})
         assert first["stop_subscriptions"][0]["status"] == "sent"
@@ -134,7 +134,7 @@ def test_explicit_subscribe_unsubscribe(app_env):
     _insert_instance(app_env.db_path, "target-1", pane="%30")
     _insert_instance(app_env.db_path, "sub-1", pane="%31")
 
-    async def run():
+    async def run() -> None:
         sub = await hooks.subscribe_hook(
             hooks.HookSubscribeRequest(target_pane="%30", subscriber_pane="%31")
         )
@@ -175,7 +175,7 @@ def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch) -> None:
 
     monkeypatch.setattr(hooks, "_resolve_instance_for_pane", counting)
 
-    async def run():
+    async def run() -> None:
         sub = await hooks.subscribe_hook(
             hooks.HookSubscribeRequest(target_pane="%55", subscriber_pane="%55")
         )
@@ -212,7 +212,7 @@ def test_distinct_pane_subscribe_resolves_each_pane(app_env, monkeypatch) -> Non
 
     monkeypatch.setattr(hooks, "_resolve_instance_for_pane", counting)
 
-    async def run():
+    async def run() -> None:
         sub = await hooks.subscribe_hook(
             hooks.HookSubscribeRequest(target_pane="%60", subscriber_pane="%61")
         )
@@ -234,7 +234,7 @@ def test_mechanicus_worker_session_start_auto_subscribes_to_live_fg(app_env):
         pane_label="mechanicus:fabricator-general",
     )
 
-    async def run():
+    async def run() -> None:
         result = await hooks.handle_session_start(
             {
                 "session_id": "worker-1",
@@ -277,7 +277,7 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
         parent="fg-2",
     )
 
-    async def run():
+    async def run() -> None:
         result = await hooks.handle_session_start(
             {
                 "session_id": "fg-2",
@@ -322,7 +322,7 @@ def test_mechanicus_spillover_worker_reconciles_without_numeric_label(app_env, m
     async def no_label(_pane):
         return None
 
-    async def run():
+    async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -343,7 +343,7 @@ def test_mechanicus_fg_and_admin_are_never_subscription_targets(app_env):
     )
     _insert_instance(app_env.db_path, "admin-1", pane="%51", pane_label="mechanicus:admin")
 
-    async def run():
+    async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -370,7 +370,7 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
         app_env.db_path, "worker-4", pane="%61", pane_label="mechanicus:1", parent="fg-4"
     )
 
-    async def run():
+    async def run() -> None:
         first = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -391,7 +391,7 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
 def test_mechanicus_worker_start_without_fg_does_not_create_subscription(app_env):
     hooks = sys.modules["routes.hooks"]
 
-    async def run():
+    async def run() -> None:
         result = await hooks.handle_session_start(
             {
                 "session_id": "worker-no-fg",
@@ -502,7 +502,7 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
 
     monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
 
-    async def run():
+    async def run() -> None:
         sub = await hooks.subscribe_hook(
             hooks.HookSubscribeRequest(
                 target_pane="%90",
@@ -527,18 +527,20 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
-def test_mark_for_close_stop_subscription_retires_after_closing_pane(app_env, monkeypatch):
+def test_mark_for_close_stop_subscription_retires_after_closing_pane(
+    app_env: object, monkeypatch: object
+) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "close-me", pane="%91")
     closed = []
 
-    async def fake_close(pane):
+    async def fake_close(pane: str) -> dict:
         closed.append(pane)
         return {"status": "closed", "pane": pane}
 
     monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
 
-    async def run():
+    async def run() -> None:
         sub = await hooks.mark_instance_for_close(
             "close-me",
             hooks.MarkForCloseRequest(mode="after-stop", lifecycle="retire", pane="%91"),
@@ -562,7 +564,9 @@ def test_mark_for_close_stop_subscription_retires_after_closing_pane(app_env, mo
     assert sub_row == ("delivered", "mark_for_close", "close-pane", 1)
 
 
-def test_mark_for_close_stop_subscription_can_archive_session_doc(app_env, monkeypatch, tmp_path):
+def test_mark_for_close_stop_subscription_can_archive_session_doc(
+    app_env: object, monkeypatch: object, tmp_path: Path
+) -> None:
     hooks = sys.modules["routes.hooks"]
     doc = tmp_path / "close-doc.md"
     doc.write_text("---\nstatus: active\n---\n# Close Doc\n", encoding="utf-8")
@@ -574,16 +578,29 @@ def test_mark_for_close_stop_subscription_can_archive_session_doc(app_env, monke
         (str(doc),),
     )
     doc_id = conn.execute("SELECT id FROM session_documents WHERE title='Close Doc'").fetchone()[0]
-    conn.execute("UPDATE instances SET session_doc_id=? WHERE id='archive-me'", (doc_id,))
     conn.commit()
     conn.close()
 
-    async def fake_close(pane):
+    async def bind_doc() -> None:
+        async with hooks.aiosqlite.connect(app_env.db_path, timeout=5.0) as db:
+            await hooks.sanctioned_update_instance(
+                db,
+                instance_id="archive-me",
+                updates={"session_doc_id": doc_id},
+                mutation_type="instance_updated",
+                write_source="test",
+                actor="test",
+            )
+            await db.commit()
+
+    asyncio.run(bind_doc())
+
+    async def fake_close(pane: str) -> dict:
         return {"status": "closed", "pane": pane}
 
     monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
 
-    async def run():
+    async def run() -> None:
         armed = await hooks.mark_instance_for_close(
             "archive-me",
             hooks.MarkForCloseRequest(
@@ -607,11 +624,11 @@ def test_mark_for_close_stop_subscription_can_archive_session_doc(app_env, monke
     assert "status: archived" in doc.read_text(encoding="utf-8")
 
 
-def test_public_hook_subscribe_rejects_close_pane_delivery(app_env):
+def test_public_hook_subscribe_rejects_close_pane_delivery(app_env: object) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "public-close", pane="%93")
 
-    async def run():
+    async def run() -> None:
         result = await hooks.subscribe_hook(
             hooks.HookSubscribeRequest(
                 target_pane="%93",
@@ -629,11 +646,11 @@ def test_public_hook_subscribe_rejects_close_pane_delivery(app_env):
     asyncio.run(run())
 
 
-def test_mark_for_close_endpoint_rejects_pane_instance_mismatch(app_env):
+def test_mark_for_close_endpoint_rejects_pane_instance_mismatch(app_env: object) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "pane-owner", pane="%96")
 
-    async def run():
+    async def run() -> None:
         result = await hooks.mark_instance_for_close(
             "pane-owner",
             hooks.MarkForCloseRequest(mode="after-stop", lifecycle="retire", pane="%97"),
@@ -649,18 +666,20 @@ def test_mark_for_close_endpoint_rejects_pane_instance_mismatch(app_env):
     assert sub_count == 0
 
 
-def test_mark_for_close_endpoint_refuses_protected_persona_pane(app_env, monkeypatch):
+def test_mark_for_close_endpoint_refuses_protected_persona_pane(
+    app_env: object, monkeypatch: object
+) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "custodes-pane", pane="%95")
 
-    async def fake_role(pane, option):
+    async def fake_role(pane: str, option: str) -> str:
         assert pane == "%95"
         assert option == "@PANE_ID"
         return "legion:custodes"
 
     monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
 
-    async def run():
+    async def run() -> None:
         result = await hooks.mark_instance_for_close(
             "custodes-pane",
             hooks.MarkForCloseRequest(mode="now", lifecycle="retire", pane="%95"),
@@ -678,18 +697,18 @@ def test_mark_for_close_endpoint_refuses_protected_persona_pane(app_env, monkeyp
     assert row == ("idle", "astartes")
 
 
-def test_mark_for_close_now_uses_executor(app_env, monkeypatch):
+def test_mark_for_close_now_uses_executor(app_env: object, monkeypatch: object) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "close-now", pane="%94")
     closed = []
 
-    async def fake_close(pane):
+    async def fake_close(pane: str) -> dict:
         closed.append(pane)
         return {"status": "closed", "pane": pane}
 
     monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
 
-    async def run():
+    async def run() -> None:
         result = await hooks.mark_instance_for_close(
             "close-now",
             hooks.MarkForCloseRequest(mode="now", lifecycle="retire", pane="%94"),
@@ -710,6 +729,37 @@ def test_mark_for_close_now_uses_executor(app_env, monkeypatch):
     assert closed == ["%94"]
     assert row == ("stopped", "retired", None)
     assert sub_row == ("delivered", "close-pane")
+
+
+def test_refused_close_pane_oneshot_deactivates(app_env: object, monkeypatch: object) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "refuse-close", pane="%98")
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane, event, delivery, status, purpose, oneshot)
+           VALUES ('refuse-close', '%98', 'refuse-close', '%98', 'stop', 'close-pane', 'active', 'mark_for_close', 1)"""
+    )
+    conn.commit()
+    conn.close()
+
+    async def fake_close(pane: str) -> dict:
+        return {"status": "refused", "reason": "static_persona_pane"}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run() -> None:
+        result = await hooks.handle_stop({"session_id": "refuse-close", "transcript_tail": ""})
+        assert result["stop_subscriptions"][0]["status"] == "refused"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    sub_status = conn.execute(
+        "SELECT status FROM stop_hook_subscriptions WHERE target_instance_id='refuse-close'"
+    ).fetchone()[0]
+    conn.close()
+    assert sub_status == "delivered"
 
 
 def _insert_subscription(
@@ -767,7 +817,7 @@ def test_reconcile_skips_worker_with_dead_parent(app_env):
         parent="ghost-uuid",
     )
 
-    async def run():
+    async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -794,7 +844,7 @@ def test_reconcile_skips_worker_parented_to_other_live_instance(app_env):
         parent="custodes-live",
     )
 
-    async def run():
+    async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -813,7 +863,7 @@ def test_reconcile_skips_parentless_worker(app_env):
     )
     _insert_instance(app_env.db_path, "worker-parentless", pane="%76", pane_label="mechanicus:7")
 
-    async def run():
+    async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
             hooks.HookReconcileRequest(page="mechanicus")
         )
@@ -846,7 +896,7 @@ def test_unsubscribe_matches_by_instance_uuid_in_pane_slot(app_env):
         subscriber_pane="%31",
     )
 
-    async def run():
+    async def run() -> None:
         unsub = await hooks.unsubscribe_hook(
             hooks.HookUnsubscribeRequest(target_pane="watched-live", subscriber_pane="notify-live")
         )
@@ -868,7 +918,7 @@ def test_unsubscribe_matches_phantom_notify_uuid(app_env):
         subscriber_pane="%32",
     )
 
-    async def run():
+    async def run() -> None:
         unsub = await hooks.unsubscribe_hook(
             hooks.HookUnsubscribeRequest(target_pane="watched-2", subscriber_pane="phantom-uuid")
         )
@@ -895,7 +945,7 @@ def test_prune_extra_live_ids_protects_swept_but_live(app_env):
         subscriber_pane="%10",
     )
 
-    async def run():
+    async def run() -> None:
         import aiosqlite
 
         async with aiosqlite.connect(app_env.db_path) as db:
@@ -941,7 +991,7 @@ def test_prune_removes_dangling_keeps_live(app_env):
         subscriber_pane="%32",
     )
 
-    async def run():
+    async def run() -> None:
         import aiosqlite
 
         async with aiosqlite.connect(app_env.db_path) as db:

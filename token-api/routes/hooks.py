@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -425,6 +426,8 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "synced": False,
     },
 }
+
+PROTECTED_MARK_FOR_CLOSE_PANE_IDS = frozenset(PERSONA_PANE_IDENTITY)
 
 
 async def _run_subprocess_offloop(
@@ -1702,25 +1705,18 @@ async def _enqueue_and_send_stop_delivery(
 
 
 async def _tmux_show_pane_option(pane: str, option: str) -> str:
-    proc = await _run_subprocess_offloop(
-        ("tmux", "show-options", "-pv", "-t", pane, option),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        timeout=2,
-    )
-    if proc.returncode != 0:
+    try:
+        proc = await _run_subprocess_offloop(
+            ("tmux", "show-options", "-pv", "-t", pane, option),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=2,
+        )
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.decode(errors="ignore").strip()
+    except Exception:
         return ""
-    return proc.stdout.decode(errors="ignore").strip()
-
-
-async def _tmux_pane_exists(pane: str) -> bool:
-    proc = await _run_subprocess_offloop(
-        ("tmux", "display-message", "-p", "-t", pane, "#{pane_id}"),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        timeout=2,
-    )
-    return proc.returncode == 0
 
 
 async def _tmux_pane_stack_window(pane: str | None) -> str | None:
@@ -1746,7 +1742,7 @@ async def _tmux_pane_stack_window(pane: str | None) -> str | None:
     if len(parts) != 3:
         return None
     window_target, pane_role, pane_type = parts
-    if pane_role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
+    if pane_role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
         return None
     if pane_type == "stack-worker":
         return window_target
@@ -1764,10 +1760,18 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
     tmuxctl = _tmuxctl_bin()
     if not tmuxctl.exists():
         return
-    log_path = Path("/tmp/mark-for-close-stack-enforce.log")
     log_handle = None
     try:
-        log_handle = log_path.open("a")
+        log_dir = Path.home() / ".claude"
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        log_handle = tempfile.NamedTemporaryFile(
+            mode="a",
+            encoding="utf-8",
+            prefix="mark-for-close-stack-enforce-",
+            suffix=".log",
+            dir=log_dir,
+            delete=False,
+        )
         env = os.environ.copy()
         env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
         subprocess.Popen(
@@ -1796,11 +1800,25 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
                 pass
 
 
-async def _cleanup_tmux_pane_chrome(pane: str) -> None:
+async def _cleanup_tmux_pane_cosmetic(pane: str) -> None:
     commands: list[tuple[str, ...]] = [
         ("tmux", "select-pane", "-t", pane, "-T", ""),
         ("tmux", "select-pane", "-t", pane, "-P", "bg=default,fg=default"),
     ]
+    for cmd in commands:
+        try:
+            await _run_subprocess_offloop(
+                cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                timeout=2,
+            )
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
+
+
+async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
+    commands: list[tuple[str, ...]] = []
     for opt in (
         "@INSTANCE_ID",
         "@CC_STATE",
@@ -1846,39 +1864,45 @@ async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
     pane = _normalize_text(pane)
     if not pane:
         return {"status": "skipped", "reason": "no_pane"}
-    role = await _tmux_show_pane_option(pane, "@PANE_ID")
-    if role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
-        return {"status": "refused", "reason": "static_persona_pane", "pane_role": role}
-    if not await _tmux_pane_exists(pane):
-        return {"status": "already_closed"}
-    stack_window = await _tmux_pane_stack_window(pane)
-    await _cleanup_tmux_pane_chrome(pane)
-    for _ in range(3):
-        await _run_subprocess_offloop(
-            ("tmux", "send-keys", "-t", pane, "C-c"),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            timeout=2,
-        )
-        await asyncio.sleep(0.2)
-    for _ in range(6):
+    stack_window = None
+    try:
+        role = await _tmux_show_pane_option(pane, "@PANE_ID")
+        if role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
+            return {"status": "refused", "reason": "static_persona_pane", "pane_role": role}
         if not await _tmux_pane_exists(pane):
-            _spawn_stack_enforce(stack_window)
-            return {"status": "closed", "pane": pane, "method": "graceful"}
-        await asyncio.sleep(0.5)
-    proc = await _run_subprocess_offloop(
-        ("tmux", "kill-pane", "-t", pane),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        timeout=3,
-    )
-    if proc.returncode != 0:
-        return {
-            "status": "failed",
-            "error": proc.stderr.decode(errors="ignore").strip() or "tmux kill-pane failed",
-        }
-    _spawn_stack_enforce(stack_window)
-    return {"status": "closed", "pane": pane, "method": "kill-pane"}
+            return {"status": "already_closed"}
+        stack_window = await _tmux_pane_stack_window(pane)
+        await _cleanup_tmux_pane_cosmetic(pane)
+        for _ in range(3):
+            await _run_subprocess_offloop(
+                ("tmux", "send-keys", "-t", pane, "C-c"),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                timeout=2,
+            )
+            await asyncio.sleep(0.2)
+        for _ in range(6):
+            if not await _tmux_pane_exists(pane):
+                await _cleanup_tmux_pane_runtime_stamps(pane)
+                _spawn_stack_enforce(stack_window)
+                return {"status": "closed", "pane": pane, "method": "graceful"}
+            await asyncio.sleep(0.5)
+        proc = await _run_subprocess_offloop(
+            ("tmux", "kill-pane", "-t", pane),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=3,
+        )
+        if proc.returncode != 0:
+            return {
+                "status": "failed",
+                "error": proc.stderr.decode(errors="ignore").strip() or "tmux kill-pane failed",
+            }
+        await _cleanup_tmux_pane_runtime_stamps(pane)
+        _spawn_stack_enforce(stack_window)
+        return {"status": "closed", "pane": pane, "method": "kill-pane"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "failed", "error": str(exc)}
 
 
 def _resolve_session_doc_path(raw_path: str | None) -> Path | None:
@@ -2009,6 +2033,7 @@ async def _mark_for_close_subscription(
         _normalize_text(row["pane_label"]),
     }
     known_panes.discard("")
+    known_panes.discard(None)
     if pane and known_panes and target_pane not in known_panes:
         return {
             "success": False,
@@ -2029,7 +2054,7 @@ async def _mark_for_close_subscription(
         }
 
     role = await _tmux_show_pane_option(target_pane, "@PANE_ID")
-    if role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
+    if role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
         return {
             "success": False,
             "action": "protected_pane",
@@ -2104,11 +2129,7 @@ async def _fanout_stop_subscriptions(
                     payload=delivery_payload,
                 )
             results.append(result)
-            if row.get("oneshot") and result.get("status") not in {
-                "duplicate",
-                "failed",
-                "refused",
-            }:
+            if row.get("oneshot") and result.get("status") != "duplicate":
                 now = datetime.now().isoformat()
                 await db.execute(
                     """UPDATE stop_hook_subscriptions

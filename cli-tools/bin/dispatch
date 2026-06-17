@@ -10,6 +10,7 @@ LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
+source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 
@@ -1623,27 +1624,9 @@ dispatch_codex_launch_inline() {
     local codex_session_id="$session_id"
     local wrapper_end_payload end_payload
     dispatch_codex_stack_enforce_if_needed() {
-      local pane="${resolved_tmux_pane:-}"
-      [[ -n "$pane" ]] || return 0
-      local meta window_target pane_role pane_type
-      meta="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}	#{@PANE_ID}	#{@PANE_TYPE}' 2>/dev/null || true)"
-      [[ -n "$meta" ]] || return 0
-      IFS=$'\t' read -r window_target pane_role pane_type <<< "$meta"
-      case "$pane_role" in
-        legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
-          return 0
-          ;;
-      esac
-      if [[ "$pane_type" != "stack-worker" && "$pane_role" != "legion:worker" && "$pane_role" != "legion:regiment" && "$pane_role" != "mechanicus:worker" && ! "$pane_role" =~ ^(legion|mechanicus):[1-9][0-9]*$ ]]; then
-        return 0
+      if declare -F token_wrapper_enforce_stack_if_needed >/dev/null 2>&1; then
+        token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"
       fi
-      (
-        if [[ -x "${SCRIPT_DIR}/tmuxctl" ]]; then
-          IMPERIUM_TMUX_AUTOMATION=1 "${SCRIPT_DIR}/tmuxctl" stack enforce --window "$window_target" --kill-pending-clear
-        else
-          IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack enforce --window "$window_target" --kill-pending-clear
-        fi
-      ) >/tmp/dispatch-stack-enforce.log 2>&1 &
     }
     if [[ -s "${bridge_dir}/${bridge_id}.session_id" ]]; then
       codex_session_id="$(cat "${bridge_dir}/${bridge_id}.session_id" 2>/dev/null || printf '%s' "$session_id")"

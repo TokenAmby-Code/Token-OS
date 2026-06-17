@@ -190,3 +190,12 @@ wait
         calls.read_text(encoding="utf-8").strip()
         == "stack enforce --window main:7 --kill-pending-clear"
     )
+
+
+def test_dispatch_stack_enforcement_uses_shared_wrapper_helper() -> None:
+    dispatch = (CLI_TOOLS / "bin" / "dispatch").read_text(encoding="utf-8")
+    assert 'source "${LIB_DIR}/agent-wrapper-common.sh"' in dispatch
+    assert 'token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"' in dispatch
+    body = dispatch.split("dispatch_codex_stack_enforce_if_needed() {", 1)[1].split("}", 1)[0]
+    assert "tmuxctl stack enforce" not in body
+    assert "#{@PANE_TYPE}" not in body

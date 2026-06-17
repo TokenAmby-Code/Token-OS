@@ -32,7 +32,7 @@ fi
 INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
 PANE_ROLE="$(tmux show-options -pv -t "$PANE" @PANE_ID 2>/dev/null || true)"
 case "$PANE_ROLE" in
-    legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+    legion:custodes|mechanicus:fabricator-general|mechanicus:admin|legion:malcador|koronus:pax|koronus:orchestrator)
         tmux display-message "mark-for-close refused for static persona pane: $PANE_ROLE" 2>/dev/null || true
         echo "Static persona panes are not closeout targets: $PANE_ROLE" >&2
         exit 1
@@ -64,8 +64,10 @@ MODE_CHOICE="$(_choose 'final-message> ' $'message\tSend one last message, close
 
 _api_post_json() {
     local path="$1" body="$2"
-    python3 - "$API_URL" "$path" "$body" <<'PY'
-import sys, urllib.request
+python3 - "$API_URL" "$path" "$body" <<'PY'
+import json
+import sys
+import urllib.request
 api, path, body = sys.argv[1], sys.argv[2], sys.argv[3]
 url = api.rstrip('/') + path
 req = urllib.request.Request(url, data=body.encode(), method='POST', headers={'Content-Type': 'application/json'})
@@ -73,6 +75,12 @@ try:
     with urllib.request.urlopen(req, timeout=8) as resp:
         text = resp.read().decode()
         if resp.status >= 300:
+            raise SystemExit(text)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict) and payload.get("success") is False:
             raise SystemExit(text)
         print(text)
 except Exception as exc:
@@ -104,7 +112,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    _api_post_json "/api/hooks/unsubscribe" "$body" >/dev/null || true
+    _api_post_json "/api/hooks/unsubscribe" "$body" >/dev/null
 }
 
 if [[ "$MODE_CHOICE" == "message" ]]; then
@@ -116,9 +124,13 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
     fi
     _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body after-stop)" >/dev/null
     if ! printf '%s' "$FINAL_MESSAGE" | "$TMUXCTL_BIN" send-text --pane "$PANE" --stdin --clear-prompt; then
-        _unsubscribe_mark
-        tmux display-message "mark-for-close: final send failed; closeout disarmed" 2>/dev/null || true
-        echo "tmux-mark-for-close: final send failed; closeout disarmed" >&2
+        if _unsubscribe_mark; then
+            tmux display-message "mark-for-close: final send failed; closeout disarmed" 2>/dev/null || true
+            echo "tmux-mark-for-close: final send failed; closeout disarmed" >&2
+        else
+            tmux display-message "mark-for-close: final send failed; disarm failed" 2>/dev/null || true
+            echo "tmux-mark-for-close: final send failed; disarm failed" >&2
+        fi
         exit 1
     fi
     tmux display-message "mark-for-close armed: $LIFECYCLE after next Stop" 2>/dev/null || true
