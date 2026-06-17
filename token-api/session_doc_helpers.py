@@ -210,31 +210,47 @@ def _serialize_yaml_block(fm: dict[str, Any]) -> str:
     ).rstrip("\n")
 
 
+def _has_valid_frontmatter(content: str) -> bool:
+    """True iff ``parse_frontmatter`` recognized a real frontmatter dict.
+
+    ``parse_frontmatter`` returns ``({}, full_content)`` both when there is no
+    leading fence AND when the fenced YAML doesn't parse to a dict (empty /
+    malformed). In those cases there is no YAML region to splice surgically, so
+    we must fall back to the prepend path rather than mis-detect a fence.
+    """
+    if not content.startswith("---"):
+        return False
+    end_idx = content.find("\n---", 3)
+    if end_idx == -1:
+        return False
+    try:
+        loaded = yaml.safe_load(content[3:end_idx].strip())
+    except yaml.YAMLError:
+        return False
+    return isinstance(loaded, dict)
+
+
 def splice_frontmatter(content: str, fm: dict[str, Any]) -> str:
     """Replace ONLY the YAML region of ``content`` with the serialized ``fm``.
 
-    Surgical write: the body (everything after the closing ``---`` fence) is
-    copied through byte-for-byte from ``content`` — it is never re-parsed or
+    Surgical write: the body (the closing ``---`` fence and everything after it)
+    is copied through byte-for-byte from ``content`` — it is never re-parsed or
     re-serialized. A frontmatter-only rewrite physically cannot clobber body
     appends made between a read and this write.
 
-    If ``content`` has no parseable frontmatter fences, the serialized block is
-    prepended (matching ``serialize_frontmatter`` for the no-frontmatter case).
+    When ``content`` has no parseable frontmatter dict, falls back to
+    ``serialize_frontmatter`` over the whole content as body, so behavior matches
+    the pre-fix writer exactly for those (rare) inputs.
     """
-    if content.startswith("---"):
+    if _has_valid_frontmatter(content):
         end_idx = content.find("\n---", 3)
-        if end_idx != -1:
-            # Tail = the closing fence and everything after it, preserved verbatim.
-            tail = content[end_idx + 1 :]  # starts at "---" of the closing fence
-            yaml_str = _serialize_yaml_block(fm)
-            return f"---\n{yaml_str}\n{tail}"
+        # Tail = the closing fence and everything after it, preserved verbatim.
+        tail = content[end_idx + 1 :]  # starts at "---" of the closing fence
+        yaml_str = _serialize_yaml_block(fm)
+        return f"---\n{yaml_str}\n{tail}"
 
-    # No frontmatter present: treat the whole content as body and prepend a block.
-    yaml_str = _serialize_yaml_block(fm)
-    body = content
-    if body and not body.startswith("\n"):
-        return f"---\n{yaml_str}\n---\n\n{body}"
-    return f"---\n{yaml_str}\n---\n{body}"
+    # No valid frontmatter: identical to the pre-fix path (whole content as body).
+    return serialize_frontmatter(fm, content)
 
 
 def update_frontmatter(

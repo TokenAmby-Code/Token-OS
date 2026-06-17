@@ -209,6 +209,30 @@ def test_splice_frontmatter_no_frontmatter_prepends(tmp_path):
     assert "# Just a body" in body
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "# no fm\nbody\n",  # no leading fence
+        "---\n---\nbody\n",  # empty (non-dict) frontmatter block
+        "---\nnot a dict just a string\n---\nx\n",  # scalar yaml, not a dict
+    ],
+)
+def test_splice_no_valid_frontmatter_matches_legacy_serialize(content):
+    """For inputs with no parseable frontmatter dict, the surgical splice must
+    fall back to exactly the pre-fix serialize_frontmatter behavior (no new
+    divergence in degenerate cases)."""
+    fm, body = sdh.parse_frontmatter(content)
+    fm = {**fm, "added": True}
+    assert sdh.splice_frontmatter(content, fm) == sdh.serialize_frontmatter(fm, body)
+
+
+def test_update_frontmatter_returns_merged_dict(tmp_path):
+    note = _daily_note(tmp_path)
+    out = sdh.update_frontmatter(note, {"timer_status": "working"})
+    assert out["timer_status"] == "working"
+    assert out["agents"] == ["custodes-abc", "guilliman-def"]
+
+
 def test_delete_keys_still_works(tmp_path):
     note = _daily_note(tmp_path)
     sdh.update_frontmatter(note, {"temp_key": "x"})
