@@ -5,8 +5,8 @@ resolve_live_persona_instance, FG (fabricator-general):
              -> must resolve to the OVERSEER, ignoring chapter children.
   SECONDARY: active overseer + a retired row sharing persona_id
              -> must resolve to the active overseer, never the retired row.
-  EDGE     : ONLY chapter children alive (no emperor-commanded overseer)
-             -> documents what the resolver returns (None).
+  EDGE     : orphan chapter-child insert (no live overseer commander)
+             -> must fail with sqlite3.IntegrityError via chapter_persona_guard.
 """
 
 from __future__ import annotations
