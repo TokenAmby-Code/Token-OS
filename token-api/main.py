@@ -9031,6 +9031,8 @@ async def _resolve_administratum_instance() -> dict | None:
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'administratum'
+                 AND i.rank != 'retired'
+                 AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
                ORDER BY i.last_activity DESC
                LIMIT 1"""
@@ -20733,6 +20735,8 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'custodes'
+                 AND i.rank != 'retired'
+                 AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
                  AND i.stopped_at IS NULL
                ORDER BY i.last_activity DESC
@@ -20869,6 +20873,7 @@ async def end_morning_session():
         morning_status = "ended" if ended_state is not None else "no_session"
     except Exception as exc:
         logger.warning("Morning end audit state-file write failed: %s", exc)
+
 
     now_ms = int(time.monotonic() * 1000)
     today = datetime.now().strftime("%Y-%m-%d")
