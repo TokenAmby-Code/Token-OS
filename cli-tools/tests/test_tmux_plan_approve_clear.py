@@ -62,7 +62,12 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
     curl_log = tmp_path / "curl.log"
     tmux_log = tmp_path / "tmux.log"
     (fakebin / "curl").write_text(
-        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {curl_log!s}\nexit 0\n"
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
+        "case \"$*\" in\n"
+        "  *'-G'*) printf '%s\\n' '{\"success\":true,\"planning_state\":\"planning\"}' ;;\n"
+        "esac\n"
+        "exit 0\n"
     )
     (fakebin / "tmux").write_text(
         "#!/usr/bin/env bash\n"

@@ -18,7 +18,7 @@ import re
 import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -3618,27 +3618,96 @@ async def handle_session_end(payload: dict) -> dict:
     return result
 
 
+PROMPT_TEXT_KEYS = (
+    "prompt",
+    "user_prompt",
+    "userPrompt",
+    "message",
+    "text",
+    "input",
+    "command",
+)
+PROMPT_PARENT_KEYS = ("payload", "event", "data", "turn", "turn_context", "context")
+
+
+def _iter_prompt_texts(payload: dict) -> Iterable[str]:
+    for key in PROMPT_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str):
+            yield value
+
+    for parent_key in PROMPT_PARENT_KEYS:
+        parent = payload.get(parent_key)
+        if isinstance(parent, dict):
+            yield from _iter_prompt_texts(parent)
+
+
+def _text_starts_command(text: str, commands: tuple[str, ...]) -> bool:
+    stripped = text.lstrip()
+    for command in commands:
+        if not stripped.startswith(command):
+            continue
+        if len(stripped) == len(command):
+            return True
+        # Slash/dollar skill commands may take args but must not match longer
+        # names such as /planning or $preplanning.
+        return stripped[len(command)].isspace()
+    return False
+
+
 def _payload_starts_slash_plan(payload: dict) -> bool:
     """Return true when a prompt-submit payload contains a direct /plan command."""
-    prompt_keys = (
-        "prompt",
-        "user_prompt",
-        "userPrompt",
-        "message",
-        "text",
-        "input",
-        "command",
-    )
-    for key in prompt_keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value.lstrip().startswith("/plan"):
-            return True
+    return any(_text_starts_command(text, ("/plan",)) for text in _iter_prompt_texts(payload))
 
-    for parent_key in ("payload", "event", "data", "turn", "turn_context", "context"):
-        parent = payload.get(parent_key)
-        if isinstance(parent, dict) and _payload_starts_slash_plan(parent):
-            return True
-    return False
+
+def _payload_starts_preplan(payload: dict) -> bool:
+    """Return true when a prompt-submit payload contains /preplan or $preplan."""
+    return any(
+        _text_starts_command(text, ("/preplan", "$preplan"))
+        for text in _iter_prompt_texts(payload)
+    )
+
+
+async def _arm_preplan_plan_subscription(
+    db,
+    *,
+    instance_id: str,
+    tmux_pane: str | None,
+    payload: str = "/plan create the plan",
+) -> dict | None:
+    """Arm the raw /preplan/$preplan → /plan one-shot Stop handoff.
+
+    Shift+Tab preplan already arms this client-side before inserting the leader.
+    This server-side path covers typed raw commands, where PromptSubmit is the
+    first deterministic event before the preplan turn runs.
+    """
+    pane = _normalize_text(tmux_pane)
+    if not pane:
+        return None
+    sub_id = await _upsert_stop_subscription(
+        db,
+        target_instance_id=instance_id,
+        target_pane=pane,
+        subscriber_instance_id=instance_id,
+        subscriber_pane=pane,
+        event="stop",
+        delivery="prompt",
+        purpose="preplan_plan",
+        payload=payload,
+        oneshot=True,
+    )
+    return {
+        "subscription_id": sub_id,
+        "target_instance_id": instance_id,
+        "target_pane": pane,
+        "subscriber_instance_id": instance_id,
+        "subscriber_pane": pane,
+        "event": "stop",
+        "delivery": "prompt",
+        "purpose": "preplan_plan",
+        "payload": payload,
+        "oneshot": True,
+    }
 
 
 def _payload_indicates_plan_mode(payload: dict) -> bool:
@@ -3801,7 +3870,25 @@ async def handle_prompt_submit(payload: dict) -> dict:
         consumed_injections = await _consume_state_injections(db, session_id)
 
         planning_event = None
-        if (
+        preplan_subscription = None
+        if _payload_starts_preplan(payload):
+            planning_event = await _set_planning_state(
+                db,
+                session_id,
+                "preplanning",
+                source="preplan:prompt-submit",
+                only_if_in=("none", "preplanning"),
+                actor="PromptSubmit",
+            )
+            tmux_pane = existing_dict.get("tmux_pane") or (payload.get("env") or {}).get(
+                "TMUX_PANE"
+            )
+            preplan_subscription = await _arm_preplan_plan_subscription(
+                db,
+                instance_id=session_id,
+                tmux_pane=tmux_pane,
+            )
+        elif (
             _payload_starts_slash_plan(payload)
             or _payload_indicates_plan_mode(payload)
             or await _transcript_indicates_plan_mode(payload)
@@ -3833,6 +3920,12 @@ async def handle_prompt_submit(payload: dict) -> dict:
 
     if planning_event:
         await log_event("planning_state_changed", instance_id=session_id, details=planning_event)
+    if preplan_subscription:
+        await log_event(
+            "stop_hook_subscription_armed",
+            instance_id=session_id,
+            details=preplan_subscription,
+        )
 
     # NOTE: this hook no longer flips global productivity. Productivity is now a
     # read-time calculus in compute_work_state (the 10s poll), which discounts

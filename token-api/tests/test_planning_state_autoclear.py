@@ -217,6 +217,55 @@ def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
     assert source == "auto-clear:prompt-submit"
 
 
+
+def _subscription(db_path, instance_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """SELECT status, purpose, payload, oneshot, target_pane, subscriber_pane
+           FROM stop_hook_subscriptions
+           WHERE target_instance_id = ?""",
+        (instance_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "slash-preplan-1", pane="%54", engine="claude")
+
+    _prompt_submit(app_env, monkeypatch, {"session_id": "slash-preplan-1", "prompt": "/preplan prepare"})
+
+    state, source = _planning(app_env.db_path, "slash-preplan-1")
+    assert state == "preplanning"
+    assert source == "preplan:prompt-submit"
+    assert _subscription(app_env.db_path, "slash-preplan-1") == (
+        "active",
+        "preplan_plan",
+        "/plan create the plan",
+        1,
+        "%54",
+        "%54",
+    )
+
+
+def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "dollar-preplan-1", pane="%55", engine="codex")
+
+    _prompt_submit(app_env, monkeypatch, {"session_id": "dollar-preplan-1", "prompt": "$preplan"})
+
+    state, source = _planning(app_env.db_path, "dollar-preplan-1")
+    assert state == "preplanning"
+    assert source == "preplan:prompt-submit"
+    assert _subscription(app_env.db_path, "dollar-preplan-1") == (
+        "active",
+        "preplan_plan",
+        "/plan create the plan",
+        1,
+        "%55",
+        "%55",
+    )
+
+
 def test_codex_prompt_submit_transcript_plan_context_sets_planning(
     app_env,
     monkeypatch,
