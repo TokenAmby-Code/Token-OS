@@ -104,6 +104,31 @@ def test_assert_locked_fails_when_any_write_bit_remains(tmp_path) -> None:
     assert run("assert-locked", str(root)).returncode == 0
 
 
+def test_lock_warns_and_fails_when_chmod_is_a_noop(tmp_path) -> None:
+    # Network mounts (SMB/CIFS) silently ignore chmod, so the tree stays
+    # writable while chmod "succeeds". Simulate that with a no-op chmod shim on
+    # PATH: lock must detect the residual write bits, warn, and exit nonzero
+    # rather than falsely report "locked".
+    root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "app.py").write_text("print('x')\n")
+    os.chmod(root, 0o777)
+
+    binshim = tmp_path / "bin"
+    binshim.mkdir()
+    shim = binshim / "chmod"
+    shim.write_text("#!/usr/bin/env bash\nexit 0\n")
+    os.chmod(shim, 0o755)
+
+    env = {**os.environ, "PATH": f"{binshim}{os.pathsep}{os.environ['PATH']}"}
+    proc = run("lock", str(root), env=env)
+
+    assert proc.returncode == 1, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "did NOT take" in proc.stderr
+    assert "locked" not in proc.stdout
+    assert has_any_write(root), "no-op chmod must leave write bits"
+
+
 def test_lock_sets_git_filemode_false_so_status_stays_clean(tmp_path) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
