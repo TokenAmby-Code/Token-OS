@@ -188,8 +188,8 @@ _timer_engine: Any = None
 _timer_log_shift: Callable[..., Any] | None = None
 _run_stop_evaluators: Callable[..., Any] | None = None
 _auto_name_instance: Callable[..., Any] | None = None
-# Server-side naming interview (main._maybe_naming_nudge). Fired on Stop so
-# Codex panes — which have no naming-nudge.sh Stop shim — get interviewed too.
+# Server-side naming interview (main._maybe_naming_nudge). Fired from generic
+# lifecycle boundaries so unnamed-pane detection is harness-agnostic.
 _maybe_naming_nudge: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
@@ -245,6 +245,27 @@ def _require_dep(name: str, value):
     if value is None:
         raise RuntimeError(f"routes.hooks dependency not initialized: {name}")
     return value
+
+
+def _schedule_naming_nudge(instance_id: str | None, source: str) -> None:
+    """Best-effort unnamed-pane interview for any harness lifecycle event.
+
+    Claude, Codex, wrapper-only launches, and future harnesses do not all emit
+    the same terminal hook set. Keep the policy here: if a lifecycle event sees
+    an instance that might still be reachable and unnamed, ask the shared
+    Token-API nudge core to decide. The core is idempotent and enforces the
+    placeholder/pending/cap gates.
+    """
+    if not instance_id:
+        return
+
+    async def _safe_naming_nudge() -> None:
+        try:
+            await _require_dep("maybe_naming_nudge", _maybe_naming_nudge)(instance_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort nudge, must not break hooks
+            logger.warning("%s: naming nudge failed for %s: %s", source, instance_id[:12], exc)
+
+    asyncio.create_task(_safe_naming_nudge())
 
 
 # ============ Hook Models ============
@@ -1965,6 +1986,11 @@ async def handle_wrapper_end(payload: dict) -> dict:
                         )
                     except Exception:
                         pass
+    if stopped_instance_id:
+        # WrapperEnd is terminal for wrappers that may not emit Stop/SessionEnd
+        # (notably some Codex launches). Reuse the same generic nudge policy.
+        _schedule_naming_nudge(stopped_instance_id, "WrapperEnd")
+
     details["stopped_instance_id"] = stopped_instance_id
     await log_event("wrapper_end", instance_id=stopped_instance_id or None, details=details)
     return {
@@ -3554,6 +3580,10 @@ async def handle_session_end(payload: dict) -> dict:
 
         await db.commit()
 
+        # Terminal SessionEnd is a harness-neutral chance to catch unnamed panes
+        # before close-time assertions/cleanup can clear runtime pane stamps.
+        _schedule_naming_nudge(session_id, "SessionEnd")
+
         try:
             if _stop_pane:
                 await asyncio.to_thread(shared.clear_pane_tint, _stop_pane, source="SessionEnd")
@@ -4117,19 +4147,10 @@ async def handle_stop(payload: dict) -> dict:
             )
         await db.commit()
 
-    # Interview unnamed panes on Stop. Engine-agnostic — this is the only path
-    # Codex panes get (no naming-nudge.sh shim), and it is harmlessly idempotent
-    # for Claude, which also fires naming-nudge.sh. The core self-guards on
-    # placeholder name, missing pane, pending nudge, and the 3-nudge cap, so a
-    # named pane is a cheap no-op. Fire-and-forget so Stop latency is unaffected;
-    # the wrapper logs (never raises) so an unforeseen error can't strand the task.
-    async def _safe_naming_nudge() -> None:
-        try:
-            await _require_dep("maybe_naming_nudge", _maybe_naming_nudge)(session_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort nudge, must not break Stop
-            logger.warning("Stop: naming nudge failed for %s: %s", session_id[:12], exc)
-
-    asyncio.create_task(_safe_naming_nudge())
+    # Interview unnamed panes from the shared lifecycle helper. The policy is not
+    # Claude- or Codex-specific; the nudge core self-guards on placeholder name,
+    # missing pane, duplicate pending request, and the 3-nudge cap.
+    _schedule_naming_nudge(session_id, "Stop")
 
     # Trinity Chunk 1: resolve any open `talk` pairs awaiting natural-stop
     # slash-copy of this target's final response. Fires for every Stop hook —

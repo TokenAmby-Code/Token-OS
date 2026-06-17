@@ -26,8 +26,20 @@ fi
 # Get action type from environment (set by settings.json hook command)
 ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
 
-# Resolve token-api URL from environment (set in nas-path.sh)
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+# Resolve token-api URL from centralized machine config.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for _nas_lib in \
+  "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
+  "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh"; do
+  if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_nas_lib" 2>/dev/null || true
+    break
+  fi
+done
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # Claude Code strips PATH during hook execution, so `command -v` may fail.
 # Use environment-configured roots only; do not hardcode NAS paths.

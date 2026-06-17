@@ -4,8 +4,20 @@
 
 INPUT=$(cat 2>/dev/null || echo "{}")
 
-# Resolve token-api URL from environment
-API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
+# Resolve token-api URL from centralized machine config.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for _nas_lib in \
+  "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
+  "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
+  "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
+  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh"; do
+  if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_nas_lib" 2>/dev/null || true
+    break
+  fi
+done
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 # Walk process tree to inject the claude PID (portable: uses ps)
 CLAUDE_PID=""
