@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Install/merge Imperium-managed Codex hooks.
+
+This intentionally patches ~/.codex/hooks.json instead of replacing it: Codex
+keeps user-local lifecycle hooks there, and runtime updates must not clobber
+existing SessionStart/Stop/PostToolUse wiring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+RUNTIME_WRITE_GUARD_HOOK: dict[str, Any] = {
+    "type": "command",
+    "command": "HOOK_AGENT=codex bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/runtime-write-guard.sh",
+    "timeout": 5,
+    "statusMessage": "Guarding runtime checkout writes",
+}
+
+
+def _load(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"hooks": {}}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"codex-hooks-install: invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"codex-hooks-install: expected object at top level in {path}")
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise SystemExit(f"codex-hooks-install: expected .hooks object in {path}")
+    return data
+
+
+def _has_command(groups: list[Any], command: str) -> bool:
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for hook in group.get("hooks", []) or []:
+            if isinstance(hook, dict) and hook.get("command") == command:
+                return True
+    return False
+
+
+def merge_codex_hooks(data: dict[str, Any]) -> bool:
+    """Merge required Codex hooks into data. Return True when changed."""
+
+    hooks = data.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    if not isinstance(pre, list):
+        raise ValueError(".hooks.PreToolUse must be an array when present")
+
+    command = RUNTIME_WRITE_GUARD_HOOK["command"]
+    if _has_command(pre, command):
+        return False
+
+    # No matcher: Codex runs this for every tool. The guard itself is precise and
+    # fail-open for non-write/non-runtime calls. Put it first so a deny happens
+    # before any later observer hook with side effects.
+    pre.insert(0, {"hooks": [dict(RUNTIME_WRITE_GUARD_HOOK)]})
+    return True
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Install required Imperium Codex hooks.")
+    default_hooks = Path.home() / ".codex" / "hooks.json"
+    parser.add_argument("--hooks", type=Path, default=default_hooks, help="hooks.json path")
+    parser.add_argument("--check", action="store_true", help="Only report whether hooks are present")
+    parser.add_argument("--no-backup", action="store_true", help="Do not create a timestamped backup")
+    args = parser.parse_args(argv)
+
+    data = _load(args.hooks)
+    changed = merge_codex_hooks(data)
+    if args.check:
+        if changed:
+            print(f"codex-hooks-install: missing required hooks in {args.hooks}")
+            return 1
+        print(f"codex-hooks-install: OK {args.hooks}")
+        return 0
+    if not changed:
+        print(f"codex-hooks-install: OK {args.hooks}")
+        return 0
+
+    args.hooks.parent.mkdir(parents=True, exist_ok=True)
+    if args.hooks.exists() and not args.no_backup:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = args.hooks.with_name(f"{args.hooks.name}.bak-{stamp}")
+        shutil.copy2(args.hooks, backup)
+        print(f"codex-hooks-install: backed up {args.hooks} -> {backup}")
+
+    args.hooks.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"codex-hooks-install: installed required hooks in {args.hooks}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
