@@ -363,6 +363,31 @@ def test_morning_entry_resets_metrics_logs_and_injects(app_env, monkeypatch):
     assert injected == ["pytest"]
 
 
+def test_morning_enter_endpoint_uses_timer_path_without_prompt(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    main = app_env.main
+    main.timer_engine._total_work_time_ms = 123_000
+    main.timer_engine._total_break_time_ms = 456_000
+    main.timer_engine._break_balance_ms = -789_000
+    monkeypatch.setattr(
+        main,
+        "_inject_custodes_morning_prompt",
+        lambda source: (_ for _ in ()).throw(AssertionError("prompt injection disabled")),
+    )
+    client = TestClient(main.app)
+
+    resp = client.post("/api/morning/enter?inject_prompt=false")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current_mode"] == "morning_session"
+    assert body["break_balance_ms"] == 0
+    assert body["total_work_time_ms"] == 0
+    assert body["total_break_time_ms"] == 0
+    assert main.timer_engine.current_mode == main.TimerMode.MORNING_SESSION
+
+
 # ── Part B: Custodes Discord injection via the singleton pane marker ──
 
 

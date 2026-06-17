@@ -20830,6 +20830,17 @@ async def start_morning_session():
     return {"status": "started", "date": today}
 
 
+@app.post("/api/morning/enter")
+async def enter_morning_session(inject_prompt: bool = True):
+    """Manually enter first-class morning-session timer mode.
+
+    The scheduler owns the normal 06:00 path. This endpoint is the explicit
+    operational/live-test path for the same timer transition, with
+    ``inject_prompt=false`` available when only the timer mode should be tested.
+    """
+    return await enter_morning_session_internal(source="api", inject_prompt=inject_prompt)
+
+
 @app.get("/api/morning/status")
 async def get_morning_session_status():
     """Check current morning session state."""
