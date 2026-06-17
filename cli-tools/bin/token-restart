@@ -267,7 +267,8 @@ runtime_write_lock_after_deploy() {
     if "$helper" lock "$dir" >/dev/null; then
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime write-protected: $dir"
     else
-        echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to write-protect runtime checkout: $dir"
+        echo -e "  ${RED}✗${NC} CD-sync: failed to write-protect runtime checkout: $dir"
+        return 1
     fi
 }
 
@@ -394,12 +395,17 @@ resolve_deploy_target() {
     git --git-dir="$TOKEN_OS_BARE_REPO" rev-parse "$target^{commit}"
 }
 
-ensure_runtime_checkout() {
+validate_runtime_checkout_path() {
     local dir="$1"
     if [[ -e "$dir" && ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
         echo -e "  ${RED}✗${NC} CD-sync: runtime path exists but is not a git checkout: $dir"
         return 1
     fi
+}
+
+ensure_runtime_checkout() {
+    local dir="$1"
+    validate_runtime_checkout_path "$dir" || return 1
     if [[ ! -e "$dir" ]]; then
         echo -e "${BLUE}→${NC} CD-sync: creating runtime checkout $dir..."
         mkdir -p "$(dirname "$dir")"
@@ -454,18 +460,21 @@ sync_live_checkout() {
     ensure_bare_repo || return 1
     sync_bare_main || return 1
 
-    local dir target rc
+    local dir target rc lock_rc
     dir="$(resolve_live_checkout)" || return 1
     target="$(resolve_deploy_target)" || return 1
     SYNC_TARGET_SHA="$target"
 
+    validate_runtime_checkout_path "$dir" || return 1
     runtime_write_unlock_for_deploy "$dir" || return 1
     set +e
     _sync_live_checkout_unlocked "$dir" "$target"
     rc=$?
+    runtime_write_lock_after_deploy "$dir"
+    lock_rc=$?
     set -e
-    runtime_write_lock_after_deploy "$dir" || true
-    return "$rc"
+    [[ "$rc" -eq 0 ]] || return "$rc"
+    return "$lock_rc"
 }
 
 restart_mac() {
