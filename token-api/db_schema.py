@@ -422,8 +422,7 @@ async def _ensure_instances(db) -> None:
                 WHERE commander.id = NEW.commander_id
                   AND commander.rank != 'retired'
                   AND commander.status != 'archived'
-                  AND (commander.persona_id IS NEW.persona_id)
-            ) THEN RAISE(ABORT, 'chapter commander must be active and share persona_id') END;
+            ) THEN RAISE(ABORT, 'chapter commander must be active') END;
         END
     """)
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_chapter_persona_guard_update")
@@ -437,8 +436,7 @@ async def _ensure_instances(db) -> None:
                 WHERE commander.id = NEW.commander_id
                   AND commander.rank != 'retired'
                   AND commander.status != 'archived'
-                  AND (commander.persona_id IS NEW.persona_id)
-            ) THEN RAISE(ABORT, 'chapter commander must be active and share persona_id') END;
+            ) THEN RAISE(ABORT, 'chapter commander must be active') END;
         END
     """)
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_retire_children")

@@ -264,26 +264,31 @@ def test_singleton_reregister_retires_previous_active(app_env):
     ]
 
 
-def test_chapter_commander_must_share_persona(app_env):
+def test_chapter_commander_requires_active_parent_not_shared_persona(app_env):
     conn = _conn(app_env.db_path)
     ultra = _persona(conn, "ultramarines")
     salamanders = _persona(conn, "salamanders")
     _insert_instance(conn, id="ultra-boss", persona_id=ultra, rank="astartes")
-    with pytest.raises(sqlite3.IntegrityError, match="share persona_id"):
+
+    # Chapter edges express control/parentage, not identity.  A dispatched worker
+    # may keep an explicitly assigned persona that differs from its commander.
+    _insert_instance(
+        conn,
+        id="salamander-child",
+        persona_id=salamanders,
+        commander_type="chapter",
+        commander_id="ultra-boss",
+    )
+
+    conn.execute("UPDATE instances SET rank = 'retired' WHERE id = 'ultra-boss'")
+    with pytest.raises(sqlite3.IntegrityError, match="chapter commander must be active"):
         _insert_instance(
             conn,
-            id="bad-child",
+            id="orphan-child",
             persona_id=salamanders,
             commander_type="chapter",
             commander_id="ultra-boss",
         )
-    _insert_instance(
-        conn,
-        id="good-child",
-        persona_id=ultra,
-        commander_type="chapter",
-        commander_id="ultra-boss",
-    )
     conn.close()
 
 
